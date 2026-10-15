@@ -38,6 +38,17 @@
 //!    `artifact.repository_id == repo` (cross-repo isolation) and that
 //!    the resolved row's quarantine status is not terminal (a row the
 //!    blob read would refuse is not a satisfied reference).
+//!
+//!    **Then the door** ([`refuse_misdeclared_signature_layers`]): when
+//!    the manifest declares EVERY layer to be signature material hort
+//!    recognises — the condition the scan/quarantine exemption of step 6
+//!    fires on — each declared layer's blob is read back from CAS and
+//!    must parse as the shape it was declared as. Unparseable ⇒ 400
+//!    `MANIFEST_INVALID` naming the offending layer digest, **before**
+//!    the mint, so a refused push leaves no artifact behind. Bytes that
+//!    cannot be read are accepted and logged instead, and an
+//!    unrecognised media type never reaches the door at all — see that
+//!    function for why each of those is deliberate.
 //! 5. Build the manifest's content-reference claim set from the resolved
 //!    references — one [`ContentReferenceClaim`] per `oci_config` /
 //!    `oci_layer` / `oci_index_member` edge, plus the `oci_subject`
@@ -565,6 +576,11 @@ fn resolve_manifest_hash(
 /// since the body already parsed cleanly upstream. On the off chance one
 /// errors, fail safe → generic path (`unwrap_or(false)`), so the generic
 /// path scans/quarantines it — never a wrongful exemption.
+///
+/// A manifest that matches then has to clear
+/// [`refuse_misdeclared_signature_layers`] before it is minted: declaring a
+/// layer to be signature material is one thing, the bytes behind it being
+/// that thing is another, and only the second earns the exemption.
 fn is_pure_signature_manifest(
     subject_digest_parsed: &Option<ContentHash>,
     body_bytes: &[u8],
@@ -572,6 +588,141 @@ fn is_pure_signature_manifest(
     subject_digest_parsed.is_some()
         && (hort_domain::oci::is_pure_sigstore_bundle(body_bytes).unwrap_or(false)
             || hort_domain::oci::is_pure_simplesigning(body_bytes).unwrap_or(false))
+}
+
+/// Upper bound on the bytes read back from CAS for one signature-layer shape
+/// check. A Sigstore v0.3 bundle is a few KB of JSON (the checked-in real
+/// cosign fixture is 11 KB) and a `simplesigning` payload is a few hundred
+/// bytes, so 1 MiB is three orders of magnitude past real signature material
+/// — the same generosity [`MANIFEST_BODY_MAX_BYTES`] applies to the manifest
+/// itself.
+///
+/// **The direction of the cap is what matters, not its value.** A layer over
+/// the cap reads as unreadable, which this door accepts and logs — so
+/// lowering the cap can only ever move a layer from *refused* to *accepted*,
+/// never the reverse, which keeps the door the narrowing-only check it claims
+/// to be. Raising it past the verify path's own 16 MiB CAS ceiling would buy
+/// nothing either: beyond that ceiling every verifier reads a truncated
+/// prefix, so there is no material up there any of them could use.
+const MAX_SIGNATURE_LAYER_READ_BYTES: usize = 1024 * 1024;
+
+/// **The door.** When a manifest declares EVERY layer to be signature
+/// material hort recognises — the condition
+/// [`is_pure_signature_manifest`] grants the scan/quarantine exemption on —
+/// the blob behind each declared layer must actually parse as the shape it was
+/// declared as. Unparseable ⇒ the push is refused, before the mint, with 400
+/// `MANIFEST_INVALID` naming the offending layer digest.
+///
+/// This narrows the exemption; it never widens it. The "every layer must be
+/// signature material" rule above is the anti-scan-evasion guard and is
+/// untouched: a mixed manifest (a signature layer plus a runnable `tar+gzip`
+/// layer) still fails `is_pure_*`, still never reaches this function, and
+/// still takes the generic scanned path.
+///
+/// # Shape, never validity
+///
+/// Whether a signature is *valid* needs the trust root and the subject's
+/// bytes and stays in the verifiers (`hort-adapters-provenance-*`, which this
+/// crate must not depend on — ADR 0008). The door answers one question: is
+/// this the kind of thing it claims to be? A door that started verifying
+/// would be both wrong — a signature can be well-formed and untrusted, which
+/// is a verdict for the verify path to record against the subject — and a
+/// denial-of-service surface on the write path.
+///
+/// # It is not total, and must not pretend to be
+///
+/// Two gaps, both deliberate, both covered by the complementary rule that
+/// unreadable material contributes nothing to a verdict (ADR 0039 D4):
+///
+/// - **Unreadable bytes are accepted.** The resolution ahead of this call
+///   establishes a same-repo, non-terminal **row** per referenced blob; a row
+///   can exist while CAS does not hold the object, and a read can fail for
+///   reasons that are nothing to do with the push. Refusing there would turn
+///   a storage fault into a client error the client cannot act on, so the
+///   read failure is logged and the push proceeds.
+/// - **Referrers hort lands itself from an upstream proxy never come through
+///   here.** The pull-through path mints them without a client PUT, so this
+///   door has no say over them at all.
+///
+/// # Forward compatibility
+///
+/// An **unrecognised** layer media type fails both purity predicates, so such
+/// a manifest is not a signature manifest at all and takes the generic ingest
+/// path — scanned and quarantined like any other content. A future bundle
+/// version carrying a new media type is therefore **not** refused here; it
+/// simply is not treated as a signature, and an artifact relying on it holds
+/// as unsigned. Only *recognised media type declared* **and** *bytes
+/// unparseable as that shape* is refused.
+async fn refuse_misdeclared_signature_layers(
+    ctx: &AppContext,
+    body_bytes: &[u8],
+    manifest_digest: &ContentHash,
+) -> Result<(), Box<Response>> {
+    let layers = match hort_domain::oci::declared_signature_layers(body_bytes) {
+        Ok(l) => l,
+        Err(e) => {
+            // Unreachable in practice: the body parsed as JSON upstream and
+            // both purity predicates parsed it again to get here. Fail safe
+            // the same way they do — no refusal out of a parse this code
+            // could not perform.
+            tracing::warn!(
+                manifest_digest = %manifest_digest,
+                error = %e,
+                "signature-layer enumeration failed on a manifest the purity predicates \
+                 accepted; the shape check is skipped for this push"
+            );
+            return Ok(());
+        }
+    };
+
+    for layer in layers {
+        // The echoed digest is rebuilt from the PARSED hash, never from the
+        // manifest's raw string: `ContentHash` is 64 lowercase hex, so this
+        // is byte-identical to what a client sent for any digest that got
+        // this far, while carrying none of the client's bytes into the
+        // response (the never-echo contract `parse_blob_digest` states).
+        let layer_digest = format!("sha256:{}", layer.hash);
+        let bytes = match ctx
+            .artifact_use_case
+            .read_content_for_projection(&layer.hash, MAX_SIGNATURE_LAYER_READ_BYTES)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    manifest_digest = %manifest_digest,
+                    layer_digest = %layer_digest,
+                    media_type = layer.carriage.media_type(),
+                    error = %e,
+                    "declared signature layer could not be read at push time; the push is \
+                     accepted and the shape is not asserted — material a verifier cannot \
+                     read contributes nothing to a verdict either"
+                );
+                continue;
+            }
+        };
+        if !layer.carriage.accepts(&bytes) {
+            tracing::warn!(
+                manifest_digest = %manifest_digest,
+                layer_digest = %layer_digest,
+                media_type = layer.carriage.media_type(),
+                "declared signature layer is not the shape its media type declares; \
+                 refusing the push"
+            );
+            return Err(Box::new(
+                OciError::ManifestInvalid {
+                    detail: Some(serde_json::json!({
+                        "reason": "layer is not well-formed as the signature media type it declares",
+                        "layer_digest": layer_digest,
+                        "media_type": layer.carriage.media_type(),
+                    })),
+                }
+                .into_response(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Ingest the manifest bytes. A `Conflict` here is the declared-hash
@@ -589,6 +740,13 @@ fn is_pure_signature_manifest(
 /// in which the referrer is live and its target collectable. Both ingest
 /// arms take them, so a pure-signature referrer is covered exactly like any
 /// other manifest.
+///
+/// `is_pure_signature` is [`is_pure_signature_manifest`]'s answer, taken as a
+/// parameter rather than re-derived here: the same decision selects the ingest
+/// arm AND gates [`refuse_misdeclared_signature_layers`] ahead of the mint,
+/// and two independently-computed copies of it could disagree — a manifest
+/// whose layers were never shape-checked taking the exempt arm is exactly the
+/// state the door exists to prevent.
 #[allow(clippy::too_many_arguments)]
 async fn run_manifest_ingest(
     ctx: &AppContext,
@@ -598,6 +756,7 @@ async fn run_manifest_ingest(
     media_type: &str,
     subject_digest_str: Option<String>,
     subject_digest_parsed: &Option<ContentHash>,
+    is_pure_signature: bool,
     claimed_edges: &[ContentReferenceClaim],
     hashes: &ManifestHashDecision,
     body_bytes: &[u8],
@@ -620,8 +779,6 @@ async fn run_manifest_ingest(
         .unwrap_or_else(|| hashes.computed_hash.clone());
     let stream: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
         Box::new(std::io::Cursor::new(body_bytes.to_vec()));
-
-    let is_pure_signature = is_pure_signature_manifest(subject_digest_parsed, body_bytes);
 
     let ingest_result = if is_pure_signature {
         ctx.ingest_use_case
@@ -1287,6 +1444,19 @@ async fn put_manifest_dispatch_inner(
     .await
     .map_err(Box::new)?;
 
+    // ONE decision, two consumers: it selects the ingest arm below and it
+    // gates the door immediately after. See `run_manifest_ingest`.
+    let is_pure_signature = is_pure_signature_manifest(&subject_digest_parsed, &body_bytes);
+
+    // The door, before the mint. Gated on a COMPLETE resolution so the bytes
+    // it parses are bytes this repository holds: on the `Missing` path there
+    // is nothing of ours to read behind at least one declared layer, and that
+    // push keeps its established answer (the post-mint 400
+    // `MANIFEST_BLOB_UNKNOWN` below) rather than acquiring a second one.
+    if is_pure_signature && matches!(resolved, ResolvedReferences::Complete(_)) {
+        refuse_misdeclared_signature_layers(ctx, &body_bytes, &hashes.computed_hash).await?;
+    }
+
     let claims = manifest_ingest_claims(subject_claim, &resolved, &referenced, &media_type);
 
     let ingest_outcome = run_manifest_ingest(
@@ -1297,6 +1467,7 @@ async fn put_manifest_dispatch_inner(
         &media_type,
         subject_digest_str,
         &subject_digest_parsed,
+        is_pure_signature,
         &claims,
         &hashes,
         &body_bytes,
@@ -2245,6 +2416,22 @@ mod tests {
         content: &[u8],
         status: QuarantineStatus,
     ) -> ContentHash {
+        let hash = seed_blob_row_without_content(artifacts, repo_id, content, status);
+        storage.insert_content(hash.clone(), content.to_vec());
+        hash
+    }
+
+    /// An artifact **row** for `content`'s hash with **no CAS object behind
+    /// it**. Reference resolution finds a same-repo, non-terminal row, and a
+    /// read of the bytes behind it then fails — the state a storage fault
+    /// leaves, and the branch the signature-layer door accepts rather than
+    /// refuses.
+    fn seed_blob_row_without_content(
+        artifacts: &MockArtifactRepository,
+        repo_id: Uuid,
+        content: &[u8],
+        status: QuarantineStatus,
+    ) -> ContentHash {
         let hex = hex::encode(Sha256::digest(content));
         let hash: ContentHash = hex.parse().unwrap();
         let mut a = sample_artifact(status);
@@ -2253,7 +2440,6 @@ mod tests {
         a.sha256_checksum = hash.clone();
         a.size_bytes = content.len() as i64;
         artifacts.insert(a);
-        storage.insert_content(hash.clone(), content.to_vec());
         hash
     }
 
@@ -3449,6 +3635,14 @@ mod tests {
     /// single bundle layer) routes to `ingest_signature_manifest`:
     /// the artifact is status `None`, NO scan job is enqueued, and the
     /// `oci_subject` content-reference row is still written.
+    ///
+    /// **The readable-and-well-formed branch of the door.** The layer blob
+    /// carries a genuine Sigstore-bundle shape, so the shape check passes and
+    /// the narrow signature path still fires — the exemption is narrowed by
+    /// the door, not broken by it. The bytes used to be an opaque
+    /// `b"the-cosign-bundle-json"` placeholder, which is material no verifier
+    /// in the system could read; a fixture standing on it was asserting an
+    /// exemption for a push hort now refuses.
     #[test]
     fn put_pure_sigstore_bundle_referrer_is_not_quarantined_or_scanned() {
         let (status, scan_calls, oci_subject_rows, artifact_status) = run(async {
@@ -3457,8 +3651,12 @@ mod tests {
             let repo_id = repo.id;
             h.repositories.insert(repo);
             let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"sig-config-bytes");
-            let bundle_hash =
-                seed_blob(&h.artifacts, &h.storage, repo_id, b"the-cosign-bundle-json");
+            let bundle_hash = seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &well_formed_bundle_bytes("the-signing-key"),
+            );
             let subject_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"the-signed-image");
             let body = build_referrer_manifest(
                 &config_hash,
@@ -3510,6 +3708,13 @@ mod tests {
     /// runnable `tar+gzip` layer, subject.digest set) is NOT exempted: it
     /// stays on `ingest_verified` and IS scanned. A pusher cannot smuggle a
     /// runnable layer past the scanner by labelling one layer a bundle.
+    ///
+    /// Also pins that the signature-layer door runs strictly INSIDE the
+    /// exemption and never widens it: this manifest's bundle layer carries
+    /// `b"a-real-bundle"`, which is not a well-formed bundle, and the push is
+    /// still accepted — because a mixed manifest is not a signature manifest
+    /// at all, so the door never sees it and the generic scanned path owns
+    /// the outcome.
     #[test]
     fn put_mixed_bundle_plus_tar_gzip_referrer_is_still_scanned() {
         let scan_calls = run(async {
@@ -3611,6 +3816,439 @@ mod tests {
         assert_eq!(
             oci_subject_rows, 1,
             "oci_subject row still written for the SBOM referrer"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // The door: a layer declared as signature material must BE that
+    // material. Four branches, named explicitly on each test — bytes
+    // readable and unparseable (refuse), bytes readable and well-formed
+    // (accept, narrow path still fires), bytes unreadable from CAS
+    // (accept, logged), and an unrecognised media type (never reaches
+    // the door at all — the generic scanned path).
+    // ----------------------------------------------------------------
+
+    const COSIGN_SIMPLESIGNING_MEDIA_TYPE: &str =
+        "application/vnd.dev.cosign.simplesigning.v1+json";
+
+    /// Bytes that are **well-formed** as a Sigstore v0.3 bundle: the
+    /// structural members the door requires, and nothing more.
+    ///
+    /// Deliberately not a *valid* signature. The door checks shape, never
+    /// validity — a test that wired a real signature in here would be
+    /// asserting the verify path's job on the push path, which is precisely
+    /// the thing the door must not start doing. `hint` varies the bytes so
+    /// two layers of one manifest get two different CAS hashes.
+    fn well_formed_bundle_bytes(hint: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "verificationMaterial": { "publicKey": { "hint": hint } },
+            "dsseEnvelope": {
+                "payload": "e30=",
+                "payloadType": "application/vnd.in-toto+json",
+                "signatures": [ { "sig": "AA==" } ],
+            },
+        }))
+        .unwrap()
+    }
+
+    /// Bytes that are **well-formed** as a cosign `simplesigning` payload:
+    /// the one field the keyed verifier binds. Same shape-not-validity rule
+    /// as [`well_formed_bundle_bytes`] — the digest is not even required to
+    /// name this push's subject, because a payload binding the wrong digest
+    /// is readable material whose binding fails, which is a finding for the
+    /// verify path and not a reason to refuse a push.
+    fn well_formed_simplesigning_bytes(digest_hex: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "critical": {
+                "identity": { "docker-reference": "example.com/app" },
+                "image": { "docker-manifest-digest": format!("sha256:{digest_hex}") },
+                "type": "cosign container image signature",
+            },
+            "optional": serde_json::Value::Null,
+        }))
+        .unwrap()
+    }
+
+    /// Read the `errors[0]` object out of an OCI error response body.
+    async fn error_envelope(resp: Response) -> serde_json::Value {
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        parsed["errors"][0].clone()
+    }
+
+    /// **Bytes readable and unparseable → REFUSE** (keyless carriage).
+    ///
+    /// A manifest declaring two Sigstore-bundle layers, the first a genuine
+    /// bundle and the second unparseable rubbish. The push is refused with
+    /// 400 `MANIFEST_INVALID` naming the SECOND layer — so the check runs
+    /// over every declared layer, not just the first — and nothing is
+    /// committed: no manifest artifact, no scan, no `oci_subject` row.
+    ///
+    /// `MANIFEST_INVALID` rather than the neighbouring
+    /// `MANIFEST_BLOB_UNKNOWN`: the blob is present and merely is not what
+    /// it claims, which is the manifest being invalid rather than a
+    /// reference being unsatisfiable. It is also the code this path already
+    /// answers for "declared media type does not match manifest shape" one
+    /// level up, in `check_declared_media_type_matches_shape`.
+    #[test]
+    fn put_signature_referrer_with_an_unparseable_bundle_layer_is_refused() {
+        let (status, envelope, scan_calls, minted, oci_subject_rows) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"sig-config-bytes");
+            let good_hash = seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &well_formed_bundle_bytes("key-a"),
+            );
+            let junk_hash = seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                b"not a sigstore bundle at all",
+            );
+            let subject_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"the-victim-image");
+            let body = build_referrer_manifest(
+                &config_hash,
+                &[
+                    (SIGSTORE_BUNDLE_MEDIA_TYPE, &good_hash),
+                    (SIGSTORE_BUNDLE_MEDIA_TYPE, &junk_hash),
+                ],
+                &subject_hash,
+                SIGSTORE_BUNDLE_MEDIA_TYPE,
+            );
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_request(
+                    "/v2/myrepo/library/nginx/manifests/sha256.sig",
+                    body,
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let envelope = error_envelope(resp).await;
+            let minted = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            let oci_subject_rows = h
+                .content_references
+                .find_by_target(repo_id, &subject_hash, Some("oci_subject"))
+                .await
+                .unwrap()
+                .len();
+            (
+                status,
+                envelope,
+                h.lifecycle.scan_enqueues().len(),
+                minted,
+                oci_subject_rows,
+            )
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(envelope["code"], "MANIFEST_INVALID");
+        assert_eq!(
+            envelope["detail"]["layer_digest"],
+            format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(b"not a sigstore bundle at all"))
+            ),
+            "the detail must name the offending layer digest — and it is the SECOND \
+             layer, so the check covers every declared layer"
+        );
+        assert_eq!(envelope["detail"]["media_type"], SIGSTORE_BUNDLE_MEDIA_TYPE);
+        assert!(
+            !minted,
+            "a refused push must leave no manifest artifact behind — the door runs \
+             before the mint"
+        );
+        assert_eq!(
+            scan_calls, 0,
+            "nothing was ingested, so nothing was scanned"
+        );
+        assert_eq!(
+            oci_subject_rows, 0,
+            "no content-reference edge may survive a refused push"
+        );
+    }
+
+    /// **Bytes readable and unparseable → REFUSE** (keyed carriage): the
+    /// same rule for a `simplesigning` layer whose blob is not a
+    /// simplesigning payload. The door's predicate here IS the keyed
+    /// verifier's readability test (`simplesigning_subject_digest`), so it
+    /// cannot refuse a payload that verifier could have read.
+    #[test]
+    fn put_signature_referrer_with_an_unparseable_simplesigning_layer_is_refused() {
+        let (status, envelope, minted) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"keyed-config-bytes");
+            let junk_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"{\"critical\":{}}");
+            let subject_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"keyed-victim-image");
+            let body = build_referrer_manifest(
+                &config_hash,
+                &[(COSIGN_SIMPLESIGNING_MEDIA_TYPE, &junk_hash)],
+                &subject_hash,
+                COSIGN_SIMPLESIGNING_MEDIA_TYPE,
+            );
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_request(
+                    "/v2/myrepo/library/nginx/manifests/sha256.sig",
+                    body,
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let envelope = error_envelope(resp).await;
+            let minted = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            (status, envelope, minted)
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(envelope["code"], "MANIFEST_INVALID");
+        assert_eq!(
+            envelope["detail"]["media_type"],
+            COSIGN_SIMPLESIGNING_MEDIA_TYPE
+        );
+        assert!(!minted, "a refused push leaves no manifest artifact behind");
+    }
+
+    /// **Bytes readable and well-formed → ACCEPT, and the narrow signature
+    /// path still fires** (keyed carriage): the keyed counterpart of test
+    /// (a). A genuine `simplesigning` payload is exempted exactly as before
+    /// the door existed — no scan enqueued, status `None`.
+    #[test]
+    fn put_pure_simplesigning_referrer_with_a_real_payload_is_still_exempted() {
+        let (status, scan_calls, artifact_status) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"keyed-config-bytes");
+            let subject_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"the-keyed-image");
+            let payload_hash = seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &well_formed_simplesigning_bytes(subject_hash.as_ref()),
+            );
+            let body = build_referrer_manifest(
+                &config_hash,
+                &[(COSIGN_SIMPLESIGNING_MEDIA_TYPE, &payload_hash)],
+                &subject_hash,
+                COSIGN_SIMPLESIGNING_MEDIA_TYPE,
+            );
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_request(
+                    "/v2/myrepo/library/nginx/manifests/sha256.sig",
+                    body,
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let artifact_status = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .await
+                .unwrap()
+                .map(|a| a.quarantine_status);
+            (status, h.lifecycle.scan_enqueues().len(), artifact_status)
+        });
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            scan_calls, 0,
+            "a pure keyed simplesigning referrer whose payload IS a simplesigning payload \
+             keeps the narrow path"
+        );
+        assert_eq!(artifact_status, Some(QuarantineStatus::None));
+    }
+
+    /// **Bytes unreadable from CAS → ACCEPT, logged.** Reference resolution
+    /// establishes a same-repo, non-terminal **row** per layer; it does not
+    /// establish that CAS holds the object. When the read behind a declared
+    /// layer fails, the push is accepted and the reason is logged — refusing
+    /// there would turn a storage fault into a client error the client cannot
+    /// act on, and the complementary rule (unreadable material contributes
+    /// nothing to a verdict) already covers the material itself.
+    #[test]
+    fn put_signature_referrer_with_unreadable_layer_bytes_is_accepted_and_logged() {
+        let ((status, scan_calls), records) = capture_tracing(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"sig-config-bytes");
+                // A row, but no CAS object behind it.
+                let bundle_hash = seed_blob_row_without_content(
+                    &h.artifacts,
+                    repo_id,
+                    b"bundle-bytes-that-storage-lost",
+                    QuarantineStatus::None,
+                );
+                let subject_hash =
+                    seed_blob(&h.artifacts, &h.storage, repo_id, b"the-signed-image");
+                let body = build_referrer_manifest(
+                    &config_hash,
+                    &[(SIGSTORE_BUNDLE_MEDIA_TYPE, &bundle_hash)],
+                    &subject_hash,
+                    SIGSTORE_BUNDLE_MEDIA_TYPE,
+                );
+
+                let router = router().with_state(h.ctx.clone());
+                let resp = router
+                    .oneshot(put_request(
+                        "/v2/myrepo/library/nginx/manifests/sha256.sig",
+                        body,
+                    ))
+                    .await
+                    .unwrap();
+                (resp.status(), h.lifecycle.scan_enqueues().len())
+            })
+        });
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "an unreadable layer must NOT refuse the push"
+        );
+        assert_eq!(
+            scan_calls, 0,
+            "the exemption still applies — the door asserts nothing about material it \
+             could not read"
+        );
+        let warned = events_at(
+            &records,
+            tracing::Level::WARN,
+            "hort_http_oci::manifests_write",
+        )
+        .iter()
+        .any(|e| {
+            e.fields.contains("could not be read at push time")
+                && e.fields.contains("the push is accepted")
+        });
+        assert!(
+            warned,
+            "the accepted-unreadable branch must say so in the log; captured: {records:?}"
+        );
+    }
+
+    /// **An unrecognised layer media type is NOT refused** — the forward
+    /// compatibility the whole shape rests on. A future bundle version
+    /// carrying a new media type fails both purity predicates, so such a
+    /// manifest is not a signature manifest at all: it takes the generic
+    /// ingest path and IS scanned. Its layer bytes are rubbish here and that
+    /// changes nothing, because the door is never consulted for a media type
+    /// it does not recognise.
+    #[test]
+    fn put_referrer_with_a_future_bundle_media_type_is_not_refused() {
+        let (status, scan_calls) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"future-config");
+            let blob_hash = seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                b"a v0.4 bundle this build cannot parse",
+            );
+            let subject_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"future-image");
+            let future_media_type = "application/vnd.dev.sigstore.bundle.v0.4+json";
+            let body = build_referrer_manifest(
+                &config_hash,
+                &[(future_media_type, &blob_hash)],
+                &subject_hash,
+                future_media_type,
+            );
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_request(
+                    "/v2/myrepo/library/nginx/manifests/sha256.sig",
+                    body,
+                ))
+                .await
+                .unwrap();
+            (resp.status(), h.lifecycle.scan_enqueues().len())
+        });
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a future bundle media type must not be refused — it is simply not treated \
+             as a signature"
+        );
+        assert_eq!(
+            scan_calls, 1,
+            "and because it is not treated as a signature it takes the generic scanned path"
+        );
+    }
+
+    /// The door is gated on a COMPLETE reference resolution, so a signature
+    /// manifest with a layer this repository does not hold keeps its
+    /// established answer — the post-mint 400 `MANIFEST_BLOB_UNKNOWN` — and
+    /// does not acquire a second one. There are no bytes of ours behind that
+    /// layer to parse, so there is nothing for the door to say.
+    #[test]
+    fn put_signature_referrer_with_an_unresolvable_layer_keeps_the_blob_unknown_answer() {
+        let (status, envelope) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"sig-config-bytes");
+            let subject_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"the-signed-image");
+            // Never seeded at all: no row, no CAS object.
+            let absent_hash: ContentHash = hex::encode(Sha256::digest(b"never-pushed-bundle"))
+                .parse()
+                .unwrap();
+            let body = build_referrer_manifest(
+                &config_hash,
+                &[(SIGSTORE_BUNDLE_MEDIA_TYPE, &absent_hash)],
+                &subject_hash,
+                SIGSTORE_BUNDLE_MEDIA_TYPE,
+            );
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_request(
+                    "/v2/myrepo/library/nginx/manifests/sha256.sig",
+                    body,
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, error_envelope(resp).await)
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            envelope["code"], "MANIFEST_BLOB_UNKNOWN",
+            "an unresolvable layer is still answered as an unsatisfiable reference, not \
+             as a misdeclared shape"
         );
     }
 

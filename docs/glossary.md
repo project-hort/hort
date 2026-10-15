@@ -83,6 +83,32 @@ has been cut whose commit is confirmed (`git merge-base --is-ancestor`) to
 contain the issue's merge — not merely once some alpha exists. See
 [UAT](#uat) and [ADR 0048](adr/0048-release-branch-staging-strategy.md) D5.
 
+### Indeterminate provenance
+
+A provenance verdict that **could not be carried out** — the trust root
+held no usable key, the attestation material was never obtained, or a
+dispatched verifier returned no verdict
+(`ProvenanceOutcome::Indeterminate`, with one `IndeterminateReason` per
+cause). Nothing about the artifact was established, so nothing was
+disproved and nothing may terminalise: under `provenanceMode: required`
+the artifact is **held** `Quarantined` (reported `held_indeterminate`),
+and under the permissive modes it runs its normal window and releases
+(reported `allowed_indeterminate`). The failure is on *hort's* side,
+which is the whole reason the state exists — a publisher's artifact must
+not go terminal because an operator misprovisioned a key or a network
+call failed. See [ADR 0039](adr/0039-keyed-provenance-verification.md)'s
+2026-10-14 amendment, D9/D11.
+
+**It is not `ScanIndeterminate`, and the two must not be read as a pair.**
+Different axis (provenance vs. scan), different verdict: an indeterminate
+*provenance* verdict is a hold and is **never** terminal, while
+`ScanIndeterminate` is one of the two [terminal](#terminal-quarantine-status)
+quarantine statuses, whose exit is a deliberate act. Neither implies the
+other, and an artifact can be in one, both, or neither. The `held_` /
+`allowed_` prefixes on the provenance reporting values are what keep the
+two apart in an operator's dashboard; the shared word is an accident of
+English, not a shared concept.
+
 ### Manual release
 
 An `ArtifactReleased` a human authorized — `released_by ∈ {Admin, Curator}` —
@@ -224,7 +250,9 @@ Said of an artifact whose lifecycle has concluded against delivery:
 exit from either is a deliberate act — an admin override, a policy loosen
 that re-judges the stored findings, a re-scan — never the passage of time.
 `Quarantined` is the contrast and is **not** terminal, even when its hold
-has no self-resolving deadline (an artifact awaiting a signature): its
+has no self-resolving deadline (an artifact awaiting a signature, or one
+whose provenance check hort could not carry out — see
+[indeterminate provenance](#indeterminate-provenance)): its
 evaluation is still outstanding. The distinction decides whether a
 referenced blob counts as present on a manifest PUT and whether a manifest
 stays deliverable. **Absence** is a third thing again: content with no

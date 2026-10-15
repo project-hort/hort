@@ -1501,6 +1501,10 @@ impl Artifact {
     ///   allowed-unsigned no-op. The two are indistinguishable *here*
     ///   because the state transition is the same one; the application
     ///   layer separates them for reporting.
+    /// - [`ProvenanceOutcome::Indeterminate`] (the check could not be
+    ///   carried out) → the **same** answer as `NoAttestation`, for a
+    ///   stronger reason: no event, status unchanged, in every mode. See
+    ///   *Why a check that could not run is never terminal* below.
     ///
     /// # Why an unsigned artifact is never terminally rejected
     ///
@@ -1531,12 +1535,44 @@ impl Artifact {
     /// regardless of shape, the enumeration is gone rather than extended —
     /// see ADR 0039's 2026-09-12 amendment, D1/D3.
     ///
-    /// Only a **positive disproof** — a signature that is *present* and
-    /// invalid (untrusted key, digest mismatch, broken chain, malformed
-    /// bundle) — is a statement about the artifact, equally wrong at every
+    /// Only a **positive disproof** — a signature that is *present*,
+    /// *readable* and invalid (untrusted key, digest mismatch, broken
+    /// chain) — is a statement about the artifact, equally wrong at every
     /// later moment. That, and only that, is terminal, and it is terminal
     /// on every shape: subject, constituent and descendant alike, and
     /// immediately, even mid-window.
+    ///
+    /// `BundleMalformed` is deliberately absent from that list, and the
+    /// distinction is between the domain and the system: handed a
+    /// `Rejected(BundleMalformed)` this method still terminalises, because
+    /// the domain's job is to apply the verdict it is given. No producer
+    /// states it any more. Unreadable bytes are not a signature whose
+    /// validity can be judged — nothing was proved, so nothing is
+    /// condemned — and the verifiers skip them. See ADR 0039's 2026-10-14
+    /// amendment, D10.
+    ///
+    /// # Why a check that could not run is never terminal
+    ///
+    /// [`ProvenanceOutcome::Indeterminate`] is the third answer the axis
+    /// needs, and it is the argument above carried one step further. An
+    /// unsigned artifact at least has a fact recorded about it — no
+    /// signature had arrived. An indeterminate verdict records nothing
+    /// about the artifact at all: the failure is on **our** side (a trust
+    /// root with no usable key, attestation material we could never
+    /// fetch), so the publisher's artifact is not implicated and there is
+    /// nothing for a terminal state to assert. A misprovisioned key would
+    /// otherwise terminalise every artifact it touched, and the operator
+    /// who fixed the key would find a fleet of unrecoverable rows behind
+    /// it.
+    ///
+    /// Its arm is therefore byte-identical to the `NoAttestation` arm —
+    /// `Ok(Vec::new())`, no status write — and kept as its own arm rather
+    /// than folded into an or-pattern, because the two hold for different
+    /// reasons and a reader needs both. The mode is not consulted in
+    /// either: emitting nothing *is* the hold under `Required` (the
+    /// release gate reads the absent `ProvenanceVerified` as
+    /// [`ProvenanceClearance::Pending`]) and the no-op under
+    /// `VerifyIfPresent` / `Off`.
     ///
     /// # Why the rejection arm appends two events
     ///
@@ -1622,6 +1658,14 @@ impl Artifact {
             // no-op under `VerifyIfPresent` / `Off`. Same transition (none)
             // either way, so the mode is not consulted at all.
             ProvenanceOutcome::NoAttestation => Ok(Vec::new()),
+            // The check could not be carried out. Nothing about the
+            // artifact was established, so nothing was disproved and
+            // nothing may terminalise: the same (absent) transition as the
+            // unsigned hold, for a stronger reason — the failure is ours,
+            // not the publisher's. Deliberately NOT merged into the arm
+            // above: the two hold for different reasons, and a reader who
+            // sees only one of them learns the wrong rule.
+            ProvenanceOutcome::Indeterminate(_) => Ok(Vec::new()),
         }
     }
 
@@ -2209,7 +2253,7 @@ mod tests {
     use super::*;
 
     use crate::entities::scan_policy::ProvenanceMode;
-    use crate::ports::provenance::ProvenanceRejectReason;
+    use crate::ports::provenance::{IndeterminateReason, ProvenanceRejectReason};
 
     // -- QuarantineStatus ---------------------------------------------------
 
@@ -4119,6 +4163,7 @@ mod tests {
             ProvenanceRejectReason::RekorNotFound,
             ProvenanceRejectReason::CertChainInvalid,
             ProvenanceRejectReason::BundleMalformed,
+            ProvenanceRejectReason::DigestMismatch,
         ];
         for reason in reasons {
             let mut a = quarantined_artifact();
@@ -4237,6 +4282,139 @@ mod tests {
         }
     }
 
+    /// **The state this unit adds.** A verdict that could not be reached
+    /// — no usable trust-root key, attestation material that could never
+    /// be fetched, a verifier that returned no verdict — is HELD, never
+    /// rejected, over every [`IndeterminateReason`] and in every mode.
+    ///
+    /// This is D4 applied to the case where **nobody's material is at
+    /// fault**: the failure is on our side, so nothing about the artifact
+    /// was established and there is nothing for a terminal state to
+    /// assert. A misprovisioned trust root would otherwise terminalise
+    /// every artifact it touched, leaving the operator who fixed the key
+    /// with a fleet of unrecoverable rows behind it.
+    #[test]
+    fn complete_provenance_indeterminate_always_holds_never_terminalises() {
+        for reason in [
+            IndeterminateReason::AttestationFetchFailed,
+            IndeterminateReason::TrustRootUnusable,
+            IndeterminateReason::VerifierUnavailable,
+        ] {
+            for mode in [
+                ProvenanceMode::Required,
+                ProvenanceMode::VerifyIfPresent,
+                ProvenanceMode::Off,
+            ] {
+                // As with the unsigned hold, `mode` is not an input — the
+                // transition is the same (none) in all three. Looping over
+                // it pins exactly that: there is no mode in which a check
+                // we could not run terminalises.
+                let mut a = quarantined_artifact();
+                let events = a
+                    .complete_provenance(ProvenanceVerdict::indeterminate(reason), "cosign")
+                    .expect("Ok");
+                assert!(
+                    events.is_empty(),
+                    "{reason:?}/{mode:?}: an unreachable verdict must emit no event"
+                );
+                assert_eq!(
+                    a.quarantine_status,
+                    QuarantineStatus::Quarantined,
+                    "{reason:?}/{mode:?}: the artifact stays Quarantined — under Required \
+                     the release gate reads that as Pending (fail-closed, 503, held)"
+                );
+                assert_eq!(
+                    a.rejection_reason, None,
+                    "{reason:?}/{mode:?}: a hold is never a rejection"
+                );
+            }
+
+            // Idempotent across repeated verifies, for the same reason the
+            // unsigned hold is: a retry of the failed check must not
+            // terminalise what the first attempt held.
+            let mut a = quarantined_artifact();
+            for attempt in 1..=3 {
+                let events = a
+                    .complete_provenance(ProvenanceVerdict::indeterminate(reason), "cosign")
+                    .expect("Ok");
+                assert!(events.is_empty(), "{reason:?} attempt {attempt}");
+                assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+            }
+        }
+    }
+
+    /// All four outcome shapes in one place: what each one answers, and
+    /// that the two held shapes answer **identically**.
+    ///
+    /// The identity is the property, not a coincidence of two arms that
+    /// happen to agree today: `Indeterminate` holds because nothing was
+    /// established and `NoAttestation` holds because nothing had arrived
+    /// yet, and if the two ever produced different state the release gate
+    /// would read one of them as something other than `Pending`.
+    #[test]
+    fn complete_provenance_answers_every_outcome_shape() {
+        // Verified — one event, status untouched (a success record that
+        // does NOT release early).
+        let mut verified = quarantined_artifact();
+        let events = verified
+            .complete_provenance(
+                ProvenanceVerdict::verified(
+                    SignerIdentity {
+                        issuer: "https://token.actions.githubusercontent.com".into(),
+                        san: "https://github.com/acme/repo/.github/workflows/r.yml@refs/heads/main"
+                            .into(),
+                    },
+                    None,
+                ),
+                "cosign",
+            )
+            .expect("Ok");
+        assert!(matches!(
+            events.as_slice(),
+            [DomainEvent::ProvenanceVerified(_)]
+        ));
+        assert_eq!(verified.quarantine_status, QuarantineStatus::Quarantined);
+
+        // Rejected — two events, terminal.
+        let mut rejected = quarantined_artifact();
+        let events = rejected
+            .complete_provenance(
+                ProvenanceVerdict::rejected(ProvenanceRejectReason::DigestMismatch),
+                "cosign",
+            )
+            .expect("Ok");
+        assert!(matches!(
+            events.as_slice(),
+            [
+                DomainEvent::ProvenanceRejected(_),
+                DomainEvent::ArtifactRejected(_)
+            ]
+        ));
+        assert_eq!(rejected.quarantine_status, QuarantineStatus::Rejected);
+
+        // The two held shapes — no event, no status write, and the same
+        // answer as each other.
+        let mut unsigned = quarantined_artifact();
+        let unsigned_events = unsigned
+            .complete_provenance(ProvenanceVerdict::no_attestation(), "cosign")
+            .expect("Ok");
+        let mut unchecked = quarantined_artifact();
+        let unchecked_events = unchecked
+            .complete_provenance(
+                ProvenanceVerdict::indeterminate(IndeterminateReason::TrustRootUnusable),
+                "cosign",
+            )
+            .expect("Ok");
+        assert!(unsigned_events.is_empty());
+        assert_eq!(
+            unsigned_events, unchecked_events,
+            "the two held shapes must emit the same (empty) batch"
+        );
+        assert_eq!(unsigned.quarantine_status, unchecked.quarantine_status);
+        assert_eq!(unsigned.rejection_reason, unchecked.rejection_reason);
+        assert_eq!(unchecked.quarantine_status, QuarantineStatus::Quarantined);
+    }
+
     /// The hold covers a MISSING attestation and nothing else. A forged /
     /// untrusted / digest-mismatch signature is *position*-independent (a
     /// forged signature on a layer blob is still forged) and
@@ -4250,7 +4428,11 @@ mod tests {
         for reason in [
             ProvenanceRejectReason::UntrustedIdentity,
             ProvenanceRejectReason::CertChainInvalid,
+            // A corrupt upload and a re-tag attack are the same variant's
+            // two halves until the producers part company; the ENTITY
+            // terminalises both, and this unit does not change that.
             ProvenanceRejectReason::BundleMalformed,
+            ProvenanceRejectReason::DigestMismatch,
             ProvenanceRejectReason::RekorNotFound,
         ] {
             // The entity is shape-blind now, so "every shape" is expressed

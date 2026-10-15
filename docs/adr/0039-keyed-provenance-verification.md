@@ -32,6 +32,21 @@
   `TerminalRejectionRecord::CorruptionTombstone` survives that fix, because
   the event store is append-only: tombstones written before it still carry
   `ArtifactCorrupted` alone and must stay unrepairable.
+- **The 2026-10-14 amendment is enforced**, as of the six changes that
+  landed with it. D9–D13 are in the code: the domain carries
+  `ProvenanceOutcome::Indeterminate` and holds on it
+  (`Artifact::complete_provenance`); the keyless verifier *skips* every
+  candidate it cannot read rather than rejecting it (`Fold::observe` /
+  `BundleVerify::Unreadable`, `classify_verification_error`);
+  `InclusionError::side` sorts the ten inclusion failures into one
+  disproof, two faults in our own trust root and seven that proved
+  nothing; the keyed verifier's digest-binding failure states
+  `ProvenanceRejectReason::DigestMismatch`; the orchestration mints **no**
+  reject reason at all (`apply_fetch_failure`, `dispatch_and_fold`); the
+  push path refuses a declared signature layer whose bytes are not the
+  shape its media type claims (`refuse_misdeclared_signature_layers`);
+  and the worker has a **second** boot refusal, for a trust root that
+  cannot build an offline verifier at all (`ensure_builds_verifier`).
 
 ## Context
 
@@ -126,6 +141,11 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
    never terminal — see the 2026-09-12 amendment below, which replaces the
    earlier `Unsigned`-at-expiry rejection); present but signature-invalid,
    wrong-key, **or digest-mismatch** → `Rejected`. The path touches no network.
+   The digest-mismatch case has a reject reason of its own —
+   `ProvenanceRejectReason::DigestMismatch`, added by the 2026-10-14
+   amendment (D9); it shared `BundleMalformed` with a structurally broken
+   upload until then, so the audit record could not tell a re-tag attack
+   from a corrupt push.
 
 3. **Trust material is a pinned public key, parallel to `trusted_root.json`.**
    A boot-provisioned public key or key *set*
@@ -190,7 +210,14 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
    on each OCI artifact. In practice an artifact carries one signature shape, so the
    matching backend decides and the other `NoAttestation`s; the OR is **benign** — a
    keyed signature **requires the operator's pinned key** (unforgeable), so accepting
-   it alongside keyless is not a downgrade. To run a **single** backend strictly,
+   it alongside keyless is not a downgrade.
+   **"In practice" was the weak part of that**, and the 2026-10-14
+   amendment (D12) replaces it: anyone with write access to the referrer
+   surface could make an artifact carry a second "shape" by attaching
+   bytes that read as neither, and the fold carried that over a real
+   signature. Unreadable material now contributes no verdict at all, so
+   the never-a-false-reject promise is **held** rather than assumed.
+   To run a **single** backend strictly,
    configure only that verifier on the worker (the keyless trust root XOR the keyed
    key file). The remaining single-verifier simplification is the metric label —
    `backend` names the verifier that decided the folded verdict (A2.4).
@@ -255,6 +282,17 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
    payload path); the keyless verifier ignores `signature` and parses `bytes` as a
    v0.3 bundle. One bundle list thus carries every shape and each verifier
    self-selects (§6).
+
+   **Both media types now have a push-time shape check behind them.** The
+   quarantine exemption for a pure signature manifest (ADR 0027 §7,
+   extended to the keyed `simplesigning` carriage here) keys on the
+   *declared* layer media types, which the pusher controls. The 2026-10-14
+   amendment (D12) adds `refuse_misdeclared_signature_layers`: on a
+   manifest that takes the exemption, each declared layer's blob must
+   parse as the shape it was declared as. It **narrows** the exemption and
+   touches nothing else — the "every layer must be signature material"
+   anti-scan-evasion rule is unchanged, and a mixed manifest still fails
+   the purity predicates and still takes the generic scanned path.
 
 9. **Keyed hosted signing requires OCI referrers mode.** The keyed carriage
    (§8) collects a keyed signature from a subject-linked **referrer** manifest —
@@ -956,9 +994,15 @@ a signature that, until now, it would let nobody else check.
   `ProvenanceVerified` exists on the stream; `Pending` is still the
   fail-closed reading; the scan, curation and window conjuncts are untouched.
   No release authority is added or widened.
-- **Positive disproof.** A forged, wrong-key, digest-mismatched or malformed
-  signature still rejects terminally, on every shape — subject, constituent,
+- **Positive disproof.** A forged, wrong-key or digest-mismatched signature
+  still rejects terminally, on every shape — subject, constituent,
   descendant alike (§11's existing wording on that point stands verbatim).
+  *(Amended 2026-10-14, D10: this list read "forged, wrong-key,
+  digest-mismatched or **malformed**". Three of the four stand verbatim.
+  **Malformed leaves** — not because a malformed signature is held
+  instead, but because unreadable bytes are not a signature whose
+  validity can be judged at all. See D10 below, which records the
+  declined reading as well as the accepted one.)*
 - **The §11 cascade and both its triggers**, including the
   both-ends-trigger principle (§12). The amendment *widens* the population
   the cascade is guaranteed to find in `Quarantined`: under D1 a subject can
@@ -969,6 +1013,367 @@ a signature that, until now, it would let nobody else check.
   only configuration effect is subtractive — the observation window stops
   influencing the provenance axis (D5), which narrows, not widens, what an
   operator setting can reach.
+
+## Amendment (2026-10-14) — only readable material from which something was proved can condemn an artifact
+
+**The rule in one sentence.**
+
+> Only **readable material from which something was actually proved** can
+> condemn an artifact.
+
+**What this amendment is.** D4 above reserved terminality for a *positive
+disproof* and then named one by example — *"a signature that is present
+and invalid, forged, signed by an untrusted key, or bound to a different
+digest"*. That is a list of four causes, and a list is not a property.
+**Four** kinds of failure fell outside it and terminalised anyway:
+material a verifier could not **read**; a trust root of ours with no
+usable key; material we never **obtained** at all; and a dispatched
+verifier that returned **no verdict**. The first produces no verdict of
+its own; the other three hold. This amendment replaces the list with the
+property, and records where each of the other answers goes instead. It
+introduces no new concept: it is D4 applied in the places D4 was written
+for and not yet followed.
+
+The decisions continue the **D-series** (D9 onward) rather than restarting
+at D1, so a cross-reference reading "ADR 0039 D11" stays unambiguous
+against the twelve numbered points of the *Decision* section and the
+D1–D8 of the 2026-09-12 amendment above.
+
+### D9 — one rule, four rows
+
+| the failure is about | verdict |
+|---|---|
+| readable material that failed — forged, wrong key, wrong digest, broken chain, failed inclusion proof | **terminal rejection** |
+| material that could not be read | **no verdict at all**: refused at push, and skipped if it got in anyway |
+| our own ability to check — an unusable trust root (no matching Rekor key, unparseable key bytes, no Fulcio certs), material never fetched, or a dispatched verifier that returned no verdict | **hold** |
+| no attestation at all | **hold** under `Required` (D1, unchanged) |
+
+Rows two and three needed vocabulary the axis did not have, and the
+vocabulary is where the rule is enforced:
+
+- `ProvenanceOutcome::Indeterminate(IndeterminateReason)` is row three.
+  Its arm in `Artifact::complete_provenance` is byte-identical to the
+  `NoAttestation` arm — `Ok(Vec::new())`, no event, no status write — so
+  `Required` holds (the release gate reads the absent `ProvenanceVerified`
+  as `Pending`) and `VerifyIfPresent` / `Off` run the normal window.
+  There is deliberately **no** `From<IndeterminateReason> for
+  ProvenanceRejectReason`: `ProvenanceOutcome::Rejected` does not accept
+  an indeterminate reason, so "we could not check" cannot be spelled as
+  "proved bad" at all. That is a compile error rather than a review
+  check, which is why no source-scan guard accompanies it — a grep guard
+  on top would imply the compile-time property were insufficient, and the
+  next reader would reasonably trust the weaker of the two.
+- Row two is the **absence** of an outcome, not a new one. A candidate a
+  verifier cannot read is `continue`d in the same loop position as a
+  candidate belonging to the other backend: it never becomes a reason,
+  never folds, and if nothing else in the set was readable the verifier
+  answers `NoAttestation` — *"I have nothing to say about this
+  artifact"*. This is the one case in the amendment that **removes**
+  code: four read gates in the keyless verifier's `verify_one`, the
+  unreadable arms of `classify_verification_error`, and the keyed
+  verifier's undecodable-payload / non-DER-signature outcomes all stopped
+  producing a verdict (`Fold::observe` → `BundleVerify::Unreadable`).
+- Row one gained one word it was missing: `DigestMismatch` (§2). The keyed
+  verifier's digest-binding failure — the re-tag attack, the strongest
+  disproof the pipeline can state — shared `BundleMalformed` with a
+  corrupt upload, so separating the attack from the garbage was not
+  expressible. Without the new reason, row two could not take the garbage
+  without taking the attack with it.
+
+**Skipping is not silence.** A skipped candidate is counted and surfaced:
+`ProvenanceVerdict::unreadable_skipped`, summed across verifiers by
+`fold_two_backend`, reaches the job row's `result_summary`
+(`"unreadable_skipped": <n>`, absent rather than `0` on an ordinary row),
+`hort_provenance_unreadable_skipped_total{backend}`, and a `warn!` —
+deliberately `warn!` and not the verdict lines' `info!`, because
+unreadable material is either a broken publisher pipeline or someone
+writing junk to the referrer surface and neither should need a log level
+raised to be seen. The
+rule is *not considered*, not *not noticed*: without the count, a
+publisher whose own signature material is broken would see only
+"unsigned", and an operator would never learn that someone had attached
+garbage to an image.
+
+**Why ignoring garbage is not laxity.** Hort still refuses to serve an
+artifact with no valid attestation under `Required`. Discarding unreadable
+material therefore produces the **unsigned hold** — `Quarantined`, 503,
+`Pending` at the release gate, indefinitely (D4) — and never a release. The
+only thing the change takes away is the attacker's ability to turn that
+hold into a terminal state on somebody else's artifact.
+
+### D10 — "malformed" leaves the positive-disproof list, and the argument is the second one, not the first
+
+The 2026-09-12 amendment's closing section listed *"a forged, wrong-key,
+digest-mismatched or **malformed** signature"* as positive disproof.
+Three of the four stand verbatim. **Malformed leaves** — and the reason
+has to be stated precisely, because the first version of the argument was
+proposed and **declined** before a different one was accepted (issue
+#350, 2026-10-14, over three exchanges):
+
+- **Declined: "a malformed signature is held instead of rejected."**
+  Tolerating garbage is not Hort's job, and a hold is a statement that
+  evidence may still arrive — which says something about material that is
+  already in hand and already unusable. The maintainer rejected this
+  reading.
+- **Accepted: unreadable bytes are not a signature whose validity can be
+  judged at all.** There is nothing there to prove or disprove, so the
+  material does not enter the evaluation: it is refused at the door
+  (D12), and ignored if it got in by another route. The artifact's verdict
+  then stands on whatever *was* readable, and on nothing if nothing was.
+
+Both readings are recorded because they produce different code. A future
+reader who sees only the conclusion — "malformed is not terminal" — will
+re-propose the declined one, and arrive at a fourth hold reason, a
+`Retry-After` question, and an operator-facing state that says "waiting"
+about bytes nothing will ever be able to read. The accepted reading adds
+no state at all.
+
+### D11 — the third row is one category with three distinct causes
+
+`IndeterminateReason` has three variants rather than one reused value,
+and the distinction is the reason:
+
+- `TrustRootUnusable` — **our provisioning**. No Rekor key in the trust
+  root matches the entry's log id, our own key bytes did not parse, or the
+  root carries no Fulcio certs / CTFE keys and so cannot build an offline
+  verifier at all.
+- `AttestationFetchFailed` — **the material was never obtained**. The
+  bundle fetch or the CAS read behind it exhausted its retries. The
+  bundle may be present and perfectly valid; we never saw it.
+- `VerifierUnavailable` — **the verifier returned no verdict**. The
+  material was fetched and handed over; the check is what did not work.
+  It is the *category* where the other two are causes: an adapter `Err`
+  is reachable from several of them and the orchestration holds a
+  `DomainError` and nothing more, so naming either neighbour would assert
+  a cause out of several.
+
+Collapsing them would make the operator-facing hold less specific than
+the code can be — each names a different thing to go and fix — while
+collapsing them into the *unsigned* hold would be worse than imprecise:
+an all-verifiers-errored run would report `held_pending_signature` and
+send the operator to the publisher's signer for a fault of ours. The
+three share one reporting pair (`held_indeterminate` under `Required`,
+`allowed_indeterminate` otherwise) because the operator's **first**
+question — whose side is this on — has one answer for all three.
+
+**Two of `TrustRootUnusable`'s three causes are caught at boot, and there
+are now two refusals rather than one.** `hort-worker`'s composition
+asserts a non-empty Rekor key map and — added here, symmetrically —
+`CachedTrustRoot::ensure_builds_verifier`, which probes `Verifier::new`
+itself rather than counting certificates so it cannot drift from what the
+verify path requires. Converting the verdict from a rejection to a hold
+makes both assertions *more* necessary, not less: a scope-wide stall with
+nothing terminal to point at is harder to notice than the wave of
+rejections it replaced. The third cause is only reachable at runtime — a
+root that carries Rekor keys but none matching *this* entry's log id — so
+the runtime arms stay the defence rather than the design.
+
+### D12 — §6's "never a false-reject" is now held rather than assumed
+
+§6 promises that the OR-fold *"never false-rejects"* and rests it on
+*"In practice an artifact carries one signature shape"*. That premise was
+an observation about well-behaved publishers, and the promise was false
+in one reachable case: a caller with **write access only** could attach
+bytes declared as a Sigstore bundle to someone else's validly
+keyed-signed image. The keyless verifier read them as neither shape,
+rejected them `BundleMalformed`, and `fold_two`'s `Rejected ⊳ Verified`
+carried that over the publisher's real signature — terminally, on an
+artifact nobody had disproved anything about. §6's own parenthetical
+shows the hazard had been met once already: the `signature.is_some()`
+skip fixed it for a well-formed *keyed* bundle and left the case of bytes
+that read as neither.
+
+The clearest statement of the whole change is the inconsistency it
+removed. **Inside** one verifier, a verified bundle already beat an
+unreadable sibling: `verify_bundles` returns on the first candidate that
+verifies and skips candidates that are not its shape. **Across** two
+verifiers, the unreadable sibling won. The two folds now agree, and they
+agree because the unreadable candidate stopped being evidence in both.
+
+**The door.** Where the garbage can be kept out, it is:
+`refuse_misdeclared_signature_layers` runs before the mint on a pushed
+manifest that takes the quarantine exemption, and refuses it 400
+`MANIFEST_INVALID` — naming the offending layer digest and the media type
+it declared — when a declared layer's blob does not parse as the shape it
+claims (`SignatureCarriage::accepts`, which defers to
+`is_well_formed_sigstore_bundle` / `simplesigning_subject_digest`).
+**Shape, never validity:** whether a signature is *valid* needs the trust
+root and the subject's bytes and stays in the verifier adapters, which
+this crate cannot even depend on (ADR 0008). A door that verified would
+be both wrong — a signature can be well-formed and untrusted, which is a
+verdict about the subject — and a denial-of-service surface on the write
+path.
+
+**Scope the door's claim narrowly, because it is not total.** What holds
+is: *every pushed manifest that took the exemption with all of its
+declared layers resolved in this repository has had those layers'
+bytes shape-checked, unless the bytes could not be read at push time.*
+It is **not** "every signature layer in the registry was checked at
+push". Four things fall outside it, all deliberate, and row two of D9 is
+what covers them:
+
+- A manifest with **no `subject.digest`**, or with any layer that is not
+  recognised signature material, never enters the exemption and never
+  reaches the door — it takes the generic ingest path and is scanned and
+  quarantined like any other content. This is also what keeps the door
+  forward-compatible: a future bundle version with a new media type is
+  not refused, it simply is not treated as a signature.
+- **Unreadable bytes are accepted.** The push resolves each referenced
+  blob to a same-repo, non-terminal **row**; a row can exist while CAS
+  does not hold the object. Refusing there would turn a storage fault
+  into a client error the client cannot act on, so the read failure is
+  logged and the push proceeds.
+- A manifest with a declared layer that resolves to **no** same-repo
+  non-terminal row keeps its established answer — 400
+  `MANIFEST_BLOB_UNKNOWN`, with the mint committed so that
+  retry-after-pushing stays idempotent — and the door is not run on it.
+- **Referrers Hort lands itself from an upstream proxy** never come
+  through the push path at all.
+
+That is exactly why the maintainer asked for both rules on the issue
+rather than either: the door is the preferable answer where it reaches,
+and it does not reach everything.
+
+### D13 — the cross-domain precedent, read before it was cited
+
+The posture — *a broken signature counts as absent, never as evidence
+against the subject* — is the established one in two neighbouring
+domains. Both were stated from memory on the issue; both were read before
+this amendment cited them.
+
+**DKIM (RFC 6376) says it outright, twice.** §6.1: *"Survivability of
+signatures after transit is not guaranteed, and signatures can fail to
+verify through no fault of the Signer. Therefore, a Verifier SHOULD NOT
+treat a message that has one or more bad signatures and no good
+signatures differently from a message with no signature at all."* And
+§4.2: *"If a Verifier module reports signatures whose evaluations
+produced PERMFAIL results, Identity Assessors SHOULD ignore those
+signatures …, acting as though they were not present in the message"*,
+alongside *"a Verifier SHOULD evaluate signatures independently and on
+their own merits"* and *"Verifiers SHOULD continue to check signatures
+until a signature successfully verifies"* — which is also `verify_bundles`'
+first-verified-wins loop, arrived at independently. Note what RFC 6376
+gives as its *rationale*: transit fragility, not third-party planting
+(§4.1's multiple-Signers scenario is an intermediary that signs, not one
+that forges). The posture matches; the reason it is needed here is a
+different one, and D12 states it.
+
+**cosign does it in code.** `verifySignatures`
+(`sigstore/cosign`, `pkg/cosign/verify.go`, read 2026-10-14) verifies
+every attached signature, collects the ones that pass into
+`checkedSignatures`, and returns an error **only** when that slice is
+empty — `ErrNoMatchingSignatures` ("no matching signatures: …"), with the
+per-signature failures joined into the message. A broken signature beside
+a good one does not fail the verification. Where the analogy stops is
+worth recording: a set in which *every* signature fails is an **error**
+in cosign, because a verifier CLI has only pass and fail. Hort's third
+state is where that error goes — a hold, not a terminal rejection.
+
+**DNSSEC is the counter-example, and it is what makes this an argument
+rather than a preference.** There a broken signature is deliberately
+*worse* than none: RFC 4033 §5 defines **Bogus** as a response that
+*"fails to validate for some reason: missing signatures, expired
+signatures, signatures with unsupported algorithms …"* and signals it to
+stub resolvers as RCODE 2, server failure (RFC 4035 §3.2.2 makes that a
+`MUST` for a BAD-cache hit with CD unset), while **Insecure** and
+**Indeterminate** resolve normally. Hard failure is safe there because of
+an asymmetry Hort does not have: *"the key that signs a zone's data is
+associated with the zone itself"* (RFC 4033 §3.1), authenticated up the
+DS chain, so no third party can place a signature on a name they do not
+control, and the signed state is the owner's own commitment. The residual
+case — an on-path attacker mangling a response — costs the victim nothing
+they were not already losing, since that attacker holds the channel.
+In a registry neither half holds: the referrers surface is writable by
+any principal with write access to the repository, the attacker is a
+tenant rather than the channel, and the hard failure is a durable state
+written onto **somebody else's** artifact. Terminality on a broken
+signature is safe exactly while the signal can only come from the owner;
+it becomes a weapon the moment strangers can write.
+
+### ADR 0027's descriptive text, brought along
+
+ADR 0039 is not the only document that described the old behaviour. ADR
+0027 — the decision this one extends — carried five sentences this
+amendment falsifies, plus its verdict-mapping sentence. They are
+**downstream description, not a second decision**: the decision is this
+amendment, and those sentences are corrected in place. Quoted here so the
+change is legible from the record that owns it:
+
+- `0027` §1, on the boot contract: *"as is a trust root carrying no Rekor
+  public key (it would reject every bundle `RekorNotFound`)"*. There are
+  **two** such refusals now, and the parenthetical was false for both
+  halves even before the second existed: each root **holds** every bundle
+  rather than rejecting it, which is what makes the refusals more
+  important, not less.
+- `0027` §1: *"A bundle lacking offline-verifiable material is
+  `Rejected{BundleMalformed}`"*. It is skipped and produces no verdict.
+- `0027` §1, on Rekor inclusion: *"Any failure is fail-closed
+  `Rejected{RekorNotFound}` (never a panic, skip, or live fetch)"*. There
+  are three answers now, and absent or unparseable log material **is** a
+  skip. `InclusionError::side` sorts the enum's ten variants: one
+  disproof (`VerifyFailed`), two faults in our own trust root, seven that
+  proved nothing. The match is wildcard-free, so an eleventh variant must
+  be classified before it compiles.
+- `0027` §7, on the quarantine exemption: *"a forged 'bundle' is
+  verification-inert (it can only produce `Rejected`/`BundleMalformed`,
+  never `Verified`)"*. The **inertness claim survives and is stronger** —
+  it produces nothing at all rather than a rejection — but the
+  parenthetical named a verdict that now has **no producer anywhere in
+  the workspace**.
+- `0027` §4, on fetch exhaustion: *"Bundle-fetch exhaustion under
+  `Required` fail-closes (`Rejected{RekorNotFound}`); under
+  `VerifyIfPresent` it degrades to `NoAttestation` so infrastructure
+  flakiness never blocks a proxy"*. **Two** paths did this, not one — the
+  fetch exhaustion the sentence names and the verifier-error arm in
+  `dispatch_and_fold` — and the sentence's whole shape ("fail-closes
+  under one mode, degrades under the other") is wrong twice over: the
+  verdict is `Indeterminate` in **every** mode and the mode decides only
+  the consequence. **The fail-closed half still stands and is restated
+  rather than dropped:** no `ProvenanceVerified` means `Pending` at the
+  release gate, so a never-verified `Required` artifact still does not
+  timer-release. `ProvenanceRejectReason::RekorNotFound` now has **no
+  producer in `hort-app` at all**; its one remaining appearance there is
+  the metric label mapping, which still labels the verifier-produced
+  reason.
+- `0027` §3, the verdict mapping: *"`NoAttestation` is allowed under
+  `VerifyIfPresent` and maps to `ProvenanceRejected{Unsigned}` under
+  `Required`"*. The `Unsigned` half was already falsified by the
+  2026-09-12 amendment (D1) and the sentence had not caught up; the
+  mapping also needed the fourth outcome this amendment adds.
+
+### What this amendment (2026-10-14) does not change
+
+- **The release gate.** `ProvenanceClearance` still resolves `Cleared`
+  iff a `ProvenanceVerified` exists on the stream; `Pending` is still the
+  fail-closed reading; the scan, curation and window conjuncts are
+  untouched. No release authority is added or widened — the amendment
+  *removes* producers of a terminal state.
+- **Disproof stays terminal** on every shape — subject, constituent,
+  descendant alike — for the three remaining causes (D10), and
+  immediately, even mid-window.
+- **The push-path exemption** and its "every layer must be signature
+  material" anti-scan-evasion rule. D12 adds a shape check *inside* the
+  exemption; it does not widen it, and every manifest that was refused
+  before is still refused.
+- **D5 and `Retry-After`.** The new hold takes exactly the shape the
+  unsigned hold has; whether a hold with no self-resolving deadline
+  should carry the header at all is the open question on the
+  quarantine-deadline issue and is not answered here.
+- **The artifacts already terminal from one of these causes.** This
+  amendment stops the state arising; it runs no sweep and writes no
+  corrective event, which is a recorded decision rather than an
+  oversight. Note that `RepairProvenanceMisrejection` (D7) does **not**
+  reach them, and fails on a different conjunct depending on when the
+  rejection was written: one written after D6 landed carries its
+  `ArtifactRejected` companion and fails conjunct 2 (nothing terminal on
+  the stream), while an older one fails conjunct 3 — a fetch that never
+  landed or a trust root with no usable key leaves no `ProvenanceVerified`
+  to contradict the rejection, and repairing on the strength of the
+  rejection alone would release an artifact nothing has verified. Naming
+  and repairing that population is its own decision.
+- **ADR 0016 is not triggered.** No operator opt-in is added and no new
+  input reaches the release-gate computation. The one new input read
+  anywhere here is a pushed layer's own bytes, read to refuse a push.
 
 ## Alternatives considered
 
@@ -1012,7 +1417,14 @@ a signature that, until now, it would let nobody else check.
   (default `["cosign"]`), `provenance_identities`, `ProvenanceMode`, and the
   fail-closed validation guards the linter extends.
 - `crates/hort-domain/src/ports/provenance.rs` — `ProvenancePort`, the
-  abstraction the `cosign-key` adapter implements.
+  abstraction the `cosign-key` adapter implements; `ProvenanceOutcome`
+  (four shapes, matched wildcard-free by every consumer),
+  `ProvenanceRejectReason` (*"a finding about material it could read"* —
+  including `DigestMismatch`, §2) and `IndeterminateReason` (*"our side"*)
+  — the two reason types the 2026-10-14 amendment keeps separate, with no
+  conversion between them (D9); and
+  `ProvenanceVerdict::unreadable_skipped`, the count that makes a skip
+  reportable rather than silent.
 - `crates/hort-adapters-provenance-sigstore/src/{verifier.rs,lib.rs}` — the
   subject-digest binding (`## Digest binding`, the `sha256(payload) ==
   content_hash` invariant) the keyed verifier mirrors for step 2.2.
@@ -1021,6 +1433,32 @@ a signature that, until now, it would let nobody else check.
   v3 keyed Sigstore v0.3 bundle (bare `publicKey`, DSSE envelope) into the PAE
   signing input + raw signature + in-toto subject digest (§8), and the
   keyed/keyless discriminator (no Fulcio cert ⟺ keyed).
+- `crates/hort-adapters-provenance-sigstore/src/inclusion.rs` —
+  `InclusionError` and `InclusionError::side`, the wildcard-free
+  classification of the ten offline-inclusion failures into one disproof,
+  two faults in our own trust root and seven that proved nothing (D9/D11);
+  `crates/hort-adapters-provenance-sigstore/src/verifier.rs`'s
+  `inclusion_outcome` is the translation into a per-candidate outcome, and
+  `Fold` / `BundleVerify::Unreadable` / `CandidateAnswer` are where an
+  unreadable candidate stops being evidence.
+- `crates/hort-domain/src/oci.rs` (`SignatureCarriage::accepts`,
+  `declared_signature_layers`), `crates/hort-domain/src/provenance_bundle.rs`
+  (`is_well_formed_sigstore_bundle`, `simplesigning_subject_digest`) and
+  `crates/hort-http-oci/src/manifests_write.rs`
+  (`refuse_misdeclared_signature_layers`, gated by
+  `is_pure_signature_manifest`) — the push-time shape check that narrows the
+  quarantine exemption (D12), and the one decision that both selects the
+  exempt ingest arm and gates the door.
+- `crates/hort-worker/src/composition.rs` — the **two** boot refusals for an
+  unusable trust root: a non-empty Rekor key map, and
+  `CachedTrustRoot::ensure_builds_verifier` (D11).
+- RFC 6376 §4.2 / §6.1 (DKIM: a bad signature is ignored *"acting as though
+  [it] were not present in the message"*), `sigstore/cosign`'s
+  `verifySignatures` in `pkg/cosign/verify.go` (an error only when no
+  signature passed), and RFC 4033 §3.1 / §5 with RFC 4035 §3.2.2 (DNSSEC's
+  **Bogus** → RCODE 2, the counter-example and why its asymmetry does not
+  hold in a registry) — the three external records D13 cites, read on
+  2026-10-14.
 - `crates/hort-app/src/use_cases/apply_config_use_case.rs` — the backend→format
   capability map (Tier-1 `{"oci"}` for cosign) and the fail-closed config lints
   to make backend-aware.

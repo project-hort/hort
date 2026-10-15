@@ -146,7 +146,9 @@ use hort_domain::entities::quarantine_transitions::{self, QuarantineEvent};
 use hort_domain::entities::scan_policy::{ProvenanceMode, SeverityThreshold};
 use hort_domain::events::{PolicyViolation, RejectionReason, ReleaseReason};
 use hort_domain::policy::ScanOutcome;
-use hort_domain::ports::provenance::{ProvenanceRejectReason, ProvenanceVerdict, SignerIdentity};
+use hort_domain::ports::provenance::{
+    IndeterminateReason, ProvenanceRejectReason, ProvenanceVerdict, SignerIdentity,
+};
 use hort_domain::types::ContentHash;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
@@ -303,6 +305,12 @@ enum Action {
     ProvenanceVerify,
     ProvenanceReject,
     ProvenanceNoAttestation,
+    // The verdict that could not be reached (no usable trust-root key,
+    // material we never fetched). A held arm like
+    // `ProvenanceNoAttestation`, and in the model for the same reason: a
+    // hold must never progress the lifecycle, whatever is interleaved
+    // around it.
+    ProvenanceIndeterminate,
     CascadeClearance,
     ElapseWindow,
     SetCurationBlocked(bool),
@@ -334,6 +342,7 @@ fn action_strategy() -> impl Strategy<Value = Action> {
         Just(Action::ProvenanceVerify),
         Just(Action::ProvenanceReject),
         Just(Action::ProvenanceNoAttestation),
+        Just(Action::ProvenanceIndeterminate),
         Just(Action::CascadeClearance),
         Just(Action::ElapseWindow),
         any::<bool>().prop_map(Action::SetCurationBlocked),
@@ -363,9 +372,10 @@ fn event_for(action: Action) -> Option<QuarantineEvent> {
         Action::BlockByCurator => Some(QuarantineEvent::BlockByCurator),
         Action::TombstoneCorruption => Some(QuarantineEvent::TombstoneFromCorruption),
         Action::FailScanIndeterminate => Some(QuarantineEvent::FailScanIndeterminate),
-        Action::ProvenanceVerify | Action::ProvenanceReject | Action::ProvenanceNoAttestation => {
-            Some(QuarantineEvent::CompleteProvenance)
-        }
+        Action::ProvenanceVerify
+        | Action::ProvenanceReject
+        | Action::ProvenanceNoAttestation
+        | Action::ProvenanceIndeterminate => Some(QuarantineEvent::CompleteProvenance),
         Action::CascadeClearance => Some(QuarantineEvent::CascadeProvenanceClearance),
         Action::ReleaseCuratorWaiver
         | Action::ReleasePolicyReEval
@@ -420,6 +430,12 @@ fn perform(artifact: &mut Artifact, aux: &Aux, action: Action) -> bool {
             .is_ok(),
         Action::ProvenanceNoAttestation => artifact
             .complete_provenance(ProvenanceVerdict::no_attestation(), "cosign")
+            .is_ok(),
+        Action::ProvenanceIndeterminate => artifact
+            .complete_provenance(
+                ProvenanceVerdict::indeterminate(IndeterminateReason::TrustRootUnusable),
+                "cosign",
+            )
             .is_ok(),
         Action::CascadeClearance => artifact
             .cascade_provenance_clearance(fixed_hash(), fixed_signer(), None, "cosign")

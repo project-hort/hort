@@ -95,9 +95,10 @@ impl CachedTrustRoot {
     ///
     /// # Errors
     /// `DomainError::Invariant` if the payload is not a parseable
-    /// `trusted_root.json` (`BundleMalformed`-shaped at the adapter
-    /// boundary, but this is a *trust-root* load error, surfaced at
-    /// construction / refresh, never on a per-verify path).
+    /// `trusted_root.json`. This is a *trust-root* load error — our own
+    /// provisioning, not anybody's attestation — and it is surfaced at
+    /// construction / refresh, never on a per-verify path, so it never
+    /// becomes a verdict about an artifact.
     pub fn from_trusted_root_json(data: &[u8]) -> DomainResult<Self> {
         Self::from_trusted_root_json_with_window(
             data,
@@ -140,9 +141,11 @@ impl CachedTrustRoot {
     /// `sigstore::Verifier::new` consumes by value. An empty map means the
     /// loaded `trusted_root.json` carries no (time-valid) Rekor key — the
     /// worker composition treats that as a hard boot error when a verifier
-    /// is registered (a root with no Rekor key would fail *every* verify
-    /// post-inclusion-fix), and a per-verify lookup against an empty map
-    /// fails closed (`RekorNotFound`).
+    /// is registered, and it has to: a per-verify lookup against an empty
+    /// map is a missing key on *our* side, so every bundle in the scope
+    /// would be held indefinitely (`Indeterminate(TrustRootUnusable)`)
+    /// rather than verified, and nothing about the artifacts would be
+    /// wrong.
     ///
     /// # Errors
     /// `DomainError::Invariant` if the cached bytes no longer parse — an
@@ -151,6 +154,34 @@ impl CachedTrustRoot {
     pub fn rekor_keys(&self) -> DomainResult<std::collections::BTreeMap<String, Vec<u8>>> {
         let trust_root = self.build_sigstore_trust_root()?;
         Ok(crate::inclusion::collect_rekor_keys(&trust_root))
+    }
+
+    /// Fail-closed boot probe, the sibling of
+    /// [`rekor_keys`](Self::rekor_keys)`.is_empty()`: can an offline
+    /// verifier be built from this trust root **at all**?
+    ///
+    /// A `trusted_root.json` carrying no Fulcio certs / CTFE keys parses
+    /// cleanly and then fails at `Verifier::new`, which the verify path
+    /// calls per bundle. Every well-formed bundle in the scope is
+    /// therefore held (`Indeterminate{TrustRootUnusable}`) — the chain is
+    /// never examined, so there is nothing to condemn — and the result is
+    /// a scope-wide stall with no terminal state and no event anywhere to
+    /// point at. Harder to notice than the wave of rejections it replaced,
+    /// which is exactly why the boot refusal matters more now and not
+    /// less.
+    ///
+    /// Probes the real production predicate (`Verifier::new` succeeding)
+    /// rather than counting certificates, so it cannot drift from what
+    /// the verify path actually requires. The built verifier is dropped;
+    /// construction is an in-memory parse, no network.
+    ///
+    /// # Errors
+    /// `DomainError::Invariant` if the cached bytes no longer parse (an
+    /// internal invariant violation — they were validated at
+    /// construction), or if no verifier can be built from them.
+    pub fn ensure_builds_verifier(&self) -> DomainResult<()> {
+        let trust_root = self.build_sigstore_trust_root()?;
+        crate::verifier::build_verifier(trust_root).map(|_verifier| ())
     }
 
     /// Whether the trust root is still within its refresh window relative
@@ -320,6 +351,36 @@ mod tests {
             assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
             assert!(!der.is_empty());
         }
+    }
+
+    /// The minimal fixture root carries no Fulcio certs, so no verifier
+    /// can be built from it — the condition the worker boot assertion
+    /// refuses to start on, and the one that holds every well-formed
+    /// bundle in the scope if it ever reaches the verify path.
+    #[test]
+    fn ensure_builds_verifier_fails_for_minimal_root() {
+        let root =
+            CachedTrustRoot::from_trusted_root_json(&minimal_trusted_root_json()).expect("parse");
+        let err = root
+            .ensure_builds_verifier()
+            .expect_err("minimal root builds no verifier");
+        match err {
+            DomainError::Invariant(msg) => {
+                assert!(msg.contains("cannot build a verifier"), "msg: {msg}");
+            }
+            other => panic!("expected Invariant, got {other:?}"),
+        }
+    }
+
+    /// The committed production public-good `trusted_root.json` does build
+    /// a verifier — the counter-assertion that keeps the probe above from
+    /// being satisfied by a function that always fails.
+    #[test]
+    fn ensure_builds_verifier_passes_for_production_root() {
+        let prod = include_bytes!("../tests/fixtures/sigstore_trusted_root_public_good.json");
+        let root = CachedTrustRoot::from_trusted_root_json(prod).expect("production root parses");
+        root.ensure_builds_verifier()
+            .expect("the production root must build a verifier — the boot assertion passes for it");
     }
 
     #[tokio::test]

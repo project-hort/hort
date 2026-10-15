@@ -169,10 +169,10 @@ const PARENT_GATE_BLOB_KINDS: [&str; 2] = ["oci_config", "oci_layer"];
 ///   ([`Artifact::complete_provenance`](hort_domain::entities::artifact::Artifact::complete_provenance));
 /// - a `Verified` / `Rejected` verdict requires attestation material,
 ///   and no attestation can ever target a blob;
-/// - so the only verdicts left for a blob constituent are the hold —
-///   which changes nothing — and the fail-closed
-///   `Rejected{RekorNotFound}` a *fetch failure* produces, which is
-///   pure harm on a candidate that had nothing to fetch.
+/// - a *fetch failure* is `Indeterminate`, which under `Required` is a
+///   hold too — so the only verdicts left for a blob constituent are
+///   two holds, and neither changes any state on a candidate that had
+///   nothing to fetch.
 ///
 /// The inverse conservatism to [`is_referenced_tree_descendant`] is
 /// deliberate: there, an unknown kind counts AS a descendant (hold-safe);

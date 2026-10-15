@@ -2195,3 +2195,90 @@ mod re_evaluated_event_tests {
         assert!(RejectionReason::all_wire_kinds().contains(&"corruption"));
     }
 }
+
+#[cfg(test)]
+mod provenance_rejected_wire_tests {
+    use super::*;
+    use crate::ports::provenance::ProvenanceRejectReason;
+
+    const HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// **Every reject reason that production streams already carry still
+    /// loads.** The payloads below are written the way the event store
+    /// holds them — a JSONB object with the reason as a bare string
+    /// discriminator — so this test fails if the variant is renamed,
+    /// reordered into a tuple/struct shape, or removed, each of which
+    /// would make an existing `ProvenanceRejected` row unreadable.
+    ///
+    /// `Unsigned` is in the corpus even though nothing produces it any
+    /// more: it is exactly the variant whose rows are historical, which is
+    /// why it must keep deserialising. `BundleMalformed` is now in the
+    /// same position — the keyless verifier's parse/decode gates and the
+    /// keyed verifier's undecodable outcomes skip instead of rejecting,
+    /// and the keyed digest-binding failure, its last producer, states
+    /// `DigestMismatch`. The variant and its wire string stay regardless;
+    /// losing a producer is not losing a reader.
+    #[test]
+    fn persisted_payload_loads_for_every_reject_reason() {
+        let persisted = [
+            ("Unsigned", ProvenanceRejectReason::Unsigned),
+            (
+                "UntrustedIdentity",
+                ProvenanceRejectReason::UntrustedIdentity,
+            ),
+            ("RekorNotFound", ProvenanceRejectReason::RekorNotFound),
+            ("CertChainInvalid", ProvenanceRejectReason::CertChainInvalid),
+            ("BundleMalformed", ProvenanceRejectReason::BundleMalformed),
+            // Forward-only: no stream carries this yet, and a build
+            // predating the variant cannot read one that does. Pinned here
+            // so the new reason's wire form is fixed from the start.
+            ("DigestMismatch", ProvenanceRejectReason::DigestMismatch),
+        ];
+
+        for (wire, expected) in persisted {
+            let payload = serde_json::json!({
+                "artifact_id": "7b3f1d2e-0000-4000-8000-000000000001",
+                "content_hash": HASH,
+                "backend": "cosign",
+                "reason": wire,
+            });
+            let loaded: ProvenanceRejected = serde_json::from_value(payload.clone())
+                .unwrap_or_else(|e| {
+                    panic!("persisted {wire} payload must still load: {e}");
+                });
+            assert_eq!(loaded.reason, expected);
+            assert_eq!(loaded.backend, "cosign");
+            assert_eq!(loaded.content_hash.to_string(), HASH);
+            loaded.validate().expect("a persisted payload is valid");
+
+            // Re-serialising gives back the same object, so a row rewritten
+            // by a current build is readable by the build that wrote it.
+            assert_eq!(serde_json::to_value(&loaded).unwrap(), payload);
+        }
+    }
+
+    /// The whole event, through the `DomainEvent` envelope the store
+    /// actually writes — the externally-tagged shape. Pinned because the
+    /// envelope's variant name is a second compatibility surface, distinct
+    /// from the reason string above.
+    #[test]
+    fn persisted_envelope_loads_through_domain_event() {
+        let envelope = serde_json::json!({
+            "ProvenanceRejected": {
+                "artifact_id": "7b3f1d2e-0000-4000-8000-000000000002",
+                "content_hash": HASH,
+                "backend": "cosign-key",
+                "reason": "BundleMalformed",
+            }
+        });
+        let loaded: crate::events::DomainEvent =
+            serde_json::from_value(envelope).expect("the envelope loads");
+        match loaded {
+            crate::events::DomainEvent::ProvenanceRejected(e) => {
+                assert_eq!(e.reason, ProvenanceRejectReason::BundleMalformed);
+                assert_eq!(e.backend, "cosign-key");
+            }
+            other => panic!("expected ProvenanceRejected, got {other:?}"),
+        }
+    }
+}

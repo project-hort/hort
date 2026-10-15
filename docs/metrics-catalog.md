@@ -3479,9 +3479,10 @@ that knows the per-ecosystem ingest count; `hort-app` only sees the aggregate
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
-| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `held_pending_subject`, `cleared_signature_material`, `requeued_no_anchor` |
-| `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed` |
+| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `held_pending_subject`, `held_indeterminate`, `allowed_indeterminate`, `cleared_signature_material`, `requeued_no_anchor` |
+| `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed`, `digest_mismatch` |
 | `hort_provenance_late_joiner_cleared_total` | counter | `backend` | — | one increment per constituent that self-cleared against an already-verified subject at its own quarantine commit |
+| `hort_provenance_unreadable_skipped_total` | counter | `backend` | — | incremented **by the number of** attestation candidates a verify skipped as unreadable; not emitted at all when nothing was skipped |
 
 The first two counters are emitted at exactly **one layer** — the
 orchestration use case
@@ -3504,6 +3505,50 @@ been checked. A `Required` scope publishing cosign signatures shows a
 steady low rate here — two rows per signature, the `{}` config blob and the
 payload layer; a rate of zero on such a scope means the signature payloads
 are stranding instead (check for `Pending` clearances on blob rows).
+
+**`hort_provenance_unreadable_skipped_total`** (ADR 0039 D4 — only a
+positive disproof about readable material is terminal). Emitted at exactly
+one layer —
+[`ProvenanceOrchestrationUseCase::verify_artifact`](../crates/hort-app/src/use_cases/provenance_orchestration.rs),
+directly after the verdict fold: the one point where the count is complete
+(every applicable verifier has run) and ahead of every early return, so no
+verdict path can drop it.
+
+Attestation material a verifier **cannot read** — unparseable bundle JSON,
+no leaf certificate, an undecodable certificate or identity, an undecodable
+keyed DSSE payload, a signature blob that is not DER — contributes
+**nothing** to the verdict: not a rejection, not a hold, not evidence of
+any kind. It is skipped exactly as a candidate belonging to the other
+backend is skipped. (A candidate skipped for belonging to the other backend
+is **not** counted here: it was not read because it was not ours, which
+would otherwise make every keyed-signed artifact look like it carried
+garbage.) This counter is what keeps *not considered* from becoming *not
+noticed*, and it answers two questions nothing else can: a publisher whose
+own signature material is broken would otherwise see only an unsigned hold,
+and an operator would never learn that somebody attached junk to an
+artifact. The accompanying `warn!` line carries the `artifact_id`.
+
+It is **not** a `result` value on `hort_provenance_verify_total`, for two
+independent reasons. A skip is orthogonal to the verdict — it can
+accompany any of the values there, `verified` included (one candidate
+verified while a sibling was unreadable) — and that taxonomy's values are
+mutually exclusive. And it is a *count* rather than an event: the number of
+candidates skipped is the operator's signal, so it is `increment(count)` on
+its own series. Putting the number in a label would be unbounded
+cardinality (the forbidden-label rule below).
+
+Reading it: a non-zero rate on a scope is either a broken publisher
+pipeline or somebody writing junk to the referrers surface, and in both
+cases the artifact's own verdict is unaffected — look at the `warn!` lines
+for the `artifact_id`s, and at the matching jobs' `result_summary`
+(`unreadable_skipped`) for the durable per-artifact trail. A rate that
+appears alongside a rise in `held_pending_signature` on the same scope is
+the publisher case: their material is arriving and is not readable. `backend`
+is the verifier that **decided** the folded verdict — the same label the
+verdict counter carries for that run — which is deliberately not
+necessarily the verifier that did the skipping: a run reports one verdict
+and the counts are summed across the verifiers that produced them, so the
+two series join on one label value per run.
 
 **`hort_provenance_late_joiner_cleared_total`** (ADR 0039 §11,
 late-joiner end). Emitted at exactly one layer —
@@ -3533,7 +3578,8 @@ per-tick batch reading: today the admin curation queue, and, once it
 exists, retention's overview.
 
 **Scrape target — the worker `/metrics` listener.** The two verdict
-counters run in **`hort-worker`** (the `provenance-verify` job). The worker
+counters and the unreadable-skip counter run in **`hort-worker`** (the
+`provenance-verify` job). The worker
 serves an opt-in `GET /metrics` listener — bound via `HORT_WORKER_METRICS_BIND`
 (disabled by default; set a pod-reachable address to enable) — making
 these series (and every other worker metric: scan counters, queue depth, …)
@@ -3543,8 +3589,15 @@ NetworkPolicy (see the how-to
 `docs/architecture/how-to/enable-provenance-verification.md` → *Worker
 metrics*). The companion per-job `result_summary`
 (`verified` / `rejected:<reason>` / `no_attestation` /
-`held_pending_signature` / `held_pending_subject` / `skipped:<why>` /
-`requeued:<why>`) is the per-artifact trail and is **not** a metric.
+`held_pending_signature` / `held_pending_subject` / `held_indeterminate` /
+`allowed_indeterminate` / `cleared:signature_material` / `skipped:<why>` /
+`requeued:<why>`) is the
+per-artifact trail and is
+**not** a metric. It carries one optional second key,
+`unreadable_skipped: <n>`, present only when a verify skipped at least one
+unreadable candidate — the durable per-artifact half of
+`hort_provenance_unreadable_skipped_total`. Absent, not `0`, on the
+ordinary row, so the rows that carry it are the ones worth reading.
 
 **`requeued_no_anchor`** (issue #90 defense-in-depth): a `NoAttestation`
 verdict under `Required` on a `None`-status, anchor-less, recently-ingested
@@ -3602,18 +3655,28 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   release the artifact early (mirrors `ScanCompleted(clean)`).
 - `rejected` — a typed rejection (`ProvenanceRejected` emitted) — the
   per-reason breakdown is on `hort_provenance_reject_total`. A rejection
-  is only ever a **positive disproof**: a signature that is present and
-  wrong (forged, untrusted identity, digest-mismatched, malformed) under
-  any mode, or a `Required`-mode fetch-exhaustion fail-closed
-  (`Rejected{RekorNotFound}` — "could not be fetched", not "proven
-  absent"). A *missing* signature never ticks this value: ADR 0039's
-  2026-09-12 amendment (D1) makes absence of evidence non-terminal, and
-  the `Rejected{Unsigned}` arm that produced it is gone.
+  is only ever a **positive disproof**: a signature that is present,
+  readable and wrong (forged, untrusted identity, digest-mismatched)
+  under any mode. Neither a *missing* signature, nor a *failed fetch*,
+  nor a *verifier that returned no verdict* ticks this value.
+  ADR 0039's 2026-09-12 amendment (D1) makes absence of
+  evidence non-terminal and the `Rejected{Unsigned}` arm that produced it
+  is gone; D4 does the same for a check that could not be carried out, so
+  the `Required`-mode fetch exhaustion and verifier error that used to
+  fail closed as `Rejected{RekorNotFound}` now tick `held_indeterminate`
+  instead ("could not be fetched" is not "proven absent", and neither it
+  nor "we could not run the check" is "proven wrong"). **The
+  orchestration now mints no reject reason at all** — every value on
+  `hort_provenance_reject_total` comes from a verifier's finding about
+  material it read.
 - `no_attestation` — no bundle was found/passed and the mode allowed it
   (`VerifyIfPresent` / `Off` no-op, no event). Strictly the
   allowed-unsigned case: an unsigned artifact under `Required` ticks
   `held_pending_signature` (or `held_pending_subject` for a constituent)
-  whether or not its window has elapsed.
+  whether or not its window has elapsed, and an artifact the same
+  permissive mode let through *without having been checked at all* ticks
+  `allowed_indeterminate`. This value therefore means one thing only:
+  the artifact carries no signature and the mode does not ask for one.
 - `held_pending_signature` — a `Required`-mode artifact found unsigned
   where a signature of its own is the thing it is waiting for. No event;
   `complete_provenance` appends nothing and the artifact stays
@@ -3638,6 +3701,42 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   misdirect an operator into checking their signer. A sustained non-zero
   rate with no `verified` follow-through means blobs are arriving whose
   manifests never do.
+- `held_indeterminate` — a `Required`-mode artifact whose verification
+  **could not be carried out**: a trust root with no usable key for the
+  check (no Rekor key for the entry's log, unparseable key bytes, or no
+  Fulcio certs / CTFE keys at all), attestation material that could never
+  be fetched, or a dispatched verifier that returned no verdict. Held
+  `Quarantined` exactly as the
+  two values above are, and for a stronger reason — nothing about the
+  artifact was established, so nothing was disproved and nothing may
+  terminalise (ADR 0039 D4). The only one of the three holds whose
+  operator action is on **our** side: fix the trust root or the verifier,
+  or let the fetch retry. A trust root carrying no Fulcio certs is
+  nonetheless a **boot** refusal rather than a population on this
+  counter: the worker declines to start on one, because a scope-wide hold
+  with nothing terminal to point at is harder to notice than the
+  rejections it replaced. Despite the name this is the *opposite* of the scan axis's
+  terminal `scan_indeterminate` status; the `held_` prefix is the
+  distinction. A rate that tracks a deploy is a provisioning regression,
+  not a publisher problem — which is precisely the misdiagnosis the split
+  from `held_pending_signature` exists to prevent.
+- `allowed_indeterminate` — the same could-not-check verdict under a mode
+  that does **not** require one to succeed (`VerifyIfPresent` / `Off`):
+  no event, no status change, and the artifact runs its normal quarantine
+  window and **releases**. Separable from `held_indeterminate` because
+  nothing is held — the `held_` / `allowed_` prefixes are the whole
+  distinction, and conflating them would make a release look like a
+  stall. Separable from `no_attestation` because that value says *the
+  artifact carries no signature*, and here the artifact's signature is
+  not what failed: our trust root had no usable key, the attestation
+  material never arrived, or our verifier returned no verdict. A
+  permissive scope whose upstream is
+  unreachable, reported as `no_attestation`, sends an operator to the
+  publisher's signing pipeline — the one place the fault is not. Read it
+  the way you read `held_indeterminate`: a rate that tracks a deploy or
+  an upstream outage is ours to fix, and it is the *only* value on this
+  counter that reports a released artifact whose provenance was never
+  established.
 
 **`reason` semantics** (`hort_provenance_reject_total`) — one per
 `ProvenanceRejectReason` variant:
@@ -3654,14 +3753,69 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   current build means the code has regressed to the terminal arm.
 - `untrusted_identity` — a cryptographically valid signature whose
   `{issuer, san}` matched no allowed `provenance_identities` pattern.
-- `rekor_not_found` — the bundle's Rekor inclusion proof / SET could not
-  be validated offline (also the fail-closed verdict on a `Required`-mode
-  bundle-fetch / CAS-read exhaustion). Never a fall-back to
-  a live Rekor fetch.
+- `rekor_not_found` — the bundle's Rekor inclusion proof / checkpoint
+  signature was present, readable, and did **not** verify offline against
+  the trust root's Rekor key: a forged or non-included entry. Never a
+  fall-back to a live Rekor fetch. **Four** neighbouring failures do
+  **not** reach this label (ADR 0039 D4): a trust root holding no usable
+  Rekor key for the entry is a fault on our side and ticks
+  `held_indeterminate`; transparency-log material that is structurally
+  absent, unparseable or impossible (a negative tree size among them)
+  proved nothing and is skipped onto
+  `hort_provenance_unreadable_skipped_total`; a bundle-fetch /
+  CAS-read exhaustion under `Required` — which this label carried until
+  it held instead — ticks `held_indeterminate` too (and
+  `allowed_indeterminate` under the permissive modes); and so does a
+  dispatched verifier that returned no verdict, this label's **last**
+  orchestration-side producer. The last two were the use the "never a
+  live Rekor fetch" sentence forbids: nothing
+  offline or cryptographic had happened at all. Rows carrying
+  `rekor_not_found` from a fetch exhaustion or a verifier error are
+  historical, exactly as
+  `unsigned`'s are, and a dashboard spanning the boundary sees traffic
+  move from here to `held_indeterminate` rather than vanish. What
+  remains is a single producer — the keyless verifier's offline
+  inclusion check — so every current row under this label is a proof
+  that was read and did not verify.
 - `cert_chain_invalid` — the Fulcio certificate chain failed validation
-  against the cached trust root.
+  against the cached trust root. A chain that was **examined and
+  rejected**: a trust root so unusable that no verifier could be built to
+  examine any chain at all carried this label until it held instead, and
+  now ticks `held_indeterminate` (`allowed_indeterminate` under the
+  permissive modes). Rows carrying `cert_chain_invalid` from that cause
+  are historical; a dashboard spanning the boundary sees the traffic move
+  rather than vanish, and the move is the difference between "this
+  publisher's certificate is not trustworthy" and "we have no trust root
+  to judge it with".
 - `bundle_malformed` — the bundle is structurally malformed or carries no
-  offline-verifiable material.
+  offline-verifiable material. **No longer produced from material a
+  verifier could not read** (ADR 0039 D4): an unparseable bundle, a missing
+  or undecodable leaf certificate, an unreadable identity, an undecodable
+  keyed DSSE payload and a non-DER signature blob are all skipped instead,
+  and are counted on
+  `hort_provenance_unreadable_skipped_total`. Rows carrying
+  `bundle_malformed` from those causes are historical, exactly as
+  `unsigned`'s are. **Nothing produces it at all now:** its last
+  producer, the keyed verifier's digest-binding failure, reports
+  `digest_mismatch` (see the next bullet). The label value is retained so
+  a dashboard querying historical data keeps resolving; a non-zero *rate*
+  on a current build means the code has regressed.
+- `digest_mismatch` — a signature that verifies, against a pinned key or a
+  trusted chain, but covers a **different digest** than the artifact being
+  served: the re-tag attack (the `sha256-<hex>.sig` carriage tag is
+  attacker-writable in the registry). The strongest disproof the pipeline
+  can state. The keyed verifier's digest-binding failure reports here
+  now; it rode `bundle_malformed` until that producer moved, so a
+  dashboard comparing across the boundary sees traffic shift between the
+  two values rather than appear from nowhere. A non-zero rate here is an
+  attack signal — which is the point of the move: the same rows under
+  `bundle_malformed` were indistinguishable from a corrupt upload.
+
+  No label exists for a check that could not be *carried out* — that is
+  not a rejection, so it never reaches this counter; it ticks
+  `held_indeterminate` (under `Required`) or `allowed_indeterminate`
+  (under `VerifyIfPresent` / `Off`) on `hort_provenance_verify_total`
+  instead.
 
 **Forbidden labels.** No `artifact_id`, `content_hash`, `version`,
 `repository`, `package`, or signer identity (`issuer`/`san`) — those would
@@ -3672,8 +3826,9 @@ accompanying `info!` audit line on the `ProvenanceVerified` /
 not `err`).
 
 Cardinality: `hort_provenance_verify_total` ≤ `backend` (~few) × `mode`
-(3) × `result` (6); `hort_provenance_reject_total` ≤ `backend` × `reason`
-(5); `hort_provenance_late_joiner_cleared_total` ≤ `backend`. All three
+(3) × `result` (9); `hort_provenance_reject_total` ≤ `backend` × `reason`
+(6); `hort_provenance_late_joiner_cleared_total` and
+`hort_provenance_unreadable_skipped_total` ≤ `backend` each. All four
 are tiny in Tier 1 (one backend). The two hold gauges are 2 series each
 (`hold`, unlabelled otherwise) regardless of deployment size.
 

@@ -221,6 +221,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A check that could not be carried out holds the artifact instead of
+  rejecting it** (#350). `ProvenanceOutcome` gains `Indeterminate`, carrying
+  three causes that are deliberately not collapsed into one: a trust root with
+  no usable key for the artifact at hand (`TrustRootUnusable`), attestation
+  material that was never fetched (`AttestationFetchFailed`), and a verifier
+  that returned no verdict (`VerifierUnavailable`). None of the three
+  establishes anything about the artifact, so none may condemn it; under
+  `Required` they hold, and the hold names our own provisioning rather than
+  the artifact. Findings about material that *was* read stay terminal — a
+  forged signature, a wrong key, a mismatched digest, a broken certificate
+  chain, a failed inclusion proof. The nine `InclusionError` variants became
+  ten and are now classified wildcard-free: one disproof, two trust-root, and
+  seven from which nothing was proved.
+
+- **The worker refuses to start on a trust root it cannot build a verifier
+  from** (#350), alongside the existing refusal for an empty Rekor key map. A
+  trust root that produces no verifier used to let the worker boot and then
+  answer identically for every keyless artifact in scope — an operator-facing
+  misconfiguration reported once per artifact instead of once, at the moment
+  it can still be fixed.
+
+- **A re-tagged signature has its own reject reason** (#350).
+  `ProvenanceRejectReason::DigestMismatch` replaces the `BundleMalformed` the
+  keyed verifier reported when a bundle's digest did not bind to the artifact,
+  so the persisted `ProvenanceRejected` event distinguishes "someone re-tagged
+  a signed image" from "the upload is corrupt". `BundleMalformed` itself
+  stays — it rides a persisted event payload — but no longer has a producer.
+
 - **The gitops YAML parser is `serde-saphyr`, and an operator's file means what
   it meant** (#347). The control path's envelope parse ran on a crate binding
   `unsafe-libyaml`, an unmaintained C transliteration carrying
@@ -1484,6 +1512,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is what kept them from drifting apart again.
 
 ### Security
+
+- **Material a provenance verifier could not read no longer condemns an
+  artifact** (#350). A caller holding only **write** access to a repository
+  could attach bytes declared
+  `application/vnd.dev.sigstore.bundle.v0.3+json` to someone else's validly
+  keyed-signed image. The keyless verifier rejected the unreadable candidate,
+  the fold's unconditional `Rejected ⊳ Verified` carried that rejection over
+  the good keyed verdict, and the image went **terminal** — the effect
+  `DeleteRepoAccess` would otherwise be required for. Nothing was overwritten:
+  both referrers coexisted, and the damage was in the aggregation of
+  per-candidate verdicts into one artifact verdict.
+
+  The rule now drawn is that **only readable material from which something was
+  actually proved can condemn an artifact**, and it is enforced twice, in that
+  order. The manifest push **refuses** a layer whose declared media type
+  claims a Sigstore bundle while its bytes are not one, so the material never
+  enters the tree. Because that push resolves layer *rows* and not bytes, the
+  door cannot be total — so a candidate arriving by any other route is
+  **skipped**, contributing no verdict at all rather than a rejecting one.
+  Skipping is not silence: the count is carried on the verify job's
+  `result_summary`, in a `warn!` line, and as
+  `hort_provenance_unreadable_skipped_total{backend}`.
 
 - **The anti-replay seen-set remembers a federated JWT for as long as that JWT
   can be presented** (#349). The `jwt_replay_seen` row's TTL horizon was the

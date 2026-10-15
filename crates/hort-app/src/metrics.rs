@@ -2118,7 +2118,7 @@ pub fn emit_policy_violations(
 // ---------------------------------------------------------------------------
 
 /// `result` label value for `hort_provenance_verify_total`. Closed
-/// taxonomy of 6. String values are normative — they appear
+/// taxonomy of 9. String values are normative — they appear
 /// verbatim in `docs/metrics-catalog.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvenanceVerifyResult {
@@ -2164,6 +2164,37 @@ pub enum ProvenanceVerifyResult {
     /// payload layer); a zero rate on such a scope means the signature
     /// payloads are stranding instead.
     ClearedSignatureMaterial,
+    /// A `Required`-mode artifact whose verification **could not be
+    /// carried out** — no usable trust-root key, or attestation material
+    /// that could never be fetched
+    /// ([`hort_domain::ports::provenance::IndeterminateReason`]). Held
+    /// `Quarantined` exactly as the two `held_*` values above are, and for
+    /// a stronger reason: nothing about the artifact was established, so
+    /// nothing was disproved (ADR 0039 D4). Separable from
+    /// `held_pending_signature` because the operator action is on **our**
+    /// side — fix the trust root, or let the fetch retry — not on the
+    /// publisher's.
+    ///
+    /// Reads as a hold despite the `indeterminate` in its name; the
+    /// `held_` prefix is load-bearing, because `scan_indeterminate` on the
+    /// *scan* axis is a terminal status and this is its opposite.
+    HeldIndeterminate,
+    /// The same could-not-check verdict under a mode that does **not**
+    /// require one to succeed (`VerifyIfPresent` / `Off`): no event, no
+    /// status change, and the artifact runs its normal quarantine window
+    /// and releases — exactly as an unsigned one does.
+    ///
+    /// Separable from [`Self::NoAttestation`] because that value says
+    /// *the artifact carries no signature*, and here the artifact's
+    /// signature is not what failed: our trust root had no usable key, or
+    /// the attestation material never arrived. A permissive scope whose
+    /// upstream is unreachable reported as `no_attestation` sends an
+    /// operator to the publisher's signing pipeline, which is the one
+    /// place the fault is not. Separable from
+    /// [`Self::HeldIndeterminate`] because nothing is held — the `held_`
+    /// / `allowed_` prefixes are the whole distinction, and conflating
+    /// them would make a release look like a stall.
+    AllowedIndeterminate,
     /// `NoAttestation`×`Required` with a `None` `quarantine_window_start`
     /// on a `None`-status, recently-ingested artifact (issue #90
     /// defense-in-depth): no terminal verdict is applied — the task
@@ -2184,6 +2215,8 @@ impl ProvenanceVerifyResult {
             Self::NoAttestation => "no_attestation",
             Self::HeldPendingSignature => "held_pending_signature",
             Self::HeldPendingSubject => "held_pending_subject",
+            Self::HeldIndeterminate => "held_indeterminate",
+            Self::AllowedIndeterminate => "allowed_indeterminate",
             Self::ClearedSignatureMaterial => "cleared_signature_material",
             Self::RequeuedNoAnchor => "requeued_no_anchor",
         }
@@ -2192,10 +2225,16 @@ impl ProvenanceVerifyResult {
 
 /// Wire string for the `reason` label on `hort_provenance_reject_total`,
 /// one per [`hort_domain::ports::provenance::ProvenanceRejectReason`]
-/// variant. Closed taxonomy of 5; the exhaustive match means a future
+/// variant. Closed taxonomy of 6; the exhaustive match means a future
 /// reject variant cannot ship without a catalog entry here (the compiler
 /// flags the missing arm). String values are normative — they appear
 /// verbatim in `docs/metrics-catalog.md`.
+///
+/// There is no label here for a check that could not be carried out: that
+/// is not a rejection, so it never reaches this counter. It ticks
+/// [`ProvenanceVerifyResult::HeldIndeterminate`] (under `Required`) or
+/// [`ProvenanceVerifyResult::AllowedIndeterminate`] (under
+/// `VerifyIfPresent` / `Off`) on `hort_provenance_verify_total` instead.
 pub fn provenance_reject_reason_label(
     reason: hort_domain::ports::provenance::ProvenanceRejectReason,
 ) -> &'static str {
@@ -2206,6 +2245,7 @@ pub fn provenance_reject_reason_label(
         R::RekorNotFound => "rekor_not_found",
         R::CertChainInvalid => "cert_chain_invalid",
         R::BundleMalformed => "bundle_malformed",
+        R::DigestMismatch => "digest_mismatch",
     }
 }
 
@@ -2242,6 +2282,40 @@ pub fn emit_provenance_reject(
         labels::REASON => provenance_reject_reason_label(reason),
     )
     .increment(1);
+}
+
+/// Emit `hort_provenance_unreadable_skipped_total{backend}`, incremented
+/// by the number of attestation candidates the verifier(s) **could not
+/// read** and therefore did not consider while reaching one folded
+/// verdict. Single emission site:
+/// `ProvenanceOrchestrationUseCase::verify_artifact`, directly after the
+/// fold — the one point where the count is complete and ahead of every
+/// early return, so no verdict path can drop it.
+///
+/// Unreadable material contributes nothing to a verdict: not a rejection,
+/// not a hold, not evidence of any kind. This counter is what keeps *not
+/// considered* from becoming *not noticed* — a non-zero rate means
+/// somebody is attaching bytes that are not readable attestation
+/// material, which is either a broken publisher pipeline or junk written
+/// to the referrer surface.
+///
+/// **Not a `result` value on `hort_provenance_verify_total`.** A skip is
+/// orthogonal to the verdict — it can accompany any of the four,
+/// `verified` included — so it does not belong in a taxonomy where the
+/// values are mutually exclusive. It is also a count rather than an
+/// event, hence `increment(count)` on its own series rather than a
+/// per-run tick: the number of candidates skipped is the operator's
+/// signal, and a label carrying it would be unbounded cardinality (the
+/// forbidden-label rule below).
+///
+/// Emitted only when `count > 0`, so an absent series means nothing was
+/// ever skipped rather than nothing was ever verified.
+pub fn emit_provenance_unreadable_skipped(backend: &str, count: u32) {
+    metrics::counter!(
+        "hort_provenance_unreadable_skipped_total",
+        labels::BACKEND => backend.to_string(),
+    )
+    .increment(u64::from(count));
 }
 
 /// Emit `hort_provenance_late_joiner_cleared_total{backend}` once per

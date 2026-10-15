@@ -2012,16 +2012,13 @@ impl QuarantineUseCase {
             // attestation of its own (the OCI referrers `subject` is a
             // manifest descriptor; cosign signs manifest digests), so the
             // verify this would enqueue has exactly two reachable
-            // outcomes: the unsigned HOLD — which changes no state at
-            // all, and which every subsequent tick would re-enqueue
-            // forever — or, on a proxy scope whose
-            // upstream referrer fetch errors, the fail-closed
-            // `Rejected{RekorNotFound}` that `apply_fetch_failure`
-            // produces regardless of the descendant flag. The first is
-            // waste; the second is a terminal rejection of a held blob
-            // caused by infra flakiness on a fetch that had nothing to
-            // find. Neither is a backstop. The blob's terminal state
-            // comes from its parent instead: the cascade clears it when
+            // outcomes, and BOTH leave the blob exactly where it was: the
+            // unsigned HOLD, and — on a proxy scope whose upstream
+            // referrer fetch errors — the indeterminate hold
+            // `apply_fetch_failure` produces regardless of the descendant
+            // flag. Every subsequent tick would re-enqueue the same
+            // no-op forever. Neither is a backstop. The blob's terminal
+            // state comes from its parent instead: the cascade clears it when
             // the parent verifies (ADR 0039), and if the parent goes away
             // (purge / manifest DELETE both sweep EVERY kind of the
             // source's edges) the predicate below stops firing on the very
