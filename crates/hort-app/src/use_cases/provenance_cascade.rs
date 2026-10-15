@@ -997,10 +997,11 @@ struct AcceptedSignature {
 /// resolves a verdict to *apply* to an artifact, so it has to rank
 /// rejections against each other and degrade a verifier's own error
 /// mode-dependently. Here the only question is acceptance: a `Rejected`,
-/// a `NoAttestation` and an errored verifier are the same answer — this
-/// candidate grants no clearance — and the artifact keeps exactly the
-/// hold it already had. Collapsing them is what makes the predicate
-/// fail-closed by construction rather than by careful ranking.
+/// an `Indeterminate`, a `NoAttestation` and an errored verifier are the
+/// same answer — this candidate grants no clearance — and the artifact
+/// keeps exactly the hold it already had. Collapsing them is what makes
+/// the predicate fail-closed by construction rather than by careful
+/// ranking.
 async fn first_accepting_verifier(
     verifiers: &[&Arc<dyn ProvenancePort>],
     subject: &ProvenanceSubject<'_>,
@@ -1020,7 +1021,14 @@ async fn first_accepting_verifier(
                         backend: port.name().to_string(),
                     })
                 }
-                ProvenanceOutcome::Rejected(_) | ProvenanceOutcome::NoAttestation => {}
+                // Not an acceptance, so not a clearance — in all three
+                // cases the held artifact keeps its hold. An
+                // `Indeterminate` candidate is explicitly NOT a clearance:
+                // a check that could not run grants nothing, which is the
+                // fail-closed direction.
+                ProvenanceOutcome::Rejected(_)
+                | ProvenanceOutcome::Indeterminate(_)
+                | ProvenanceOutcome::NoAttestation => {}
             },
             Err(e) => tracing::warn!(
                 backend = port.name(),
@@ -1076,9 +1084,9 @@ pub(crate) fn build_bundle(bytes: Vec<u8>) -> AttestationBundle {
     match hort_domain::provenance_bundle::extract_keyed_dsse_signature(&bytes) {
         Ok(Some(material)) => AttestationBundle::new_signed(bytes, material.signature),
         // Keyless, or not a keyed DSSE bundle, or unparseable-as-keyed: the
-        // Sigstore verifier's (a truly malformed bundle folds to
-        // BundleMalformed there). Never route a non-keyed bundle to the keyed
-        // verifier.
+        // Sigstore verifier's (which skips what it cannot read rather than
+        // producing a verdict from it). Never route a non-keyed bundle to the
+        // keyed verifier.
         Ok(None) | Err(_) => AttestationBundle::new(bytes),
     }
 }

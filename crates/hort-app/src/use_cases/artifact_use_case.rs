@@ -1172,12 +1172,23 @@ impl ArtifactUseCase {
     /// neither, and reusing the latter would also emit its
     /// hold-read-served audit line for a read that served nobody.
     ///
-    /// The caller today is the OCI pull-through's coalesced follower: a
-    /// follower that registers its own per-repo manifest row from an
+    /// Two callers. The OCI pull-through's coalesced follower: a follower
+    /// that registers its own per-repo manifest row from an
     /// already-CAS-resident hash never held the manifest bytes, yet that
     /// row's `content_references` edges must exist exactly as the
     /// ingesting leg's do — so it re-derives them from the authoritative
-    /// CAS content.
+    /// CAS content. And the OCI manifest-push path's signature-layer shape
+    /// check, which reads a layer blob back to decide whether the bytes
+    /// behind a layer declared as signature material actually are that
+    /// material before the manifest earns its scan/quarantine exemption.
+    ///
+    /// The second one shows why the status-agnostic rule above is not
+    /// incidental: a blob pushed moments earlier is ordinarily
+    /// `Quarantined`, which [`Self::download`] refuses outright, and a
+    /// shape check that could not read a freshly-pushed layer would
+    /// achieve nothing. Neither caller puts the bytes on the wire — one
+    /// builds an index over them, the other parses them and answers
+    /// yes/no.
     ///
     /// **Keyed on the content hash, not an artifact id**, and that is
     /// load-bearing rather than a convenience. The edges this read feeds

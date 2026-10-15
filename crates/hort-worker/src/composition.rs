@@ -1880,7 +1880,12 @@ pub(crate) async fn health_check_all_or_fail(
 ///    via Hort releases (ADR 0010 — no live TUF client on the verify
 ///    path). The adapter's `refresh_trusted_root_json` live-refresh
 ///    method is deliberately **unreferenced** by this composition.
-/// 2. Constructs the `SigstoreProvenanceAdapter` as the single
+/// 2. Asserts the root is usable for both halves of the offline check —
+///    a non-empty Rekor key map, and a root an offline verifier can
+///    actually be built from — because a root that fails either one
+///    holds every artifact in the scope on *our* provisioning rather
+///    than rejecting any, which is a silent stall. Then constructs the
+///    `SigstoreProvenanceAdapter` as the single
 ///    `Arc<dyn ProvenancePort>`.
 /// 3. Runs the port's `health_check()` — failure ⇒ `Err`. The check
 ///    verifies the cached trust root is loaded + within its refresh
@@ -1955,8 +1960,12 @@ async fn register_provenance_verify(
         // Fail-closed boot assertion (ADR 0027): the verify path
         // cryptographically verifies the Rekor Merkle inclusion proof +
         // checkpoint signature against the trust root's Rekor public key. A
-        // trust root with no (time-valid) Rekor key would reject EVERY bundle
-        // `RekorNotFound` — catch the misprovisioned root here at boot.
+        // trust root with no (time-valid) Rekor key can verify NO bundle, and
+        // a key we failed to provision is a fault on our side rather than a
+        // finding about anyone's artifact — so every artifact in the scope
+        // would be held indefinitely, a scope-wide stall with nothing
+        // terminal to point at. Catch the misprovisioned root here at boot
+        // instead.
         let rekor_keys = cached_trust_root.rekor_keys().map_err(|e| {
             anyhow!(
                 "the pinned Sigstore trust root at {} could not be read for its Rekor keys: {e}",
@@ -1967,12 +1976,38 @@ async fn register_provenance_verify(
             return Err(anyhow!(
                 "the pinned Sigstore trust root at {} carries no Rekor public key (empty/expired \
                  `tlogs`). Provenance verification now requires a Rekor key to verify the Merkle \
-                 inclusion proof + checkpoint signature (ADR 0027); without one every bundle would \
-                 be rejected `RekorNotFound`. Provision a current trusted_root.json with a valid \
-                 Rekor key (rotated via the Hort image/release pipeline).",
+                 inclusion proof + checkpoint signature (ADR 0027); without one no bundle can be \
+                 verified and every artifact in the scope would be held indefinitely. Provision a \
+                 current trusted_root.json with a valid Rekor key (rotated via the Hort \
+                 image/release pipeline).",
                 trusted_root_path.display()
             ));
         }
+
+        // The symmetric assertion on the Fulcio half (ADR 0027 §8). A root
+        // carrying no Fulcio certs / CTFE keys parses cleanly and then
+        // fails at `Verifier::new`, which the verify path calls per
+        // bundle — so every well-formed bundle in the scope is held on our
+        // own provisioning (`Indeterminate{TrustRootUnusable}`: the
+        // publisher's chain is never examined, so there is nothing to
+        // condemn). The two halves make the same scope-wide stall out of
+        // the same class of fault, and a stall with no terminal state and
+        // no event to point at is harder to notice than the wave of
+        // rejections it replaced — which makes failing fast here more
+        // necessary, not less. Probes `Verifier::new` itself rather than
+        // counting certificates, so it cannot drift from what the verify
+        // path requires.
+        cached_trust_root.ensure_builds_verifier().map_err(|e| {
+            anyhow!(
+                "the pinned Sigstore trust root at {} cannot build an offline verifier \
+                 (no Fulcio certs / CTFE keys?): {e}. Without one, no bundle's certificate \
+                 chain can be checked at all and every artifact in the scope would be held \
+                 indefinitely — nothing about those artifacts would be wrong, and nothing \
+                 would be terminal to point at. Provision a current trusted_root.json \
+                 (rotated via the Hort image/release pipeline).",
+                trusted_root_path.display()
+            )
+        })?;
 
         let port: Arc<dyn ProvenancePort> = Arc::new(
             hort_adapters_provenance_sigstore::SigstoreProvenanceAdapter::new(cached_trust_root),

@@ -18,15 +18,40 @@
 //! ## Verdict flow ([`SigstoreProvenanceAdapter::verify`])
 //! - empty `bundles` → [`NoAttestation`] (the unsigned case — **not** an
 //!   error);
-//! - a bundle that does not parse / carries no leaf cert / no offline
-//!   material → [`Rejected(BundleMalformed)`];
+//! - a bundle that does not parse / carries no leaf cert / carries no
+//!   readable identity → **skipped, not judged**: the verifier could not
+//!   read it, so it establishes nothing about the artifact and contributes
+//!   nothing to the verdict — no rejection, no hold, no evidence. The skip
+//!   is counted on the returned verdict
+//!   ([`ProvenanceVerdict::unreadable_skipped`]) so it is not *silent*,
+//!   and a bundle set with nothing readable in it answers
+//!   [`NoAttestation`]. Only findings about material the verifier read may
+//!   condemn an artifact; otherwise anyone who can write a referrer could
+//!   reject somebody else's correctly-signed image by attaching
+//!   unparseable bytes;
 //! - cert chain that does not validate to the trust root → [`Rejected(CertChainInvalid)`];
+//! - a trust root carrying no Fulcio certs / CTFE keys, from which no
+//!   offline verifier can be built at all → **held**
+//!   ([`Indeterminate(TrustRootUnusable)`]), never rejected: the chain
+//!   was never examined, so the rejection above would be a finding about
+//!   a certificate nothing looked at. The worker refuses to boot on such
+//!   a root, so this is the defence rather than the design;
 //! - a bundle whose Rekor Merkle inclusion proof or checkpoint signature
 //!   does not cryptographically verify against the trust root's Rekor key
-//!   (or whose tlog material is structurally absent / unparseable) →
-//!   [`Rejected(RekorNotFound)`] — **never** a fall-back to a live Rekor
-//!   fetch. This catches both a *structurally* absent proof and a
-//!   forged-but-well-formed one whose entry is not provably in the log;
+//!   → [`Rejected(RekorNotFound)`] — **never** a fall-back to a live
+//!   Rekor fetch. That is the forged-but-well-formed entry: a proof the
+//!   verifier read, which did not verify;
+//! - a bundle whose transparency-log material is structurally absent,
+//!   unparseable or impossible (the v0.1 SET-only shape and a negative
+//!   tree size among them) → **skipped**, like any other material nothing
+//!   could be concluded from — it is not garbage and not a forgery, so
+//!   the artifact holds as unsigned rather than being condemned on it;
+//! - a bundle whose entry log id matches no Rekor key in the trust root,
+//!   or whose matching key bytes do not parse → **held**
+//!   ([`Indeterminate(TrustRootUnusable)`]), never rejected: the check
+//!   never ran, and a publisher's correctly signed, log-included artifact
+//!   is not implicated by our own provisioning. The held artifact
+//!   verifies on the next run once the key is there;
 //! - a cryptographically-valid signature whose observed `{issuer, san}`
 //!   matches no allowed [`SignerIdentityPattern`] → [`Rejected(UntrustedIdentity)`];
 //! - valid + trusted + identity-match → [`Verified { signer, predicate_type }`].
@@ -71,17 +96,21 @@
 //! Merkle inclusion over the entry's `canonicalized_body` leaf, **plus** the
 //! checkpoint signature, **plus** root/tree-size consistency — against the
 //! Rekor public key selected from the pinned trust root by the entry's
-//! `logID`. Any failure (absent proof/checkpoint, no matching Rekor key,
-//! unparseable material, bad width, failed Merkle/signature check) is
-//! fail-closed [`Rejected(RekorNotFound)`] — never a panic, never a skip,
-//! never a live Rekor fetch. So this adapter now proves that a valid Fulcio
-//! cert with SCT for a policy-allowed identity signed these bytes **and**
-//! that the entry is provably in the public Rekor transparency log. The
-//! older v0.1 SET-only (`inclusion_promise`) path is out of scope
-//! (ADR 0027:168) and rejected.
+//! `logID`. No failure there can reach `Verified`, and none is ever a
+//! panic or a live Rekor fetch — but fail-closed is not the same thing as
+//! terminal, so which answer a failure gives depends on whose side it is
+//! on: a proof that did not verify is [`Rejected(RekorNotFound)`], a
+//! trust root with no usable key for the entry is a hold, and absent or
+//! unparseable log material is a skip. So this adapter now proves that a
+//! valid Fulcio cert with SCT for a policy-allowed identity signed these
+//! bytes **and** that the entry is provably in the public Rekor
+//! transparency log. The older v0.1 SET-only (`inclusion_promise`) path is
+//! out of scope (ADR 0027:168): a bundle of that shape can never verify
+//! here, and it is skipped rather than condemned.
 //!
+//! [`Indeterminate(TrustRootUnusable)`]: hort_domain::ports::provenance::IndeterminateReason::TrustRootUnusable
 //! [`NoAttestation`]: hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
-//! [`Rejected(BundleMalformed)`]: hort_domain::ports::provenance::ProvenanceRejectReason::BundleMalformed
+//! [`ProvenanceVerdict::unreadable_skipped`]: hort_domain::ports::provenance::ProvenanceVerdict::unreadable_skipped
 //! [`Rejected(CertChainInvalid)`]: hort_domain::ports::provenance::ProvenanceRejectReason::CertChainInvalid
 //! [`Rejected(RekorNotFound)`]: hort_domain::ports::provenance::ProvenanceRejectReason::RekorNotFound
 //! [`Rejected(UntrustedIdentity)`]: hort_domain::ports::provenance::ProvenanceRejectReason::UntrustedIdentity
@@ -183,8 +212,9 @@ impl ProvenancePort for SigstoreProvenanceAdapter {
             // A factory that builds a fresh offline verifier from the
             // cached trust-root bytes on demand (offline; consumes the
             // owned `TrustRoot` `sigstore::Verifier::new` requires). It is
-            // invoked only for a well-formed bundle, so a malformed bundle
-            // is `BundleMalformed` before any trust-root step.
+            // invoked only for a well-formed bundle, so an unreadable
+            // bundle is skipped before any trust-root step — a broken
+            // trust root can never turn one into a chain finding.
             let make_verifier = || {
                 let trust_root = self.trust_root.build_sigstore_trust_root()?;
                 verifier::build_verifier(trust_root)
@@ -195,15 +225,18 @@ impl ProvenancePort for SigstoreProvenanceAdapter {
             // verification each bundle runs *after* `verify_digest`
             // succeeds (ADR 0027; the `verify_digest` consume forces the
             // keys to be extracted before the verifier is built). An empty
-            // map fails every verify closed (`RekorNotFound`); the worker
-            // boot check surfaces a Rekor-keyless trust root up front.
+            // map can never let a verify pass, and it holds every artifact
+            // rather than rejecting one — a missing key is our
+            // provisioning, not a finding — which is why the worker boot
+            // check surfaces a Rekor-keyless trust root up front instead.
             let rekor_keys = self.trust_root.rekor_keys()?;
 
-            // Fold across the supplied bundles: the first bundle that
-            // yields a terminal verdict (Verified or a non-malformed
-            // Rejected) wins; otherwise we keep the "most informative"
-            // rejection. A single OCI artifact usually has one cosign
-            // bundle, but the Referrers surface can carry several.
+            // Fold across the supplied bundles: the first `Verified` wins;
+            // otherwise we keep the "most informative" finding about
+            // material we could read, and if there was none, the honest
+            // `NoAttestation`. A single OCI artifact usually has one
+            // cosign bundle, but the Referrers surface can carry several —
+            // and anyone with write access to it can add one.
             let verdict = verifier::verify_bundles(
                 make_verifier,
                 artifact.payload,
@@ -239,7 +272,9 @@ impl ProvenancePort for SigstoreProvenanceAdapter {
 mod tests {
     use super::*;
     use hort_domain::entities::scan_policy::SignerIdentityPattern;
-    use hort_domain::ports::provenance::{AttestationBundle, ProvenanceOutcome};
+    use hort_domain::ports::provenance::{
+        AttestationBundle, IndeterminateReason, ProvenanceOutcome,
+    };
     use hort_domain::types::ContentHash;
 
     /// `VALID_SHA256` is `sha256(b"")` — so the empty-byte preimage
@@ -289,10 +324,27 @@ mod tests {
         };
         let verdict = a.verify(&subj, &[], &reqs).await.expect("ok");
         assert_eq!(verdict.outcome, ProvenanceOutcome::NoAttestation);
+        // An empty set skipped nothing — the same outcome as an
+        // all-unreadable set, told apart by the count.
+        assert_eq!(verdict.unreadable_skipped, 0);
     }
 
+    /// **Changed meaning.** This test was
+    /// `malformed_bundle_is_rejected_bundle_malformed` and asserted
+    /// `Rejected{BundleMalformed}`.
+    ///
+    /// Bytes the verifier cannot read prove nothing about the artifact, so
+    /// they are not a rejection, not a hold and not evidence of any kind:
+    /// the candidate is skipped and counted, and a set with nothing else
+    /// in it answers `NoAttestation` — "I have nothing to say about this
+    /// artifact". Under `Required` that is the indefinite unsigned hold;
+    /// under `VerifyIfPresent`, the allow. The behaviour the old
+    /// assertion pinned is the exposure: the referrer surface is writable
+    /// by anyone with push access to the repository, so a rejection
+    /// derived from unparseable bytes is a denial-of-service against
+    /// somebody else's correctly-signed image.
     #[tokio::test]
-    async fn malformed_bundle_is_rejected_bundle_malformed() {
+    async fn malformed_bundle_is_skipped_not_rejected() {
         let a = adapter();
         let hash: ContentHash = VALID_SHA256.parse().unwrap();
         let subj = subject(&hash);
@@ -302,12 +354,9 @@ mod tests {
         // Not a Sigstore bundle at all.
         let bundles = [AttestationBundle::new(b"not a bundle".to_vec())];
         let verdict = a.verify(&subj, &bundles, &reqs).await.expect("ok");
-        assert_eq!(
-            verdict.outcome,
-            ProvenanceOutcome::Rejected(
-                hort_domain::ports::provenance::ProvenanceRejectReason::BundleMalformed
-            )
-        );
+        assert_eq!(verdict.outcome, ProvenanceOutcome::NoAttestation);
+        // Skipped, but recorded: *not considered* is not *not noticed*.
+        assert_eq!(verdict.unreadable_skipped, 1);
     }
 
     #[tokio::test]
@@ -331,10 +380,28 @@ mod tests {
         assert_eq!(verdict.outcome, ProvenanceOutcome::NoAttestation);
     }
 
+    /// **Changed meaning, and this is the test whose old comment stated
+    /// the behaviour being reversed.** It was
+    /// `mixed_keyed_and_malformed_keyless_skips_keyed_keeps_keyless_reject`,
+    /// and its comment read *"the keyed bundle is skipped, but the
+    /// malformed KEYLESS bundle still drives the verdict"*.
+    ///
+    /// Nothing in this set drives a verdict any more. Both candidates are
+    /// skipped — the keyed one because it is not this verifier's, the
+    /// unreadable one because nothing can be concluded from it — and the
+    /// two skips are *different* skips, which is why only one of them is
+    /// counted: a keyed bundle was not read because it belongs to the
+    /// other backend, and counting it would make every keyed-signed
+    /// artifact look like it carried garbage.
+    ///
+    /// On a worker running BOTH backends this exact set is the attack this
+    /// unit closes: the keyed verifier verifies the real signature, this
+    /// verifier answers `NoAttestation`, and the fold is `Verified`. The
+    /// end-to-end proof is in the orchestration tests
+    /// (`a_valid_keyed_signature_survives_unreadable_keyless_garbage`);
+    /// here it is this verifier's half.
     #[tokio::test]
-    async fn mixed_keyed_and_malformed_keyless_skips_keyed_keeps_keyless_reject() {
-        // A mixed set: the keyed bundle is skipped, but the malformed KEYLESS
-        // bundle still drives the verdict — the keyed one does not mask it.
+    async fn mixed_keyed_and_unreadable_keyless_both_skip_to_no_attestation() {
         let a = adapter();
         let hash: ContentHash = VALID_SHA256.parse().unwrap();
         let subj = subject(&hash);
@@ -346,11 +413,10 @@ mod tests {
             AttestationBundle::new(b"not a bundle".to_vec()),
         ];
         let verdict = a.verify(&subj, &bundles, &reqs).await.expect("ok");
+        assert_eq!(verdict.outcome, ProvenanceOutcome::NoAttestation);
         assert_eq!(
-            verdict.outcome,
-            ProvenanceOutcome::Rejected(
-                hort_domain::ports::provenance::ProvenanceRejectReason::BundleMalformed
-            )
+            verdict.unreadable_skipped, 1,
+            "only the unreadable keyless candidate counts — the keyed one was not ours",
         );
     }
 
@@ -391,12 +457,15 @@ mod tests {
         }
     }
 
+    /// **Changed meaning.** The happy guard branch: the payload hashes to
+    /// `content_hash`, so the adapter proceeds to the bundle and the
+    /// *bundle* drives the outcome rather than the guard. That is still
+    /// what this asserts — only the bundle's own answer moved: `{}` parses
+    /// as JSON but carries no verification material, so it is a candidate
+    /// the verifier cannot read, and the recorded skip is the proof the
+    /// adapter got past the guard and into `verify_bundles`.
     #[tokio::test]
     async fn valid_payload_invariant_reaches_bundle_verdict() {
-        // The happy guard branch: payload hashes to content_hash, so the
-        // adapter proceeds to the bundle and the verdict is driven by the
-        // bundle (here `{}` parses as JSON but is not a valid bundle →
-        // BundleMalformed), not the guard.
         let a = adapter();
         let hash: ContentHash = VALID_SHA256.parse().unwrap();
         let subj = subject(&hash); // payload: b"" == sha256 preimage of VALID_SHA256
@@ -405,11 +474,10 @@ mod tests {
         };
         let bundles = [AttestationBundle::new(b"{}".to_vec())];
         let verdict = a.verify(&subj, &bundles, &reqs).await.expect("ok");
+        assert_eq!(verdict.outcome, ProvenanceOutcome::NoAttestation);
         assert_eq!(
-            verdict.outcome,
-            ProvenanceOutcome::Rejected(
-                hort_domain::ports::provenance::ProvenanceRejectReason::BundleMalformed
-            )
+            verdict.unreadable_skipped, 1,
+            "the bundle was examined (and unreadable) — not short-circuited by the guard",
         );
     }
 
@@ -442,15 +510,28 @@ mod tests {
     }
 
     /// The real committed cosign bundle parses, the leaf identity is
-    /// extracted, and — because it does **not** chain to our *fixture*
-    /// (empty) trust root — it is rejected with a cert/SET reason, never
-    /// `Verified`. This exercises the full parse → identity-extract →
-    /// offline-crypto path end to end against a real-world bundle without
-    /// a live network. (A `Verified` outcome would require the matching
+    /// extracted, and the offline-crypto step is reached — exercising the
+    /// full parse → identity-extract → offline-crypto path end to end
+    /// against a real-world bundle without a live network. It is never
+    /// `Verified`. (A `Verified` outcome would require the matching
     /// public-good trust root + the original artifact preimage, neither of
     /// which is reproducible offline — see the crate-level fixture note.)
+    ///
+    /// **Changed verdict.** This was
+    /// `real_cosign_bundle_against_fixture_root_is_rejected_not_verified`
+    /// and asserted `Rejected(_)` — "*it is rejected with a cert/SET
+    /// reason*" — because the fixture trust root's inability to build a
+    /// verifier was stated as a finding about the publisher's chain. The
+    /// fixture root carries no Fulcio certs, so that chain is never
+    /// examined; the honest answer is the hold, and this is the adapter's
+    /// whole-`verify` statement of it.
+    ///
+    /// It asserts the reason rather than `Indeterminate(_)`, because the
+    /// hold this path must produce is specifically the trust-root one: an
+    /// adapter answering some *other* indeterminate here would be
+    /// reporting a different fault than the one that occurred.
     #[tokio::test]
-    async fn real_cosign_bundle_against_fixture_root_is_rejected_not_verified() {
+    async fn real_cosign_bundle_against_unusable_fixture_root_holds_not_verified() {
         let a = adapter();
         let hash: ContentHash = VALID_SHA256.parse().unwrap();
         let subj = subject(&hash);
@@ -469,12 +550,17 @@ mod tests {
             "real bundle must not verify against the empty fixture trust root: {:?}",
             verdict.outcome
         );
-        // And it must be a typed rejection (cert chain / SET / malformed),
-        // never a silent pass.
-        assert!(
-            matches!(verdict.outcome, ProvenanceOutcome::Rejected(_)),
-            "expected a typed Rejected, got {:?}",
-            verdict.outcome
+        // And it must be the typed hold that names our trust root — never
+        // a silent pass, and never a rejection minted from a certificate
+        // chain no verifier was ever built to examine.
+        assert_eq!(
+            verdict.outcome,
+            ProvenanceOutcome::Indeterminate(IndeterminateReason::TrustRootUnusable),
+            "a trust root that cannot build a verifier is our fault, not the publisher's",
         );
+        // The bundle was read in full on the way there, so it is not a
+        // skip either: *not checked* and *not readable* are different
+        // records, and only one of them is true here.
+        assert_eq!(verdict.unreadable_skipped, 0);
     }
 }

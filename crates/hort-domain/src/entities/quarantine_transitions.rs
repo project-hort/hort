@@ -546,6 +546,9 @@ const COMPLETE_PROVENANCE_TRIGGERS: &[&str] = &[
     "ProvenanceOutcome::Verified -> no-op (status unchanged, success record only)",
     "ProvenanceOutcome::Rejected (positive disproof) -> Rejected, ProvenanceRejected + ArtifactRejected",
     "ProvenanceOutcome::NoAttestation -> no-op in every mode (Required: held Quarantined/Pending)",
+    "ProvenanceOutcome::Indeterminate (the check could not run) -> no-op in every mode, \
+     identical to NoAttestation (Required: held Quarantined/Pending); our own failure \
+     proves nothing about the artifact, so nothing terminalises",
 ];
 
 // ---------------------------------------------------------------------------
