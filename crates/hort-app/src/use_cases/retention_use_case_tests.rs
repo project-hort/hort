@@ -34,7 +34,7 @@ use hort_domain::retention::{
     BooleanOp, ExpirationReason, PolicyPredicate, RetentionEvaluationMode, RetentionPolicy,
     RetentionPolicyEvent, RetentionScope,
 };
-use hort_domain::types::Finding;
+use hort_domain::types::{ComponentRelation, Finding};
 
 use crate::event_store_publisher::wrap_for_test;
 use crate::use_cases::retention_use_case::{RetentionCandidate, RetentionUseCase};
@@ -126,6 +126,7 @@ fn finding(sev: SeverityThreshold, cvss: Option<f32>, fixed: Vec<&str>) -> Findi
         aliases: vec![],
         informational_class: None,
         severity_basis: hort_domain::types::SeverityBasis::Assessed,
+        component_relation: ComponentRelation::NotEstablished,
     }
 }
 

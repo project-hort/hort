@@ -322,6 +322,7 @@ fn non_security_reason(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> Exp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ComponentRelation;
 
     fn ts(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(secs, 0).unwrap()
@@ -340,6 +341,7 @@ mod tests {
             aliases: vec![],
             informational_class: None,
             severity_basis: crate::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 

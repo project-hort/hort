@@ -887,6 +887,7 @@ pub(crate) mod tests {
                     aliases: vec![],
                     informational_class: None,
                     severity_basis: crate::types::SeverityBasis::Assessed,
+                    component_relation: crate::types::ComponentRelation::NotEstablished,
                 }],
                 previously_clean_at: Utc::now(),
             }),

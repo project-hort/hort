@@ -46,7 +46,8 @@ use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::advisory::{AdvisoryDiffResult, AdvisoryPort};
 use hort_domain::ports::ephemeral_store::EphemeralStore;
 use hort_domain::types::{
-    collapse_alias_groups, is_informational_class, Ecosystem, Finding, SbomComponent, SeverityBasis,
+    collapse_alias_groups, is_informational_class, ComponentRelation, Ecosystem, Finding,
+    SbomComponent, SeverityBasis,
 };
 
 use crate::bulk::{osv_label_to_ecosystem, pull_one_ecosystem, BulkFetchErrorKind};
@@ -563,6 +564,7 @@ impl OsvAdvisoryAdapter {
             aliases,
             informational_class,
             severity_basis,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 }

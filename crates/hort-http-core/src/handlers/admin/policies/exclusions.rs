@@ -496,7 +496,7 @@ mod tests {
     use hort_domain::ports::identity_provider::IdentityProvider;
     use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
     use hort_domain::ports::user_repository::UserRepository;
-    use hort_domain::types::{ArtifactCoords, Finding, SeverityBasis};
+    use hort_domain::types::{ArtifactCoords, ComponentRelation, Finding, SeverityBasis};
 
     use crate::context::AuthContext;
     use crate::test_support::{build_mock_ctx, with_auth, MockPorts};
@@ -669,6 +669,7 @@ mod tests {
             aliases: Vec::new(),
             informational_class: None,
             severity_basis: SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 

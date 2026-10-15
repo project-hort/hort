@@ -2418,6 +2418,7 @@ mod tests {
     };
     use hort_domain::ports::content_reference_index::ContentReference;
     use hort_domain::ports::event_store::ExpectedVersion;
+    use hort_domain::types::ComponentRelation;
     use uuid::Uuid;
 
     use metrics::SharedString;
@@ -2644,6 +2645,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             });
         }
         for i in 0..severity.high {
@@ -2659,6 +2661,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             });
         }
         for i in 0..severity.medium {
@@ -2674,6 +2677,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             });
         }
         for i in 0..severity.low {
@@ -2689,6 +2693,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             });
         }
         out
@@ -4686,6 +4691,7 @@ mod tests {
             aliases: vec![],
             informational_class: None,
             severity_basis: hort_domain::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }];
         uc.record_scan_result(
             artifact_id,
@@ -10172,6 +10178,7 @@ spec:
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             });
         }
         // Sanity: confirm we cleared the cap before invoking the use case.

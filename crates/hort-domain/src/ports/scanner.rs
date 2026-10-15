@@ -188,6 +188,43 @@ impl ScanAnalysis {
 }
 
 // ---------------------------------------------------------------------------
+// EvidenceBasis
+// ---------------------------------------------------------------------------
+
+/// What a scanner backend looked at in order to produce its findings.
+///
+/// This is the backend's own, permanent property — not a per-scan outcome
+/// — and the consumer needs it for one question it cannot answer any other
+/// way: **what does it mean when a finding's `purl` matches nothing in the
+/// artifact's SBOM?**
+///
+/// - [`Self::MaterialisedPayload`] — the backend pulled the artifact's
+///   bytes out of storage and reported what it unpacked. A package it
+///   names that the BOM never listed is a normal outcome, because the BOM
+///   and the materialised tree are derived differently; the package was in
+///   the artifact either way.
+/// - [`Self::SuppliedSbom`] — the BOM *is* the backend's whole input. A
+///   purl matching nothing in it cannot be a package discovered elsewhere,
+///   so it is a join that failed, and the consumer records that it could
+///   not establish the relation rather than inventing one.
+///
+/// Deriving the distinction from the backend's evidence, rather than from
+/// a list of backend names held by the consumer, is what keeps it correct
+/// when a backend is added: "did this come from the payload or from the
+/// BOM?" has an answer for any scanner, while a name list silently omits
+/// the new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceBasis {
+    /// The backend materialises the artifact's stored bytes and scans what
+    /// it unpacked (Trivy).
+    MaterialisedPayload,
+    /// The backend consumes the supplied SBOM and never reads the payload
+    /// (OSV-scanner). The same basis as the advisory-enrichment path,
+    /// which the orchestrator feeds with the component list directly.
+    SuppliedSbom,
+}
+
+// ---------------------------------------------------------------------------
 // ScannerPort
 // ---------------------------------------------------------------------------
 
@@ -232,6 +269,17 @@ pub trait ScannerPort: Send + Sync {
     /// claimed without evidence is the false release authority the split
     /// between a verdict and an abstention exists to prevent.
     fn applies_to(&self, format: &str) -> bool;
+
+    /// What this backend looked at to produce its findings — see
+    /// [`EvidenceBasis`].
+    ///
+    /// Required, with no default, for the same reason
+    /// [`applies_to`](Self::applies_to) is: a defaulted answer would let a
+    /// new adapter inherit a claim about its own evidence that nobody
+    /// checked. The two readings differ in what the consumer records for a
+    /// finding the SBOM does not list, so an inherited wrong answer is
+    /// silent — it produces a plausible relation on every such finding.
+    fn evidence_basis(&self) -> EvidenceBasis;
 
     /// Run the scanner against the target and return what came of it.
     ///
@@ -279,6 +327,9 @@ mod tests {
             fn applies_to(&self, format: &str) -> bool {
                 format == "maven"
             }
+            fn evidence_basis(&self) -> EvidenceBasis {
+                EvidenceBasis::MaterialisedPayload
+            }
             fn scan<'a>(
                 &'a self,
                 _target: &'a ScanTarget<'a>,
@@ -294,6 +345,25 @@ mod tests {
         assert!(port.applies_to("maven"));
         assert!(!port.applies_to("oci"));
         assert!(!port.applies_to("gradle"));
+        // Same shape, same reason: `evidence_basis` is required, so the
+        // stub had to state it, and it is dispatchable through the trait
+        // object the orchestrator holds.
+        assert_eq!(port.evidence_basis(), EvidenceBasis::MaterialisedPayload);
+    }
+
+    /// The two bases are distinct values and both are constructible —
+    /// the consumer branches on them and would read a collapsed enum as
+    /// "every backend scanned the payload".
+    #[test]
+    fn evidence_basis_variants_are_distinct_and_debug_printable() {
+        assert_ne!(
+            EvidenceBasis::MaterialisedPayload,
+            EvidenceBasis::SuppliedSbom
+        );
+        let copied = EvidenceBasis::SuppliedSbom;
+        assert_eq!(copied, EvidenceBasis::SuppliedSbom);
+        assert!(format!("{:?}", EvidenceBasis::MaterialisedPayload).contains("MaterialisedPayload"));
+        assert!(format!("{:?}", EvidenceBasis::SuppliedSbom).contains("SuppliedSbom"));
     }
 
     /// `Box<dyn ScannerPort>` resolves — proves the trait can be

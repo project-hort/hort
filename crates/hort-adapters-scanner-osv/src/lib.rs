@@ -48,7 +48,8 @@ use std::time::Duration;
 
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::scanner::{
-    NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER,
+    EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort,
+    SCAN_REPORT_TOO_LARGE_MARKER,
 };
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{Finding, Sbom};
@@ -450,6 +451,14 @@ impl ScannerPort for OsvScannerAdapter {
     /// over. [`SBOM_CAPABLE_FORMATS`] holds the set and the reasoning.
     fn applies_to(&self, format: &str) -> bool {
         SBOM_CAPABLE_FORMATS.contains(&format)
+    }
+
+    /// The supplied SBOM is this backend's entire input — it opens no
+    /// storage read and the raw payload is irrelevant to it (see the
+    /// workspace module docs). Every package it can possibly name came
+    /// out of the BOM it was handed.
+    fn evidence_basis(&self) -> EvidenceBasis {
+        EvidenceBasis::SuppliedSbom
     }
 
     /// OSV-scanner adjudicates the **SBOM**, not the payload, so the

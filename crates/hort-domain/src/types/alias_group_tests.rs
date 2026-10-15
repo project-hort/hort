@@ -10,6 +10,7 @@
 use super::*;
 use crate::entities::scan_policy::SeverityThreshold;
 use crate::types::finding::severity_summary_from_findings;
+use crate::types::ComponentRelation;
 
 const RAND_PURL: &str = "pkg:cargo/rand@0.7.3";
 const TYPEMAP_PURL: &str = "pkg:cargo/typemap@0.3.3";
@@ -31,6 +32,7 @@ fn bare_mirror(purl: &str, id: &str, aliases: &[&str]) -> Finding {
         aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
         informational_class: None,
         severity_basis: SeverityBasis::Unassessed,
+        component_relation: ComponentRelation::NotEstablished,
     }
 }
 
@@ -42,6 +44,7 @@ fn informational(purl: &str, id: &str, class: &str, aliases: &[&str]) -> Finding
         severity: SeverityThreshold::Low,
         informational_class: Some(class.into()),
         severity_basis: SeverityBasis::Assessed,
+        component_relation: ComponentRelation::NotEstablished,
         ..bare_mirror(purl, id, aliases)
     }
 }
@@ -52,6 +55,7 @@ fn scored(purl: &str, id: &str, score: f32, sev: SeverityThreshold, aliases: &[&
         severity: sev,
         cvss_score: Some(score),
         severity_basis: SeverityBasis::Assessed,
+        component_relation: ComponentRelation::NotEstablished,
         ..bare_mirror(purl, id, aliases)
     }
 }
@@ -63,6 +67,7 @@ fn label_only(purl: &str, id: &str, sev: SeverityThreshold, aliases: &[&str]) ->
     Finding {
         severity: sev,
         severity_basis: SeverityBasis::Assessed,
+        component_relation: ComponentRelation::NotEstablished,
         ..bare_mirror(purl, id, aliases)
     }
 }

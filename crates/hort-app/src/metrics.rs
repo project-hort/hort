@@ -2957,6 +2957,43 @@ pub fn emit_sbom_resolution(format: &str, result: SbomResolutionResult) {
     .increment(1);
 }
 
+/// Emit `hort_finding_component_relation_total{format, result}` once per
+/// finding the scan path tags with a
+/// [`ComponentRelation`](hort_domain::types::ComponentRelation).
+///
+/// **The label taxonomy is the domain enum itself**, rendered by
+/// `hort_domain::types::component_relation_label` — the same precedent as
+/// the `severity` label on `hort_scan_findings_total`. A parallel
+/// label enum here would be a second four-arm taxonomy to hold in step
+/// with the one that is actually persisted on the finding, with nothing
+/// but review to keep them equal; `SbomResolutionResult` carries its own
+/// enum because it has two arms the handler vocabulary cannot express,
+/// and this counter has none.
+///
+/// **Why this counter exists.** `not_established` is the relation the
+/// scan path assigns when it could not join a finding to the artifact's
+/// BOM, and the stored finding treats it as condemning. That default is
+/// only defensible while it stays rare: every production SBOM builder
+/// derives its subject from the artifact's coordinates rather than its
+/// payload, so a fresh scan should essentially never produce one. A
+/// non-zero `not_established` rate on new scans is therefore a defect in
+/// the format's SBOM builder (or in the purl spelling on one side of the
+/// join), not a resting state — and without this series nothing would
+/// say so.
+///
+/// Emitted at tagging time, so it ticks once per **producer** finding —
+/// unlike `hort_scan_findings_total`, which ticks after the
+/// cross-backend dedup. That is deliberate: a tagging decision is what
+/// is being counted, and the one a merge discards was still made.
+pub fn emit_component_relation(format: &str, relation: hort_domain::types::ComponentRelation) {
+    metrics::counter!(
+        "hort_finding_component_relation_total",
+        labels::FORMAT => format.to_string(),
+        labels::RESULT => hort_domain::types::component_relation_label(relation),
+    )
+    .increment(1);
+}
+
 /// Add `count` to `hort_sbom_components_skipped_total{format}` — the
 /// dependencies a resolved closure walked through but could not emit,
 /// for having no registry coordinates (path- and git-sourced entries).
@@ -3089,6 +3126,15 @@ pub fn register_scan_metrics() {
          payload_unavailable / not_applicable)"
     );
     let _ = counter!("hort_sbom_resolution_total");
+
+    describe_counter!(
+        "hort_finding_component_relation_total",
+        Unit::Count,
+        "findings tagged by the scan path, by `format` and how the component the \
+         finding names relates to the artifact (`result`: subject / contained / \
+         not_contained / not_established)"
+    );
+    let _ = counter!("hort_finding_component_relation_total");
 
     describe_counter!(
         "hort_sbom_components_skipped_total",
@@ -7270,6 +7316,7 @@ mod tests {
             "hort_advisory_query_total",
             "hort_sbom_extraction_total",
             "hort_sbom_resolution_total",
+            "hort_finding_component_relation_total",
             "hort_sbom_components_skipped_total",
             "hort_artifact_became_vulnerable_total",
             "hort_scan_record_outcome_failures_total",

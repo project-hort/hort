@@ -510,6 +510,14 @@ impl FormatHandler for PyPiFormatHandler {
         }
     }
 
+    /// A wheel or sdist ships the distribution's own modules; its
+    /// dependencies are `Requires-Dist` declarations resolved by the
+    /// installer against the index, so the BOM's components are names the
+    /// artifact does not carry.
+    fn payload_contains_components(&self) -> bool {
+        false
+    }
+
     /// Parse a download path like `simple/{project}/{filename}` into coordinates.
     ///
     /// Version is not extracted from the filename — it comes from upload

@@ -23,7 +23,7 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::repo_security_score_repository::RepoSecurityScore;
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
-use hort_domain::types::{Finding, SeverityBasis};
+use hort_domain::types::{ComponentRelation, Finding, SeverityBasis};
 
 use crate::BoxFuture;
 
@@ -90,6 +90,12 @@ impl FindingRow {
             // behaves identically to a legacy blob-sourced one and is
             // never talked down by a lower reading.
             severity_basis: SeverityBasis::Assessed,
+            // The projection has no column for the component relation
+            // either, so it cannot be reconstructed from these rows.
+            // `NotEstablished` is the honest reading — nothing here
+            // established one — and the fail-closed one: the finding
+            // keeps the release authority it has today.
+            component_relation: ComponentRelation::NotEstablished,
         })
     }
 }

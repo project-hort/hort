@@ -5914,7 +5914,7 @@ mod tests {
     // directions pass + paginated population port)
     // ---------------------------------------------------------------------
 
-    use hort_domain::types::Finding;
+    use hort_domain::types::{ComponentRelation, Finding};
     use sha2::{Digest, Sha256};
 
     /// Build an active (`Released` by default) artifact under `repo_id`.
@@ -5958,6 +5958,7 @@ mod tests {
             aliases: vec![],
             informational_class: None,
             severity_basis: hort_domain::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 

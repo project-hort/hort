@@ -2779,6 +2779,7 @@ intentionally NOT operator-tunable.
 | `hort_advisory_hydration_total` | counter | `result` | — | `cache_hit`, `fetched`, `failed` |
 | `hort_sbom_extraction_total` | counter | `format`, `result` | — | `result ∈ {success, unsupported_format, parse_error, payload_unavailable}` |
 | `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, unusable_lockfile, payload_unavailable, not_applicable}` |
+| `hort_finding_component_relation_total` | counter | `format`, `result` | — | `result ∈ {subject, contained, not_contained, not_established}` |
 | `hort_sbom_components_skipped_total` | counter | `format` | — | — (the skip count rides the counter's value) |
 | `hort_artifact_became_vulnerable_total` | counter | `repository`, `severity`, `ingest_source` | — | `severity ∈ {critical, high, medium, low}`; `ingest_source ∈ {direct, proxied}` |
 | `hort_scan_record_outcome_failures_total` | counter | `result`, `scanner` | — | `result ∈ {failed_branch, report_too_large, nothing_analysable, inert_pairing}`; `scanner ∈ {(none), trivy, osv, …registered backend names}` |
@@ -2798,6 +2799,15 @@ Source of truth for the result enums:
   lifted from `hort_domain::ports::format_handler::SbomResolution` (the
   handler-side vocabulary) via `From`; the remaining two are outcomes only
   the orchestrator can observe.
+- `hort_domain::types::ComponentRelation` for
+  `hort_finding_component_relation_total.result` — the **domain** enum
+  itself, rendered by `hort_domain::types::component_relation_label` and
+  pinned equal to the variant's persisted `serde` spelling. There is no
+  parallel enum in the emitting layer, for the same reason
+  `hort_scan_findings_total.severity` has none: the taxonomy is exactly
+  the one written onto the finding, with no arm only the orchestrator can
+  see, so a second copy here would be a taxonomy to keep in step rather
+  than a translation of anything.
 
 Adding a variant to any of those enums requires updating this catalog
 in the same change.
@@ -2822,6 +2832,37 @@ transition; closed taxonomy of 4):
 - `retried` — emitted when `record_outcome` reschedules the job for
   a future attempt via `JobsRepository::reschedule`. One tick per
   reschedule call.
+
+**`hort_finding_component_relation_total` semantics** — emitted by
+`ScanOrchestrationUseCase::run_scan` once per finding as it is tagged
+with the component it is about (ADR 0056 as amended 2026-10-15). Closed
+taxonomy of 4, mirroring `hort_domain::types::ComponentRelation`:
+
+- `subject` — the finding names the artifact's own subject component.
+- `contained` — it names something else whose code the artifact carries:
+  a component listed in the BOM of a format whose payload contains its
+  closure (an OCI image and its layers), or any package a
+  payload-scanning backend unpacked out of the artifact.
+- `not_contained` — it names a component the artifact's BOM lists but its
+  payload does not ship (a cargo `.crate`'s lockfile pins, an npm
+  packument's dependency ranges, a POM's `<dependencies>`). True
+  information about the dependency; no evidence about this artifact.
+- `not_established` — the relation could not be determined: an
+  SBOM-driven producer reported a purl the BOM does not name, or the BOM
+  has no subject to join against.
+
+**Read `not_established` as a defect, not as background.** Every
+compiled-in SBOM builder derives its subject from the artifact's
+coordinates rather than its payload, so a fresh scan should essentially
+never produce one; a non-zero rate on new scans means a format's subject
+is not being derived, or the two sides of the purl join are spelling it
+differently. The stored relation treats `not_established` as condemning
+(the fail-closed reading of absent evidence), and that default is only
+defensible while it stays rare — this series is what says whether it is.
+
+Unlike `hort_scan_findings_total`, this counter ticks **before** the
+cross-backend dedup: it counts tagging decisions, and a decision a merge
+later discards was still made.
 
 **`hort_scan_findings_total` semantics** — emitted by
 `ScanOrchestrationUseCase::run_scan` once per (deduplicated) finding

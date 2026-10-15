@@ -388,6 +388,14 @@ impl FormatHandler for NpmFormatHandler {
         }
     }
 
+    /// A published npm tarball contains the package's own files and no
+    /// `node_modules`: the dependency *ranges* in `package.json` are what
+    /// the BOM is built from, and the installer resolves them against the
+    /// registry at install time. None of that code is in the artifact.
+    fn payload_contains_components(&self) -> bool {
+        false
+    }
+
     /// Parse a tarball download path into coordinates.
     ///
     /// Accepts both shapes:

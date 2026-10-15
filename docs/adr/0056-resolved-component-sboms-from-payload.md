@@ -13,6 +13,10 @@
   `hort_sbom_resolution_total{format, result}` counter, whose `no_lockfile`
   and `unusable_lockfile` arms make every non-resolved outcome observable
   rather than silent.
+- **Amended 2026-10-15** — a finding condemns only an artifact that carries
+  the named component; see the amendment below. Enforced by
+  `hort_domain::types::ComponentRelation` and the single predicate
+  `Finding::may_condemn_artifact`, consumed by `evaluate_scan_result`.
 - **Supersedes:** —
 - **Relates:** [0005](0005-wasm-format-modules-capability-taxonomy.md) (the
   capability-group shape this reuses),
@@ -339,6 +343,72 @@ finding is kept and observable without becoming release authority.
 configuration this note is for; #259 tracks the apply-time warn-rule
 that flags `reject × proxy × payload-resolve format` so an operator is
 told rather than left to discover it from a rejected release.
+
+## Amendment (2026-10-15) — a finding condemns only an artifact that carries the named component
+
+**What this narrows.** The 2026-09-17 amendment above removed the
+repository-class gate and located the remaining risk control in operator
+configuration. Its *Rationale reversal* section reads, in part:
+
+> *"That argument correctly identifies a risk, but it locates the fix in the
+> wrong layer: it makes the scanner withhold information the repository
+> configuration says should exist, **rather than letting the operator's
+> `enforcement` setting decide what a finding does to the artifact**."*
+
+The first half stands and is not reopened: the SBOM carries the resolved
+components on every repository class, proxies included. **The second half is
+withdrawn.** `enforcement` is the wrong instrument for this question, because
+it is artifact-wide: it cannot tell a finding *about this artifact* from a
+finding about something the artifact does not contain. It offers the operator
+a choice between "everything gates" and "nothing gates" when the correct
+answer lies between the two.
+
+**The decision.** A finding may condemn an artifact only when the affected
+code is **in** that artifact. For a source distribution that is the subject
+component alone; a component resolved out of a manifest or lockfile the
+payload merely *ships* carries no release authority. For a format whose
+payload contains its closure — an OCI image and its layers — the non-subject
+components are contained, and they condemn exactly as before. The component
+list is unchanged either way: a non-contained finding stays recorded,
+queryable and counted, and loses only its authority over the release gate.
+
+**This is not the alternative rejected above.** That section rejected
+per-repository-class gate power, because it "adds a second mechanism
+duplicating what `enforcement` already does". This keys on the
+**component's relation to the artifact**, not on the repository's class — a
+different axis, and not a duplicate. `enforcement` answers *"should findings
+gate in this repository?"*, which is an operator's risk preference. The
+relation answers *"is this finding about this artifact?"*, which is a question
+of fact with one correct answer and is not the operator's to set.
+
+**Why the previous mitigation was not enough — measured, not argued.** The
+2026-09-17 *Operator note* predicted this exact failure, named `crates-proxy`
+as "exactly the configuration this note is for", recommended
+`enforcement: record` there, and deferred an apply-time warning to a tracking
+issue. By 2026-10-15 none of it had taken effect: the warn-rule was never
+built and its issue closed carrying a different subject, the proxy policy
+still declares no `enforcement` key at all (so it falls back to `Reject` by
+design — "non-enforcement is an explicit operator declaration, never a
+fallback"), and a release was blocked by a terminal rejection of
+`hyper-util 0.1.21` caused by an advisory against `h2 0.4.13` — a version read
+out of the crate's own embedded `Cargo.lock`, which a consumer's build
+ignores, and which this workspace resolves to the patched `0.4.16`. The
+advisory's own text reads "Low severity". A mitigation that lives in operator
+configuration, for a hazard the system can recognise itself, is the wrong
+layer twice over.
+
+**What stays untouched.** ADR 0007's release predicate: no authority is added,
+removed or reinterpreted, and this changes only what counts as a *blocking*
+finding. ADR 0059's reconciliation: alias collapsing and the
+information-quality merge decide which finding survives a collision; this
+decides whether a survivor may condemn. ADR 0040's negligible lane is reused
+rather than duplicated — a non-contained finding rides a non-enforcing lane
+exactly as an informational one does.
+
+**Deliberately not decided here.** The `Unassessed → Critical` severity floor
+is a separate question and is left as it stands. It had no part in this
+decision beyond raising the same artifact's severity, and narrowing it would
+require widening a rescan-candidacy query for a case with no current victim.
 
 ## References
 

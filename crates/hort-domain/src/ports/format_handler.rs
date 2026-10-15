@@ -890,6 +890,50 @@ pub trait FormatHandler: Send + Sync {
         Ok(None)
     }
 
+    /// Whether this format's payload **carries the code of the
+    /// components its SBOM lists** — the fact that decides whether a
+    /// finding against a non-subject component is about this artifact.
+    ///
+    /// The two shapes a format can have:
+    ///
+    /// - A **source or single-unit distribution** answers `false`. A
+    ///   cargo `.crate` embeds the publishing maintainer's own
+    ///   `Cargo.lock`, a wheel embeds `Requires-Dist`, a packument lists
+    ///   `dependencies`, a POM lists `<dependencies>` — every one of those
+    ///   *names* a component without shipping a byte of it, and a
+    ///   consumer's build resolves its own versions anyway. An advisory
+    ///   against such a component is true information about the
+    ///   dependency and no evidence at all about this artifact.
+    /// - A **self-contained distribution** answers `true`. An OCI image
+    ///   carries its layers, so a component in its BOM is code in the
+    ///   artifact and a finding against it is a finding against the
+    ///   artifact.
+    ///
+    /// # Why the declaration lives here
+    ///
+    /// Containment is a property of the *format*, not of the repository,
+    /// the operator's configuration or the scanner that happened to run.
+    /// The alternative — a list of format keys held by the consumer —
+    /// ages silently: the entry a new format never got is invisible until
+    /// one of its artifacts is wrongly condemned, or wrongly spared.
+    /// Declaring it on the handler (ADR 0005) makes a new format answer
+    /// the question by construction.
+    ///
+    /// # Why the default is `true`
+    ///
+    /// `true` is the fail-closed answer: it keeps every finding's release
+    /// authority exactly as it is today, so a format that has not thought
+    /// about the question cannot lose a verdict by inheriting one. A
+    /// `false` default would strip authority from the component findings
+    /// of every format that never overrode it, which is a fail-open
+    /// regression against ADR 0007 of the same shape
+    /// [`crate::types::ComponentRelation`]'s `NotEstablished` default
+    /// avoids. The four formats whose BOM is a *declaration* rather than
+    /// a shipped closure override it.
+    fn payload_contains_components(&self) -> bool {
+        true
+    }
+
     /// `Some` iff this format declares the [`PayloadSbom`] capability
     /// group — deriving the SBOM's components from the artifact's own
     /// stored bytes rather than from `format_metadata`. Default `None`.
@@ -1201,6 +1245,17 @@ mod tests {
     #[test]
     fn default_metadata_expected_max_bytes_is_64_kb() {
         assert_eq!(DefaultsOnlyHandler.metadata_expected_max_bytes(), 64 * 1024);
+    }
+
+    /// A handler that has not thought about containment inherits "my
+    /// payload carries what my BOM lists" — the answer under which every
+    /// finding keeps the release authority it has today. Flipping this
+    /// default to `false` would silently disarm the component findings of
+    /// every format that never overrode it, which is the fail-open
+    /// direction (ADR 0007); nothing else in the suite would notice.
+    #[test]
+    fn default_payload_contains_components_is_true() {
+        assert!(DefaultsOnlyHandler.payload_contains_components());
     }
 
     /// Build an artifact row good enough to classify. Only `path` and

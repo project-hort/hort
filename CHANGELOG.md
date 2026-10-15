@@ -1513,6 +1513,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A finding condemns only an artifact that carries the named component**
+  (#351). A cargo `.crate` is a source distribution: it ships the publishing
+  maintainer's own `Cargo.lock` and none of the code that lockfile pins, and a
+  consumer's build ignores a dependency's lockfile entirely. The SBOM is built
+  by walking that file (ADR 0056), so an advisory against one of those pins was
+  recorded against the artifact and counted toward its release verdict.
+  Measured: `hyper-util 0.1.21` sat terminally rejected over
+  `RUSTSEC-2026-0258` against `h2 0.4.13` — a version no build here resolves
+  (this workspace locks `h2 0.4.16`, above the advisory's own patch floor) and
+  whose code is in no `.crate` — while the advisory's text reads
+  *"Low severity."*
+
+  **ADR 0056's 2026-10-15 amendment** narrows the decision: a finding may
+  condemn an artifact only when the affected code is **in** that artifact. Its
+  2026-09-17 amendment had located this control in the operator's
+  `enforcement` setting; that half is withdrawn, because `enforcement` is
+  artifact-wide and cannot tell a finding *about this artifact* from one about
+  a component the artifact does not contain. The axis is the component's
+  relation to the artifact, not the repository's class — so this is not the
+  per-repository-class gate power that amendment considered and rejected.
+
+  A non-carried finding **stays recorded**: present in `ScanCompleted`, in the
+  findings blob, in `scan_findings` and on the events surface, counted by the
+  severity summary, and queryable exactly as before. Only its authority over
+  the release gate is withheld, on the non-enforcing lane ADR 0040 already
+  defines for informational findings.
+
+  `Finding::component_relation` records the fact and
+  `Finding::may_condemn_artifact` is the single place it becomes authority.
+  Containment is declared by each format handler (`.crate`, npm tarball, wheel
+  and POM carry no closure; an OCI image carries its layers) rather than
+  listed in the consumer, and the default is the condemning one at every
+  level — an unestablished relation, a format that has not answered, and a
+  record written before the field all keep the authority they have today,
+  because stripping it on a fact nobody established would be a fail-open
+  regression against ADR 0007. `hort_finding_component_relation_total{format,
+  result}` makes the rate observable, and a non-zero `not_established` on
+  fresh scans is a defect rather than background.
+
+  Both functions that compute a blocking verdict consult the predicate, so a
+  re-evaluation over stored findings cannot answer `StillRejected` where a
+  fresh scan would answer `Clean`;
+  `crates/hort-app/tests/condemning_rule_is_single_sourced.rs` pins that the
+  rule has exactly those two readers. ADR 0007's release predicate, ADR 0059's
+  reconciliation and the unscored-advisory severity floor are untouched.
+
 - **Material a provenance verifier could not read no longer condemns an
   artifact** (#350). A caller holding only **write** access to a repository
   could attach bytes declared

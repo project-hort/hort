@@ -1203,7 +1203,7 @@ mod tests {
         SubscriptionUpdated, TargetKindWire, TaskFailed, TaskInvoked, UpstreamMappingChange,
     };
     use crate::retention::ExpirationReason;
-    use crate::types::{ArtifactCoords, ContentHash, Finding};
+    use crate::types::{ArtifactCoords, ComponentRelation, ContentHash, Finding};
     use chrono::Utc;
 
     fn sha256() -> ContentHash {
@@ -1559,6 +1559,7 @@ mod tests {
                         aliases: vec![],
                         informational_class: None,
                         severity_basis: crate::types::SeverityBasis::Assessed,
+                        component_relation: ComponentRelation::NotEstablished,
                     }],
                     previously_clean_at: Utc::now(),
                 }),
