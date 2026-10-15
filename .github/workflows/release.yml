@@ -516,11 +516,20 @@ jobs:
             # -f: a non-2xx (most likely 403 — this identity's prefetch
             # grant on cargo-virtual is not applied) must be loud, not
             # rendered as a misleading `queued: ?  already_present: ?` line.
+            # The three result lists do not share a shape:
+            # `skipped_already_held[]` is flat (`package`, `version`), while
+            # `rejected_packages[]` and `failed[]` nest that pair under
+            # `coords` and carry `reason` / `error` — see `RejectedItemDto` /
+            # `FailedItemDto` in `crates/hort-cli/src/prefetch.rs`. Reading
+            # them alike prints a rejection's reason with `null` for its name,
+            # and on this path that name is the one thing a blocked release
+            # needs: a rejected dep is NOT cold, so the warm below cannot
+            # clear it and no quarantine wait will.
             if ! curl -fsS -X POST "${HORT_URL}/api/v1/repositories/${CARGO_SOURCE_REPO}/prefetch" \
               -H "Authorization: Bearer ${HORT_TOKEN}" \
               -H "Content-Type: application/json" \
               -d "{\"items\": ${items}}" \
-              | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")'; then
+              | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.coords.package) \(.coords.version // "") — \(.reason)") , (.failed[]? | "  failed: \(.coords.package) \(.coords.version // "") — \(.error)")'; then
               echo "::warning::prefetch POST failed — likely cause: the gha-release-prefetch-cargo-virtual grant is not applied yet (issue #138). Cold deps below still block this publish."
             fi
 
