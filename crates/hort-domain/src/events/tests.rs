@@ -2649,6 +2649,7 @@ fn sample_finding() -> crate::types::Finding {
         aliases: vec!["GHSA-35jh-r3h4-6jhm".into()],
         informational_class: None,
         severity_basis: crate::types::SeverityBasis::Assessed,
+        component_relation: crate::types::ComponentRelation::NotEstablished,
     }
 }
 

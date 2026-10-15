@@ -241,6 +241,18 @@ impl FormatHandler for CargoFormatHandler {
         }
     }
 
+    /// A `.crate` is a **source** distribution: it carries the crate's
+    /// own sources plus, for a binary crate, the maintainer's
+    /// `Cargo.lock` — and none of the code that lockfile pins. The
+    /// `PayloadSbom` walk below turns those pins into components, so the
+    /// BOM names versions the artifact does not ship and a consumer's
+    /// build does not resolve (only the top-level package's lock decides
+    /// what is built). A finding against one of them is information
+    /// about the dependency, not evidence about this crate.
+    fn payload_contains_components(&self) -> bool {
+        false
+    }
+
     /// Parse `api/v1/crates/{name}/{version}/download` into coordinates.
     ///
     /// The stored path uses the normalized (lowercased) crate name for

@@ -71,7 +71,8 @@ use std::time::Duration;
 
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::scanner::{
-    NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER,
+    EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort,
+    SCAN_REPORT_TOO_LARGE_MARKER,
 };
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::BoxFuture;
@@ -526,6 +527,14 @@ impl ScannerPort for TrivyAdapter {
     /// table and names the evidence test behind each cell.
     fn applies_to(&self, format: &str) -> bool {
         workspace::format_is_analysable(format)
+    }
+
+    /// This adapter pulls the artifact's bytes out of `StoragePort`,
+    /// materialises them into a temp tree and scans what it unpacked —
+    /// so the packages it names are the ones it found in the artifact,
+    /// whether or not the SBOM happens to list them.
+    fn evidence_basis(&self) -> EvidenceBasis {
+        EvidenceBasis::MaterialisedPayload
     }
 
     fn scan<'a>(

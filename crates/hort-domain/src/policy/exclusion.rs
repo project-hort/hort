@@ -359,6 +359,7 @@ mod tests {
     use super::*;
     use crate::entities::repository::RepositoryFormat;
     use crate::events::PolicyScope;
+    use crate::types::ComponentRelation;
 
     fn ts(secs: i64) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(secs, 0).expect("fixed timestamp")
@@ -406,6 +407,7 @@ mod tests {
             aliases: vec![],
             informational_class: None,
             severity_basis: crate::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 
@@ -426,6 +428,7 @@ mod tests {
             aliases: vec![alias.into()],
             informational_class: None,
             severity_basis: crate::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 

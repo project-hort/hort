@@ -2631,7 +2631,7 @@ mod tests {
 
     use super::*;
     use hort_domain::error::{DomainError, DomainResult};
-    use hort_domain::ports::scanner::{ScanAnalysis, ScanTarget};
+    use hort_domain::ports::scanner::{EvidenceBasis, ScanAnalysis, ScanTarget};
     use hort_domain::ports::BoxFuture;
     use hort_domain::types::Sbom;
     use tracing_test::traced_test;
@@ -2809,6 +2809,10 @@ BBBB
             // capability answer is irrelevant to them. The parity guard
             // uses the real adapters, not this mock.
             true
+        }
+        fn evidence_basis(&self) -> EvidenceBasis {
+            // Same: nothing here tags a finding, so the basis is inert.
+            EvidenceBasis::MaterialisedPayload
         }
         fn scan<'a>(
             &'a self,

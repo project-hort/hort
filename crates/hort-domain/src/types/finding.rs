@@ -145,6 +145,33 @@ pub struct Finding {
     /// struct.
     #[serde(default)]
     pub severity_basis: SeverityBasis,
+    /// How the component this finding names relates to the artifact it was
+    /// found on — the artifact's own subject component, a component the
+    /// artifact carries, a component it does not carry, or not established.
+    /// See [`ComponentRelation`].
+    ///
+    /// `#[serde(default)]` yields [`ComponentRelation::NotEstablished`], and
+    /// [`Finding::may_condemn_artifact`] reads that as condemning. A record
+    /// written before this field existed carries no evidence about its
+    /// component at all, so it cannot be *proven* to name code the artifact
+    /// does not contain; defaulting it to `NotContained` would strip release
+    /// authority from every finding already in the event store and the
+    /// findings blob in one step, which is a fail-open regression against
+    /// ADR 0007. Same direction, and the same reasoning, as `severity_basis`
+    /// defaulting to `Assessed`.
+    ///
+    /// The condemning default is only safe while `NotEstablished` stays rare
+    /// and correctable. A scan whose SBOM has a subject always establishes
+    /// the relation, and the subject is derived from the artifact's
+    /// coordinates rather than its payload, so a persisted `NotEstablished`
+    /// is a record awaiting a rescan, not a resting state of the design. A
+    /// format that starts producing it on fresh scans is a defect in that
+    /// format's SBOM builder, not something this default absorbs.
+    ///
+    /// Same no-re-validation posture as every other shape-evolution on this
+    /// struct.
+    #[serde(default)]
+    pub component_relation: ComponentRelation,
 }
 
 /// Whether a finding's `severity` is a real reading or the fail-closed
@@ -178,6 +205,120 @@ pub enum SeverityBasis {
     /// information about the advisory beyond "unreadable"; it is a floor,
     /// not an assessment.
     Unassessed,
+}
+
+/// How the component a finding names relates to the artifact under scan —
+/// the fact a scan observed, never the verdict drawn from it.
+///
+/// A finding's `purl` names a component; the artifact's SBOM
+/// ([`crate::types::Sbom`]) names a `subject` (the artifact itself) and the
+/// `components` its payload resolved, joined to findings on
+/// `Finding.purl == SbomComponent.purl`. Those resolved components are not
+/// all in the artifact. A cargo `.crate` is a **source** distribution: it
+/// carries the publishing maintainer's own `Cargo.lock` and none of the code
+/// that lockfile pins, and a consumer's build ignores a dependency's
+/// lockfile entirely — only the top-level package's resolve decides what is
+/// built. So an advisory against a version read out of that embedded
+/// lockfile is about code the artifact does not contain and nobody resolves.
+/// A format whose payload carries its closure — an OCI image and its layers
+/// — is the opposite case: the same non-subject component *is* in the
+/// artifact. Keeping those apart is what this enum is for; the component
+/// list itself stays useful either way (ADR 0056).
+///
+/// An enum, not a bool, for the reason ADR 0059 gives for [`SeverityBasis`]:
+/// a bool fixes one question for ever, and there are already four distinct
+/// observations here — two of which, "contained but not the subject" and
+/// "not contained", a bool would have to collapse into one answer.
+///
+/// Persist the fact, derive the interpretation (ADR 0040): the variants name
+/// what was observed about the component, and
+/// [`Finding::may_condemn_artifact`] is the only place an observation
+/// becomes release authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentRelation {
+    /// The finding names the artifact's **subject** component — the artifact
+    /// itself. Its code is in the artifact by definition.
+    Subject,
+    /// The finding names a component other than the subject whose code the
+    /// artifact nevertheless carries, because the format's payload contains
+    /// its closure (an OCI image and its layers).
+    Contained,
+    /// The finding names a component whose code the artifact does **not**
+    /// carry. The payload resolved the component's coordinates out of a
+    /// manifest or lockfile it ships, but ships none of that component.
+    NotContained,
+    /// The relation was not determined — no subject was available to join
+    /// the finding against, or the finding predates the field.
+    ///
+    /// The `Default`, and therefore what `#[serde(default)]` yields for a
+    /// record persisted before the field existed. It is the fail-safe
+    /// reading: an unestablished relation is an *absence* of evidence, and
+    /// the finding keeps the release authority it has today rather than
+    /// losing it on a fact nobody established.
+    #[default]
+    NotEstablished,
+}
+
+impl ComponentRelation {
+    /// Resolve two relations for the **same** advisory on the same artifact
+    /// to the one that withholds the least authority — the single
+    /// definition of "which of these two is more condemning?", and the
+    /// companion to [`Finding::may_condemn_artifact`] rather than a second
+    /// answer to it.
+    ///
+    /// Two backends can report one `(purl, vulnerability_id)` and tag it
+    /// differently: a purl the BOM does not list is a package a
+    /// payload-scanning backend physically found
+    /// ([`Self::Contained`]) and a failed join for a backend whose whole
+    /// input was the BOM ([`Self::NotEstablished`]). The reconciliation
+    /// that picks a survivor for such a collision ranks severity,
+    /// information quality and CVSS (ADR 0059) and knows nothing about the
+    /// relation, so without this the surviving row's release authority
+    /// would be decided by which backend happened to win a severity
+    /// comparison. The survivor keeps the stronger claim instead:
+    /// authority is withheld only where non-containment was actually
+    /// **established**, never as a side effect of a ranking on another
+    /// axis (ADR 0007 fail-closed).
+    ///
+    /// Commutative, and idempotent, by construction: it is the maximum
+    /// over [`Self::containment_claim_rank`], so the answer cannot depend
+    /// on which backend reported first, and folding it across a run of
+    /// collisions cannot move back down the order.
+    pub fn more_condemning(self, other: Self) -> Self {
+        if other.containment_claim_rank() > self.containment_claim_rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// How strongly this relation claims the artifact carries the named
+    /// component's code: `Subject` (it *is* the artifact) > `Contained`
+    /// (observed in the payload) > `NotEstablished` (nothing observed) >
+    /// `NotContained` (observed absent).
+    ///
+    /// The bottom of the order is exactly the one relation
+    /// [`Finding::may_condemn_artifact`] refuses, which is what makes the
+    /// maximum above "the more condemning one" rather than a second,
+    /// drifting opinion about authority —
+    /// `the_bottom_of_the_order_is_exactly_the_relation_that_cannot_condemn`
+    /// pins the two together. The order above the bottom is the evidential
+    /// strength of the claim, so a future rule that withheld authority
+    /// from a weaker claim would still find the strongest one surviving a
+    /// merge.
+    ///
+    /// Exhaustive with no wildcard arm, for [`Finding::may_condemn_artifact`]'s
+    /// reason: a new relation must be *placed* in the order, and getting a
+    /// rank by omission is a compile error instead.
+    const fn containment_claim_rank(self) -> u8 {
+        match self {
+            ComponentRelation::Subject => 3,
+            ComponentRelation::Contained => 2,
+            ComponentRelation::NotEstablished => 1,
+            ComponentRelation::NotContained => 0,
+        }
+    }
 }
 
 /// Recognises the OSV `database_specific.informational` classes that mark a
@@ -240,6 +381,28 @@ pub fn severity_label(s: SeverityThreshold) -> &'static str {
         SeverityThreshold::High => "high",
         SeverityThreshold::Medium => "medium",
         SeverityThreshold::Low => "low",
+    }
+}
+
+/// Lowercase wire string for a [`ComponentRelation`] metric label.
+/// Mirrors the `#[serde(rename_all = "snake_case")]` wire spelling
+/// exactly — pinned by `component_relation_label_matches_the_serde_wire_spelling`
+/// — so a stored finding and the counter that observed it name the same
+/// relation with the same word.
+///
+/// Lives beside [`severity_label`], and for the same reason: the label
+/// values of `hort_finding_component_relation_total{format, result}` are
+/// this enum's variants and nothing else, so a parallel label enum in the
+/// emitting layer would be a second taxonomy to keep in step rather than a
+/// translation of anything. The match is exhaustive with no wildcard: a new
+/// relation has to be given a wire word here, which is also what forces the
+/// catalog row to move with it.
+pub fn component_relation_label(relation: ComponentRelation) -> &'static str {
+    match relation {
+        ComponentRelation::Subject => "subject",
+        ComponentRelation::Contained => "contained",
+        ComponentRelation::NotContained => "not_contained",
+        ComponentRelation::NotEstablished => "not_established",
     }
 }
 
@@ -316,6 +479,45 @@ impl Finding {
         matches!(self.severity_basis, SeverityBasis::Assessed)
             || self.cvss_score.is_some()
             || self.is_informational()
+    }
+
+    /// Whether this finding may condemn the artifact it was found on — the
+    /// **single** place that question is answered. Every decision about
+    /// whether a finding gates a release asks here; nothing re-derives the
+    /// rule by matching on [`Finding::component_relation`] itself, and there
+    /// is deliberately no second accessor phrasing the same question in
+    /// other words.
+    ///
+    /// A finding condemns unless the artifact is known **not** to carry the
+    /// named component's code. A source distribution lists the versions its
+    /// maintainer resolved at publish time without shipping any of that
+    /// code, and a consumer's build ignores those pins, so an advisory
+    /// against one of them is not evidence about this artifact. Such a
+    /// finding stays in the record — it is true information about the
+    /// dependency, and a consumer may well want it — it simply carries no
+    /// release authority.
+    ///
+    /// [`ComponentRelation::NotEstablished`] condemns. No relation having
+    /// been established is an absence of evidence, and the fail-closed
+    /// reading of absent evidence is that the finding still counts
+    /// (ADR 0007).
+    ///
+    /// The match is exhaustive with no wildcard arm on purpose: a new
+    /// relation must be given release authority, or denied it, here — and
+    /// adding one without deciding is a compile error rather than a silent
+    /// grant.
+    ///
+    /// [`ComponentRelation::more_condemning`] is the ordering companion,
+    /// not a second answer: it says which of two relations reported for one
+    /// advisory survives their reconciliation, and its bottom element is
+    /// exactly the relation this predicate refuses.
+    pub fn may_condemn_artifact(&self) -> bool {
+        match self.component_relation {
+            ComponentRelation::Subject => true,
+            ComponentRelation::Contained => true,
+            ComponentRelation::NotContained => false,
+            ComponentRelation::NotEstablished => true,
+        }
     }
 
     /// Validate the per-finding length caps.
@@ -395,6 +597,7 @@ mod tests {
             aliases: vec!["GHSA-35jh-r3h4-6jhm".into()],
             informational_class: None,
             severity_basis: SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 
@@ -422,6 +625,7 @@ mod tests {
             aliases: vec![],
             informational_class: None,
             severity_basis: SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         };
         let json = serde_json::to_string(&f).unwrap();
         let back: Finding = serde_json::from_str(&json).unwrap();
@@ -620,6 +824,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             },
             Finding {
                 purl: "pkg:npm/b@1".into(),
@@ -633,6 +838,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             },
             Finding {
                 purl: "pkg:npm/c@1".into(),
@@ -646,6 +852,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             },
             Finding {
                 purl: "pkg:npm/d@1".into(),
@@ -659,6 +866,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             },
             Finding {
                 purl: "pkg:npm/e@1".into(),
@@ -672,6 +880,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             },
         ];
         let s = severity_summary_from_findings(&findings);
@@ -852,6 +1061,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             },
             Finding {
                 purl: "pkg:npm/b@1".into(),
@@ -865,6 +1075,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             },
             Finding {
                 purl: "pkg:npm/c@1".into(),
@@ -878,6 +1089,7 @@ mod tests {
                 aliases: vec![],
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
+                component_relation: ComponentRelation::NotEstablished,
             },
         ];
         assert_eq!(highest_severity(&findings), Some(SeverityThreshold::High));
@@ -1036,5 +1248,422 @@ mod tests {
         f.cvss_score = None;
         f.informational_class = Some("mystery".to_string());
         assert!(!f.is_informed());
+    }
+
+    // ----- ComponentRelation -----------------------------------------------
+
+    /// Backward compatibility, and the half of the rule that protects the
+    /// stored corpus. A finding persisted before `component_relation` existed
+    /// carries no such field; it MUST deserialise as `NotEstablished` and it
+    /// MUST still condemn. Defaulting the other way — or dropping
+    /// `#[serde(default)]` so the field became required — would strip release
+    /// authority from, or fail to parse, every finding already in the event
+    /// store and the CAS findings blob.
+    #[test]
+    fn legacy_finding_without_component_relation_deserialises_as_not_established() {
+        let raw = serde_json::json!({
+            "purl": "pkg:cargo/hyper-util@0.1.21",
+            "vulnerability_id": "RUSTSEC-2026-0004",
+            "severity": "Critical",
+            "cvss_score": null,
+            "title": "advisory",
+            "fixed_versions": [],
+            "source_scanner": "osv",
+            "references": [],
+        })
+        .to_string();
+        let parsed: Finding = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.component_relation, ComponentRelation::NotEstablished);
+        assert!(
+            parsed.may_condemn_artifact(),
+            "a record written before the field existed keeps today's authority",
+        );
+    }
+
+    #[test]
+    fn component_relation_default_is_not_established() {
+        assert_eq!(
+            ComponentRelation::default(),
+            ComponentRelation::NotEstablished
+        );
+    }
+
+    #[test]
+    fn component_relation_round_trips_through_serde() {
+        for relation in [
+            ComponentRelation::Subject,
+            ComponentRelation::Contained,
+            ComponentRelation::NotContained,
+            ComponentRelation::NotEstablished,
+        ] {
+            let mut f = valid_finding();
+            f.component_relation = relation;
+            let raw = serde_json::to_string(&f).unwrap();
+            let parsed: Finding = serde_json::from_str(&raw).unwrap();
+            assert_eq!(parsed.component_relation, relation);
+        }
+    }
+
+    /// The wire spelling is part of the compatibility surface: `Finding` is
+    /// carried in event payloads and in the CAS findings blob, so a renamed
+    /// variant string makes already-written records unreadable.
+    #[test]
+    fn component_relation_wire_spelling_is_snake_case() {
+        for (relation, wire) in [
+            (ComponentRelation::Subject, "subject"),
+            (ComponentRelation::Contained, "contained"),
+            (ComponentRelation::NotContained, "not_contained"),
+            (ComponentRelation::NotEstablished, "not_established"),
+        ] {
+            let mut f = valid_finding();
+            f.component_relation = relation;
+            let raw = serde_json::to_string(&f).unwrap();
+            assert!(
+                raw.contains(&format!("\"component_relation\":\"{wire}\"")),
+                "{raw}"
+            );
+        }
+    }
+
+    /// The metric label and the persisted wire spelling must be the same
+    /// word. They are produced by two different mechanisms (a hand-written
+    /// match and serde's rename rule), so nothing but this assertion stops
+    /// a counter series from naming a relation differently than the record
+    /// it counted — which would make a dashboard and a stored finding
+    /// disagree about the same scan.
+    #[test]
+    fn component_relation_label_matches_the_serde_wire_spelling() {
+        for relation in [
+            ComponentRelation::Subject,
+            ComponentRelation::Contained,
+            ComponentRelation::NotContained,
+            ComponentRelation::NotEstablished,
+        ] {
+            let serialised = serde_json::to_string(&relation).unwrap();
+            assert_eq!(
+                serialised,
+                format!("\"{}\"", component_relation_label(relation)),
+                "label and wire spelling diverged for {relation:?}"
+            );
+        }
+    }
+
+    /// Every arm of the label match is reached, and no two relations share
+    /// a word — a label collision would merge two counter series and hide
+    /// exactly the `not_established` rate the counter exists to show.
+    #[test]
+    fn component_relation_labels_are_distinct_per_variant() {
+        let labels = [
+            component_relation_label(ComponentRelation::Subject),
+            component_relation_label(ComponentRelation::Contained),
+            component_relation_label(ComponentRelation::NotContained),
+            component_relation_label(ComponentRelation::NotEstablished),
+        ];
+        assert_eq!(
+            labels,
+            ["subject", "contained", "not_contained", "not_established"]
+        );
+        let distinct: std::collections::HashSet<&str> = labels.into_iter().collect();
+        assert_eq!(distinct.len(), 4, "label values must be distinct");
+    }
+
+    #[test]
+    fn component_relation_debug_and_clone_are_available() {
+        let relation = ComponentRelation::NotContained;
+        #[allow(clippy::clone_on_copy)]
+        let cloned = relation.clone();
+        assert_eq!(cloned, relation);
+        assert!(format!("{relation:?}").contains("NotContained"));
+    }
+
+    // ----- may_condemn_artifact --------------------------------------------
+
+    /// The case that must not regress. A finding about the artifact's own
+    /// subject component keeps full release authority; an over-broad
+    /// predicate here disarms the scanner silently.
+    #[test]
+    fn a_subject_finding_may_condemn() {
+        let mut f = valid_finding();
+        f.component_relation = ComponentRelation::Subject;
+        assert!(f.may_condemn_artifact());
+    }
+
+    /// A format whose payload carries its closure (an OCI image and its
+    /// layers): a non-subject component is still in the artifact, so it
+    /// condemns exactly as before.
+    #[test]
+    fn a_contained_component_finding_may_condemn() {
+        let mut f = valid_finding();
+        f.component_relation = ComponentRelation::Contained;
+        assert!(f.may_condemn_artifact());
+    }
+
+    /// The one relation that withholds authority: the artifact resolved the
+    /// component's coordinates out of a manifest it ships but ships none of
+    /// that component's code.
+    #[test]
+    fn a_not_contained_component_finding_may_not_condemn() {
+        let mut f = valid_finding();
+        f.component_relation = ComponentRelation::NotContained;
+        assert!(!f.may_condemn_artifact());
+    }
+
+    /// Absence of evidence is not evidence of non-containment: an
+    /// unestablished relation keeps the authority the finding has today.
+    #[test]
+    fn a_not_established_relation_may_condemn() {
+        let mut f = valid_finding();
+        f.component_relation = ComponentRelation::NotEstablished;
+        assert!(f.may_condemn_artifact());
+    }
+
+    /// The predicate answers one question and only that question. Folding in
+    /// severity, the informational class or the severity basis would make a
+    /// `NotContained` Critical condemn again — or, worse, silently remove
+    /// authority from a subject finding whose severity could not be read.
+    #[test]
+    fn may_condemn_artifact_reads_only_the_component_relation() {
+        for severity in [
+            SeverityThreshold::Critical,
+            SeverityThreshold::High,
+            SeverityThreshold::Medium,
+            SeverityThreshold::Low,
+        ] {
+            for (cvss, class, basis) in [
+                (Some(9.8), None, SeverityBasis::Assessed),
+                (
+                    None,
+                    Some("unmaintained".to_string()),
+                    SeverityBasis::Assessed,
+                ),
+                (None, None, SeverityBasis::Unassessed),
+            ] {
+                let mut f = valid_finding();
+                f.severity = severity;
+                f.cvss_score = cvss;
+                f.informational_class = class;
+                f.severity_basis = basis;
+
+                f.component_relation = ComponentRelation::NotContained;
+                assert!(
+                    !f.may_condemn_artifact(),
+                    "a non-contained component never condemns: {f:?}"
+                );
+
+                f.component_relation = ComponentRelation::Subject;
+                assert!(
+                    f.may_condemn_artifact(),
+                    "a subject finding always condemns: {f:?}"
+                );
+            }
+        }
+    }
+
+    /// A finding the artifact does not contain is removed from the
+    /// *condemning* set, not from the record: it still validates, still
+    /// round-trips, and is still counted into the severity summary exactly
+    /// as before. Dropping it from the record would trade one wrong answer
+    /// for another.
+    #[test]
+    fn a_not_contained_finding_is_still_recorded_and_still_counted() {
+        let mut f = valid_finding();
+        f.component_relation = ComponentRelation::NotContained;
+        f.severity = SeverityThreshold::Critical;
+        f.validate().unwrap();
+
+        let raw = serde_json::to_string(&f).unwrap();
+        let parsed: Finding = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed, f);
+
+        assert_eq!(
+            severity_summary_from_findings(&[f]),
+            SeveritySummary {
+                critical: 1,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            "the aggregate still counts it; only its release authority changes",
+        );
+    }
+
+    /// `component_relation` is outside `validate()`'s remit — it is a typed
+    /// enum, not a length-capped string, so there is nothing to cap and no
+    /// relation that makes a finding invalid.
+    #[test]
+    fn validate_accepts_every_component_relation() {
+        for relation in [
+            ComponentRelation::Subject,
+            ComponentRelation::Contained,
+            ComponentRelation::NotContained,
+            ComponentRelation::NotEstablished,
+        ] {
+            let mut f = valid_finding();
+            f.component_relation = relation;
+            f.validate().unwrap();
+        }
+    }
+
+    // ----- more_condemning -------------------------------------------------
+
+    /// Every relation, so a pairwise sweep is exhaustive by construction
+    /// rather than by a reviewer counting arms. A new variant that is not
+    /// added here leaves the sweeps below quietly narrower, which is why
+    /// `every_relation_is_covered_by_the_pairwise_sweep` asserts the
+    /// length.
+    const ALL_RELATIONS: [ComponentRelation; 4] = [
+        ComponentRelation::Subject,
+        ComponentRelation::Contained,
+        ComponentRelation::NotContained,
+        ComponentRelation::NotEstablished,
+    ];
+
+    fn with_relation(relation: ComponentRelation) -> Finding {
+        let mut f = valid_finding();
+        f.component_relation = relation;
+        f
+    }
+
+    /// The sweep's own reach. `ComponentRelation` has no iterator, so a
+    /// fifth variant would silently leave every pairwise assertion below
+    /// testing a subset of the enum.
+    #[test]
+    fn every_relation_is_covered_by_the_pairwise_sweep() {
+        for relation in ALL_RELATIONS {
+            assert!(
+                ALL_RELATIONS.contains(&relation),
+                "{relation:?} missing from the sweep",
+            );
+        }
+        let mut distinct = ALL_RELATIONS.to_vec();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "the sweep must list each relation exactly once",
+        );
+    }
+
+    /// The property the merge rests on: whichever row wins a severity
+    /// comparison, the relation that survives is never less condemning
+    /// than either input. Asserted over all sixteen pairs through
+    /// [`Finding::may_condemn_artifact`] itself, so the order and the
+    /// predicate cannot drift apart.
+    #[test]
+    fn more_condemning_never_returns_a_relation_less_condemning_than_an_input() {
+        for a in ALL_RELATIONS {
+            for b in ALL_RELATIONS {
+                let winner = a.more_condemning(b);
+                if with_relation(a).may_condemn_artifact()
+                    || with_relation(b).may_condemn_artifact()
+                {
+                    assert!(
+                        with_relation(winner).may_condemn_artifact(),
+                        "{a:?} + {b:?} resolved to {winner:?}, which cannot condemn \
+                         although an input could",
+                    );
+                }
+                assert!(
+                    winner == a || winner == b,
+                    "{a:?} + {b:?} resolved to {winner:?}, which is neither input",
+                );
+            }
+        }
+    }
+
+    /// Order independence, stated as the test the merge needs: two
+    /// backends reporting one advisory must reconcile to the same relation
+    /// whichever arrived first, because nothing upstream fixes their
+    /// order.
+    #[test]
+    fn more_condemning_is_commutative() {
+        for a in ALL_RELATIONS {
+            for b in ALL_RELATIONS {
+                assert_eq!(a.more_condemning(b), b.more_condemning(a), "{a:?} + {b:?}",);
+            }
+        }
+    }
+
+    /// Folding across a run of collisions — three backends for one
+    /// advisory — cannot walk back down the order. The merge applies the
+    /// resolution pairwise as each duplicate arrives, so without this a
+    /// third row could undo the second's.
+    #[test]
+    fn more_condemning_is_idempotent_and_monotone_under_folding() {
+        for a in ALL_RELATIONS {
+            assert_eq!(a.more_condemning(a), a, "{a:?}");
+            for b in ALL_RELATIONS {
+                for c in ALL_RELATIONS {
+                    let folded = a.more_condemning(b).more_condemning(c);
+                    assert_eq!(
+                        folded,
+                        a.more_condemning(b.more_condemning(c)),
+                        "{a:?} + {b:?} + {c:?} must not depend on the grouping",
+                    );
+                    for input in [a, b, c] {
+                        assert_eq!(
+                            folded.more_condemning(input),
+                            folded,
+                            "{folded:?} dropped below {input:?} while folding",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The tie the merge can actually reach today: a purl the BOM does not
+    /// list, which a payload-scanning backend found in the artifact and an
+    /// SBOM-driven one could not join at all. `Contained` is the stronger
+    /// claim and survives.
+    #[test]
+    fn a_payload_observation_outranks_a_failed_join() {
+        assert_eq!(
+            ComponentRelation::NotEstablished.more_condemning(ComponentRelation::Contained),
+            ComponentRelation::Contained,
+        );
+        assert_eq!(
+            ComponentRelation::Contained.more_condemning(ComponentRelation::NotEstablished),
+            ComponentRelation::Contained,
+        );
+    }
+
+    /// The step that decides authority: `NotContained` loses to every
+    /// other relation, and only to it does any other relation lose
+    /// nothing. This is the assertion that makes "more condemning" mean
+    /// what its name says.
+    #[test]
+    fn not_contained_loses_to_every_other_relation() {
+        for other in ALL_RELATIONS {
+            if other == ComponentRelation::NotContained {
+                continue;
+            }
+            assert_eq!(
+                ComponentRelation::NotContained.more_condemning(other),
+                other,
+                "{other:?} must outrank NotContained",
+            );
+        }
+    }
+
+    /// Ties the order to the predicate: the bottom of the containment
+    /// order is exactly the relation that cannot condemn. If a future
+    /// variant is ranked at the bottom while still condemning (or ranked
+    /// above it while not condemning), the merge would resolve a
+    /// disagreement away from the condemning relation and this fails.
+    #[test]
+    fn the_bottom_of_the_order_is_exactly_the_relation_that_cannot_condemn() {
+        for relation in ALL_RELATIONS {
+            let is_bottom = ALL_RELATIONS
+                .iter()
+                .all(|other| relation.more_condemning(*other) == *other || *other == relation);
+            assert_eq!(
+                is_bottom,
+                !with_relation(relation).may_condemn_artifact(),
+                "{relation:?}: sitting at the bottom of the containment order and \
+                 being refused release authority must be the same thing",
+            );
+        }
     }
 }

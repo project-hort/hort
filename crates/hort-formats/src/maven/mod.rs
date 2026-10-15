@@ -184,6 +184,23 @@ impl FormatHandler for MavenFormatHandler {
         classify_scan_kind(&artifact.path)
     }
 
+    /// A POM's `<dependencies>` — the component list this handler
+    /// derives — are coordinates Maven resolves from the repository at
+    /// build time, and a plain `.jar` carries only its own classes, so
+    /// the artifact ships none of the components its BOM lists.
+    ///
+    /// The declaration is per **format**, and a shaded uber-jar is the
+    /// case that approximates: such a jar does carry its dependencies'
+    /// classes. The shade plugin publishes a dependency-reduced POM by
+    /// default, so the BOM derived from it normally lists nothing to
+    /// mis-attribute — but an unreduced POM beside a shaded jar would
+    /// have its bundled components read as not-carried. Telling the two
+    /// apart needs a per-artifact answer, which this is deliberately
+    /// not.
+    fn payload_contains_components(&self) -> bool {
+        false
+    }
+
     /// Build the stored logical path for a Maven file. `filename` is
     /// REQUIRED — a Maven path is always file-addressed. See
     /// [`coords::build_logical_path`].

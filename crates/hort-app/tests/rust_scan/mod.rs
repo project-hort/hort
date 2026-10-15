@@ -1,11 +1,14 @@
 //! Shared token-aware Rust scanning primitives for the `crates/`
 //! structural guards.
 //!
-//! Two guard targets read the same tree for different structural shapes —
-//! `db_tests_are_serialized.rs` (a test that reaches a real Postgres
-//! connection without the workspace serialization key) and
+//! Three guard targets read the same tree for different structural shapes
+//! — `db_tests_are_serialized.rs` (a test that reaches a real Postgres
+//! connection without the workspace serialization key),
 //! `cas_reads_are_verified.rs` (a storage adapter whose `StoragePort::get`
-//! hands back an unverified stream). Both need the identical lexical
+//! hands back an unverified stream) and
+//! `condemning_rule_is_single_sourced.rs` (a second reader of a finding's
+//! component relation re-deriving the release-authority rule). All three
+//! need the identical lexical
 //! discipline, and a second verbatim copy of it would be the exact
 //! duplication that lets one copy drift into weakness while the other
 //! stays honest. The lexer therefore lives here once; each guard keeps its
@@ -13,6 +16,13 @@
 //! are the parts that encode a policy and must stay reviewable in one
 //! file. Same split, and the same reason, as `tests/sql_scan/mod.rs` for
 //! the `migrations/` guards.
+//!
+//! [`production_region`] — comments and literals blanked, then every
+//! `#[cfg(test)]` item — is part of that shared discipline rather than a
+//! policy: a guard that read test code would be satisfied by a fixture's
+//! assertions about itself, and a guard that truncated at the first
+//! `#[cfg(test)]` would blank the production code that follows a
+//! test-only struct field.
 //!
 //! The discipline this module implements, and why naive substring
 //! matching is wrong for Rust:
@@ -484,4 +494,108 @@ pub fn attr_path(attr: &str) -> &str {
         .trim_start_matches('[')
         .trim_end_matches(']');
     inner.split(['(', '=']).next().unwrap_or("").trim()
+}
+
+/// The attribute that marks an item as test-only.
+pub const CFG_TEST: &str = "#[cfg(test)]";
+
+/// The offset of the first non-whitespace byte at or after `from`.
+pub fn skip_ws(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+        at += 1;
+    }
+    at
+}
+
+/// The offset of the byte that ends the item an attribute applies to,
+/// counting from `from`, with which byte it is: a `{` opening the item's
+/// block, or the `;` / `,` terminating a block-less one.
+///
+/// All three are needed, and `,` is the one that is easy to forget. The
+/// adapter crates attach `#[cfg(test)]` to **struct fields** and
+/// struct-literal fields (`hort-adapters-postgres/src/purge_gc.rs`'s
+/// `interrupt_after_append: AtomicBool,`), which end at a comma; a rule
+/// looking only for `{` or `;` runs past the field, past the struct's own
+/// closing brace, and blanks the whole `impl` block that follows it —
+/// over-blanking, which in this guard means a silent false negative.
+///
+/// Depth matters because the item may carry any of the three nested:
+/// `fn f(a: u8, b: u8)` carries commas inside parens, `const X: [u8; 2]`
+/// a `;` inside brackets, and `use a::b::{C, D};` a comma inside the
+/// brace group — the last one being why the `{` is reported first and the
+/// caller then matches it.
+pub fn item_delimiter(bytes: &[u8], from: usize) -> Option<(usize, u8)> {
+    let mut parens = 0usize;
+    let mut brackets = 0usize;
+    for (at, byte) in bytes.iter().enumerate().skip(from) {
+        match byte {
+            b'(' => parens += 1,
+            b')' => parens = parens.saturating_sub(1),
+            b'[' => brackets += 1,
+            b']' => brackets = brackets.saturating_sub(1),
+            b'{' | b';' | b',' if parens == 0 && brackets == 0 => return Some((at, *byte)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Blank every `#[cfg(test)]`-attributed item, leaving the file's
+/// production code.
+///
+/// Scoped **per item** rather than "from the first `#[cfg(test)]` to the
+/// end of the file", which is the shape `capped_stream_reads` can afford
+/// because it scans files whose inline test module comes last. The
+/// adapter crates do not honour that: `purge_gc.rs` attaches the
+/// attribute to a test-only `use`, a test-only field and a test-only
+/// method with 850 lines of production code after them, and a truncating
+/// rule would read that file — and `artifact_repo.rs`, and
+/// `upstream-http/src/lib.rs` — as having almost no code at all.
+///
+/// Only the exact `#[cfg(test)]` spelling counts.
+/// `#[cfg(any(test, feature = "test-support"))]` deliberately does not:
+/// in this workspace it gates individual *production-file* items (a
+/// `pub mod test_support;` declaration, a `wrap_for_test` constructor),
+/// and treating it as a test marker would blank production code.
+pub fn blank_cfg_test_items(blanked: &str) -> String {
+    let bytes = blanked.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut cursor = 0usize;
+    while let Some(found) = blanked[cursor..].find(CFG_TEST) {
+        let at = cursor + found;
+        let after_attr = at + CFG_TEST.len();
+        let end = match item_delimiter(bytes, after_attr) {
+            // A block item: the attribute covers it to the matching brace.
+            Some((brace, b'{')) => match block_end(bytes, brace) {
+                Some(close) => {
+                    // `use a::{A, B};` and `struct S { … };` both leave a
+                    // terminator past the brace; absorb it so no stray
+                    // fragment survives as code.
+                    let next = skip_ws(bytes, close + 1);
+                    if bytes.get(next) == Some(&b';') {
+                        next + 1
+                    } else {
+                        close + 1
+                    }
+                }
+                None => bytes.len(),
+            },
+            // A block-less item: `#[cfg(test)] use std::…::{…};` reaches
+            // the arm above, `#[cfg(test)] const X: u8 = 1;` and
+            // `#[cfg(test)] probe: AtomicBool,` this one.
+            Some((terminator, _)) => terminator + 1,
+            None => bytes.len(),
+        };
+        blank_range(&mut out, at, end);
+        cursor = end;
+    }
+    String::from_utf8(out).expect("blanking replaces whole items with ASCII spaces")
+}
+
+/// The scannable production text of a source file: comments and literals
+/// blanked, then the `#[cfg(test)]` items. Byte offsets and line numbers
+/// survive both passes.
+pub fn production_region(source: &str) -> String {
+    blank_cfg_test_items(&blank_noncode(source))
 }

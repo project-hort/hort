@@ -37,11 +37,13 @@ use hort_domain::ports::format_handler::{
     FormatHandler, PayloadSbom, PayloadSbomExtraction, SbomResolution,
 };
 use hort_domain::ports::jobs_repository::{JobStatus, JobsRepository, ScanJob, TriggerSource};
-use hort_domain::ports::scanner::{NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort};
+use hort_domain::ports::scanner::{
+    EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort,
+};
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{
-    ArtifactCoords, ArtifactKind, ContentHash, Ecosystem, Finding, PayloadAccess, Sbom,
-    SbomComponent, SeverityBasis,
+    ArtifactCoords, ArtifactKind, ComponentRelation, ContentHash, Ecosystem, Finding,
+    PayloadAccess, Sbom, SbomComponent, SeverityBasis,
 };
 
 use super::*;
@@ -176,6 +178,12 @@ struct MockScanner {
     /// means "every format", which is what the tests that drive
     /// dispatch purely from the policy's backend list want.
     covers: Option<Vec<String>>,
+    /// What this backend looked at — the mock's programmable
+    /// [`ScannerPort::evidence_basis`]. The default mirrors the
+    /// out-of-the-box backend (`trivy`, which materialises the payload);
+    /// the component-relation tests that need the other reading set it
+    /// with [`MockScanner::sbom_driven`].
+    evidence: EvidenceBasis,
 }
 
 impl MockScanner {
@@ -196,6 +204,7 @@ impl MockScanner {
             seen_format: Mutex::new(None),
             seen_path: Mutex::new(None),
             covers: None,
+            evidence: EvidenceBasis::MaterialisedPayload,
         }
     }
 
@@ -205,6 +214,14 @@ impl MockScanner {
     /// point is a backend that answers `false` for the job's format.
     fn covering(mut self, formats: &[&str]) -> Self {
         self.covers = Some(formats.iter().map(|f| (*f).to_string()).collect());
+        self
+    }
+
+    /// Declare this backend SBOM-driven: it consumes the component list
+    /// it is handed and never opens the payload, the way the osv adapter
+    /// and the advisory-enrichment path do.
+    fn sbom_driven(mut self) -> Self {
+        self.evidence = EvidenceBasis::SuppliedSbom;
         self
     }
 
@@ -241,6 +258,9 @@ impl ScannerPort for MockScanner {
         self.covers
             .as_ref()
             .is_none_or(|formats| formats.iter().any(|f| f == format))
+    }
+    fn evidence_basis(&self) -> EvidenceBasis {
+        self.evidence
     }
     fn scan<'a>(
         &'a self,
@@ -318,6 +338,7 @@ fn finding(purl: &str, vuln: &str, sev: SeverityThreshold) -> Finding {
         aliases: vec![],
         informational_class: None,
         severity_basis: SeverityBasis::Assessed,
+        component_relation: ComponentRelation::NotEstablished,
     }
 }
 
@@ -859,6 +880,169 @@ fn merge_two_unassessed_findings_compare_by_tier() {
 
     let winner = merge_collision(&unassessed_critical, &unassessed_low, true);
     assert_eq!(winner.severity, SeverityThreshold::Critical);
+}
+
+/// The relation the merge hands the survivor is the more condemning of
+/// the two inputs, whichever row won on severity — and `merge_collision`
+/// asserts it in BOTH contribution orders, which is the point: the
+/// ranking and the relation disagree here on purpose.
+///
+/// The reachable shape, with the ranking deliberately pointing the other
+/// way: a purl the BOM does not list, found in the payload by a backend
+/// that materialised the artifact's bytes (`Contained`) and unjoinable by
+/// one whose whole input was the BOM (`NotEstablished`). The SBOM-driven
+/// row carries the higher tier, so it wins the ranking — and must not
+/// bring its weaker claim with it, or release authority would be decided
+/// by a severity comparison that never looked at containment.
+#[test]
+fn merge_keeps_the_more_condemning_relation_when_the_other_row_wins_on_severity() {
+    let purl = "pkg:cargo/unlisted@1.0.0";
+    let vuln = "CVE-9999-0010";
+
+    let mut payload_scanned = finding(purl, vuln, SeverityThreshold::Low);
+    payload_scanned.component_relation = ComponentRelation::Contained;
+    payload_scanned.source_scanner = "trivy".into();
+
+    let mut sbom_driven = finding(purl, vuln, SeverityThreshold::Critical);
+    sbom_driven.component_relation = ComponentRelation::NotEstablished;
+    sbom_driven.source_scanner = "osv".into();
+
+    let winner = merge_collision(&payload_scanned, &sbom_driven, true);
+    assert_eq!(
+        winner.severity,
+        SeverityThreshold::Critical,
+        "the ranking is untouched — the higher tier still wins the row",
+    );
+    assert_eq!(
+        winner.component_relation,
+        ComponentRelation::Contained,
+        "the survivor keeps the stronger containment claim, not the loser's",
+    );
+}
+
+/// The direction that decides a verdict, and the one §7 is fail-closed
+/// about: an established non-containment must never be the relation a
+/// merge picks up from the row that won on severity. A `NotContained`
+/// winner here would hand a condemning finding's authority away on an
+/// axis the ranking never compared.
+#[test]
+fn merge_never_lets_a_not_contained_row_disarm_a_condemning_one() {
+    let purl = "pkg:cargo/h2@0.4.13";
+    let vuln = "RUSTSEC-2026-0004";
+
+    let mut not_contained_critical = finding(purl, vuln, SeverityThreshold::Critical);
+    not_contained_critical.component_relation = ComponentRelation::NotContained;
+
+    for other in [
+        ComponentRelation::Subject,
+        ComponentRelation::Contained,
+        ComponentRelation::NotEstablished,
+    ] {
+        let mut condemning_low = finding(purl, vuln, SeverityThreshold::Low);
+        condemning_low.component_relation = other;
+
+        let winner = merge_collision(&not_contained_critical, &condemning_low, true);
+        assert_eq!(
+            winner.severity,
+            SeverityThreshold::Critical,
+            "{other:?}: the ranking still picks the higher tier",
+        );
+        assert_eq!(
+            winner.component_relation, other,
+            "{other:?}: must outrank an established non-containment",
+        );
+        assert!(
+            winner.may_condemn_artifact(),
+            "{other:?}: the merged finding must keep the authority an input had",
+        );
+    }
+}
+
+/// Agreement is a no-op: two rows carrying the same relation merge to it,
+/// for every relation. The resolution must not perturb the common case —
+/// in particular it must not promote a `NotContained` pair into something
+/// that condemns, which is what a "fail closed, always" reading written
+/// without the order would do.
+#[test]
+fn merge_leaves_an_agreed_relation_alone() {
+    let purl = "pkg:cargo/x@1.0.0";
+    let vuln = "CVE-9999-0011";
+
+    for relation in [
+        ComponentRelation::Subject,
+        ComponentRelation::Contained,
+        ComponentRelation::NotContained,
+        ComponentRelation::NotEstablished,
+    ] {
+        let mut a = finding(purl, vuln, SeverityThreshold::Critical);
+        a.component_relation = relation;
+        let mut b = finding(purl, vuln, SeverityThreshold::Low);
+        b.component_relation = relation;
+
+        let winner = merge_collision(&a, &b, true);
+        assert_eq!(winner.component_relation, relation, "{relation:?}");
+    }
+}
+
+/// Three backends on one advisory: the resolution is folded pairwise as
+/// each duplicate arrives, so a third row must not walk the relation back
+/// down. Swept over every permutation, because the arrival order is the
+/// configured `scan_backends` list.
+#[test]
+fn merge_folds_three_relations_to_the_most_condemning_in_every_order() {
+    let purl = "pkg:cargo/x@1.0.0";
+    let vuln = "CVE-9999-0012";
+
+    let relations = [
+        ComponentRelation::NotContained,
+        ComponentRelation::NotEstablished,
+        ComponentRelation::Contained,
+    ];
+    let row = |relation: ComponentRelation| {
+        let mut f = finding(purl, vuln, SeverityThreshold::Critical);
+        f.component_relation = relation;
+        f
+    };
+    for (i, j, k) in [
+        (0, 1, 2),
+        (0, 2, 1),
+        (1, 0, 2),
+        (1, 2, 0),
+        (2, 0, 1),
+        (2, 1, 0),
+    ] {
+        let merged = merge_findings(
+            vec![row(relations[i]), row(relations[j]), row(relations[k])],
+            true,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].component_relation,
+            ComponentRelation::Contained,
+            "order {i}{j}{k} must still fold to the strongest claim",
+        );
+    }
+}
+
+/// A collision on `(purl, vulnerability_id)` only — the relation
+/// resolution must not reach across findings that never collided.
+/// Two different purls both keep their own relation.
+#[test]
+fn merge_resolves_the_relation_per_collision_not_across_the_set() {
+    let vuln = "CVE-9999-0013";
+    let mut subject = finding("pkg:cargo/app@1.0.0", vuln, SeverityThreshold::Critical);
+    subject.component_relation = ComponentRelation::Subject;
+    let mut elsewhere = finding("pkg:cargo/dep@2.0.0", vuln, SeverityThreshold::Critical);
+    elsewhere.component_relation = ComponentRelation::NotContained;
+
+    let merged = merge_findings(vec![subject, elsewhere], true);
+    assert_eq!(merged.len(), 2, "different purls do not collide");
+    assert_eq!(merged[0].component_relation, ComponentRelation::Subject);
+    assert_eq!(
+        merged[1].component_relation,
+        ComponentRelation::NotContained,
+        "a finding that collided with nothing keeps the relation it was tagged with",
+    );
 }
 
 /// The orchestrator's default posture: `defaults_for_worker` has the
@@ -4342,6 +4526,134 @@ mod metrics_emission_tests {
             Some(1),
         );
     }
+
+    // -------------------------------------------------------------------
+    // `hort_finding_component_relation_total{format, result}`
+    // -------------------------------------------------------------------
+
+    /// One tick per tagged finding, on the relation the join assigned and
+    /// under the artifact's format. Without this series the
+    /// `not_established` rate — the signal that says the condemning
+    /// default has stopped being rare — is invisible.
+    #[test]
+    fn hort_finding_component_relation_total_ticks_once_per_tagged_finding() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let _ = run_tagged_scan(
+                    "cargo",
+                    Some(sbom_with(
+                        Some("pkg:cargo/hyper-util@0.1.21"),
+                        &["pkg:cargo/h2@0.4.13"],
+                    )),
+                    false,
+                    vec![finding(
+                        "pkg:cargo/h2@0.4.13",
+                        "RUSTSEC-ADVISORY",
+                        SeverityThreshold::Low,
+                    )],
+                    vec![finding(
+                        "pkg:cargo/hyper-util@0.1.21",
+                        "CVE-SUBJECT",
+                        SeverityThreshold::High,
+                    )],
+                    true,
+                )
+                .await;
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_finding_component_relation_total", |labels| {
+                labels.get("format") == Some(&"cargo")
+                    && labels.get("result") == Some(&"not_contained")
+            }),
+            Some(1),
+            "the advisory path's lockfile-pin finding"
+        );
+        assert_eq!(
+            find_counter(&snap, "hort_finding_component_relation_total", |labels| {
+                labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&"subject")
+            }),
+            Some(1),
+            "the scanner path's subject finding"
+        );
+        assert_eq!(
+            find_counter(&snap, "hort_finding_component_relation_total", |labels| {
+                labels.get("result") == Some(&"not_established")
+            }),
+            None,
+            "a production-shaped BOM joins both findings"
+        );
+    }
+
+    /// The `not established` arm is reachable and observable: an
+    /// SBOM-driven producer naming a purl the BOM does not list ticks it.
+    /// This is the series an operator alerts on — a non-zero rate on new
+    /// scans means the join is broken, not that the artifact is odd.
+    #[test]
+    fn hort_finding_component_relation_total_records_a_failed_join() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let _ = run_tagged_scan(
+                    "cargo",
+                    Some(sbom_with(Some("pkg:cargo/app@1"), &["pkg:cargo/dep@2"])),
+                    false,
+                    vec![],
+                    vec![finding(
+                        "pkg:cargo/unlisted@3",
+                        "CVE-UNLISTED",
+                        SeverityThreshold::Critical,
+                    )],
+                    false,
+                )
+                .await;
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_finding_component_relation_total", |labels| {
+                labels.get("format") == Some(&"cargo")
+                    && labels.get("result") == Some(&"not_established")
+            }),
+            Some(1),
+        );
+    }
+
+    /// Closed taxonomy, bounded cardinality: the counter carries exactly
+    /// `format` and `result`, and never a purl or a vulnerability id. The
+    /// relation is per-finding, so an identity label here would mint one
+    /// series per advisory.
+    #[test]
+    fn hort_finding_component_relation_total_carries_no_unbounded_labels() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let _ = run_tagged_scan(
+                    "cargo",
+                    Some(sbom_with(Some("pkg:cargo/app@1"), &[])),
+                    false,
+                    vec![],
+                    vec![finding(
+                        "pkg:cargo/app@1",
+                        "CVE-SUBJECT",
+                        SeverityThreshold::High,
+                    )],
+                    true,
+                )
+                .await;
+            })
+        });
+        let keys: Vec<_> = snap
+            .iter()
+            .filter(|(k, _, _, _)| k.key().name() == "hort_finding_component_relation_total")
+            .collect();
+        assert_eq!(keys.len(), 1, "one series for one tagged finding");
+        let labels: HashMap<&str, &str> = keys[0]
+            .0
+            .key()
+            .labels()
+            .map(|l| (l.key(), l.value()))
+            .collect();
+        assert_eq!(labels.get("result"), Some(&"subject"));
+        assert_eq!(labels.len(), 2, "exactly `format` and `result`: {labels:?}");
+    }
 }
 
 // ===========================================================================
@@ -5215,4 +5527,731 @@ async fn run_scan_records_not_applicable_when_no_backend_covers_the_format() {
     assert!(findings.is_empty());
     assert_eq!(trivy.calls(), 0);
     assert_eq!(osv.calls(), 0);
+}
+
+// ===========================================================================
+// COMPONENT RELATION — which component each finding is about
+//
+// `ComponentRelations` is the one place `Finding.component_relation` is
+// decided (ADR 0056 as amended): the join between a finding's purl and
+// the artifact's BOM, refined by the format's containment declaration and
+// by what the producing backend actually looked at. These tests pin the
+// rule directly, then pin that both producers reach it through `run_scan`.
+//
+// The tagging itself decides no verdict: it writes one field per finding
+// and the rule that reads it lives in `evaluate_scan_result`. The two
+// tests at the end of this section are where the two meet — a
+// `NotContained` Critical that no longer rejects while staying in the
+// record, and a clean scan that still rejects nothing.
+// ===========================================================================
+
+/// A BOM with an optional subject and a list of components, built from
+/// purls alone — the join key is the purl and nothing else.
+fn sbom_with(subject: Option<&str>, components: &[&str]) -> Sbom {
+    Sbom {
+        subject: subject.map(component),
+        components: components.iter().copied().map(component).collect(),
+    }
+}
+
+/// The join over `sbom`, for a format that ships none of the components
+/// its BOM lists (cargo / npm / pypi / maven — the four that override
+/// `payload_contains_components`).
+fn declaring_format(sbom: &Sbom) -> ComponentRelations<'_> {
+    ComponentRelations {
+        sbom: Some(sbom),
+        payload_contains_components: false,
+        format: "cargo",
+    }
+}
+
+/// The join over `sbom`, for a format whose payload carries its closure
+/// (an OCI image and its layers — and the trait default).
+fn self_contained_format(sbom: &Sbom) -> ComponentRelations<'_> {
+    ComponentRelations {
+        sbom: Some(sbom),
+        payload_contains_components: true,
+        format: "oci",
+    }
+}
+
+/// The artifact's own subject component is in the artifact by
+/// definition, whatever the format and whichever producer found it.
+/// Reading this as anything else would disarm the scanner on exactly the
+/// findings that are about the artifact.
+#[test]
+fn a_finding_naming_the_bom_subject_is_tagged_subject() {
+    let sbom = sbom_with(
+        Some("pkg:cargo/hyper-util@0.1.21"),
+        &["pkg:cargo/h2@0.4.13"],
+    );
+    for evidence in [
+        EvidenceBasis::MaterialisedPayload,
+        EvidenceBasis::SuppliedSbom,
+    ] {
+        assert_eq!(
+            declaring_format(&sbom).relation_for("pkg:cargo/hyper-util@0.1.21", evidence),
+            ComponentRelation::Subject,
+            "{evidence:?}"
+        );
+        assert_eq!(
+            self_contained_format(&sbom).relation_for("pkg:cargo/hyper-util@0.1.21", evidence),
+            ComponentRelation::Subject,
+            "{evidence:?}"
+        );
+    }
+}
+
+/// The incident this whole change exists for, in one assertion: a
+/// `.crate` carries the maintainer's `Cargo.lock` and none of the code it
+/// pins, so an advisory against a pinned version names a component the
+/// artifact does not contain. Reading it as `Contained` is what terminally
+/// rejected `hyper-util 0.1.21` over `h2 0.4.13`.
+#[test]
+fn a_listed_component_is_not_contained_when_the_format_ships_none_of_it() {
+    let sbom = sbom_with(
+        Some("pkg:cargo/hyper-util@0.1.21"),
+        &["pkg:cargo/h2@0.4.13"],
+    );
+    for evidence in [
+        EvidenceBasis::MaterialisedPayload,
+        EvidenceBasis::SuppliedSbom,
+    ] {
+        assert_eq!(
+            declaring_format(&sbom).relation_for("pkg:cargo/h2@0.4.13", evidence),
+            ComponentRelation::NotContained,
+            "{evidence:?}"
+        );
+    }
+}
+
+/// The opposite format shape: an image carries its layers, so the same
+/// position in the BOM means the code *is* in the artifact and the
+/// finding keeps full authority. A rule keyed on "is it the subject?"
+/// rather than "is it in the artifact?" would collapse these two tests
+/// into one wrong answer.
+#[test]
+fn a_listed_component_is_contained_when_the_payload_carries_its_closure() {
+    let sbom = sbom_with(Some("pkg:oci/app@1"), &["pkg:deb/openssl@3.0.2"]);
+    for evidence in [
+        EvidenceBasis::MaterialisedPayload,
+        EvidenceBasis::SuppliedSbom,
+    ] {
+        assert_eq!(
+            self_contained_format(&sbom).relation_for("pkg:deb/openssl@3.0.2", evidence),
+            ComponentRelation::Contained,
+            "{evidence:?}"
+        );
+    }
+}
+
+/// A backend that materialised the artifact's bytes reports what it
+/// unpacked, so a package the BOM never listed was still in the
+/// artifact — the BOM and the materialised tree are derived differently.
+/// The opposite reading would silently disarm every payload-scanner
+/// finding the BOM happens not to list.
+#[test]
+fn an_unmatched_purl_from_a_payload_scanned_backend_is_contained() {
+    let sbom = sbom_with(
+        Some("pkg:cargo/hyper-util@0.1.21"),
+        &["pkg:cargo/h2@0.4.13"],
+    );
+    assert_eq!(
+        declaring_format(&sbom).relation_for(
+            "pkg:cargo/never-listed@9.9.9",
+            EvidenceBasis::MaterialisedPayload
+        ),
+        ComponentRelation::Contained,
+    );
+}
+
+/// The BOM is an SBOM-driven producer's whole input, so a purl matching
+/// nothing in it cannot be a package discovered elsewhere — it is a join
+/// that failed, and the counter has to show it rather than the default
+/// absorbing it.
+#[test]
+fn an_unmatched_purl_from_an_sbom_driven_producer_is_not_established() {
+    let sbom = sbom_with(
+        Some("pkg:cargo/hyper-util@0.1.21"),
+        &["pkg:cargo/h2@0.4.13"],
+    );
+    assert_eq!(
+        declaring_format(&sbom)
+            .relation_for("pkg:cargo/never-listed@9.9.9", EvidenceBasis::SuppliedSbom),
+        ComponentRelation::NotEstablished,
+    );
+}
+
+/// `Sbom.subject` is an `Option` and the type permits `None`, so the arm
+/// is handled explicitly rather than unwrapped: with nothing to join
+/// against, an SBOM-driven finding's relation is not established and the
+/// counter says so. Every production builder sets a subject, which is
+/// what makes a non-zero count here a defect rather than a steady state.
+#[test]
+fn a_bom_without_a_subject_leaves_an_sbom_driven_finding_not_established() {
+    let sbom = sbom_with(None, &["pkg:cargo/h2@0.4.13"]);
+    assert_eq!(
+        declaring_format(&sbom).relation_for("pkg:cargo/anything@1", EvidenceBasis::SuppliedSbom),
+        ComponentRelation::NotEstablished,
+    );
+    // A *listed* component still joins — the missing subject only costs
+    // the subject arm, it does not blind the component arm.
+    assert_eq!(
+        declaring_format(&sbom).relation_for("pkg:cargo/h2@0.4.13", EvidenceBasis::SuppliedSbom),
+        ComponentRelation::NotContained,
+    );
+}
+
+/// No BOM at all (no handler registered, an opaque format, a failed
+/// extraction) is the same situation as a purl the BOM does not name,
+/// and is answered the same way — by what the producer looked at. This
+/// is the steady state for OCI, whose handler extracts no SBOM: its
+/// Trivy findings are `Contained`, not a flood of failed joins that
+/// would drown the `not_established` signal on its first day.
+#[test]
+fn no_bom_at_all_falls_through_to_the_producer_evidence() {
+    let none = ComponentRelations {
+        sbom: None,
+        payload_contains_components: true,
+        format: "oci",
+    };
+    assert_eq!(
+        none.relation_for("pkg:deb/openssl@3.0.2", EvidenceBasis::MaterialisedPayload),
+        ComponentRelation::Contained,
+    );
+    assert_eq!(
+        none.relation_for("pkg:deb/openssl@3.0.2", EvidenceBasis::SuppliedSbom),
+        ComponentRelation::NotEstablished,
+    );
+}
+
+/// The join is `Finding.purl == SbomComponent.purl` verbatim — the key
+/// `SbomComponent`'s own rustdoc declares, and the case-sensitive PURL
+/// convention `merge_findings` and `compute_added_findings` already use.
+/// A near-miss spelling does not silently join; it lands on the
+/// unmatched arm, where an SBOM-driven producer makes it visible.
+#[test]
+fn the_purl_join_is_verbatim_and_case_sensitive() {
+    let sbom = sbom_with(Some("pkg:cargo/Subject@1"), &["pkg:cargo/Dep@2"]);
+    let relations = declaring_format(&sbom);
+    assert_eq!(
+        relations.relation_for("pkg:cargo/subject@1", EvidenceBasis::SuppliedSbom),
+        ComponentRelation::NotEstablished,
+        "a case-folded subject purl must not join"
+    );
+    assert_eq!(
+        relations.relation_for("pkg:cargo/dep@2", EvidenceBasis::SuppliedSbom),
+        ComponentRelation::NotEstablished,
+        "a case-folded component purl must not join"
+    );
+    assert_eq!(
+        relations.relation_for("pkg:cargo/Dep@2", EvidenceBasis::SuppliedSbom),
+        ComponentRelation::NotContained,
+    );
+}
+
+/// The interop convention duplicates the subject into `components[]`
+/// (the OSV adapter's CycloneDX rendering relies on it). The subject arm
+/// is checked first, so a BOM listing its own subject still reports
+/// `Subject` — not `NotContained`, which for a declaring format would
+/// strip authority from the finding that matters most.
+#[test]
+fn the_subject_wins_over_a_component_entry_with_the_same_purl() {
+    let sbom = sbom_with(Some("pkg:cargo/leaf@1"), &["pkg:cargo/leaf@1"]);
+    assert_eq!(
+        declaring_format(&sbom).relation_for("pkg:cargo/leaf@1", EvidenceBasis::SuppliedSbom),
+        ComponentRelation::Subject,
+    );
+}
+
+/// A handler whose BOM a test chooses outright, with the format's
+/// containment declaration alongside it. Mirrors what the real handlers
+/// do — npm/pypi/cargo/maven declare `false`, OCI inherits `true` — while
+/// keeping the BOM's shape under the test's control.
+struct BomShapedHandler {
+    key: &'static str,
+    sbom: Option<Sbom>,
+    contains_components: bool,
+}
+
+impl FormatHandler for BomShapedHandler {
+    fn format_key(&self) -> &str {
+        self.key
+    }
+    fn parse_download_path(&self, _path: &str) -> DomainResult<ArtifactCoords> {
+        Err(DomainError::Validation("not used by these tests".into()))
+    }
+    fn normalize_name(&self, name: &str) -> String {
+        name.to_string()
+    }
+    fn payload_contains_components(&self) -> bool {
+        self.contains_components
+    }
+    fn extract_sbom(
+        &self,
+        _coords: &ArtifactCoords,
+        _format_metadata: &serde_json::Value,
+        _payload: PayloadAccess<'_>,
+    ) -> DomainResult<Option<Sbom>> {
+        Ok(self.sbom.clone())
+    }
+}
+
+/// Register one `BomShapedHandler` under `format`.
+fn bom_handler_map(
+    format: &'static str,
+    sbom: Option<Sbom>,
+    contains_components: bool,
+) -> HashMap<String, Arc<dyn FormatHandler>> {
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert(
+        format.to_string(),
+        Arc::new(BomShapedHandler {
+            key: format,
+            sbom,
+            contains_components,
+        }),
+    );
+    handlers
+}
+
+/// Run one scan against a BOM-shaped handler and return the findings the
+/// orchestrator produced. `advisory` seeds the SBOM-driven producer,
+/// `scanner_findings` the backend's, and `payload_scanned` picks which
+/// evidence that backend declares.
+async fn run_tagged_scan(
+    format: &'static str,
+    sbom: Option<Sbom>,
+    contains_components: bool,
+    advisory_findings: Vec<Finding>,
+    scanner_findings: Vec<Finding>,
+    payload_scanned: bool,
+) -> Vec<Finding> {
+    let scanner = MockScanner::new("trivy", Ok(scanner_findings));
+    let scanner = if payload_scanned {
+        scanner
+    } else {
+        scanner.sbom_driven()
+    };
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_global_policy(vec!["trivy".into()]));
+    let (uc, _jobs, _events, _storage, artifacts, repositories, _policy, _metadata) =
+        make_uc_with_policy_repo_and_handlers(
+            one_scanner(Arc::new(scanner)),
+            Arc::new(MockAdvisory::ok(advisory_findings)),
+            policy_projections,
+            bom_handler_map(format, sbom, contains_components),
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, format);
+
+    match uc.run_scan(&job).await.expect("run_scan") {
+        ScanRunOutcome::Completed { findings, .. } => findings,
+        other => panic!("expected a completed scan, got {other:?}"),
+    }
+}
+
+/// Look one finding up by vulnerability id.
+fn relation_of(findings: &[Finding], vuln: &str) -> ComponentRelation {
+    findings
+        .iter()
+        .find(|f| f.vulnerability_id == vuln)
+        .unwrap_or_else(|| panic!("no finding {vuln} in {findings:?}"))
+        .component_relation
+}
+
+/// The advisory path alone. Its tagging site is the one that initialises
+/// `accumulated`; a scan whose only producer is advisory enrichment must
+/// still leave every finding tagged, and this fails alone if that site
+/// is lost.
+#[tokio::test]
+async fn run_scan_tags_the_advisory_paths_findings() {
+    let findings = run_tagged_scan(
+        "cargo",
+        Some(sbom_with(
+            Some("pkg:cargo/hyper-util@0.1.21"),
+            &["pkg:cargo/h2@0.4.13"],
+        )),
+        false,
+        vec![finding(
+            "pkg:cargo/h2@0.4.13",
+            "RUSTSEC-ADVISORY",
+            SeverityThreshold::Low,
+        )],
+        vec![],
+        true,
+    )
+    .await;
+    assert_eq!(findings.len(), 1);
+    assert_eq!(
+        relation_of(&findings, "RUSTSEC-ADVISORY"),
+        ComponentRelation::NotContained,
+    );
+}
+
+/// The scanner path alone — the other tagging site, inside the
+/// per-backend loop. A backend that contributes findings while the
+/// advisory path contributes none must still leave them tagged.
+#[tokio::test]
+async fn run_scan_tags_the_scanner_paths_findings() {
+    let findings = run_tagged_scan(
+        "cargo",
+        Some(sbom_with(
+            Some("pkg:cargo/hyper-util@0.1.21"),
+            &["pkg:cargo/h2@0.4.13"],
+        )),
+        false,
+        vec![],
+        vec![finding(
+            "pkg:cargo/h2@0.4.13",
+            "CVE-FROM-BACKEND",
+            SeverityThreshold::Low,
+        )],
+        false,
+    )
+    .await;
+    assert_eq!(findings.len(), 1);
+    assert_eq!(
+        relation_of(&findings, "CVE-FROM-BACKEND"),
+        ComponentRelation::NotContained,
+    );
+}
+
+/// Both producers reach the tagging step, and each one's finding carries
+/// the relation the join assigns. Before this unit every finding left
+/// `run_scan` as `NotEstablished`, so a single untagged path is the
+/// regression this kills — and `NotEstablished` is precisely the value
+/// an untagged path would leave behind.
+#[tokio::test]
+async fn run_scan_tags_findings_from_both_producers() {
+    let findings = run_tagged_scan(
+        "cargo",
+        Some(sbom_with(
+            Some("pkg:cargo/hyper-util@0.1.21"),
+            &["pkg:cargo/h2@0.4.13"],
+        )),
+        false,
+        vec![finding(
+            "pkg:cargo/h2@0.4.13",
+            "RUSTSEC-ADVISORY",
+            SeverityThreshold::Low,
+        )],
+        vec![finding(
+            "pkg:cargo/hyper-util@0.1.21",
+            "CVE-SUBJECT",
+            SeverityThreshold::High,
+        )],
+        true,
+    )
+    .await;
+
+    assert_eq!(findings.len(), 2);
+    assert_eq!(
+        relation_of(&findings, "RUSTSEC-ADVISORY"),
+        ComponentRelation::NotContained,
+        "the advisory path's finding names a lockfile pin the crate does not ship"
+    );
+    assert_eq!(
+        relation_of(&findings, "CVE-SUBJECT"),
+        ComponentRelation::Subject,
+        "the scanner path's finding names the artifact itself"
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|f| f.component_relation != ComponentRelation::NotEstablished),
+        "no finding may leave the orchestrator untagged: {findings:?}"
+    );
+}
+
+/// §6, through the orchestrator: a payload-scanning backend's finding
+/// that the BOM does not list keeps its authority. The opposite reading
+/// disarms every Trivy finding an npm packument or a cargo lockfile
+/// happens not to mention.
+#[tokio::test]
+async fn run_scan_tags_a_payload_scanned_finding_the_bom_omits_as_contained() {
+    let findings = run_tagged_scan(
+        "cargo",
+        Some(sbom_with(Some("pkg:cargo/app@1"), &["pkg:cargo/dep@2"])),
+        false,
+        vec![],
+        vec![finding(
+            "pkg:cargo/unlisted@3",
+            "CVE-UNLISTED",
+            SeverityThreshold::Critical,
+        )],
+        true,
+    )
+    .await;
+    assert_eq!(
+        relation_of(&findings, "CVE-UNLISTED"),
+        ComponentRelation::Contained,
+    );
+}
+
+/// §6's other half: the same unlisted purl from a backend whose only
+/// input was the BOM is a broken join, recorded as such.
+#[tokio::test]
+async fn run_scan_tags_an_sbom_driven_finding_the_bom_omits_as_not_established() {
+    let findings = run_tagged_scan(
+        "cargo",
+        Some(sbom_with(Some("pkg:cargo/app@1"), &["pkg:cargo/dep@2"])),
+        false,
+        vec![],
+        vec![finding(
+            "pkg:cargo/unlisted@3",
+            "CVE-UNLISTED",
+            SeverityThreshold::Critical,
+        )],
+        false,
+    )
+    .await;
+    assert_eq!(
+        relation_of(&findings, "CVE-UNLISTED"),
+        ComponentRelation::NotEstablished,
+    );
+}
+
+/// §5's claim, asserted rather than assumed: every production SBOM
+/// builder derives its subject from the artifact's coordinates, which
+/// always exist, so no scan over a production-shaped BOM may produce a
+/// `not established` finding. If one does, a format's subject is not
+/// being derived — a defect in that builder, and the thing that would
+/// make the condemning default a resting state instead of a rarity.
+///
+/// The shapes are the ones the compiled-in handlers actually emit:
+/// subject + resolved closure (cargo with a lockfile, maven from a POM),
+/// subject + declared dependencies (npm, pypi), and subject-only (a leaf
+/// package, or a payload whose lockfile was unusable).
+#[tokio::test]
+async fn run_scan_over_production_sbom_shapes_yields_no_not_established_findings() {
+    let shapes: Vec<(&'static str, Sbom)> = vec![
+        (
+            "subject + resolved closure",
+            sbom_with(Some("pkg:cargo/app@1.0.0"), &["pkg:cargo/h2@0.4.13"]),
+        ),
+        (
+            "subject + declared dependencies",
+            sbom_with(Some("pkg:npm/app@1.0.0"), &["pkg:npm/lodash@4.17.20"]),
+        ),
+        (
+            "subject only (leaf package / no usable lockfile)",
+            sbom_with(Some("pkg:pypi/app@1.0.0"), &[]),
+        ),
+    ];
+
+    for (label, sbom) in shapes {
+        // Both the subject and a listed component, from both producers —
+        // every purl a production BOM can be joined on.
+        let subject_purl = sbom
+            .subject
+            .as_ref()
+            .expect("production shape")
+            .purl
+            .clone();
+        let component_purl = sbom
+            .components
+            .first()
+            .map(|c| c.purl.clone())
+            .unwrap_or_else(|| subject_purl.clone());
+        for payload_scanned in [true, false] {
+            let findings = run_tagged_scan(
+                "cargo",
+                Some(sbom.clone()),
+                false,
+                vec![finding(
+                    &component_purl,
+                    "CVE-ADVISORY",
+                    SeverityThreshold::Low,
+                )],
+                vec![finding(
+                    &subject_purl,
+                    "CVE-SCANNER",
+                    SeverityThreshold::Low,
+                )],
+                payload_scanned,
+            )
+            .await;
+            for f in &findings {
+                assert_ne!(
+                    f.component_relation,
+                    ComponentRelation::NotEstablished,
+                    "{label} (payload_scanned={payload_scanned}): {} was not joined",
+                    f.purl
+                );
+            }
+        }
+    }
+}
+
+/// **The verdict this change exists to move**, end to end through the
+/// orchestrator and the record path: `hyper-util 0.1.21` scanned with a
+/// Critical advisory against `h2 0.4.13`, a version read out of the
+/// crate's own embedded `Cargo.lock`. A `.crate` is a source tarball — it
+/// ships that lockfile and none of the code it pins, and a consumer's
+/// build resolves none of those pins — so the advisory is not evidence
+/// about this artifact and no longer condemns it. The finding is still
+/// recorded, still counted and still on the events surface; only its
+/// authority over the release gate is gone.
+///
+/// Its clean-direction sibling below is the other half of the pin and
+/// must stay green: the narrowing may not invent a rejection, nor remove
+/// one a condemning finding earned.
+#[tokio::test]
+async fn a_not_contained_critical_no_longer_rejects_but_is_still_recorded() {
+    let scanner = Arc::new(MockScanner::new(
+        "trivy",
+        Ok(vec![finding(
+            "pkg:cargo/h2@0.4.13",
+            "CVE-NOT-CONTAINED",
+            SeverityThreshold::Critical,
+        )]),
+    ));
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_global_policy(vec!["trivy".into()]));
+    let (uc, _jobs, events, _storage, artifacts, repositories, _policy, _metadata) =
+        make_uc_with_policy_repo_and_handlers(
+            one_scanner(scanner),
+            Arc::new(MockAdvisory::ok(vec![])),
+            policy_projections,
+            bom_handler_map(
+                "cargo",
+                Some(sbom_with(
+                    Some("pkg:cargo/hyper-util@0.1.21"),
+                    &["pkg:cargo/h2@0.4.13"],
+                )),
+                false,
+            ),
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, "cargo");
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed { ref findings, .. } = outcome else {
+        panic!("expected a completed scan, got {outcome:?}");
+    };
+    assert_eq!(
+        findings[0].component_relation,
+        ComponentRelation::NotContained,
+        "precondition: the finding is tagged as naming code the crate does not carry"
+    );
+
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+
+    let appended: Vec<DomainEvent> = events
+        .appended_batches()
+        .into_iter()
+        .flat_map(|batch| batch.events.into_iter().map(|e| e.event))
+        .collect();
+    assert!(
+        !appended
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ArtifactRejected(_))),
+        "an advisory against a component the crate ships none of must not reject it",
+    );
+    assert_ne!(
+        artifacts
+            .get(artifact_id)
+            .expect("artifact")
+            .quarantine_status,
+        QuarantineStatus::Rejected,
+        "and the artifact must not be left holding that verdict",
+    );
+
+    // The other half of the rule, on the surface an operator reads: the
+    // finding is still there. Removing it from the record would trade one
+    // wrong answer for another — a consumer may well want to know that a
+    // crate's own lockfile pinned a vulnerable version.
+    let scan_completed = appended
+        .iter()
+        .find_map(|e| match e {
+            DomainEvent::ScanCompleted(sc) => Some(sc),
+            _ => None,
+        })
+        .expect("the scan is still recorded — a ScanCompleted on the stream");
+    assert_eq!(
+        scan_completed.finding_count, 1,
+        "the finding is recorded, not dropped",
+    );
+    assert_eq!(
+        scan_completed.severity_summary.critical, 1,
+        "and still counted as the Critical it is",
+    );
+    assert!(
+        scan_completed.findings_blob.is_some(),
+        "the per-finding record is still persisted",
+    );
+}
+
+/// The clean direction of the same pin: tagging introduces no rejection
+/// where there was none. A tagging step that mutated the finding set
+/// (rather than one field of each finding) would show up here.
+#[tokio::test]
+async fn tagging_changes_no_verdict_a_clean_scan_still_rejects_nothing() {
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_global_policy(vec!["trivy".into()]));
+    let (uc, _jobs, events, _storage, artifacts, repositories, _policy, _metadata) =
+        make_uc_with_policy_repo_and_handlers(
+            one_scanner(Arc::new(MockScanner::new("trivy", Ok(vec![])))),
+            Arc::new(MockAdvisory::ok(vec![])),
+            policy_projections,
+            bom_handler_map(
+                "cargo",
+                Some(sbom_with(Some("pkg:cargo/app@1"), &[])),
+                false,
+            ),
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, "cargo");
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed { ref findings, .. } = outcome else {
+        panic!("expected a completed scan, got {outcome:?}");
+    };
+    assert!(findings.is_empty());
+
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+
+    let rejected = events
+        .appended_batches()
+        .iter()
+        .flat_map(|b| b.events.iter())
+        .any(|e| matches!(&e.event, DomainEvent::ArtifactRejected(_)));
+    assert!(!rejected, "a clean scan must still reject nothing");
+}
+
+/// With no handler registered for the format there is no BOM and no
+/// containment declaration to read, and the fail-closed trait default
+/// applies. Nothing here may panic or unwrap a missing subject.
+#[tokio::test]
+async fn run_scan_tags_findings_when_no_handler_is_registered() {
+    let scanner = Arc::new(MockScanner::new(
+        "trivy",
+        Ok(vec![finding(
+            "pkg:generic/thing@1",
+            "CVE-NOHANDLER",
+            SeverityThreshold::High,
+        )]),
+    ));
+    let (uc, _jobs, _events, artifacts, repositories) =
+        make_uc_with_handler(vec!["trivy".into()], one_scanner(scanner), HashMap::new());
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, "generic");
+
+    let ScanRunOutcome::Completed { findings, .. } = uc.run_scan(&job).await.expect("run_scan")
+    else {
+        panic!("expected a completed scan");
+    };
+    assert_eq!(
+        relation_of(&findings, "CVE-NOHANDLER"),
+        ComponentRelation::Contained,
+        "a payload-scanning backend found it in the artifact; no BOM says otherwise"
+    );
 }

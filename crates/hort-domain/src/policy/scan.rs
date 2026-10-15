@@ -19,6 +19,22 @@
 //!    `ExclusionProjection.cve_id`. The post-exclusion
 //!    [`SeveritySummary`] is computed from the surviving findings —
 //!    single source of truth.
+//!
+//!    Then (step 1b in the body)
+//!    [`crate::types::Finding::may_condemn_artifact`] narrows the
+//!    survivors to the findings that may decide *this* artifact's
+//!    verdict: one naming a component whose code the artifact does not
+//!    carry is dropped from the **condemning** set, and the summary the
+//!    tier walk and the negligible lane read is recomputed over what is
+//!    left. Nothing is removed from the record — see that predicate and
+//!    ADR 0056's 2026-10-15 amendment.
+//!
+//!    [`crate::policy::decide_rejected_transition`] applies the same
+//!    narrowing at the same point, because it is the other function that
+//!    computes a blocking verdict from a finding list and the two must
+//!    not disagree about which findings may decide one. Those are the
+//!    predicate's only two consumers; a third would be the moment to
+//!    collapse the verdict functions instead.
 //! 2. Threshold resolved from `policy.severity_threshold` if a policy
 //!    was provided, else [`DefaultPolicy::block_on_critical`] (only
 //!    `critical` findings block when no operator policy is configured).
@@ -71,7 +87,7 @@ use crate::entities::scan_policy::{
     ExclusionProjection, NegligibleAction, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use crate::events::PolicyViolation;
-use crate::types::{ArtifactCoords, Finding};
+use crate::types::{severity_summary_from_findings, ArtifactCoords, Finding};
 
 use super::cve::evaluate_cve_thresholds;
 use super::exclusion::filter_excluded_findings;
@@ -269,6 +285,42 @@ pub fn evaluate_scan_result(
     // `ExclusionProjection.cve_id`.
     let filtered = filter_excluded_findings(findings, exclusions, coords, now);
 
+    // Step 1b — narrow the survivors to the findings that may decide THIS
+    // artifact's verdict. A finding naming a component whose code the
+    // artifact does not carry is real information about that component —
+    // the payload resolved its coordinates out of a manifest or lockfile
+    // it ships, and a consumer's build resolves none of those pins — but
+    // it is not evidence about this artifact, so it has no authority over
+    // this artifact's release gate (ADR 0056 as amended).
+    //
+    // It stays in the record. This function reads `findings` and writes
+    // nothing, so the caller's list, the findings blob, the per-finding
+    // rows and `ScanCompleted.severity_summary` are untouched; what is
+    // narrowed is only the aggregate the thresholds are walked against —
+    // the same present-but-non-enforcing split ADR 0040's negligible lane
+    // already draws, reused rather than duplicated.
+    //
+    // Here, beside the exclusion filter, because both answer "which
+    // findings may decide this verdict?" over the same input before any
+    // threshold exists to walk — and the summary is recomputed from the
+    // survivors for step 1's reason: no aggregate reaches the tier walk
+    // that was not derived from the findings it governs. Both tier inputs
+    // below (the walk and the negligible lane) read `condemning_summary`,
+    // or a non-carried finding would still block through whichever one was
+    // missed. Moving the vec out of `filtered` rather than copying it is
+    // what makes reading the wider `filtered.remaining_findings` below a
+    // compile error instead of a judgement call.
+    //
+    // `Finding::may_condemn_artifact` is the single definition of the
+    // question; re-deriving it by matching on the relation here is what
+    // `hort-app/tests/condemning_rule_is_single_sourced.rs` rejects.
+    // `decide_rejected_transition` is its only other consumer and narrows
+    // at the point this function does — the two verdict functions have to
+    // agree about which findings may decide one finding list.
+    let mut condemning = filtered.remaining_findings;
+    condemning.retain(Finding::may_condemn_artifact);
+    let condemning_summary = severity_summary_from_findings(&condemning);
+
     // Step 2 — resolve threshold.
     let threshold = policy
         .map(|p| p.severity_threshold)
@@ -278,7 +330,7 @@ pub fn evaluate_scan_result(
     // escalation (each tier's own severity drives Allow → Warn → Block).
     let mut accumulator = ViolationsAccumulator::new();
     accumulator
-        .collect_with_severity_escalation(evaluate_cve_thresholds(&filtered.remaining, threshold));
+        .collect_with_severity_escalation(evaluate_cve_thresholds(&condemning_summary, threshold));
 
     // Step 4 — license policy, only when a non-empty policy object was
     // supplied. `Value::Null` (the operator-left-the-field-unset
@@ -317,7 +369,7 @@ pub fn evaluate_scan_result(
     collect_negligible_action(
         &mut accumulator,
         negligible_action,
-        filtered.remaining.negligible,
+        condemning_summary.negligible,
     );
 
     // Step 5 — translate accumulator outcome into ScanOutcome. The
@@ -425,6 +477,7 @@ mod tests {
         ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
     };
     use crate::events::PolicyScope;
+    use crate::types::ComponentRelation;
     use chrono::TimeZone;
     use uuid::Uuid;
 
@@ -458,6 +511,7 @@ mod tests {
             aliases: vec![],
             informational_class: None,
             severity_basis: crate::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 
@@ -1155,6 +1209,252 @@ mod tests {
             evaluate_scan_result(&coords("any"), &findings(1, 0, 0, 0), None, &[], ts(0));
         assert!(matches!(with_policy, ScanOutcome::Reject(_)));
         assert!(matches!(no_policy, ScanOutcome::Reject(_)));
+    }
+
+    // ---- evaluate_scan_result: which findings may condemn ----
+    //
+    // The regression these pin matters more than the narrowing itself:
+    // an over-broad predicate disarms the scanner silently, because every
+    // test that only checks "the bad artifact was rejected for the right
+    // reason" keeps passing on the cases it still catches. So the
+    // subject-still-condemns direction comes first, and
+    // `every_relation_that_may_condemn_still_rejects` sweeps the whole
+    // enum against the predicate rather than naming one relation.
+
+    /// `finding`, re-tagged with the relation under test — the only thing
+    /// that differs between the cases below.
+    fn about(relation: ComponentRelation, mut f: Finding) -> Finding {
+        f.component_relation = relation;
+        f
+    }
+
+    /// §4, first: a finding about the artifact's **own** subject component
+    /// condemns exactly as before. This is the case the narrowing must not
+    /// touch, and an over-broad predicate would fail here and nowhere
+    /// else obvious.
+    #[test]
+    fn a_subject_component_finding_over_the_threshold_still_rejects() {
+        let findings = vec![about(
+            ComponentRelation::Subject,
+            finding("CVE-SUBJECT", SeverityThreshold::Critical),
+        )];
+        let r = evaluate_scan_result(&coords("hyper-util"), &findings, None, &[], ts(0));
+        assert!(
+            matches!(r, ScanOutcome::Reject(_)),
+            "a finding about the artifact itself keeps full release authority, got {r:?}",
+        );
+    }
+
+    /// §4, fourth: a format whose payload carries its closure — an OCI
+    /// image and its layers. The component is not the subject and the code
+    /// *is* in the artifact, so it condemns unchanged. Collapsing this
+    /// into the subject case would disarm every layer finding on every
+    /// image.
+    #[test]
+    fn a_contained_component_finding_over_the_threshold_still_rejects() {
+        let findings = vec![about(
+            ComponentRelation::Contained,
+            finding("CVE-LAYER", SeverityThreshold::Critical),
+        )];
+        let r = evaluate_scan_result(&coords("app"), &findings, None, &[], ts(0));
+        assert!(matches!(r, ScanOutcome::Reject(_)), "{r:?}");
+    }
+
+    /// §4, third: an unestablished relation condemns. A record whose
+    /// relation was never established — every finding persisted before the
+    /// field existed — must keep today's behaviour; defaulting the other
+    /// way would disarm the whole stored corpus in one step (ADR 0007).
+    #[test]
+    fn a_not_established_relation_over_the_threshold_still_rejects() {
+        let findings = vec![about(
+            ComponentRelation::NotEstablished,
+            finding("CVE-LEGACY", SeverityThreshold::Critical),
+        )];
+        let r = evaluate_scan_result(&coords("any"), &findings, None, &[], ts(0));
+        assert!(matches!(r, ScanOutcome::Reject(_)), "{r:?}");
+    }
+
+    /// The narrowing itself (§4, second) — and the half that keeps it
+    /// honest. A finding naming a component the artifact does not carry no
+    /// longer blocks, AND it is still in the caller's list and still
+    /// counted by the aggregate the `ScanCompleted` event carries.
+    /// Implementing the rule as a removal from the record would trade one
+    /// wrong answer for another.
+    #[test]
+    fn a_not_contained_component_finding_no_longer_rejects_and_stays_in_the_record() {
+        let findings = vec![about(
+            ComponentRelation::NotContained,
+            finding("CVE-ELSEWHERE", SeverityThreshold::Critical),
+        )];
+        let r = evaluate_scan_result(&coords("any"), &findings, None, &[], ts(0));
+        assert_eq!(
+            r,
+            ScanOutcome::Clean,
+            "a component the artifact does not carry has no authority over its release",
+        );
+
+        assert_eq!(findings.len(), 1, "the evaluator removes nothing");
+        assert_eq!(
+            severity_summary_from_findings(&findings).critical,
+            1,
+            "the recorded aggregate still counts it; only its authority changed",
+        );
+    }
+
+    /// The incident this change exists for, through the evaluator. A cargo
+    /// `.crate` ships the maintainer's `Cargo.lock` and none of the code it
+    /// pins, so the advisory against the pinned `h2` names code the
+    /// artifact does not contain — and `hyper-util 0.1.21` was terminally
+    /// rejected over it.
+    #[test]
+    fn a_lockfile_pin_no_longer_rejects_the_crate_that_ships_none_of_it() {
+        let mut pinned = about(
+            ComponentRelation::NotContained,
+            finding("RUSTSEC-2026-0004", SeverityThreshold::Critical),
+        );
+        pinned.purl = "pkg:cargo/h2@0.4.13".into();
+        let r = evaluate_scan_result(&coords("hyper-util"), &[pinned], None, &[], ts(0));
+        assert_eq!(r, ScanOutcome::Clean);
+    }
+
+    /// The narrowing is per finding, not per scan: one non-carried
+    /// component alongside a real subject finding must not carry the
+    /// subject's rejection away with it.
+    #[test]
+    fn a_subject_finding_still_rejects_beside_a_non_contained_one() {
+        let findings = vec![
+            about(
+                ComponentRelation::NotContained,
+                finding("CVE-ELSEWHERE", SeverityThreshold::Critical),
+            ),
+            about(
+                ComponentRelation::Subject,
+                finding("CVE-HERE", SeverityThreshold::Critical),
+            ),
+        ];
+        let r = evaluate_scan_result(&coords("any"), &findings, None, &[], ts(0));
+        match r {
+            ScanOutcome::Reject(violations) => assert_eq!(
+                violations.len(),
+                1,
+                "exactly the one condemning critical, not two: {violations:?}",
+            ),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// The evaluator's verdict follows the predicate for every relation —
+    /// which is what catches a filter here that narrows on its own terms
+    /// rather than by asking. Expectations come from
+    /// `Finding::may_condemn_artifact` itself, so a future relation is
+    /// swept without an edit; the price is that it says nothing about the
+    /// predicate's own arms (a change there moves both sides at once).
+    /// Those arms are pinned in `types::finding`, and the four cases
+    /// above name their relations literally for exactly this reason.
+    #[test]
+    fn every_relation_that_may_condemn_still_rejects() {
+        for relation in [
+            ComponentRelation::Subject,
+            ComponentRelation::Contained,
+            ComponentRelation::NotContained,
+            ComponentRelation::NotEstablished,
+        ] {
+            let one = about(relation, finding("CVE-SWEEP", SeverityThreshold::Critical));
+            let condemns = one.may_condemn_artifact();
+            let r = evaluate_scan_result(&coords("any"), &[one], None, &[], ts(0));
+            assert_eq!(
+                matches!(r, ScanOutcome::Reject(_)),
+                condemns,
+                "{relation:?}: the verdict must follow the predicate, got {r:?}",
+            );
+        }
+    }
+
+    /// The negligible lane reads the narrowed aggregate too. An
+    /// informational advisory about a component the artifact does not
+    /// carry cannot block under `negligibleAction: block` — otherwise the
+    /// rule would hold on the scored lane and leak on the lane beside it.
+    #[test]
+    fn a_non_contained_informational_finding_cannot_block_the_negligible_lane() {
+        let mut policy = projection(SeverityThreshold::Critical, serde_json::Value::Null);
+        policy.negligible_action = NegligibleAction::Block;
+        let findings = vec![about(
+            ComponentRelation::NotContained,
+            informational_finding("RUSTSEC-2026-0173"),
+        )];
+        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        assert_eq!(r, ScanOutcome::Clean, "{r:?}");
+    }
+
+    /// The other direction of the same lane: an informational advisory
+    /// whose relation was never established still blocks under
+    /// `negligibleAction: block`, exactly as before.
+    #[test]
+    fn a_not_established_informational_finding_still_blocks_the_negligible_lane() {
+        let mut policy = projection(SeverityThreshold::Critical, serde_json::Value::Null);
+        policy.negligible_action = NegligibleAction::Block;
+        let findings = vec![about(
+            ComponentRelation::NotEstablished,
+            informational_finding("RUSTSEC-2026-0173"),
+        )];
+        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        match r {
+            ScanOutcome::Reject(violations) => {
+                assert_eq!(violations.len(), 1);
+                assert_eq!(violations[0].rule, NEGLIGIBLE_RULE);
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// A non-carried finding produces no violation at all, so under
+    /// `enforcement: record` the verdict is `Clean` rather than an empty
+    /// `FindingsRecorded` — the same shape an excluded finding already
+    /// takes. An operator reading a recorded verdict must be looking at
+    /// something that was actually computed against this artifact.
+    #[test]
+    fn a_non_contained_finding_under_record_enforcement_is_clean_not_recorded() {
+        let policy = projection_with_enforcement(ScanEnforcement::Record);
+        let findings = vec![about(
+            ComponentRelation::NotContained,
+            finding("CVE-ELSEWHERE", SeverityThreshold::Critical),
+        )];
+        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        assert_eq!(r, ScanOutcome::Clean);
+    }
+
+    /// The narrowing is independent of the threshold: lowering the
+    /// operator's threshold to the finding's own tier does not give a
+    /// non-carried component authority back.
+    #[test]
+    fn a_non_contained_finding_does_not_block_at_its_own_threshold() {
+        let policy = projection(SeverityThreshold::Low, serde_json::Value::Null);
+        let findings = vec![about(
+            ComponentRelation::NotContained,
+            finding("CVE-LOW", SeverityThreshold::Low),
+        )];
+        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        assert_eq!(r, ScanOutcome::Clean);
+    }
+
+    /// The two filters compose, in either order: an exclusion clearing the
+    /// one condemning finding leaves a non-carried one that cannot block,
+    /// so the artifact comes out clean rather than held by the leftover.
+    #[test]
+    fn an_exclusion_and_the_relation_filter_compose() {
+        let findings = vec![
+            about(
+                ComponentRelation::Subject,
+                finding("CVE-HERE", SeverityThreshold::Critical),
+            ),
+            about(
+                ComponentRelation::NotContained,
+                finding("CVE-ELSEWHERE", SeverityThreshold::Critical),
+            ),
+        ];
+        let exs = vec![exclusion(7, "CVE-HERE", None, None)];
+        let r = evaluate_scan_result(&coords("any"), &findings, None, &exs, ts(0));
+        assert_eq!(r, ScanOutcome::Clean, "{r:?}");
     }
 
     // ---- ScanOutcome derives ----

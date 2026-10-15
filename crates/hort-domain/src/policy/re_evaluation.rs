@@ -23,6 +23,17 @@
 //! [`crate::policy::evaluate_scan_result`] cannot disagree about which
 //! verdicts block.
 //!
+//! That agreement covers which *findings* reach the verdict too: both
+//! functions drop the operator's exclusions and then narrow what is left
+//! to the findings that may condemn the artifact
+//! ([`crate::types::Finding::may_condemn_artifact`]), in that order and
+//! before any threshold is walked. One of the two skipping the narrowing
+//! is what leaves an artifact held on a verdict a fresh scan of the same
+//! findings would not reach. The one place they knowingly differ is the
+//! aggregate-summary fallback, which has no per-finding data to narrow —
+//! an accepted, fail-closed residual documented on
+//! [`decide_rejected_transition`].
+//!
 //! Pure domain — zero I/O, zero `tracing`. The application caller is
 //! responsible for loading the artifact's last `ScanCompleted` summary,
 //! the resolved policy + exclusion set, and translating the outcome
@@ -57,7 +68,7 @@ use chrono::{DateTime, Utc};
 use crate::entities::artifact::Artifact;
 use crate::entities::scan_policy::{ExclusionProjection, ScanEnforcement, ScanPolicyProjection};
 use crate::events::SeveritySummary;
-use crate::types::{ArtifactCoords, Finding};
+use crate::types::{severity_summary_from_findings, ArtifactCoords, Finding};
 
 use super::cve::evaluate_cve_thresholds;
 use super::exclusion::{filter_excluded_findings, filter_excluded_summary};
@@ -97,6 +108,17 @@ pub enum ReEvaluationOutcome {
 ///    model captured in `crates/hort-domain/src/policy/exclusion.rs`'s
 ///    `cve_matches` rule.
 ///
+///    The survivors are then narrowed by
+///    [`crate::types::Finding::may_condemn_artifact`] — step 1b of
+///    [`crate::policy::evaluate_scan_result`], applied here at the
+///    equivalent point — and the aggregate both tier inputs read is
+///    recomputed over what is left. A finding naming a component whose
+///    code the artifact does not carry keeps its place in the record and
+///    loses its authority over this artifact's release gate (ADR 0056 as
+///    amended). Both verdict functions must apply it or they answer
+///    differently about one finding list; see the body for the sequence
+///    that strands an artifact when only one of them does.
+///
 /// 2. **Aggregate-summary fallback** — when
 ///    `last_findings` is `None`, [`filter_excluded_summary`] applies
 ///    the highest-tier-first decrement: each active+pattern-matching
@@ -104,6 +126,23 @@ pub enum ReEvaluationOutcome {
 ///    (Critical → High → Medium → Low). Preserved bit-for-bit
 ///    for callers that cannot resolve the `findings_blob`
 ///    (clean scans, missing CAS object, deserialise failure).
+///
+///    **This path cannot narrow the condemning set, and that is an
+///    accepted residual rather than an inconsistency.** Per-tier counts
+///    carry no per-finding data, so there is nothing to ask
+///    [`crate::types::Finding::may_condemn_artifact`] about: a finding
+///    naming a component the artifact does not carry keeps the release
+///    authority the per-finding mode above denies it, because on this
+///    path nothing records that it was such a finding. The divergence is
+///    fail-closed — a degraded read holds an artifact the per-finding
+///    verdict might have cleared, never the reverse — and it is the one
+///    this path already takes with `severity_basis`, which a count
+///    cannot carry either (a `critical: 1` does not say whether that
+///    Critical was assessed or was the unreadable-advisory floor).
+///    Reconstructing the relation from counts would mean inventing it,
+///    and the fail-closed reading of absent evidence is that the finding
+///    still counts (ADR 0007); the correctable path is a rescan, which
+///    re-establishes the relation and re-enters mode 1.
 ///
 /// The caller has already loaded the artifact's last `ScanCompleted`
 /// summary (`last_scan_summary`), the resolved active scan policy
@@ -159,8 +198,50 @@ pub fn decide_rejected_transition(
     // cases).
     let post_exclusion_summary = match last_findings {
         Some(findings) => {
-            filter_excluded_findings(findings, updated_exclusions, &coords, now).remaining
+            // The exclusion filter, then step 1b — the same two questions
+            // `evaluate_scan_result` asks of the same input, in the same
+            // order, before any threshold exists to walk: which findings
+            // survive the operator's exclusions, and which of those may
+            // decide THIS artifact's verdict.
+            //
+            // A finding naming a component whose code the artifact does
+            // not carry is real information about that component — the
+            // payload resolved its coordinates out of a manifest or
+            // lockfile it ships, and a consumer's build resolves none of
+            // those pins — but it is not evidence about this artifact, so
+            // it has no authority over this artifact's release gate
+            // (ADR 0056 as amended). It stays in the record: this function
+            // reads `last_findings` and writes nothing, so the stored blob
+            // and the `ScanCompleted` aggregate are untouched and the
+            // operator still sees the finding present and counted.
+            //
+            // The narrowing has to happen on BOTH verdict paths or they
+            // answer differently about one finding list, and the direction
+            // the disagreement breaks in is the one that strands an
+            // artifact: a rejection over a carried finding, an exclusion
+            // added for it, and the non-carried leftover read as blocking
+            // here while a fresh scan of the identical findings comes back
+            // clean. Fail-closed, but held on a verdict no scan would
+            // reach and clearable only by a rescan.
+            //
+            // The narrowed aggregate is the arm's only result, so every
+            // tier input below — the CVE walk and the negligible lane
+            // alike — is derived from the findings it governs; an
+            // un-narrowed summary is never bound and so cannot be read by
+            // whichever one a later edit forgets.
+            //
+            // `Finding::may_condemn_artifact` is the single definition of
+            // the question; re-deriving it by matching on the relation here
+            // is what `hort-app/tests/condemning_rule_is_single_sourced.rs`
+            // rejects.
+            let filtered = filter_excluded_findings(findings, updated_exclusions, &coords, now);
+            let mut condemning = filtered.remaining_findings;
+            condemning.retain(Finding::may_condemn_artifact);
+            severity_summary_from_findings(&condemning)
         }
+        // The aggregate-summary fallback cannot consult the relation —
+        // per-tier counts carry no per-finding data. See this function's
+        // rustdoc: an accepted, fail-closed residual, not an oversight.
         None => {
             filter_excluded_summary(last_scan_summary, updated_exclusions, &coords, now).remaining
         }
@@ -217,7 +298,8 @@ mod tests {
     use crate::entities::repository::RepositoryFormat;
     use crate::entities::scan_policy::{NegligibleAction, ProvenanceMode, SeverityThreshold};
     use crate::events::PolicyScope;
-    use crate::types::{ContentHash, Finding};
+    use crate::policy::{evaluate_scan_result, ScanOutcome};
+    use crate::types::{ComponentRelation, ContentHash, Finding};
     use chrono::TimeZone;
     use uuid::Uuid;
 
@@ -646,6 +728,7 @@ mod tests {
             aliases: vec![],
             informational_class: None,
             severity_basis: crate::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 
@@ -830,5 +913,316 @@ mod tests {
             ts(1_000_000),
         );
         assert_eq!(outcome, ReEvaluationOutcome::ResetToReleased);
+    }
+
+    // ---- which findings may condemn, on the re-evaluation path ----
+    //
+    // Same order and the same reasoning as the sibling block in
+    // `crate::policy::scan`: the directions the narrowing must NOT touch
+    // come first, because an over-broad predicate disarms the gate
+    // silently — every test that only checks "the bad artifact stayed
+    // rejected" keeps passing on the cases it still catches. The
+    // elapsed-deadline shape (`Some(ts(1_000_000))`, `ts(2_000_000)`) is
+    // used throughout so a cleared verdict reads as `ResetToReleased` and
+    // the time hold cannot be what decided the assertion.
+
+    /// `finding`, re-tagged with the relation under test — the only thing
+    /// that differs between the cases below.
+    fn about(relation: ComponentRelation, mut f: Finding) -> Finding {
+        f.component_relation = relation;
+        f
+    }
+
+    /// The [`ArtifactCoords`] `decide_rejected_transition` derives from
+    /// `artifact` internally, format sentinel included, so a comparison
+    /// against [`evaluate_scan_result`] runs the other verdict function
+    /// over the same inputs rather than merely similar ones.
+    fn coords_of(artifact: &Artifact) -> ArtifactCoords {
+        ArtifactCoords {
+            name: artifact.name.clone(),
+            name_as_published: artifact.name_as_published.clone(),
+            version: artifact.version.clone(),
+            path: artifact.path.clone(),
+            format: RepositoryFormat::Other(String::new()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    /// A Critical about the artifact's **own** subject component — the
+    /// case that keeps full release authority, and the one an over-broad
+    /// narrowing would break here and nowhere else obvious.
+    fn subject_critical(vuln: &str) -> Finding {
+        about(
+            ComponentRelation::Subject,
+            finding(vuln, SeverityThreshold::Critical),
+        )
+    }
+
+    /// A Critical about a component the artifact does **not** carry — the
+    /// `h2` pinned in a published crate's embedded `Cargo.lock`, whose
+    /// code the `.crate` does not ship and no consumer's build resolves.
+    fn not_contained_critical(vuln: &str) -> Finding {
+        about(
+            ComponentRelation::NotContained,
+            finding(vuln, SeverityThreshold::Critical),
+        )
+    }
+
+    #[test]
+    fn a_subject_component_finding_keeps_the_artifact_rejected() {
+        let artifact = rejected_artifact("hyper-util");
+        let findings = vec![subject_critical("CVE-SUBJECT")];
+        let outcome = decide_rejected_transition(
+            &artifact,
+            &summary(1, 0, 0, 0),
+            Some(&findings),
+            None,
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(
+            outcome,
+            ReEvaluationOutcome::StillRejected,
+            "a finding about the artifact itself keeps full release authority",
+        );
+    }
+
+    #[test]
+    fn a_contained_component_finding_keeps_the_artifact_rejected() {
+        // A format whose payload carries its closure — an OCI image and
+        // its layers. Not the subject, and the code IS in the artifact,
+        // so it condemns unchanged; collapsing this into the subject case
+        // would disarm every layer finding on every image.
+        let artifact = rejected_artifact("app");
+        let findings = vec![about(
+            ComponentRelation::Contained,
+            finding("CVE-LAYER", SeverityThreshold::Critical),
+        )];
+        let outcome = decide_rejected_transition(
+            &artifact,
+            &summary(1, 0, 0, 0),
+            Some(&findings),
+            None,
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::StillRejected);
+    }
+
+    #[test]
+    fn a_not_established_relation_keeps_the_artifact_rejected() {
+        // A record whose relation was never established — every finding
+        // persisted before the field existed, which on this path means
+        // every blob already in CAS — must keep today's behaviour.
+        // Defaulting the other way would disarm the whole stored corpus
+        // in one step (ADR 0007).
+        let artifact = rejected_artifact("any");
+        let findings = vec![about(
+            ComponentRelation::NotEstablished,
+            finding("CVE-LEGACY", SeverityThreshold::Critical),
+        )];
+        let outcome = decide_rejected_transition(
+            &artifact,
+            &summary(1, 0, 0, 0),
+            Some(&findings),
+            None,
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::StillRejected);
+    }
+
+    #[test]
+    fn a_not_contained_component_finding_no_longer_keeps_the_artifact_rejected() {
+        // The narrowing itself, and the half that keeps it honest: the
+        // finding loses its hold on the artifact AND is still in the
+        // caller's list afterwards. This function reads the slice and
+        // writes nothing, so the stored blob and the `ScanCompleted`
+        // aggregate it was hydrated from are untouched — implementing the
+        // rule as a removal from the record would trade one wrong answer
+        // for another.
+        let artifact = rejected_artifact("hyper-util");
+        let findings = vec![not_contained_critical("CVE-ELSEWHERE")];
+        let outcome = decide_rejected_transition(
+            &artifact,
+            &summary(1, 0, 0, 0),
+            Some(&findings),
+            None,
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(
+            outcome,
+            ReEvaluationOutcome::ResetToReleased,
+            "a Critical about code the artifact does not carry has no \
+             authority over this artifact's release",
+        );
+        assert_eq!(findings.len(), 1, "the finding stays in the caller's list");
+        assert_eq!(findings[0].severity, SeverityThreshold::Critical);
+        assert_eq!(
+            findings[0].component_relation,
+            ComponentRelation::NotContained,
+        );
+    }
+
+    #[test]
+    fn the_two_verdict_functions_agree_once_the_subject_finding_is_excluded() {
+        // The sequence that made this unit necessary, end to end: an
+        // artifact rejected over a Critical about its own subject that
+        // ALSO carries a Critical about a component it does not ship; the
+        // operator excludes the subject one. Before the narrowing reached
+        // this function, the leftover non-carried Critical read as
+        // blocking and the artifact stayed `Rejected` — while a fresh
+        // scan of the identical findings came back `Clean`. Fail-closed,
+        // but held on a verdict no scan would reach, clearable only by a
+        // rescan.
+        //
+        // Both functions are run over the same findings, the same
+        // exclusion set and the same coords, so the assertion is about
+        // the two agreeing rather than about one of them in isolation.
+        let artifact = rejected_artifact("hyper-util");
+        let findings = vec![
+            subject_critical("CVE-SUBJECT"),
+            not_contained_critical("CVE-ELSEWHERE"),
+        ];
+        let exclusions = vec![exclusion("CVE-SUBJECT")];
+        let now = ts(2_000_000);
+
+        let fresh_scan =
+            evaluate_scan_result(&coords_of(&artifact), &findings, None, &exclusions, now);
+        assert_eq!(
+            fresh_scan,
+            ScanOutcome::Clean,
+            "a fresh scan of these findings under this exclusion is clean",
+        );
+
+        let re_evaluated = decide_rejected_transition(
+            &artifact,
+            &summary(2, 0, 0, 0),
+            Some(&findings),
+            None,
+            &exclusions,
+            Some(ts(1_000_000)),
+            now,
+        );
+        assert_eq!(
+            re_evaluated,
+            ReEvaluationOutcome::ResetToReleased,
+            "re-evaluation must reach the same verdict as the fresh scan \
+             the operator could have triggered instead; `StillRejected` \
+             here is an artifact stranded on a verdict no scan produces",
+        );
+    }
+
+    #[test]
+    fn the_two_verdict_functions_agree_that_a_non_carried_finding_alone_is_clean() {
+        // The acceptance shape stated as one assertion over both
+        // functions: a finding list carrying nothing but non-carried
+        // findings yields a non-blocking outcome from each.
+        let artifact = rejected_artifact("hyper-util");
+        let findings = vec![
+            not_contained_critical("CVE-ELSEWHERE"),
+            about(
+                ComponentRelation::NotContained,
+                finding("CVE-ALSO-ELSEWHERE", SeverityThreshold::High),
+            ),
+        ];
+
+        let fresh_scan =
+            evaluate_scan_result(&coords_of(&artifact), &findings, None, &[], ts(2_000_000));
+        let re_evaluated = decide_rejected_transition(
+            &artifact,
+            &summary(1, 1, 0, 0),
+            Some(&findings),
+            None,
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(fresh_scan, ScanOutcome::Clean);
+        assert_eq!(re_evaluated, ReEvaluationOutcome::ResetToReleased);
+    }
+
+    #[test]
+    fn a_not_contained_informational_finding_no_longer_blocks_the_negligible_lane() {
+        // The negligible lane reads the SAME narrowed aggregate as the
+        // CVE walk, or a non-carried finding would still block through
+        // whichever input was missed — and under
+        // `negligible_action: Block` the lane is the only path a
+        // CVE-clean finding can block through. The complement, an
+        // informational finding whose relation is `NotEstablished`, is
+        // `informational_finding_under_block_stays_rejected_after_exclusion`
+        // above and still blocks.
+        let artifact = rejected_artifact("proc-macro-error2");
+        let summary = SeveritySummary {
+            critical: 0,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 1,
+        };
+        let findings = vec![about(
+            ComponentRelation::NotContained,
+            informational_finding("RUSTSEC-2026-0173"),
+        )];
+        let policy = projection_with_negligible(SeverityThreshold::High, NegligibleAction::Block);
+        let outcome = decide_rejected_transition(
+            &artifact,
+            &summary,
+            Some(&findings),
+            Some(&policy),
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::ResetToReleased);
+    }
+
+    #[test]
+    fn the_aggregate_summary_fallback_cannot_narrow_and_keeps_condemning() {
+        // The accepted residual, pinned as behaviour so the rustdoc
+        // paragraph has something holding it: with the blob unhydratable
+        // (`last_findings: None`) there are only per-tier counts, nothing
+        // records which component each count was about, and the Critical
+        // keeps its hold. The same findings in hand answer `Clean`.
+        //
+        // This asserts a known divergence, deliberately: it is
+        // fail-closed (a degraded read holds an artifact the per-finding
+        // verdict would have cleared, never the reverse) and a rescan
+        // re-establishes the relation. A future change that makes the
+        // aggregate path relation-aware should update this test and the
+        // rustdoc together.
+        let artifact = rejected_artifact("hyper-util");
+        let findings = vec![not_contained_critical("CVE-ELSEWHERE")];
+
+        let with_findings = decide_rejected_transition(
+            &artifact,
+            &summary(1, 0, 0, 0),
+            Some(&findings),
+            None,
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        let blob_unhydratable = decide_rejected_transition(
+            &artifact,
+            &summary(1, 0, 0, 0),
+            None,
+            None,
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(with_findings, ReEvaluationOutcome::ResetToReleased);
+        assert_eq!(
+            blob_unhydratable,
+            ReEvaluationOutcome::StillRejected,
+            "per-tier counts cannot say which component a count was \
+             about, so the fail-closed reading keeps the artifact held",
+        );
     }
 }

@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use hort_domain::types::Finding;
+use hort_domain::types::{ComponentRelation, Finding};
 use serde::Deserialize;
 
 use crate::purl::build_purl;
@@ -252,6 +252,7 @@ fn vuln_to_finding(trivy_type: &str, vuln: &TrivyVulnerability) -> Finding {
         // `trivy_severity_to_threshold` fell back to the SUP-4 `Critical`
         // floor; `Assessed` for every band Trivy actually reported.
         severity_basis,
+        component_relation: ComponentRelation::NotEstablished,
     }
 }
 

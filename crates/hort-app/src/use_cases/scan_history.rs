@@ -442,7 +442,7 @@ mod tests {
         ScanAssessment, ScanCompleted, SeveritySummary, StreamId,
     };
     use hort_domain::ports::storage::StoragePort;
-    use hort_domain::types::{ContentHash, Finding};
+    use hort_domain::types::{ComponentRelation, ContentHash, Finding};
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
 
@@ -487,6 +487,7 @@ mod tests {
             aliases: vec![],
             informational_class: None,
             severity_basis: hort_domain::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 
