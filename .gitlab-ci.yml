@@ -913,7 +913,17 @@ prefetch:warm:
 
       case "${status}" in
         200)
-          echo "${body}" | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")'
+          # The three lists do not share a shape, and reading them as if they
+          # did is why a rejection printed its reason and `null` for its name.
+          # `skipped_already_held[]` is flat (`package`, `version`);
+          # `rejected_packages[]` and `failed[]` nest the pair under `coords`
+          # and carry `reason` / `error` respectively — see `RejectedItemDto`
+          # and `FailedItemDto` in `crates/hort-cli/src/prefetch.rs`, which
+          # mirror the server's response. The rejected line is the only
+          # actionable output this job has: enabling HORT_PROXY_ENABLED is
+          # safe only once the vetted index serves the whole Cargo.lock, so a
+          # rejection that cannot be named is a blocker that cannot be worked.
+          echo "${body}" | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.coords.package) \(.coords.version // "") — \(.reason)") , (.failed[]? | "  failed: \(.coords.package) \(.coords.version // "") — \(.error)")'
           ;;
         403)
           # Federation worked (we got here — HORT_WARM_TOKEN was minted), but the
@@ -1024,7 +1034,17 @@ prefetch:warm:internal:
 
       case "${status}" in
         200)
-          echo "${body}" | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")'
+          # The three lists do not share a shape, and reading them as if they
+          # did is why a rejection printed its reason and `null` for its name.
+          # `skipped_already_held[]` is flat (`package`, `version`);
+          # `rejected_packages[]` and `failed[]` nest the pair under `coords`
+          # and carry `reason` / `error` respectively — see `RejectedItemDto`
+          # and `FailedItemDto` in `crates/hort-cli/src/prefetch.rs`, which
+          # mirror the server's response. The rejected line is the only
+          # actionable output this job has: enabling HORT_PROXY_ENABLED is
+          # safe only once the vetted index serves the whole Cargo.lock, so a
+          # rejection that cannot be named is a blocker that cannot be worked.
+          echo "${body}" | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.coords.package) \(.coords.version // "") — \(.reason)") , (.failed[]? | "  failed: \(.coords.package) \(.coords.version // "") — \(.error)")'
           ;;
         403)
           # Federation may work but the prefetch grant on the internal
