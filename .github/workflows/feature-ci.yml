@@ -97,11 +97,17 @@ jobs:
                       | select(.source != null and (.source | startswith("registry")))
                       | {package: .name, version: .version}]')
           echo "Prefetching $(printf '%s' "$items" | jq 'length') registry dependencies into hort/${CARGO_SOURCE_REPO}…"
+          # The three result lists do not share a shape: `skipped_already_held[]`
+          # is flat (`package`, `version`), while `rejected_packages[]` and
+          # `failed[]` nest that pair under `coords` and carry `reason` /
+          # `error` — see `RejectedItemDto` / `FailedItemDto` in
+          # `crates/hort-cli/src/prefetch.rs`. Reading them alike prints a
+          # rejection's reason with `null` for its name.
           curl -sS -X POST "${HORT_URL}/api/v1/repositories/${CARGO_SOURCE_REPO}/prefetch" \
             -H "Authorization: Bearer ${token}" \
             -H "Content-Type: application/json" \
             -d "{\"items\": ${items}}" \
-            | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.package) \(.version // "") — \(.reason // .message // "no reason given")") , (.failed[]? | "  failed: \(.package) \(.version // "") — \(.reason // .message // "no reason given")")' \
+            | jq -r '"enqueued: \(.enqueued_job_ids | length)  already_held: \(.skipped_already_held | length)  rejected: \(.rejected_packages | length)  failed: \(.failed | length)" , (.rejected_packages[]? | "  rejected: \(.coords.package) \(.coords.version // "") — \(.reason)") , (.failed[]? | "  failed: \(.coords.package) \(.coords.version // "") — \(.error)")' \
             || echo "::warning::prefetch POST failed — quarantine not pre-warmed this run (non-fatal)"
 
       # ── the feature-branch build itself: against UPSTREAM (crates.io) ───────
