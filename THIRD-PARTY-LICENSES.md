@@ -299,7 +299,7 @@ the result instead.
 | hybrid-array | 0.4.14 | MIT | https://github.com/RustCrypto/hybrid-array |
 | rustls-pki-types | 1.15.1 | MIT | https://github.com/rustls/pki-types |
 | powerfmt | 0.2.0 | MIT | https://github.com/jhpratt/powerfmt |
-| hyper-util | 0.1.21 | MIT | https://github.com/hyperium/hyper-util |
+| hyper-util | 0.1.20 | MIT | https://github.com/hyperium/hyper-util |
 | cpubits | 0.1.1 | MIT | https://github.com/RustCrypto/utils |
 | deranged | 0.5.8 | MIT | https://github.com/jhpratt/deranged |
 | rapidhash | 4.4.1 | MIT | https://github.com/hoxxep/rapidhash |
@@ -12751,7 +12751,7 @@ SOFTWARE.
 
 ```
 
-### hyper-util 0.1.21 — MIT
+### hyper-util 0.1.20 — MIT
 
 Repository: https://github.com/hyperium/hyper-util
 
