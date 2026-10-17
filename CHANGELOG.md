@@ -221,6 +221,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A ZIP entry whose name cannot be decoded is no longer read under an
+  invented one** (#278). `zip` 9 makes `ZipFile::name()` fallible, because a
+  ZIP entry name is a byte string and need not be UTF-8. The two archive
+  consumers answer that differently, on purpose:
+
+  - the **metadata reader** (`hort-formats::archive_bounds::iter_zip_entries`)
+    stands at no door — the artifact is already accepted and the walk only
+    locates members a format handler asked for *by name* — so it **skips the
+    entry and counts the skip**, exactly as it treats one that breaches the
+    size bounds. The count now travels out of the walk, and the PyPI metadata
+    reader names it in its "no `*.dist-info/METADATA`" diagnosis, so a
+    not-found verdict can be told apart from a skipped entry.
+  - the **scan extractor** (`hort-adapters-scanner-trivy`) does stand at a
+    door and already uses it: a name that fails the lexical containment check
+    refuses the whole archive. A name that cannot be put to that rule at all
+    is not a weaker case, and dropping just the entry would let the scanner
+    judge a tree with a file missing from it that nobody looked at. It now
+    refuses through a dedicated `UndecodableEntryName` error carrying the
+    entry index and not the bytes.
+
+  **Operator-visible consequence:** an archive carrying such an entry can now
+  fail its scan materialisation where it previously materialised with a
+  substituted name. With `zip` 9.0.3 the decode does not actually fail for any
+  input — the fallback to CP437 is total — so the arms are correct and
+  currently unreachable, and two probe tests pin that measured behaviour and go
+  red if a future version changes it.
+
 - **A check that could not be carried out holds the artifact instead of
   rejecting it** (#350). `ProvenanceOutcome` gains `Indeterminate`, carrying
   three causes that are deliberately not collapsed into one: a trust root with
@@ -1512,6 +1539,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is what kept them from drifting apart again.
 
 ### Security
+
+- **`zip` 8.6.0 → 9.0.3, resolving three advisories against the archive
+  reader** — RUSTSEC-2026-0367 (7.3, SUID/SGID bits preserved during
+  extraction), RUSTSEC-2026-0368 (`ZipArchive::extract` creating symlinks
+  whose attacker-controlled targets lie outside the destination) and
+  RUSTSEC-2026-0369 (9.1, `extract()` applying Unix permissions *through* a
+  symlink without confining the target). All three are solved by `>= 9.0.0`.
+
+  **hort was not exposed by them**: neither `ZipArchive::extract` nor
+  `ZipStreamReader` is called anywhere in the tree. Both archive consumers walk
+  the central directory themselves and write through their own lexical
+  containment check, and the scan extractor never materialises a symlink at
+  all. The upgrade is taken because the dependency carries the advisories, not
+  because the path was reachable — stated here so an operator scanning hort's
+  dependency tree can tell the two apart.
 
 - **A finding condemns only an artifact that carries the named component**
   (#351). A cargo `.crate` is a source distribution: it ships the publishing
