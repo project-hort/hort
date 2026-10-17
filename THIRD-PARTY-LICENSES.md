@@ -377,7 +377,7 @@ the result instead.
 | chrono | 0.4.45 | MIT | https://github.com/chronotope/chrono |
 | governor | 0.10.4 | MIT | https://github.com/boinkor-net/governor.git |
 | granit-parser | 0.0.7 | MIT | https://github.com/bourumir-wyngs/granit-parser |
-| granit-parser | 1.3.0 | MIT | https://github.com/bourumir-wyngs/granit-parser |
+| granit-parser | 2.0.0 | MIT | https://github.com/bourumir-wyngs/granit-parser |
 | libm | 0.2.16 | MIT | https://github.com/rust-lang/compiler-builtins |
 | objc2-app-kit | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-core-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
@@ -454,7 +454,7 @@ the result instead.
 | rustversion | 1.0.22 | MIT | https://github.com/dtolnay/rustversion |
 | semver | 1.0.28 | MIT | https://github.com/dtolnay/semver |
 | serde-saphyr | 0.0.29 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
-| serde-saphyr | 1.3.0 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
+| serde-saphyr | 2.0.0 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
 | serde | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_core | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_derive | 1.0.229 | MIT | https://github.com/serde-rs/serde |
@@ -14958,7 +14958,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### granit-parser 1.3.0 — MIT
+### granit-parser 2.0.0 — MIT
 
 Repository: https://github.com/bourumir-wyngs/granit-parser
 
@@ -17145,7 +17145,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde-saphyr 1.3.0 — MIT
+### serde-saphyr 2.0.0 — MIT
 
 Repository: https://github.com/bourumir-wyngs/serde-saphyr
 
