@@ -37,12 +37,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cp target/release/hort-cli /usr/local/bin/hort-cli
 
 # ---------- Stage 2: the client image ----------
-# Based on python:3.12-slim-trixie (ships pip 24.x) rather than debian:trixie-slim:
-# scenarios create venvs (`python3 -m venv`) and the python:*-slim images seed them
-# (via ensurepip) with a modern pip. An older stock Debian pip mishandled hort's
-# PEP 658/714 simple-index metadata ("TypeError: unhashable type: 'dict'"). Trixie
-# keeps Python 3.12, so this stays on 3.12 — matching run-e2e's proven PYPI_IMAGE.
-FROM python:3.14-slim-trixie
+# Based on a python:*-slim-trixie image rather than debian:trixie-slim. The
+# `python:` half is the load-bearing one: scenarios create venvs
+# (`python3 -m venv`) and these images seed them (via ensurepip) with the pip
+# that shipped with that CPython release. Debian's own stock pip mishandled
+# hort's PEP 658/714 simple-index metadata ("TypeError: unhashable type:
+# 'dict'"), so a debian:trixie-slim base would reintroduce that failure
+# whatever Python version it carries alongside.
+#
+# The CPython minor in the tag is not itself a constraint — no scenario pins a
+# Python version, they call `python3` — so bumping it needs only that the tag
+# exists as a *-slim-trixie variant and still carries python3, pip3 and the
+# `python3 -m pip install build twine` below.
+FROM python:3.15-slim-trixie
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash curl ca-certificates jq git xz-utils \

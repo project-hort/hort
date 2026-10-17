@@ -401,7 +401,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # per-ecosystem `all.zip` bulk feeds. `default-features = false` +
 # `deflate` keeps the dep minimal (no AES/zstd we don't need); the OSV
 # archives use deflate exclusively.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # gzip (de)compression. `flate2`'s `GzDecoder` decompresses npm `.tgz` /
 # cargo `.crate` archives inside
 # `hort-formats::archive_bounds::read_tar_gz_entry`. `deny.toml:183-189`

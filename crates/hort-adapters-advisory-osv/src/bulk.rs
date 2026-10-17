@@ -253,7 +253,12 @@ pub(crate) async fn pull_one_ecosystem(
                 },
             );
             match result {
-                Ok(()) => {}
+                // The skipped-name count is not picked up here: the bulk
+                // feed is a whole-ecosystem archive whose members are
+                // selected by a `.json` suffix rather than by one exact
+                // name, so a skipped member is one advisory the next cron
+                // rescan picks up, not a verdict about one artifact.
+                Ok(_) => {}
                 // Bounds-tripped on a trusted bulk feed is a warning,
                 // not a ParseError. The entries already visited are kept; the
                 // cap only fires if the ecosystem has grown beyond
@@ -937,7 +942,7 @@ mod tests {
         // The call-site match (mirroring pull_one_ecosystem's blocking closure):
         // Bounds error → warn + keep collected advisories (do NOT return ParseError).
         match result {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(ZipIterError::Bounds(_)) => {
                 // This is the tolerated arm — keep `out` as-is, do NOT abort.
                 // In production this emits tracing::warn!; here we just verify

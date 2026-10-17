@@ -19,8 +19,9 @@
 #   3. hort-server logs contain "ChecksumMismatch" within ~30s of the
 #      install attempt.
 #
-# Runs inside a `python:3.12-slim-bookworm` sidecar attached to the v2
-# compose network (see test-pypi-upstream-verification.sh's header for
+# Runs inside the native-tests client image (`hort-test-client:dev`, built
+# from Dockerfile.client, which carries python3 + pip + curl) attached to
+# the v2 compose network (see test-pypi-upstream-verification.sh's header for
 # the full infrastructure dependency list, including the dual-host
 # pypi.org / files.pythonhosted.org rationale and SSRF caveat).
 #

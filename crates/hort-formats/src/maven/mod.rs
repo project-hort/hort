@@ -745,7 +745,12 @@ fn extract_jar_embedded_pom_sbom(
     );
 
     match iter_result {
-        Ok(()) => {}
+        // The skipped-name count is not picked up here: a jar with no
+        // readable embedded POM already degrades to the same subject-only
+        // resolution whatever the reason, and that resolution is reported
+        // with the artifact's own coordinates, so the count would not
+        // sharpen the operator's diagnosis.
+        Ok(_) => {}
         // Not a valid ZIP — non-fatal: the same leaf outcome as a jar
         // with no embedded POM. The primary-content-hash check already
         // verified this artifact at ingest; SBOM extraction just can't

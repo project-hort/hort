@@ -38,8 +38,10 @@
 # /pypi/{repo_key}/simple/... paths before serving to pip, so pip
 # never tries to GET files.pythonhosted.org directly.
 #
-# Runs inside a `python:3.12-slim-bookworm` sidecar attached to the v2
-# compose network. Not intended to be invoked directly from a host shell.
+# Runs inside the native-tests client image (`hort-test-client:dev`, built
+# from Dockerfile.client, which carries python3 + pip + curl) attached to
+# the v2 compose network. Not intended to be invoked directly from a host
+# shell.
 #
 # Deferred: will become a scenarios/upstream/* scenario once the SSRF guard
 # gains a test-only escape hatch; not currently run by the runner.
