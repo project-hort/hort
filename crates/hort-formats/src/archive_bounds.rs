@@ -408,6 +408,28 @@ pub enum ZipIterError {
     Bounds(BoundsError),
 }
 
+/// What a completed [`iter_zip_entries`] walk skipped without offering to
+/// the visitor.
+///
+/// The walk itself has no verdict to return — it either completes or
+/// fails — but a *completed* walk can still have left entries out, and a
+/// caller that concludes "the member I wanted is not in this archive"
+/// needs to know that before it says so. `iter_zip_entries` does not know
+/// which artifact it is reading, so a log line from inside it cannot be
+/// correlated with the conclusion it changed; the count therefore travels
+/// out in the `Ok` value, where the entity that *can* name the artifact
+/// picks it up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ZipScanStats {
+    /// File entries skipped because the archive does not carry a name for
+    /// them that this process can decode. See [`iter_zip_entries`] for why
+    /// such an entry is skipped rather than refused. Counts file entries
+    /// only — a directory entry is skipped regardless of its name, so
+    /// including it would inflate the number past "members the visitor
+    /// could have been offered".
+    pub undecodable_names: usize,
+}
+
 /// Open a ZIP archive from `reader` and call `visit(name, reader)` for
 /// every file entry; directory entries are silently skipped.
 ///
@@ -422,6 +444,41 @@ pub enum ZipIterError {
 /// inside `visit` (e.g. skip on `is_err()`).  To abort early, use a shared
 /// flag set inside the closure and checked by the caller after return.
 ///
+/// Returns [`ZipScanStats`] on a completed walk: a walk can finish having
+/// left entries out, and the caller is the only party that can say which
+/// artifact that happened to.
+///
+/// # An entry name this process cannot decode
+///
+/// A ZIP entry name is a byte string, not text, so decoding one can fail.
+/// Such an entry is **skipped and counted**, not refused.
+///
+/// This loop stands at no door: the archive has already been accepted,
+/// and the only thing the walk does is find members a format handler
+/// asked for *by name*. Refusing the whole artifact because some
+/// unrelated member carries a name this process cannot read would reject
+/// correct artifacts over a fact nobody asked about. The entry is
+/// therefore handled exactly as one that breaches the size bounds is —
+/// left out of the reckoning — and if the skipped entry was the one the
+/// handler wanted, the handler fails on its own terms ("no METADATA
+/// found") rather than matching something else under a name that was
+/// invented for it. Neither an empty name nor a lossily-substituted one
+/// may be passed to `visit`: both turn bytes nobody could read into a
+/// claim about what they said.
+///
+/// A to-disk extractor makes the opposite call, because it *is* standing
+/// at a door — see `hort-adapters-scanner-trivy::extract::extract_zip`.
+///
+/// **This arm does not fire with `zip` 9.0.3**, and a reader must not take
+/// it for a guarantee that a non-UTF-8 name is kept out of `visit`:
+/// `ZipFile::name()` is fallible in its signature but falls back to CP437,
+/// which is total over bytes, so every name decodes — into a
+/// transliteration the producer may never have meant. The arm is what this
+/// module does when a decode *does* fail; it is not a filter on names that
+/// decode surprisingly. The probe test
+/// `iter_zip_entries_undecodable_name_probe_zip9_decodes_it_as_cp437`
+/// pins that behaviour and goes red if it changes.
+///
 /// # Security
 ///
 /// - Entry count is bounded by [`BoundsConfig::max_entries`].
@@ -434,13 +491,14 @@ pub fn iter_zip_entries<R, F>(
     reader: R,
     config: BoundsConfig,
     mut visit: F,
-) -> Result<(), ZipIterError>
+) -> Result<ZipScanStats, ZipIterError>
 where
     R: Read + Seek,
     F: FnMut(&str, &mut dyn Read),
 {
     let mut archive = zip::ZipArchive::new(reader).map_err(ZipIterError::Open)?;
     let mut counter = EntryCounter::new(config.max_entries);
+    let mut stats = ZipScanStats::default();
     for i in 0..archive.len() {
         counter.tick().map_err(ZipIterError::Bounds)?;
         let mut entry = archive.by_index(i).map_err(|e| ZipIterError::Entry {
@@ -450,12 +508,29 @@ where
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_string();
+        // Skipped, counted, and never substituted — see the "entry name
+        // this process cannot decode" section above for why this is a skip
+        // here and a refusal in the to-disk extractor. The index and the
+        // decode-error kind identify the entry; the undecodable bytes
+        // themselves are not reproduced, under the same rule
+        // `BoundsError::NestedArchiveRejected` states for its `reason`.
+        let name = match entry.name() {
+            Ok(name) => name.into_owned(),
+            Err(source) => {
+                stats.undecodable_names += 1;
+                tracing::warn!(
+                    entry_index = i,
+                    error = %source,
+                    "zip entry name could not be decoded; entry skipped without being read"
+                );
+                continue;
+            }
+        };
         let cap = config.output_cap_for(entry.compressed_size());
         let mut bounded = BoundedReader::new(&mut entry, cap);
         visit(&name, &mut bounded);
     }
-    Ok(())
+    Ok(stats)
 }
 
 /// Build a minimal ZIP archive in memory, for use in tests.
@@ -865,6 +940,149 @@ mod tests {
             matches!(result, Err(ZipIterError::Bounds(_))),
             "expected Err(Bounds(_)), got {result:?}"
         );
+    }
+
+    /// Rewrite an ASCII placeholder in an already-built archive into bytes
+    /// that are **not** valid UTF-8, and set general-purpose bit 11 (the
+    /// "the name in this header is UTF-8" flag) on every header that
+    /// carried the placeholder.
+    ///
+    /// An entry name lives twice in a ZIP — once in the local file header
+    /// and once in the central directory — and both copies have to agree,
+    /// which is why this patches by scanning for the placeholder rather
+    /// than touching one offset. The flag field sits at a fixed offset
+    /// inside whichever header the name belongs to: +6 in a local file
+    /// header (`PK\x03\x04`, name at +30), +8 in a central directory
+    /// record (`PK\x01\x02`, name at +46). Bit 11 of that little-endian
+    /// u16 is `0x08` in its high byte.
+    ///
+    /// Returns the number of headers patched, so a caller can assert it
+    /// found both and did not merely match a byte run inside a deflate
+    /// stream.
+    fn forge_non_utf8_name(bytes: &mut [u8], placeholder: &[u8], replacement: &[u8]) -> usize {
+        const LOCAL_HEADER: &[u8] = &[0x50, 0x4b, 0x03, 0x04];
+        const CENTRAL_HEADER: &[u8] = &[0x50, 0x4b, 0x01, 0x02];
+        assert_eq!(
+            placeholder.len(),
+            replacement.len(),
+            "a name rewrite must preserve the declared name length"
+        );
+        let mut patched = 0;
+        let mut at = 0;
+        while at + placeholder.len() <= bytes.len() {
+            if &bytes[at..at + placeholder.len()] != placeholder {
+                at += 1;
+                continue;
+            }
+            // Only a run that a header signature vouches for is a name.
+            let header = if at >= 30 && bytes[at - 30..at - 26] == *LOCAL_HEADER {
+                Some(at - 30 + 6)
+            } else if at >= 46 && bytes[at - 46..at - 42] == *CENTRAL_HEADER {
+                Some(at - 46 + 8)
+            } else {
+                None
+            };
+            if let Some(flags_at) = header {
+                bytes[at..at + placeholder.len()].copy_from_slice(replacement);
+                bytes[flags_at + 1] |= 0x08;
+                patched += 1;
+                at += placeholder.len();
+            } else {
+                at += 1;
+            }
+        }
+        patched
+    }
+
+    /// The condition the skip-and-count decision is about, driven as far as
+    /// this `zip` version permits — and a tripwire for the day it permits
+    /// further.
+    ///
+    /// Measured against zip 9.0.3: `ZipFile::name()` is fallible in its
+    /// signature but **unconditionally `Ok` in its body**. It tries UTF-8
+    /// and otherwise decodes CP437, and CP437 decoding of a byte slice is
+    /// total — every one of the 256 byte values has a character, and the
+    /// only error path it carries (a `from_utf8` of an all-under-0x80
+    /// slice) cannot fail. The general-purpose UTF-8 flag is never
+    /// consulted. So a name that is *declared* UTF-8 and is not UTF-8 is
+    /// not refused by the crate: it is silently transliterated.
+    ///
+    /// That makes the fail-closed arm in `iter_zip_entries` unreachable
+    /// through this crate's public reader today, and makes the invented
+    /// name — not the skip — the behaviour this archive actually produces.
+    /// Asserting the transliteration is therefore the honest assertion:
+    /// if a future `zip` makes the decode fail, this test goes red and
+    /// points at the arm that becomes live, where it should be rewritten
+    /// to assert the skip and the count.
+    #[test]
+    fn iter_zip_entries_undecodable_name_probe_zip9_decodes_it_as_cp437() {
+        let mut bytes =
+            make_zip(&[("NAME.json", b"first"), ("sibling.json", b"second")]).into_inner();
+        // 0xff / 0xfe are not a valid UTF-8 sequence in any position.
+        let patched = forge_non_utf8_name(&mut bytes, b"NAME", &[0xff, 0xfe, 0xff, 0xfe]);
+        assert_eq!(
+            patched, 2,
+            "the forged name must land in both the local header and the central directory"
+        );
+
+        // What the crate makes of the forged entry, asserted directly: the
+        // premise of everything below.
+        let mut archive =
+            zip::ZipArchive::new(Cursor::new(bytes.clone())).expect("forged archive still opens");
+        let forged = archive.by_index(0).expect("forged entry opens");
+        assert_eq!(
+            forged.name_raw(),
+            [0xff, 0xfe, 0xff, 0xfe, b'.', b'j', b's', b'o', b'n'],
+            "the entry really does carry non-UTF-8 name bytes"
+        );
+        assert!(
+            std::str::from_utf8(forged.name_raw()).is_err(),
+            "the forged name bytes must not be valid UTF-8, or the probe proves nothing"
+        );
+        let decoded = forged
+            .name()
+            .expect(
+                "zip 9.0.3 decodes any name byte sequence via CP437; an Err here means the \
+                 crate became fallible in fact as well as in signature — rewrite this probe to \
+                 assert the skip-and-count arm of iter_zip_entries, which is then reachable",
+            )
+            .into_owned();
+        assert_eq!(
+            decoded, "\u{a0}\u{25a0}\u{a0}\u{25a0}.json",
+            "0xff/0xfe decode to the CP437 characters for those bytes"
+        );
+        drop(forged);
+
+        // Consequence for the walk: the forged entry is visited under the
+        // invented name, and nothing is counted as skipped.
+        let mut names: Vec<String> = Vec::new();
+        let stats = iter_zip_entries(
+            Cursor::new(bytes),
+            BoundsConfig::default_for_metadata_extraction(),
+            |name, _r| names.push(name.to_string()),
+        )
+        .expect("the walk completes");
+        assert_eq!(names, vec![decoded, "sibling.json".to_string()]);
+        assert_eq!(
+            stats.undecodable_names, 0,
+            "nothing was skipped, because nothing failed to decode"
+        );
+    }
+
+    /// A clean archive reports no skips — the other half of the count's
+    /// contract, and the half an operator relies on when the PyPI
+    /// not-found diagnosis says "0 entries were skipped".
+    #[test]
+    fn iter_zip_entries_reports_no_skips_for_a_decodable_archive() {
+        let zip = make_zip(&[("a.json", b"aaa"), ("b.json", b"bbb")]);
+        let stats = iter_zip_entries(
+            zip,
+            BoundsConfig::default_for_metadata_extraction(),
+            |_, _| {},
+        )
+        .expect("no error");
+        assert_eq!(stats, ZipScanStats::default());
+        assert_eq!(stats.undecodable_names, 0);
     }
 
     #[test]

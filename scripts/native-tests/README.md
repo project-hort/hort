@@ -38,9 +38,10 @@ so it matches the workspace's pinned MSRV rather than a separately-pinned
 version), skopeo, `psql`, `jq`, `curl` — so scenarios never depend on host
 toolchains. `run.sh` builds it (cached) as
 `hort-test-client:dev` and runs each scenario as a throwaway container. It is based
-on `python:3.12-slim` specifically so venvs created by scenarios inherit a modern
-pip (Debian's stock pip 23.0.1 crashes on hort's PEP 658/714 simple-index
-metadata).
+on a `python:*-slim-trixie` image specifically so venvs created by scenarios
+inherit a modern pip (Debian's stock pip 23.0.1 crashes on hort's PEP 658/714
+simple-index metadata); the CPython minor in the tag is free to move, since no
+scenario pins one.
 
 ## Modes
 

@@ -106,7 +106,14 @@ mod tests {
         let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).expect("re-open built archive");
         assert_eq!(archive.len(), 2);
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_owned())
+            .map(|i| {
+                archive
+                    .by_index(i)
+                    .unwrap()
+                    .name()
+                    .expect("built archive names are ASCII, so they decode")
+                    .into_owned()
+            })
             .collect();
         assert!(names
             .iter()
