@@ -1652,8 +1652,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consulted. Measured on the pushes that opened the issue: five manifests
   answered `200` while a referenced layer answered `404 BLOB_UNKNOWN` — which
   containerd surfaces as `failed to pull and unpack … not found` *after* it has
-  committed to the pull, and which cost twelve HelmRelease attempts at a
-  15-minute timeout each with nothing on the wire distinguishing "this layer was
+  committed to the pull, and which costs a deployment every retry it makes at
+  its own timeout, with nothing on the wire distinguishing "this layer was
   rejected" from "this registry is broken". Hort already held the rule
   everywhere else: the shared index pipeline drops a terminally-held version
   under both index modes, so npm, PyPI, Cargo and Maven never advertise one. The
@@ -1684,16 +1684,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Operator impact, and it is not small.** The rule applies to the whole
   existing inventory from the first request after upgrade; there is no
-  migration step and no backfill. Measured against the dogfood instance,
-  **8,845 signature manifests stop being deliverable** — caused by six
-  terminally rejected `{}` config blobs rather than by the ~2.5k rejected
-  payloads — so a signature check against that instance's **existing**
-  signatures fails. **New** signatures are unaffected (the forward path that
-  created that population is closed and no payload has been terminally rejected
-  since 2026-08-15), and **image pulls** are unaffected, because a signature
-  manifest hangs off its subject as a referrer and is not in the closure a pull
-  walks. This window is accepted deliberately and indefinitely: the affected
-  population is discarded, not repaired, and no repair instrument ships.
+  migration step and no backfill. The effect is concentrated rather than
+  proportional: signature manifests share constituents — many reference the
+  same `{}` config blob — so a handful of terminally rejected blobs can
+  withdraw a large population of existing signatures at once, and a signature
+  check against them then fails. The population at risk is therefore measured
+  by the terminally rejected **constituents** in a registry, not by the number
+  of manifests that look healthy. **New** signatures are unaffected (nothing
+  terminal can enter the closure of a manifest the write path accepts), and
+  **image pulls** are unaffected, because a signature manifest hangs off its
+  subject as a referrer and is not in the closure a pull walks. **No repair
+  instrument ships**: an affected population is discarded, not repaired, and
+  that is a deliberate choice rather than an oversight.
 
   The Referrers API still reports such a signature as present while a fetch of
   it fails — from outside that reads like a registry fault rather than a
