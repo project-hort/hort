@@ -410,19 +410,23 @@ export COSIGN_DOCKER_MEDIA_TYPES=1
 export COSIGN_EXPERIMENTAL=1
 SIGN_OUT=""
 SIGN_RC=0
-# `--tlog-upload=false`: this scenario's subject is a PROXY-PULLED upstream
-# image, so its index digest is identical on every run — signing it against
-# the public sigstore transparency log asks that log to accept an equivalent
+# `--use-signing-config=false --tlog-upload=false`: this scenario's subject is
+# a PROXY-PULLED upstream image, so its index digest is identical on every
+# run — signing it against the public sigstore transparency log asks that log
+# to accept an equivalent
 # entry twice, and the second ask is a `409 createLogEntryConflict` that fails
 # the lane. Nothing here needs the log: hort's keyed verifier consults no
 # Rekor proof at all (`hort-adapters-provenance-cosign-key`: "no Fulcio chain,
 # Rekor proof, SCT, or trust root — strictly more offline"), and what this
 # scenario asserts is hort's referrer and quarantine behaviour. Dropping the
 # upload also removes a public-network dependency from a compose run that is
-# otherwise self-contained.
+# otherwise self-contained. The two flags are a PAIR -- cosign v3 refuses
+# `--tlog-upload=false` on its own with "not supported with --signing-config
+# or --use-signing-config" -- which is why `.gitlab/ci/cosign-sign.sh:47-50`
+# passes both and says so in its own comment.
 SIGN_OUT="$(cosign sign --yes \
     --key "$COSIGN_KEY" \
-    --tlog-upload=false \
+    --use-signing-config=false --tlog-upload=false \
     --registry-referrers-mode=oci-1-1 \
     --registry-username="$PUSH_USER" \
     --registry-password="$PUSH_SECRET" \
