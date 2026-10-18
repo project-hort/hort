@@ -262,9 +262,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same registry used to contradict each other. Asking for a held version's
   tarball returned `503` with a `Retry-After` — the truth. Asking the catalog
   what versions exist left it out of `versions{}` and out of `dist-tags`, so
-  anyone checking concluded the version was missing upstream. In production
-  that cost two days: a pinned `package-lock.json` install failed, and every
-  human who then read the packument drew the wrong conclusion.
+  anyone checking concluded the version was missing upstream — a pinned
+  `package-lock.json` install then fails, and the packument hands every human
+  who reads it the wrong answer.
 
   The packument now carries an additional top-level `hort` block naming each
   withheld version, why it is withheld, and — for a version inside its
@@ -850,10 +850,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `quarantined` and therefore stays at the head of the next tick's
   selection. Once a whole batch of the oldest candidates was permanently
   unreleasable, **no artifact anywhere in the deployment was ever
-  released again**, with nothing in the logs that looked like a failure
-  (a live deployment hit this at 1482 quarantined artifacts against a
-  batch of 1000, of which 964 of the oldest 1000 were parent-gated
-  blobs). Candidacy now rotates: a new nullable
+  released again**, with nothing in the logs that looked like a failure.
+  Candidacy now rotates: a new nullable
   `artifacts.release_attempt_at` column records when the sweep last
   *attempted* a row (scheduling metadata only — it records that a
   decision was attempted, never what it was, and is deliberately not
@@ -898,10 +896,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `result_summary` gains a third count, `held_parent_gated`, carrying
   the parent-gated share of what used to be reported under
   `skipped_provenance_pending`; the log line's tick-complete and
-  stall-warn fields gain the same field. On the production deployment
-  that motivated this split, ~964 of 1000 candidates in a stalled batch
-  are the structural kind — the split is what makes that stall warning
-  readable rather than alarming. (#209)
+  stall-warn fields gain the same field. A stall made of the
+  structural kind is not the same event as one made of the actionable
+  kind, and only the split makes that warning readable rather than
+  alarming. (#209)
 
 ## [0.12.0] - 2026-08-27
 
