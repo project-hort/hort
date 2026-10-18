@@ -30,8 +30,17 @@ pub mod artifact_group_repo;
 pub mod artifact_lifecycle;
 pub mod artifact_metadata_repo;
 pub mod artifact_repo;
+// Atomic authority-row-plus-audit-event writer (ADR 0012 / 0018): a
+// grant / claim-mapping / issuer mutation and the events attesting it
+// share one transaction, so neither can land without the other.
+pub mod authority_lifecycle;
 pub(crate) mod blob_lock;
 pub mod claim_mapping_repo;
+// The constituent-deliverability read behind ADR 0062 on the OCI paths:
+// one statement that turns a manifest's closure into the strongest
+// terminal verdict inside it, with the terminal vocabulary bound from
+// `QuarantineStatus::is_terminal` rather than written into the SQL.
+pub mod constituent_status;
 // Transient write-contention (serialization failure / deadlock): the
 // sqlstate classifier and the bounded whole-transaction retry over it.
 // Crate-internal by design — the Postgres vocabulary it speaks must not
@@ -61,8 +70,17 @@ pub mod curation_queue_repository;
 pub mod curation_rule_repo;
 pub mod event_chain_head_reader;
 pub mod event_chain_reader;
+pub mod event_repository_resolver;
 pub mod event_store;
 pub mod jobs_repository;
+// The list-surface census behind ADR 0062's omission shape: one
+// recursive statement over the `content_references` membership
+// projection that turns a set of candidate manifest hashes into the
+// subset the referrers index and `tags/list` must omit. The
+// by-the-bytes sibling is `constituent_status`; the two answer the same
+// question from different sources on purpose, because their callers
+// differ in whether they already hold the bytes.
+pub mod list_deliverability;
 pub mod mappers;
 pub(crate) mod merged_category_read;
 pub mod metrics;
@@ -77,6 +95,11 @@ pub mod purge_gc;
 // `rescan_candidates`'s file layout; consumed by
 // `QuarantineReleaseSweepHandler`.
 pub mod quarantine_release_candidates;
+// The `artifacts.quarantine_status` codec: the column's stored
+// vocabulary, its encoder and its fail-closed decoder, as one inverse
+// pair. Crate-internal — the stored spelling of a domain state must not
+// cross the port boundary (ADR 0008).
+pub(crate) mod quarantine_status_sql;
 pub mod ref_lifecycle;
 pub mod ref_registry_repo;
 pub mod refcount_reconcile;
@@ -106,6 +129,19 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Persisted quarantine statuses that must never be offered to garbage
 /// collection or refcount repair paths.
+///
+/// Four sites bind this list, and they protect two different things.
+/// Three are about the **artifact**: `purge_gc::list_pending_purge`
+/// never offers it as a purge candidate,
+/// `retention_candidate_reader` never lets it acquire an
+/// `ArtifactExpired`, and `refcount_reconcile` mints it no reference
+/// edge (deliberately — a repaired refcount must not make a
+/// quarantined blob look GC-protected for the wrong reason). The
+/// fourth, `purge_gc::protected_claimants`, is about the **bytes**:
+/// CAS shares a content hash across artifacts, and the third site's
+/// missing edge means such an artifact's claim on its own content
+/// counts zero, so without that query a released sibling's purge
+/// deletes the evidence's bytes.
 const GC_PROTECTED_QUARANTINE_STATUSES: [(&str, QuarantineStatus); 3] = [
     ("quarantined", QuarantineStatus::Quarantined),
     ("rejected", QuarantineStatus::Rejected),
@@ -163,13 +199,6 @@ pub(crate) const ARTIFACT_IS_TAG_TARGETED_SQL: &str = r#"
     )
 "#;
 
-/// Map a persisted status when it belongs to the shared GC-protected set.
-pub(crate) fn gc_protected_quarantine_status(raw: &str) -> Option<QuarantineStatus> {
-    GC_PROTECTED_QUARANTINE_STATUSES
-        .iter()
-        .find_map(|(name, status)| (*name == raw).then_some(*status))
-}
-
 /// Map sqlx errors to domain errors.
 ///
 /// Order matters. The contention arm sits ahead of the catch-all because a
@@ -219,25 +248,30 @@ pub(crate) fn escape_like_pattern(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The SQL literals bound into the GC / retention protection
+    /// filters and the domain variants they stand for are two halves of
+    /// one pairing, and the halves must not drift: a literal that no
+    /// longer matches what the column actually holds would silently
+    /// stop protecting that state, and the filters are what keep a
+    /// quarantined blob out of a destructive sweep. The names are
+    /// checked against the crate's one status encoder — the same
+    /// function every writer binds through — so a renamed `Display`
+    /// spelling fails here rather than in a purge.
     #[test]
-    fn gc_protected_status_definition_supplies_names_and_domain_values() {
+    fn gc_protected_status_names_match_what_the_writers_store() {
+        use crate::quarantine_status_sql::quarantine_status_to_sql;
+
         assert_eq!(
             gc_protected_quarantine_status_names(),
             ["quarantined", "rejected", "scan_indeterminate"]
         );
-        assert_eq!(
-            gc_protected_quarantine_status("quarantined"),
-            Some(QuarantineStatus::Quarantined)
-        );
-        assert_eq!(
-            gc_protected_quarantine_status("rejected"),
-            Some(QuarantineStatus::Rejected)
-        );
-        assert_eq!(
-            gc_protected_quarantine_status("scan_indeterminate"),
-            Some(QuarantineStatus::ScanIndeterminate)
-        );
-        assert_eq!(gc_protected_quarantine_status("released"), None);
+        for (name, status) in GC_PROTECTED_QUARANTINE_STATUSES {
+            assert_eq!(
+                quarantine_status_to_sql(status).as_deref(),
+                Some(name),
+                "the bound literal for {status} is not what a writer stores"
+            );
+        }
     }
 
     #[test]

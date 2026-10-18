@@ -96,7 +96,11 @@ fn real_keyed_v03_bundle_with_matching_digest_verifies() {
 #[test]
 fn real_keyed_v03_bundle_retagged_onto_other_image_is_digest_mismatch() {
     // The re-tag attack: a valid signature for image A presented for image B.
-    // MUST be rejected (BundleMalformed per ADR 0039 §2 mapping), never Verified.
+    // MUST be rejected (ADR 0039 §2), never Verified. A finding about readable
+    // material — the crypto succeeded and still says this is not the signed
+    // artifact — so it stays terminal, and it reports under the reason that
+    // names the attack: the audit record has to separate a re-tag from a
+    // corrupt upload, which the structural reason it used to borrow could not.
     let v = verifier();
     let h = hash(OTHER_DIGEST_HEX);
     let subj = subject(&h);
@@ -104,7 +108,7 @@ fn real_keyed_v03_bundle_retagged_onto_other_image_is_digest_mismatch() {
     let verdict = run(v.verify(&subj, &bundles, &empty_reqs())).unwrap();
     assert_eq!(
         verdict,
-        ProvenanceVerdict::rejected(ProvenanceRejectReason::BundleMalformed),
+        ProvenanceVerdict::rejected(ProvenanceRejectReason::DigestMismatch),
         "a valid keyed signature re-tagged onto a different image digest must be Rejected"
     );
 }
@@ -188,12 +192,18 @@ fn keyless_fulcio_bundle_is_not_claimed_by_the_keyed_verifier() {
     );
 }
 
+/// **Changed meaning.** This asserted `Rejected{BundleMalformed}` for a
+/// keyed-shaped bundle whose DSSE material is undecodable. The verifier
+/// could not read that material, so it established nothing about the
+/// artifact and may not condemn it: the candidate is skipped and counted,
+/// and a set with nothing else in it answers `NoAttestation`. Under
+/// `Required` that is the indefinite hold; under `VerifyIfPresent`, the
+/// allow.
 #[test]
-fn malformed_keyed_bundle_is_rejected_bundle_malformed() {
+fn malformed_keyed_bundle_is_skipped_not_rejected() {
     // A bundle that IS keyed-shaped (bare publicKey, no cert) but whose DSSE
-    // payload is not valid base64 → the extractor errs → the keyed verifier
-    // maps it to Malformed → BundleMalformed. Fed as new_signed (a keyed
-    // routing) so it reaches the keyed verify path.
+    // payload is not valid base64 → the extractor errs → unreadable. Fed as
+    // new_signed (a keyed routing) so it reaches the keyed verify path.
     let malformed = br#"{
         "verificationMaterial": { "publicKey": { "hint": "x" } },
         "dsseEnvelope": {
@@ -209,8 +219,59 @@ fn malformed_keyed_bundle_is_rejected_bundle_malformed() {
     let verdict = run(v.verify(&subj, &[bundle], &empty_reqs())).unwrap();
     assert_eq!(
         verdict,
-        ProvenanceVerdict::rejected(ProvenanceRejectReason::BundleMalformed),
-        "a keyed-shaped bundle with undecodable DSSE material must be Rejected{{BundleMalformed}}"
+        ProvenanceVerdict::no_attestation().with_unreadable_skipped(1),
+        "a keyed-shaped bundle with undecodable DSSE material contributes nothing — \
+         and the skip is recorded",
+    );
+}
+
+/// The headline attack, over the **real** cosign fixture: the publisher's
+/// genuine keyed signature plus unparseable bytes someone else attached as
+/// a second keyed referrer. The real signature verifies, the artifact is
+/// NOT rejected, and the garbage is reported rather than believed.
+#[test]
+fn real_keyed_bundle_still_verifies_beside_attached_garbage() {
+    let v = verifier();
+    let h = hash(BOUND_DIGEST_HEX);
+    let subj = subject(&h);
+    let bundles = [
+        // Listed first, so the short-circuit on the good one cannot be
+        // what makes this pass.
+        AttestationBundle::new_signed(b"\x00\x01 not a bundle at all".to_vec(), vec![0x30, 0x06]),
+        keyed_bundle(BUNDLE_JSON.as_bytes()),
+    ];
+    let verdict = run(v.verify(&subj, &bundles, &empty_reqs())).unwrap();
+    assert_eq!(
+        verdict,
+        ProvenanceVerdict::verified(keyed_signer(), None).with_unreadable_skipped(1),
+        "attached garbage must not condemn a correctly-signed image — and must still be \
+         reported",
+    );
+}
+
+/// The push-path well-formedness door must never refuse material THIS
+/// verifier can read. The real keyed fixture is the ground truth for that
+/// direction: its signature verifies above, so a door that rejected it would
+/// refuse a push the system can verify. It also pins the one condition the
+/// door deliberately does not check — the keyed path never reads `mediaType`,
+/// so the door must not either.
+#[test]
+fn the_real_keyed_fixture_passes_the_push_path_well_formedness_door() {
+    assert!(
+        hort_domain::provenance_bundle::is_well_formed_sigstore_bundle(BUNDLE_JSON.as_bytes()),
+        "the real keyed cosign bundle must pass the push-path door"
+    );
+    let mut stripped: serde_json::Value =
+        serde_json::from_str(BUNDLE_JSON).expect("fixture parses");
+    stripped
+        .as_object_mut()
+        .expect("bundle is an object")
+        .remove("mediaType");
+    assert!(
+        hort_domain::provenance_bundle::is_well_formed_sigstore_bundle(
+            stripped.to_string().as_bytes()
+        ),
+        "the door must not gate on mediaType — the keyed verifier never reads it"
     );
 }
 

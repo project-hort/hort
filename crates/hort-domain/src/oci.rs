@@ -206,6 +206,112 @@ pub fn is_pure_simplesigning(manifest_json: &[u8]) -> DomainResult<bool> {
             .all(|l| l.media_type.as_deref() == Some(COSIGN_SIMPLESIGNING_MEDIA_TYPE)))
 }
 
+/// Which recognised signature carriage a layer's declared `mediaType` names.
+///
+/// The two carriages ADR 0039 recognises, and nothing else — an unrecognised
+/// media type maps to no carriage ([`Self::of_media_type`] returns `None`),
+/// which is what keeps a future bundle format out of every decision keyed on
+/// this type instead of being refused by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureCarriage {
+    /// [`SIGSTORE_BUNDLE_MEDIA_TYPE`] — a Sigstore v0.3 bundle, keyless
+    /// (Fulcio cert) or cosign-v3 keyed (bare public key).
+    SigstoreBundle,
+    /// [`COSIGN_SIMPLESIGNING_MEDIA_TYPE`] — the legacy keyed
+    /// `cosign sign --key` payload layer.
+    Simplesigning,
+}
+
+impl SignatureCarriage {
+    /// The carriage `media_type` names, or `None` when it names none.
+    pub fn of_media_type(media_type: &str) -> Option<Self> {
+        match media_type {
+            SIGSTORE_BUNDLE_MEDIA_TYPE => Some(Self::SigstoreBundle),
+            COSIGN_SIMPLESIGNING_MEDIA_TYPE => Some(Self::Simplesigning),
+            _ => None,
+        }
+    }
+
+    /// The layer `mediaType` this carriage is declared as — for a diagnostic
+    /// that has the carriage in hand and must name what was declared.
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Self::SigstoreBundle => SIGSTORE_BUNDLE_MEDIA_TYPE,
+            Self::Simplesigning => COSIGN_SIMPLESIGNING_MEDIA_TYPE,
+        }
+    }
+
+    /// Does `layer_bytes` have the shape this carriage names?
+    ///
+    /// **Shape, never validity.** Whether a signature is *valid* needs the
+    /// trust root and the subject's bytes and stays in the verifiers
+    /// (`hort-adapters-provenance-*`); this answers only "is this the kind of
+    /// thing it claims to be", which is what a push-time door can ask without
+    /// becoming a verification — or a denial-of-service surface — on the write
+    /// path.
+    ///
+    /// Each arm is at most as strict as the corresponding verifier's own read,
+    /// so a `false` here means **no** verifier could have read the bytes
+    /// either. See
+    /// [`is_well_formed_sigstore_bundle`](crate::provenance_bundle::is_well_formed_sigstore_bundle)
+    /// and
+    /// [`simplesigning_subject_digest`](crate::provenance_bundle::simplesigning_subject_digest)
+    /// for which conditions that leaves and why.
+    pub fn accepts(self, layer_bytes: &[u8]) -> bool {
+        match self {
+            Self::SigstoreBundle => {
+                crate::provenance_bundle::is_well_formed_sigstore_bundle(layer_bytes)
+            }
+            Self::Simplesigning => {
+                crate::provenance_bundle::simplesigning_subject_digest(layer_bytes).is_some()
+            }
+        }
+    }
+}
+
+/// One layer of a manifest whose declared `mediaType` names a recognised
+/// signature carriage: the layer blob's CAS hash plus the carriage it was
+/// declared as. Mirrors [`ManifestBlobRef`]'s shape — the hash is what a
+/// consumer reads the bytes by, the second field is what it must know about
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredSignatureLayer {
+    pub hash: ContentHash,
+    pub carriage: SignatureCarriage,
+}
+
+/// Every layer of `manifest_json` whose declared `mediaType` names a
+/// recognised signature carriage, in manifest order.
+///
+/// This is the per-layer counterpart of the two purity predicates: they answer
+/// "is EVERY layer signature material" over the same declared media types,
+/// this one hands back the layers themselves so a consumer can go and look at
+/// the bytes behind them. A layer declaring an unrecognised media type is
+/// **omitted**, not an error — on a manifest the purity predicates admit there
+/// are none, and on any other manifest the caller is not asking about it.
+///
+/// A layer whose `digest` is absent, uses another algorithm, or is malformed
+/// hex is likewise omitted: there is no CAS object to reach for, which is the
+/// same skip [`sigstore_bundle_layers`] and [`manifest_blob_refs`] apply.
+/// Malformed / non-manifest JSON is [`DomainError::Validation`], the error
+/// shape every parser in this module produces.
+pub fn declared_signature_layers(
+    manifest_json: &[u8],
+) -> DomainResult<Vec<DeclaredSignatureLayer>> {
+    let manifest: OciManifest = serde_json::from_slice(manifest_json)
+        .map_err(|e| DomainError::Validation(format!("not a valid OCI manifest: {e}")))?;
+
+    Ok(manifest
+        .layers
+        .iter()
+        .filter_map(|l| {
+            let carriage = SignatureCarriage::of_media_type(l.media_type.as_deref()?)?;
+            let hash = l.digest.as_deref().and_then(parse_sha256_digest)?;
+            Some(DeclaredSignatureLayer { hash, carriage })
+        })
+        .collect())
+}
+
 /// One legacy cosign `simplesigning` signature carried on a `.sig` referrer:
 /// the CAS hash of the payload-layer blob (the `simplesigning` JSON) plus the
 /// base64 detached signature read from the layer's
@@ -373,6 +479,49 @@ pub fn manifest_blob_refs(manifest_json: &[u8]) -> DomainResult<Vec<ManifestBlob
     });
 
     Ok(config_ref.chain(layer_refs).collect())
+}
+
+/// Minimal projection for [`manifest_subject_digest`] — only the
+/// `subject` descriptor. A distinct type from [`OciManifestBlobRefs`]
+/// and [`OciManifest`] for the same reason they are distinct from each
+/// other: widening one projection must not perturb the parsers the other
+/// helpers share. `serde` ignores every other manifest field.
+#[derive(Deserialize)]
+struct OciManifestSubject {
+    #[serde(default)]
+    subject: Option<OciBlobDescriptor>,
+}
+
+/// Returns the CAS content hash the manifest's **`subject` descriptor**
+/// names — the artifact an OCI referrer (a cosign signature manifest, an
+/// SBOM, an attestation) declares itself to be *about*.
+///
+/// This is the referrer's own statement of what it covers, read from the
+/// referrer's bytes. It is therefore usable where the `oci_subject`
+/// `content_references` row is not: that row is a mutable projection
+/// derived from this very field at push time, so it can be stale or
+/// absent, while the bytes are the thing the pusher's digest commits to.
+/// The field is still only a *claim* — it says which artifact a signature
+/// purports to cover, never that the signature verifies — so a caller
+/// that acts on it must verify the referrer's bundle against that
+/// subject's preimage.
+///
+/// `sha256`-only: a `subject.digest` using another algorithm or malformed
+/// hex yields `Ok(None)`, mirroring [`manifest_blob_digests`] and
+/// [`index_child_digests`]. A manifest with no `subject` key, a `subject`
+/// with no `digest`, or a `null` subject likewise yields `Ok(None)` — a
+/// plain image manifest and an index both do. Malformed / non-object JSON
+/// is [`DomainError::Validation`] — the same error shape
+/// [`sigstore_bundle_layers`] produces.
+pub fn manifest_subject_digest(manifest_json: &[u8]) -> DomainResult<Option<ContentHash>> {
+    let manifest: OciManifestSubject = serde_json::from_slice(manifest_json)
+        .map_err(|e| DomainError::Validation(format!("not a valid OCI manifest: {e}")))?;
+
+    Ok(manifest
+        .subject
+        .as_ref()
+        .and_then(|d| d.digest.as_deref())
+        .and_then(parse_sha256_digest))
 }
 
 /// Minimal OCI image-index projection — only the `manifests[]` child
@@ -867,6 +1016,151 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
+    // SignatureCarriage + declared_signature_layers
+    // ----------------------------------------------------------------
+    //
+    // The per-layer counterpart of the purity predicates: the push-path door
+    // needs the layers themselves, so it can read the bytes behind each one
+    // and ask whether they are the shape the layer declared.
+
+    #[test]
+    fn carriage_recognises_exactly_the_two_declared_media_types() {
+        assert_eq!(
+            SignatureCarriage::of_media_type(SIGSTORE_BUNDLE_MEDIA_TYPE),
+            Some(SignatureCarriage::SigstoreBundle)
+        );
+        assert_eq!(
+            SignatureCarriage::of_media_type(COSIGN_SIMPLESIGNING_MEDIA_TYPE),
+            Some(SignatureCarriage::Simplesigning)
+        );
+    }
+
+    /// Forward compatibility, at the source: an unrecognised media type names
+    /// no carriage. A future bundle version is therefore not signature
+    /// material to this code at all — it takes the generic, scanned ingest
+    /// path — rather than being refused by a door that does not know it.
+    #[test]
+    fn an_unrecognised_media_type_names_no_carriage() {
+        for mt in [
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            "application/spdx+json",
+            "application/vnd.dev.sigstore.bundle.v0.4+json",
+            "",
+        ] {
+            assert_eq!(
+                SignatureCarriage::of_media_type(mt),
+                None,
+                "media type {mt}"
+            );
+        }
+    }
+
+    #[test]
+    fn carriage_round_trips_its_media_type() {
+        for c in [
+            SignatureCarriage::SigstoreBundle,
+            SignatureCarriage::Simplesigning,
+        ] {
+            assert_eq!(SignatureCarriage::of_media_type(c.media_type()), Some(c));
+        }
+    }
+
+    #[test]
+    fn carriage_accepts_only_its_own_shape() {
+        let bundle = serde_json::json!({
+            "verificationMaterial": { "publicKey": { "hint": "k" } },
+            "dsseEnvelope": { "payload": "e30=", "payloadType": "x", "signatures": [] },
+        })
+        .to_string();
+        let payload = serde_json::json!({
+            "critical": { "image": { "docker-manifest-digest": "sha256:aa" } }
+        })
+        .to_string();
+
+        assert!(SignatureCarriage::SigstoreBundle.accepts(bundle.as_bytes()));
+        assert!(!SignatureCarriage::SigstoreBundle.accepts(payload.as_bytes()));
+        assert!(SignatureCarriage::Simplesigning.accepts(payload.as_bytes()));
+        assert!(!SignatureCarriage::Simplesigning.accepts(bundle.as_bytes()));
+        for c in [
+            SignatureCarriage::SigstoreBundle,
+            SignatureCarriage::Simplesigning,
+        ] {
+            assert!(!c.accepts(b"unreadable rubbish"), "{c:?} accepted garbage");
+        }
+    }
+
+    #[test]
+    fn carriage_debug_and_copy_are_available() {
+        let c = SignatureCarriage::SigstoreBundle;
+        let copied = c;
+        assert_eq!(copied, c);
+        assert!(!format!("{c:?}").is_empty());
+    }
+
+    #[test]
+    fn declared_signature_layers_returns_both_carriages_in_manifest_order() {
+        let (ha, hb) = (hex64('a'), hex64('b'));
+        let m = manifest(&serde_json::json!({
+            "layers": [
+                { "mediaType": COSIGN_SIMPLESIGNING_MEDIA_TYPE, "digest": format!("sha256:{ha}") },
+                { "mediaType": SIGSTORE_BUNDLE_MEDIA_TYPE, "digest": format!("sha256:{hb}") }
+            ]
+        }));
+        let got = declared_signature_layers(&m).expect("valid manifest");
+        assert_eq!(
+            got,
+            vec![
+                DeclaredSignatureLayer {
+                    hash: ha.parse().expect("hex"),
+                    carriage: SignatureCarriage::Simplesigning,
+                },
+                DeclaredSignatureLayer {
+                    hash: hb.parse().expect("hex"),
+                    carriage: SignatureCarriage::SigstoreBundle,
+                },
+            ]
+        );
+        assert!(!format!("{:?}", got[0]).is_empty());
+        assert_eq!(got[0].clone(), got[0]);
+    }
+
+    /// A layer declaring an unrecognised media type is omitted rather than
+    /// erroring: on a manifest the purity predicates admit there are none, and
+    /// on a mixed manifest the caller is not asking about the runnable layer.
+    #[test]
+    fn unrecognised_and_undigestable_layers_are_omitted() {
+        let hex = hex64('c');
+        let m = manifest(&serde_json::json!({
+            "layers": [
+                { "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                  "digest": format!("sha256:{}", hex64('a')) },
+                // Recognised media type, but no usable CAS digest: nothing to
+                // read, so nothing to check.
+                { "mediaType": SIGSTORE_BUNDLE_MEDIA_TYPE },
+                { "mediaType": SIGSTORE_BUNDLE_MEDIA_TYPE, "digest": "sha512:abc" },
+                { "mediaType": SIGSTORE_BUNDLE_MEDIA_TYPE, "digest": "sha256:nothex" },
+                // No media type at all.
+                { "digest": format!("sha256:{}", hex64('b')) },
+                { "mediaType": SIGSTORE_BUNDLE_MEDIA_TYPE, "digest": format!("sha256:{hex}") }
+            ]
+        }));
+        let got = declared_signature_layers(&m).expect("valid manifest");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].hash.as_ref(), hex.as_str());
+    }
+
+    #[test]
+    fn declared_signature_layers_of_a_layerless_manifest_is_empty() {
+        assert!(declared_signature_layers(b"{}").expect("valid").is_empty());
+    }
+
+    #[test]
+    fn declared_signature_layers_malformed_json_is_validation_error() {
+        let err = declared_signature_layers(b"not json at all").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    // ----------------------------------------------------------------
     // image-index parsing (design §2 D2)
     // ----------------------------------------------------------------
     //
@@ -1199,6 +1493,85 @@ mod tests {
     #[test]
     fn index_child_digests_non_object_json_is_validation_error() {
         let err = index_child_digests(b"[1, 2, 3]").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    // ----------------------------------------------------------------
+    // manifest_subject_digest (the referrer's own claim about what it
+    // covers — ADR 0039 D8's membership walk reads it from the bytes)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn manifest_subject_digest_returns_the_subject_descriptor_hash() {
+        let hex = hex64('d');
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "subject": {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": format!("sha256:{hex}"),
+                "size": 528
+            },
+            "layers": [
+                { "mediaType": SIGSTORE_BUNDLE_MEDIA_TYPE, "digest": format!("sha256:{}", hex64('a')) }
+            ]
+        }));
+        let got = manifest_subject_digest(&m).expect("valid manifest");
+        assert_eq!(got.as_ref().map(AsRef::as_ref), Some(hex.as_str()));
+    }
+
+    #[test]
+    fn manifest_subject_digest_absent_subject_is_none() {
+        // A plain image manifest and an image index both carry no
+        // `subject` — the legacy cosign tag-scheme `.sig` too.
+        let image = manifest(&serde_json::json!({
+            "config": { "digest": format!("sha256:{}", hex64('c')) },
+            "layers": [ { "digest": format!("sha256:{}", hex64('a')) } ]
+        }));
+        assert_eq!(manifest_subject_digest(&image).expect("valid"), None);
+        let index = manifest(&serde_json::json!({
+            "mediaType": OCI_IMAGE_INDEX_MEDIA_TYPE,
+            "manifests": [ { "digest": format!("sha256:{}", hex64('b')) } ]
+        }));
+        assert_eq!(manifest_subject_digest(&index).expect("valid"), None);
+        assert_eq!(manifest_subject_digest(b"{}").expect("valid"), None);
+    }
+
+    #[test]
+    fn manifest_subject_digest_null_subject_is_none() {
+        let m = manifest(&serde_json::json!({ "subject": serde_json::Value::Null }));
+        assert_eq!(manifest_subject_digest(&m).expect("valid"), None);
+    }
+
+    #[test]
+    fn manifest_subject_digest_subject_without_digest_is_none() {
+        let m = manifest(&serde_json::json!({
+            "subject": { "mediaType": "application/vnd.oci.image.manifest.v1+json", "size": 7 }
+        }));
+        assert_eq!(manifest_subject_digest(&m).expect("valid"), None);
+    }
+
+    #[test]
+    fn manifest_subject_digest_non_sha256_or_malformed_hex_is_none() {
+        let other_algo = manifest(&serde_json::json!({
+            "subject": { "digest": format!("sha512:{}", hex64('e')) }
+        }));
+        assert_eq!(manifest_subject_digest(&other_algo).expect("valid"), None);
+        let short_hex = manifest(&serde_json::json!({
+            "subject": { "digest": "sha256:dead" }
+        }));
+        assert_eq!(manifest_subject_digest(&short_hex).expect("valid"), None);
+        let not_hex = manifest(&serde_json::json!({
+            "subject": { "digest": format!("sha256:{}", std::iter::repeat_n('z', 64).collect::<String>()) }
+        }));
+        assert_eq!(manifest_subject_digest(&not_hex).expect("valid"), None);
+    }
+
+    #[test]
+    fn manifest_subject_digest_malformed_json_is_validation_error() {
+        let err = manifest_subject_digest(b"not json at all").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        let err = manifest_subject_digest(b"[1, 2, 3]").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
     }
 }

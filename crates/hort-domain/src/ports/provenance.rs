@@ -145,7 +145,8 @@ pub struct ProvenanceRequirements<'a> {
     pub allowed_identities: &'a [SignerIdentityPattern],
 }
 
-/// Why a verifier rejected an attestation.
+/// Why a verifier rejected an attestation — **a finding about material it
+/// could read**.
 ///
 /// Each variant is a distinct, audited rejection cause carried on the
 /// emitted `ProvenanceRejected` event so an operator can tell a forged
@@ -153,8 +154,31 @@ pub struct ProvenanceRequirements<'a> {
 /// (`BundleMalformed`) from an unsigned-under-`Required` artifact
 /// (`Unsigned`).
 ///
+/// **Every variant here is a positive disproof, and only a positive
+/// disproof is terminal** (ADR 0039 D4). A failure of *our own* ability to
+/// check — a trust root with no usable key, attestation material that could
+/// never be fetched, a verifier that did not return a verdict — proves
+/// nothing about the artifact and belongs to
+/// [`IndeterminateReason`], which holds instead. There is deliberately **no**
+/// `From<IndeterminateReason>` for this type: that conversion is the one
+/// thing that would re-open the line, letting "we could not check" be
+/// spelled as "proved bad" at a call site a reviewer reads as a formality.
+///
+/// The line needs no source-scan guard. It is a compile error:
+/// [`ProvenanceOutcome::Rejected`] does not accept an
+/// [`IndeterminateReason`], and the matches over [`ProvenanceOutcome`] are
+/// wildcard-free, so a future outcome must be classified before it compiles.
+/// A grep guard on top would imply that compile-time property is
+/// insufficient, and the next reader would reasonably trust the weaker of
+/// the two.
+///
 /// Carries `Serialize`/`Deserialize` because it rides the
-/// `ProvenanceRejected` event payload.
+/// `ProvenanceRejected` event payload. **Adding a variant is forward-only**:
+/// the derive is externally tagged, so a build predating a variant cannot
+/// deserialise an event carrying it. That is the same class as adding a new
+/// `DomainEvent` type — a rollback past the vocabulary cannot read streams
+/// written after it — and not a new hazard; it is why no variant is ever
+/// removed or renamed here, only added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProvenanceRejectReason {
     /// No attestation was present and policy required one.
@@ -169,21 +193,133 @@ pub enum ProvenanceRejectReason {
     /// A valid signature whose `{issuer, san}` is not in the allowed set.
     UntrustedIdentity,
     /// The bundle's Rekor transparency-log entry is not provably in the
-    /// log: the Merkle inclusion proof or the checkpoint signature failed to
-    /// verify against the trust root's Rekor public key, or the tlog
-    /// material is structurally absent / unparseable. The Sigstore adapter
-    /// verifies this cryptographically and fully offline (RFC-6962 Merkle
-    /// inclusion + checkpoint signature, v0.3 bundle format); it is
-    /// **never** a fall-back to a live Rekor fetch. This catches both a
-    /// structurally absent proof and a forged-but-well-formed one whose
-    /// entry is not in the log.
+    /// log: a **present, readable** Merkle inclusion proof or checkpoint
+    /// signature failed to verify against the trust root's Rekor public
+    /// key. The Sigstore adapter verifies this cryptographically and fully
+    /// offline (RFC-6962 Merkle inclusion + checkpoint signature, v0.3
+    /// bundle format); it is **never** a fall-back to a live Rekor fetch.
+    /// The case it exists for is a forged-but-well-formed entry whose
+    /// proof does not check out.
+    ///
+    /// **Four neighbouring failures no longer reach it**, because none of
+    /// them proves anything about the artifact (ADR 0039 D4):
+    ///
+    /// - transparency-log material that is **structurally absent or
+    ///   unparseable** is *skipped* — that candidate contributes no
+    ///   verdict at all, so this variant's wording no longer covers it;
+    /// - a trust root holding **no usable key** for the entry's log is
+    ///   [`IndeterminateReason::TrustRootUnusable`] — our provisioning,
+    ///   not the publisher's signature;
+    /// - attestation material that could **never be fetched** is
+    ///   [`IndeterminateReason::AttestationFetchFailed`]. The
+    ///   orchestration's fetch-exhaustion path stated this variant until
+    ///   it held instead, and that was precisely the use the "never a
+    ///   live Rekor fetch" sentence above forbids: nothing offline or
+    ///   cryptographic had happened at all;
+    /// - a dispatched verifier that **returned no verdict at all** is
+    ///   [`IndeterminateReason::VerifierUnavailable`]. That was the last
+    ///   orchestration-side producer of this variant, which leaves the
+    ///   keyless verifier's offline inclusion check as its **only**
+    ///   producer in the workspace — i.e. the wording above now describes
+    ///   every event that carries it.
     RekorNotFound,
     /// The Fulcio certificate chain failed validation against the cached
     /// trust root.
     CertChainInvalid,
     /// The bundle is structurally malformed or carries no
     /// offline-verifiable material (e.g. a bare signature, no SET).
+    ///
+    /// **Unreadable material no longer produces it.** A candidate a
+    /// verifier cannot parse or decode proves nothing about the artifact,
+    /// so it is skipped and contributes no verdict at all — the keyless
+    /// verifier's parse / leaf-cert / certificate-decode / identity gates
+    /// and the unreadable arms of its error classification all `continue`
+    /// now, and the keyed verifier's undecodable-payload and
+    /// undecodable-signature outcomes do the same.
+    ///
+    /// **No producer remains.** The keyed verifier's digest-binding
+    /// failure was the last one, and it states [`Self::DigestMismatch`]
+    /// now — the reason it was in substance all along, and the one an
+    /// operator can act on: a re-tagged signature and a corrupt upload
+    /// called for opposite responses while sharing this variant.
+    ///
+    /// The variant stays regardless: persisted `ProvenanceRejected` events
+    /// carry it and must keep deserialising, exactly as [`Self::Unsigned`]
+    /// does, and the keyless verifier's reject-reason ranking keeps its
+    /// rung for the same reason.
     BundleMalformed,
+    /// A signature that verifies — against a pinned key or a trusted
+    /// chain — but covers a **different digest** than the artifact being
+    /// served: the re-tag attack. The `sha256-<hex>.sig` carriage tag is
+    /// attacker-writable in the registry, so a valid signature for image A
+    /// re-tagged onto image B must reject, and it is the strongest
+    /// disproof the pipeline can state: the crypto succeeded and still
+    /// says this is not the signed artifact.
+    ///
+    /// Distinct from [`Self::BundleMalformed`] because the audit record
+    /// has to separate an attack from a corrupt upload — they are the
+    /// same variant's two halves today, and an operator cannot tell them
+    /// apart.
+    ///
+    /// Appended last because the declaration order is not the wire form
+    /// (unit variants serialise as their names) and not the reject-reason
+    /// precedence either (that ranking lives in the verifier adapter that
+    /// folds several per-bundle reasons into one).
+    DigestMismatch,
+}
+
+/// Why a verification **could not be carried out**. *Our* side: nothing
+/// about the artifact's material was established, so nothing was
+/// disproved, and the artifact is HELD — never rejected (ADR 0039 D4,
+/// terminality only from positive disproof; D2, fail-closed is not the
+/// same as terminal).
+///
+/// Material that *was* readable and failed is a
+/// [`ProvenanceRejectReason`]; the two types are separate because the
+/// outcomes are separate, and the separation is what makes the line a
+/// compile error rather than a convention. See that type's rustdoc for
+/// why no conversion between them exists and why no source-scan guard
+/// accompanies this.
+///
+/// Carries `Serialize`/`Deserialize` for symmetry with
+/// [`ProvenanceRejectReason`] and so a future hold record can carry the
+/// reason; **no event payload references it today** (a hold emits no
+/// event at all — that absence *is* the hold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndeterminateReason {
+    /// Attestation material could not be obtained at all — the fetch
+    /// failed, exhausted its retries, or the CAS read behind it did. The
+    /// bundle may be present and perfectly valid; we never saw it.
+    AttestationFetchFailed,
+    /// The trust root holds no usable key for this check — no Rekor key
+    /// matches the entry's log id, our own key bytes did not parse, or the
+    /// root carries no Fulcio certs / CTFE keys and so cannot build a
+    /// verifier at all. An operator provisioning fault, not a finding
+    /// about the artifact: the publisher's signature is not implicated by
+    /// our inability to load a key.
+    TrustRootUnusable,
+    /// A verifier we dispatched did not return a verdict — the adapter
+    /// itself failed. The material was fetched and handed over; what did
+    /// not work is the check.
+    ///
+    /// **The category, where its two neighbours are causes.** An adapter
+    /// error is reachable from several of them (a trust root that cannot
+    /// build a verifier, a subject-payload/content-hash mismatch, an
+    /// internal fault), and the orchestration cannot see which: it holds
+    /// a `DomainError` and nothing more. Naming it
+    /// [`Self::TrustRootUnusable`] would assert one cause out of several,
+    /// and [`Self::AttestationFetchFailed`] would assert the material was
+    /// never obtained when in fact it was read — so the honest value is
+    /// its own.
+    ///
+    /// Reported exactly as the other two are (`held_indeterminate` under
+    /// `Required`, `allowed_indeterminate` otherwise), because the
+    /// epistemic state is the same: nothing about the artifact was
+    /// established. Contributing *nothing* instead would be worse than
+    /// either lie — an all-verifiers-errored run would fold to
+    /// [`ProvenanceOutcome::NoAttestation`] and send the operator to the
+    /// publisher's signer for a fault of ours.
+    VerifierUnavailable,
 }
 
 /// The outcome of a single verification.
@@ -213,6 +349,20 @@ pub enum ProvenanceOutcome {
     /// in time, not about the artifact (ADR 0039's 2026-09-12 amendment,
     /// D1).
     NoAttestation,
+    /// The check could not be carried out — see [`IndeterminateReason`].
+    /// A hold, with exactly the shape [`Self::NoAttestation`] has: no
+    /// event, no status change, `Pending` at the release gate under
+    /// `Required` (fail-closed, 503), the normal quarantine window under
+    /// `VerifyIfPresent` / `Off`.
+    ///
+    /// Never terminal, and for a stronger reason than `NoAttestation`'s:
+    /// an unsigned artifact at least has a fact about it recorded (no
+    /// signature had arrived), while here *nothing* about the artifact was
+    /// established. A publisher's artifact must not go terminal because
+    /// our trust root was misprovisioned, a network call failed, or our
+    /// verifier could not run — nobody's material is at fault
+    /// (ADR 0039 D4).
+    Indeterminate(IndeterminateReason),
 }
 
 /// A verifier's verdict for one artifact.
@@ -220,6 +370,29 @@ pub enum ProvenanceOutcome {
 pub struct ProvenanceVerdict {
     /// The verification outcome.
     pub outcome: ProvenanceOutcome,
+    /// How many candidates the verifier **could not read**, and therefore
+    /// did not take into account when reaching [`Self::outcome`].
+    ///
+    /// Material a verifier cannot parse or decode proves nothing about the
+    /// artifact, so it contributes nothing to the verdict: not a
+    /// rejection, not a hold, not evidence of any kind. It is skipped,
+    /// exactly as a candidate belonging to another backend is. This count
+    /// is the whole difference between *not considered* and *not noticed*
+    /// — without it, a publisher whose own signature material is broken
+    /// would see only "unsigned", and an operator would never learn that
+    /// someone attached garbage to an artifact.
+    ///
+    /// Deliberately **orthogonal to the outcome**: a non-zero count can
+    /// accompany any of the four, `Verified` included (one candidate
+    /// verified while a sibling was unreadable). It is reporting only and
+    /// gates nothing — it reaches the job's `result_summary`, a log line
+    /// and a counter, and no decision reads it.
+    ///
+    /// Counted per candidate the verifier **examined**. A verifier that
+    /// short-circuits on its first acceptance has not examined what
+    /// follows, so a later unreadable candidate is not counted (it was
+    /// never skipped — it was never looked at).
+    pub unreadable_skipped: u32,
 }
 
 impl ProvenanceVerdict {
@@ -230,6 +403,7 @@ impl ProvenanceVerdict {
                 signer,
                 predicate_type,
             },
+            unreadable_skipped: 0,
         }
     }
 
@@ -237,6 +411,7 @@ impl ProvenanceVerdict {
     pub fn rejected(reason: ProvenanceRejectReason) -> Self {
         Self {
             outcome: ProvenanceOutcome::Rejected(reason),
+            unreadable_skipped: 0,
         }
     }
 
@@ -244,7 +419,30 @@ impl ProvenanceVerdict {
     pub fn no_attestation() -> Self {
         Self {
             outcome: ProvenanceOutcome::NoAttestation,
+            unreadable_skipped: 0,
         }
+    }
+
+    /// Convenience constructor for the indeterminate (could-not-check)
+    /// verdict — a hold, never a rejection.
+    pub fn indeterminate(reason: IndeterminateReason) -> Self {
+        Self {
+            outcome: ProvenanceOutcome::Indeterminate(reason),
+            unreadable_skipped: 0,
+        }
+    }
+
+    /// Record that `count` candidates were skipped as unreadable while
+    /// reaching this verdict (see [`Self::unreadable_skipped`]).
+    ///
+    /// A builder rather than a constructor argument: every verdict carries
+    /// the count, including the three the four constructors above build
+    /// with nothing skipped, and an adapter that skips nothing should not
+    /// have to say so.
+    #[must_use]
+    pub fn with_unreadable_skipped(mut self, count: u32) -> Self {
+        self.unreadable_skipped = count;
+        self
     }
 }
 
@@ -295,6 +493,17 @@ mod tests {
     use super::*;
 
     const VALID_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// Every rejection cause the vocabulary has. Listed once so a new
+    /// variant is added in one place and both reason tests below see it.
+    const ALL_REJECT_REASONS: [ProvenanceRejectReason; 6] = [
+        ProvenanceRejectReason::Unsigned,
+        ProvenanceRejectReason::UntrustedIdentity,
+        ProvenanceRejectReason::RekorNotFound,
+        ProvenanceRejectReason::CertChainInvalid,
+        ProvenanceRejectReason::BundleMalformed,
+        ProvenanceRejectReason::DigestMismatch,
+    ];
 
     fn sample_hash() -> ContentHash {
         VALID_SHA256.parse().unwrap()
@@ -456,14 +665,7 @@ mod tests {
     /// (Copy + Eq + Debug), covering the full reason set.
     #[test]
     fn every_reject_reason_constructs_and_round_trips() {
-        let reasons = [
-            ProvenanceRejectReason::Unsigned,
-            ProvenanceRejectReason::UntrustedIdentity,
-            ProvenanceRejectReason::RekorNotFound,
-            ProvenanceRejectReason::CertChainInvalid,
-            ProvenanceRejectReason::BundleMalformed,
-        ];
-        for r in reasons {
+        for r in ALL_REJECT_REASONS {
             let copied = r;
             assert_eq!(copied, r);
             // Debug is non-empty (covers the derive).
@@ -474,7 +676,83 @@ mod tests {
         }
     }
 
-    /// The three verdict constructors build the three outcomes.
+    /// Every reject reason's **wire form** is its variant name, and every
+    /// one of them deserialises back. The type rides the persisted
+    /// `ProvenanceRejected` payload, so the string is the compatibility
+    /// surface: a rename is a stream that stops loading. (The
+    /// whole-payload load is pinned beside the event itself, in
+    /// `events::artifact_events`.)
+    #[test]
+    fn every_reject_reason_serialises_as_its_variant_name() {
+        let expected = [
+            "Unsigned",
+            "UntrustedIdentity",
+            "RekorNotFound",
+            "CertChainInvalid",
+            "BundleMalformed",
+            "DigestMismatch",
+        ];
+        assert_eq!(ALL_REJECT_REASONS.len(), expected.len());
+        for (r, name) in ALL_REJECT_REASONS.into_iter().zip(expected) {
+            let json = serde_json::to_value(r).expect("serialises");
+            assert_eq!(json, serde_json::json!(name), "{r:?}");
+            let back: ProvenanceRejectReason = serde_json::from_value(json).expect("deserialises");
+            assert_eq!(back, r);
+        }
+    }
+
+    /// Every [`IndeterminateReason`] variant constructs, round-trips on
+    /// the wire, and reaches a verdict through
+    /// [`ProvenanceVerdict::indeterminate`] — which produces
+    /// [`ProvenanceOutcome::Indeterminate`] and nothing else. There is no
+    /// path from one of these to a [`ProvenanceRejectReason`]: the absence
+    /// of that conversion is what keeps "we could not check" from being
+    /// spelled as "proved bad".
+    ///
+    /// The three are also **pairwise distinct**, which is the property the
+    /// vocabulary exists for: each names a different thing that did not
+    /// work on our side, and a variant quietly standing in for another
+    /// would satisfy every "is it held?" assertion in the suite.
+    #[test]
+    fn every_indeterminate_reason_constructs_and_round_trips() {
+        let expected = [
+            (
+                IndeterminateReason::AttestationFetchFailed,
+                "AttestationFetchFailed",
+            ),
+            (IndeterminateReason::TrustRootUnusable, "TrustRootUnusable"),
+            (
+                IndeterminateReason::VerifierUnavailable,
+                "VerifierUnavailable",
+            ),
+        ];
+        for (r, name) in expected {
+            let copied = r;
+            assert_eq!(copied, r);
+            assert!(!format!("{r:?}").is_empty());
+
+            let json = serde_json::to_value(r).expect("serialises");
+            assert_eq!(json, serde_json::json!(name), "{r:?}");
+            let back: IndeterminateReason = serde_json::from_value(json).expect("deserialises");
+            assert_eq!(back, r);
+
+            let verdict = ProvenanceVerdict::indeterminate(r);
+            assert_eq!(verdict.outcome, ProvenanceOutcome::Indeterminate(r));
+            // The outcome's own derives, on the new variant.
+            assert_eq!(verdict.clone(), verdict);
+            assert!(!format!("{:?}", verdict.outcome).is_empty());
+        }
+        // Pairwise distinct over the whole vocabulary, not just the first
+        // two: three reasons that compared equal would make the holds
+        // indistinguishable without changing a single hold's behaviour.
+        for (i, (a, _)) in expected.iter().enumerate() {
+            for (b, _) in &expected[i + 1..] {
+                assert_ne!(a, b, "{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    /// The four verdict constructors build the four outcomes.
     #[test]
     fn verdict_constructors_build_each_outcome() {
         let v = ProvenanceVerdict::verified(sample_identity(), Some("pred".into()));
@@ -494,5 +772,75 @@ mod tests {
 
         let n = ProvenanceVerdict::no_attestation();
         assert_eq!(n.outcome, ProvenanceOutcome::NoAttestation);
+
+        let i = ProvenanceVerdict::indeterminate(IndeterminateReason::TrustRootUnusable);
+        assert_eq!(
+            i.outcome,
+            ProvenanceOutcome::Indeterminate(IndeterminateReason::TrustRootUnusable)
+        );
+
+        // A rejection and a hold are never equal, whatever they carry —
+        // the two reason vocabularies do not meet.
+        assert_ne!(r.outcome, i.outcome);
+        assert_ne!(n.outcome, i.outcome);
+    }
+
+    /// Every constructor starts at nothing skipped, and
+    /// `with_unreadable_skipped` is the only thing that moves the count.
+    /// Nothing about a verdict built the ordinary way claims an unreadable
+    /// candidate.
+    #[test]
+    fn every_constructor_starts_with_nothing_skipped() {
+        let built = [
+            ProvenanceVerdict::verified(sample_identity(), None),
+            ProvenanceVerdict::rejected(ProvenanceRejectReason::UntrustedIdentity),
+            ProvenanceVerdict::no_attestation(),
+            ProvenanceVerdict::indeterminate(IndeterminateReason::TrustRootUnusable),
+        ];
+        for v in built {
+            assert_eq!(v.unreadable_skipped, 0, "{:?}", v.outcome);
+            let carried = v.clone().with_unreadable_skipped(3);
+            assert_eq!(carried.unreadable_skipped, 3);
+            // The count is orthogonal: carrying it changes nothing about
+            // the outcome it accompanies.
+            assert_eq!(carried.outcome, v.outcome);
+        }
+    }
+
+    /// The count rides **every** outcome, `Verified` included — one
+    /// candidate verified while a sibling was unreadable is exactly the
+    /// case the attack this field exists for produces, and a type that
+    /// could only carry the count on a rejection would lose it there.
+    ///
+    /// It is also part of the verdict's identity: two verdicts that agree
+    /// on the outcome and disagree on how much was skipped are not the
+    /// same verdict, which is what keeps a fold from silently discarding
+    /// the record.
+    #[test]
+    fn the_skip_count_rides_every_outcome_and_is_part_of_verdict_identity() {
+        let verified = ProvenanceVerdict::verified(sample_identity(), None);
+        let with_skip = verified.clone().with_unreadable_skipped(1);
+        assert!(matches!(
+            with_skip.outcome,
+            ProvenanceOutcome::Verified { .. }
+        ));
+        assert_eq!(with_skip.unreadable_skipped, 1);
+        assert_ne!(with_skip, verified);
+
+        // The builder is total over the range, not a flag.
+        assert_eq!(
+            ProvenanceVerdict::no_attestation()
+                .with_unreadable_skipped(u32::MAX)
+                .unreadable_skipped,
+            u32::MAX
+        );
+        // Last call wins (the adapters set it once, at the end of a fold).
+        assert_eq!(
+            ProvenanceVerdict::no_attestation()
+                .with_unreadable_skipped(2)
+                .with_unreadable_skipped(5)
+                .unreadable_skipped,
+            5
+        );
     }
 }

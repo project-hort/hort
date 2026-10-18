@@ -36,7 +36,9 @@
 //! (mirrors the Trivy adapter's `aggregate_findings`).
 
 use hort_domain::entities::scan_policy::SeverityThreshold;
-use hort_domain::types::{collapse_alias_groups, is_informational_class, Finding, SeverityBasis};
+use hort_domain::types::{
+    collapse_alias_groups, is_informational_class, ComponentRelation, Finding, SeverityBasis,
+};
 use serde::Deserialize;
 
 use crate::ecosystem::osv_ecosystem_to_purl_type;
@@ -520,6 +522,7 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
         aliases: collect_aliases(groups, vuln),
         informational_class,
         severity_basis,
+        component_relation: ComponentRelation::NotEstablished,
     }
 }
 

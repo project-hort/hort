@@ -45,10 +45,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use chrono::Utc;
 
 use hort_app::use_cases::repository_access::AccessLevel;
-use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{Repository, RepositoryFormat, RepositoryType};
 use hort_domain::events::ApiActor;
@@ -61,7 +59,10 @@ use hort_http_core::authz::write::{reject_write_to_virtual, resolve_actor_user_i
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
-use hort_http_core::limits::{BoundedPath, DEFAULT_PUBLISH_BODY_LIMIT};
+use hort_http_core::limits::{
+    publish_disabled_response, refuse_publishes_when_disabled, BoundedPath,
+    DEFAULT_PUBLISH_BODY_LIMIT,
+};
 use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 
 pub(crate) mod serve;
@@ -86,19 +87,49 @@ use serve::MetadataLevel;
 /// `hort_upstream_insecure_total`.
 pub(crate) const UPSTREAM_PROXY_FORMAT: RepositoryFormat = RepositoryFormat::Maven;
 
-/// Build the Maven route tree (GET / HEAD / PUT on a wildcard tail).
+/// Build the Maven route tree with the default publish body limit
+/// (GET / HEAD / PUT on a wildcard tail).
 ///
 /// PUT carries the shared publish body limit
 /// ([`DEFAULT_PUBLISH_BODY_LIMIT`] — 300 MiB) so a large `.jar` is not
-/// rejected by axum's default 2 MiB ceiling. The server mounts this tree
-/// under `/maven`.
+/// rejected by axum's default 2 MiB ceiling. Operators can override it
+/// via `HORT_PUBLISH_BODY_MAX_SIZE`; the override is threaded through
+/// `AppContext` and reaches this builder as
+/// [`maven_routes_with_publish_limit`] in `http.rs::build_router`. The
+/// server mounts this tree under `/maven`.
 pub fn maven_routes() -> Router<Arc<AppContext>> {
-    Router::new().route(
+    maven_routes_with_publish_limit(DEFAULT_PUBLISH_BODY_LIMIT)
+}
+
+/// Build the Maven route tree with a custom publish body limit (in bytes).
+///
+/// `http.rs::build_router` calls this with the effective limit
+/// (`HORT_PUBLISH_BODY_MAX_SIZE` or the default). Tests also use it
+/// directly to exercise the body-limit reject path without sending
+/// hundreds of megabytes.
+///
+/// A **size** is carried by `DefaultBodyLimit` alone: [`upload`]
+/// consumes the body through the buffering `Bytes` extractor, which
+/// consults the `DefaultBodyLimit` marker, so there is no streaming
+/// consumer that would need the value handed to it a second time as an
+/// `Extension` (contrast npm, whose publish decoder reads a raw
+/// `Body`).
+///
+/// **Zero** is the refuse-all-publishes kill switch rather than a
+/// ceiling, and it is answered by
+/// `hort_http_core::limits::refuse_publishes_when_disabled` — `503`,
+/// before the PUT reaches the handler — not by the body limit. Leaving
+/// it to `DefaultBodyLimit::max(0)` admitted a zero-byte `.jar`,
+/// because this PUT has no envelope that could fail on empty input:
+/// the switch was on and an empty artifact was ingested.
+pub fn maven_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
+    let routes = Router::new().route(
         "/{repo_key}/{*artifact_path}",
         get(download)
             .head(download)
-            .put(upload.layer(DefaultBodyLimit::max(DEFAULT_PUBLISH_BODY_LIMIT))),
-    )
+            .put(upload.layer(DefaultBodyLimit::max(limit))),
+    );
+    refuse_publishes_when_disabled(routes, limit, publish_disabled_response)
 }
 
 /// Resolve the repo for a Maven request and confirm it is a Maven- or
@@ -464,57 +495,24 @@ async fn resolve_unresolved_snapshot(
     Ok(MavenFormatHandler.resolve_mutable_version(artifact_path, &available_refs)?)
 }
 
-/// Surface the per-artifact status gate as the non-servable HTTP response
-/// (`Quarantined` → 503 + `Retry-After`; `Rejected` → 403;
-/// `ScanIndeterminate` → 403), or `None` when the artifact is servable
-/// (`Released` / `None`). Shared by the file GET ([`render_file_response`])
-/// and the checksum-sidecar GET ([`sidecar::serve_sidecar`]) so a sidecar
-/// inherits its target file's exact status response (design §11) — a
+/// Surface the per-artifact status gate as the non-servable HTTP
+/// response, or `None` when the artifact is servable. The answer itself
+/// is [`hort_http_core::artifact_gate::non_servable_response`], the one
+/// definition the content routes share; what this wrapper adds is the
+/// Maven-specific invariant that makes it worth a name here.
+///
+/// That invariant: the file GET ([`render_file_response`]) and the
+/// checksum-sidecar GET ([`sidecar::serve_sidecar`]) resolve the same
+/// target artifact and must reach the **same** answer (design §11) — a
 /// quarantined file and its sidecar both 503, a rejected file and its
-/// sidecar both 403, and the digest of a held version is never computed.
+/// sidecar both 403. Routing both through one call is what guarantees
+/// it, and it is why the gate runs *before* any CAS read or cache
+/// lookup: the digest of a held version is never computed, so the
+/// sidecar reveals nothing the file's own status response does not.
 pub(crate) fn non_servable_response(
     artifact: &hort_domain::entities::artifact::Artifact,
 ) -> Option<Response> {
-    match artifact.quarantine_status {
-        QuarantineStatus::Quarantined => {
-            // The use-case layer hydrates the transient computed
-            // `quarantine_deadline` (ADR 0007); the format crate never
-            // computes it. 503 + Retry-After — NEVER 409 (proxies cache it).
-            let retry_after = artifact
-                .quarantine_deadline
-                .map(|deadline| {
-                    let secs = (deadline - Utc::now()).num_seconds().max(1);
-                    secs.to_string()
-                })
-                .unwrap_or_else(|| "3600".to_string());
-            Some(
-                Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header("Retry-After", retry_after)
-                    .body(Body::from(
-                        serde_json::json!({"error": "artifact is quarantined"}).to_string(),
-                    ))
-                    .unwrap(),
-            )
-        }
-        QuarantineStatus::Rejected => Some(
-            Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact is rejected"}).to_string(),
-                ))
-                .unwrap(),
-        ),
-        QuarantineStatus::ScanIndeterminate => Some(
-            Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact scan is indeterminate"}).to_string(),
-                ))
-                .unwrap(),
-        ),
-        QuarantineStatus::None | QuarantineStatus::Released => None,
-    }
+    hort_http_core::artifact_gate::non_servable_response(artifact)
 }
 
 /// Render the final file HTTP response: surface the quarantine gate via

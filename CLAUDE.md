@@ -3,9 +3,9 @@
 Auto-generated from all feature plans. Last updated: 011
 
 ## Active Technologies
-- Rust 1.94+ (backend) + git2, axum
-- Rust 1.94+ + axum, sqlx, tokio, reqwest
-- Rust 1.94+ + axum, serde, serde_json
+- Rust 1.97+ (backend) + git2, axum
+- Rust 1.97+ + axum, sqlx, tokio, reqwest
+- Rust 1.97+ + axum, serde, serde_json
 - Planned, post-v1 (not wired into the build today — see
   `hort-formats/README.md`): wasmtime 21.0+, wasmtime-wasi, wit-bindgen,
   filesystem for WASM binaries. Format handlers are currently compiled-in
@@ -115,10 +115,10 @@ release gate.
 
 ## Code Style
 
-Rust 1.94+ with the following project configuration:
+Rust 1.97+ with the following project configuration:
 
 - **Line width:** 100 characters (see `rustfmt.toml`)
-- **MSRV:** 1.94.0 (see `.clippy.toml`)
+- **MSRV:** 1.97.0 (see `.clippy.toml`)
 - **`unsafe` is forbidden workspace-wide** via `[workspace.lints.rust] unsafe_code = "forbid"` in the root `Cargo.toml`. This cannot be overridden with `#[allow]` — it is a compile error. All dependencies that need `unsafe` handle it within their own crates; no application code in this workspace has a legitimate need for it. If a future edge case requires revisiting this, the change must be made in `Cargo.toml` and reviewed as a policy change.
 - **Clippy lints** are configured in `[workspace.lints.clippy]` in the root `Cargo.toml`. Every crate inherits these via `[lints] workspace = true`. Do not override workspace lints in individual crates without justification.
 - **SonarCloud quality gate** runs on every PR and enforces >= 85% coverage on new code and <= 1% duplication on new code. PRs that fail the gate will be blocked.
@@ -141,7 +141,12 @@ Coverage requirements vary by crate layer. Core crates contain the security-crit
 
 **DB-backed test isolation (parallel-safety contract).** The DB-backed suites have **three modes**, and a reviewer has to know which one a test is in:
 
-- **`test_support::isolated_db_from`** — creates and migrates a fresh `hort_test_<epoch>_<uuid>` database per call. This is the overwhelming majority of the harness: **61 files** (54 in `hort-adapters-postgres`, 7 in `hort-server`), usually reached through a module-local `maybe_pool()`.
+- **`test_support::isolated_db_from`** — creates and migrates a fresh `hort_test_<epoch>_<uuid>` database per call. This is the overwhelming majority of the harness: **66 files** (58 in `hort-adapters-postgres`, 8 in `hort-server`) as measured on 2026-10-08, usually reached through a module-local `maybe_pool()`. The figure moves whenever a DB test is added or relocated, so re-measure rather than trusting it:
+  ```bash
+  grep -rl 'isolated_db_from(' crates/*/src crates/*/tests --include='*.rs' \
+    | grep -v 'test_support\|db_tests_are_serialized\|db_gate_not_silent'
+  ```
+  (the two excluded guards name the helper as a pattern to scan for, not as a call).
 - **`test_support::shared_migrated_pool`** — connects to and migrates the shared `DATABASE_URL` target, for the few tests that deliberately exercise shared-DB behaviour (isolating them would defeat the point of the test): **4 files**, all in `hort-adapters-postgres`.
 - **A hand-rolled throwaway database on the `DATABASE_URL` target** — an `admin_pool()` (now `test_support::connect_or_panic`) plus the file's own `create_temp_db` / `drop_temp_db`, because these tests drive the migrator itself and so cannot be handed an already-migrated database: **5 files**, `hort-server/tests/migrate_{assert_current,harden_events,schema_compat,fleet_fence}.rs` and `hort-worker/tests/schema_compat_boot.rs`, 35 DB-backed tests. All 35 carry `#[serial(hort_pg_db)]`; until the sweep that added the guard below, only `migrate_fleet_fence.rs`'s 6 did, and the other 29 ran their `CREATE DATABASE` + full migration set (cluster-global `CREATE ROLE` included) unkeyed — they fell through the *wording* of the old rule, which named `hort-adapters-postgres` and so did not reach `hort-server` / `hort-worker`. There is also one test in a sixth file that hand-rolls a throwaway database inside an otherwise `isolated_db_from` file (`hort-adapters-postgres/tests/api_tokens_migration.rs::idempotent_after_rollback`, whose `DROP TABLE … CASCADE` cannot be let near a database anything else will reuse); a mode-by-file listing will not find it, which is why the guard scans functions.
 
@@ -161,6 +166,37 @@ The rule holds on both paths, for two different reasons, and both halves are loa
 - On the **isolated** path a per-test database is **not** isolation from cluster-global work. `CREATE ROLE` (the migration set creates roles), `pg_stat_activity` probes, `CREATE`/`DROP DATABASE` and the shared catalogs the stale-database sweeper touches are all **server-wide**: a test in its own database still collides with a sibling through the cluster, and the serial key is what keeps that collision from happening.
 
 Coverage % is necessary but **not sufficient**: a DB-backed test that is correct serially but interferes with a concurrently-running sibling is a defect, not passing.
+
+### A test double that round-trips must refuse what production refuses
+
+`MockEventStore` (`crates/hort-app/src/use_cases/test_support.rs`) is used by
+nine crates, and it **round-trips**: `read_stream` serves what `append`
+accepted. So a test seeds events there, production code reads them back, and a
+decision is asserted over them — which makes the double's acceptance criteria
+part of every such test's premise.
+
+The production adapter validates: every `EventStore::append` goes through
+`validate_and_serialize` (`crates/hort-adapters-postgres/src/event_store.rs`),
+which calls `DomainEvent::validate()` on every event in the batch and then
+enforces a 64 KB serialised cap. **An event the double accepts and the adapter
+would reject is an event no producer in the system can write**, and a test
+standing on one proves a behaviour production cannot show.
+
+This is measured, not theoretical. The authority-derivation corpus for the
+release gate held `ScanCompleted` events whose `finding_count` disagreed with
+their `severity_summary` sum — which `validate()` rejects — because the fixture
+built the summary from the count with a different rule. The five sites seeded
+the store directly, so nothing checked them, and the two release paths appeared
+to agree *because the fixture made them agree*. The divergence that cost a
+production incident survived behind impossible events.
+
+The rule is therefore scoped by round-tripping, not by "every double": a double
+whose `append` discards the batch (several local ones error or ignore it, and
+their `read_stream` is `unreachable!`) cannot host a corpus, because nothing
+reads it back. **A double that serves `read_stream` from what it accepted calls
+`validate()` on append and returns the error.** When adding such a double, do
+the same; when a fixture starts failing because of it, the fixture was building
+an event the system cannot produce.
 
 **Enforcement: `crates/hort-app/tests/db_tests_are_serialized.rs`**, a DB-free sub-second source scan in the same family as `db_gate_not_silent` — so `cargo test --workspace` runs it automatically. It reports every test function (inline `#[cfg(test)]` *and* `crates/*/tests/`) that reaches `test_support::{isolated_db_from, shared_migrated_pool, connect_or_panic}` — directly or through a same-file helper, transitively — or opens a raw `PgPool::connect` / `PgConnection::connect*`, and carries no `#[serial(hort_pg_db)]`. **It has no allow-list, by design**: a site that genuinely should not carry the key is a review conversation, not an exemption entry. Its blind spot is the one every source scan has — a helper in *another* file, or a connection opened through a macro — so the review check survives alongside it (see the architect Implementation Review Checklist).
 
@@ -324,13 +360,15 @@ cargo deny check                                           # advisories+bans+lic
 It runs the full local suite — every crate's `--lib` unit tests AND every
 `tests/` integration target. DB-gated tests self-skip without `DATABASE_URL`,
 so no database is needed: a bare `cargo test --workspace` runs every DB-free
-test and early-returns from the rest (measured: 12,368 passed / 9 ignored /
-0 failed, identical to the same command *with* `DATABASE_URL` set).
+test and early-returns from the rest (measured 2026-10-10 on
+`agent/343-audit-block-5`: 13,086 passed / 10 ignored / 0 failed, identical to
+the same command *with* `DATABASE_URL` set — the totals move with every test
+added, so re-measure rather than quoting these).
 **A self-skipped DB-gated test reports `ok`, not `ignored`** — libtest has no
 dynamic-ignore verdict, so the skip is an early `return` from a test that counts
 as passed. The `ignored` column therefore says nothing about how many DB tests
-ran: none of those 9 is DB-gated (5 slow-seeding, 2 broker test-infra TODOs,
-2 doc-tests). An earlier wording here promised
+ran: none of those 10 is DB-gated (5 slow-seeding, 2 broker test-infra TODOs,
+3 doc-tests). An earlier wording here promised
 `ignored, requires DATABASE_URL`; that described the pre-self-skip `#[ignore]`
 world, which the conversion to runtime self-skip retired.
 
@@ -396,8 +434,59 @@ connection without `#[serial(hort_pg_db)]`, with no allow-list),
 `DATABASE_URL` read. A DB-gated fixture only reaches a connect because the
 variable was set, so a swallowed connect error is a configured database that
 did not work being reported as no database at all, and the test then says `ok`
-without having run) are pure source-/fixture-scan
-guards — no database, sub-second — enforcing structural invariants that a
+without having run), `status_decode_fails_closed` (the same hazard class
+carried from a discarded Postgres *connect* to a discarded
+quarantine-**status** read or decode: rejects `.ok()` / `unwrap_or*` wherever
+the receiver it throws away or the fallback it substitutes names the
+quarantine status. `QuarantineStatus::None` is the most permissive state in
+the system — `Artifact::is_downloadable` admits it and the default
+`ReleasedOnly` index mode serves it — AND the state a swallowed decode
+naturally defaults to, so a discarded error there does not degrade a serving
+decision, it inverts it. The predicate is receiver-scoped rather than
+statement-scoped, which is what lets it run with **no allow-list**: a
+discarded *artifact load* beside a status read, or a fallback on the field
+next to a status cell, are not hits. Carries a counter-assertion that the
+corpus is real, that the one codec
+(`hort_adapters_postgres::quarantine_status_sql`) still defines both halves of
+its encode/decode pair, and that the read paths still decode through it — so a
+rename cannot make the scan vacuously green. Same blind spot as its siblings:
+a decode reached through a differently-named local helper),
+`cas_reads_are_verified` (ADR 0003's read-verification amendment — asserts
+that every `impl StoragePort for` under `crates/hort-adapters-*/src`
+constructs a `VerifyingReader` inside its own `get`. The wrap was hand-written
+at two sites with nothing holding it: a third adapter returning its backend's
+raw stream compiles, passes clippy and passes the suite, and the only thing it
+breaks is a guarantee no test stated — `VerifyingReader::poll_read` is the
+single production construction point of `CasIntegrityFailure`, so an adapter
+without the wrap makes at-rest corruption indistinguishable from a clean read
+for every consumer and `CasScrubUseCase` sweeps corrupt storage reporting
+success. **Function-scoped**, which is load-bearing rather than fastidious:
+both adapters carry a `get_range` doc comment naming `VerifyingReader` in
+order to say it does *not* apply there, so a file-scoped scan stays green
+after the wrap itself is deleted. The scope is derived — an outbound adapter
+lives in an `hort-adapters-*` crate (ADR 0008) and a `#[cfg(test)]` test
+double is excluded by how it is compiled, not by an entry — so there is **no
+allow-list**. Carries a counter-assertion pinning the two known production
+implementations by type and file, so renaming the port, the method or the
+reader cannot make it vacuously green. Blind spot: a `get` that delegates the
+wrap to a helper reads as unverified — a false positive, and a review
+conversation about where the wrap belongs),
+`https_rule_is_single_sourced` (pins that "a download URL recovered from an
+upstream metadata document must be `https://`" has exactly one definition,
+`hort_domain::ports::format_handler::require_https_metadata_url`, by
+rejecting every other https-exclusive scheme comparison in the
+upstream-metadata → fetch pipeline — `hort-domain`, `hort-formats`,
+`hort-http-*`, `hort-app`, scoped by ADR 0008's layering rather than
+enumerated, with **no allow-list** and counter-assertions on both the
+definition and the per-file call-site census, because the rule had been
+re-typed per consumer five times and the sixth consumer, the autonomous
+prefetch path with no 502 behind it, carried no copy at all. A statement
+that also names `http://` is an "is this absolute?" test and deliberately
+not a hit, which is what keeps cargo's `http://`-tolerant index `dl` field
+out of scope; blind spots are a comparison assembled through a macro or
+spelled on a parsed `Url::scheme()` instead of a string prefix, and a sixth
+copy landing in a crate outside the pipeline) are pure
+source-/fixture-scan guards — no database, sub-second — enforcing structural invariants that a
 rename or a stray `use` silently breaks. (A stale keyspace registry once shipped
 undetected because the gate then ran only `--lib`.) Because `cargo test --workspace`
 now runs every `tests/` target automatically, a new DB-free structural guard
@@ -552,6 +641,7 @@ Release-note mechanics:
 ### Changelog and Release Notes
 
 - Follow the [Keep a Changelog](https://keepachangelog.com/) format: record changes under `### Added` / `### Changed` / `### Fixed` / `### Security` / `### Removed` beneath the `## [Unreleased]` heading.
+- **An entry is one or two lines, and the changelog carries only the changes that matter to someone running or upgrading hort.** State what changed and, where it is not obvious, what an operator must do about it — then stop. No rationale, no mechanism, no before/after narration, no sub-bullets walking the implementation: that belongs in the commit, the MR and the issue, which the `(#NNN)` reference reaches. Related changes under one issue are one entry, not one per call site. Leave out what a user cannot observe — test-harness work, internal refactors, documentation fixes. **No statement about a single installation belongs in the changelog** — not a measurement taken against one, not what one of them cost, not the state one of them is in, in any section including already-released ones. A reader's exposure is their own, so give the shape of the impact and never another deployment's numbers (see *Code comments* above for the same rule one level down). Naming a public endpoint a reader consumes, such as where a chart is published, is product surface and is not covered by this.
 - **`[Unreleased]` accumulates across the entire pre-release (`-alpha`, and any future `-beta`/`-rc`) series and is stamped `## [X.Y.Z] - <date>` exactly once — at the final `develop → main` promotion.** Pre-release commits do **not** stamp or fold the changelog. (The old per-pre-release fold is retired: it produced stale section dates — a `[0.9.8] - 2026-07-03` heading that kept accreting later entries — and a manual, error-prone move at every pre-release.) An alpha's "changelog" is simply the current `[Unreleased]` at that tag; per-alpha traceability comes from the git tags plus the auto-generated GitHub release notes.
 - GitHub Release notes are **auto-generated** (`generate_release_notes: true` in `release.yml`) — do NOT hardcode static product descriptions, feature lists, or format counts in release bodies.
 - Hort has a single author and no external contributors or sponsors at present, so changelog entries and release notes carry no `### Thank You` / `### Sponsors` recognition sections. If external contributors or sponsors appear later, reintroduce those sections at that point.

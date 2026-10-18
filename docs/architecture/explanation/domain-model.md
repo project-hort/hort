@@ -191,6 +191,17 @@ Three things worth noticing:
   through it; pure reads go through the repositories and `EventStore`
   directly. `ArtifactMetadataRepository` deliberately has no `save`
   method — writes are owned by the lifecycle port.
+- **`AuthorityLifecyclePort` is the same guarantee for the CRUD rows
+  that carry an audit trail** — permission grants, claim mappings, OIDC
+  issuers, gitops-managed upstream mappings, service-account
+  aggregates. One call commits the desired rows and the audit batches
+  the gitops apply's prior-vs-desired diff produced, so none of those
+  rows can become live with nothing in the authorization stream
+  attesting it. The repositories keep their read surfaces and nothing
+  else: four of the five are read-only traits and the fifth
+  (`RepositoryUpstreamMappingRepository`) keeps only its non-gitops
+  `managed_by = 'local'` CRUD pair, so an apply branch that tries to
+  write an authority row outside the transaction does not compile.
 - **`FormatHandler` is synchronous.** It is a pure strategy pattern, not
   an I/O port. Parsing a download path has no state to block on.
 - **Upload-payload metadata** flows from the inbound handler via
@@ -347,10 +358,14 @@ covers 11 kinds (see `crates/hort-config/src/envelope.rs` `Kind` enum):
 - `ClaimMapping` — CRUD; IdP-group → claim resolution (no `GroupMapping` or `Role` kinds exist — see ADR 0012).
 - `PermissionGrant` — CRUD; rows in `permission_grants`, with a sum-typed subject (`claims` / `user`).
 - `CurationRule` — CRUD; standalone per-package allow/deny/warn rule.
-- `ScanPolicy` — event-sourced; severity threshold, license policy,
-  quarantine duration, signature/approval requirements.
+- `ScanPolicy` — event-sourced; severity threshold, quarantine
+  duration, provenance mode, approval requirement. (`licensePolicy` is
+  carried but refused at apply — no port surfaces an artifact's
+  licences, so it decides nothing.)
 - `Exclusion` — event-sourced sub-state of a parent `ScanPolicy`
-  (auditable CVE override on a package pattern).
+  (auditable CVE override on a package pattern). Its reach is the
+  parent policy's scope; its own `scope` must be `global`, because the
+  finding filter never reads it.
 - `UpstreamMapping` — CRUD; maps a repository to an upstream proxy source.
 - `OidcIssuer` — CRUD; trusted OIDC issuer for workload identity federation.
 - `ServiceAccount` — CRUD; service-account declaration (ADR 0018).

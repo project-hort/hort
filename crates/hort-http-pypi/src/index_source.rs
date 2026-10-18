@@ -225,7 +225,9 @@ impl IndexSource for HostedPypiSource {
                 .next()
                 .unwrap_or(&artifact.path)
                 .to_string();
-            let hash_sha256 = Some(artifact.sha256_checksum.to_string());
+            // Already a `ContentHash` on the stored row — carried across
+            // typed rather than widened to `String` and re-parsed.
+            let hash_sha256 = Some(artifact.sha256_checksum.clone());
             let requires_python = metadata_map
                 .get(&artifact.id)
                 .and_then(|m| m.metadata.get("pkg_info"))
@@ -446,18 +448,17 @@ impl IndexSource for ProxyPypiSource {
             }
         };
 
-        // Per-version status hydration: a status-query failure degrades
-        // to "no status known" + WARN.
+        // Per-version status hydration, propagated and never degraded
+        // — see the npm proxy source for the full reasoning: an empty
+        // status map is the claim "hort holds nothing non-servable
+        // here", which under `IncludePending` re-advertises every
+        // version hort is holding back.
         let handler = PyPiFormatHandler;
         let normalized = handler.normalize_name(package_name);
         let pkg_status = ctx
             .artifact_use_case
             .package_version_status(repo.id, &normalized)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "pypi proxy source: package_version_status failed; degrading to no status");
-                Vec::new()
-            });
+            .await?;
 
         // Fire the prefetch trigger on every successful fetch
         // (see `docs/architecture/explanation/prefetch-pipeline.md`).
@@ -537,6 +538,21 @@ pub(crate) fn projection_to_entries(
             .metadata_sha256
             .as_deref()
             .and_then(|hex| hex.parse::<hort_domain::types::ContentHash>().ok());
+        // Same narrowing for the file's own `hashes.sha256` / `#sha256=`
+        // fragment: the projection carries the upstream's verbatim hex,
+        // and the builder interpolates it into an `href`. Parsing here
+        // means a value that is not a canonical SHA-256 digest collapses
+        // to `None` (builder emits no fragment) instead of travelling
+        // into the served document. Case is folded first because an
+        // upstream that spells the digest in uppercase still named that
+        // digest, and lowercase is the form a client's own `hexdigest()`
+        // produces — dropping it would lose a check that can succeed,
+        // which a non-hex or wrong-length value never could.
+        let hash_sha256 = f
+            .sha256
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .and_then(|hex| hex.parse::<hort_domain::types::ContentHash>().ok());
         let Some(version) = extract_version_from_filename(&filename, normalized_project) else {
             continue;
         };
@@ -545,7 +561,7 @@ pub(crate) fn projection_to_entries(
             .or_default()
             .push(PypiVersionFile {
                 filename,
-                hash_sha256: f.sha256,
+                hash_sha256,
                 requires_python: f.requires_python,
                 metadata_hash,
             });
@@ -706,4 +722,4 @@ fn extract_version_from_filename(filename: &str, _normalized_project: &str) -> O
 // raw-body `parse_html_to_entries`: the HTML arm now projects to
 // `PypiSimpleIndexProjection` via
 // `crate::html_projection::HtmlSimpleIndexProjector`, which carries its
-// own `html_unescape_attr` for the `requires-python` attribute.
+// own `html_unescape` for every attribute-derived value.

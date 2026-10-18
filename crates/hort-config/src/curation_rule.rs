@@ -53,7 +53,7 @@ pub fn parse_curation_rule(
     _path: &Path,
     bytes: &[u8],
 ) -> Result<Envelope<CurationRuleSpec>, ParseError> {
-    let env: Envelope<CurationRuleSpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<CurationRuleSpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::CurationRule {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),

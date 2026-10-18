@@ -107,6 +107,24 @@ pub const MAX_ADMIN_EXPIRY_DAYS: u32 = 30;
 /// A requested lifetime above this is clamped down to it.
 pub const MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS: u64 = 3600;
 
+/// Reserved username of the break-glass admin identity minted by the
+/// `admin bootstrap-session` CLI (ADR 0038).
+///
+/// Canonical here rather than in the CLI because the CLI is not the only
+/// consumer: [`ApiTokenUseCase::run_issuance_gates`] refuses every
+/// request-path issuance whose token owner is this identity, and the two
+/// must name the same user or the gate guards a different row than the
+/// CLI reserves.
+///
+/// Recognising the identity by **username on the loaded `users` row** is
+/// what makes the gate robust. `users.username` is `UNIQUE` in the schema
+/// and no application surface writes it (`UserUseCase::update` touches
+/// email / display_name / is_active / is_admin only, and there is no
+/// user-mutation HTTP route), so the marker cannot be moved off the row
+/// it identifies. A token *name* is operator-chosen and therefore not an
+/// identity marker at all.
+pub const BOOTSTRAP_ADMIN_USERNAME: &str = "bootstrap-admin";
+
 // -- CLI-session lifetime caps (seconds; ADR 0013) --
 //
 // RFC 8693 §2.1 seconds-based `requested_token_lifetime`. Below-min is
@@ -264,8 +282,16 @@ pub struct FederationSource {
     /// denies `jti_required`-equivalent.
     pub iat: Option<i64>,
     /// Raw `exp` NumericDate
-    /// seconds. Always present (the validator enforced `exp`). Part of
-    /// the `ReplayKey::Composite` fallback.
+    /// seconds. Always present (the validator enforced `exp`). Two
+    /// consumers: part of the `ReplayKey::Composite` fallback, and —
+    /// on BOTH key shapes — the anti-replay seen-set row's TTL
+    /// horizon, because how long this JWT can still be presented is
+    /// the only horizon that keeps the seen-set's promise (the minted
+    /// bearer's capped lifetime is a different, shorter window and
+    /// would have the prune forget the JWT while it is still
+    /// redeemable). A value that is not a representable
+    /// `DateTime<Utc>` denies the exchange fail-closed — no token row,
+    /// no event.
     pub exp: i64,
     /// The resolved
     /// `OidcIssuer.require_jti` flag, threaded from the handler (which
@@ -480,6 +506,22 @@ pub enum ApiTokenError {
     /// 403 — service-account user attempted self-mint.
     #[error("service accounts must use admin-mint")]
     ServiceAccountSelfMint,
+
+    /// 403 — the issuance would produce a token owned by the reserved
+    /// [`BOOTSTRAP_ADMIN_USERNAME`] break-glass identity.
+    ///
+    /// That identity's only mint path is the DSN-gated
+    /// `admin bootstrap-session` CLI
+    /// ([`ApiTokenUseCase::issue_for_bootstrap_admin_system`]), which
+    /// bounds the credential to [`MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS`]
+    /// and revokes the principal's tokens on the next rotation. A
+    /// request-path issuance carries neither bound, so admitting one
+    /// would let the one-hour break-glass credential compose into a
+    /// standing full-admin credential (ADR 0038 governs the derived
+    /// credential; ADR 0016 requires the fail-closed close rather than
+    /// a shortened expiry).
+    #[error("the bootstrap break-glass identity may not be issued request-path tokens")]
+    BootstrapAdminMintForbidden,
 
     /// 400 — admin token requested without `HORT_TOKEN_ALLOW_ADMIN=true`.
     #[error("admin tokens disabled by composition-root config")]
@@ -1023,24 +1065,53 @@ impl ApiTokenUseCase {
         //      claim. Runs ONLY on the federation path
         //      (`federation_source.is_some()`); the rotation reconciler
         //      and every other system-mint caller set it to `None` and
-        //      skip the guard entirely. Placed AFTER expiry resolution
-        //      (the seen-set row reuses the resolved token
-        //      `expires_at = min(jwt_remaining, fed_max)`) and BEFORE
-        //      `tokens.insert` + the `ApiTokenIssued` append, so a
-        //      replay or a guard outage produces ZERO side effects (no
-        //      token row, no event — "no partial side effects on deny").
+        //      skip the guard entirely. Placed BEFORE `tokens.insert` +
+        //      the `ApiTokenIssued` append — that half of the ordering
+        //      is load-bearing: a replay, a guard outage or an
+        //      underivable TTL horizon produces ZERO side effects (no
+        //      token row, no event — "no partial side effects on
+        //      deny"). It also sits after expiry resolution, but no
+        //      longer draws anything from it: the seen-set horizon is
+        //      the source JWT's own `exp`, not the minted bearer's.
         if let Some(fs) = request.federation_source.as_ref() {
-            // The seen-set TTL horizon is exactly the resolved token
-            // expiry. The system-mint path always resolves a
-            // bounded `expires_at` (the unbounded path is closed for
-            // federation), so a `None` here is an invariant violation,
-            // not a "never expires" seen-set row.
-            let seen_expires_at = token.expires_at.ok_or_else(|| {
-                ApiTokenError::Infrastructure(DomainError::Invariant(
-                    "federation mint resolved an unbounded expiry — \
-                     replay seen-set TTL is not derivable"
-                        .to_string(),
-                ))
+            // The seen-set row's TTL horizon is the **source JWT's own
+            // `exp`** — how long that signed JWT can still be
+            // presented — and NOT the minted bearer's `expires_at`.
+            // The row exists to answer "has this JWT been exchanged
+            // before?", and the TTL prune is
+            // `DELETE … WHERE expires_at < now()`, so the row has to
+            // outlast its subject: a horizon of
+            // `min(jwt_remaining, federation_max)` drops the row while
+            // the same signed JWT is still presentable — 23 h early
+            // for a 24 h CI identity against the 1 h bearer cap — and
+            // the next presentation of it is no longer a replay. The
+            // price is one row per distinct exchange per JWT lifetime
+            // instead of per bearer lifetime: finite, measured, and
+            // exactly what a seen-set must retain to keep its promise.
+            //
+            // This SUPERSEDES the `public.jwt_replay_seen.expires_at`
+            // column note in
+            // `migrations/011_gitops_machine_identity.sql`
+            // ("TTL horizon = `min(jwt_remaining, federation_max)`"),
+            // which cannot be corrected where it stands: an applied
+            // migration is never edited in place — `sqlx::migrate!`
+            // rejects the altered checksum and every existing
+            // deployment would fail at boot. The live rule is here.
+            //
+            // `fs.exp` is a NumericDate in seconds and always present
+            // (the validator enforced `exp`), but an `i64` that is not
+            // a representable `DateTime<Utc>` yields no horizon at
+            // all. That is fail-CLOSED, in the same shape as every
+            // other deny on this path: the exchange is denied, the
+            // guard is not consulted, no token row, no event. Never a
+            // clamp or a default — a horizon we invented would record
+            // a claim the prune could remove early.
+            let seen_expires_at = DateTime::<Utc>::from_timestamp(fs.exp, 0).ok_or_else(|| {
+                ApiTokenError::Infrastructure(DomainError::Invariant(format!(
+                    "federation source jwt exp ({}) is not a representable Utc \
+                     timestamp — replay seen-set TTL horizon is not derivable",
+                    fs.exp
+                )))
             })?;
 
             // Replay-key selection → either a ReplayKey or the
@@ -1941,10 +2012,17 @@ impl ApiTokenUseCase {
         })
     }
 
-    /// Steps 1-5 of the issuance pipeline — static request validation,
+    /// Steps 0-5 of the issuance pipeline — the reserved break-glass
+    /// identity refusal, static request validation,
     /// repo-set / admin-token gating (with denial-event emission),
     /// expiry resolution, and the cap-vs-authority check against the
     /// live [`RbacEvaluator`]. Returns the resolved `expires_at`.
+    ///
+    /// Step 0 refuses any issuance whose token **owner** (`target`) is
+    /// the reserved [`BOOTSTRAP_ADMIN_USERNAME`] identity. Anchoring it
+    /// on the owner rather than on the route is what makes a future
+    /// issuance route inherit the refusal instead of re-opening the
+    /// composition (ADR 0016; ADR 0038).
     ///
     /// `caller` drives steps 1-4 (validation, the admin-token flag +
     /// `principal_is_admin` gate, expiry resolution/audit). `authz_subject`
@@ -1966,6 +2044,38 @@ impl ApiTokenUseCase {
         kind: TokenKind,
         request: &IssueTokenRequest,
     ) -> Result<Option<DateTime<Utc>>, ApiTokenError> {
+        // 0. Reserved break-glass identity. Refused before
+        //    request-shape validation: this is a refusal of the
+        //    identity, not of the request, so a malformed request from
+        //    that identity must still report the identity reason.
+        //
+        //    The CLI mint (`issue_for_bootstrap_admin_system`) does not
+        //    pass through these gates and is unaffected — it is the one
+        //    path that carries the ≤ 1 h clamp and the single-active
+        //    rotation. Anything reaching here carries neither, so a
+        //    break-glass credential good for an hour would mint a
+        //    standing one: the admin gate at step 3 below would allow it
+        //    30 days under an operator-chosen name. Keyed on the owner
+        //    row's username, which is UNIQUE and not writable through
+        //    any application surface — see `BOOTSTRAP_ADMIN_USERNAME`.
+        if target.username == BOOTSTRAP_ADMIN_USERNAME {
+            self.emit_denial(
+                actor.user_id,
+                target.id,
+                kind,
+                request,
+                DenialReason::BootstrapAdminMintForbidden,
+            )
+            .await?;
+            tracing::info!(
+                actor_user_id = %actor.user_id,
+                target_user_id = %target.id,
+                denial_reason = "bootstrap_admin_mint_forbidden",
+                "token issuance denied"
+            );
+            return Err(ApiTokenError::BootstrapAdminMintForbidden);
+        }
+
         // 1. Static request validation (description / name / empty
         //    repository_ids). These do not produce a denial event —
         //    they are malformed-input rejects, not authority
@@ -2510,7 +2620,8 @@ fn build_replay_key(
 ///   gating (flag-off, no admin authority, expiry-out-of-range, or
 ///   admin-token-without-explicit-expiry).
 /// - `validation_error` — every other malformed-input or
-///   authorization-shaped reject (service-account self-mint, target
+///   authorization-shaped reject (service-account self-mint,
+///   bootstrap-admin mint forbidden, target
 ///   not service account, unbounded SVC token disallowed, empty
 ///   repo set, name/description shape, expiry outside [1, 365],
 ///   not-authorized, infrastructure failure, and the
@@ -2526,6 +2637,7 @@ fn issuance_result_label(result: &Result<IssuedToken, ApiTokenError>) -> &'stati
         | Err(ApiTokenError::AdminTokenExceedsThirtyDays)
         | Err(ApiTokenError::AdminTokenUnboundedNotAllowed) => "admin_disallowed",
         // Every other Err variant — service-account self-mint,
+        // bootstrap-admin mint forbidden,
         // unbounded SVC, invalid repo set, NotServiceAccount,
         // NotAuthorized, TokenNotFound (cannot occur on issuance
         // path but exhaustive for safety), name/description/expiry
@@ -4115,11 +4227,17 @@ mod tests {
 
     // ---------- issue_for_bootstrap_admin_system ----------
 
-    /// The reserved `bootstrap-admin` user: `is_admin = true`,
-    /// `is_service_account = false`. Id pinned to `0xACE` so it aligns
-    /// with `make_use_case` lookups.
+    /// The reserved `bootstrap-admin` user: the reserved username,
+    /// `is_admin = true`, `is_service_account = false`. Id pinned to
+    /// `0xACE` so it aligns with `make_use_case` lookups.
+    ///
+    /// The username is the reserved one, not the generic fixture's, because
+    /// it is the field the step-0 issuance gate keys on — a fixture naming
+    /// the row `alice` would let every test below pass while the gate was
+    /// guarding a different identity.
     fn bootstrap_admin_user() -> User {
         User {
+            username: BOOTSTRAP_ADMIN_USERNAME.into(),
             is_admin: true,
             is_service_account: false,
             ..user(false)
@@ -4411,8 +4529,10 @@ mod tests {
     }
 
     /// A federation system-mint request carrying a `jti` (the common
-    /// case → `ReplayKey::Jti`). `expires_in_seconds` is bounded so the
-    /// seen-set TTL is derivable.
+    /// case → `ReplayKey::Jti`). `expires_in_seconds` is the minted
+    /// bearer's lifetime, as the handler resolves it; the seen-set
+    /// TTL horizon is a separate value and comes from
+    /// `federation_source.exp`.
     fn make_request_federation_jti(jti: &str) -> IssueTokenRequest {
         IssueTokenRequest {
             name: "ci-pusher".into(),
@@ -4475,7 +4595,7 @@ mod tests {
             "guard consulted exactly once before mint"
         );
         // The claim used a Jti key scoped to the resolved issuer name,
-        // and the TTL is the resolved token expiry (min(jwt, fed_max)).
+        // and the TTL horizon is the source JWT's own `exp`.
         let (key, ttl) = guard_first.calls()[0].clone();
         assert_eq!(
             key,
@@ -4485,9 +4605,9 @@ mod tests {
             }
         );
         assert_eq!(
-            Some(ttl),
-            issued.expires_at,
-            "seen-set TTL must equal the resolved token expiry"
+            ttl,
+            DateTime::<Utc>::from_timestamp(1_700_000_900, 0).unwrap(),
+            "seen-set TTL must be the source JWT's exp"
         );
 
         // -- second presentation: guard says Replayed → DENY, no side effects --
@@ -4516,6 +4636,98 @@ mod tests {
         assert_eq!(guard_replay.call_count(), 1);
         // sanity: the first path DID append exactly one event
         assert_eq!(events.appended_batches().len(), 1);
+    }
+
+    /// Kills the wrong predicate: the seen-set row's TTL horizon is the
+    /// **source JWT's** `exp`, never the minted bearer's expiry. The
+    /// shape under test is the one the handler actually produces for a
+    /// 24 h CI identity — the bearer clamped to the 1 h federation cap
+    /// while the source `exp` stays 24 h out. On the bearer's horizon
+    /// the prune's `expires_at < now()` would delete the row 23 h
+    /// before that same signed JWT stops being presentable, and the
+    /// next presentation would mint again.
+    #[tokio::test]
+    async fn federation_seen_set_ttl_is_source_jwt_exp_not_bearer_cap() {
+        let guard = MockReplayGuard::new(Ok(ReplayClaim::FirstSeen));
+        let (uc, tokens, users, _events) = make_uc_with_guard(guard.clone());
+        users.insert(user(true));
+
+        let jwt_exp = Utc::now() + Duration::hours(24);
+        let mut req = make_request_federation_jti("jti-24h-identity");
+        // What the handler resolves: min(1h, jwt_remaining) = 1h.
+        req.expires_in_seconds = Some(3600);
+        if let Some(fs) = req.federation_source.as_mut() {
+            fs.exp = jwt_exp.timestamp();
+        }
+
+        let issued = uc
+            .issue_for_service_account_system(Uuid::from_u128(0xACE), req)
+            .await
+            .expect("first presentation must mint");
+        assert_eq!(tokens.inserts().len(), 1);
+
+        let (_key, ttl) = guard.calls()[0].clone();
+        assert_eq!(
+            ttl,
+            DateTime::<Utc>::from_timestamp(jwt_exp.timestamp(), 0).unwrap(),
+            "the seen-set horizon must be the source JWT's own exp"
+        );
+        let bearer_expiry = issued.expires_at.expect("the bearer expiry is bounded");
+        assert!(
+            ttl > bearer_expiry,
+            "the seen-set row must outlive the bearer it was minted beside \
+             (horizon {ttl}, bearer {bearer_expiry})"
+        );
+        let slack = (ttl - bearer_expiry).num_seconds();
+        assert!(
+            slack > 22 * 3600,
+            "a 24h JWT against the 1h bearer cap must leave ~23h of seen-set \
+             horizon beyond the bearer, got {slack}s"
+        );
+    }
+
+    /// Fail-CLOSED conversion: a source `exp` that is not a
+    /// representable `DateTime<Utc>` yields no TTL horizon, so the
+    /// exchange is denied with **no token row and no event** — and the
+    /// guard is never consulted, because a claim can only be recorded
+    /// under a horizon we actually know. Not a clamp, not a default.
+    #[tokio::test]
+    async fn federation_unrepresentable_source_exp_fails_closed() {
+        let guard = MockReplayGuard::new(Ok(ReplayClaim::FirstSeen));
+        let (uc, tokens, users, events) = make_uc_with_guard(guard.clone());
+        users.insert(user(true));
+        let mut req = make_request_federation_jti("jti-unrepresentable-exp");
+        if let Some(fs) = req.federation_source.as_mut() {
+            fs.exp = i64::MAX;
+        }
+
+        let err = uc
+            .issue_for_service_account_system(Uuid::from_u128(0xACE), req)
+            .await
+            .expect_err("an unrepresentable exp must deny, never mint");
+
+        match &err {
+            ApiTokenError::Infrastructure(DomainError::Invariant(msg)) => {
+                assert!(
+                    msg.contains("not a representable Utc timestamp"),
+                    "the deny must name the underivable TTL horizon, got {msg:?}"
+                );
+            }
+            other => panic!("expected an underivable-TTL invariant deny, got {other:?}"),
+        }
+        assert!(
+            tokens.inserts().is_empty(),
+            "FAIL-CLOSED: an underivable TTL horizon must NOT persist a token row"
+        );
+        assert!(
+            events.appended_batches().is_empty(),
+            "FAIL-CLOSED: an underivable TTL horizon must NOT append an event"
+        );
+        assert_eq!(
+            guard.call_count(),
+            0,
+            "nothing may be claimed under an unknown horizon"
+        );
     }
 
     /// Fail-CLOSED regression: the guard
@@ -4839,6 +5051,200 @@ mod tests {
             !any_replay_metric,
             "guard-unavailable must NOT touch hort_jwt_replay_rejected_total"
         );
+    }
+
+    // ---------- Cross-opt-in: a break-glass credential must not ----------
+    // ---------- compose into a standing one (ADR 0016 / ADR 0038) --------
+    //
+    // These tests turn BOTH opt-ins on in one use case. That is the point:
+    // the one-hour clamp on the CLI mint and the 1-30 day admin window on
+    // the self-mint route were each covered by their own green test, and the
+    // composition of the two was what nobody tested. A test that exercises
+    // one clamp at a time cannot see this finding.
+
+    /// The principal the auth middleware builds for a caller presenting a
+    /// `bootstrap-session` PAT: the bootstrap-admin row's id and reserved
+    /// username, `TokenKind::Pat`, the synthetic `admin` claim derived from
+    /// `is_admin = true`, and the full admin cap the CLI minted onto it.
+    fn bootstrap_session_principal() -> CallerPrincipal {
+        CallerPrincipal {
+            user_id: Uuid::from_u128(0xACE),
+            external_id: "local:bootstrap-admin".into(),
+            username: BOOTSTRAP_ADMIN_USERNAME.into(),
+            email: "bootstrap-admin@hort-internal.local".into(),
+            claims: vec!["admin".into()],
+            token_kind: Some(TokenKind::Pat),
+            issued_at: Utc::now(),
+            token_cap: Some(hort_domain::entities::api_token::TokenCap {
+                permissions: full_admin_cap(),
+                repository_ids: None,
+            }),
+        }
+    }
+
+    /// Both opt-ins on: `allow_admin_tokens` is the server-process
+    /// `HORT_TOKEN_ALLOW_ADMIN`, and the CLI-process one is exercised for
+    /// real by actually running the bootstrap mint.
+    fn both_optins_on() -> ApiTokenIssuanceConfig {
+        ApiTokenIssuanceConfig {
+            allow_admin_tokens: true,
+            allow_unbounded_svc_tokens: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_session_token_cannot_self_mint_a_thirty_day_admin_pat() {
+        let (uc, tokens, users, events) = make_use_case(both_optins_on());
+        users.insert(bootstrap_admin_user());
+
+        // 1. The CLI-side opt-in path, run for real: a <= 1 h full-cap
+        //    admin Pat for the reserved identity. This is the credential an
+        //    operator holds after `admin bootstrap-session`.
+        let issued = uc
+            .issue_for_bootstrap_admin_system(
+                Uuid::from_u128(0xACE),
+                "bootstrap-session".into(),
+                full_admin_cap(),
+                MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS,
+            )
+            .await
+            .expect("the DSN-gated CLI mint is the one path that must still work");
+        let ttl = issued.expires_at.expect("break-glass token must expire") - Utc::now();
+        assert!(
+            ttl <= Duration::seconds(MAX_BOOTSTRAP_ADMIN_LIFETIME_SECS as i64),
+            "break-glass token TTL must be <= 1h, got {ttl}"
+        );
+
+        // 2. That credential presented to the self-mint route, asking for
+        //    the maximum standing admin window the server-side opt-in
+        //    permits, under a name bootstrap rotation never matched.
+        let err = uc
+            .issue_self_token(
+                &bootstrap_session_principal(),
+                IssueTokenRequest {
+                    name: "ci-automation".into(),
+                    description: None,
+                    declared_permissions: full_admin_cap(),
+                    repository_ids: None,
+                    expires_in_days: Some(MAX_ADMIN_EXPIRY_DAYS),
+                    expires_in_seconds: None,
+                    federation_source: None,
+                },
+            )
+            .await
+            .expect_err("a bootstrap-derived principal must not reach self-mint");
+        assert!(
+            matches!(err, ApiTokenError::BootstrapAdminMintForbidden),
+            "expected a fail-closed refusal, got {err:?}"
+        );
+
+        // Rejection, not a shortened expiry: no second row exists at all.
+        let inserts = tokens.inserts();
+        assert_eq!(
+            inserts.len(),
+            1,
+            "only the CLI mint may persist a row for this identity"
+        );
+        assert_eq!(inserts[0].name, "bootstrap-session");
+        assert_eq!(count_issuances(&events), 1);
+
+        // The refusal is audited.
+        let denial = assert_denial_event(&events);
+        assert_eq!(
+            denial.denial_reason,
+            DenialReason::BootstrapAdminMintForbidden
+        );
+        assert_eq!(denial.target_user_id, Uuid::from_u128(0xACE));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_session_token_cannot_self_mint_a_non_admin_pat_either() {
+        // The close is anchored on the identity, not on the admin
+        // permission. A read-only 365-day PAT owned by the break-glass
+        // identity is still a standing credential derived from a one-hour
+        // one, so narrowing the cap is not a way around the refusal.
+        let (uc, tokens, users, _events) = make_use_case(both_optins_on());
+        users.insert(bootstrap_admin_user());
+
+        let err = uc
+            .issue_self_token(
+                &bootstrap_session_principal(),
+                IssueTokenRequest {
+                    name: "read-only".into(),
+                    description: None,
+                    declared_permissions: vec![Permission::Read],
+                    repository_ids: None,
+                    expires_in_days: Some(MAX_EXPIRY_DAYS),
+                    expires_in_seconds: None,
+                    federation_source: None,
+                },
+            )
+            .await
+            .expect_err("a non-admin cap is not a way around the refusal");
+        assert!(matches!(err, ApiTokenError::BootstrapAdminMintForbidden));
+        assert!(tokens.inserts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_session_token_cannot_mint_a_cli_session_either() {
+        // The refusal lives in the gates shared by the opaque-token and the
+        // CliSession JWT credential forms, so it is not escapable by
+        // changing credential form. (The `/exchange` handler already
+        // refuses a PAT-shaped `subject_token`, which is why this is
+        // defence in depth rather than the live hole — but a gate anchored
+        // on the token owner holds whichever route arrives.)
+        let (uc, tokens, users, _events) = make_use_case(both_optins_on());
+        users.insert(bootstrap_admin_user());
+
+        let err = uc
+            .issue_cli_session(
+                &bootstrap_session_principal(),
+                IssueCliSessionRequest {
+                    client_name: Some("hort-cli".into()),
+                    source_ip: "203.0.113.7".into(),
+                    requested_scope: full_admin_cap(),
+                    requested_lifetime_secs: Some(MAX_ADMIN_CLI_SESSION_LIFETIME_SECS),
+                },
+            )
+            .await
+            .expect_err("a bootstrap-derived principal must not mint a CliSession");
+        assert!(matches!(err, ApiTokenError::BootstrapAdminMintForbidden));
+        assert!(tokens.inserts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn self_mint_for_a_non_reserved_username_is_unaffected() {
+        // Counter-assertion: the gate matches the reserved username and
+        // nothing else, so the ordinary admin self-mint still works with
+        // both flags on. Without this, a gate that refused every caller
+        // would pass every test above.
+        let (principal, rbac) = admin_principal();
+        let (uc, tokens, users, events) = make_use_case_with_rbac(both_optins_on(), rbac);
+        users.insert(User {
+            id: principal.user_id,
+            is_admin: true,
+            ..user(false)
+        });
+
+        assert_ne!(principal.username, BOOTSTRAP_ADMIN_USERNAME);
+        let issued = uc
+            .issue_self_token(
+                &principal,
+                IssueTokenRequest {
+                    name: "ci-automation".into(),
+                    description: None,
+                    declared_permissions: vec![Permission::Read, Permission::Admin],
+                    repository_ids: None,
+                    expires_in_days: Some(MAX_ADMIN_EXPIRY_DAYS),
+                    expires_in_seconds: None,
+                    federation_source: None,
+                },
+            )
+            .await
+            .expect("an ordinary admin self-mint is untouched by the bootstrap gate");
+        assert_eq!(issued.kind, TokenKind::Pat);
+        assert_eq!(tokens.inserts().len(), 1);
+        assert_eq!(count_denials(&events), 0);
     }
 
     // ---------- revoke ----------

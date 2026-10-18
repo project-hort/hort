@@ -163,6 +163,19 @@ impl FailedBlockEntryDto {
             AppError::Domain(DomainError::UpstreamMetadataInvalid) => {
                 ("upstream_metadata_invalid", err.to_string())
             }
+            // Raised only where a CVE names several exclusions on one
+            // policy and the request has to say which — the
+            // exclusion-removal surface, which renders the candidates as
+            // structured members because the caller needs the
+            // `exclusion_id` out of them. This per-row shape carries a
+            // kind and a message and nothing else, so it could not render
+            // them; unreachable on this path (curation-block operates on
+            // already-ingested artifacts), and the arm exists for
+            // exhaustive matching. `err.to_string()` is the CVE the
+            // caller supplied plus a count.
+            AppError::Domain(DomainError::AmbiguousExclusion { .. }) => {
+                ("ambiguous_exclusion", err.to_string())
+            }
             AppError::Repository(_) => ("repository", "internal error".into()),
             AppError::Storage(_) => ("storage", "internal error".into()),
             AppError::EventStore(_) => ("event_store", "internal error".into()),

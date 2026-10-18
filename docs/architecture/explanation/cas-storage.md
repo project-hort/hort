@@ -87,7 +87,7 @@ decide it already exists.
 | Moment | What is checked |
 |---|---|
 | `put` | Hash is computed *from the actual bytes* received. The returned `ContentHash` is always correct for the stored object. |
-| `get` | Stream is wrapped in a `VerifyingReader` (in `hort-adapters-storage::integrity`) that hashes bytes incrementally as they flow through and compares at EOF. On mismatch the final `poll_read` yields `io::ErrorKind::InvalidData` and the adapter bumps `hort_storage_integrity_failures_total{backend}`. No buffering; zero time-to-first-byte impact. |
+| `get` | Stream is wrapped in a `VerifyingReader` (in `hort-adapters-storage::integrity`) that hashes bytes incrementally as they flow through and compares at EOF. On mismatch the final `poll_read` yields an `io::ErrorKind::InvalidData` error carrying a `hort_domain::ports::storage::CasIntegrityFailure` payload (`expected` + `computed`), and the adapter bumps `hort_storage_integrity_failures_total{backend}`. No buffering; zero time-to-first-byte impact. The wrap is not per-adapter taste: the structural guard `cas_reads_are_verified` (`crates/hort-app/tests/`) asserts that every `impl StoragePort for` under `crates/hort-adapters-*/src` constructs it inside its own `get`, and [ADR 0003](../../adr/0003-streaming-enforced-cas.md)'s 2026-10-08 amendment states what a consumer may rely on. |
 | Background integrity sweep | `hort-server scrub` CLI subcommand. Runs as a daily CronJob (`templates/cronjob-scrub.yaml`). Walks every blob via `StoragePort::list_all`, re-hashes via streaming SHA-256, compares against the CAS key. Catches at-rest corruption of blobs that nobody happens to read. Read-time verify and the sweep are complementary, not substitutes. See [Background integrity scrub](#background-integrity-scrub) below. |
 
 Why fail-late at EOF is acceptable: a mismatch surfaces as a truncated
@@ -124,19 +124,36 @@ backup-restore mistakes, deliberate tampering). The
 CAS blob, re-streams the bytes through a SHA-256 hasher, and compares
 the result to the CAS key.
 
+**How the scrub learns the observed digest.** The reader it gets back
+verifies too, and fails the read at EOF rather than completing it — so for a
+corrupted blob the scrub never reaches a clean end-of-stream of its own. The
+verdict therefore travels as data: `CasIntegrityFailure::from_io_error` recovers
+`expected` + `computed` from the error, and that `computed` is the
+`observed_hash` on the `CasIntegrityMismatch` record. A read failure carrying no
+such payload stays a `read_error`. The discriminator is deliberately the typed
+payload and not `io::ErrorKind::InvalidData`: a backend may raise that kind for
+its own reasons, and the kind alone cannot produce the digest the audit record
+and the tombstone transition both need.
+
+The scrub also hashes the bytes itself, which is not redundant with the above.
+A verifier cannot detect its own absence — a `StoragePort` whose `get` does not
+verify would otherwise report a clean sweep over corrupt storage — so the
+independent digest is what makes the scrub correct about the CAS regardless of
+the adapter beneath it.
+
 Behaviour on mismatch is operator-chosen via
 `HORT_CAS_SCRUB_ACTION_ON_MISMATCH`:
 
 | Action | What happens on mismatch | Operator response |
 |---|---|---|
 | `alert` (default) | Emit `CasIntegrityMismatch` event + `tracing::warn!` + bump `hort_cas_scrub_checks_total{result="hash_mismatch"}`. The blob remains readable. | Investigate; decide whether to restore from backup, hard-delete, or keep the data. The artifact's `quarantine_status` is unchanged. |
-| `tombstone` | Additionally emit `ArtifactCorrupted` **and its `ArtifactRejected{Corruption}` companion**, and transition the artifact through the existing quarantine state machine to `quarantine_status = 'rejected'` via `ArtifactLifecyclePort::commit_transition` (one append, so the status is never `rejected` without the event explaining it — ADR 0039's 2026-09-12 amendment, D6). | Subsequent download attempts are blocked at the application layer (the same existing quarantine error the rejected state already produces). The artifact surfaces in the curation queue with reason `corruption`. To recover from a false positive — e.g. operator restores the blob from a known-good backup — issue `POST /quarantine/:artifact_id/release`; a re-scan will not clear it, since a clean verdict over the wrong bytes says nothing about the right ones. |
+| `tombstone` | Additionally emit `ArtifactCorrupted` **and its `ArtifactRejected{Corruption}` companion**, and transition the artifact through the existing quarantine state machine to `quarantine_status = 'rejected'` via `ArtifactLifecyclePort::commit_transition` (one append, so the status is never `rejected` without the event explaining it — ADR 0039's 2026-09-12 amendment, D6). | Subsequent download attempts are blocked at the application layer (the same existing quarantine error the rejected state already produces). The artifact surfaces in the curation queue with reason `corruption`. There is no manual release out of it: the curator's waive reaches a `rejected` artifact on the axes the curator owns (scan, curation, provenance) but **never** the corruption axis, so it answers `409` here (ADR 0025), and ADR 0007 records the corruption axis as the one a manual release never reaches even where the state would allow one — a re-scan will not clear it either, since a clean verdict over the wrong bytes says nothing about the right ones. Recovering a false positive means re-ingesting the restored blob. |
 
 **Why `tombstone` reuses `Rejected` rather than introducing a new
 state.** Corruption is structurally identical to a disqualifying scan
 finding: permanently bad content, time does not reverse it. The
-existing `Rejected` semantics — sticky, requires admin override —
-match the corruption response exactly. A new `Tombstoned` state
+existing `Rejected` semantics — sticky, and not reachable by any
+manual release — match the corruption response exactly. A new `Tombstoned` state
 would have the same downstream behaviour with twice the audit-tooling
 surface.
 

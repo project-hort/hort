@@ -63,6 +63,11 @@ pub(crate) mod tail;
 // suites in `manifests` and `blobs`.
 #[cfg(test)]
 pub(crate) mod test_authz;
+// Shared test-only `tracing` capture harness for the handler suites whose
+// invariant is a log line (`manifests_write`'s genuine-Conflict `error!`,
+// `blobs`'s ADR 0039 D6 illegal-state `error!`).
+#[cfg(test)]
+pub(crate) mod test_tracing;
 pub mod upload_session;
 pub mod uploads;
 // Distribution-Spec `/v2/auth` token-exchange handler + the
@@ -367,6 +372,38 @@ pub fn oci_routes_with_config(
     config: &OciHttpConfig,
     ctx: Arc<AppContext>,
 ) -> Router<Arc<AppContext>> {
+    oci_routes_with_publish_limit(
+        config,
+        ctx,
+        hort_http_core::limits::DEFAULT_PUBLISH_BODY_LIMIT,
+    )
+}
+
+/// Build the OCI route tree with an explicit configuration and an
+/// explicit publish body limit (in bytes).
+///
+/// `hort-server::http::build_router_with_oci_config` calls this with
+/// the effective `HORT_PUBLISH_BODY_MAX_SIZE`, so a zero limit refuses
+/// every OCI push — the same refuse-all-publishes kill switch the four
+/// hosted-format routers honour, applied through the same guard
+/// (`hort_http_core::limits::refuse_publishes_when_disabled`). The
+/// two-argument [`oci_routes_with_config`] wrapper passes the shared
+/// default, which keeps every existing caller and test on today's
+/// behaviour.
+///
+/// The limit is **only** a kill-switch input here: unlike npm / PyPI /
+/// Maven, a non-zero value does not become a `DefaultBodyLimit` on the
+/// push routes. The OCI upload path bounds each `PATCH` chunk through
+/// its own session accounting rather than capping a whole-blob request
+/// body, which is what lets a multi-GB base layer through at the
+/// default — capping the request body here would break that, and
+/// `OciError::SizeInvalid` already owns the size answer for this
+/// surface.
+pub fn oci_routes_with_publish_limit(
+    config: &OciHttpConfig,
+    ctx: Arc<AppContext>,
+    publish_limit: usize,
+) -> Router<Arc<AppContext>> {
     // Split the OCI route tree into two sub-routers so the upload-write
     // surface can opt out of the global 5-minute request deadline.
     //
@@ -468,8 +505,29 @@ pub fn oci_routes_with_config(
     // layer stack — the upload routes carry the 60-minute ceiling,
     // the read/admin routes carry the global deadline. After merge,
     // attach the OCI bearer-auth `route_layer` covering BOTH halves.
-    upload_router
-        .merge(read_and_admin_router)
+    // The publish kill switch, applied to the merged tree *inside* the
+    // bearer-auth layer, because that layer has to stay outermost on
+    // this subtree: it owns the anonymous-write challenge and the
+    // `/v2/auth` skip, and moving the hold outside it would answer a
+    // push before the client ever learns which scheme to authenticate
+    // with. The consequence is that on `/v2/*` an unauthenticated push
+    // gets its `401` + `/v2/auth` challenge and only an authenticated
+    // one is told the hold — the reverse of the hosted formats, where
+    // auth is resolved by a handler extractor and so the hold answers
+    // first. That asymmetry follows from which layer owns auth on each
+    // subtree, not from a decision taken here.
+    //
+    // The guard discriminates by method, so it covers the blob upload
+    // POST / PATCH / PUT and the manifest PUT wherever they are
+    // registered — it does not depend on the upload-versus-read router
+    // split staying where it is today. GET / HEAD pulls and the
+    // upload-session cancel DELETE are untouched.
+    let merged = hort_http_core::limits::refuse_publishes_when_disabled(
+        upload_router.merge(read_and_admin_router),
+        publish_limit,
+        error::publishing_disabled_response,
+    );
+    merged
         // OCI bearer auth (ADR 0012). Owns the auth story for the
         // `/v2/*` subtree: validates the JWT minted by `/v2/auth`,
         // inserts the reconstituted `CallerPrincipal` into request

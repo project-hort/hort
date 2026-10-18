@@ -22,12 +22,29 @@
 //!    global authz stream ([`StreamId::authorization`]).
 //!
 //! 5. **Compensating delete** — if the event-store append fails, attempts a
-//!    best-effort `JobsRepository::delete_job` to undo the INSERT. This is
-//!    NOT a true two-phase commit: if the compensating delete also fails, the
-//!    system is in a temporarily inconsistent state. The `jobs` row exists
-//!    but no audit event was appended; the row will idle as `pending` and an
-//!    operator can purge it manually. A doc comment on this limitation is
-//!    placed on the compensating path below.
+//!    best-effort `JobsRepository::delete_job` to undo the INSERT. The
+//!    delete is scoped to a still-`pending` row, because that is the only
+//!    row it is entitled to remove: a claimed row is executing, and
+//!    deleting it would also free the durable single-flight idempotency
+//!    key (ADR 0028) that stops a destructive kind running twice.
+//!
+//!    This is NOT a true two-phase commit, and it leaves the `jobs` row
+//!    without an audit event in **two** distinguishable ways — the row is
+//!    in a different state in each, and so is the recovery:
+//!
+//!    - *the delete failed* (`Err`): the row is still `pending` and
+//!      unclaimed. It idles until a worker claims it, and an operator who
+//!      purges it has undone the enqueue.
+//!    - *the delete matched no row*
+//!      (`CompensatingDelete::NoLongerPending`): a worker claimed the row
+//!      inside the append window, so the row is `running` (or already
+//!      terminal) and the task is executing un-audited. It does **not**
+//!      idle, and purging it does not undo what it did — the execution has
+//!      to be reconciled from the task's own side effects.
+//!
+//!    Both land on the operator-visible `error!` path, with messages that
+//!    say which one happened. A doc comment on this limitation is placed on
+//!    the compensating path below.
 //!
 //! # Observability
 //!
@@ -59,7 +76,7 @@ use hort_domain::events::{
 };
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
-    EnqueueOutcome, JobRow, JobsRepository, ListJobsFilter, ListJobsPage,
+    CompensatingDelete, EnqueueOutcome, JobRow, JobsRepository, ListJobsFilter, ListJobsPage,
 };
 use hort_domain::types::IdempotencyKey;
 
@@ -288,12 +305,20 @@ impl TaskUseCase {
     /// The INSERT and the event-store append are not inside a shared
     /// Postgres transaction (the `EventStore` port does not expose one).
     /// If the append fails, we attempt `delete_job` to undo the INSERT.
-    /// If that also fails, the `jobs` row exists without an audit event.
-    /// An operator can identify and remove orphaned rows by looking for
-    /// `status='pending'` rows with no corresponding `TaskInvoked` event
-    /// on the kind-routed audit stream (the `authorization()` stream for
+    /// If that delete does not roll the row back, the `jobs` row exists
+    /// without an audit event.
+    ///
+    /// An orphaned row is one with no corresponding `TaskInvoked` event on
+    /// the kind-routed audit stream (the `authorization()` stream for
     /// ordinary kinds, the `eventstore_retention()` audit-meta stream for
-    /// destructive kinds) for the same `job_id`.
+    /// destructive kinds) for the same `job_id`. Searching for it by
+    /// `status='pending'` alone finds only the case where the delete
+    /// errored: when it returned
+    /// [`CompensatingDelete::NoLongerPending`] the row is `running` or
+    /// already terminal, because a worker claimed it before the delete
+    /// reached it. Removing that row is not a recovery — the task is
+    /// executing, or has executed, and only its own side effects say what
+    /// it did.
     #[tracing::instrument(skip(self))]
     pub async fn enqueue(
         &self,
@@ -431,9 +456,16 @@ impl TaskUseCase {
             //    row again, and the operator-visible failure is the
             //    missing TaskInvoked on the duplicate event itself.
             //
-            // Limitation: if the compensating delete also fails on the
-            // fresh-enqueue path, the `jobs` row exists without an audit
-            // event. See module-level doc for recovery guidance.
+            // Limitation, in two shapes — the `jobs` row exists without an
+            // audit event either way, but the row is in a different state
+            // and the recovery differs (see the module-level doc):
+            //
+            //  - the compensating delete errors: the row is still
+            //    `pending` and unclaimed, so purging it undoes the enqueue;
+            //  - the compensating delete matches nothing
+            //    (`NoLongerPending`): a worker claimed the row inside the
+            //    append window and the task is executing un-audited.
+            //    Purging the row does not undo what it did.
             tracing::warn!(
                 job_id = %audit_job_id,
                 kind,
@@ -442,14 +474,31 @@ impl TaskUseCase {
                 "TaskInvoked append failed",
             );
             if is_fresh_enqueue {
-                if let Err(del_err) = self.jobs.delete_job(audit_job_id).await {
-                    tracing::error!(
-                        job_id = %audit_job_id,
-                        kind,
-                        error = %del_err,
-                        "compensating delete of jobs row failed — row may be orphaned; \
-                         operator should inspect jobs WHERE id = job_id",
-                    );
+                match self.jobs.delete_job(audit_job_id).await {
+                    // The insert is undone; nothing ran and nothing is
+                    // owed an audit event.
+                    Ok(CompensatingDelete::RolledBack) => {}
+                    Ok(CompensatingDelete::NoLongerPending) => {
+                        tracing::error!(
+                            job_id = %audit_job_id,
+                            kind,
+                            "compensating delete of jobs row matched no pending row — the \
+                             row was already claimed and the task is executing with no \
+                             TaskInvoked audit event; operator should inspect jobs WHERE \
+                             id = job_id, which is no longer pending, and reconcile the \
+                             execution from its own side effects",
+                        );
+                    }
+                    Err(del_err) => {
+                        tracing::error!(
+                            job_id = %audit_job_id,
+                            kind,
+                            error = %del_err,
+                            "compensating delete of jobs row failed — row may be orphaned \
+                             and still pending; operator should inspect jobs WHERE \
+                             id = job_id",
+                        );
+                    }
                 }
             }
             return Err(append_err.into());
@@ -576,7 +625,10 @@ mod tests {
         ) -> BoxFuture<'a, DomainResult<EnqueueOutcome>> {
             panic!("PanicJobsRepository::enqueue_task must not be called");
         }
-        fn delete_job<'a>(&'a self, _job_id: Uuid) -> BoxFuture<'a, DomainResult<()>> {
+        fn delete_job<'a>(
+            &'a self,
+            _job_id: Uuid,
+        ) -> BoxFuture<'a, DomainResult<CompensatingDelete>> {
             panic!("PanicJobsRepository::delete_job must not be called");
         }
     }
@@ -605,14 +657,19 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
             panic!("PanicEventStore::read_category must not be called");
         }
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
             panic!("PanicEventStore::delete_stream must not be called");
         }
         fn archive_stream(
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
             panic!("PanicEventStore::archive_stream must not be called");
         }
     }
@@ -647,6 +704,11 @@ mod tests {
         /// `Enqueued`. Used by the unit tests pinning the
         /// pass-through semantics on the Duplicate branch.
         duplicate_existing_id: Option<Uuid>,
+        /// What the compensating `delete_job` reports. The use case
+        /// branches three ways on it, so the double has to be able to
+        /// produce all three; `Ok(RolledBack)` is the default — the
+        /// delete removed the still-unclaimed row it inserted.
+        delete_outcome: DomainResult<CompensatingDelete>,
     }
 
     impl RecordingJobsRepository {
@@ -657,6 +719,7 @@ mod tests {
                 return_id,
                 enqueue_error: None,
                 duplicate_existing_id: None,
+                delete_outcome: Ok(CompensatingDelete::RolledBack),
             }
         }
 
@@ -670,7 +733,23 @@ mod tests {
                 return_id: Uuid::nil(),
                 enqueue_error: None,
                 duplicate_existing_id: Some(existing),
+                delete_outcome: Ok(CompensatingDelete::RolledBack),
             }
+        }
+
+        /// Make the compensating `delete_job` report that the row was no
+        /// longer `pending` — the statement matched nothing because a
+        /// worker claimed the row inside the append window.
+        fn with_delete_no_longer_pending(mut self) -> Self {
+            self.delete_outcome = Ok(CompensatingDelete::NoLongerPending);
+            self
+        }
+
+        /// Make the compensating `delete_job` fail outright — an
+        /// infrastructure error, distinct from "matched nothing".
+        fn with_delete_error(mut self, err: DomainError) -> Self {
+            self.delete_outcome = Err(err);
+            self
         }
 
         fn enqueue_calls(&self) -> Vec<EnqueueCall> {
@@ -753,12 +832,16 @@ mod tests {
                 Box::pin(async move { Ok(EnqueueOutcome::Enqueued { job_id: id }) })
             }
         }
-        fn delete_job<'a>(&'a self, job_id: Uuid) -> BoxFuture<'a, DomainResult<()>> {
+        fn delete_job<'a>(
+            &'a self,
+            job_id: Uuid,
+        ) -> BoxFuture<'a, DomainResult<CompensatingDelete>> {
             self.delete_calls
                 .lock()
                 .unwrap()
                 .push(DeleteCall { job_id });
-            Box::pin(async { Ok(()) })
+            let outcome = self.delete_outcome.clone();
+            Box::pin(async move { outcome })
         }
     }
 
@@ -826,15 +909,20 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
+            Box::pin(async { Ok(hort_domain::ports::event_store::SealOutcome::Sealed) })
         }
         fn archive_stream(
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
+            Box::pin(async { Ok(hort_domain::ports::event_store::SealOutcome::Sealed) })
         }
     }
 
@@ -1743,5 +1831,262 @@ mod tests {
         let delete_calls = jobs.delete_calls();
         assert_eq!(delete_calls.len(), 1);
         assert_eq!(delete_calls[0].job_id, job_id);
+    }
+
+    // -- Compensating-delete outcomes (three branches) ---------------------
+    //
+    // The compensating delete has three outcomes and each is a separate
+    // branch of the failure path, because each leaves the operator a
+    // different job: nothing to do (`RolledBack`), a row that is still
+    // pending and purgeable (`Err`), and a task executing with no audit
+    // event (`NoLongerPending`). The two non-success branches are only
+    // distinguishable to an operator through the log line, so the log is
+    // what these tests assert.
+    //
+    // The capture machinery mirrors `use_cases/repository_access.rs`: a
+    // global passthrough subscriber poisons the callsite-interest cache
+    // with `sometimes()` so a sibling test cannot cache `Never` for our
+    // callsite, one mutex serialises install + drive + observe, and each
+    // test layers a thread-local subscriber over the global one.
+
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::Registry;
+
+    #[derive(Clone, Default)]
+    struct CapturingLayer {
+        records: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CapturingLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn register_callsite(
+            &self,
+            _meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(
+            &self,
+            _meta: &tracing::Metadata<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = MessageVisitor::default();
+            event.record(&mut visitor);
+            self.records
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.combined));
+        }
+    }
+
+    #[derive(Default)]
+    struct MessageVisitor {
+        combined: String,
+    }
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.combined
+                .push_str(&format!("{}={:?} ", field.name(), value));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.combined
+                .push_str(&format!("{}={} ", field.name(), value));
+        }
+    }
+
+    /// Serialises the subscriber install + drive + observe sequence; the
+    /// callsite-interest cache is process-global, so two tests doing this
+    /// at once race.
+    static TRACING_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn install_global_passthrough_subscriber() {
+        use std::sync::OnceLock;
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let global = Registry::default().with(CapturingLayer::default());
+            let _ = tracing::subscriber::set_global_default(global);
+        });
+    }
+
+    /// Drive one `enqueue` whose `TaskInvoked` append fails under a
+    /// thread-local capturing subscriber, and return the enqueue's result
+    /// alongside every record it emitted.
+    ///
+    /// Synchronous (`#[test]` + own current-thread runtime) because the
+    /// guard is a `std::sync::Mutex` and must not be held across an
+    /// `await`.
+    fn capture_failed_append_enqueue(
+        jobs: Arc<RecordingJobsRepository>,
+    ) -> (AppResult<EnqueueOutcome>, Vec<(tracing::Level, String)>) {
+        install_global_passthrough_subscriber();
+        let _serial = TRACING_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let layer = CapturingLayer::default();
+        let captured = layer.records.clone();
+        let subscriber = Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let events = Arc::new(MockEventStore::new());
+        events.fail_all_appends(DomainError::Invariant("event store append down".into()));
+        let use_case = TaskUseCase::new(
+            jobs as _,
+            crate::event_store_publisher::wrap_for_test(events),
+            rbac_with_task_invoke(),
+        );
+        let actor = caller_with_task_admin_role();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(async {
+            use_case
+                .enqueue(&actor, "noop", &serde_json::json!({}), None)
+                .await
+        });
+
+        let records = captured.lock().unwrap().clone();
+        (result, records)
+    }
+
+    fn error_records(records: &[(tracing::Level, String)]) -> Vec<String> {
+        records
+            .iter()
+            .filter(|(lvl, _)| *lvl == tracing::Level::ERROR)
+            .map(|(_, msg)| msg.clone())
+            .collect()
+    }
+
+    /// Branch 1 — the delete rolled the row back. Nothing ran and nothing
+    /// is owed an audit event, so the compensation emits NO error-level
+    /// record: the only operator-visible line is the append failure
+    /// itself. The `warn!` assertion is the counter-assertion that the
+    /// capture is live — without it "no error record" would also pass on a
+    /// harness that captured nothing at all.
+    #[test]
+    fn enqueue_append_failure_rolled_back_emits_no_orphan_error() {
+        let job_id = Uuid::new_v4();
+        let jobs = Arc::new(RecordingJobsRepository::new(job_id));
+        let (result, records) = capture_failed_append_enqueue(Arc::clone(&jobs));
+
+        assert!(
+            result.is_err(),
+            "the append failure must surface; got {result:?}"
+        );
+        let delete_calls = jobs.delete_calls();
+        assert_eq!(delete_calls.len(), 1);
+        assert_eq!(delete_calls[0].job_id, job_id);
+
+        assert!(
+            records.iter().any(|(lvl, msg)| *lvl == tracing::Level::WARN
+                && msg.contains("TaskInvoked append failed")),
+            "the append-failure warn must be captured, else the no-error assertion below \
+             is vacuous; records: {records:?}"
+        );
+        assert!(
+            error_records(&records).is_empty(),
+            "a rolled-back compensation leaves nothing for an operator to do and must not \
+             log an error; records: {records:?}"
+        );
+    }
+
+    /// Branch 2 — the delete matched no row. The row was claimed inside
+    /// the append window, so a task is executing with no `TaskInvoked`.
+    /// The log must say that, and must NOT read as the infrastructure
+    /// failure of branch 3: an operator who reads "compensating delete
+    /// failed" retries or purges a `pending` row, which is the wrong
+    /// action on a row that is already running.
+    #[test]
+    fn enqueue_append_failure_no_longer_pending_logs_the_claimed_row() {
+        let job_id = Uuid::new_v4();
+        let jobs = Arc::new(RecordingJobsRepository::new(job_id).with_delete_no_longer_pending());
+        let (result, records) = capture_failed_append_enqueue(Arc::clone(&jobs));
+
+        assert!(
+            result.is_err(),
+            "the append failure must surface; got {result:?}"
+        );
+        assert_eq!(jobs.delete_calls().len(), 1);
+
+        let errors = error_records(&records);
+        assert_eq!(
+            errors.len(),
+            1,
+            "exactly one operator-visible error for the un-audited execution; records: \
+             {records:?}"
+        );
+        let msg = &errors[0];
+        assert!(
+            msg.contains("matched no pending row"),
+            "the log must name what the statement saw; got {msg}"
+        );
+        assert!(
+            msg.contains("TaskInvoked"),
+            "the log must say the execution has no audit event; got {msg}"
+        );
+        assert!(
+            msg.contains(&job_id.to_string()),
+            "the log must carry the job id an operator has to inspect; got {msg}"
+        );
+        assert!(
+            !msg.contains("delete of jobs row failed"),
+            "this branch must not read as branch 3's infrastructure failure — the row is \
+             running, not pending, and purging it undoes nothing; got {msg}"
+        );
+    }
+
+    /// Branch 3 — the delete itself errored. The row is still `pending`
+    /// and unclaimed, and the log keeps the original wording plus the
+    /// underlying error, which is what distinguishes it from branch 2.
+    #[test]
+    fn enqueue_append_failure_delete_error_logs_the_infrastructure_failure() {
+        let job_id = Uuid::new_v4();
+        let jobs = Arc::new(
+            RecordingJobsRepository::new(job_id)
+                .with_delete_error(DomainError::Invariant("jobs delete down".into())),
+        );
+        let (result, records) = capture_failed_append_enqueue(Arc::clone(&jobs));
+
+        assert!(
+            result.is_err(),
+            "the append failure must surface; got {result:?}"
+        );
+        assert_eq!(jobs.delete_calls().len(), 1);
+
+        let errors = error_records(&records);
+        assert_eq!(
+            errors.len(),
+            1,
+            "exactly one operator-visible error for the failed compensation; records: \
+             {records:?}"
+        );
+        let msg = &errors[0];
+        assert!(
+            msg.contains("delete of jobs row failed"),
+            "branch 3 keeps the failed-compensation wording; got {msg}"
+        );
+        assert!(
+            msg.contains("jobs delete down"),
+            "the underlying error must reach the operator; got {msg}"
+        );
+        assert!(
+            !msg.contains("matched no pending row"),
+            "branch 3 must not claim the row was claimed — nothing is executing; got {msg}"
+        );
     }
 }

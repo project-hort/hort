@@ -15,11 +15,20 @@
 //!    policy yields `resolved_rescan_interval_hours = None` (→ default
 //!    24 h) rather than being dropped — age-based retention applies
 //!    even without a scan policy.
-//! 2. The protected-status filter admits SQL `NULL`, `none`, the legacy
-//!    non-terminal scan spellings (`unscanned`, `clean`, `flagged`), and
-//!    `released`; it excludes exactly `quarantined`, `rejected`, and
-//!    `scan_indeterminate`. This is broader than the rescan adapter's
-//!    `= 'released'`. Soft-deleted artifacts are outside the enumeration.
+//! 2. The protected-status filter admits SQL `NULL` (the stored
+//!    spelling of `QuarantineStatus::None`) and `released`; it excludes
+//!    exactly `quarantined`, `rejected`, and `scan_indeterminate`. This
+//!    is broader than the rescan adapter's `= 'released'`.
+//!    Soft-deleted artifacts are outside the enumeration.
+//!
+//!    The filter is a `<> ALL` over the protected *names*, so a value
+//!    outside the column's stored vocabulary passes it — and then fails
+//!    the row mapper, which refuses to classify it
+//!    (`quarantine_status_sql`). For a destructive sweep that is the
+//!    right direction: a blob whose hold state cannot be read is not
+//!    offered for purge. Widening the filter into a positive allow-list
+//!    would instead *drop* such a row silently, which is the shape this
+//!    adapter must not take.
 //!
 //! The query additionally `JOIN`s `repositories r ON r.id =
 //! a.repository_id` to select `r.format::text` (aliased `repo_format`) — the
@@ -69,8 +78,7 @@
 //! `(quarantine_status IS NULL OR quarantine_status <> ALL($4::text[]))`
 //! bound from `gc_protected_quarantine_status_names` (`lib.rs`), whose
 //! `IS NULL` arm is what keeps `QuarantineStatus::None` (persisted as
-//! SQL `NULL`) and the legacy `unscanned` / `clean` / `flagged`
-//! spellings in the rank. One predicate, bound once, read by both
+//! SQL `NULL`) in the rank. One predicate, bound once, read by both
 //! CTEs: a second spelling of the protected set here is how the page
 //! and the rank drift apart.
 //!
@@ -603,22 +611,65 @@ mod tests {
         }
     }
 
+    /// A `NULL` status — the stored spelling of
+    /// `QuarantineStatus::None` — is an eligible candidate: nothing is
+    /// holding the artifact back.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    async fn list_candidates_includes_null_and_legacy_non_terminal_statuses() {
+    async fn list_candidates_includes_a_null_status() {
         let Some(pool) = maybe_pool().await else {
             return;
         };
         let repo_id = seed_repo(&pool).await;
         let null_status = seed_artifact(&pool, repo_id, None, false).await;
-        let unscanned = seed_artifact(&pool, repo_id, Some("unscanned"), false).await;
 
         let ids = candidate_ids(pool).await;
 
         assert!(ids.contains(&null_status));
-        assert!(ids.contains(&unscanned));
-        // The other legacy non-terminal spellings, `clean` and `flagged`,
-        // belong to the same eligible class and are covered by the full matrix below.
+    }
+
+    /// The legacy scan-state spellings migration `003`'s CHECK still
+    /// accepts (`unscanned` / `clean` / `flagged`) used to be *admitted*
+    /// here, because the row mapper collapsed them to
+    /// `QuarantineStatus::None`. They now fail the read instead: the
+    /// candidate SQL still selects the row (the filter is a `<> ALL`
+    /// over the protected names, and these are not protected names), and
+    /// `ArtifactRow -> Artifact` refuses to classify it.
+    ///
+    /// That is the fail-closed direction for a destructive sweep — a
+    /// blob whose hold state cannot be read is not offered for purge —
+    /// and it is why `030_artifacts_quarantine_status_legacy_backfill.sql`
+    /// replaces the spellings with the held state (`'quarantined'` plus a
+    /// window anchor): after that migration a database cannot reach this
+    /// state without a write behind the adapter's back.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn list_candidates_fails_closed_on_a_legacy_scan_state_spelling() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        for raw in ["unscanned", "clean", "flagged"] {
+            let repo_id = seed_repo(&pool).await;
+            let id = seed_artifact(&pool, repo_id, Some(raw), false).await;
+
+            let err = PgRetentionCandidateReader::new(pool.clone())
+                .list_candidates(1000, None, Utc::now())
+                .await
+                .expect_err("an unclassifiable hold state must not be offered for purge");
+            assert!(
+                err.to_string().contains(raw),
+                "the error must name the offending value; got {err}"
+            );
+
+            // Clear before the next spelling: `list_candidates` reads
+            // the whole table, so a leftover row would make the next
+            // iteration's assertion name the previous spelling's value.
+            sqlx::query("DELETE FROM artifacts WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("drop the fixture row");
+        }
     }
 
     #[tokio::test]
@@ -652,11 +703,14 @@ mod tests {
         };
         let repo_id = seed_repo(&pool).await;
         let mut seeded = Vec::new();
+        // The classifiable set: `NULL` plus the four spellings
+        // `quarantine_status_to_sql` produces. The legacy scan-state
+        // spellings are not a status either side can map, so "agree"
+        // has no meaning for them — their contract is the fail-closed
+        // read pinned in
+        // `list_candidates_fails_closed_on_a_legacy_scan_state_spelling`.
         for raw in [
             None,
-            Some("unscanned"),
-            Some("clean"),
-            Some("flagged"),
             Some("quarantined"),
             Some("released"),
             Some("rejected"),

@@ -367,12 +367,46 @@ and emits `hort_http_responses_total{result="shed"}`.
 
 Override `publishBodyMaxSize` only when publishing artifacts above
 300 MiB. It is a human-readable size string (e.g. `"512Mi"`, `"1Gi"`);
-an empty string leaves it unset (binary default), and an explicit
-`"0"` is the refuse-all-publishes kill-switch. The env var is the
+an empty string leaves it unset (binary default). The env var is the
 size-string `HORT_PUBLISH_BODY_MAX_SIZE` — a size string (not a
 bare integer) so a multi-GiB value cannot round-trip through Helm's
 float64 coercion into scientific notation (a known boot-crash class;
 ADR 0029).
+
+A **size** applies to the npm, PyPI and Maven publish routes. Cargo
+keeps its own fixed 200 MiB ceiling regardless, so that tuning this
+value for Python wheels does not silently move cargo's ceiling along
+with it. The OCI push path takes no ceiling from this value either: it
+bounds each upload chunk through its own session accounting rather than
+capping a whole-blob request body, which is what lets a multi-GB base
+layer through at the default.
+
+An explicit `"0"` is the **refuse-all-publishes kill-switch**. Zero is
+not a smaller ceiling, so neither carve-out above applies to it: it
+closes **every publish surface** — all four hosted formats *and* the
+OCI push path (the blob-upload `POST`/`PATCH`/`PUT` dance and the
+manifest `PUT`).
+
+What a refused publish sees:
+
+- **`503 Service Unavailable`**, with **no `Retry-After`**. The hold has
+  no deadline to quote — it ends when you change this value and restart
+  — and a fabricated interval is one a well-behaved client would act
+  on. The response body says so.
+- The refusal happens on the **publish methods** (`POST` / `PUT` /
+  `PATCH`), before the request reaches a handler, so nothing is
+  ingested and no scan or quarantine timer is created.
+
+What the switch deliberately leaves alone:
+
+- **Reads.** `GET` / `HEAD` keep serving artifacts on every format. A
+  hort that stopped serving because publishing was switched off would
+  be a worse outage than the one the switch exists to produce.
+- **Deletions.** `DELETE` is not a publish; notably the OCI
+  `DELETE /v2/<name>/blobs/uploads/<uuid>` cancel stays available, so a
+  client can still release an upload session it can no longer finish.
+- **The control plane.** `/api/v1/*` admin writes are unaffected —
+  this knob governs artifact publication, not administration.
 
 ### `upstream`
 
@@ -833,9 +867,12 @@ artifact/token-gen clients, and — when `control.bindAddr` is set —
 Egress: open to Postgres / S3 / Redis / OIDC issuer / upstream registries
 plus the known webhook-forwarder set. A separate Job-scoped policy
 auto-renders to grant the migrate/bootstrap/pre-pull Jobs DNS + egress
-(selected by the `hort-server.io/job` label every Job/CronJob/pre-pull
-pod carries — no per-Job policy edit was needed to add pre-pull to this
-allowance). The pre-pull DaemonSets' own pods need no egress at all:
+(its `podSelector` ANDs **this release's** `app.kubernetes.io/{name,instance}`
+with the `hort-server.io/job` label key every Job/CronJob/pre-pull pod
+carries, so a pod needs both and one belonging to another release — or to
+nothing in this chart — is out whatever it labels itself; no per-Job policy
+edit was needed to add pre-pull to this allowance). The pre-pull
+DaemonSets' own pods need no egress at all:
 image pulls happen via the node's container runtime, outside the pod
 network namespace NetworkPolicy governs.
 See [`control-plane-tiers.md`](./control-plane-tiers.md) for a

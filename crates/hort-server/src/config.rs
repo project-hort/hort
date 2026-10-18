@@ -239,8 +239,15 @@ pub struct Config {
     /// `hort_http_core::limits::DEFAULT_PUBLISH_BODY_LIMIT` (300 MiB).
     /// Malformed values surface as [`ConfigError::InvalidValue`].
     ///
-    /// Only PyPI and npm consume this override; Cargo carries its own
-    /// fixed 200 MiB ceiling per `hort_http_core::limits::CARGO_PUBLISH_BODY_LIMIT`.
+    /// npm, PyPI and Maven consume a non-zero override as their ceiling;
+    /// Cargo keeps its own fixed 200 MiB per
+    /// `hort_http_core::limits::CARGO_PUBLISH_BODY_LIMIT`, and the OCI
+    /// push path takes no ceiling from this value at all. An explicit
+    /// `Some(0)` is the refuse-all-publishes kill switch and closes
+    /// every publish surface — the four hosted formats (see
+    /// `hort_http_core::limits::cargo_publish_body_limit`) and OCI push
+    /// — answering `503` on the publish methods via
+    /// `hort_http_core::limits::refuse_publishes_when_disabled`.
     pub publish_body_limit_bytes: Option<usize>,
     /// Per-session Postgres statement timeout.
     /// Parsed from `PG_STATEMENT_TIMEOUT_MS`.
@@ -862,10 +869,12 @@ pub struct Config {
     /// retention).
     pub audit_retention_floors: AuditRetentionFloors,
     /// The ONE global event-stream
-    /// retention mode for v1 (`HORT_RETENTION_STREAM_MODE` ∈
-    /// `delete` | `archive`; `HORT_RETENTION_ARCHIVE_TARGET` supplies the
-    /// archive target prefix when `archive`). Defaults to
-    /// [`StreamRetentionMode::Delete`].
+    /// retention mode for v1. `HORT_RETENTION_STREAM_MODE=delete` (or
+    /// unset) is the only accepted configuration and resolves to
+    /// [`StreamRetentionMode::Delete`]; `archive` is a startup error
+    /// while the cold-storage writer is deferred post-v1 (see
+    /// [`StreamRetentionMode`]), so `HORT_RETENTION_ARCHIVE_TARGET` is
+    /// never consulted.
     ///
     /// Deferred post-v1: per-stream-granular
     /// config is explicitly out of v1 scope (end-user
@@ -1481,26 +1490,33 @@ impl AuditRetentionFloors {
 /// (the end-user retention DSL / YAML grammar). No pre-v1
 /// action expected.
 ///
-/// `Delete` routes to `EventStore::delete_stream`; `Archive` routes to
-/// `EventStore::archive_stream` with a target string of
-/// `format!("{target_prefix}/{stream_id}")`. The `target` is
-/// adapter-opaque (`crates/hort-domain/src/ports/event_store.rs:191-199`).
-///
-/// Deferred post-v1: designing the cold-
-/// storage *write* (S3 IA / Glacier / EventStoreDB partition) is a
-/// follow-on. No pre-v1 action expected.
+/// [`Self::Delete`] routes to `EventStore::delete_stream` and is the
+/// **only** mode configuration accepts: `HORT_RETENTION_STREAM_MODE=archive`
+/// is refused at startup by [`parse_retention_stream_mode`] because the
+/// cold-storage *write* (S3 IA / Glacier / EventStoreDB partition) is
+/// deferred post-v1, which leaves [`Self::Archive`] removing the stream's
+/// events exactly like `Delete` while the sweep reports them archived.
+/// Refusing the value is the shape ADR 0015 requires of an
+/// accepted-but-inert operator surface (the `prefetchPolicy.maxAgeDays`
+/// apply-time rejection is the exemplar in the gitops path).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamRetentionMode {
     /// `delete_stream` — the stream's rows are removed (after the
-    /// `StreamSealed` tombstone). The v1 default.
+    /// `StreamSealed` tombstone). The v1 default, and the only mode
+    /// config parsing accepts.
     Delete,
-    /// `archive_stream` — the stream is moved to a cold-storage target
-    /// rooted at `target_prefix`. v1 only carries the prefix through
-    /// the chokepoint.
+    /// `archive_stream` with a target string of
+    /// `format!("{target_prefix}/{stream_id}")`. The `target` is
+    /// adapter-opaque (`crates/hort-domain/src/ports/event_store.rs`,
+    /// `EventStore::archive_stream`).
     ///
-    /// Deferred post-v1: the actual cold-
-    /// storage write is a follow-on (S3 IA / Glacier /
-    /// EventStoreDB partition). No pre-v1 action expected.
+    /// **Not constructible from configuration.** The cold-storage write
+    /// is deferred post-v1, so `PgEventStore::archive_stream` seals the
+    /// chain head and deletes the live rows just like the delete path,
+    /// carrying `target_prefix` no further than one `tracing` field. The
+    /// variant stays in the type as the shape the mode lands in once a
+    /// writer exists; until then `parse_retention_stream_mode` errors
+    /// instead of producing it.
     Archive { target_prefix: String },
 }
 
@@ -2403,31 +2419,46 @@ fn parse_audit_retention_floors() -> Result<AuditRetentionFloors, ConfigError> {
 
 /// Parse `HORT_RETENTION_STREAM_MODE`.
 ///
-/// `delete` (default) or `archive`; `archive` requires a non-empty
-/// `HORT_RETENTION_ARCHIVE_TARGET` prefix — a missing/empty target with
-/// `archive` is a startup hard-fail, since silently degrading to delete
-/// would be data loss.
+/// `delete` is the default and the only accepted value. `archive` is
+/// recognised and **refused**: the cold-storage writer is deferred
+/// post-v1, so `PgEventStore::archive_stream` runs the same
+/// `DELETE FROM events WHERE stream_id = $1` as the delete path and
+/// carries the archive target no further than one `tracing` field —
+/// after which `EventStoreRetentionUseCase` increments its `archived`
+/// counter. An operator selecting `archive` would therefore be told the
+/// events were kept while they were removed, which is worse than a
+/// refusal. Rejecting the value at parse time is the shape ADR 0015
+/// requires of an accepted-but-inert operator surface; the
+/// `prefetchPolicy.maxAgeDays` apply-time rejection is the exemplar.
+/// Unset or empty → [`StreamRetentionMode::Delete`], unchanged.
 fn parse_retention_stream_mode() -> Result<StreamRetentionMode, ConfigError> {
     match std::env::var("HORT_RETENTION_STREAM_MODE") {
         Ok(v) if !v.is_empty() => match v.to_ascii_lowercase().as_str() {
             "delete" => Ok(StreamRetentionMode::Delete),
-            "archive" => {
-                let target = std::env::var("HORT_RETENTION_ARCHIVE_TARGET")
-                    .ok()
-                    .filter(|t| !t.is_empty())
-                    .ok_or_else(|| ConfigError::InvalidValue {
-                        var: "HORT_RETENTION_ARCHIVE_TARGET",
-                        reason: "HORT_RETENTION_STREAM_MODE=archive requires a non-empty \
-                                 HORT_RETENTION_ARCHIVE_TARGET prefix"
-                            .to_owned(),
-                    })?;
-                Ok(StreamRetentionMode::Archive {
-                    target_prefix: target,
-                })
-            }
+            // Refused rather than quietly mapped to `Delete`: an
+            // operator who asked for the events to be kept must not have
+            // them removed by a mode that reports success.
+            // `HORT_RETENTION_ARCHIVE_TARGET` is deliberately not read
+            // here — no target can make the mode archive anything, so
+            // demanding one first would only lead the operator through a
+            // fix that changes nothing.
+            "archive" => Err(ConfigError::InvalidValue {
+                var: "HORT_RETENTION_STREAM_MODE",
+                reason: "`archive` is not implemented: the cold-storage writer is deferred \
+                         post-v1, so the archive path removes a stream's events exactly like \
+                         `delete` while reporting them archived. Nothing is misconfigured on \
+                         your side — the mode is refused at startup rather than silently \
+                         deleting what it promises to keep. Use `delete` (or leave \
+                         HORT_RETENTION_STREAM_MODE unset); HORT_RETENTION_ARCHIVE_TARGET has \
+                         no effect until the cold-storage writer ships."
+                    .to_owned(),
+            }),
             other => Err(ConfigError::InvalidValue {
                 var: "HORT_RETENTION_STREAM_MODE",
-                reason: format!("expected one of [delete, archive], got {other:?}"),
+                reason: format!(
+                    "expected `delete` — the only implemented mode; `archive` is refused \
+                     while the cold-storage writer is deferred post-v1 — got {other:?}"
+                ),
             }),
         },
         _ => Ok(StreamRetentionMode::Delete),
@@ -3152,8 +3183,17 @@ fn parse_positive_optional<T: PositiveInt>(var: &'static str) -> Result<Option<T
 ///
 /// Note: unlike the other `Option<_>` parser this one does NOT reject
 /// zero — a zero publish-body-limit is an explicit "refuse all publishes"
-/// kill-switch, handled downstream — so an explicit `"0"` resolves to
-/// `Some(0)`, distinct from the unset `None` (binary default).
+/// kill-switch — so an explicit `"0"` resolves to `Some(0)`, distinct
+/// from the unset `None` (binary default). Downstream is
+/// `http::build_router_with_oci_config`, which carries the zero into the
+/// four hosted-format route builders (cargo, npm, PyPI, Maven) and into
+/// the OCI route builder, so the switch closes every publish surface
+/// rather than some of them. Each of those subtrees applies
+/// `hort_http_core::limits::refuse_publishes_when_disabled`, which
+/// answers a publish method with `503` instead of leaving the refusal
+/// to a zero-byte `DefaultBodyLimit` — a limit of zero admits a body of
+/// zero bytes, which is how an empty Maven `.jar` used to be ingested
+/// with the switch on.
 fn parse_publish_body_limit_bytes() -> Result<Option<usize>, ConfigError> {
     const VAR: &str = "HORT_PUBLISH_BODY_MAX_SIZE";
     match std::env::var(VAR) {
@@ -6164,44 +6204,73 @@ mod tests {
         });
     }
 
-    /// `HORT_RETENTION_STREAM_MODE=archive` requires a non-empty
-    /// `HORT_RETENTION_ARCHIVE_TARGET` — silently degrading to delete
-    /// would be data loss.
+    /// `HORT_RETENTION_STREAM_MODE=archive` is refused at startup — with
+    /// and without `HORT_RETENTION_ARCHIVE_TARGET`, and whatever the
+    /// letter case. The cold-storage writer is deferred post-v1, so the
+    /// archive path deletes the stream's events exactly like `delete`
+    /// while reporting them archived; a supplied target cannot change
+    /// that, which is why the target is not what the error names.
     #[test]
-    fn retention_mode_archive_requires_target() {
-        let mut env = fs_env();
-        env_clear_retention(&mut env);
-        env.push(("HORT_RETENTION_STREAM_MODE", Some("archive")));
-        temp_env::with_vars(env, || {
-            let err = Config::from_env().unwrap_err();
-            match err {
-                ConfigError::InvalidValue { var, .. } => {
-                    assert_eq!(var, "HORT_RETENTION_ARCHIVE_TARGET");
+    fn retention_mode_archive_rejected_until_cold_storage_writer_ships() {
+        for target in [None, Some("s3://cold-bucket/hort-event-archive")] {
+            for mode in ["archive", "ARCHIVE"] {
+                let mut env = fs_env();
+                env_clear_retention(&mut env);
+                env.push(("HORT_RETENTION_STREAM_MODE", Some(mode)));
+                if let Some(t) = target {
+                    env.push(("HORT_RETENTION_ARCHIVE_TARGET", Some(t)));
                 }
-                other => panic!("expected InvalidValue, got {other:?}"),
+                temp_env::with_vars(env, || {
+                    // The refused mode is what the operator must change,
+                    // not the (now inert) archive target — and the
+                    // wording is pinned, not just the variant: the
+                    // deferred writer is why, `delete` is the way out.
+                    match Config::from_env().unwrap_err() {
+                        ConfigError::InvalidValue { var, reason } => {
+                            assert_eq!(var, "HORT_RETENTION_STREAM_MODE", "target={target:?}");
+                            assert!(
+                                reason.starts_with(
+                                    "`archive` is not implemented: the cold-storage writer"
+                                ),
+                                "got: {reason}"
+                            );
+                            assert!(reason.contains("Use `delete`"), "got: {reason}");
+                        }
+                        other => panic!("expected InvalidValue, got {other:?}"),
+                    }
+                });
             }
-        });
+        }
     }
 
-    /// `archive` + a target prefix parses to
-    /// `StreamRetentionMode::Archive { target_prefix }`.
+    /// `delete` is accepted and unchanged by the `archive` refusal — the
+    /// explicit value resolves exactly like the unset default asserted in
+    /// `retention_floors_unset_use_c1_defaults`. Case-insensitive, as
+    /// before.
     #[test]
-    fn retention_mode_archive_with_target_parses() {
+    fn retention_mode_delete_still_accepted() {
+        for mode in ["delete", "DELETE"] {
+            let mut env = fs_env();
+            env_clear_retention(&mut env);
+            env.push(("HORT_RETENTION_STREAM_MODE", Some(mode)));
+            temp_env::with_vars(env, || {
+                let cfg = Config::from_env().expect("`delete` must still parse");
+                assert_eq!(cfg.retention_stream_mode, StreamRetentionMode::Delete);
+            });
+        }
+    }
+
+    /// An empty value is not an unknown value: it falls through to the
+    /// `Delete` default like an unset variable (an empty env slot is how
+    /// a Helm/compose template renders "no override").
+    #[test]
+    fn retention_mode_empty_value_defaults_to_delete() {
         let mut env = fs_env();
         env_clear_retention(&mut env);
-        env.push(("HORT_RETENTION_STREAM_MODE", Some("archive")));
-        env.push((
-            "HORT_RETENTION_ARCHIVE_TARGET",
-            Some("s3://cold-bucket/hort-event-archive"),
-        ));
+        env.push(("HORT_RETENTION_STREAM_MODE", Some("")));
         temp_env::with_vars(env, || {
-            let cfg = Config::from_env().unwrap();
-            assert_eq!(
-                cfg.retention_stream_mode,
-                StreamRetentionMode::Archive {
-                    target_prefix: "s3://cold-bucket/hort-event-archive".to_owned()
-                }
-            );
+            let cfg = Config::from_env().expect("an empty mode must fall back to the default");
+            assert_eq!(cfg.retention_stream_mode, StreamRetentionMode::Delete);
         });
     }
 
@@ -6217,7 +6286,11 @@ mod tests {
             match err {
                 ConfigError::InvalidValue { var, reason } => {
                     assert_eq!(var, "HORT_RETENTION_STREAM_MODE");
-                    assert!(reason.contains("delete") && reason.contains("archive"));
+                    // The message names the one accepted value AND says
+                    // what happened to `archive`, so a typo'd `arcive`
+                    // does not send the operator to a second refusal.
+                    assert!(reason.contains("`delete`"), "got: {reason}");
+                    assert!(reason.contains("`archive` is refused"), "got: {reason}");
                 }
                 other => panic!("expected InvalidValue, got {other:?}"),
             }

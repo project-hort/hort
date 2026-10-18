@@ -198,6 +198,37 @@ public hostname of the operator's edge.
   gitops YAML. Every fetch then emits `WARN` and increments
   `hort_upstream_insecure_total`.
 
+### Operator-declared realm hosts for a credentialed exchange
+
+- **Control:** on a `bearer_challenge` mapping that carries a
+  `secretRef`, the `WWW-Authenticate` realm must be the mapping's own
+  origin or a host the operator listed in `spec.allowedRealmHosts`. The
+  realm arrives in an upstream response header, so it is
+  upstream-controlled data, and the realm exchange is the request that
+  carries the credential — the `https` and routability gates above
+  bound where it may travel, not to whom. The refusal happens before
+  the credential is read from the `SecretPort`, and a listed realm's
+  redirects are bound to its own origin.
+- **Chart default:** unconditional in the binary; the list defaults to
+  empty.
+- **Operator action required:** **yes, if** a mapping is *both*
+  credentialed *and* has an off-origin realm. Authenticated Docker Hub
+  is the canonical case (`registry-1.docker.io` with a PAT, realm
+  `auth.docker.io`). An anonymous mapping — including every
+  `bearer_challenge` mapping shipped in this repository — needs no
+  entry.
+- **Verify post-install:** a refused exchange surfaces as
+  `hort_upstream_fetch_total{result="parse_error"}` plus a server log
+  line naming the mapping and the realm host to add:
+  ```bash
+  kubectl logs -n <ns> deploy/<release>-hort-server \
+    | grep -i 'does not allow to receive its credential'
+  ```
+- **Relaxation:** list the host —
+  `allowedRealmHosts: [auth.docker.io]` — in the mapping's gitops YAML.
+  There is no knob that disables the gate; declaring the host *is* the
+  supported way to permit the exchange.
+
 ### Operating behind an egress (forward) proxy
 
 - **What uses the proxy:** Hort builds every outbound `reqwest` client
@@ -465,21 +496,26 @@ distinct mechanism) is unchanged.
   kind without emitting these events are explicitly out of scope for
   this release; if/when added they MUST emit the matching event.
 
-### `ArtifactReleased` carries `admin_id` + justification
+### `ArtifactReleased` carries the deciding user + justification
 
-- **Control:** Manual quarantine release requires a `justification`
-  body field (≤ 512 bytes) and stamps the `admin_id` of the releasing
-  caller into the `ArtifactReleased` event. Auditors can reconstruct
-  who released what and why.
+- **Control:** The manual quarantine release requires a `justification`
+  body field (≤ 512 bytes) and stamps the `released_by_user_id` of the
+  deciding caller into the `ArtifactReleased` event. Auditors can
+  reconstruct who released what and why. There is exactly one such
+  route — the curator's waive (ADR 0007, "One authority owns the manual
+  release") — so there is no second surface with its own cap to keep in
+  step.
 - **Chart default:** unconditional in the binary.
 - **Operator action required:** no — the HTTP DTO change is
   client-side; the chart only needs the binary version.
 - **Verify post-install:**
   ```bash
-  # Empty body -> 400; with justification -> 200, event carries admin_id.
+  # Empty body -> 400; with justification -> 200, event carries
+  # released_by_user_id. `Permission::Curate` OR `Permission::Admin`.
   curl -i -X POST -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
     -d '{"justification":"SOC ticket #123"}' \
-    http://<svc-or-ingress>/quarantine/<id>/release
+    http://<svc-or-ingress>/api/v1/admin/curation/quarantine/<id>/waive
   ```
 - **Relaxation:** none. The validator rejects empty / oversize
   justifications at the use-case boundary.

@@ -336,12 +336,16 @@ impl LintOutcome {
 /// exempt; a bare operator-declared `User` grant has no justification
 /// mechanism in v1 and is exactly the shape the rule wants blocked.
 ///
-/// Pure over its inputs (no I/O) — the caller
-/// ([`apply_permission_grants`](crate::use_cases::apply_config_use_case))
-/// owns the strict-atomic abort: if [`LintOutcome::rejected`] is true
-/// it returns `AppError::Domain(DomainError::Validation(_))` *before*
-/// the permission-grant `save_managed`, so no grant row and no
-/// `PermissionGrantApplied` event lands.
+/// Pure over its inputs (no I/O) — the caller owns the abort. In
+/// `apply_permission_grants` a `rejected()` outcome returns
+/// `AppError::Domain(DomainError::Validation(_))` *before* the
+/// permission-grant commit, so no grant row and no
+/// `PermissionGrantApplied` event lands. That abort is no longer the
+/// earliest one, and must not be mistaken for the whole guarantee: it
+/// comes after the repository, policy and mapping writes of the same
+/// apply, so the rejection an operator actually hits is the pre-write
+/// pass's row 8 (see the module docs). This caller is the authority on
+/// the port-built set and the emitter of the metric.
 ///
 /// Observability: each `Warn` logs `tracing::warn!` and
 /// each `Reject` logs `tracing::error!`, both with the rule key, the

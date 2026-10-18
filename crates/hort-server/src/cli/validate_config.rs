@@ -16,7 +16,7 @@
 //! 3. The pure
 //!    [`StaticConfigValidator`](hort_app::lint::StaticConfigValidator) —
 //!    the snapshot-free lint subset of the apply-time pass (rows
-//!    2,3,5,6,6b,7,7b,7c,8,9).
+//!    2,3,5,6,6b,7,7b,7c,8,9,10,11,12,13).
 //!
 //! It is the offline operator surface for a CI pre-merge gate: it
 //! reproduces the server's *snapshot-free* validation faithfully without
@@ -365,7 +365,7 @@ fn validate_tree(
         return ExitCode::from(1);
     }
 
-    // ---- 5. run the snapshot-free validator (rows 2,3,5,6,6b,7,7b,7c,8,9) ----
+    // ---- 5. run the snapshot-free validator (rows 2,3,5,6,6b,7,7b,7c,8,9,10,11,12,13) ----
     let report = static_validator(backend).validate(&desired);
 
     // ---- 6. print findings + footer ----
@@ -421,7 +421,7 @@ fn validate_tree(
 }
 
 /// Build the snapshot-free lint validator this command runs (rows
-/// 2,3,5,6,6b,7,7b,7c,8,9).
+/// 2,3,5,6,6b,7,7b,7c,8,9,10,11,12,13).
 ///
 /// Its own function rather than an inline block inside [`validate_tree`]
 /// so the row-0 parity test can ask "would the *static* rows alone have
@@ -489,6 +489,56 @@ mod tests {
 
     // A minimal, well-formed hosted OCI repo on filesystem — clean under
     // every static rule. Used as the "valid small fixture".
+    /// A `ScanPolicy` that trips no lint row, for trees whose subject is
+    /// something that needs a parent policy to exist.
+    const SCAN_POLICY_GLOBAL_CLEAN: &str = "\
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: p-global-clean
+spec:
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  provenanceMode: off
+  licensePolicy: {}
+  scanBackends: [trivy]
+";
+
+    /// An `npm` virtual whose only member is the `pypi` repository
+    /// below. The member is declared and non-virtual; only its format
+    /// differs.
+    const NPM_VIRTUAL_OVER_PY_LIB: &str = "\
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: all-npm
+spec:
+  name: all-npm
+  format: npm
+  type: virtual
+  virtualMembers: [py-lib]
+  isPublic: true
+  replicationPriority: on_demand
+";
+
+    const PYPI_HOSTED_PY_LIB: &str = "\
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: py-lib
+spec:
+  name: py-lib
+  format: pypi
+  type: hosted
+  isPublic: true
+  replicationPriority: local_only
+  storage:
+    backend: filesystem
+    path: py-lib
+";
+
     const REPO_OCI_HOSTED: &str = "\
 apiVersion: project-hort.de/v1
 kind: ArtifactRepository
@@ -904,6 +954,197 @@ spec:
         assert_eq!(code_str(code), success());
     }
 
+    /// Row 10 — a `ScanPolicy` declaring licence rules the scan path
+    /// evaluates against an empty licence list → exit 1. Like row 9,
+    /// this belongs in the `StaticConfigValidator` and not in the
+    /// per-spec validator: the value is structurally fine — the wire
+    /// schema passes `licensePolicy` through as opaque JSON on purpose —
+    /// so row 0 has nothing to say about it, and only the lint row knows
+    /// no port surfaces an artifact's licences.
+    #[test]
+    fn validate_tree_row_10_declared_license_policy_is_exit_1() {
+        let policy = "\
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: block-gpl
+spec:
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  provenanceMode: off
+  licensePolicy:
+    denied_licenses: [GPL-3.0]
+    action: Block
+  scanBackends: [trivy]
+";
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", REPO_OCI_HOSTED);
+        write(dir.path(), "policies/p.yaml", policy);
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), exit(1));
+    }
+
+    /// The same tree with `licensePolicy: {}` — the inert default every
+    /// shipped example tree writes — is clean, so the rejection above is
+    /// the declared rules and not the presence of the field.
+    #[test]
+    fn validate_tree_row_10_empty_license_policy_is_success() {
+        let policy = "\
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: no-licence-claim
+spec:
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  provenanceMode: off
+  licensePolicy: {}
+  scanBackends: [trivy]
+";
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", REPO_OCI_HOSTED);
+        write(dir.path(), "policies/p.yaml", policy);
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), success());
+    }
+
+    /// Row 11 — an `Exclusion` scoped to a repository the finding filter
+    /// never reads → exit 1. The repository and the parent policy are
+    /// both declared, so neither reference rule is what refuses it.
+    #[test]
+    fn validate_tree_row_11_repository_scoped_exclusion_is_exit_1() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", REPO_OCI_HOSTED);
+        write(dir.path(), "policies/p.yaml", SCAN_POLICY_GLOBAL_CLEAN);
+        write(
+            dir.path(),
+            "policies/ex.yaml",
+            "\
+apiVersion: project-hort.de/v1
+kind: Exclusion
+metadata:
+  name: cve-on-one-repo
+spec:
+  policy: p-global-clean
+  cveId: CVE-2026-0001
+  scope:
+    repository: oci-hosted
+  reason: patched in the base layer
+",
+        );
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), exit(1));
+    }
+
+    /// The same exclusion at `scope: global` is clean — the rejection
+    /// above is the scope, not the exclusion.
+    #[test]
+    fn validate_tree_row_11_global_exclusion_is_success() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", REPO_OCI_HOSTED);
+        write(dir.path(), "policies/p.yaml", SCAN_POLICY_GLOBAL_CLEAN);
+        write(
+            dir.path(),
+            "policies/ex.yaml",
+            "\
+apiVersion: project-hort.de/v1
+kind: Exclusion
+metadata:
+  name: cve-everywhere
+spec:
+  policy: p-global-clean
+  cveId: CVE-2026-0001
+  scope: global
+  reason: patched in the base layer
+",
+        );
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), success());
+    }
+
+    /// Row 12 — a `virtualMembers` entry on another format → exit 1. The
+    /// member is declared and non-virtual, so neither the
+    /// dangling-member rule nor the no-nested-virtuals rule is what
+    /// refuses it.
+    #[test]
+    fn validate_tree_row_12_cross_format_virtual_member_is_exit_1() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/v.yaml", NPM_VIRTUAL_OVER_PY_LIB);
+        write(dir.path(), "repositories/m.yaml", PYPI_HOSTED_PY_LIB);
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), exit(1));
+    }
+
+    /// The same virtual over a member of its own format is clean — the
+    /// rejection above is the format difference, not the aggregation.
+    #[test]
+    fn validate_tree_row_12_same_format_virtual_member_is_success() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "repositories/v.yaml",
+            &NPM_VIRTUAL_OVER_PY_LIB.replace("py-lib", "npm-lib"),
+        );
+        write(
+            dir.path(),
+            "repositories/m.yaml",
+            &PYPI_HOSTED_PY_LIB
+                .replace("py-lib", "npm-lib")
+                .replace("format: pypi", "format: npm"),
+        );
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), success());
+    }
+
+    /// Row 13 — a `ScanPolicy` declaring a `maxArtifactAge` the age
+    /// evaluator never applies → exit 1. The duration is well-formed, so
+    /// the per-envelope format check (which stays) has nothing to say
+    /// about it; only the lint row knows `evaluate_age_gates` has no
+    /// caller.
+    #[test]
+    fn validate_tree_row_13_declared_max_artifact_age_is_exit_1() {
+        let policy = "\
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: stale-cap
+spec:
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  provenanceMode: off
+  maxArtifactAge: 90d
+  licensePolicy: {}
+  scanBackends: [trivy]
+";
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", REPO_OCI_HOSTED);
+        write(dir.path(), "policies/p.yaml", policy);
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), exit(1));
+    }
+
+    /// An otherwise identical global policy without the field — the
+    /// inert default every shipped example tree writes — is clean over
+    /// the same repository, so the rejection above is the declared cap
+    /// and not something else in the envelope. Which *row* rejects is
+    /// pinned where the harness can see it:
+    /// `static_validator_and_apply_agree_on_reject_rule`'s row-13 corpus
+    /// entry.
+    #[test]
+    fn validate_tree_row_13_omitted_max_artifact_age_is_success() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", REPO_OCI_HOSTED);
+        write(dir.path(), "policies/p.yaml", SCAN_POLICY_GLOBAL_CLEAN);
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), success());
+    }
+
     /// Row 6 — accepted-but-inert `prefetchPolicy.maxAgeDays` → exit 1.
     #[test]
     fn validate_tree_row_6_prefetch_max_age_days_is_exit_1() {
@@ -1022,6 +1263,104 @@ spec:
         write(dir.path(), "auth/g.yaml", grant);
         let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
         assert_eq!(code_str(code), exit(1));
+    }
+
+    /// Row 0 — an `UpstreamMapping` carrying half an mTLS pair → exit 1.
+    ///
+    /// The three TLS-material rules mirror invariants of the domain
+    /// constructor `RepositoryUpstreamMapping::new`, which gitops apply
+    /// reaches only in its third stage — after the repository and policy
+    /// writes of the same bundle. They earn their place in the per-spec
+    /// validator rather than in the `StaticConfigValidator` by the usual
+    /// criterion: each is decidable from one envelope, with no deployment
+    /// fact row 0 lacks. That placement is also what makes this command
+    /// and the boot preflight reject the bundle identically — both run
+    /// `DesiredState::validate`.
+    #[test]
+    fn validate_tree_row_0_half_mtls_pair_is_exit_1() {
+        let repo = "\
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: oci-mirror
+spec:
+  name: oci-mirror
+  format: oci
+  type: proxy
+  isPublic: true
+  replicationPriority: local_only
+  proxy:
+    upstreamUrl: https://registry-1.docker.io
+  storage:
+    backend: filesystem
+    path: oci-mirror
+";
+        let mapping = "\
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: oci-mirror-dockerhub
+spec:
+  repository: oci-mirror
+  pathPrefix: dockerhub/
+  upstreamUrl: https://registry-1.docker.io
+  auth:
+    type: anonymous
+  mtlsCertRef:
+    source: env_var
+    location: CLIENT_CERT
+";
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", repo);
+        write(dir.path(), "upstreams/m.yaml", mapping);
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), exit(1));
+    }
+
+    /// The same tree with the complete mTLS pair is clean — the rejection
+    /// above is the half pair, not the presence of TLS material.
+    #[test]
+    fn validate_tree_row_0_complete_mtls_pair_is_success() {
+        let repo = "\
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: oci-mirror
+spec:
+  name: oci-mirror
+  format: oci
+  type: proxy
+  isPublic: true
+  replicationPriority: local_only
+  proxy:
+    upstreamUrl: https://registry-1.docker.io
+  storage:
+    backend: filesystem
+    path: oci-mirror
+";
+        let mapping = "\
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: oci-mirror-dockerhub
+spec:
+  repository: oci-mirror
+  pathPrefix: dockerhub/
+  upstreamUrl: https://registry-1.docker.io
+  auth:
+    type: anonymous
+  mtlsCertRef:
+    source: env_var
+    location: CLIENT_CERT
+  mtlsKeyRef:
+    source: env_var
+    location: CLIENT_KEY
+";
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", repo);
+        write(dir.path(), "upstreams/m.yaml", mapping);
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), success());
     }
 
     // ---- warnings-but-no-errors → strict promotion ----------------------
@@ -1173,6 +1512,31 @@ spec:
     Repos: [ghost-repo]
 ";
 
+    /// A `ScanPolicy` scoped to a repository that is not declared.
+    /// Everything else is deliberately clean: `provenanceMode: off`
+    /// keeps the provenance rows silent and `scanBackends: [trivy]`
+    /// covers the declared OCI repository, so the scope reference is the
+    /// only defect. The static rows leave an unresolved scope name to
+    /// row 0 by construction (`first_uncovered_required_format`,
+    /// `effective_repositories_for`) — which is the half that was
+    /// missing: nothing in row 0 rejected it either, and the apply
+    /// pipeline's `resolve_scope` panicked on it in Stage 2.
+    const SCAN_POLICY_SCOPE_GHOST: &str = "\
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: scan-ghost
+spec:
+  scope:
+    repository: ghost-repo
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  provenanceMode: off
+  licensePolicy: {}
+  scanBackends: [trivy]
+";
+
     /// A structurally invalid predicate: a zero-second TTL expires every
     /// artifact the instant it is ingested. Scope is clean.
     const RETENTION_ZERO_AGE: &str = "\
@@ -1270,6 +1634,14 @@ spec:
             files: &[
                 ("repositories/oci.yaml", REPO_OCI_HOSTED),
                 ("retention/p.yaml", RETENTION_SCOPE_GHOST),
+            ],
+            row0_rejects: true,
+        },
+        Row0Case {
+            label: "scan-policy-scope-references-undeclared-repository",
+            files: &[
+                ("repositories/oci.yaml", REPO_OCI_HOSTED),
+                ("policies/p.yaml", SCAN_POLICY_SCOPE_GHOST),
             ],
             row0_rejects: true,
         },
@@ -1451,6 +1823,24 @@ spec:
         assert_eq!(
             row0_exit(row0_case(
                 "retention-scope-references-undeclared-repository"
+            )),
+            exit(1)
+        );
+    }
+
+    /// A `ScanPolicy` scope naming an undeclared repository → exit 1.
+    ///
+    /// The offline gate has to reject this one for the same reason the
+    /// boot preflight does, and that reason is sharper here than for its
+    /// siblings: the apply pipeline resolves the scope name to a
+    /// repository id and panics on a miss, so an operator typo that got
+    /// past validation did not fail the apply — it crashlooped the pod,
+    /// after the earlier stages had written.
+    #[test]
+    fn validate_tree_row_0_scan_policy_scope_references_undeclared_repository_is_exit_1() {
+        assert_eq!(
+            row0_exit(row0_case(
+                "scan-policy-scope-references-undeclared-repository"
             )),
             exit(1)
         );

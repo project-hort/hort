@@ -29,9 +29,7 @@
 //!
 //! [`Command::Admin`]: super::Command::Admin
 
-use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -50,7 +48,8 @@ use hort_adapters_postgres::{
 use hort_app::event_store_publisher::EventStorePublisher;
 use hort_app::rbac::RbacEvaluator;
 use hort_app::use_cases::api_token_use_case::{
-    ApiTokenIssuanceConfig, ApiTokenUseCase, IssueTokenRequest, DEFAULT_SVC_EXPIRY_DAYS,
+    ApiTokenIssuanceConfig, ApiTokenUseCase, IssueTokenRequest, BOOTSTRAP_ADMIN_USERNAME,
+    DEFAULT_SVC_EXPIRY_DAYS,
 };
 use hort_app::use_cases::user_use_case::{CreateUser, UserPrivileges, UserUseCase};
 use hort_domain::entities::api_token::ApiToken;
@@ -143,8 +142,12 @@ pub struct IssueSvcTokenArgs {
     ///
     /// - `stdout` (default): print to stdout. The Helm bootstrap Job pipes
     ///   this into `kubectl create secret generic`.
-    /// - `file:<path>`: write to `<path>` with mode 0600. Useful for local
-    ///   dev and provisioning scripts that need a file-based secret.
+    /// - `file:<path>`: atomically place the token at `<path>` as a file
+    ///   this process created at mode 0600 — a pre-existing file or
+    ///   symlink there is *replaced*, never inherited or followed, so the
+    ///   0600 promise holds on an overwrite too. `<path>`'s parent
+    ///   directory must already exist and is left untouched. Useful for
+    ///   local dev and provisioning scripts that need a file-based secret.
     /// - `kube-secret`: deferred —
     ///   post-v1 (cluster RBAC); not implemented in v1. The bootstrap Job
     ///   uses the `stdout` mode and shells out to `kubectl`. This mode
@@ -222,7 +225,9 @@ pub struct BootstrapSessionArgs {
     /// Output mode for the issued token.
     ///
     /// - `stdout` (default): print to stdout.
-    /// - `file:<path>`: write to `<path>` with mode 0600.
+    /// - `file:<path>`: atomically place the token at `<path>` as a file
+    ///   this process created at mode 0600 (see `issue-svc-token`'s
+    ///   `--output` for the exact guarantee).
     ///
     /// Same shape as `issue-svc-token`; `kube-secret` is not supported
     /// here (the bootstrap token is a one-off break-glass credential,
@@ -707,22 +712,42 @@ fn parse_output_mode(output: &str) -> anyhow::Result<Option<String>> {
 
 /// Write the plaintext token to the resolved output sink.
 ///
-/// `None` → stdout (the Helm / provisioning caller reads it). `Some(path)`
-/// → write to `<path>` with mode 0600 so only the owning process can read.
+/// `None` → stdout (the Helm / provisioning caller reads it).
+/// `Some(path)` → atomically place it at `<path>` as a file *this* process
+/// created at mode 0600, via the shared
+/// [`hort_secret_file::write_secret_file`].
+///
+/// The secret never reaches a file whose mode or type this process did not
+/// set. `OpenOptionsExt::mode` applies only when a file is *created*, so
+/// opening `<path>` with `create(true).truncate(true).mode(0o600)` would
+/// leave a pre-existing group- or world-readable file at its own
+/// permissions and write the bearer into it — the documented 0600 output
+/// silently not holding — and would follow a symlink at `<path>` to a path
+/// the operator never named. Replacing the directory entry closes both.
+/// What leaks on that path is a service-account bearer or a full-cap
+/// bootstrap admin PAT, and the issuance gates (DSN access,
+/// `HORT_TOKEN_ALLOW_ADMIN`) guard the *minting*, not this sink.
+///
+/// Re-running the command against the same `<path>` keeps working: what
+/// makes the overwrite safe is the atomic replace, not a refusal to
+/// overwrite.
+///
+/// `<path>`'s parent directory must already exist and is never modified.
+/// The operator chose that directory, and the native deployment's default
+/// token location is `/etc/hort/tasks-token` — a directory deliberately
+/// kept `root:hort` 0750 so `hort-server.service` can read the env files
+/// beside the token. Tightening it to 0700 on a token mint would break the
+/// service. The parent's mode is not what protects the secret anyway; the
+/// 0600 inode is. The replaced file is owned by this process, so a caller
+/// needing a different owner (the Ansible timers role chowns the token to
+/// its run user) sets it after the write.
 fn write_plaintext(output_path: &Option<String>, plaintext: &str) -> anyhow::Result<()> {
     match output_path {
         None => {
             println!("{plaintext}");
         }
         Some(path) => {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)
-                .with_context(|| format!("opening output file {path:?}"))?;
-            file.write_all(plaintext.as_bytes())
+            hort_secret_file::write_secret_file(Path::new(path), plaintext.as_bytes())
                 .with_context(|| format!("writing token to {path:?}"))?;
             eprintln!("info: token written to {path}");
         }
@@ -730,12 +755,29 @@ fn write_plaintext(output_path: &Option<String>, plaintext: &str) -> anyhow::Res
     Ok(())
 }
 
+/// Page size for the `list_for_user` walks below. The port exposes no
+/// `find_by_name` and no "all rows" read, so every enumeration pages.
+const TOKEN_PAGE_LIMIT: u64 = 100;
+
+/// Upper bound on pages walked by [`live_token_ids_for_user`].
+///
+/// The walk stops on a short page; this budget only exists so a
+/// repository that ignored `offset` could not spin the CLI forever —
+/// headless, a non-terminating loop is indistinguishable from a hang.
+/// Exhausting it is reported as an error, never silently truncated: a
+/// truncated enumeration would leave tokens un-revoked while the
+/// command reported success.
+const MAX_TOKEN_PAGES: usize = 1_000;
+
 /// Scan the first page of tokens for a user and return the one whose
 /// `name` matches `token_name`, if any.
 ///
 /// The port only exposes `list_for_user` (no `find_by_name`). For the
-/// CLI bootstrap path this is acceptable: service accounts have at most
-/// a handful of tokens, so a single page (100 items) is always enough.
+/// service-account rotation path this is acceptable: the operator names
+/// the token, and a service account holds at most a handful, so a single
+/// page (100 items) is always enough. The bootstrap rotation does NOT
+/// use this — it revokes by principal, see
+/// [`live_token_ids_for_user`].
 async fn find_token_by_name(
     repo: &dyn ApiTokenRepository,
     user_id: Uuid,
@@ -746,12 +788,86 @@ async fn find_token_by_name(
             user_id,
             PageRequest {
                 offset: 0,
-                limit: 100,
+                limit: TOKEN_PAGE_LIMIT,
             },
         )
         .await
         .context("listing tokens for service-account user")?;
     Ok(page.items.into_iter().find(|t| t.name == token_name))
+}
+
+/// Collect the ids of every not-yet-revoked token owned by `user_id`,
+/// walking **all** pages.
+///
+/// Identity, not label, is the selector: the owner is the whole
+/// predicate and the token's `name` is never read. A caller-chosen name
+/// says nothing about who owns a credential, so a name-matched sweep
+/// leaves every differently-named token of the same principal in place —
+/// and the first page only compounds it.
+///
+/// Already-revoked rows are skipped: `ApiTokenRepository::revoke` is
+/// idempotent, so including them would be harmless but would emit a
+/// second `ApiTokenRevoked` event per row and inflate the count the
+/// caller logs.
+async fn live_token_ids_for_user(
+    repo: &dyn ApiTokenRepository,
+    user_id: Uuid,
+) -> anyhow::Result<Vec<Uuid>> {
+    let mut ids = Vec::new();
+    let mut offset = 0u64;
+    for _ in 0..MAX_TOKEN_PAGES {
+        let page = repo
+            .list_for_user(
+                user_id,
+                PageRequest {
+                    offset,
+                    limit: TOKEN_PAGE_LIMIT,
+                },
+            )
+            .await
+            .with_context(|| format!("listing tokens for user {user_id}"))?;
+        let fetched = page.items.len() as u64;
+        ids.extend(
+            page.items
+                .iter()
+                .filter(|t| t.revoked_at.is_none())
+                .map(|t| t.id),
+        );
+        // A short page is the end of the list. Deliberately not keyed on
+        // `page.total`: revocation is an UPDATE, not a DELETE, so the row
+        // count cannot shrink underneath the walk, but a `total` computed
+        // by a separate count query is still the weaker signal of the two.
+        if fetched < TOKEN_PAGE_LIMIT {
+            return Ok(ids);
+        }
+        offset += fetched;
+    }
+    anyhow::bail!(
+        "listing tokens for user {user_id} did not terminate within \
+         {MAX_TOKEN_PAGES} pages of {TOKEN_PAGE_LIMIT}; refusing to proceed on a \
+         partial enumeration — a truncated sweep would leave live tokens behind"
+    )
+}
+
+/// Revoke each token id in `ids` through the use case, so every
+/// revocation lands its `ApiTokenRevoked` audit event.
+///
+/// Fails on the first error rather than continuing: a partially-revoked
+/// rotation that reported success would leave a live full-admin
+/// credential behind with nothing recording it.
+async fn revoke_bootstrap_admin_tokens(
+    token_uc: &ApiTokenUseCase,
+    actor: ApiActor,
+    ids: &[Uuid],
+) -> anyhow::Result<()> {
+    for id in ids {
+        info!(token_id = %id, "revoking prior bootstrap-admin token");
+        token_uc
+            .revoke(actor.clone(), *id, true)
+            .await
+            .with_context(|| format!("revoking prior bootstrap-admin token {id}"))?;
+    }
+    Ok(())
 }
 
 /// Build an [`ApiTokenUseCase`] used by the admin CLI bootstrap path.
@@ -783,14 +899,13 @@ fn build_token_use_case(
 // bootstrap-session
 // ---------------------------------------------------------------------------
 
-/// Reserved username for the first-admin / break-glass admin identity.
-///
-/// This is the ONE deliberate admin-identity creation in the CLI. It is
-/// a NON-service-account user (`is_admin = true`,
-/// `is_service_account = false`) — service accounts are strictly
-/// non-admin (Entry 4 / ADR 0012), so the bootstrap admin is
-/// intentionally not one.
-const BOOTSTRAP_ADMIN_USERNAME: &str = "bootstrap-admin";
+// The reserved username of the first-admin / break-glass admin identity is
+// `hort_app::use_cases::api_token_use_case::BOOTSTRAP_ADMIN_USERNAME`,
+// imported above rather than declared here. It belongs to the use-case
+// layer because the issuance gates refuse request-path tokens for that
+// identity and must name the same user this command reserves; a second
+// copy here could drift and leave the gate guarding a row the CLI does
+// not create.
 
 /// Token row name (and audit label) for the bootstrap-admin token.
 const BOOTSTRAP_ADMIN_TOKEN_NAME: &str = "bootstrap-session";
@@ -939,30 +1054,29 @@ async fn bootstrap_session_async(args: BootstrapSessionArgs) -> anyhow::Result<(
         }
     };
 
-    // Single active bootstrap token: revoke any prior one before minting.
-    if let Some(prev) = find_token_by_name(
-        token_repo.as_ref(),
-        admin_user.id,
-        BOOTSTRAP_ADMIN_TOKEN_NAME,
-    )
-    .await?
-    {
-        info!(token_id = %prev.id, "revoking prior bootstrap-admin token");
+    // Single active credential for the break-glass identity: revoke
+    // every live token the principal owns before minting the next one.
+    //
+    // By principal, not by name. The reserved name is what this command
+    // mints under, but it is not what the identity is, and a token the
+    // principal owns under any other name is exactly as powerful — so
+    // matching the name left such a token live through every subsequent
+    // rotation. The walk also covers every page, not just the first.
+    let stale = live_token_ids_for_user(token_repo.as_ref(), admin_user.id).await?;
+    if !stale.is_empty() {
         let token_uc = build_token_use_case(
             token_repo.clone(),
             user_repo.clone(),
             event_publisher.clone(),
         );
-        token_uc
-            .revoke(
-                ApiActor {
-                    user_id: admin_user.id,
-                },
-                prev.id,
-                true,
-            )
-            .await
-            .context("revoking prior bootstrap-admin token")?;
+        revoke_bootstrap_admin_tokens(
+            &token_uc,
+            ApiActor {
+                user_id: admin_user.id,
+            },
+            &stale,
+        )
+        .await?;
     }
 
     // System-mint a short-lived (≤ 1 h) full-cap admin Pat. The use case
@@ -1647,6 +1761,146 @@ mod tests {
         assert!(err.to_string().contains("unknown output mode"));
     }
 
+    // -- `--output=file:` sink: the secret never lands in a file whose
+    //    mode or type this process did not set -----------------------------
+    //
+    // The three cases the sink has to survive, each asserting the
+    // PERMISSIONS of the resulting file and not merely its content:
+    // a pre-existing world-readable regular file, a pre-existing symlink,
+    // and a target that does not exist yet. What flows through here is a
+    // service-account bearer or a full-cap bootstrap admin PAT, so these
+    // run against a real filesystem — the mode bits of the resulting
+    // inode, and whether a symlink was followed, are not observable any
+    // other way.
+
+    const SINK_TOKEN: &str = "hort_pat_sekret-bearer-value";
+
+    /// Permission bits of `path`.
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    /// Drive the `file:<path>` sink exactly as the command does: through
+    /// `parse_output_mode`, so the test covers the real argument path and
+    /// not just the writer.
+    fn write_token_to(path: &Path) {
+        let mode = parse_output_mode(&format!("file:{}", path.display())).expect("parse");
+        assert_eq!(mode.as_deref(), Some(path.to_str().unwrap()));
+        write_plaintext(&mode, SINK_TOKEN).expect("write");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_file_target_that_does_not_exist_is_created_0600() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("svc.token");
+
+        write_token_to(&path);
+
+        assert_eq!(mode_of(&path), 0o600, "a fresh token file must be 0600");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SINK_TOKEN);
+        // No temp sibling may survive — a leftover would be a second copy
+        // of the bearer at a name nothing cleans up.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["svc.token".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_file_existing_world_readable_target_ends_up_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("svc.token");
+
+        // A local user pre-creates the operator's output path 0644. With
+        // `create(true).truncate(true).mode(0o600)` the mode would survive
+        // (mode applies only on create) and the bearer would land in a
+        // world-readable file.
+        std::fs::write(&path, "pre-existing").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&path), 0o644, "precondition");
+
+        write_token_to(&path);
+
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the documented 0600 output must hold on an overwrite too"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            SINK_TOKEN,
+            "and the overwrite must still work — operators re-run \
+             issue-svc-token against the same path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_file_existing_symlink_is_replaced_not_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = dir.path().join("attacker-readable");
+        std::fs::write(&elsewhere, "original elsewhere bytes").unwrap();
+        let path = dir.path().join("svc.token");
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+
+        write_token_to(&path);
+
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "the symlink must be replaced by our own regular file"
+        );
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SINK_TOKEN);
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            "original elsewhere bytes",
+            "the bearer must not reach the link target — a path the \
+             operator never named"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_file_leaves_the_operators_directory_mode_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let etc_hort = dir.path().join("etc-hort");
+        std::fs::create_dir(&etc_hort).unwrap();
+        // Mimic the native deployment's /etc/hort: group-readable on
+        // purpose so the service user can read hort-server.env beside the
+        // token. Pulling it to 0700 on a mint would break the service.
+        std::fs::set_permissions(&etc_hort, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        write_token_to(&etc_hort.join("tasks-token"));
+
+        assert_eq!(mode_of(&etc_hort), 0o750);
+    }
+
+    #[test]
+    fn output_file_with_a_missing_parent_directory_fails_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("no-such-dir").join("svc.token");
+        let mode = parse_output_mode(&format!("file:{}", path.display())).expect("parse");
+
+        let err = write_plaintext(&mode, SINK_TOKEN).expect_err("must fail");
+
+        // The message has to name the path the operator passed, so a
+        // provisioning run that fails is actionable from its log alone.
+        let msg = format!("{err:#}");
+        assert!(msg.contains(path.to_str().unwrap()), "unexpected: {msg}");
+        assert!(!path.exists(), "no partial token file may be left behind");
+    }
+
     // -- bootstrap-session: HORT_TOKEN_ALLOW_ADMIN gate ----------------------
 
     #[test]
@@ -1741,6 +1995,282 @@ mod tests {
         };
         assert_eq!(args.ttl, "30m");
         assert_eq!(args.output, "file:/tmp/admin.txt");
+    }
+
+    // -- bootstrap rotation: revoke by principal, every page ---------------
+
+    /// Shorthand for the `ApiTokenRepository` port's return type. The fully
+    /// qualified form is wider than the 100-char line budget in every method
+    /// signature below.
+    type Fut<'a, T> = hort_domain::ports::BoxFuture<'a, hort_domain::error::DomainResult<T>>;
+
+    /// `ApiTokenRepository` fixture that honours `PageRequest`.
+    ///
+    /// The shared `hort_app::use_cases::test_support::MockApiTokenRepository`
+    /// returns its whole canned list on every call regardless of offset, so
+    /// it cannot tell a one-page walk from an all-pages walk — which is the
+    /// property under test here.
+    struct PagingTokenRepo {
+        rows: Vec<ApiToken>,
+        revokes: std::sync::Mutex<Vec<Uuid>>,
+    }
+
+    impl PagingTokenRepo {
+        fn new(rows: Vec<ApiToken>) -> Self {
+            Self {
+                rows,
+                revokes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn revoked(&self) -> Vec<Uuid> {
+            self.revokes.lock().unwrap().clone()
+        }
+    }
+
+    impl ApiTokenRepository for PagingTokenRepo {
+        fn insert(&self, _token: &ApiToken) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn find_by_prefix(&self, _prefix: &str) -> Fut<'_, Option<ApiToken>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn find_by_id(&self, id: Uuid) -> Fut<'_, ApiToken> {
+            let found = self.rows.iter().find(|t| t.id == id).cloned().ok_or(
+                hort_domain::error::DomainError::NotFound {
+                    entity: "ApiToken",
+                    id: id.to_string(),
+                },
+            );
+            Box::pin(async move { found })
+        }
+
+        fn list_for_user(
+            &self,
+            user_id: Uuid,
+            page: PageRequest,
+        ) -> Fut<'_, hort_domain::types::Page<ApiToken>> {
+            let owned: Vec<ApiToken> = self
+                .rows
+                .iter()
+                .filter(|t| t.user_id == user_id)
+                .cloned()
+                .collect();
+            let total = owned.len() as u64;
+            let items = owned
+                .into_iter()
+                .skip(page.offset as usize)
+                .take(page.limit as usize)
+                .collect();
+            Box::pin(async move { Ok(hort_domain::types::Page { items, total }) })
+        }
+
+        fn update_last_used(
+            &self,
+            _token_id: Uuid,
+            _at: chrono::DateTime<chrono::Utc>,
+            _client_ip: Option<&str>,
+            _user_agent: Option<&str>,
+        ) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn revoke(&self, token_id: Uuid) -> Fut<'_, ()> {
+            self.revokes.lock().unwrap().push(token_id);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    const BOOTSTRAP_USER_ID: Uuid = Uuid::from_u128(0xB0075);
+
+    fn token_row(name: &str, user_id: Uuid, revoked: bool) -> ApiToken {
+        ApiToken {
+            id: Uuid::new_v4(),
+            user_id,
+            name: name.to_owned(),
+            description: None,
+            kind: hort_domain::entities::api_token::TokenKind::Pat,
+            token_hash: "$argon2id$dummy".to_owned(),
+            token_prefix: "abcdefgh".to_owned(),
+            declared_permissions: vec![Permission::Admin],
+            repository_ids: None,
+            expires_at: None,
+            revoked_at: revoked.then(chrono::Utc::now),
+            last_used_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
+            created_by_user_id: user_id,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// An `ApiTokenUseCase` over the paging repo, wired the way
+    /// `bootstrap_session_async` wires it.
+    fn token_use_case_over(repo: Arc<PagingTokenRepo>) -> ApiTokenUseCase {
+        use hort_app::use_cases::test_support::{MockEventStore, MockUserRepository};
+        let users = Arc::new(MockUserRepository::new());
+        let events = Arc::new(EventStorePublisher::without_broadcast(
+            Arc::new(MockEventStore::new()) as Arc<dyn EventStore>,
+        ));
+        build_token_use_case(repo as Arc<dyn ApiTokenRepository>, users, events)
+    }
+
+    #[tokio::test]
+    async fn rotation_revokes_a_bootstrap_token_under_a_non_reserved_name() {
+        // The finding: a token the break-glass principal owns under an
+        // operator-chosen name is exactly as powerful as the reserved one,
+        // and the name-matched sweep left it live through every subsequent
+        // rotation. Ownership is the whole predicate.
+        let reserved = token_row(BOOTSTRAP_ADMIN_TOKEN_NAME, BOOTSTRAP_USER_ID, false);
+        let renamed = token_row("ci-automation", BOOTSTRAP_USER_ID, false);
+        let already_revoked = token_row("stale", BOOTSTRAP_USER_ID, true);
+        let someone_else = token_row("other-user-token", Uuid::new_v4(), false);
+        let repo = Arc::new(PagingTokenRepo::new(vec![
+            reserved.clone(),
+            renamed.clone(),
+            already_revoked.clone(),
+            someone_else.clone(),
+        ]));
+
+        let ids = live_token_ids_for_user(repo.as_ref(), BOOTSTRAP_USER_ID)
+            .await
+            .unwrap();
+        let uc = token_use_case_over(repo.clone());
+        revoke_bootstrap_admin_tokens(
+            &uc,
+            ApiActor {
+                user_id: BOOTSTRAP_USER_ID,
+            },
+            &ids,
+        )
+        .await
+        .unwrap();
+
+        let revoked = repo.revoked();
+        assert!(
+            revoked.contains(&renamed.id),
+            "a non-reserved-name token of the bootstrap principal must be revoked"
+        );
+        assert!(revoked.contains(&reserved.id));
+        // Already-revoked rows are skipped, and another user's token is not
+        // this principal's to revoke.
+        assert!(!revoked.contains(&already_revoked.id));
+        assert!(!revoked.contains(&someone_else.id));
+        assert_eq!(revoked.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rotation_revokes_tokens_beyond_the_first_page() {
+        // The second half of the same finding: the sweep read one page.
+        // Seed more rows than `TOKEN_PAGE_LIMIT` and require the last one —
+        // which only a multi-page walk reaches — to be revoked.
+        let rows: Vec<ApiToken> = (0..(TOKEN_PAGE_LIMIT as usize * 2 + 7))
+            .map(|i| token_row(&format!("token-{i}"), BOOTSTRAP_USER_ID, false))
+            .collect();
+        let last_id = rows.last().unwrap().id;
+        let repo = Arc::new(PagingTokenRepo::new(rows.clone()));
+
+        let ids = live_token_ids_for_user(repo.as_ref(), BOOTSTRAP_USER_ID)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), rows.len());
+        let uc = token_use_case_over(repo.clone());
+        revoke_bootstrap_admin_tokens(
+            &uc,
+            ApiActor {
+                user_id: BOOTSTRAP_USER_ID,
+            },
+            &ids,
+        )
+        .await
+        .unwrap();
+
+        let revoked = repo.revoked();
+        assert_eq!(revoked.len(), rows.len());
+        assert!(
+            revoked.contains(&last_id),
+            "a token past the first page must be revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_token_ids_for_user_is_empty_for_a_principal_with_no_tokens() {
+        // First bootstrap run on a fresh database: nothing to revoke, and
+        // the walk must not bail.
+        let repo = PagingTokenRepo::new(Vec::new());
+        let ids = live_token_ids_for_user(&repo, BOOTSTRAP_USER_ID)
+            .await
+            .unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_token_ids_for_user_bails_when_the_walk_does_not_terminate() {
+        // A repository that ignores `offset` would otherwise spin the CLI
+        // forever — headless, indistinguishable from a hang. The budget
+        // reports an error rather than silently truncating the sweep, which
+        // would leave live full-admin tokens behind while the command
+        // claimed success.
+        struct OffsetIgnoringRepo {
+            page: Vec<ApiToken>,
+        }
+
+        impl ApiTokenRepository for OffsetIgnoringRepo {
+            fn insert(&self, _token: &ApiToken) -> Fut<'_, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn find_by_prefix(&self, _prefix: &str) -> Fut<'_, Option<ApiToken>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn find_by_id(&self, id: Uuid) -> Fut<'_, ApiToken> {
+                Box::pin(async move {
+                    Err(hort_domain::error::DomainError::NotFound {
+                        entity: "ApiToken",
+                        id: id.to_string(),
+                    })
+                })
+            }
+            fn list_for_user(
+                &self,
+                _user_id: Uuid,
+                _page: PageRequest,
+            ) -> Fut<'_, hort_domain::types::Page<ApiToken>> {
+                let items = self.page.clone();
+                Box::pin(async move {
+                    Ok(hort_domain::types::Page {
+                        items,
+                        total: u64::MAX,
+                    })
+                })
+            }
+            fn update_last_used(
+                &self,
+                _token_id: Uuid,
+                _at: chrono::DateTime<chrono::Utc>,
+                _client_ip: Option<&str>,
+                _user_agent: Option<&str>,
+            ) -> Fut<'_, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn revoke(&self, _token_id: Uuid) -> Fut<'_, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let repo = OffsetIgnoringRepo {
+            page: (0..TOKEN_PAGE_LIMIT)
+                .map(|i| token_row(&format!("t{i}"), BOOTSTRAP_USER_ID, false))
+                .collect(),
+        };
+        let err = live_token_ids_for_user(&repo, BOOTSTRAP_USER_ID)
+            .await
+            .expect_err("a non-terminating walk must be reported, not truncated");
+        assert!(
+            err.to_string().contains("did not terminate"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -87,6 +87,19 @@ impl FormatHandler for OciFormatHandler {
         ))
     }
 
+    /// An image carries its layers, so every component an OCI BOM could
+    /// list is code physically inside the artifact — the one format in
+    /// this build for which "my payload contains my components" is a
+    /// positive claim rather than an inherited default. Stated explicitly
+    /// for the same reason as `classify_group_member` below: it puts the
+    /// claim beside the handler that makes it, so the census of which
+    /// formats contain their closure is one grep over these impls rather
+    /// than a list held somewhere else. (The trait default is `true`, and
+    /// nothing consults it for OCI today — this handler extracts no SBOM.)
+    fn payload_contains_components(&self) -> bool {
+        true
+    }
+
     /// Explicit override returning `None` — the trait default would give
     /// the same value, but the explicit override documents the §2.14.2
     /// rationale at the impl site: OCI group attachment is explicit in

@@ -110,7 +110,9 @@ pub enum DomainEvent {
     /// The storage delete completed
     /// (or the blob was confirmed already absent). Terminal event for an
     /// `ArtifactExpired` work item; `refs_remaining` carries the
-    /// post-decrement cross-`kind` refcount. Idempotent (ADR 0028).
+    /// post-decrement claim count for the hash — `content_references`
+    /// rows, or the GC-protected artifacts holding it without one.
+    /// Idempotent (ADR 0028).
     /// Additive on this `#[non_exhaustive]` enum.
     ArtifactPurged(ArtifactPurged),
     /// The artifact was deleted from its repository — the terminal
@@ -579,8 +581,8 @@ impl DomainEvent {
     /// The locus is
     /// `ArtifactDownloaded`: it carries a `repository_id` (lands on
     /// `StreamCategory::DownloadAudit`) and
-    /// [`crate::entities::subscription::EventTypeKind::repository_id`]
-    /// returns `Some(repo)` for it, so the *None-repo*
+    /// [`crate::entities::subscription::EventTypeKind::disclosed_repositories`]
+    /// answers with that repository, so the *no-repository-association*
     /// admin re-check never sees it and it escapes to any `Read` principal
     /// on the repo. Like [`Self::is_authorization_model_mutation`], when
     /// this predicate is `true` the read + subscription gates require
@@ -885,6 +887,7 @@ pub(crate) mod tests {
                     aliases: vec![],
                     informational_class: None,
                     severity_basis: crate::types::SeverityBasis::Assessed,
+                    component_relation: crate::types::ComponentRelation::NotEstablished,
                 }],
                 previously_clean_at: Utc::now(),
             }),

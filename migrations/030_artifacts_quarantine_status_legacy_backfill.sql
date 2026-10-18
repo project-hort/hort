@@ -1,0 +1,169 @@
+-- 030_artifacts_quarantine_status_legacy_backfill.sql
+--
+-- Clear the three legacy scan-state spellings out of
+-- `artifacts.quarantine_status`, so the column holds only values the
+-- domain can classify — and put every row that carried one into the
+-- HELD state, because a spelling the domain cannot classify is the
+-- absence of a scan verdict, not a verdict of "nothing found".
+--
+-- ## What was wrong
+--
+-- The column's CHECK (declared inline in
+-- `003_artifacts_cas.sql`, carried over from the prototype's schema
+-- dump) accepts SEVEN values:
+--
+--     unscanned, clean, flagged, quarantined, released, rejected,
+--     scan_indeterminate
+--
+-- `hort_domain::entities::artifact::QuarantineStatus` models FIVE
+-- states, and the adapter stores `None` as SQL NULL rather than as a
+-- literal, so the set any writer in this tree can actually produce is
+--
+--     NULL, quarantined, released, rejected, scan_indeterminate
+--
+-- `unscanned`, `clean` and `flagged` are prototype-era scan states.
+-- Nothing in this repository's history has ever written one (verified
+-- with `git log -S` over `crates/*/src`); they survive only as values
+-- the CHECK keeps admitting. Until the change this migration
+-- accompanies, the row mapper resolved the disagreement by discarding
+-- the parse error and substituting `QuarantineStatus::None` — which is
+-- the MOST permissive state in the system (`Artifact::is_downloadable`
+-- admits it, and the default `ReleasedOnly` index mode serves it) and
+-- one the column cannot even hold. A row carrying any of the three was
+-- therefore advertised and served with no release authority behind it
+-- and no `ArtifactReleased` in its stream.
+--
+-- The decode now fails closed: an unclassifiable stored status is a
+-- `DomainError::Invariant`, and the read that cannot classify the
+-- artifact fails rather than serve it. That is the correct posture, and
+-- it is also why this backfill has to ship WITH it: a database that
+-- still holds such a row would start failing every read that touches
+-- it — downloads, index serves, the retention sweep (which fails the
+-- whole candidate page, not just the offending row) — the moment the
+-- new code serves. This migration is what makes that state
+-- unreachable.
+--
+-- ## Why the target is `'quarantined'` and not NULL
+--
+-- NULL is the stored spelling of `QuarantineStatus::None`, and `None`
+-- is how every previous release's row mapper already classified these
+-- three values. Writing NULL would therefore be the no-availability-
+-- change rewrite — and that is exactly what makes it wrong. `None` is
+-- the most permissive state in the system, so a NULL backfill would
+-- hand the affected rows the same servability the fail-closed decode
+-- was introduced to take away from them: the codec refuses a legacy
+-- spelling, and the migration would turn it into a valid permissive
+-- one first. For the rows this statement touches the outcome would be
+-- identical to the defect.
+--
+-- The honest reading of a value the domain cannot classify is "no valid
+-- scan verdict is on record for this row". The fail-closed target for
+-- that is HELD, not "nothing holds it".
+--
+-- ### Why `'quarantined'` and not a terminal state
+--
+-- `'rejected'` and `'scan_indeterminate'` are also non-downloadable, and
+-- both are the wrong answer here. They are terminal states (ADR 0007):
+-- `rejected` asserts provably bad content and `scan_indeterminate`
+-- asserts a scan that ran and could not decide, and neither is ever
+-- re-scanned automatically — `PgRescanCandidatesRepository::select_stranded`
+-- selects `quarantine_status = 'quarantined'` and deliberately excludes
+-- both. Recovery from either is an admin override. Nothing incriminating
+-- is known about these rows; asserting a terminal verdict over them
+-- would be the mirror-image error to serving them.
+--
+-- `'quarantined'` is the state ADR 0007 already defines for "held, and
+-- the system will decide later": a scan that fails mid-window leaves the
+-- artifact quarantined and it is re-scanned when the scanner is back,
+-- self-healing with no operator intervention. That is the same shape as
+-- a row whose stored verdict was never readable in the first place:
+--
+--   1. `select_stranded` admits a `'quarantined'` artifact with no
+--      `kind='scan'` job row at all (its `LEFT JOIN LATERAL` yields a
+--      NULL status, which the predicate accepts alongside `'failed'`),
+--      so the stranded-rescan sweep enqueues the scan these rows never
+--      had. It is gated on the resolved policy actually scanning, so a
+--      `scan_backends: []` repository is left alone — there the
+--      `ScanWaived` release authority applies instead.
+--   2. The resulting `ScanCompleted` is the release authority the
+--      fail-closed release predicate requires, so a clean verdict
+--      releases the artifact — inline in `record_scan_result`'s fast
+--      path if the window has already elapsed, otherwise on the next
+--      `release_expired` tick.
+--
+-- Until that happens the artifact is not downloadable and no index
+-- source advertises it, which is the acceptance this migration exists
+-- to meet.
+--
+-- ### The window anchor is part of the state, not a decoration
+--
+-- `'quarantined'` is only coherent with `quarantine_window_start` set.
+-- The anchor is what makes the hold reviewable: the release sweep's
+-- candidacy query filters `quarantine_window_start IS NOT NULL` and
+-- compares `anchor + resolved duration` against now, and
+-- `record_scan_result`'s inline fast path treats an absent anchor as
+-- "window not elapsed". A `'quarantined'` row with a NULL anchor is
+-- therefore held with no exit but an admin override — a terminal state
+-- by accident, which is the outcome this choice rejects. So the
+-- statement stamps the anchor in the same UPDATE.
+--
+-- `created_at` is the anchor: it is the row's ingest instant, and
+-- `ingested_at` is exactly what ADR 0007 names as the window anchor's
+-- default resolution. Anchoring there rather than at `now()` means the
+-- observation window has been running since the artifact arrived
+-- instead of restarting at upgrade time — for a prototype-era row, long
+-- past — so the hold lasts as long as it takes to obtain a verdict and
+-- not a fresh `quarantineDuration` on top of it. `COALESCE` keeps an
+-- anchor the row already carries rather than re-dating the hold.
+--
+-- ### What a rolling upgrade sees
+--
+-- A previous-release binary reads `'quarantined'` as
+-- `QuarantineStatus::Quarantined` — a state it has always understood and
+-- always refused to serve. So the old and the new fleet agree about
+-- these rows for the whole mixed-version window; what changes is that
+-- they stop being served, by both. That is a deliberate availability
+-- change for the affected rows and it is the point of the unit: a
+-- legacy spelling the CHECK happens to accept is not an operator opt-out
+-- of the hold and must not become one. The expected row count is zero on
+-- every install this project has ever cut, so in practice the change is
+-- to the rule rather than to any data.
+--
+-- The UPDATE is written to be a no-op when no row matches, and is
+-- bounded by a sequential scan over a column that is NULL for almost
+-- every row.
+--
+-- ## The CHECK itself is NOT narrowed here
+--
+-- Narrowing the CHECK to the five storable values is a CONTRACTION
+-- under the expand/contract policy (ADR 0030): it removes values the
+-- schema accepted, so it may ship only in a release strictly after the
+-- last one whose code referenced them. `purge_gc::map_status` named all
+-- three until the change this migration accompanies, i.e. up to and
+-- including this release — so the narrowing belongs to the NEXT one.
+-- It is recorded, with that release, under "Scheduled contractions" in
+-- `migrations/CONTRACTIONS.toml`.
+--
+-- Until then the CHECK stays wider than the domain, and the fail-closed
+-- decode is what holds the line: a value outside the storable set
+-- cannot be classified, so it cannot be served.
+--
+-- GRANTs / role wiring: none — this touches no privileges and adds no
+-- object (post-004 default-privileges convention, ADR 0009).
+--
+-- Idempotence: the migration runs exactly once via the
+-- `_sqlx_migrations` ledger. The statement is idempotent anyway — a
+-- second run matches no rows, because the first one left none with a
+-- legacy spelling.
+--
+-- Reversal (sqlx::migrate! is UP-only; no paired *.down.sql): there is
+-- none, and that is deliberate. The pre-state is not recoverable from
+-- the post-state (`'quarantined'` does not record which of the three
+-- spellings it replaced) and it is not worth recovering: the three
+-- values carry no verdict the lifecycle can read, which is why they are
+-- being replaced by the state that says so.
+
+UPDATE public.artifacts
+   SET quarantine_status = 'quarantined',
+       quarantine_window_start = COALESCE(quarantine_window_start, created_at)
+ WHERE quarantine_status IN ('unscanned', 'clean', 'flagged');

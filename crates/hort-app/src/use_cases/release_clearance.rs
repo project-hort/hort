@@ -4,7 +4,7 @@
 //! exactly **one** place here so the two release-gating callers cannot
 //! drift:
 //!
-//! - [`QuarantineUseCase::resolve_provenance_clearance`](crate::use_cases::quarantine_use_case)
+//! - [`QuarantineUseCase::read_path_provenance_clearance`](crate::use_cases::quarantine_use_case)
 //!   — the timer-sweep release path (ADR 0027); and
 //! - the `Rejected`-artifact re-evaluation callers (the policy-mutation
 //!   population pass's loosen direction in
@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, CurationClearance, ProvenanceClearance};
 use hort_domain::entities::scan_policy::ProvenanceMode;
-use hort_domain::events::{DomainEvent, StreamId};
+use hort_domain::events::{DomainEvent, PersistedEvent, StreamId};
 use hort_domain::policy::{evaluate_curation, CurationOutcome};
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::EventStore;
@@ -41,9 +41,25 @@ use crate::use_cases::read_artifact_stream;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
 
 /// Compute the provenance side of the release gate for a candidate
-/// artifact under the given [`ProvenanceMode`] (ADR 0027). This is the
-/// **single source** both the timer sweep and the ADR 0041 re-evaluation
-/// pass call — see the module rustdoc.
+/// artifact under the given [`ProvenanceMode`] (ADR 0027), reading the
+/// artifact stream in front of the verdict — **for a read path only**.
+///
+/// The name says read path because the distinction is load-bearing and a
+/// shorter name hid it. This function is the one place in `hort-app`
+/// where an artifact's stream is read *on behalf of another module*, so
+/// it is the helper a new caller would naturally reach for while
+/// composing "decide release, then append" — and a decision read here and
+/// committed behind a version obtained afterwards is exactly the stale
+/// window [`ArtifactAtVersion`](crate::use_cases::ArtifactAtVersion)
+/// exists to close. Nothing structural can stop that composition from
+/// being *written*; what it can do is stop it from being written
+/// innocently, and this name plus
+/// [`UnpairedAppend`](crate::use_cases::UnpairedAppend) on the version
+/// read is that. A caller that appends takes
+/// [`provenance_clearance_from`] over its pairing instead.
+///
+/// The verdict mapping is the **single source** both the timer sweep and
+/// the ADR 0041 re-evaluation pass reach — see the module rustdoc.
 ///
 /// - `provenance_mode ∈ {Off, VerifyIfPresent}` ⇒
 ///   [`ProvenanceClearance::NotRequired`]. `VerifyIfPresent` never gates
@@ -61,6 +77,11 @@ use crate::use_cases::repository_access::RepositoryAccessUseCase;
 /// `NotRequired`); this helper owns only the stream read + the verdict
 /// mapping so the two callers cannot diverge.
 ///
+/// Two entry points, one predicate: [`provenance_clearance_from`] is the
+/// verdict mapping and this is the read in front of it, for the callers
+/// that only ask the question and append nothing behind it (a read-path
+/// candidacy check, a transient-hold `Retry-After`).
+///
 /// The `Required` arm reads the artifact stream in full via
 /// [`read_artifact_stream`](crate::use_cases::read_artifact_stream): an
 /// over-cap stream surfaces as an error rather than as a `Pending` that
@@ -68,27 +89,47 @@ use crate::use_cases::repository_access::RepositoryAccessUseCase;
 /// fail-closed for release, but only the error is honest — and the
 /// difference matters where this same resolution feeds an operator-facing
 /// answer (the transient-hold `Retry-After` on the read path).
-pub(crate) async fn resolve_provenance_clearance(
+pub(crate) async fn read_path_provenance_clearance(
     events: &dyn EventStore,
     artifact_id: Uuid,
     mode: ProvenanceMode,
 ) -> AppResult<ProvenanceClearance> {
     match mode {
-        // VerifyIfPresent never gates release; Off is inert.
+        // VerifyIfPresent never gates release; Off is inert — and
+        // neither needs the stream, so neither pays for the read.
         ProvenanceMode::Off | ProvenanceMode::VerifyIfPresent => {
             Ok(ProvenanceClearance::NotRequired)
         }
         ProvenanceMode::Required => {
             let stream_id = StreamId::artifact(artifact_id);
             let persisted = read_artifact_stream(events, &stream_id).await?;
-            let verified = persisted
+            Ok(provenance_clearance_from(&persisted, mode))
+        }
+    }
+}
+
+/// The verdict mapping itself, over a stream the caller already holds.
+///
+/// This is the **single** place the provenance leg of the release gate is
+/// decided; [`read_path_provenance_clearance`] is this function behind a
+/// read. Every release-gating caller lands here, so the two computations
+/// that drifted once (the timer sweep's and the re-evaluation pass's)
+/// cannot drift again.
+pub(crate) fn provenance_clearance_from(
+    stream: &[PersistedEvent],
+    mode: ProvenanceMode,
+) -> ProvenanceClearance {
+    match mode {
+        ProvenanceMode::Off | ProvenanceMode::VerifyIfPresent => ProvenanceClearance::NotRequired,
+        ProvenanceMode::Required => {
+            let verified = stream
                 .iter()
                 .any(|e| matches!(e.event, DomainEvent::ProvenanceVerified(_)));
-            Ok(if verified {
+            if verified {
                 ProvenanceClearance::Cleared
             } else {
                 ProvenanceClearance::Pending
-            })
+            }
         }
     }
 }
@@ -195,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn off_is_not_required() {
         let events = Arc::new(MockEventStore::new());
-        let out = resolve_provenance_clearance(&*events, Uuid::new_v4(), ProvenanceMode::Off)
+        let out = read_path_provenance_clearance(&*events, Uuid::new_v4(), ProvenanceMode::Off)
             .await
             .unwrap();
         assert_eq!(out, ProvenanceClearance::NotRequired);
@@ -205,10 +246,13 @@ mod tests {
     #[tokio::test]
     async fn verify_if_present_is_not_required() {
         let events = Arc::new(MockEventStore::new());
-        let out =
-            resolve_provenance_clearance(&*events, Uuid::new_v4(), ProvenanceMode::VerifyIfPresent)
-                .await
-                .unwrap();
+        let out = read_path_provenance_clearance(
+            &*events,
+            Uuid::new_v4(),
+            ProvenanceMode::VerifyIfPresent,
+        )
+        .await
+        .unwrap();
         assert_eq!(out, ProvenanceClearance::NotRequired);
     }
 
@@ -225,7 +269,7 @@ mod tests {
                 persisted(sid.clone(), 1, verified_event(artifact_id)),
             ],
         );
-        let out = resolve_provenance_clearance(&*events, artifact_id, ProvenanceMode::Required)
+        let out = read_path_provenance_clearance(&*events, artifact_id, ProvenanceMode::Required)
             .await
             .unwrap();
         assert_eq!(out, ProvenanceClearance::Cleared);
@@ -241,7 +285,7 @@ mod tests {
             &sid,
             vec![persisted(sid.clone(), 0, other_event(artifact_id))],
         );
-        let out = resolve_provenance_clearance(&*events, artifact_id, ProvenanceMode::Required)
+        let out = read_path_provenance_clearance(&*events, artifact_id, ProvenanceMode::Required)
             .await
             .unwrap();
         assert_eq!(out, ProvenanceClearance::Pending);
@@ -251,9 +295,10 @@ mod tests {
     #[tokio::test]
     async fn required_empty_stream_is_pending() {
         let events = Arc::new(MockEventStore::new());
-        let out = resolve_provenance_clearance(&*events, Uuid::new_v4(), ProvenanceMode::Required)
-            .await
-            .unwrap();
+        let out =
+            read_path_provenance_clearance(&*events, Uuid::new_v4(), ProvenanceMode::Required)
+                .await
+                .unwrap();
         assert_eq!(out, ProvenanceClearance::Pending);
     }
 
@@ -284,15 +329,26 @@ mod tests {
             ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
                 Box::pin(async { unreachable!("read_category not exercised") })
             }
-            fn delete_stream(&self, _s: StreamId) -> BoxFuture<'_, DomainResult<()>> {
+            fn delete_stream(
+                &self,
+                _s: StreamId,
+                _authority: hort_domain::ports::event_store::SealAuthority,
+            ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>>
+            {
                 Box::pin(async { unreachable!() })
             }
-            fn archive_stream(&self, _s: StreamId, _t: &str) -> BoxFuture<'_, DomainResult<()>> {
+            fn archive_stream(
+                &self,
+                _s: StreamId,
+                _t: &str,
+                _authority: hort_domain::ports::event_store::SealAuthority,
+            ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>>
+            {
                 Box::pin(async { unreachable!() })
             }
         }
         let events = FailingReadStore;
-        let err = resolve_provenance_clearance(&events, Uuid::new_v4(), ProvenanceMode::Required)
+        let err = read_path_provenance_clearance(&events, Uuid::new_v4(), ProvenanceMode::Required)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("event store down"));

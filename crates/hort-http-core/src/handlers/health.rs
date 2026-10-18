@@ -74,7 +74,7 @@ mod tests {
     use hort_domain::error::{DomainError, DomainResult};
     use hort_domain::events::{PersistedEvent, StreamCategory, StreamId};
     use hort_domain::ports::event_store::{
-        AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
+        AppendEvents, AppendResult, EventStore, ReadFrom, SealAuthority, SealOutcome, SubscribeFrom,
     };
     use hort_domain::ports::BoxFuture;
 
@@ -120,7 +120,11 @@ mod tests {
         }
 
         // not exercised by /readyz tests
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
             Box::pin(async { unimplemented!("not exercised by /readyz tests") })
         }
 
@@ -129,7 +133,8 @@ mod tests {
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
+            _authority: SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
             Box::pin(async { unimplemented!("not exercised by /readyz tests") })
         }
     }

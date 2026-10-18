@@ -24,7 +24,10 @@ use hort_app::gitops_apply_status::GitopsApplyStatus;
 use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUseCase;
 use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
+use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
+use hort_app::use_cases::list_deliverability::ListDeliverabilityUseCase;
+use hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeUseCase;
 use hort_app::use_cases::pat_cache::PatCache;
@@ -306,12 +309,14 @@ pub struct AppContext {
     /// collapse, and conflict detection (`status IN
     /// ('pending','running')`) all live inside the use case.
     pub manual_rescan_use_case: Arc<ManualRescanUseCase>,
-    /// Admin-only read of the patch-candidate
+    /// Curator-or-admin read of the patch-candidate
     /// quarantine surface (`GET /admin/quarantine/patch-candidates`).
-    /// The use case enforces `Permission::Admin` (defence in depth —
-    /// the `AdminPrincipal` extractor enforces the same gate at the
-    /// request edge) and clamps `filter.limit` at 500 before reaching
-    /// the adapter.
+    /// The use case enforces `Permission::Curate` OR `Permission::Admin`
+    /// (defence in depth — the `CurateOrAdminPrincipal` extractor
+    /// enforces the same gate at the request edge) and clamps
+    /// `filter.limit` at 500 before reaching the adapter. The gate
+    /// matches the manual release this listing feeds, which one
+    /// authority owns (ADR 0007).
     pub patch_candidate_use_case: Arc<PatchCandidateUseCase>,
     /// Admin-only read of the `scanner_registry` worker table
     /// (`GET /api/v1/admin/workers`). The use case enforces
@@ -391,6 +396,50 @@ pub struct AppContext {
     /// composition wiring has not landed — the field is unwired in
     /// production and only the mock test harness populates it.
     pub subscription_use_case: Arc<SubscriptionUseCase>,
+    /// The repository-visibility primitive for the
+    /// `GET /api/v1/events` read gate (`hort-http-events`), shared with
+    /// the notification dispatcher's subscription filter.
+    ///
+    /// The handler needs it because the post-ingest artifact lifecycle
+    /// carries no repository column: `ArtifactQuarantined`,
+    /// `ScanCompleted`, `ArtifactReleased` and their siblings name the
+    /// artifact, and the artifact aggregate owns the repository. Without
+    /// resolving that, the per-event repo filter has nothing to check a
+    /// non-admin caller's `Read` grants against. The use case resolves a
+    /// whole page in one round trip, which is why the handler holds the
+    /// use case rather than the `pub(crate)` `artifacts` port (ADR 0008)
+    /// — and why the resolution is not per event.
+    pub event_visibility_use_case: Arc<EventVisibilityUseCase>,
+    /// "Is every artifact in this manifest's closure still deliverable?"
+    /// — ADR 0062's constituent half, for the OCI manifest read paths.
+    ///
+    /// The format crate holds the **use case**, not the ports behind it,
+    /// and both halves of that matter here (ADR 0008). The answer needs
+    /// the manifest's own CAS bytes — `ctx.storage` is `pub(crate)` — and
+    /// a catalog read the artifact ports do not expose as one statement;
+    /// resolving either from `hort-http-oci` would reach past the use
+    /// case. Keeping the walk here also keeps it single-sourced: `GET`
+    /// and `HEAD` cannot drift, and a second format that ever serves an
+    /// immutable multi-part document resolves it the same way.
+    pub manifest_deliverability_use_case: Arc<ManifestDeliverabilityUseCase>,
+    /// "Which of the manifests this document is about to name would the
+    /// pull refuse?" — ADR 0062's **omission** half, for the OCI
+    /// surfaces hort builds out of manifest digests (the referrers
+    /// index, `tags/list`).
+    ///
+    /// The sibling above answers the same question about **one**
+    /// manifest and resolves its closure from the bytes its caller is
+    /// already holding. This one answers it about a **set**, and
+    /// resolves the closure from the membership projection, because a
+    /// list surface holds no bytes and the same derivation there would
+    /// be N round trips. The split is the decision, not an
+    /// inconsistency — see the use case's module doc.
+    ///
+    /// The format crate holds the **use case**, not the census port
+    /// behind it (ADR 0008): `ctx.content_references` is `pub(crate)`,
+    /// and the walk is not a projection read a format crate could
+    /// assemble from it in one statement anyway.
+    pub list_deliverability_use_case: Arc<ListDeliverabilityUseCase>,
     /// Curator decision authority over quarantined
     /// / non-terminal artifacts. The inbound HTTP adapter
     /// (`handlers/admin/curation/`) calls
@@ -763,14 +812,25 @@ pub struct AppContext {
     /// `rate_limit_config`.
     pub http_timeout_config: crate::middleware::request_timeout::HttpTimeoutConfig,
     /// Per-publish body-size ceiling applied to
-    /// PyPI and npm publish routes via `DefaultBodyLimit::max`. `None`
+    /// the npm, PyPI and Maven publish routes via
+    /// `DefaultBodyLimit::max`. `None`
     /// means "use the shared default" ([`crate::limits::DEFAULT_PUBLISH_BODY_LIMIT`],
     /// 300 MiB). `Some(n)` comes from the `HORT_PUBLISH_BODY_MAX_SIZE`
     /// env var parsed by `hort-server::config::Config`.
     ///
-    /// Cargo is deliberately NOT driven by this field; it keeps its
-    /// own fixed 200 MiB ceiling via
-    /// [`crate::limits::CARGO_PUBLISH_BODY_LIMIT`].
+    /// Cargo's *ceiling* is deliberately NOT driven by this field; it
+    /// keeps its own fixed 200 MiB via
+    /// [`crate::limits::CARGO_PUBLISH_BODY_LIMIT`]. The OCI push path
+    /// takes no ceiling from it at all — it bounds each upload chunk
+    /// through its own session accounting.
+    ///
+    /// `Some(0)` is not a ceiling but the refuse-all-publishes kill
+    /// switch. It reaches Cargo via
+    /// [`crate::limits::cargo_publish_body_limit`] and OCI via
+    /// `oci_routes_with_publish_limit`, and the refusal itself —
+    /// `503`, publish methods only, no `Retry-After` — comes from
+    /// [`crate::limits::refuse_publishes_when_disabled`] rather than
+    /// from `DefaultBodyLimit`.
     pub publish_body_limit_bytes: Option<usize>,
     /// Per-version-object byte cap inside
     /// the streaming JSON projectors (npm `versions{}` value, PyPI
@@ -930,6 +990,12 @@ pub struct AppContextParts {
     pub rbac_resolve_use_case: Arc<RbacResolveUseCase>,
     /// See [`AppContext::subscription_use_case`].
     pub subscription_use_case: Arc<SubscriptionUseCase>,
+    /// See [`AppContext::event_visibility_use_case`].
+    pub event_visibility_use_case: Arc<EventVisibilityUseCase>,
+    /// See [`AppContext::manifest_deliverability_use_case`].
+    pub manifest_deliverability_use_case: Arc<ManifestDeliverabilityUseCase>,
+    /// See [`AppContext::list_deliverability_use_case`].
+    pub list_deliverability_use_case: Arc<ListDeliverabilityUseCase>,
 
     /// See [`AppContext::curation_use_case`].
     pub curation_use_case: Arc<CurationUseCase>,
@@ -1058,6 +1124,9 @@ impl AppContext {
             effective_permissions_use_case: parts.effective_permissions_use_case,
             rbac_resolve_use_case: parts.rbac_resolve_use_case,
             subscription_use_case: parts.subscription_use_case,
+            event_visibility_use_case: parts.event_visibility_use_case,
+            manifest_deliverability_use_case: parts.manifest_deliverability_use_case,
+            list_deliverability_use_case: parts.list_deliverability_use_case,
             curation_use_case: parts.curation_use_case,
             provenance_misrejection_repair_use_case: parts.provenance_misrejection_repair_use_case,
             policy_use_case: parts.policy_use_case,

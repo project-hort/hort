@@ -109,7 +109,7 @@ pub fn parse_oidc_issuer(
     _path: &Path,
     bytes: &[u8],
 ) -> Result<Envelope<OidcIssuerSpec>, ParseError> {
-    let env: Envelope<OidcIssuerSpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<OidcIssuerSpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::OidcIssuer {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),

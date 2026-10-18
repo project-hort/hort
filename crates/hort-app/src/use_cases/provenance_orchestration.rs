@@ -22,15 +22,29 @@
 //!
 //! # Fail-closed semantics
 //!
-//! - Under [`ProvenanceMode::Required`], a bundle-fetch / CAS-read failure
-//!   that retries cannot resolve → fold to
-//!   `ProvenanceRejected{RekorNotFound}` so a **never-verified** `Required`
-//!   artifact never timer-releases (it stays `Pending` in the release
-//!   sweep's clearance computation).
+//! - A bundle-fetch / CAS-read failure that retries cannot resolve is
+//!   `Indeterminate{AttestationFetchFailed}` in every mode — the material
+//!   was never seen, so nothing about the artifact was established.
+//!   Under [`ProvenanceMode::Required`] the artifact HOLDS: no event, so
+//!   a **never-verified** `Required` artifact still never timer-releases
+//!   (it stays `Pending` in the release sweep's clearance computation).
+//!   Fail-closed, and not terminal — terminality needs a positive
+//!   disproof (ADR 0039 D2/D4).
+//! - A dispatched verifier that returns `Err` — an adapter fault, a
+//!   trust root that cannot build a verifier, a subject-payload
+//!   mismatch — is `Indeterminate{VerifierUnavailable}`, again in every
+//!   mode: it returned no verdict, so nothing about the artifact was
+//!   established. The consequence is the fetch failure's, for the same
+//!   reason. It contributes a verdict rather than nothing, so that an
+//!   all-verifiers-errored run does not fold to `NoAttestation` and
+//!   report an unsigned artifact for a fault of ours.
 //! - Under [`ProvenanceMode::VerifyIfPresent`], the same unresolved
-//!   infra/fetch failure **degrades to `NoAttestation` (allow)** — it must
-//!   NEVER make the proxy fail-closed on flakiness. `VerifyIfPresent` only
-//!   ever *adds* a rejection on a forged/untrusted signature.
+//!   infra/fetch/verifier failure is allowed through — it must NEVER make
+//!   the proxy fail-closed on flakiness — and reports
+//!   `allowed_indeterminate` rather than the allowed-unsigned value, so
+//!   an unreachable upstream does not read as an unsigned artifact.
+//!   `VerifyIfPresent` only ever *adds* a rejection on a forged/untrusted
+//!   signature.
 //! - [`ProvenanceMode::Off`] never enqueues a `provenance-verify` job
 //!   (the gate is at ingest-enqueue time); the orchestrator returns a
 //!   no-op skip if it is ever invoked for an `Off` policy.
@@ -53,13 +67,15 @@ use hort_domain::entities::scan_policy::ProvenanceMode;
 use hort_domain::events::{system_actor, ArtifactIngested, DomainEvent, IngestSource};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
-use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
+use hort_domain::ports::content_reference_index::{
+    ContentReference, ContentReferenceClaim, ContentReferenceIndex,
+};
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::provenance::{
-    AttestationBundle, ProvenancePort, ProvenanceRejectReason, ProvenanceRequirements,
-    ProvenanceSubject, ProvenanceVerdict,
+    AttestationBundle, IndeterminateReason, ProvenancePort, ProvenanceRejectReason,
+    ProvenanceRequirements, ProvenanceSubject, ProvenanceVerdict,
 };
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping;
@@ -74,7 +90,9 @@ use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::provenance_cascade::ProvenanceCascade;
-use crate::use_cases::read_expected_version;
+use crate::use_cases::{
+    read_unpaired_append_version, ArtifactAtVersion, OverCapStream, UnpairedAppend,
+};
 
 /// The `kind` filter used to read cosign attestation bundles off the
 /// content-reference / OCI Referrers surface. A cosign signature manifest
@@ -84,9 +102,10 @@ const OCI_SUBJECT_KIND: &str = "oci_subject";
 
 /// Number of attempts (1 initial + N-1 retries) the orchestrator makes to
 /// fetch the bundle set / read the CAS preimage before giving up. On
-/// exhaustion the mode decides: `Required` → fail-closed
-/// `Rejected{RekorNotFound}`; `VerifyIfPresent` → degrade to
-/// `NoAttestation` (allow).
+/// exhaustion the verdict is `Indeterminate{AttestationFetchFailed}`
+/// whatever the mode; the mode decides only the consequence (`Required` →
+/// a hold, `VerifyIfPresent` / `Off` → allowed through). See
+/// `apply_fetch_failure`.
 const FETCH_ATTEMPTS: u32 = 3;
 
 /// Bounded grace window (issue #90 defense-in-depth) — see `apply_verdict`.
@@ -99,10 +118,18 @@ const FETCH_ATTEMPTS: u32 = 3;
 /// dual-commit path exhibiting the same symptom, and against clock/replica
 /// skew. A steady-state PERMISSIVE artifact (`quarantine_duration_secs ==
 /// 0`) shows the identical shape forever, so the window must stay short:
-/// generous enough for a couple of the dispatcher's own retries
-/// (`DEFAULT_BACKOFF_SECS = 30`, doubling) to land, short enough that a
-/// permissive artifact still resolves to its correct terminal decision
-/// within a few minutes, not indefinitely.
+/// generous enough for at least one of the dispatcher's own retries to
+/// land inside it, short enough that a permissive artifact still resolves
+/// to its correct terminal decision within a few minutes, not
+/// indefinitely.
+///
+/// The gate is the artifact's *age*, not a retry count, so the shared
+/// retry curve (`crate::retry_backoff::compute_backoff`) decides only
+/// how much of the attempt budget the window costs. At its 1/5/30/60-min
+/// shape a requeued verify re-runs at ~60 s — inside the window — and
+/// again at ~360 s, by which point the artifact is past it and the
+/// verdict is applied: two of five attempts spent, leaving budget for a
+/// genuine infrastructure failure afterwards.
 const PROVENANCE_ANCHOR_GRACE_SECS: i64 = 300;
 
 /// The verdict reached on an `Applied` run, surfaced to the task handler
@@ -121,9 +148,9 @@ pub enum ProvenanceVerdictSummary {
     /// A trusted signature was verified (`ProvenanceVerified` emitted).
     Verified,
     /// A typed rejection (`ProvenanceRejected` + its `ArtifactRejected`
-    /// companion emitted), carrying the typed reason. Covers a verifier's
-    /// positive disproof and the fail-closed `Rejected{RekorNotFound}`
-    /// fetch-exhaustion path.
+    /// companion emitted), carrying the typed reason. Only ever a
+    /// verifier's **positive disproof** about material it could read: a
+    /// fetch that never landed holds instead (ADR 0039 D4).
     Rejected(ProvenanceRejectReason),
     /// No bundle was found / passed and the mode allowed it
     /// (`VerifyIfPresent`/`Off` no-op, no event) — a previously-silent
@@ -142,6 +169,27 @@ pub enum ProvenanceVerdictSummary {
     /// it via the cascade or the late-joiner self-clear, which is a
     /// different operator action (push/sign the parent, not this row).
     HeldPendingSubject,
+    /// A `Required`-mode artifact whose verification **could not be
+    /// carried out**: no event, status stays `Quarantined` (HELD).
+    /// Distinct from the two above because the thing to fix is on *our*
+    /// side — a trust root with no usable key, attestation material that
+    /// could never be fetched, a verifier that returned no verdict — and
+    /// nothing about the artifact was established, so nothing was
+    /// disproved (ADR 0039 D4).
+    HeldIndeterminate,
+    /// The same could-not-check verdict under `VerifyIfPresent` / `Off`:
+    /// no event, status unchanged, and the artifact runs its normal
+    /// quarantine window and releases. **Not** a hold.
+    ///
+    /// Distinct from [`Self::NoAttestation`] for the reason that value
+    /// could not carry: `no_attestation` says the artifact has no
+    /// signature, and here the artifact's signature is not what failed —
+    /// our trust root had no usable key, the material never arrived, or
+    /// our verifier returned no verdict. An operator reading "allowed
+    /// unsigned" off a permissive scope whose upstream is unreachable
+    /// goes looking at the publisher's signing pipeline, the one place
+    /// the fault is not.
+    AllowedIndeterminate,
 }
 
 /// Result of a single `verify` invocation, before the job row is closed.
@@ -171,6 +219,31 @@ pub enum ProvenanceRunOutcome {
     Applied {
         event_appended: bool,
         verdict: ProvenanceVerdictSummary,
+        /// How many candidates the verifier(s) skipped as unreadable
+        /// while reaching this verdict — the sum across every verifier
+        /// that ran (see
+        /// [`ProvenanceVerdict::unreadable_skipped`](hort_domain::ports::provenance::ProvenanceVerdict::unreadable_skipped)).
+        /// Carried so the job's `result_summary` can name it: the
+        /// material was not *considered*, which must not become not
+        /// *noticed*. Reporting only — it gates nothing.
+        unreadable_skipped: u32,
+    },
+    /// The artifact is the **signature material of a subject the
+    /// verifier accepts** (ADR 0039 D8): the folded verdict was
+    /// `NoAttestation` under `Required`, and a signature manifest that
+    /// binds this artifact's digest had its bundle verified against the
+    /// subject it names. A cascaded `ProvenanceVerified` was committed —
+    /// so no hold was applied and no `NoAttestation` verdict reached
+    /// `complete_provenance`. Distinct from
+    /// [`Self::Applied`]`{verdict: Verified}` because this artifact holds
+    /// no direct verification of its own: the authority is another
+    /// artifact's signature, recorded in the event's `cascaded_from`.
+    ClearedAsSignatureMaterial {
+        /// The skip count from the folded verdict, carried for the same
+        /// reason [`Self::Applied`] carries it: this path returns before
+        /// `apply_verdict`, and a candidate someone attached to a
+        /// signature payload must still be reported.
+        unreadable_skipped: u32,
     },
     /// Defense-in-depth bounded requeue (issue #90): a `NoAttestation`
     /// verdict under `Required` on a `None`-status, anchor-less,
@@ -182,24 +255,35 @@ pub enum ProvenanceRunOutcome {
     RequeuedNoAnchor,
 }
 
-/// What a `NoAttestation × Required` HOLD is waiting for.
+/// What a HOLD under `Required` is waiting for.
 ///
-/// **Reporting only — never a gate.** A `NoAttestation` verdict holds
-/// unconditionally (ADR 0039's 2026-09-12 amendment, D1/D3); this type
-/// decides nothing about the outcome, it only says *what the operator is
-/// waiting for*, which under D4's indefinite hold is the one thing the
-/// observability has to answer: `PendingSignature` means "this artifact
-/// may still be signed" (sign it); `PendingSubject` means "this artifact
-/// will never be signed on its own — its subject must arrive and clear
-/// it" (push/sign the parent). Keeping the mapping to the log line, the
-/// metric label and the job's `result_summary` on one type is what stops
-/// the three from drifting apart.
+/// **Reporting only — never a gate.** Both held verdicts hold
+/// unconditionally — `NoAttestation` under ADR 0039's 2026-09-12 amendment
+/// (D1/D3), `Indeterminate` under D4 — so this type decides nothing about
+/// the outcome; it only says *what the operator is waiting for*, which
+/// under D4's indefinite hold is the one thing the observability has to
+/// answer: `PendingSignature` means "this artifact may still be signed"
+/// (sign it); `PendingSubject` means "this artifact will never be signed
+/// on its own — its subject must arrive and clear it" (push/sign the
+/// parent); `Indeterminate` means "we could not check" (fix the trust
+/// root or the verifier, or the fetch will be retried) — the only one of
+/// the three whose action is on *our* side rather than the publisher's.
+/// Keeping the mapping to the log line, the metric label and the job's
+/// `result_summary` on one type is what stops the three from drifting
+/// apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HoldReason {
     /// A subject — a row that could carry an attestation of its own.
     PendingSignature,
     /// A constituent that can never carry its own attestation.
     PendingSubject,
+    /// The check could not be carried out at all — nothing about the
+    /// artifact was established, so nothing was disproved. Carries no
+    /// [`hort_domain::ports::provenance::IndeterminateReason`]: the
+    /// operator answer is the same for all of them ("we could not
+    /// check"), and the specific reason rides the verdict's own audit
+    /// trail rather than splitting a reporting label three ways.
+    Indeterminate,
 }
 
 impl HoldReason {
@@ -207,6 +291,7 @@ impl HoldReason {
         match self {
             Self::PendingSignature => crate::metrics::ProvenanceVerifyResult::HeldPendingSignature,
             Self::PendingSubject => crate::metrics::ProvenanceVerifyResult::HeldPendingSubject,
+            Self::Indeterminate => crate::metrics::ProvenanceVerifyResult::HeldIndeterminate,
         }
     }
 
@@ -214,6 +299,7 @@ impl HoldReason {
         match self {
             Self::PendingSignature => ProvenanceVerdictSummary::HeldPendingSignature,
             Self::PendingSubject => ProvenanceVerdictSummary::HeldPendingSubject,
+            Self::Indeterminate => ProvenanceVerdictSummary::HeldIndeterminate,
         }
     }
 
@@ -228,6 +314,86 @@ impl HoldReason {
                  attestation of its own and is cleared by its subject's cascade or the \
                  late-joiner self-clear)"
             }
+            Self::Indeterminate => {
+                "provenance held — the check could not be carried out (Required; no usable \
+                 trust-root key, attestation material that could not be fetched, or a \
+                 verifier that returned no verdict. Nothing about the artifact was \
+                 established, so nothing is terminal: fix the trust root or the verifier, \
+                 or the fetch is retried)"
+            }
+        }
+    }
+}
+
+/// What an **empty event batch** from [`Artifact::complete_provenance`]
+/// has to report — the one question the batch cannot answer about itself.
+///
+/// The domain emits the identical (absent) transition for an unsigned
+/// artifact and for a check that could not be carried out, under every
+/// mode: `Required` holds, `VerifyIfPresent` / `Off` allow. Four readings,
+/// one shape. By the time the batch comes back the verdict has been moved
+/// into the domain, so the outcome × mode reading is taken *before* the
+/// call and carried here.
+///
+/// It exists rather than a bare `Option<HoldReason>` because the
+/// permissive half needs the same separation the held half got. A
+/// `VerifyIfPresent` scope whose trust root is unusable, or whose
+/// attestation material never arrived, must not report the
+/// allowed-unsigned value: that names the **artifact's** state when the
+/// fault is on *our* side, and sends an operator to the publisher's
+/// signer instead of to their own provisioning. Both reportings live on
+/// one type for the reason [`HoldReason`]'s three do — a reading that
+/// reached the metric and not the job row, or the reverse, would show up
+/// in a dashboard and not in the forensic trail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoEventReport {
+    /// A `Required`-mode HOLD — [`HoldReason`] says which, and owns the
+    /// operator-facing wording.
+    Held(HoldReason),
+    /// `VerifyIfPresent` / `Off` let an unsigned artifact through: the
+    /// allowed-unsigned no-op.
+    AllowedUnsigned,
+    /// `VerifyIfPresent` / `Off` let through an artifact whose check
+    /// could not be carried out at all. The artifact proceeds exactly as
+    /// the unsigned case does — normal quarantine window, normal release
+    /// — and the reporting is the only thing that differs, which is the
+    /// whole point of the value.
+    AllowedIndeterminate,
+}
+
+impl NoEventReport {
+    fn metric_result(self) -> crate::metrics::ProvenanceVerifyResult {
+        match self {
+            Self::Held(reason) => reason.metric_result(),
+            Self::AllowedUnsigned => crate::metrics::ProvenanceVerifyResult::NoAttestation,
+            Self::AllowedIndeterminate => {
+                crate::metrics::ProvenanceVerifyResult::AllowedIndeterminate
+            }
+        }
+    }
+
+    fn verdict_summary(self) -> ProvenanceVerdictSummary {
+        match self {
+            Self::Held(reason) => reason.verdict_summary(),
+            Self::AllowedUnsigned => ProvenanceVerdictSummary::NoAttestation,
+            Self::AllowedIndeterminate => ProvenanceVerdictSummary::AllowedIndeterminate,
+        }
+    }
+
+    /// The `info!` line, present **only** for a hold.
+    ///
+    /// `None` is a decision, not an omission: a hold is an operator audit
+    /// signal (an image that is not yet clearable), while the allowed
+    /// paths run at proxy scale on every unsigned pull-through and would
+    /// be a firehose. Their rate signal is the counter and their
+    /// per-artifact trail is the job's `result_summary`; the one allowed
+    /// reading with something specific to say — a fetch that failed —
+    /// already carries its own `warn!` naming the stage and the error,
+    /// which no line here could reproduce.
+    fn log_message(self) -> Option<&'static str> {
+        match self {
+            Self::Held(reason) => Some(reason.log_message()),
+            Self::AllowedUnsigned | Self::AllowedIndeterminate => None,
         }
     }
 }
@@ -315,43 +481,44 @@ impl ProvenanceOrchestrationUseCase {
     /// the verifier(s), and threads the folded verdict through
     /// [`Artifact::complete_provenance`], persisting the event (if any).
     pub async fn verify_artifact(&self, artifact_id: Uuid) -> AppResult<ProvenanceRunOutcome> {
-        let artifact = self.artifacts.find_by_id(artifact_id).await?;
-
-        // Read the expected stream version HERE — paired with the load
-        // above, BEFORE the bundle-fetch / CAS-preimage / verifier round
-        // trip below (issue #108 H2a). Reading it late (at commit time,
-        // where it used to live) meant a scan verdict that committed
-        // `ArtifactRejected` during that round trip was ALREADY in the
-        // version we then read, so the provenance append did not conflict
-        // — and `complete_provenance(Verified)`, working from the
-        // stale-loaded `Quarantined`, wrote that status back over
+        // Pair the artifact load with the version this verify's append
+        // will carry, BEFORE the bundle-fetch / CAS-preimage / verifier
+        // round trip below. See `ArtifactAtVersion`'s contract: read the
+        // version at commit time instead, and a scan verdict that
+        // committed `ArtifactRejected` during that round trip is ALREADY
+        // in the version read — so the provenance append does not
+        // conflict, and `complete_provenance(Verified)`, working from the
+        // stale-loaded `Quarantined`, writes that status back over
         // `Rejected`, resurrecting a rejected artifact into a
-        // timer-releasable state. Anchored to the load, a concurrent
-        // verdict's append now makes THIS append fail `Conflict` and the
-        // paired projection write never runs.
+        // timer-releasable state.
         //
         // Nothing between here and the commit appends to THIS stream:
         // the referrer-landing path (`commit_referrer_manifest`) mints a
         // NEW artifact id and appends to its own stream, and the cascade
         // runs only after this artifact's own verdict has committed.
         //
-        // Mirrors `policy_use_case.rs`'s early-read shape (warn on read
-        // error), but PROPAGATES instead of skipping: that is a bulk
-        // re-evaluation pass where one artifact is skippable, whereas
-        // this is a single-artifact job — returning `Err` fails the job
-        // so the dispatcher retries it, rather than silently reporting a
-        // verify that never happened.
-        let stream_id = hort_domain::events::StreamId::artifact(artifact_id);
-        let expected_version = read_expected_version(&*self.events, &stream_id, false)
-            .await
-            .inspect_err(|e| {
-                tracing::warn!(
-                    artifact_id = %artifact_id,
-                    error = %e,
-                    "provenance verify: expected-version read failed; aborting this artifact \
-                     (job retries)",
-                );
-            })?;
+        // `Err` PROPAGATES instead of skipping: this is a
+        // single-artifact job, so failing it makes the dispatcher retry
+        // rather than silently report a verify that never happened (the
+        // bulk re-evaluation pass, where one artifact is skippable, logs
+        // and continues instead).
+        let paired = ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Tolerate,
+        )
+        .await
+        .inspect_err(|e| {
+            tracing::warn!(
+                artifact_id = %artifact_id,
+                error = %e,
+                "provenance verify: artifact/expected-version pairing failed; aborting this \
+                 artifact (job retries)",
+            );
+        })?;
+        let expected_version = paired.expected_version();
+        let artifact = paired.into_artifact();
 
         let repo = self.repositories.find_by_id(artifact.repository_id).await?;
         let format = repo.format.to_string();
@@ -476,15 +643,15 @@ impl ProvenanceOrchestrationUseCase {
 
         // Fetch the attestation bundles off the OCI Referrers /
         // content-reference surface (possibly empty), with bounded
-        // retries. A fetch failure that retries cannot resolve folds to a
-        // mode-dependent verdict (Required → fail-closed; VerifyIfPresent
-        // → allow).
+        // retries. A fetch failure that retries cannot resolve folds to
+        // one verdict in every mode — `Indeterminate`, "we could not
+        // look" — and the mode decides only whether that holds.
         // The backend label for the metrics. Tier-1 is a single verifier
         // (cosign); for a future multi-verifier set the first applicable
         // port names the metric series — the representative backend that
         // ran for this format. Captured before any fetch-failure
-        // early-return so the fail-closed / degrade verdicts carry the
-        // same label.
+        // early-return so the indeterminate verdict carries the same
+        // label.
         let backend = applicable[0].name().to_string();
 
         let mut bundles = match self
@@ -513,9 +680,8 @@ impl ProvenanceOrchestrationUseCase {
         // narrow create, then re-read the local bundle set once. A
         // hosted repo (`resolve → None`) with no local bundle is left
         // unchanged (nothing to fetch → stays `NoAttestation`). An upstream
-        // fetch error follows the SAME `apply_fetch_failure` arm as a local
-        // bundle-fetch failure (VerifyIfPresent → degrade-to-allow; Required →
-        // fail-closed).
+        // fetch error follows the SAME `apply_fetch_failure` path as a local
+        // bundle-fetch failure: the material was never seen either way.
         if bundles.is_empty() {
             if let Some((mapping, upstream_name)) = self
                 .upstream_resolver
@@ -603,18 +769,92 @@ impl ProvenanceOrchestrationUseCase {
 
         // Dispatch each applicable verifier and fold to one verdict.
         let (verdict, verdict_backend) = self
-            .dispatch_and_fold(&applicable, &subject, &bundles, &requirements, mode)
+            .dispatch_and_fold(&applicable, &subject, &bundles, &requirements)
             .await;
 
-        // Label the metric with the backend that DECIDED the folded verdict
-        // (ADR 0039 §6), not `applicable[0]`. The dead-defensive empty case (no
-        // verifier ran — impossible since `applicable` is non-empty) falls back
-        // to the representative `backend`.
+        // Label every emission below with the backend that DECIDED the
+        // folded verdict (ADR 0039 §6), not `applicable[0]`. The
+        // dead-defensive empty case (no verifier ran — impossible since
+        // `applicable` is non-empty) falls back to the representative
+        // `backend`. Resolved here, directly after the fold, so the
+        // unreadable-skip report and the verdict's own metric carry the
+        // same label rather than two different ones.
         let metric_backend = if verdict_backend.is_empty() {
             backend
         } else {
             verdict_backend
         };
+
+        // Material a verifier could not read contributed nothing to the
+        // verdict above — not a rejection, not a hold, not evidence of any
+        // kind. *Not considered* must not become *not noticed*, so the
+        // count is reported here, at the one point where it is complete
+        // (every verifier has run) and ahead of every early return below,
+        // so no downstream path can drop it. Two real cases depend on it
+        // being visible: a publisher whose own signature material is
+        // broken would otherwise see only "unsigned", and an operator
+        // would never learn that someone attached garbage to an artifact.
+        //
+        // `warn!`, not `info!` — unreadable attestation material is
+        // either a broken publisher pipeline or someone writing junk to
+        // the referrer surface, and neither should need a log level
+        // raised to be seen. Emitted only when something was actually
+        // skipped, so the ordinary path stays silent.
+        let unreadable_skipped = verdict.unreadable_skipped;
+        if unreadable_skipped > 0 {
+            tracing::warn!(
+                artifact_id = %artifact.id,
+                backend = %metric_backend,
+                unreadable_skipped,
+                "provenance: skipped unreadable attestation candidate(s) — they could not be \
+                 read, so they were not considered: no rejection, no hold, no evidence. Check \
+                 what is attached to this artifact's referrer surface",
+            );
+            crate::metrics::emit_provenance_unreadable_skipped(&metric_backend, unreadable_skipped);
+        }
+
+        // ADR 0039 D8 — signature material is not on the provenance axis,
+        // and that includes its bytes. Nothing signs a signature, so the
+        // `{}` config blob and the payload layer of a cosign signature
+        // manifest can never acquire an attestation of their own and
+        // neither end of the §11 cascade can ever fire for them: under
+        // `Required` D1 holds them and D4 holds them indefinitely, which
+        // is the terminality D4 reserves for positive disproof reached by
+        // another route. Resolved HERE, in the window between the folded
+        // verdict and the hold, because the question is one of
+        // applicability and everything it needs — the applicable
+        // verifiers, the CAS, the content-reference index, the resolved
+        // signer patterns — is already in scope. This is NOT a fourth
+        // shape predicate on the `NoAttestation` × `Required` arm (D3
+        // deleted those): the verdict stays shape-independent, and what
+        // decides the clearance is another artifact's VERIFIED signature,
+        // not this artifact's shape.
+        if mode == ProvenanceMode::Required
+            && matches!(
+                verdict.outcome,
+                hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
+            )
+        {
+            if let Some(cleared) = self
+                .cascade
+                .resolve_signature_material_clearance(&artifact, &applicable, &requirements)
+                .await
+            {
+                // The constituent now carries a real cascaded
+                // `ProvenanceVerified` whose `cascaded_from` names the
+                // signature manifest, so the release gate's provenance
+                // leg (`provenance_clearance_from`: any
+                // `ProvenanceVerified` on the stream) reads `Cleared`
+                // without a second code path. Labelled with the verifier
+                // that accepted the signature manifest's bundle.
+                crate::metrics::emit_provenance_verify(
+                    &cleared.backend,
+                    mode,
+                    crate::metrics::ProvenanceVerifyResult::ClearedSignatureMaterial,
+                );
+                return Ok(ProvenanceRunOutcome::ClearedAsSignatureMaterial { unreadable_skipped });
+            }
+        }
 
         // Capture the cascade seed BEFORE the verdict is moved into
         // `apply_verdict`: a `Verified` verdict of the real verifier under
@@ -720,36 +960,16 @@ impl ProvenanceOrchestrationUseCase {
                 .await?;
             let manifest_bytes = self.cascade.read_bounded(&source.sha256_checksum).await?;
 
-            // Parse the referrer manifest and keep only the Sigstore-bundle
-            // layer blobs (the pure `sigstore_bundle_layers` helper). A referrer that
-            // carries no Sigstore-bundle layer (a non-cosign referrer — SBOM,
-            // an attestation of another predicate, an ordinary manifest)
-            // contributes nothing — skipped, not errored.
-            let blob_hashes = hort_domain::oci::sigstore_bundle_layers(&manifest_bytes)?;
-            for blob_hash in blob_hashes {
-                // The bundle blob digest IS its CAS content hash. A blob
-                // referenced by the manifest but absent from CAS surfaces as
-                // a `read_bounded` error → the existing fetch-failure path
-                // (mode-dependent), never a panic.
-                let bundle_bytes = self.cascade.read_bounded(&blob_hash).await?;
-                bundles.push(build_bundle(bundle_bytes));
-            }
-
-            // Keyed (ADR 0039 §8): collect any legacy cosign `simplesigning`
-            // signatures on the same referrer. Each yields a SIGNED bundle —
-            // `bytes` = the simplesigning payload-layer blob, `signature` = the
-            // base64 `dev.cosignproject.cosign/signature` annotation decoded. An
-            // undecodable annotation can never be a valid signature → skipped
-            // (under `Required`, no valid bundle folds to `NoAttestation`, which
-            // holds).
-            let sig_layers = hort_domain::oci::simplesigning_signature_layers(&manifest_bytes)?;
-            for sig in sig_layers {
-                let payload_bytes = self.cascade.read_bounded(&sig.payload_layer).await?;
-                let Some(sig_bytes) = decode_simplesigning_signature(&sig.signature) else {
-                    continue;
-                };
-                bundles.push(AttestationBundle::new_signed(payload_bytes, sig_bytes));
-            }
+            // Both carriage shapes — keyless Sigstore v0.3 bundle layers and
+            // keyed cosign `simplesigning` layers — come from the one
+            // extraction in `ProvenanceCascade::referrer_bundles`, which the
+            // D8 signature-material walk also uses. A referrer that carries
+            // neither (a non-cosign referrer — SBOM, an attestation of
+            // another predicate, an ordinary manifest) contributes nothing:
+            // skipped, not errored. A bundle blob the manifest references but
+            // CAS does not hold surfaces as an `Err` → the existing
+            // fetch-failure path (indeterminate), never a panic.
+            bundles.extend(self.cascade.referrer_bundles(&manifest_bytes).await?);
         }
         Ok(bundles)
     }
@@ -768,8 +988,8 @@ impl ProvenanceOrchestrationUseCase {
     /// bundle blob from CAS on the subsequent re-read.
     ///
     /// `#[instrument]` without `err` (the upstream fetch is a normal
-    /// operation; a failure is reported by the caller's `apply_fetch_failure`
-    /// arm, mode-dependently). `info!` on a fetch that yielded ≥1 bundle;
+    /// operation; a failure is reported by the caller's
+    /// `apply_fetch_failure` path). `info!` on a fetch that yielded ≥1 bundle;
     /// `warn!` on a fetch error. No per-`no_attestation` log.
     #[tracing::instrument(skip(self, artifact, mapping))]
     async fn fetch_and_land_upstream_referrers(
@@ -783,7 +1003,7 @@ impl ProvenanceOrchestrationUseCase {
         // 1. Discover the upstream referrers for this image's digest
         //    (Referrers API + cosign `.sig` tag-scheme fallback in the
         //    adapter). A fetch error propagates to the caller's
-        //    mode-dependent `apply_fetch_failure` arm.
+        //    `apply_fetch_failure` path.
         let descriptors = self
             .upstream_proxy
             .fetch_referrers(mapping.clone(), upstream_name.clone(), image_digest.clone())
@@ -841,7 +1061,7 @@ impl ProvenanceOrchestrationUseCase {
     /// referrer-manifest artifact, and write the `oci_subject` row. Returns
     /// `Ok(true)` when ≥1 bundle blob was landed, `Ok(false)` when the
     /// referrer was skipped (non-bundle manifest, or digest integrity
-    /// mismatch). An upstream / CAS error propagates (mode-dependent).
+    /// mismatch). An upstream / CAS error propagates (indeterminate).
     async fn land_one_referrer(
         &self,
         artifact: &Artifact,
@@ -936,46 +1156,67 @@ impl ProvenanceOrchestrationUseCase {
             return Ok(false);
         }
 
-        // e. Narrow create — the referrer-manifest `artifacts` row. Built with
-        //    the already-held `lifecycle` port (NOT `IngestUseCase`):
+        // e. Narrow create — the referrer-manifest `artifacts` row plus the
+        //    content-reference edges it claims, in ONE transaction. Built
+        //    with the already-held `lifecycle` port (NOT `IngestUseCase`):
         //    `quarantine_status = None` (an internal provenance-bookkeeping
         //    artifact, outside the scan/quarantine/provenance lifecycle) and
         //    NO `jobs.enqueue_*` — the whole point of the narrow create.
-        let manifest_artifact = self
-            .commit_referrer_manifest(artifact, manifest_put.hash, manifest_put.size_bytes)
-            .await?;
-
-        // f. The `oci_subject` content-reference row — source is the referrer
-        //    manifest artifact, target is the proxied image's content hash
-        //    (mirrors the push-path row shape in manifests_write.rs). Upsert
-        //    on PK → idempotent re-run.
-        self.content_references
-            .insert(ContentReference {
-                source_artifact_id: manifest_artifact.id,
-                target_content_hash: artifact.sha256_checksum.clone(),
-                kind: OCI_SUBJECT_KIND.to_string(),
-                metadata: serde_json::json!({
-                    "artifact_type": hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
-                    "media_type": "application/vnd.oci.image.manifest.v1+json",
-                }),
-                repository_id: artifact.repository_id,
-                recorded_at: chrono::Utc::now(),
-            })
+        //
+        //    The `oci_subject` claim — source the referrer manifest, target
+        //    the proxied image's content hash, mirroring the push-path row
+        //    shape in `manifests_write.rs` — rides that transaction rather
+        //    than following it. A `content_references` row is the claim that
+        //    keeps bytes alive: the storage GC deletes a CAS blob exactly
+        //    when no row targets its hash, and this row claims the IMAGE's
+        //    bytes, not the referrer's. Written afterwards it left a window
+        //    in which the referrer was live and the image it attests had one
+        //    fewer claim, with nothing to repair it — the refcount-reconcile
+        //    sweep converges `primary_content` / `metadata_blob` from the
+        //    artifact row, and no relational row records what a manifest
+        //    references. Upsert on the full PK, so a re-run is idempotent.
+        let _manifest_artifact = self
+            .commit_referrer_manifest(
+                artifact,
+                manifest_put.hash,
+                manifest_put.size_bytes,
+                &[ContentReferenceClaim {
+                    target_content_hash: artifact.sha256_checksum.clone(),
+                    kind: OCI_SUBJECT_KIND.to_string(),
+                    metadata: serde_json::json!({
+                        "artifact_type": hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
+                        "media_type": "application/vnd.oci.image.manifest.v1+json",
+                    }),
+                }],
+            )
             .await?;
 
         Ok(true)
     }
 
-    /// Commit the status-`None` referrer-manifest artifact via
-    /// `commit_transition` + a single `ArtifactIngested` event — the same
-    /// create primitive `IngestUseCase::ingest_signature_manifest` uses,
-    /// inlined here against the already-held ports. NO scan / provenance
-    /// enqueue. Returns the created `Artifact`.
+    /// Commit the status-`None` referrer-manifest artifact, a single
+    /// `ArtifactIngested` event and the manifest's content-reference edges
+    /// via `commit_transition_with_enqueues` — the same create primitive
+    /// `IngestUseCase::ingest_signature_manifest` uses, inlined here against
+    /// the already-held ports. NO scan / provenance enqueue. Returns the
+    /// created `Artifact`.
+    ///
+    /// The edge set is the manifest's own `primary_content` plus whatever the
+    /// caller claims. Both are claims on bytes against the storage GC, which
+    /// deletes a CAS blob exactly when no `content_references` row targets
+    /// its hash, so they belong in the transaction that makes the claiming
+    /// artifact live. `primary_content` matters here in particular because
+    /// this artifact commits at `quarantine_status = None` — outside the
+    /// scan/quarantine lifecycle, and therefore outside the GC's
+    /// protected-evidence rule — so with no row claiming its own content it
+    /// counted zero against itself until the next reconcile sweep converged
+    /// it.
     async fn commit_referrer_manifest(
         &self,
         image: &Artifact,
         manifest_hash: ContentHash,
         size_bytes: u64,
+        claimed_edges: &[ContentReferenceClaim],
     ) -> AppResult<Artifact> {
         let artifact_id = Uuid::new_v4();
         let now = chrono::Utc::now();
@@ -1017,10 +1258,30 @@ impl ProvenanceOrchestrationUseCase {
         };
 
         let stream_id = hort_domain::events::StreamId::artifact(artifact_id);
-        let expected_version = read_expected_version(&*self.events, &stream_id, true).await?;
+        let expected_version = read_unpaired_append_version(
+            &*self.events,
+            &stream_id,
+            true,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await?;
+
+        let mut edges = vec![ContentReference {
+            source_artifact_id: artifact_id,
+            target_content_hash: artifact.sha256_checksum.clone(),
+            kind: "primary_content".to_string(),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            repository_id: artifact.repository_id,
+            recorded_at: now,
+        }];
+        edges.extend(
+            claimed_edges
+                .iter()
+                .map(|c| c.resolve(artifact_id, artifact.repository_id, now)),
+        );
 
         self.lifecycle
-            .commit_transition(
+            .commit_transition_with_enqueues(
                 &artifact,
                 AppendEvents {
                     stream_id,
@@ -1033,6 +1294,9 @@ impl ProvenanceOrchestrationUseCase {
                     actor: system_actor(),
                 },
                 None,
+                // No ingest-time jobs — see this method's docstring.
+                &[],
+                &edges,
             )
             .await?;
 
@@ -1059,26 +1323,38 @@ impl ProvenanceOrchestrationUseCase {
     /// Dispatch each applicable verifier and fold the verdicts to one. In
     /// the Tier-1 single-verifier deployment this is a single call; the
     /// fold rule keeps the orchestrator total for a future multi-verifier
-    /// set:
+    /// set, and is [`fold_two`]'s ladder:
     ///
     /// - any `Rejected` verdict wins (most restrictive — a forged/untrusted
     ///   signature from any verifier rejects the artifact);
     /// - else any `Verified` verdict wins (a trusted signature from any
     ///   verifier clears it);
+    /// - else any `Indeterminate` verdict wins (both remaining rungs
+    ///   hold, and this is the more informative hold — it names an
+    ///   operator action the other does not);
     /// - else `NoAttestation` (no verifier found a bundle).
     ///
-    /// A verifier that itself errors (an adapter bug / infra fault) is
-    /// folded mode-dependently: under `Required` it contributes a
-    /// `Rejected{RekorNotFound}` (fail-closed); under `VerifyIfPresent` it
-    /// is treated as `NoAttestation` (the verifier could not decide; do
-    /// not block on flakiness).
+    /// A verifier that itself errors (an adapter bug, a trust root that
+    /// cannot build a verifier, a subject-payload/content-hash mismatch)
+    /// returned no verdict at all, so it proved nothing about the
+    /// artifact: it contributes
+    /// `Indeterminate{VerifierUnavailable}` — **one value, in every
+    /// mode**, because the epistemic state does not depend on policy. The
+    /// mode decides the consequence downstream and once, exactly as it
+    /// does for a fetch that never landed (see `apply_fetch_failure`):
+    /// `Required` holds, `VerifyIfPresent` / `Off` allow through and
+    /// report `allowed_indeterminate`.
+    ///
+    /// It does **not** contribute nothing: a run in which every verifier
+    /// errored would then fold to `NoAttestation` and report
+    /// `held_pending_signature`, sending the operator to the publisher's
+    /// signer for a fault of ours.
     async fn dispatch_and_fold(
         &self,
         applicable: &[&Arc<dyn ProvenancePort>],
         subject: &ProvenanceSubject<'_>,
         bundles: &[AttestationBundle],
         requirements: &ProvenanceRequirements<'_>,
-        mode: ProvenanceMode,
     ) -> (ProvenanceVerdict, String) {
         use hort_domain::ports::provenance::ProvenanceOutcome;
 
@@ -1087,21 +1363,26 @@ impl ProvenanceOrchestrationUseCase {
             let verdict = match port.verify(subject, bundles, requirements).await {
                 Ok(v) => v,
                 Err(e) => {
-                    // Verifier infra fault. Mode decides fail-closed vs
-                    // degrade-to-allow.
+                    // The verifier returned no verdict, so nothing about
+                    // the artifact was established and nothing was
+                    // disproved — the check is what failed, not the
+                    // material. One value in every mode: the mode decides
+                    // the consequence downstream (a hold under `Required`,
+                    // allowed through otherwise), and the epistemic state
+                    // does not depend on policy.
+                    //
+                    // The `warn!` keeps `backend` and `error` — the only
+                    // record of WHICH verifier failed and why, which the
+                    // verdict itself does not carry.
                     tracing::warn!(
                         backend = port.name(),
                         error = %e,
-                        "provenance verifier errored; folding mode-dependently",
+                        "provenance verifier returned no verdict — the check could not be \
+                         carried out (indeterminate: held under Required, allowed under \
+                         VerifyIfPresent/Off; never terminal, because nothing about the \
+                         artifact was established)",
                     );
-                    match mode {
-                        ProvenanceMode::Required => {
-                            ProvenanceVerdict::rejected(ProvenanceRejectReason::RekorNotFound)
-                        }
-                        ProvenanceMode::VerifyIfPresent | ProvenanceMode::Off => {
-                            ProvenanceVerdict::no_attestation()
-                        }
-                    }
+                    ProvenanceVerdict::indeterminate(IndeterminateReason::VerifierUnavailable)
                 }
             };
             // Carry the deciding backend alongside the verdict so the metric
@@ -1119,6 +1400,7 @@ impl ProvenanceOrchestrationUseCase {
             (
                 ProvenanceVerdict {
                     outcome: ProvenanceOutcome::NoAttestation,
+                    unreadable_skipped: 0,
                 },
                 String::new(),
             )
@@ -1181,36 +1463,69 @@ impl ProvenanceOrchestrationUseCase {
             return Ok(ProvenanceRunOutcome::RequeuedNoAnchor);
         }
 
-        // Under `Required` an unsigned artifact is HELD:
-        // `complete_provenance` emits nothing and leaves the status
-        // `Quarantined` → the release gate reads it as `Pending`
-        // (fail-closed / held), not an allowed-unsigned no-op. Captured
-        // before the verdict is moved into `complete_provenance` so the
-        // empty-batch branch can tell the hold from the VerifyIfPresent/Off
-        // allow — the domain produces the same (absent) transition for
-        // both, and only the mode distinguishes them.
+        // What an empty event batch will mean, captured before the verdict
+        // is moved into `complete_provenance` (see [`NoEventReport`]). Two
+        // outcomes emit nothing — an unsigned artifact and a check that
+        // could not be carried out — and the domain produces the SAME
+        // (absent) transition for both under every mode, so neither the
+        // outcome nor the mode is recoverable from the batch that comes
+        // back. Both have to be read here or not at all.
         //
-        // A hold that fell through to the `else` below would be reported as
-        // the allowed-unsigned `NoAttestation` no-op, mislabelling a
-        // fail-closed hold as a pass in both the summary and the metric.
+        // Under `Required` both are HELD: `complete_provenance` emits
+        // nothing and leaves the status `Quarantined` → the release gate
+        // reads it as `Pending` (fail-closed / held), not an
+        // allowed-unsigned no-op. A hold reported as the allowed-unsigned
+        // no-op would mislabel a fail-closed hold as a pass in both the
+        // summary and the metric.
         //
         // Which hold is a LABEL, not a gate (see `HoldReason`): a
         // constituent can never carry an attestation of its own, so it is
         // waiting for its subject's cascade, not for its own signature —
         // a different operator action, and the hold is indefinite, so the
         // distinction is the useful half of the observability.
-        let hold_reason = if mode == ProvenanceMode::Required
-            && matches!(
-                verdict.outcome,
-                hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
-            ) {
-            Some(if is_constituent {
-                HoldReason::PendingSubject
-            } else {
-                HoldReason::PendingSignature
-            })
-        } else {
-            None
+        //
+        // An `Indeterminate` verdict is the second held outcome and takes
+        // the third label. It is NOT split by `is_constituent`: the thing
+        // to fix is our trust root, our fetch or our verifier, which is
+        // the same answer whatever shape the artifact has.
+        //
+        // Under `VerifyIfPresent` / `Off` both are allowed through, and
+        // they are still two different readings: an artifact nobody
+        // signed, and an artifact we could not check. Reporting the second
+        // as the first names the artifact's state when the fault is ours.
+        //
+        // Wildcard-free over the outcome so a future one has to state what
+        // an empty batch would report before it compiles — the whole point
+        // of the held/terminal line being a type rather than a convention.
+        let no_event_report = {
+            use hort_domain::ports::provenance::ProvenanceOutcome as O;
+            match (&verdict.outcome, mode) {
+                (O::NoAttestation, ProvenanceMode::Required) => {
+                    NoEventReport::Held(if is_constituent {
+                        HoldReason::PendingSubject
+                    } else {
+                        HoldReason::PendingSignature
+                    })
+                }
+                (O::Indeterminate(_), ProvenanceMode::Required) => {
+                    NoEventReport::Held(HoldReason::Indeterminate)
+                }
+                (O::NoAttestation, ProvenanceMode::VerifyIfPresent | ProvenanceMode::Off) => {
+                    NoEventReport::AllowedUnsigned
+                }
+                (O::Indeterminate(_), ProvenanceMode::VerifyIfPresent | ProvenanceMode::Off) => {
+                    NoEventReport::AllowedIndeterminate
+                }
+                // `Verified` / `Rejected` each append their own axis event,
+                // so they never reach the empty-batch branch and this
+                // reading is never read. They take the no-op value because
+                // that is what an empty batch would have meant for them:
+                // nothing was recorded at all. A total value rather than an
+                // `unreachable!`, for the same reason the axis-event fold
+                // further down keeps a defensive default — a value cannot
+                // become a panic when the domain changes under it.
+                (O::Verified { .. } | O::Rejected(_), _) => NoEventReport::AllowedUnsigned,
+            }
         };
         // The status as LOADED, captured before `complete_provenance`
         // mutates it — the guard the conditional projection write keys on
@@ -1218,41 +1533,40 @@ impl ProvenanceOrchestrationUseCase {
         // `Verified` verdict leaves the artifact `Quarantined`, i.e.
         // EQUAL to this, so the adapter skips the status write entirely.
         let prior_status = artifact.quarantine_status;
+        // Captured before the verdict is consumed. The count is reported
+        // (log + counter) by the caller, which is the only place it is
+        // complete; it is carried onto the outcome here so the job row's
+        // `result_summary` — the per-artifact forensic trail — names it
+        // too.
+        let unreadable_skipped = verdict.unreadable_skipped;
         let events = artifact.complete_provenance(verdict, backend)?;
 
         if events.is_empty() {
-            if let Some(reason) = hold_reason {
-                // Held: no event, status stays Quarantined. `info!` (no
-                // `err`) — the operator audit signal that an image is not
-                // yet clearable. Ticks a distinct result value (NOT
-                // `no_attestation`), so a `Required` hold is separable from
-                // the allowed-unsigned no-op. Single emission layer — the
-                // orchestration use case.
+            // No event, status unchanged — held under `Required`, allowed
+            // under `VerifyIfPresent` / `Off`. Each of the four readings
+            // ticks its own result value, so a hold is never reported as a
+            // pass and a check we could not run is never reported as an
+            // artifact nobody signed. Single emission layer — the
+            // orchestration use case.
+            //
+            // The `info!` (no `err`) is the operator audit signal that an
+            // image is not yet clearable, and is therefore scoped to the
+            // holds; see `NoEventReport::log_message`.
+            if let Some(message) = no_event_report.log_message() {
                 tracing::info!(
                     artifact_id = %artifact.id,
                     backend = %backend,
                     is_constituent,
+                    unreadable_skipped,
                     "{}",
-                    reason.log_message(),
+                    message,
                 );
-                crate::metrics::emit_provenance_verify(backend, mode, reason.metric_result());
-                return Ok(ProvenanceRunOutcome::Applied {
-                    event_appended: false,
-                    verdict: reason.verdict_summary(),
-                });
             }
-            // NoAttestation under VerifyIfPresent / Off — no event, status
-            // unchanged. The allowed-unsigned case ticks `no_attestation`
-            // (no reject sibling). Single emission layer — the
-            // orchestration use case.
-            crate::metrics::emit_provenance_verify(
-                backend,
-                mode,
-                crate::metrics::ProvenanceVerifyResult::NoAttestation,
-            );
+            crate::metrics::emit_provenance_verify(backend, mode, no_event_report.metric_result());
             return Ok(ProvenanceRunOutcome::Applied {
                 event_appended: false,
-                verdict: ProvenanceVerdictSummary::NoAttestation,
+                verdict: no_event_report.verdict_summary(),
+                unreadable_skipped,
             });
         }
 
@@ -1306,21 +1620,20 @@ impl ProvenanceOrchestrationUseCase {
         let stream_id = hort_domain::events::StreamId::artifact(artifact.id);
         let correlation_id = Uuid::new_v4();
 
-        // Column-scoped, prior-status-guarded verdict commit (issues #90
-        // and #108). `artifact` was loaded at the top of
-        // `verify_artifact`, before the bundle fetch / CAS preimage read /
-        // verifier dispatch round trip — by now its snapshot of every
-        // column can be stale. Three things keep that from clobbering a
-        // concurrent verdict:
+        // Column-scoped, prior-status-guarded verdict commit.
+        // `artifact` was loaded at the top of `verify_artifact`, before
+        // the bundle fetch / CAS preimage read / verifier dispatch round
+        // trip — by now its snapshot of every column can be stale. Three
+        // things keep that from clobbering a concurrent verdict:
         //
-        // 1. `expected_version` was read at that same load (#108 H2a, see
-        //    `verify_artifact`), so an intervening append fails this one
+        // 1. `expected_version` came from the `ArtifactAtVersion` pairing
+        //    at that same load, so an intervening append fails this one
         //    `Conflict` before any projection write happens.
         // 2. `commit_provenance_verdict` writes only `quarantine_status`,
         //    so a concurrent transition's `quarantine_window_start` (the
-        //    quarantine anchor) survives regardless (#90).
+        //    quarantine anchor) survives regardless.
         // 3. `prior_status` makes even that one column's write
-        //    skip-if-unchanged and conditional-if-changed (#108 H2b).
+        //    skip-if-unchanged and conditional-if-changed.
         self.lifecycle
             .commit_provenance_verdict(
                 &artifact,
@@ -1339,25 +1652,42 @@ impl ProvenanceOrchestrationUseCase {
         Ok(ProvenanceRunOutcome::Applied {
             event_appended: true,
             verdict: verdict_summary,
+            unreadable_skipped,
         })
     }
 
-    /// Handle a bundle-fetch / CAS-read failure mode-dependently:
+    /// Handle a bundle-fetch / CAS-read failure: the attestation material
+    /// could not be obtained at all, so nothing about the artifact was
+    /// established and nothing was disproved. The verdict is
+    /// `Indeterminate{AttestationFetchFailed}` — **one value, in every
+    /// mode**, because the epistemic state does not depend on policy. The
+    /// mode already decides the consequence, downstream and once:
     ///
-    /// - `Required` → fail-closed `Rejected{RekorNotFound}` (a never-
-    ///   verified `Required` artifact must never timer-release);
-    /// - `VerifyIfPresent` / `Off` → degrade to `NoAttestation` (allow —
-    ///   never fail-closed on infra flakiness).
+    /// - `Required` → the artifact HOLDS (`Quarantined`, `Pending` at the
+    ///   release gate, 503 to a pull), under the indeterminate hold
+    ///   reason so the operator sees that the fault is on our side. A
+    ///   never-verified `Required` artifact still cannot timer-release:
+    ///   the hold IS the fail-closed reading, and fail-closed is not the
+    ///   same as terminal (ADR 0039 D2).
+    /// - `VerifyIfPresent` / `Off` → no event, no status change: the
+    ///   artifact runs its normal quarantine window and releases, exactly
+    ///   as it does for an unsigned one. The run reports
+    ///   `allowed_indeterminate`, not the allowed-unsigned value, so an
+    ///   unreachable upstream does not read as an artifact nobody signed.
     ///
-    /// The `Required` arm stays fail-closed on every shape — mid-window, on
-    /// a descendant, on a constituent alike — because the verdict it
-    /// produces is `Rejected{RekorNotFound}`, not `NoAttestation`. The
-    /// distinction is deliberate and survives the 2026-09-12 amendment's
-    /// unconditional unsigned hold: an artifact whose attestation material
-    /// could not be FETCHED is a different failure from one that provably
-    /// has none, and only the latter is "the evidence has not arrived yet".
-    /// The hold-label input (`is_constituent`) is therefore not threaded
-    /// here — no hold can result.
+    /// A fetch that never happened is the weakest state the pipeline can
+    /// be in: not "the signature is wrong", not even "no signature has
+    /// arrived" — *we could not look*. Terminality follows only from a
+    /// positive disproof about readable material (ADR 0039 D4), which is
+    /// why this path states no [`ProvenanceRejectReason`] at all: a
+    /// network error is nobody's material being at fault.
+    ///
+    /// The hold-label input (`is_constituent`) is not threaded: the
+    /// indeterminate hold is not split by the artifact's shape, because
+    /// the thing to fix is our fetch either way.
+    ///
+    /// The `warn!` keeps `stage` and `error` — the only record of WHICH
+    /// fetch failed, which the verdict itself does not carry.
     async fn apply_fetch_failure(
         &self,
         artifact: Artifact,
@@ -1367,36 +1697,18 @@ impl ProvenanceOrchestrationUseCase {
         err: crate::error::AppError,
         expected_version: ExpectedVersion,
     ) -> AppResult<ProvenanceRunOutcome> {
-        match mode {
-            ProvenanceMode::Required => {
-                tracing::warn!(
-                    artifact_id = %artifact.id,
-                    stage,
-                    error = %err,
-                    "provenance: fetch exhausted under Required — fail-closed (RekorNotFound)",
-                );
-                // `RekorNotFound` is the backend-AGNOSTIC fail-closed-fetch reason
-                // here ("no verifiable attestation material was obtained"). The keyed
-                // `cosign-key` backend has no Rekor, but reuses this marker rather than
-                // growing the enum — the audit event's `backend` label disambiguates
-                // which backend's fetch failed.
-                let verdict = ProvenanceVerdict::rejected(ProvenanceRejectReason::RekorNotFound);
-                self.apply_verdict(artifact, backend, verdict, mode, false, expected_version)
-                    .await
-            }
-            ProvenanceMode::VerifyIfPresent | ProvenanceMode::Off => {
-                tracing::warn!(
-                    artifact_id = %artifact.id,
-                    stage,
-                    error = %err,
-                    "provenance: fetch exhausted under VerifyIfPresent — \
-                     degrade to NoAttestation (allow)",
-                );
-                let verdict = ProvenanceVerdict::no_attestation();
-                self.apply_verdict(artifact, backend, verdict, mode, false, expected_version)
-                    .await
-            }
-        }
+        tracing::warn!(
+            artifact_id = %artifact.id,
+            mode = %mode,
+            stage,
+            error = %err,
+            "provenance: attestation fetch exhausted — the check could not be carried out \
+             (indeterminate: held under Required, allowed under VerifyIfPresent/Off; never \
+             terminal, because nothing about the artifact was established)",
+        );
+        let verdict = ProvenanceVerdict::indeterminate(IndeterminateReason::AttestationFetchFailed);
+        self.apply_verdict(artifact, backend, verdict, mode, false, expected_version)
+            .await
     }
 }
 
@@ -1410,70 +1722,81 @@ fn parse_sha256_digest(digest: &str) -> Option<ContentHash> {
     digest.strip_prefix("sha256:")?.parse().ok()
 }
 
-/// Decode a base64 `dev.cosignproject.cosign/signature` annotation into raw
-/// signature bytes (ADR 0039 §8). cosign emits standard-alphabet base64. A
-/// malformed annotation yields `None` — the carriage skips it; it can never be
-/// a valid signature, and under `Required` the absence of any valid bundle
-/// folds to `NoAttestation`, which holds.
-fn decode_simplesigning_signature(annotation: &str) -> Option<Vec<u8>> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(annotation.trim())
-        .ok()
-}
-
-/// Wrap a Sigstore v0.3 bundle blob as the right [`AttestationBundle`] shape so
-/// the two verifiers self-select (ADR 0039 §6/§8):
+/// Fold two verdicts to one (the multi-verifier fold rule):
+/// `Rejected` ⊳ `Verified` ⊳ `Indeterminate` ⊳ `NoAttestation`.
 ///
-/// - a **cosign v3 keyed** bundle (a v0.3 bundle whose `verificationMaterial`
-///   is a bare `publicKey`, no Fulcio cert) → `new_signed(bytes, raw DSSE sig)`,
-///   so the keyed `cosign-key` verifier claims it (its loop requires
-///   `signature.is_some()`) and the Sigstore verifier skips it. The keyed
-///   verifier re-derives the DSSE PAE + subject digest from `bytes`; the
-///   `signature` half both flips the routing gate and carries the raw sig it
-///   verifies.
-/// - a **keyless** bundle (Fulcio cert chain), or any bundle the keyed
-///   extractor does not claim / cannot parse → `new(bytes)` (`signature =
-///   None`), routed to the Sigstore verifier unchanged (byte-for-byte the prior
-///   behaviour).
-fn build_bundle(bytes: Vec<u8>) -> AttestationBundle {
-    match hort_domain::provenance_bundle::extract_keyed_dsse_signature(&bytes) {
-        Ok(Some(material)) => AttestationBundle::new_signed(bytes, material.signature),
-        // Keyless, or not a keyed DSSE bundle, or unparseable-as-keyed: the
-        // Sigstore verifier's (a truly malformed bundle folds to
-        // BundleMalformed there). Never route a non-keyed bundle to the keyed
-        // verifier.
-        Ok(None) | Err(_) => AttestationBundle::new(bytes),
-    }
-}
-
-/// Fold two verdicts to one (the multi-verifier fold rule). `Rejected`
-/// dominates `Verified` dominates `NoAttestation`. Pure helper — testable
-/// without the use case.
+/// `Rejected` ⊳ `Verified` is the standing decision and is unchanged: a
+/// finding about pushed material dominates a second verifier's acceptance
+/// of it.
+///
+/// `Verified` ⊳ `Indeterminate` is the position the could-not-check state
+/// takes, and the direction matters: a real signature is **not** overridden
+/// because the *other* verifier had no usable trust-root key or never
+/// fetched its material. Our provisioning fault cannot invalidate a
+/// signature we did verify.
+///
+/// `Indeterminate` ⊳ `NoAttestation` keeps the more informative hold. Both
+/// hold, so no verdict changes — but "we could not check" names an operator
+/// action (fix the trust root; the fetch retries) that "nothing was signed"
+/// does not, and folding the other way would lose it.
+///
+/// The final arm is deliberately the concrete `(NoAttestation,
+/// NoAttestation)` pair rather than a wildcard: a future outcome makes this
+/// match non-exhaustive and must be given a rung on the ladder before it
+/// compiles. Pure helper — testable without the use case.
+///
+/// The ladder decides the **outcome** only. A verdict also carries
+/// `unreadable_skipped`, which is not on any rung — it is a record of what
+/// each verifier could not read, so the two verifiers' counts have to be
+/// *added*, not ranked. [`fold_two_backend`] does that; this function
+/// returns one of its two arguments whole, so calling it directly discards
+/// the loser's count.
 fn fold_two(a: ProvenanceVerdict, b: ProvenanceVerdict) -> ProvenanceVerdict {
-    use hort_domain::ports::provenance::ProvenanceOutcome::{NoAttestation, Rejected, Verified};
+    use hort_domain::ports::provenance::ProvenanceOutcome::{
+        Indeterminate, NoAttestation, Rejected, Verified,
+    };
     match (&a.outcome, &b.outcome) {
         (Rejected(_), _) => a,
         (_, Rejected(_)) => b,
         (Verified { .. }, _) => a,
         (_, Verified { .. }) => b,
+        (Indeterminate(_), _) => a,
+        (_, Indeterminate(_)) => b,
         (NoAttestation, NoAttestation) => a,
     }
 }
 
 /// Fold two `(verdict, backend)` candidates — [`fold_two`] plus backend
-/// attribution. The returned backend names the verifier whose verdict won, so
+/// attribution, plus the **sum** of the two candidates' unreadable-skip
+/// counts. The returned backend names the verifier whose verdict won, so
 /// the metric labels the deciding backend rather than `applicable[0]`
 /// (ADR 0039 §6). Pure helper — testable without the use case.
+///
+/// The count is summed rather than inherited from the winner because the
+/// two verifiers partition the candidate set by shape: each one can only
+/// report on the candidates that were its own, and the losing verdict's
+/// count is exactly the part the winner never saw. Inheriting the winner's
+/// count is the shape of this unit's whole failure mode — a keyed bundle
+/// that verifies next to unparseable bytes declared as a keyless bundle
+/// yields `Verified` from the keyed verifier and the skip from the
+/// keyless one, so the winner's count is 0 and the record would be lost
+/// precisely in the case it exists for.
+///
+/// Associative over the running fold (the intermediate carries the running
+/// total), so a three-verifier set sums all three.
 fn fold_two_backend(
     a: (ProvenanceVerdict, String),
     b: (ProvenanceVerdict, String),
 ) -> (ProvenanceVerdict, String) {
-    if fold_two(a.0.clone(), b.0.clone()) == a.0 {
+    let total =
+        a.0.unreadable_skipped
+            .saturating_add(b.0.unreadable_skipped);
+    let (verdict, backend) = if fold_two(a.0.clone(), b.0.clone()) == a.0 {
         a
     } else {
         b
-    }
+    };
+    (verdict.with_unreadable_skipped(total), backend)
 }
 
 #[cfg(test)]

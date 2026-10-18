@@ -8,7 +8,8 @@ use hort_domain::events::{
     PersistedEvent, StreamCategory, StreamId, StreamSealed,
 };
 use hort_domain::ports::event_store::{
-    AppendEvents, AppendResult, EventStore, EventToAppend, ExpectedVersion, ReadFrom, SubscribeFrom,
+    AppendEvents, AppendResult, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
+    SealAuthority, SealOutcome, SubscribeFrom,
 };
 use hort_domain::ports::BoxFuture;
 
@@ -168,6 +169,18 @@ pub(crate) struct PgUnitOfWork {
 impl PgUnitOfWork {
     /// Access the underlying connection for executing queries.
     pub(crate) fn conn(&mut self) -> &mut sqlx::PgConnection {
+        &mut self.tx
+    }
+
+    /// Access the underlying transaction itself.
+    ///
+    /// For the helpers whose signature demands a `&mut Transaction` rather
+    /// than a bare connection because transaction scope is part of what they
+    /// guarantee — `crate::blob_lock`, whose advisory locks are released by
+    /// the end of *this* transaction and must not be reachable from a pool
+    /// handle. [`Self::conn`] would type-erase exactly the thing those
+    /// helpers are asserting.
+    pub(crate) fn tx(&mut self) -> &mut sqlx::Transaction<'static, sqlx::Postgres> {
         &mut self.tx
     }
 
@@ -639,14 +652,40 @@ impl EventStore for PgEventStore {
         })
     }
 
-    fn delete_stream(&self, stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
-        Box::pin(async move { self.seal_and_remove(stream_id, SealMode::Delete).await })
+    fn delete_stream(
+        &self,
+        stream_id: StreamId,
+        authority: SealAuthority,
+    ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
+        Box::pin(async move {
+            self.seal_and_remove(stream_id, SealMode::Delete, authority)
+                .await
+        })
     }
 
-    fn archive_stream(&self, stream_id: StreamId, target: &str) -> BoxFuture<'_, DomainResult<()>> {
+    /// **This deletes.** There is no cold-storage write behind it: the
+    /// body runs the same `seal_and_remove` chokepoint as
+    /// [`Self::delete_stream`] — `StreamSealed` tombstone, then
+    /// `DELETE FROM events WHERE stream_id = $1` — and `target` reaches
+    /// nothing but one `tracing` field. Designing the cold-storage write
+    /// (S3 IA / Glacier / EventStoreDB partition) is deferred post-v1.
+    ///
+    /// No shipped deployment calls this: `HORT_RETENTION_STREAM_MODE=archive`
+    /// is refused by both binaries' config parsing until that writer
+    /// exists, so the only remaining callers are this crate's own tests
+    /// (which assert the delete parity deliberately). The method stays
+    /// because `EventStore` declares it and the retention use case's
+    /// `Archive` arm routes to it; it must not grow a success path that
+    /// looks like archiving before a writer backs it.
+    fn archive_stream(
+        &self,
+        stream_id: StreamId,
+        target: &str,
+        authority: SealAuthority,
+    ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
         let target = target.to_owned();
         Box::pin(async move {
-            self.seal_and_remove(stream_id, SealMode::Archive { target })
+            self.seal_and_remove(stream_id, SealMode::Archive { target }, authority)
                 .await
         })
     }
@@ -662,6 +701,14 @@ impl EventStore for PgEventStore {
 // carries the deleted stream's chain head so the verifier can treat the
 // now-absent stream as a defined `SealedGap` rather than a `Broken` chain.
 //
+// Removal is also **conditional**: `delete_stream` / `archive_stream`
+// take the `SealAuthority` the caller's terminality + retention-floor
+// proof was read at, and remove nothing unless the stream is still at
+// that tail — checked against this transaction's own tail read AND
+// carried as a predicate on the `DELETE` itself. See
+// `seal_and_remove`'s doc comment for why both checks are needed and
+// what remains open.
+//
 // The ordering invariant is load-bearing and structural: the tombstone
 // append and the row removal happen in **one transaction**, tombstone
 // FIRST. If the tombstone append fails the transaction rolls back and
@@ -670,9 +717,11 @@ impl EventStore for PgEventStore {
 // rolls back, so a tombstone is never left orphaned without its
 // corresponding deletion. There is exactly one chokepoint
 // (`seal_and_remove`); `archive_stream` is treated identically to
-// `delete_stream` for the live DB — the cold-storage archive *target* is
-// The cold-storage archive target is future work; today both seal the
-// chain head and remove the live rows; only the trace differs.
+// `delete_stream` for the live DB. The cold-storage archive *write* is
+// deferred post-v1: today both modes seal the chain head and remove the
+// live rows, and only the trace differs — which is why
+// `HORT_RETENTION_STREAM_MODE=archive` is refused at config parsing in
+// both binaries rather than reporting a delete as an archive.
 //
 // Row-removal mechanism (decided 2026-05-17): the actual row removal past
 // the `events_immutable` BEFORE-DELETE trigger is NOT done by disabling
@@ -743,13 +792,19 @@ impl EventStore for PgEventStore {
 
 /// Whether the seal+removal chokepoint was reached via `delete_stream`
 /// or `archive_stream`. The live-DB action is identical (seal the chain
-/// head, then remove the rows); only the emitted trace differs. The
-/// cold-storage `target` is carried for the log line and as a forward
-/// hook for the archive-backend follow-on.
+/// head, then remove the rows); only the emitted trace differs — so
+/// `Archive` removes the stream's events exactly as `Delete` does. The
+/// `target` is carried for the log line and as a forward hook for the
+/// post-v1 cold-storage-backend write; it is read by nothing else.
 #[derive(Debug)]
 enum SealMode {
     Delete,
-    Archive { target: String },
+    /// Reached only from `PgEventStore::archive_stream`, which no shipped
+    /// deployment calls — the `archive` retention mode is refused at
+    /// config parsing until the cold-storage writer exists.
+    Archive {
+        target: String,
+    },
 }
 
 impl SealMode {
@@ -767,12 +822,60 @@ impl PgEventStore {
     /// then removes the stream's rows — both in one transaction,
     /// tombstone first. No delete/archive code path may bypass this.
     ///
+    /// # The seal is conditional on `authority`
+    ///
+    /// The caller proved terminality and the retention floor from a read
+    /// of its own, in an earlier transaction. This one re-reads the tail
+    /// *without* `FOR UPDATE` — and must, because the append path holds
+    /// no row lock either (`UNIQUE (stream_id, stream_position)` is the
+    /// serializer, which `004_events.sql` calls "Optimistic
+    /// concurrency"), so there is no lock a seal could take that would
+    /// exclude an appender. ADR 0020's single-flight serializes seal jobs
+    /// against *each other*, not a seal against an append.
+    ///
+    /// `authority` is therefore what holds the proof and the removal
+    /// together, and it is checked at **both** points where the stream
+    /// could have moved:
+    ///
+    /// 1. **Against the tail read below.** An event that landed between
+    ///    the caller's proof and this read would otherwise be deleted
+    ///    under a tombstone that matches it perfectly — a stream whose
+    ///    tail is no longer the category terminal, removed as if it
+    ///    were.
+    /// 2. **On the `DELETE` itself**, which carries the same condition
+    ///    as a predicate and has its row count checked against the count
+    ///    the tombstone claims. A re-check as its own statement would
+    ///    not do: under READ COMMITTED every statement takes a fresh
+    ///    snapshot, so an append committing between a check and the
+    ///    `DELETE` is invisible to the check and present for the
+    ///    `DELETE`. Both halves are load-bearing — the predicate stops
+    ///    the removal, and the row-count comparison is what turns
+    ///    "deleted nothing" into a rolled-back refusal instead of a
+    ///    committed tombstone over an intact stream.
+    ///
+    /// # What stays open
+    ///
+    /// An append that commits *after* the `DELETE`'s snapshot is not
+    /// reachable from here: its row is neither visible to the `DELETE`
+    /// nor removed by it, so it survives as the first event of a stream
+    /// whose tombstone describes the events before it. That is what
+    /// "after the seal" means anywhere in this system — the window is
+    /// closed down to the removal statement, and no mechanism inside one
+    /// transaction can reach past its own commit. The chain verifier
+    /// reads such a stream as a `SealedGap` followed by live events,
+    /// which is the honest description of what happened.
+    ///
     /// Tracing-only (no metric — there is no `hort_*_seal*` metric in the
     /// catalog; the security-relevant
     /// state change is surfaced via the `info!` on emission and the
     /// `error!` on abort).
     #[tracing::instrument(skip(self))]
-    async fn seal_and_remove(&self, stream_id: StreamId, mode: SealMode) -> DomainResult<()> {
+    async fn seal_and_remove(
+        &self,
+        stream_id: StreamId,
+        mode: SealMode,
+        authority: SealAuthority,
+    ) -> DomainResult<SealOutcome> {
         let (target_id, target_cat) = stream_id_to_columns(&stream_id);
 
         let mut tx = self.pool.begin().await.map_err(|e| {
@@ -801,16 +904,48 @@ impl PgEventStore {
             // existed is not `Broken` (the verifier only flags streams
             // a checkpoint anchored). Idempotent no-op — do NOT write
             // a tombstone for a head that does not exist.
+            //
+            // Reported as `NotAtProvenVersion` rather than `Sealed`: the
+            // caller proved a tail at `authority.final_stream_position`
+            // and this call removed nothing, so counting it as a seal
+            // would report a deletion that did not happen.
             tracing::info!(
                 op = mode.op(),
                 stream_id = %target_id,
+                proven_final_stream_position = authority.final_stream_position,
                 "seal_and_remove: stream absent/empty — nothing to seal or remove"
             );
             tx.commit().await.map_err(|e| {
                 DomainError::Invariant(format!("seal transaction commit failed: {e}"))
             })?;
-            return Ok(());
+            return Ok(SealOutcome::NotAtProvenVersion);
         };
+
+        // The stream must still be at the tail the caller's proof read.
+        // A mismatch means an event landed after that proof: the tail is
+        // no longer the category terminal the caller verified, and the
+        // stream now holds an event the floor proof never covered. Refuse
+        // before anything is staged — no tombstone, no removal — and
+        // leave the stream whole for the next sweep to re-evaluate from
+        // a fresh proof. `<` is not reachable (nothing but this
+        // chokepoint removes event rows, and ADR 0020 single-flights it)
+        // but is refused on the same footing: a tail *behind* the proof
+        // means the stream is not the one that was proven either.
+        if final_position as u64 != authority.final_stream_position {
+            tracing::warn!(
+                op = mode.op(),
+                stream_id = %target_id,
+                proven_final_stream_position = authority.final_stream_position,
+                actual_final_stream_position = final_position,
+                "seal refused: the stream moved since the caller proved it \
+                 terminal and past its retention floor — NOT sealed, nothing \
+                 removed, no tombstone written (re-evaluated next sweep)"
+            );
+            tx.commit().await.map_err(|e| {
+                DomainError::Invariant(format!("seal transaction commit failed: {e}"))
+            })?;
+            return Ok(SealOutcome::NotAtProvenVersion);
+        }
 
         let final_event_hash: [u8; 32] = head_bytes.as_slice().try_into().map_err(|_| {
             DomainError::Invariant(format!(
@@ -946,19 +1081,89 @@ impl PgEventStore {
         // above were bypassed; it is mapped distinctly below
         // ("failed to remove sealed stream rows") so an operator can
         // tell a real trigger RAISE from a not-assumable-role error.
-        let removed = sqlx::query("DELETE FROM events WHERE stream_id = $1")
-            .bind(&target_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                // Defence-in-depth (events-role hardening): if the
-                // still-enabled trigger fired (DELETE under a non
-                // hort_retention_role), tick the `trigger_caught` metric
-                // before mapping the error.
-                inspect_audit_block(&e);
-                DomainError::Invariant(format!("failed to remove sealed stream rows: {e}"))
-            })?
-            .rows_affected();
+        //
+        // THE REMOVAL CARRIES THE CONDITION, and it has to be this
+        // statement that carries it: under READ COMMITTED each statement
+        // takes a fresh snapshot, so the tail read above — and any
+        // re-check phrased as its own statement — cannot see an append
+        // that commits before this `DELETE` begins, while the `DELETE`
+        // itself would delete it. The `NOT EXISTS` is evaluated in the
+        // same snapshot as the rows it guards, so a stream that grew
+        // past the proven tail yields zero deleted rows instead of a
+        // removed stream plus a tombstone naming a head that was no
+        // longer the head. The subquery is uncorrelated (one evaluation
+        // for the statement) and reads through the same
+        // `(stream_id, stream_position)` unique index the scan uses.
+        let removed = sqlx::query(
+            r#"DELETE FROM events
+               WHERE stream_id = $1
+                 AND NOT EXISTS (
+                       SELECT 1 FROM events newer
+                        WHERE newer.stream_id = $1
+                          AND newer.stream_position > $2
+                     )"#,
+        )
+        .bind(&target_id)
+        .bind(final_position)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            // Defence-in-depth (events-role hardening): if the
+            // still-enabled trigger fired (DELETE under a non
+            // hort_retention_role), tick the `trigger_caught` metric
+            // before mapping the error.
+            inspect_audit_block(&e);
+            DomainError::Invariant(format!("failed to remove sealed stream rows: {e}"))
+        })?
+        .rows_affected();
+
+        // The predicate above stops the removal; this comparison is what
+        // makes the stop a decision. Without it a blocked `DELETE` would
+        // commit the staged tombstone over an intact stream — the worst
+        // of the two outcomes, because the audit record would then claim
+        // a removal that never happened. `event_count` is the count the
+        // tombstone claims, so the only committing case is the one where
+        // the tombstone describes exactly what was removed.
+        if removed != event_count {
+            if removed == 0 {
+                // The predicate matched nothing: an append committed
+                // between the tail read and this statement. Dropping
+                // `tx` without commit rolls back the staged tombstone
+                // with it — the same fail-safe shape the role-assumption
+                // error path relies on — so the stream is left whole and
+                // untombstoned.
+                tracing::warn!(
+                    op = mode.op(),
+                    stream_id = %target_id,
+                    proven_final_stream_position = authority.final_stream_position,
+                    "seal refused at the removal: the stream grew between the \
+                     tail read and the DELETE — rolled back, nothing removed, \
+                     no tombstone written (re-evaluated next sweep)"
+                );
+                return Ok(SealOutcome::NotAtProvenVersion);
+            }
+            // Neither "all of it" nor "none of it": the stream's
+            // positions are not the contiguous 0-based run every reader
+            // of this table assumes, so `event_count` — and the
+            // tombstone built from it — does not describe this stream.
+            // Roll back rather than commit an audit record that
+            // misstates what was removed.
+            tracing::error!(
+                op = mode.op(),
+                stream_id = %target_id,
+                final_stream_position = final_position,
+                rows_removed = removed,
+                tombstone_event_count = event_count,
+                "seal aborted: the removal count does not match the event \
+                 count the tombstone claims, so the stream's positions are \
+                 not contiguous — rolled back, nothing removed"
+            );
+            return Err(DomainError::Invariant(format!(
+                "sealed stream {target_id} removal removed {removed} rows but its \
+                 tombstone claims {event_count} events (stream_position run is \
+                 not contiguous) — rolled back"
+            )));
+        }
 
         tx.commit()
             .await
@@ -977,7 +1182,7 @@ impl PgEventStore {
             },
             "StreamSealed tombstone emitted; stream sealed and removed"
         );
-        Ok(())
+        Ok(SealOutcome::Sealed)
     }
 }
 
@@ -2468,7 +2673,22 @@ mod tests {
                 .await
                 .unwrap();
 
-        store.delete_stream(stream.clone()).await.unwrap();
+        // The authority is the head this test just read — the shape a
+        // caller that proved terminality from the same tail supplies.
+        let outcome = store
+            .delete_stream(
+                stream.clone(),
+                SealAuthority {
+                    final_stream_position: head_before.0 as u64,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            SealOutcome::Sealed,
+            "a stream still at the proven tail must seal"
+        );
 
         // The target stream is gone...
         let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE stream_id = $1")
@@ -2657,7 +2877,14 @@ mod tests {
         // slot uncommitted; the emitter's INSERT at that position
         // blocks then fails (the slot is taken), so the seal returns
         // Err and its transaction rolls back.
-        let result = store.delete_stream(stream.clone()).await;
+        let result = store
+            .delete_stream(
+                stream.clone(),
+                SealAuthority {
+                    final_stream_position: 0,
+                },
+            )
+            .await;
         assert!(
             result.is_err(),
             "delete_stream must return Err when the tombstone append fails"
@@ -2705,14 +2932,28 @@ mod tests {
         // remove. MUST be a clean no-op and MUST NOT write a tombstone
         // (a tombstone for a head that does not exist would itself be
         // misleading audit).
-        store
-            .delete_stream(StreamId::artifact(Uuid::new_v4()))
-            .await
-            .unwrap();
-        store
-            .archive_stream(StreamId::artifact(Uuid::new_v4()), "s3://archive")
-            .await
-            .unwrap();
+        let authority = SealAuthority {
+            final_stream_position: 0,
+        };
+        assert_eq!(
+            store
+                .delete_stream(StreamId::artifact(Uuid::new_v4()), authority)
+                .await
+                .unwrap(),
+            SealOutcome::NotAtProvenVersion,
+            "an absent stream removed nothing, so it did not seal"
+        );
+        assert_eq!(
+            store
+                .archive_stream(
+                    StreamId::artifact(Uuid::new_v4()),
+                    "s3://archive",
+                    authority
+                )
+                .await
+                .unwrap(),
+            SealOutcome::NotAtProvenVersion
+        );
 
         let sealed_after: i64 =
             sqlx::query_scalar("SELECT count(*) FROM events WHERE stream_id = $1")
@@ -2728,8 +2969,10 @@ mod tests {
 
     /// Tier 2 (DB): `archive_stream` is treated identically to
     /// `delete_stream` for the live DB — it also seals (one tombstone)
-    /// and removes the rows. Cold-storage offload is a follow-on item;
-    /// only the trace differs.
+    /// and **removes the rows**. The cold-storage write is deferred
+    /// post-v1; only the trace differs. This test is the pinned evidence
+    /// for that, and is why `HORT_RETENTION_STREAM_MODE=archive` is
+    /// refused at config parsing: nothing here keeps the events.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn b9_db_archive_stream_parity_with_delete() {
@@ -2766,10 +3009,17 @@ mod tests {
                 .await
                 .unwrap();
 
-        store
-            .archive_stream(stream.clone(), "s3://archive-bucket/x")
+        let outcome = store
+            .archive_stream(
+                stream.clone(),
+                "s3://archive-bucket/x",
+                SealAuthority {
+                    final_stream_position: 0,
+                },
+            )
             .await
             .unwrap();
+        assert_eq!(outcome, SealOutcome::Sealed);
 
         let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE stream_id = $1")
             .bind(stream.to_string())
@@ -2788,6 +3038,373 @@ mod tests {
             sealed_after,
             sealed_before + 1,
             "archive_stream must also append exactly one StreamSealed tombstone"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The seal is conditional on the authority the caller proved
+    // -----------------------------------------------------------------
+
+    /// Seed a one-event artifact stream (tail position 0) and return
+    /// `(artifact_id, stream_id)`. Shared by the authority tests below so
+    /// each one is about the window it exercises, not the fixture.
+    async fn seed_one_event_stream(store: &PgEventStore) -> (Uuid, StreamId) {
+        let artifact_id = Uuid::new_v4();
+        let stream = StreamId::artifact(artifact_id);
+        store
+            .append(AppendEvents {
+                stream_id: stream.clone(),
+                expected_version: ExpectedVersion::NoStream,
+                events: vec![EventToAppend::new(DomainEvent::ArtifactRejected(
+                    ArtifactRejected {
+                        artifact_id,
+                        rejected_by: RejectionReason::Scanner,
+                        reason: "seal authority fixture".into(),
+                    },
+                ))],
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: hort_domain::events::system_actor(),
+            })
+            .await
+            .expect("seed one event");
+        (artifact_id, stream)
+    }
+
+    /// Append one more event to an existing artifact stream — the "late
+    /// `ArtifactExpired`" an authority is supposed to catch. Goes through
+    /// the real append path (`ExpectedVersion::Any`, exactly what the
+    /// retention evaluation uses), so the row it leaves is chained like
+    /// any other.
+    async fn append_late_event(store: &PgEventStore, artifact_id: Uuid, stream: &StreamId) {
+        store
+            .append(AppendEvents {
+                stream_id: stream.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(DomainEvent::ArtifactRejected(
+                    ArtifactRejected {
+                        artifact_id,
+                        rejected_by: RejectionReason::Admin,
+                        reason: "landed after the terminality proof".into(),
+                    },
+                ))],
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: hort_domain::events::system_actor(),
+            })
+            .await
+            .expect("late append");
+    }
+
+    /// How many `StreamSealed` tombstones name this exact stream.
+    /// Scoped to the stream rather than counted globally: the audit-meta
+    /// stream is a process-wide singleton every seal appends to, so a
+    /// before/after delta would race sibling tests.
+    async fn tombstones_for(pool: &PgPool, stream: &StreamId) -> i64 {
+        sqlx::query_scalar(
+            r#"SELECT count(*) FROM events
+               WHERE stream_id = $1
+                 AND event_type = 'StreamSealed'
+                 AND event_data->'data'->>'sealed_stream_id' = $2"#,
+        )
+        .bind(StreamId::eventstore_retention().to_string())
+        .bind(stream.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count tombstones for this stream")
+    }
+
+    async fn rows_in(pool: &PgPool, stream: &StreamId) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE stream_id = $1")
+            .bind(stream.to_string())
+            .fetch_one(pool)
+            .await
+            .expect("count stream rows")
+    }
+
+    /// Tier 2 (DB): an event that landed **before** the seal's own tail
+    /// read. The caller proved a tail at position 0; by the time the
+    /// chokepoint reads, the stream is at 1. Without the authority this
+    /// is the worst of the two windows — a stream whose tail is no
+    /// longer the category terminal, deleted under a tombstone that
+    /// describes it perfectly.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn b9_db_stale_authority_refuses_to_seal_a_grown_stream() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let store = PgEventStore::new(pool.clone()).await.unwrap();
+        let (artifact_id, stream) = seed_one_event_stream(&store).await;
+
+        // The late event: the retention evaluation proved position 0.
+        append_late_event(&store, artifact_id, &stream).await;
+
+        let outcome = store
+            .delete_stream(
+                stream.clone(),
+                SealAuthority {
+                    final_stream_position: 0,
+                },
+            )
+            .await
+            .expect("a stale authority is a refusal, not a failure");
+
+        assert_eq!(
+            rows_in(&pool, &stream).await,
+            2,
+            "STREAM DELETED — the stream must survive whole, including \
+             the event that landed after the proof"
+        );
+        assert_eq!(
+            tombstones_for(&pool, &stream).await,
+            0,
+            "TOMBSTONE NAMES THE WRONG HEAD — a refused seal writes no \
+             tombstone at all"
+        );
+        assert_eq!(outcome, SealOutcome::NotAtProvenVersion);
+
+        // `archive_stream` is the same chokepoint and must refuse
+        // identically — the two verbs may not differ in what authorizes
+        // them.
+        let archive_outcome = store
+            .archive_stream(
+                stream.clone(),
+                "s3://archive-bucket/x",
+                SealAuthority {
+                    final_stream_position: 0,
+                },
+            )
+            .await
+            .expect("a stale authority is a refusal, not a failure");
+        assert_eq!(archive_outcome, SealOutcome::NotAtProvenVersion);
+        assert_eq!(rows_in(&pool, &stream).await, 2);
+        assert_eq!(tombstones_for(&pool, &stream).await, 0);
+    }
+
+    /// Tier 2 (DB): an authority *ahead* of the real tail is refused on
+    /// the same footing. Not reachable in production (nothing but this
+    /// chokepoint removes event rows), but "the stream is not the one
+    /// you proved" is the condition, not "the stream grew".
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn b9_db_authority_ahead_of_the_tail_is_refused_too() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let store = PgEventStore::new(pool.clone()).await.unwrap();
+        let (_artifact_id, stream) = seed_one_event_stream(&store).await;
+
+        let outcome = store
+            .delete_stream(
+                stream.clone(),
+                SealAuthority {
+                    final_stream_position: 5,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, SealOutcome::NotAtProvenVersion);
+        assert_eq!(rows_in(&pool, &stream).await, 1);
+        assert_eq!(tombstones_for(&pool, &stream).await, 0);
+    }
+
+    /// Block a seal between its tail read and its `DELETE`, run
+    /// `interleaved` while it is parked there, then release it and return
+    /// the seal's outcome.
+    ///
+    /// The park point is the tombstone append: it sits between the two,
+    /// and a *separate, uncommitted* transaction holding the audit-meta
+    /// stream's next `stream_position` makes the chained INSERT wait on
+    /// that unique-index entry (read-committed cannot see the
+    /// uncommitted row, so the append still targets the contended
+    /// position). Rolling the squatter back frees the slot, so the seal
+    /// then proceeds through the `DELETE` — which is the only way to get
+    /// a committed row into the window the `DELETE`'s own snapshot sees.
+    ///
+    /// The store pool carries a generous `lock_timeout` purely so a
+    /// failure to detect the park can never hang the suite; the test
+    /// asserts the park was observed, so a timeout surfaces as a failed
+    /// assertion rather than a silent pass.
+    async fn seal_with_append_in_the_delete_window<F, Fut>(
+        pool: &PgPool,
+        stream: &StreamId,
+        authority: SealAuthority,
+        interleaved: F,
+    ) -> DomainResult<SealOutcome>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use sqlx::postgres::PgPoolOptions;
+        use sqlx::Executor;
+
+        let store_pool = PgPoolOptions::new()
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    conn.execute("SET lock_timeout = '30s'").await?;
+                    Ok::<(), sqlx::Error>(())
+                })
+            })
+            // Must target the SAME isolated database `pool` is on —
+            // cloning its connect options is what guarantees that (a
+            // fresh parse of `DATABASE_URL` would reach the shared
+            // target instead, and the squatter would hold a slot that
+            // is not in the seal's write path at all).
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .expect("store pool on the isolated database");
+        let store = PgEventStore::new(store_pool).await.unwrap();
+
+        let retention_sid = StreamId::eventstore_retention().to_string();
+        let next_pos: i64 = sqlx::query_scalar(
+            r#"SELECT COALESCE(MAX(stream_position), -1) + 1
+               FROM events WHERE stream_id = $1"#,
+        )
+        .bind(&retention_sid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let mut squatter = pool.begin().await.unwrap();
+        sqlx::query(
+            r#"INSERT INTO events
+                 (event_id, stream_id, stream_category, stream_position,
+                  event_type, event_version, event_data, correlation_id,
+                  actor_type, prev_event_hash, event_hash)
+               VALUES ($1,$2,'admin',$3,'StreamSealed',1,
+                       '{"type":"StreamSealed","data":{}}'::jsonb,$4,
+                       'timer',$5,$6)"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(&retention_sid)
+        .bind(next_pos)
+        .bind(Uuid::new_v4())
+        .bind([0u8; 32].as_slice())
+        .bind([1u8; 32].as_slice())
+        .execute(&mut *squatter)
+        .await
+        .unwrap();
+
+        let seal_stream = stream.clone();
+        let seal = tokio::spawn(async move { store.delete_stream(seal_stream, authority).await });
+
+        // Wait for the seal to park on the squatter's unique slot.
+        // Scoped to this isolated database, and `#[serial(hort_pg_db)]`
+        // keeps siblings out of the same server.
+        let mut parked = false;
+        for _ in 0..300 {
+            let blocked: i64 = sqlx::query_scalar(
+                r#"SELECT count(*) FROM pg_stat_activity
+                   WHERE datname = current_database()
+                     AND wait_event_type = 'Lock'
+                     AND state = 'active'"#,
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if blocked > 0 {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            parked,
+            "the seal never parked on the contended audit-meta slot — the \
+             interleaving this test is about was never constructed"
+        );
+
+        // The seal has read the target stream's tail and is waiting
+        // before its DELETE. This is the window.
+        interleaved().await;
+
+        squatter.rollback().await.unwrap();
+        seal.await.expect("seal task did not panic")
+    }
+
+    /// Tier 2 (DB): THE WINDOW THE `DELETE` ITSELF HAS TO CLOSE. The
+    /// late event commits after the seal's tail read and before its
+    /// `DELETE` — invisible to the tail read, visible to the `DELETE`.
+    /// A re-check phrased as its own statement cannot see it either
+    /// (read-committed gives every statement a fresh snapshot), which is
+    /// why the condition rides on the `DELETE`.
+    ///
+    /// Removing that condition makes this test fail on the two
+    /// assertions it exists for: the stream is gone, and the committed
+    /// tombstone names position 0 while the stream's head was 1.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn b9_db_append_inside_the_delete_window_refuses_the_seal() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let seeder = PgEventStore::new(pool.clone()).await.unwrap();
+        let (artifact_id, stream) = seed_one_event_stream(&seeder).await;
+
+        let authority = SealAuthority {
+            final_stream_position: 0,
+        };
+        let appender_stream = stream.clone();
+        let outcome = seal_with_append_in_the_delete_window(&pool, &stream, authority, || async {
+            append_late_event(&seeder, artifact_id, &appender_stream).await;
+        })
+        .await
+        .expect("an append in the window is a refusal, not a failure");
+
+        // The two facts first, each with its own statement: dropping
+        // the condition from the `DELETE` has to fail *here*, saying what
+        // broke, rather than tripping the outcome comparison below and
+        // leaving a reader to work out which half went wrong.
+        assert_eq!(
+            rows_in(&pool, &stream).await,
+            2,
+            "STREAM DELETED — the removal must roll back when an append \
+             commits inside the DELETE's window; the stream must still \
+             hold both its original event and the late one"
+        );
+        assert_eq!(
+            tombstones_for(&pool, &stream).await,
+            0,
+            "TOMBSTONE NAMES THE WRONG HEAD — a committed tombstone here \
+             would record final_stream_position 0 while the stream's head \
+             was already 1; no tombstone may commit for a stream that \
+             moved past the proven tail"
+        );
+        assert_eq!(outcome, SealOutcome::NotAtProvenVersion);
+    }
+
+    /// Tier 2 (DB): the control for the test above — the **same** park,
+    /// the same release, and nothing appended in the window. The stream
+    /// must still seal normally, or the condition is not a condition but
+    /// a brake.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn b9_db_quiet_window_still_seals_normally() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let seeder = PgEventStore::new(pool.clone()).await.unwrap();
+        let (_artifact_id, stream) = seed_one_event_stream(&seeder).await;
+
+        let authority = SealAuthority {
+            final_stream_position: 0,
+        };
+        let outcome = seal_with_append_in_the_delete_window(&pool, &stream, authority, || async {})
+            .await
+            .expect("an unchanged stream seals");
+
+        assert_eq!(outcome, SealOutcome::Sealed);
+        assert_eq!(
+            rows_in(&pool, &stream).await,
+            0,
+            "a stream nothing touched in the window must still be removed"
+        );
+        assert_eq!(
+            tombstones_for(&pool, &stream).await,
+            1,
+            "and must carry exactly one tombstone"
         );
     }
 }

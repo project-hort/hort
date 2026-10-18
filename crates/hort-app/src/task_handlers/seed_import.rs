@@ -269,14 +269,21 @@ mod tests {
 
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let content_refs = Arc::new(MockContentReferenceIndex::new());
+        // Paired so the ingest's refcount edges, which ride
+        // `commit_transition_with_enqueues`, land in the index rather than
+        // being dropped — the Postgres adapter commits them inside the
+        // artifact's own transaction.
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone())
+                .with_content_references(content_refs.clone()),
+        );
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
         let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
         let group_uc = Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
         let curation_rules = Arc::new(MockCurationRuleRepository::new());
-        let content_refs = Arc::new(MockContentReferenceIndex::new());
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let jobs = Arc::new(MockJobsRepository::default());
 

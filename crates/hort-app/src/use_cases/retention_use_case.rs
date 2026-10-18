@@ -18,8 +18,8 @@
 //!   metric, no event). `scan_indeterminate` is treated the same as
 //!   `rejected` for protection — a terminal-failure artifact is
 //!   evidence, not GC fodder (ADR 0007;
-//!   `ScanIndeterminate` recovery is admin-only). `none` / `released`
-//!   are eligible.
+//!   `ScanIndeterminate` recovery is an explicit manual release).
+//!   `none` / `released` are eligible.
 //! - **inv 7 — scan-data freshness gate (per-artifact).** Before a
 //!   *security-driven* predicate evaluates, **this artifact's own**
 //!   most-recent `ScanCompleted.stored_at` on its `artifact:<id>`
@@ -643,7 +643,7 @@ impl RetentionUseCase {
     /// **The cap is enforced here, not by the adapter.**
     /// `ExpectedVersion::Any` means the adapter performs no version check
     /// at all, so this append gets none of the bound that
-    /// [`read_expected_version`](crate::use_cases::read_expected_version)
+    /// [`read_unpaired_append_version`](crate::use_cases::read_unpaired_append_version)
     /// gives every `ExpectedVersion::Exact` writer. Without a refusal of
     /// its own, the expiry sweep is the one writer able to push an
     /// artifact stream past [`STREAM_EVENT_CAP`] — and past the cap every
@@ -653,7 +653,7 @@ impl RetentionUseCase {
     /// decision to refuse needs no extra I/O.
     ///
     /// A refusal returns `DomainError::Conflict`, matching
-    /// `read_expected_version`'s refusal for the same condition; the
+    /// `read_unpaired_append_version`'s refusal for the same condition; the
     /// caller folds it into [`EvalStep::Errored`] and keeps sweeping, so
     /// one frozen artifact does not stall the pass.
     async fn append_expired(

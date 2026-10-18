@@ -198,8 +198,14 @@ pub enum ReplayGuardError {
 /// `INSERT … ON CONFLICT DO NOTHING RETURNING` so the database
 /// arbitrates the race.
 pub trait ReplayGuardPort: Send + Sync {
-    /// Atomically claim `key` with the given `expires_at` (the row's
-    /// TTL horizon, already computed = `min(jwt_remaining, fed_max)`).
+    /// Atomically claim `key` with the given `expires_at` — the row's
+    /// TTL horizon, which the caller computes as the **source JWT's
+    /// own `exp`**. The horizon must outlast the JWT the row guards
+    /// against: an implementation prunes on `expires_at < now()`, so a
+    /// horizon shorter than the JWT's own validity (the minted
+    /// bearer's capped lifetime, for instance) removes the row while
+    /// the same signed JWT is still presentable, and the next
+    /// presentation of it no longer reads as a replay.
     ///
     /// Returns [`ReplayClaim::FirstSeen`] iff this exact key was not
     /// present (and is now recorded), [`ReplayClaim::Replayed`] iff it

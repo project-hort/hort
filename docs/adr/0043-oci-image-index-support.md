@@ -7,8 +7,8 @@
   [0039](0039-keyed-provenance-verification.md) (the provenance hold + the
   write-authorized manifest HEAD-and-GET exemption the push-then-sign payoff
   reuses),
-  [0008](0008-per-format-adapter-free-http-crates.md) (the index PUT writes its
-  membership rows through the content-reference use case, adapter-free),
+  [0008](0008-per-format-adapter-free-http-crates.md) (the index PUT records its
+  membership rows adapter-free, through a use case and never an adapter),
   [0054](0054-content-level-age-evidence-anchors-quarantine.md) /
   [0015](0015-apply-time-linter-inert-fields-and-naming.md) (the anchor
   derivation the eager-child-ingest amendment rests on, and the inert-field rule
@@ -68,8 +68,9 @@ lifecycle. There is **no index-specific lifecycle** and no group-model overhaul.
    new **fixed** kind `"oci_index_member"` is added to the allocated vocabulary
    (`content_reference_index.rs`): an index PUT writes one row per child —
    `source = index artifact, target = child manifest's own content hash,
-   kind = "oci_index_member"` — through the content-reference use case
-   (adapter-free, ADR 0008; mirrors the `oci_subject` write). N children share
+   kind = "oci_index_member"` — recorded **in the index artifact's own
+   minting transaction** and adapter-free (ADR 0008; the same shape as the
+   `oci_subject` write — see the 2026-10-07 amendment). N children share
    one `(source, kind)`, distinct only by target hash.
 
 3. **Quarantine / scan / release / provenance: the generic manifest lifecycle,
@@ -92,6 +93,15 @@ blocked content: consumption safety is enforced **per-child and per-layer**, not
 at the index. The ADR 0007 fail-closed release predicate is satisfied **per
 artifact** — the index's own release still requires its own scan success /
 waiver (plus provenance clearance under `required`), exactly like any manifest.
+
+**Narrowed 2026-10-13 — for a terminal child only; the argument above stands
+for a held one ([ADR 0062](0062-never-advertise-what-you-will-not-serve.md)).**
+A held child's per-leaf `503` is exactly the "not yet" answer and nothing here
+changes for it, but where a child is `Rejected` / `ScanIndeterminate` the answer
+is already "never", so advertising the index invites a pull that cannot complete
+and such an index is not served — ADR 0062 holds that argument; the per-artifact
+fail-closed release predicate (ADR 0007) and the provenance cascade (ADR 0039
+§11) are untouched.
 
 **Provenance-cascade interaction (ADR 0039 §11).** The per-artifact model has
 one deliberate exception on the *provenance* axis: cosign signs only the index
@@ -116,8 +126,9 @@ still reject `Unsigned` at window expiry.
 just index→child manifest: a single-image manifest PUT additionally writes one
 row per referenced blob — `kind = "oci_config"` for the config blob,
 `"oci_layer"` for each layer blob — `source = manifest artifact, target =
-blob's own content hash`, through the same content-reference use case
-(adapter-free, ADR 0008) as `oci_index_member`. Bounded by the existing
+blob's own content hash`, recorded the same way as `oci_index_member` — in
+the manifest artifact's own minting transaction, adapter-free (ADR 0008; see
+the 2026-10-07 amendment). Bounded by the existing
 `MAX_BLOB_REFERENCES`; idempotent on re-PUT via the widened PK (point 2 above).
 An index PUT is unaffected — it has no config/layers, only `oci_index_member`
 for its children. These are GC-active keepalive edges exactly like
@@ -262,6 +273,160 @@ there is no sweep that walks existing `oci_index_member` rows and enqueues them.
 Its children continue to arrive lazily, on the first client GET, exactly as
 before. Deploying this and then wondering why an existing index's children are
 still lazy is the expected observation, not a bug.
+
+### Membership edges commit with the artifact that claims them (issue #337, amended 2026-10-07)
+
+*Authorised by the answer on issue #337; implementing work on #335, units
+268–270.*
+
+The wording above said these rows are written "through the content-reference
+use case". They are not, any more: `oci_index_member`, `oci_config`,
+`oci_layer` and `oci_subject` travel into the mint as a
+`ContentReferenceClaim` — the edge minus the three fields only the mint can
+supply — and commit in the **same transaction** as the claiming artifact's
+events, row and metadata, or not at all.
+
+**Why this is the shape.** A `content_references` row is not a projection
+that may lag: the storage GC deletes a CAS object exactly when no row targets
+its hash, so the row *is* the claim that keeps the bytes alive. Written after
+its referrer committed, it leaves a window in which the referrer is live and
+its target is collectable — and for a **tree** edge nothing repairs that
+afterwards. The refcount reconcile derives `primary_content` and
+`metadata_blob` from the artifact row; no relational row records what a
+manifest references, so an edge that never landed cannot be re-derived and
+the referrer cannot re-assert it.
+
+**The ordering this forces, and it is OCI-specific, which is why it belongs
+here.** `oci_config` / `oci_layer` / `oci_index_member` are kinds the
+referenced-tree-descendant predicate counts. An edge naming a blob the
+repository does not hold would therefore let that blob's own later ingest see
+itself already referenced and take the zero-window quarantine carve-out — an
+observation window shortened on the strength of an edge written for content
+that did not exist. So the declared references are resolved **before** the
+mint and the membership claims are built only from a *complete* resolution.
+The unknown-blob posture is unchanged: a manifest referencing blobs the client
+has not pushed yet is still minted and still answered with 400
+`MANIFEST_BLOB_UNKNOWN`, so the retry-after-pushing path stays idempotent — it
+simply carries no membership claims, which is what the previous
+insert-after-the-gate already left behind on that path.
+
+`oci_subject` is deliberately **not** gated the same way: the Referrers flow
+legitimately lets a referrer be pushed for a subject this repository does not
+hold, and gating it would refuse a legitimate push. Note what that costs,
+because the opposite is easy to assume — `oci_subject` **is** a tree edge on
+the descendant predicate, so a referrer for an absent subject does set the
+zero-window carve-out for that subject's own later ingest. Pre-existing, and
+neither introduced nor repaired by moving the edge into the mint.
+
+**Unchanged by this amendment:** which rows exist, their key, that they are
+GC-active, idempotent on re-PUT, bounded by `MAX_BLOB_REFERENCES`, and
+adapter-free under [0008](0008-per-format-adapter-free-http-crates.md) — the
+format crate still speaks only to a use case.
+
+**A note for whoever edits this next.** The clause that went stale named a
+*call site*, and that is why it drifted — twice, since the `oci_subject` half
+was already wrong before the membership half caught up. A decision record
+holds the decision and its consequences, not the call graph. The two durable
+properties here are *adapter-free* and *the edge commits in the transaction of
+the artifact that claims it*; neither names a function, and both survive the
+next rebuild of the path. State those, not the caller.
+
+**Deliberately not stated here:** the format-agnostic rule that a new
+post-commit edge writer on any minting path is a defect. That holds for every
+format, not just OCI, so it lives where a developer adding a new `kind` meets
+it — the port module documentation in `content_reference_index.rs` — rather
+than in a format-specific decision record. The two backfill handlers remain
+the only production writers after a commit, which is their entire purpose.
+
+### A manifest is deliverable only while its constituents are (issue #342, amended 2026-10-13)
+
+*Authorised by the human's confirmation on issue #342; the rule itself is
+[ADR 0062](0062-never-advertise-what-you-will-not-serve.md), and this is where
+its OCI read-path half meets the per-child argument above.*
+
+**The decision.** A manifest or image index is served only while **every
+artifact in its closure** carries a non-terminal status. A `Rejected` or
+`ScanIndeterminate` constituent — config blob, layer blob, child manifest, or
+anything inside a child's own closure — withholds the document. This narrows
+the load-bearing argument above exactly as ADR 0062 states: the per-leaf answer
+stays correct for a **held** child, whose `503` *is* "not yet", and stops being
+correct for a **terminal** one, where "never" is already known at the moment the
+document is served.
+
+**Three properties, none of which name a call site** (the note two sections up
+applies to this amendment too):
+
+1. **The closure is derived from the document's bytes, never from the
+   `content_references` edges.** Edges *nominate*; the bytes decide — the same
+   authority ordering [ADR 0039](0039-keyed-provenance-verification.md) §11's
+   provenance cascade walks, and for the same reason: the edge projection is
+   repairable rather than guaranteed, which is why
+   `oci-membership-edge-backfill` exists. This is settled by human decision
+   (2026-10-10) **with the 2026-10-07 amendment above already in place**: that
+   amendment makes an edge atomic with its claiming artifact, so the projection
+   is no longer the lagging thing the objection described, and the decision was
+   nevertheless taken for the bytes. It is not reopened by citing the
+   amendment; if the measured cost of the byte reads is the problem, that is a
+   measurement to bring.
+2. **The question is transitive, and bounded by the ingest's own depth cap.**
+   One hop would be an arbitrary cut: an index over a child whose layers are
+   terminal would answer `200` and then fail at the child, which is the same
+   contradiction one level up. The walk reuses `MAX_CHILD_INGEST_DEPTH` —
+   walking deeper than the eager child ingest ever fetches would be asking
+   about documents this registry declines to pull — plus a total expansion
+   budget, because the depth bound alone does not bound the walk: the breadth
+   cap is 1024 per level.
+3. **Absence is not a hold, and this half is as load-bearing as the rule.** A
+   constituent with no catalog row is *not local yet* — the ordinary state of
+   every cold pull-through manifest, whose references are registered by digest
+   with no existence check (see the unknown-blob posture in the 2026-10-07
+   amendment). Only a **present** row in a terminal state changes the answer.
+   Inverting this would refuse every cold pull-through in the registry.
+
+**Failing to resolve the question refuses.** The document's own bytes being
+unreadable or unparseable, or its closure outgrowing the expansion budget,
+leaves hort unable to say what it binds, and
+[ADR 0007](0007-fail-closed-quarantine-release-predicate.md) says what to
+answer then. A *child's* bytes being unreadable is bounded instead: the child
+is still judged on its own catalog row and only its descendants go unasked,
+because the alternative would turn every cold index into a refusal.
+
+**No write-authorized exemption.** [ADR 0039](0039-keyed-provenance-verification.md)
+§10 / [ADR 0055](0055-write-authorized-hold-read-generalised.md) let a
+write-granted principal read a *held* manifest so a subject can be signed. That
+does not extend here and the reason is not procedural: a terminal constituent
+will not become deliverable by the pusher completing their workflow, so there is
+no push-then-sign payoff to protect. The write path's refusal of a terminal
+reference means a current push cannot create this shape in the first place.
+
+**The refusal names the offending constituent.** It carries the constituent's
+digest and — for a `Rejected` one — its rejection axis, in the same envelope the
+manifest's *own* refusal uses (`403 DENIED`, the subject and axis shape ADR 0055
+admits for a caller the read gate let through). This is deliberate rather than
+incidental: in the incident behind this rule the blob digest was what identified
+the cause — identical across repeated pulls of one manifest, different across
+manifests, which is how a shared base layer was ruled out — and a concealed
+refusal would delete that signal for everyone who cannot read hort's logs. A
+server-side line carries the same three facts (which document, which
+constituent, which verdict) and is not optional.
+
+**The Referrers asymmetry, stated so it is not left inferable.** `GET
+/v2/<name>/referrers/<digest>` keeps reporting a signature manifest as present
+while a fetch of that manifest now fails. From outside, that reads like a
+registry fault rather than a withheld artifact, and it is the price of refusing
+an immutable document rather than editing it. The Referrers answer is
+**deliberately out of scope** for this amendment — not overlooked, and not
+blessed either: ADR 0062's consequences say a resolution surface that does not
+hold the rule is a defect against that record, so closing it is enforcement
+work someone may schedule, with its own decision about what an unlistable
+referrer does to a signing client. Until then the server-side line above is
+what tells an operator which of the two they are looking at.
+
+**Deliberately unchanged:** `Quarantined` constituents (a hold means "not yet",
+and the client's own blob fetch already answers it with the deadline), the
+per-artifact fail-closed release predicate (ADR 0007), the provenance cascade
+(ADR 0039 §11), the unknown-blob posture on the write path, and every answer a
+manifest gives about its **own** status.
 
 ## Consequences
 

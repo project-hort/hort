@@ -75,11 +75,25 @@
 //! `refcount_reconcile`'s repair upsert, and the pair is pinned by a
 //! source-scan guard (`crates/hort-app/tests/blob_reclaim_lock.rs`)
 //! rather than by convention.
+//!
+//! # Whose transaction
+//!
+//! The statement itself lives in [`upsert_edges_in_tx`], which writes
+//! into a transaction the **caller** owns. [`ContentReferenceIndex::insert`]
+//! opens one per call, for the callers whose edge stands alone (the OCI
+//! manifest PUT's `oci_subject` / membership rows, the reconcile's
+//! repair). The ingest instead hands over the unit of work that is
+//! already writing the `ArtifactIngested` events, the artifact row, its
+//! metadata and its job-queue rows, so the artifact and its claim on the
+//! bytes commit or roll back as one: an artifact committed without its
+//! `primary_content` edge counts zero against its own content, and a
+//! released sibling carrying the same bytes then drives the GC's count to
+//! zero and authorises the delete.
 
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use hort_domain::error::{DomainError, DomainResult};
@@ -153,25 +167,89 @@ fn row_to_reference(row: ContentReferenceRow) -> DomainResult<ContentReference> 
 }
 
 // ---------------------------------------------------------------------------
+// In-transaction writer
+// ---------------------------------------------------------------------------
+
+/// Upsert `edges` inside a transaction the caller owns, under the
+/// blob-reclamation lock for every target hash.
+///
+/// Both of its callers go through it: the port's
+/// [`ContentReferenceIndex::insert`] (which wraps it in a transaction of its
+/// own) and the ingest's artifact transition (`crate::artifact_lifecycle`,
+/// which hands it the unit of work that is already writing the events, the
+/// artifact row, its metadata and the job queue — so the artifact and its
+/// claim on the bytes commit or roll back together). One spelling means the
+/// row an ingest writes and the row an OCI manifest PUT writes cannot diverge
+/// in shape. `refcount_reconcile`'s repair keeps its own statement, because
+/// it is a delete-then-insert over a different key.
+///
+/// Upsert on the PK so an idempotent source re-push is a refresh, not a 409 —
+/// see the module docs. The caller typically supplies `Utc::now()` but tests
+/// and replay may set `recorded_at` explicitly.
+///
+/// ## Lock order
+///
+/// **Every** lock is taken before **any** insert, in the total order
+/// [`crate::blob_lock::blob_lock_order`] defines. That is what keeps this
+/// composable with a transaction that writes other tables: a caller holding
+/// a blob lock never afterwards waits on an edge row, so no transaction here
+/// can hold half of a cycle. Taking the locks per-edge instead would make the
+/// order the caller's `edges` order, and two overlapping ingests could then
+/// each hold the lock the other needs next.
+pub(crate) async fn upsert_edges_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    edges: &[ContentReference],
+) -> DomainResult<()> {
+    if edges.is_empty() {
+        return Ok(());
+    }
+    // The blob-reclamation lock, taken before the rows that claim those
+    // bytes exist and held to the owning transaction's end. A reference
+    // written outside it can land between the storage-GC sweep's
+    // refcount-zero re-check and its delete, leaving the row pointing at
+    // bytes that no longer exist.
+    crate::blob_lock::lock_blobs_in_tx(tx, edges.iter().map(|e| e.target_content_hash.clone()))
+        .await?;
+    for edge in edges {
+        tracing::debug!(
+            entity = "ContentReference",
+            repository_id = %edge.repository_id,
+            source_artifact_id = %edge.source_artifact_id,
+            target_content_hash = %edge.target_content_hash,
+            kind = %edge.kind,
+            "upsert"
+        );
+        let ctx = format!("{}/{}", edge.repository_id, edge.source_artifact_id);
+        sqlx::query(
+            r#"INSERT INTO content_references (
+                   source_artifact_id, target_content_hash, kind, metadata,
+                   repository_id, recorded_at
+               ) VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (repository_id, source_artifact_id, target_content_hash, kind)
+               DO UPDATE SET
+                   metadata    = EXCLUDED.metadata,
+                   recorded_at = EXCLUDED.recorded_at"#,
+        )
+        .bind(edge.source_artifact_id)
+        .bind(edge.target_content_hash.as_ref())
+        .bind(&edge.kind)
+        .bind(&edge.metadata)
+        .bind(edge.repository_id)
+        .bind(edge.recorded_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| map_sqlx_error(&e, "ContentReference", &ctx))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Port impl
 // ---------------------------------------------------------------------------
 
 impl ContentReferenceIndex for PgContentReferenceRepo {
     fn insert(&self, reference: ContentReference) -> BoxFuture<'_, DomainResult<()>> {
         Box::pin(async move {
-            tracing::debug!(
-                entity = "ContentReference",
-                repository_id = %reference.repository_id,
-                source_artifact_id = %reference.source_artifact_id,
-                target_content_hash = %reference.target_content_hash,
-                kind = %reference.kind,
-                "insert"
-            );
-            // Upsert on the PK so idempotent source re-push is a
-            // refresh, not a 409 — see module docs. The caller
-            // typically supplies `Utc::now()` but tests / replay may
-            // set `recorded_at` explicitly.
-            let target_hex = reference.target_content_hash.as_ref().to_owned();
             // Retried on a contention abort. Sibling manifests of one push
             // share targets by construction — every attestation manifest in a
             // buildkit image index references the same empty-config blob — so
@@ -181,7 +259,7 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
             // the blob lock and the upsert — and re-running it is
             // re-opening it from the start, so a retry re-acquires the
             // lock rather than proceeding without it. The upsert is
-            // idempotent by the `ON CONFLICT DO UPDATE` above, so a
+            // idempotent by its `ON CONFLICT DO UPDATE`, so a
             // re-run cannot double-write even in the case where the
             // abort was reported after the row landed. A genuine
             // `Conflict` is not retried here (see `crate::contention`),
@@ -192,7 +270,6 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                 CONTENTION_RETRY_ATTEMPTS,
                 contention_backoff,
                 || {
-                    let target_hex = target_hex.clone();
                     let reference = &reference;
                     async move {
                         let ctx = || {
@@ -206,31 +283,7 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                             .begin()
                             .await
                             .map_err(|e| map_sqlx_error(&e, "ContentReference", &ctx()))?;
-                        // The blob-reclamation lock, taken before the
-                        // row that claims those bytes exists. Held to
-                        // this transaction's end, which is one
-                        // statement away.
-                        crate::blob_lock::lock_blob_in_tx(&mut tx, &reference.target_content_hash)
-                            .await?;
-                        sqlx::query(
-                            r#"INSERT INTO content_references (
-                       source_artifact_id, target_content_hash, kind, metadata,
-                       repository_id, recorded_at
-                   ) VALUES ($1, $2, $3, $4, $5, $6)
-                   ON CONFLICT (repository_id, source_artifact_id, target_content_hash, kind)
-                   DO UPDATE SET
-                       metadata    = EXCLUDED.metadata,
-                       recorded_at = EXCLUDED.recorded_at"#,
-                        )
-                        .bind(reference.source_artifact_id)
-                        .bind(&target_hex)
-                        .bind(&reference.kind)
-                        .bind(&reference.metadata)
-                        .bind(reference.repository_id)
-                        .bind(reference.recorded_at)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| map_sqlx_error(&e, "ContentReference", &ctx()))?;
+                        upsert_edges_in_tx(&mut tx, std::slice::from_ref(reference)).await?;
                         tx.commit()
                             .await
                             .map_err(|e| map_sqlx_error(&e, "ContentReference", &ctx()))?;

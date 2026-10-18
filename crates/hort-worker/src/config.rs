@@ -275,10 +275,13 @@ pub struct WorkerConfig {
     /// duplicated here. Fed positionally into `canonical_retention_rules(...)`
     /// by the composition root.
     pub audit_retention_floors: AuditRetentionFloors,
-    /// The one global v1 stream-retention mode (`HORT_RETENTION_STREAM_MODE`
-    /// ∈ `{delete, archive}`; `archive` requires a non-empty
-    /// `HORT_RETENTION_ARCHIVE_TARGET`). Mirrors
-    /// `hort-server::config::StreamRetentionMode`.
+    /// The one global v1 stream-retention mode.
+    /// `HORT_RETENTION_STREAM_MODE=delete` (or unset) is the only
+    /// accepted configuration; `archive` is a startup error while the
+    /// cold-storage writer is deferred post-v1, so
+    /// `HORT_RETENTION_ARCHIVE_TARGET` is never consulted. Mirrors
+    /// `hort-server::config::StreamRetentionMode` — both binaries read
+    /// the same variable and must agree on which values start.
     pub retention_stream_mode: RetentionStreamMode,
     /// Defense-in-depth Postgres `lock_timeout` (in ms) applied via
     /// `.after_connect` to **both** worker pools (the main pool and the
@@ -462,7 +465,25 @@ impl AuditRetentionFloors {
 /// (the one global v1 stream-retention mode).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetentionStreamMode {
+    /// `EventStore::delete_stream` — the stream's rows are removed after
+    /// the `StreamSealed` tombstone. The v1 default, and the only mode
+    /// [`WorkerConfig::from_env`] accepts.
     Delete,
+    /// `EventStore::archive_stream` with a target rooted at
+    /// `target_prefix`.
+    ///
+    /// **Not constructible from configuration.** The cold-storage write
+    /// is deferred post-v1, so `PgEventStore::archive_stream` seals the
+    /// chain head and deletes the live rows just like the delete path,
+    /// carrying `target_prefix` no further than one `tracing` field —
+    /// while the sweep counts the stream as `archived`.
+    /// `WorkerConfig::from_env` therefore rejects
+    /// `HORT_RETENTION_STREAM_MODE=archive` rather than producing this
+    /// variant; it stays in the type as the shape the mode lands in once
+    /// a writer exists. The `build_app_context` arm that maps it to
+    /// `StreamRetentionModeRef::Archive` is consequently unreachable in a
+    /// shipped deployment and is kept only so the mapping does not have
+    /// to be reconstructed with the writer.
     Archive { target_prefix: String },
 }
 
@@ -595,30 +616,49 @@ impl WorkerConfig {
                 )?,
             }
         };
-        // The one global v1 stream-retention mode (mirrors
-        // hort-server's HORT_RETENTION_STREAM_MODE; `archive` requires
-        // a non-empty target — a missing target hard-fails rather than
-        // silently degrading to delete = data loss).
+        // The one global v1 stream-retention mode (mirrors hort-server's
+        // HORT_RETENTION_STREAM_MODE, refusal included — the two binaries
+        // read the same variable, so a value that starts one and stops
+        // the other would be worse than either verdict).
+        //
+        // `archive` is recognised and refused: the cold-storage writer is
+        // deferred post-v1, so `PgEventStore::archive_stream` runs the
+        // same `DELETE FROM events WHERE stream_id = $1` as the delete
+        // path and carries the target no further than one `tracing`
+        // field, after which `EventStoreRetentionUseCase` increments its
+        // `archived` counter. An operator picking `archive` would be told
+        // the events were kept while they were removed. Refusing the
+        // value — rather than quietly mapping it to `Delete` — is the
+        // shape ADR 0015 requires of an accepted-but-inert operator
+        // surface. `HORT_RETENTION_ARCHIVE_TARGET` is deliberately not
+        // read: no target can make the mode archive anything, so
+        // demanding one first would walk the operator through a fix that
+        // changes nothing.
         let retention_stream_mode = match std::env::var("HORT_RETENTION_STREAM_MODE") {
             Ok(v) if !v.is_empty() => match v.to_ascii_lowercase().as_str() {
                 "delete" => RetentionStreamMode::Delete,
                 "archive" => {
-                    let target = optional("HORT_RETENTION_ARCHIVE_TARGET").ok_or_else(|| {
-                        ConfigError::InvalidValue {
-                            var: "HORT_RETENTION_ARCHIVE_TARGET",
-                            reason: "HORT_RETENTION_STREAM_MODE=archive requires a \
-                                     non-empty HORT_RETENTION_ARCHIVE_TARGET prefix"
-                                .into(),
-                        }
-                    })?;
-                    RetentionStreamMode::Archive {
-                        target_prefix: target,
-                    }
+                    return Err(ConfigError::InvalidValue {
+                        var: "HORT_RETENTION_STREAM_MODE",
+                        reason: "`archive` is not implemented: the cold-storage writer is \
+                                 deferred post-v1, so the archive path removes a stream's \
+                                 events exactly like `delete` while reporting them archived. \
+                                 Nothing is misconfigured on your side — the mode is refused \
+                                 at startup rather than silently deleting what it promises to \
+                                 keep. Use `delete` (or leave HORT_RETENTION_STREAM_MODE \
+                                 unset); HORT_RETENTION_ARCHIVE_TARGET has no effect until \
+                                 the cold-storage writer ships."
+                            .into(),
+                    })
                 }
                 other => {
                     return Err(ConfigError::InvalidValue {
                         var: "HORT_RETENTION_STREAM_MODE",
-                        reason: format!("expected one of [delete, archive], got {other:?}"),
+                        reason: format!(
+                            "expected `delete` — the only implemented mode; `archive` is \
+                             refused while the cold-storage writer is deferred post-v1 — \
+                             got {other:?}"
+                        ),
                     })
                 }
             },
@@ -1047,6 +1087,12 @@ mod tests {
         "HORT_WORKER_LOCK_TIMEOUT_MS",
         // Worker /metrics listener bind.
         "HORT_WORKER_METRICS_BIND",
+        // The one global v1 stream-retention mode + its (inert) archive
+        // target. Cleared so a mode leaking in from the surrounding
+        // process env cannot fail an unrelated test at the `archive`
+        // refusal.
+        "HORT_RETENTION_STREAM_MODE",
+        "HORT_RETENTION_ARCHIVE_TARGET",
     ];
 
     fn clear_all() {
@@ -1640,6 +1686,104 @@ mod tests {
         match err {
             ConfigError::InvalidValue { var, .. } => {
                 assert_eq!(var, "HORT_WORKER_METRICS_BIND");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    // -- The one global v1 stream-retention mode ---------------------------
+    //
+    // The worker and hort-server read the same
+    // `HORT_RETENTION_STREAM_MODE`, so these mirror
+    // `hort-server::config`'s own retention-mode tests: a value that
+    // started one binary and stopped the other would be worse than
+    // either verdict on its own.
+
+    /// `HORT_RETENTION_STREAM_MODE=archive` is refused at startup — with
+    /// and without `HORT_RETENTION_ARCHIVE_TARGET`, and whatever the
+    /// letter case. The cold-storage writer is deferred post-v1, so the
+    /// archive path deletes the stream's events exactly like `delete`
+    /// while reporting them archived; a supplied target cannot change
+    /// that, which is why the target is not what the error names.
+    #[test]
+    fn retention_mode_archive_rejected_until_cold_storage_writer_ships() {
+        for target in [None, Some("s3://cold-bucket/hort-event-archive")] {
+            for mode in ["archive", "ARCHIVE"] {
+                let _g = lock_env();
+                clear_all();
+                std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+                std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+                std::env::set_var("HORT_RETENTION_STREAM_MODE", mode);
+                if let Some(t) = target {
+                    std::env::set_var("HORT_RETENTION_ARCHIVE_TARGET", t);
+                }
+
+                let err = WorkerConfig::from_env()
+                    .expect_err("`archive` must not start the worker, with or without a target");
+                // The refused mode is what the operator must change, not
+                // the (now inert) archive target. The wording is pinned
+                // rather than just the variant, and it is the same
+                // wording hort-server emits: one variable, one answer.
+                match err {
+                    ConfigError::InvalidValue { var, reason } => {
+                        assert_eq!(var, "HORT_RETENTION_STREAM_MODE", "target={target:?}");
+                        assert!(
+                            reason.starts_with(
+                                "`archive` is not implemented: the cold-storage writer"
+                            ),
+                            "got: {reason}"
+                        );
+                        assert!(reason.contains("Use `delete`"), "got: {reason}");
+                    }
+                    other => panic!("expected InvalidValue, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// `delete`, an empty value and an unset variable all still resolve
+    /// to [`RetentionStreamMode::Delete`] — the `archive` refusal changed
+    /// nothing on the accepted path. (An empty env slot is how a
+    /// Helm/compose template renders "no override", so it must behave as
+    /// unset and not as an unknown value.)
+    #[test]
+    fn retention_mode_delete_and_unset_still_accepted() {
+        for mode in [None, Some(""), Some("delete"), Some("DELETE")] {
+            let _g = lock_env();
+            clear_all();
+            std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+            std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+            if let Some(m) = mode {
+                std::env::set_var("HORT_RETENTION_STREAM_MODE", m);
+            }
+
+            let cfg = WorkerConfig::from_env().expect("`delete` / unset must still parse");
+            assert_eq!(
+                cfg.retention_stream_mode,
+                RetentionStreamMode::Delete,
+                "mode={mode:?} must resolve to Delete"
+            );
+        }
+    }
+
+    /// An unknown mode string is a hard startup failure (not a silent
+    /// fallback to delete), and the message names both the one accepted
+    /// value and what happened to `archive` — so a typo'd `arcive` does
+    /// not send the operator into a second refusal.
+    #[test]
+    fn retention_mode_unknown_value_rejected() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var("HORT_RETENTION_STREAM_MODE", "incinerate");
+
+        let err = WorkerConfig::from_env().expect_err("an unknown mode must error");
+        match err {
+            ConfigError::InvalidValue { var, reason } => {
+                assert_eq!(var, "HORT_RETENTION_STREAM_MODE");
+                assert!(reason.contains("`delete`"), "got: {reason}");
+                assert!(reason.contains("`archive` is refused"), "got: {reason}");
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }

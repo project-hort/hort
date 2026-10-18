@@ -18,6 +18,7 @@ use hort_domain::entities::artifact::Artifact;
 use hort_domain::error::DomainError;
 use hort_domain::events::{
     ArtifactQuarantined, PersistedEvent, ProvenanceRejected, ProvenanceVerified, RejectionReason,
+    StreamId,
 };
 use hort_domain::ports::curation_queue_repository::CurationQueueEntry;
 use hort_domain::ports::provenance::{ProvenanceRejectReason, SignerIdentity};
@@ -776,25 +777,75 @@ async fn a_stream_read_failure_is_reported_per_artifact() {
     assert!(report.failed[0].1.contains("event store down"));
 }
 
-/// The **clearance** read failing is reported too, not read as "no
-/// `ProvenanceVerified`". Conjunct 3 is resolved by a second stream read
-/// (through the shared release-gate helper); if an infrastructure failure
-/// there were treated as "not cleared", a repairable artifact would be
-/// dropped from the report with nothing said about it.
+/// A candidate whose stream breached the event cap is reported as failed,
+/// not silently skipped and not repaired.
+///
+/// Both conjuncts below the pairing read the stream, and over a truncated
+/// prefix the absence of a terminal `ArtifactRejected` means only "not in
+/// the part we reached" — which is the shape that would repair a genuinely
+/// rejected artifact back into a releasable state.
 #[tokio::test]
-async fn a_clearance_read_failure_is_reported_not_read_as_no_evidence() {
+async fn a_candidate_whose_stream_breached_the_event_cap_is_reported_as_failed() {
+    let f = build();
+    let (artifact, entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
+        let mut stream = vec![quarantined(id, 0, anchor)];
+        stream.extend((1..201).map(|i| persisted_scan_completed(id, 0, i)));
+        stream
+    });
+    f.queue.set_entries(vec![entry]);
+
+    let report = f.uc.run(repair_request(true), api_actor()).await.unwrap();
+
+    assert!(report.affected.is_empty());
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].0, artifact.id);
+    assert!(
+        report.failed[0].1.contains("200-event cap"),
+        "the failure must name the cap it is enforcing; got {}",
+        report.failed[0].1
+    );
+}
+
+/// Conjuncts 2 and 3 are decided from **one** observation of the stream,
+/// not two reads of it.
+///
+/// There is exactly one stream read per candidate — the `ArtifactAtVersion`
+/// pairing — and the terminal-rejection record, the provenance clearance
+/// and the version the repair's append carries all come out of it. So a
+/// failure armed at read index 1 never fires: there is no second read to
+/// fail, and the candidate is reported as affected.
+///
+/// What this closes is not a read-error-handling question (the single read
+/// failing is covered above) but an ordering one: with two reads, a
+/// `ProvenanceVerified` landing between them would clear conjunct 3 on
+/// evidence the terminal-record check never saw, while the append still
+/// carried the earlier version — so the repair would commit without
+/// conflicting.
+#[tokio::test]
+async fn both_conjuncts_and_the_version_come_from_one_stream_read() {
     let f = build();
     let (_, entry) = seed_stranded(&f);
     f.queue.set_entries(vec![entry.clone()]);
-    // Call 0 is the terminal-event read; call 1 is the clearance read.
+    // Armed at call index 1 — a second read of the artifact stream. It
+    // must never fire.
     f.events
-        .fail_read_stream_at(1, DomainError::Invariant("clearance read failed".into()));
+        .fail_read_stream_at(1, DomainError::Invariant("there is no second read".into()));
 
     let report = f.uc.run(repair_request(true), api_actor()).await.unwrap();
-    assert!(report.affected.is_empty());
-    assert_eq!(report.failed.len(), 1);
-    assert_eq!(report.failed[0].0, entry.artifact_id);
-    assert!(report.failed[0].1.contains("clearance read failed"));
+    assert_eq!(
+        report
+            .affected
+            .iter()
+            .map(|a| a.artifact_id)
+            .collect::<Vec<_>>(),
+        vec![entry.artifact_id]
+    );
+    assert!(report.failed.is_empty());
+    assert_eq!(
+        f.events.read_stream_call_count(),
+        1,
+        "the repair must observe the candidate's stream exactly once"
+    );
 }
 
 /// An empty scan is a legitimate, reportable outcome — the expected

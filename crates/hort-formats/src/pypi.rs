@@ -3,7 +3,9 @@ use std::io::{Cursor, Read};
 use bytes::Bytes;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::format_handler::{DependencySpec, FormatHandler, VersionDiscovery};
+use hort_domain::ports::format_handler::{
+    require_https_metadata_url, DependencySpec, FormatHandler, MetadataUrlSubject, VersionDiscovery,
+};
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::{
     ArtifactCoords, ArtifactKind, Ecosystem, PayloadAccess, Sbom, SbomComponent,
@@ -431,7 +433,11 @@ fn extract_wheel_metadata_bytes_from_zip(buf: &[u8]) -> DomainResult<Option<Byte
     );
 
     match iter_result {
-        Ok(()) => {}
+        // The skipped-name count is not picked up here: this path's
+        // not-found outcome is a silent, non-fatal `Ok(None)` with no
+        // diagnosis to attach it to. The fatal sibling
+        // `locate_wheel_metadata_in_zip` does carry it.
+        Ok(_) => {}
         // A non-ZIP / corrupt buffer is non-fatal on the PEP 658 path: the
         // wheel ingest already succeeded; PEP 658 just is not advertised.
         Err(crate::archive_bounds::ZipIterError::Open(_)) => return Ok(None),
@@ -506,6 +512,14 @@ impl FormatHandler for PyPiFormatHandler {
         } else {
             ArtifactKind::Other
         }
+    }
+
+    /// A wheel or sdist ships the distribution's own modules; its
+    /// dependencies are `Requires-Dist` declarations resolved by the
+    /// installer against the index, so the BOM's components are names the
+    /// artifact does not carry.
+    fn payload_contains_components(&self) -> bool {
+        false
     }
 
     /// Parse a download path like `simple/{project}/{filename}` into coordinates.
@@ -1066,11 +1080,18 @@ impl VersionDiscovery for PyPiFormatHandler {
         match buf.as_slice() {
             // Wheel = zip. Magic `PK\x03\x04` (local file header).
             [0x50, 0x4B, 0x03, 0x04, ..] => {
-                let metadata = locate_wheel_metadata_in_zip(&buf)?.ok_or_else(|| {
-                    DomainError::Validation(
-                        "pypi wheel is missing a *.dist-info/METADATA entry (corrupt artifact)"
-                            .to_string(),
-                    )
+                let scan = locate_wheel_metadata_in_zip(&buf)?;
+                // The skipped-name count is stated unconditionally, including
+                // when it is zero: "0 skipped" is what rules out the one other
+                // explanation for this verdict, so an operator reading the
+                // message can tell a wheel that has no METADATA from a wheel
+                // whose METADATA was passed over unread.
+                let metadata = scan.metadata.ok_or_else(|| {
+                    DomainError::Validation(format!(
+                        "pypi wheel is missing a *.dist-info/METADATA entry (corrupt artifact); \
+                         {} entries were skipped for an undecodable name",
+                        scan.undecodable_names
+                    ))
                 })?;
                 parse_wheel_metadata_into_specs(&metadata)
             }
@@ -1165,16 +1186,22 @@ impl VersionDiscovery for PyPiFormatHandler {
 /// genuine corrupt-wheel signal the cascade must surface as `Err`.
 ///
 /// Returns:
-/// - `Ok(Some(bytes))` — the first matching METADATA entry's bytes.
-/// - `Ok(None)` — the zip is valid but carries no `*.dist-info/METADATA`
-///   entry (the caller maps this to a corrupt-wheel `Err`).
+/// - `Ok(scan)` with `scan.metadata == Some(bytes)` — the first matching
+///   METADATA entry's bytes.
+/// - `Ok(scan)` with `scan.metadata == None` — the zip is valid but carries no
+///   `*.dist-info/METADATA` entry (the caller maps this to a corrupt-wheel
+///   `Err`). `scan.undecodable_names` is how many file entries were skipped
+///   because their names could not be decoded, which is the one other way
+///   this verdict can be reached: without it the caller cannot tell "the
+///   wheel has no METADATA" from "the member that would have matched was
+///   passed over unread".
 /// - `Err(DomainError::Validation)` — the buffer is not a readable ZIP, or an
 ///   `archive_bounds` guard tripped (entry-count / compression-ratio), or the
 ///   matched entry exceeds [`PYPI_WHEEL_METADATA_MAX_BYTES`].
-fn locate_wheel_metadata_in_zip(buf: &[u8]) -> DomainResult<Option<Vec<u8>>> {
+fn locate_wheel_metadata_in_zip(buf: &[u8]) -> DomainResult<WheelMetadataScan> {
     let mut found: Option<Vec<u8>> = None;
     let mut read_err: Option<String> = None;
-    crate::archive_bounds::iter_zip_entries(
+    let stats = crate::archive_bounds::iter_zip_entries(
         Cursor::new(buf),
         crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
         |name, reader| {
@@ -1206,7 +1233,27 @@ fn locate_wheel_metadata_in_zip(buf: &[u8]) -> DomainResult<Option<Vec<u8>>> {
     if let Some(msg) = read_err {
         return Err(DomainError::Validation(msg));
     }
-    Ok(found)
+    Ok(WheelMetadataScan {
+        metadata: found,
+        undecodable_names: stats.undecodable_names,
+    })
+}
+
+/// What a completed wheel-METADATA walk found, plus what it had to pass
+/// over to get there.
+///
+/// The two fields are reported together because the absence of METADATA is
+/// only diagnosable alongside the count: a wheel that genuinely has no
+/// `*.dist-info/METADATA` entry and a wheel whose METADATA entry was
+/// skipped for an undecodable name produce the same `None`, and only the
+/// handler can name the artifact that happened to.
+struct WheelMetadataScan {
+    /// The first matching `*.dist-info/METADATA` entry's bytes, if one was
+    /// both present and readable.
+    metadata: Option<Vec<u8>>,
+    /// File entries the walk skipped because their names could not be
+    /// decoded. See [`archive_bounds::ZipScanStats`](crate::archive_bounds::ZipScanStats).
+    undecodable_names: usize,
 }
 
 /// Parse the *declared runtime* dependency specs from a wheel `METADATA`
@@ -1506,9 +1553,10 @@ fn extract_pypi_license_list(metadata: &serde_json::Value) -> Vec<String> {
 /// on disk; PEP 503 normalisation applies to project names, not filenames),
 /// then returns the entry's `url` field as a `String`.
 ///
-/// The URL is required to begin with `https://`. `http://`, missing scheme,
-/// or any other scheme is rejected as a `Validation` error so we never
-/// promote a downgrade-attack target to a fetch URL.
+/// The scheme check is [`require_https_metadata_url`] — the single
+/// definition of "a metadata-supplied download URL must be `https://`",
+/// shared with every other consumer of that rule rather than re-spelled
+/// here.
 ///
 /// `max_bytes` is the per-format input-size ceiling. The caller must pass
 /// [`PyPiFormatHandler::metadata_expected_max_bytes`]; the parameter is
@@ -1561,11 +1609,7 @@ pub fn extract_upstream_file_url(
         ))
     })?;
 
-    if !url.starts_with("https://") {
-        return Err(DomainError::Validation(format!(
-            "upstream PyPI returned non-https URL: {url}"
-        )));
-    }
+    require_https_metadata_url(url, MetadataUrlSubject::PypiFileUrl)?;
 
     Ok(url.to_string())
 }
@@ -3897,6 +3941,25 @@ Long description body.\n" as &[u8];
             .extract_dependency_specs(&mut Cursor::new(whl))
             .unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+    }
+
+    /// The not-found diagnosis states how many entries the walk passed
+    /// over for a name it could not decode. Absence of METADATA and a
+    /// METADATA entry skipped unread produce the same verdict, and only
+    /// this handler knows which artifact it was reading, so the number has
+    /// to appear here. It is stated even when it is zero: "0 skipped" is
+    /// what rules the second explanation out.
+    #[test]
+    fn extract_dependency_specs_pypi_missing_metadata_diagnosis_states_the_skip_count() {
+        let whl = build_wheel_zip(&[("requests/__init__.py", b"")]);
+        let err = handler()
+            .extract_dependency_specs(&mut Cursor::new(whl))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("0 entries were skipped for an undecodable name"),
+            "the diagnosis must name the skip count: {err}"
+        );
     }
 
     /// Bytes whose leading magic is neither `PK\x03\x04` (wheel/zip) nor

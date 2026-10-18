@@ -255,14 +255,22 @@ call's inputs + decision:
   only production path that emits `permission="delete"`. Cancel/finalize
   of an in-flight upload deliberately stays on `permission="write"`.
   `curate` covers the `CurateOrAdminPrincipal`
-  extractor that gates the HTTP decision endpoints under
-  `/api/v1/admin/curation/...`. A decision lights up
+  extractor. It gates the HTTP decision endpoints under
+  `/api/v1/admin/curation/...`, the finding-exclusion writes under
+  `/api/v1/admin/policies/{policy_id}/exclusions`, and
+  `GET /api/v1/admin/quarantine/patch-candidates` — the read that
+  grounds the manual release, which carries the release's own gate
+  (ADR 0007). A decision lights up
   `permission="curate"` regardless of whether the underlying
   authority was `Permission::Curate` or `Permission::Admin` (the
   extractor accepts either) — the label tracks "decisions on the
   curator surface", not "which authority the evaluator consulted".
-  An admin-only caller hitting `/api/v1/admin/curation/...` ticks
-  `curate=allow`, NOT `admin=allow`.
+  An admin-only caller hitting any of those routes ticks
+  `curate=allow`, NOT `admin=allow`. The patch-candidate listing moved
+  onto this label when its gate widened; a dashboard that counted it
+  under `permission="admin"` sees that series drop, and because this
+  extractor is absent from `hort_authz_denials_total` (see below) a
+  denied listing request no longer contributes a `reason` there.
 
 `hort_authz_denials_total` is the **deny-only sibling** of the decision
 counter, carrying WHICH leg of the two-leg authorization AND
@@ -655,8 +663,8 @@ so they don't all hit the snapshot queries on the same edge
 
 | Metric | Type | Labels | Unit | Description |
 |---|---|---|---|---|
-| `hort_dispatcher_principal_resolved_total` | counter | `source ∈ {snapshot_present, snapshot_empty_admin, snapshot_empty_no_admin}` | — | One increment per principal synthesis in the subscription-delivery dispatcher. 3-series. `snapshot_present` = `subscription.snapshot_claims` was non-empty and was used as the evaluation claim set; `snapshot_empty_admin` = `snapshot_claims` empty but the owner carries the admin bit (evaluates with admin authority); `snapshot_empty_no_admin` = `snapshot_claims` empty and owner is not an admin — the operator diagnostic for "subscription created via PAT by a non-admin user" (such a subscription can never match a claims-scoped grant). |
-| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository and `prefetch_trigger_requires_version_discovery` per offending `prefetchPolicy.triggers` entry (the ADR 0015 inert-field rules); `scan_backend_capability` fires per offending (ScanPolicy, repository, `scanBackends` entry) pairing — the same ADR 0015 rule on the scan axis, rejecting a backend the compiled-in scanner capability map says cannot analyse that repository's format; `retention_unused_for_not_implemented` fires per offending `RetentionPolicy` whose predicate uses `UnusedFor` at the root or nested in a `Composite` (the same ADR 0015 rule on the retention axis, in its mislabelled rather than merely inert form — no last-download signal exists, so the evaluator falls back to the creation time and the predicate silently decides on age; the rule is retired when a real last-download anchor is wired). `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented`, `prefetch_trigger_requires_version_discovery`, `scan_backend_capability`, `retention_unused_for_not_implemented` — cardinality is fixed at the rule count (9). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 9 rules × 3 results = 27. |
+| `hort_dispatcher_principal_resolved_total` | counter | `source ∈ {snapshot_present, snapshot_empty_admin, snapshot_empty_no_admin}` | — | One increment per principal synthesis in the subscription-delivery dispatcher — one per **active subscription per reconcile pass**, since the principal is re-synthesised for a running task as well as a new one, so the rate tracks the active-subscription count rather than the spawn rate. 3-series. `snapshot_present` = `subscription.snapshot_claims` was non-empty and was used as the evaluation claim set; `snapshot_empty_admin` = `snapshot_claims` empty but the owner carries the admin bit (evaluates with admin authority); `snapshot_empty_no_admin` = `snapshot_claims` empty and owner is not an admin — the operator diagnostic for "subscription created via PAT by a non-admin user" (such a subscription can never match a claims-scoped grant). |
+| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository and `prefetch_trigger_requires_version_discovery` per offending `prefetchPolicy.triggers` entry (the ADR 0015 inert-field rules); `scan_backend_capability` fires per offending (ScanPolicy, repository, `scanBackends` entry) pairing — the same ADR 0015 rule on the scan axis, rejecting a backend the compiled-in scanner capability map says cannot analyse that repository's format; `retention_unused_for_not_implemented` fires per offending `RetentionPolicy` whose predicate uses `UnusedFor` at the root or nested in a `Composite` (the same ADR 0015 rule on the retention axis, in its mislabelled rather than merely inert form — no last-download signal exists, so the evaluator falls back to the creation time and the predicate silently decides on age; the rule is retired when a real last-download anchor is wired); `scan_policy_license_policy_not_implemented` fires per offending `ScanPolicy` declaring a non-inert `licensePolicy` (the scan path evaluates it against an empty licence list, so every rule in it matches nothing — retired when a port surfaces an artifact's licences); `exclusion_scope_not_implemented` fires per offending `Exclusion` whose `scope` names a repository (the finding filter never reads the scope, so the waiver clears its CVE for every repository the parent policy governs — retired when per-repository scoping is enforced); `virtual_member_format_not_enforced` fires per offending (virtual repository, `virtualMembers` entry) pair whose formats differ (nothing compares them, so the member is resolved for the virtual's format and owns the names it holds there — retired when a format-compatibility model ships); `scan_policy_max_artifact_age_not_implemented` fires per offending `ScanPolicy` declaring a `maxArtifactAge` (the cap is projected, event-sourced and persisted while the age evaluator has no caller on any scan, release or retention path, so no artifact is ever flagged for age — retired when a consumer feeds the projected cap and the artifact's ingest instant through `evaluate_age_gates`). `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented`, `prefetch_trigger_requires_version_discovery`, `scan_backend_capability`, `retention_unused_for_not_implemented`, `scan_policy_license_policy_not_implemented`, `exclusion_scope_not_implemented`, `virtual_member_format_not_enforced`, `scan_policy_max_artifact_age_not_implemented` — cardinality is fixed at the rule count (13). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 13 rules × 3 results = 39. |
 | `hort_effective_permissions_lookups_total` | counter | `result ∈ {ok, denied, not_found}` | — | One increment per call to the admin effective-permissions endpoint (`GET /api/v1/admin/users/:user_id/effective-permissions`). 3-series. `ok` = admin caller, inspected user resolved, view returned; `denied` = `require_admin()` rejected the caller (emitted before the early return; the inspected user was never resolved); `not_found` = caller was admin but the inspected `user_id` did not resolve to a user row. |
 
 Emitted by
@@ -726,6 +734,7 @@ truth: `crates/hort-app/src/use_cases/api_token_use_case.rs::issuance_result_lab
   token issuance attempted and refused" — the typed reason is in
   the denial event for SOC drill-down.
 - `validation_error` — every other Err arm: `ServiceAccountSelfMint`,
+  `BootstrapAdminMintForbidden`,
   `UnboundedSvcTokenDisallowed`, `InvalidRepositorySet`,
   `NotServiceAccount`, `NotAuthorized`, `TokenNotFound`,
   `NameEmpty`/`NameTooLong`, `DescriptionTooLong`,
@@ -1340,7 +1349,7 @@ SERVICE_ACCOUNT_ALL}`.
 | `hort_api_token_used_audit_dropped` | counter | `result` | — | `throttled`, `append_error` |
 | `hort_download_duration_seconds` | histogram | `format` | seconds | — |
 | `hort_quarantine_triggered_total` | counter | `format`, `repository` | — | — |
-| `hort_quarantine_released_total` | counter | `reason` | — | `reason` ∈ `timer`, `admin`, `policy_re_evaluation` |
+| `hort_quarantine_released_total` | counter | `reason` | — | `reason` ∈ `timer`, `curator`, `policy_re_evaluation` (a historical `admin` value is retired and no longer emitted — the manual release is the curator's, so `curator` replaced it) |
 
 **`IngestResult` semantics:**
 
@@ -2328,7 +2337,7 @@ fetch port is called:
   softer here at 13 values; further splitting would push past the
   architect-doc per-metric ceiling (5–10) without operator-actionable
   benefit (both terminal states share the same handling: "no
-  automated path forward; needs human curator/admin override").
+  automated path forward; needs a human curator decision").
 - `internal` (`hort_prefetch_self_service_total` ONLY) — Hort-side
   infrastructure failure: a DB / jobs-port / `package_version_status`
   error, including a `jobs_trigger_source_check` constraint violation.
@@ -2770,6 +2779,7 @@ intentionally NOT operator-tunable.
 | `hort_advisory_hydration_total` | counter | `result` | — | `cache_hit`, `fetched`, `failed` |
 | `hort_sbom_extraction_total` | counter | `format`, `result` | — | `result ∈ {success, unsupported_format, parse_error, payload_unavailable}` |
 | `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, unusable_lockfile, payload_unavailable, not_applicable}` |
+| `hort_finding_component_relation_total` | counter | `format`, `result` | — | `result ∈ {subject, contained, not_contained, not_established}` |
 | `hort_sbom_components_skipped_total` | counter | `format` | — | — (the skip count rides the counter's value) |
 | `hort_artifact_became_vulnerable_total` | counter | `repository`, `severity`, `ingest_source` | — | `severity ∈ {critical, high, medium, low}`; `ingest_source ∈ {direct, proxied}` |
 | `hort_scan_record_outcome_failures_total` | counter | `result`, `scanner` | — | `result ∈ {failed_branch, report_too_large, nothing_analysable, inert_pairing}`; `scanner ∈ {(none), trivy, osv, …registered backend names}` |
@@ -2789,6 +2799,15 @@ Source of truth for the result enums:
   lifted from `hort_domain::ports::format_handler::SbomResolution` (the
   handler-side vocabulary) via `From`; the remaining two are outcomes only
   the orchestrator can observe.
+- `hort_domain::types::ComponentRelation` for
+  `hort_finding_component_relation_total.result` — the **domain** enum
+  itself, rendered by `hort_domain::types::component_relation_label` and
+  pinned equal to the variant's persisted `serde` spelling. There is no
+  parallel enum in the emitting layer, for the same reason
+  `hort_scan_findings_total.severity` has none: the taxonomy is exactly
+  the one written onto the finding, with no arm only the orchestrator can
+  see, so a second copy here would be a taxonomy to keep in step rather
+  than a translation of anything.
 
 Adding a variant to any of those enums requires updating this catalog
 in the same change.
@@ -2813,6 +2832,37 @@ transition; closed taxonomy of 4):
 - `retried` — emitted when `record_outcome` reschedules the job for
   a future attempt via `JobsRepository::reschedule`. One tick per
   reschedule call.
+
+**`hort_finding_component_relation_total` semantics** — emitted by
+`ScanOrchestrationUseCase::run_scan` once per finding as it is tagged
+with the component it is about (ADR 0056 as amended 2026-10-15). Closed
+taxonomy of 4, mirroring `hort_domain::types::ComponentRelation`:
+
+- `subject` — the finding names the artifact's own subject component.
+- `contained` — it names something else whose code the artifact carries:
+  a component listed in the BOM of a format whose payload contains its
+  closure (an OCI image and its layers), or any package a
+  payload-scanning backend unpacked out of the artifact.
+- `not_contained` — it names a component the artifact's BOM lists but its
+  payload does not ship (a cargo `.crate`'s lockfile pins, an npm
+  packument's dependency ranges, a POM's `<dependencies>`). True
+  information about the dependency; no evidence about this artifact.
+- `not_established` — the relation could not be determined: an
+  SBOM-driven producer reported a purl the BOM does not name, or the BOM
+  has no subject to join against.
+
+**Read `not_established` as a defect, not as background.** Every
+compiled-in SBOM builder derives its subject from the artifact's
+coordinates rather than its payload, so a fresh scan should essentially
+never produce one; a non-zero rate on new scans means a format's subject
+is not being derived, or the two sides of the purl join are spelling it
+differently. The stored relation treats `not_established` as condemning
+(the fail-closed reading of absent evidence), and that default is only
+defensible while it stays rare — this series is what says whether it is.
+
+Unlike `hort_scan_findings_total`, this counter ticks **before** the
+cross-backend dedup: it counts tagging decisions, and a decision a merge
+later discards was still made.
 
 **`hort_scan_findings_total` semantics** — emitted by
 `ScanOrchestrationUseCase::run_scan` once per (deduplicated) finding
@@ -3205,7 +3255,7 @@ the OSV bulk diff).
 | `hort_policy_reevaluation_artifacts_total` | counter | `result` | — | `result ∈ {released, re_held, unchanged}` — per-artifact terminal outcome of an async scan-policy re-evaluation pass (ADR 0041 Item 3). One increment per in-scope artifact the pass reached a verdict for. NO high-cardinality labels (`policy_id` / `artifact_id` forbidden). |
 | `hort_policy_reevaluation_population` | gauge | (none) | artifacts | set once at the completion of a `policy-reevaluation` pass to the in-scope population it walked (loosen + tighten); the **completeness** signal — a partial pass (loosen-list truncation, a tighten-page read failure) reports the population it actually walked, so a population/counter gap is observable rather than silent |
 | `hort_policy_reevaluation_enqueue_failed_total` | counter | (none) | — | incremented when a gate-affecting policy mutation committed but its async `policy-reevaluation` pass failed to enqueue (the best-effort enqueue swallowed the error so the mutation still succeeds). The **alertable signal that a pass never ran** — the `_artifacts_total` / `_population` metrics emit only at pass completion, so a swallowed enqueue is otherwise invisible. For a TIGHTEN, the now-non-compliant population stays downloadable until a later gate-affecting mutation re-enqueues or the operator re-applies the policy; alert on a non-zero rate. Bare counter (no labels — the failed `policy_id` / `trigger` is on the warn-level log line). |
-| `hort_patch_candidates_listed_total` | counter | `repository`, `result` | — | `repository ∈ {"_all", <key>}` for v1: `_all` for admin-wide scope (no `?repository` filter), the resolved repository key when the handler successfully resolved `?repository=<key>` to a row. `"unknown"` is reserved for future non-HTTP / dispatcher paths — the HTTP handler short-circuits to 404 on lookup failure before reaching the use case. `result ∈ {ok, denied, invalid, error}` |
+| `hort_patch_candidates_listed_total` | counter | `repository`, `result` | — | `repository ∈ {"_all", <key>}` for v1: `_all` for an unscoped read (no `?repository` filter), the resolved repository key when the handler successfully resolved `?repository=<key>` to a row. `"unknown"` is reserved for future non-HTTP / dispatcher paths — the HTTP handler short-circuits to 404 on lookup failure before reaching the use case. `result ∈ {ok, denied, invalid, error}` |
 
 Source of truth for the result enums:
 - `hort_app::metrics::TriggerSourceLabel` for `hort_scan_jobs_enqueued_total.trigger_source`. Mirrors `hort_domain::ports::jobs_repository::TriggerSource` (the SQL wire form). The two MUST agree — a drift is enforced as a compile-equality test.
@@ -3310,22 +3360,26 @@ gate; the counter and histogram below are the operator-visible
 breakdown.
 
 **`hort_patch_candidates_listed_total` result semantics** (closed
-taxonomy of 4; one emission per admin call to
+taxonomy of 4; one emission per call to
 [`PatchCandidateUseCase::list`](../crates/hort-app/src/use_cases/patch_candidate_use_case.rs).
 The `repository` label is the resolved repository key when the HTTP
 handler successfully looked up `?repository=<key>` via
 `RepositoryRepository::find_by_key` and threaded it onto
 `PatchCandidateFilter::repository_key_for_metric`, or the `_all`
-sentinel when the request had no `?repository` filter (admin-wide
-scope). `"unknown"` is reserved for future non-HTTP / dispatcher
+sentinel when the request had no `?repository` filter (unscoped — every
+repository). `"unknown"` is reserved for future non-HTTP / dispatcher
 callers — the HTTP handler short-circuits to 404 on lookup failure
 before invoking the use case, so the use-case-side metric only ever
-sees `_all` or a resolved key in v1):
+sees `_all` or a resolved key in v1. The taxonomy carries no authority
+dimension: a curator call and an admin call are indistinguishable in
+these labels, and the deny leg that produced a `denied` tick is on the
+log line, not the series):
 
-- `ok` — admin call succeeded; repo returned a `Vec<PatchCandidate>`
+- `ok` — the call succeeded; repo returned a `Vec<PatchCandidate>`
   (possibly empty). Emitted on the success path after the audit log
   fires.
-- `denied` — `require_admin()` rejected the caller. Emitted *before*
+- `denied` — `require_curate_or_admin()` rejected the caller: neither
+  `Permission::Curate` nor `Permission::Admin`. Emitted *before*
   the early return so dashboards count attempted-but-forbidden
   invocations distinctly from input-validation failures. Repo is
   never called.
@@ -3466,9 +3520,10 @@ that knows the per-ecosystem ingest count; `hort-app` only sees the aggregate
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
-| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `held_pending_subject`, `requeued_no_anchor` |
-| `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed` |
+| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `held_pending_subject`, `held_indeterminate`, `allowed_indeterminate`, `cleared_signature_material`, `requeued_no_anchor` |
+| `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed`, `digest_mismatch` |
 | `hort_provenance_late_joiner_cleared_total` | counter | `backend` | — | one increment per constituent that self-cleared against an already-verified subject at its own quarantine commit |
+| `hort_provenance_unreadable_skipped_total` | counter | `backend` | — | incremented **by the number of** attestation candidates a verify skipped as unreadable; not emitted at all when nothing was skipped |
 
 The first two counters are emitted at exactly **one layer** — the
 orchestration use case
@@ -3477,6 +3532,64 @@ orchestration use case
 to this layer at the emission site). One increment per **applied
 provenance verdict**. Standing decisions: ADR 0027
 (`docs/adr/0027-artifact-provenance-verification.md`).
+
+**`result="cleared_signature_material"`** (ADR 0039 D8) is the one
+`hort_provenance_verify_total` value on which no verdict was applied to the
+artifact the job named: the folded verdict was `NoAttestation` under
+`Required`, and a signature manifest binding that artifact's digest had its
+bundle verified against the subject it names, so a cascaded
+`ProvenanceVerified` was committed instead of a hold. `backend` is the
+verifier that accepted the signature manifest's bundle. Separable from
+`verified` because the artifact carries no direct verification of its own,
+and from `held_pending_subject` because that subject has now arrived and
+been checked. A `Required` scope publishing cosign signatures shows a
+steady low rate here — two rows per signature, the `{}` config blob and the
+payload layer; a rate of zero on such a scope means the signature payloads
+are stranding instead (check for `Pending` clearances on blob rows).
+
+**`hort_provenance_unreadable_skipped_total`** (ADR 0039 D4 — only a
+positive disproof about readable material is terminal). Emitted at exactly
+one layer —
+[`ProvenanceOrchestrationUseCase::verify_artifact`](../crates/hort-app/src/use_cases/provenance_orchestration.rs),
+directly after the verdict fold: the one point where the count is complete
+(every applicable verifier has run) and ahead of every early return, so no
+verdict path can drop it.
+
+Attestation material a verifier **cannot read** — unparseable bundle JSON,
+no leaf certificate, an undecodable certificate or identity, an undecodable
+keyed DSSE payload, a signature blob that is not DER — contributes
+**nothing** to the verdict: not a rejection, not a hold, not evidence of
+any kind. It is skipped exactly as a candidate belonging to the other
+backend is skipped. (A candidate skipped for belonging to the other backend
+is **not** counted here: it was not read because it was not ours, which
+would otherwise make every keyed-signed artifact look like it carried
+garbage.) This counter is what keeps *not considered* from becoming *not
+noticed*, and it answers two questions nothing else can: a publisher whose
+own signature material is broken would otherwise see only an unsigned hold,
+and an operator would never learn that somebody attached junk to an
+artifact. The accompanying `warn!` line carries the `artifact_id`.
+
+It is **not** a `result` value on `hort_provenance_verify_total`, for two
+independent reasons. A skip is orthogonal to the verdict — it can
+accompany any of the values there, `verified` included (one candidate
+verified while a sibling was unreadable) — and that taxonomy's values are
+mutually exclusive. And it is a *count* rather than an event: the number of
+candidates skipped is the operator's signal, so it is `increment(count)` on
+its own series. Putting the number in a label would be unbounded
+cardinality (the forbidden-label rule below).
+
+Reading it: a non-zero rate on a scope is either a broken publisher
+pipeline or somebody writing junk to the referrers surface, and in both
+cases the artifact's own verdict is unaffected — look at the `warn!` lines
+for the `artifact_id`s, and at the matching jobs' `result_summary`
+(`unreadable_skipped`) for the durable per-artifact trail. A rate that
+appears alongside a rise in `held_pending_signature` on the same scope is
+the publisher case: their material is arriving and is not readable. `backend`
+is the verifier that **decided** the folded verdict — the same label the
+verdict counter carries for that run — which is deliberately not
+necessarily the verifier that did the skipping: a run reports one verdict
+and the counts are summed across the verifiers that produced them, so the
+two series join on one label value per run.
 
 **`hort_provenance_late_joiner_cleared_total`** (ADR 0039 §11,
 late-joiner end). Emitted at exactly one layer —
@@ -3506,7 +3619,8 @@ per-tick batch reading: today the admin curation queue, and, once it
 exists, retention's overview.
 
 **Scrape target — the worker `/metrics` listener.** The two verdict
-counters run in **`hort-worker`** (the `provenance-verify` job). The worker
+counters and the unreadable-skip counter run in **`hort-worker`** (the
+`provenance-verify` job). The worker
 serves an opt-in `GET /metrics` listener — bound via `HORT_WORKER_METRICS_BIND`
 (disabled by default; set a pod-reachable address to enable) — making
 these series (and every other worker metric: scan counters, queue depth, …)
@@ -3516,8 +3630,15 @@ NetworkPolicy (see the how-to
 `docs/architecture/how-to/enable-provenance-verification.md` → *Worker
 metrics*). The companion per-job `result_summary`
 (`verified` / `rejected:<reason>` / `no_attestation` /
-`held_pending_signature` / `held_pending_subject` / `skipped:<why>` /
-`requeued:<why>`) is the per-artifact trail and is **not** a metric.
+`held_pending_signature` / `held_pending_subject` / `held_indeterminate` /
+`allowed_indeterminate` / `cleared:signature_material` / `skipped:<why>` /
+`requeued:<why>`) is the
+per-artifact trail and is
+**not** a metric. It carries one optional second key,
+`unreadable_skipped: <n>`, present only when a verify skipped at least one
+unreadable candidate — the durable per-artifact half of
+`hort_provenance_unreadable_skipped_total`. Absent, not `0`, on the
+ordinary row, so the rows that carry it are the ones worth reading.
 
 **`requeued_no_anchor`** (issue #90 defense-in-depth): a `NoAttestation`
 verdict under `Required` on a `None`-status, anchor-less, recently-ingested
@@ -3575,18 +3696,28 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   release the artifact early (mirrors `ScanCompleted(clean)`).
 - `rejected` — a typed rejection (`ProvenanceRejected` emitted) — the
   per-reason breakdown is on `hort_provenance_reject_total`. A rejection
-  is only ever a **positive disproof**: a signature that is present and
-  wrong (forged, untrusted identity, digest-mismatched, malformed) under
-  any mode, or a `Required`-mode fetch-exhaustion fail-closed
-  (`Rejected{RekorNotFound}` — "could not be fetched", not "proven
-  absent"). A *missing* signature never ticks this value: ADR 0039's
-  2026-09-12 amendment (D1) makes absence of evidence non-terminal, and
-  the `Rejected{Unsigned}` arm that produced it is gone.
+  is only ever a **positive disproof**: a signature that is present,
+  readable and wrong (forged, untrusted identity, digest-mismatched)
+  under any mode. Neither a *missing* signature, nor a *failed fetch*,
+  nor a *verifier that returned no verdict* ticks this value.
+  ADR 0039's 2026-09-12 amendment (D1) makes absence of
+  evidence non-terminal and the `Rejected{Unsigned}` arm that produced it
+  is gone; D4 does the same for a check that could not be carried out, so
+  the `Required`-mode fetch exhaustion and verifier error that used to
+  fail closed as `Rejected{RekorNotFound}` now tick `held_indeterminate`
+  instead ("could not be fetched" is not "proven absent", and neither it
+  nor "we could not run the check" is "proven wrong"). **The
+  orchestration now mints no reject reason at all** — every value on
+  `hort_provenance_reject_total` comes from a verifier's finding about
+  material it read.
 - `no_attestation` — no bundle was found/passed and the mode allowed it
   (`VerifyIfPresent` / `Off` no-op, no event). Strictly the
   allowed-unsigned case: an unsigned artifact under `Required` ticks
   `held_pending_signature` (or `held_pending_subject` for a constituent)
-  whether or not its window has elapsed.
+  whether or not its window has elapsed, and an artifact the same
+  permissive mode let through *without having been checked at all* ticks
+  `allowed_indeterminate`. This value therefore means one thing only:
+  the artifact carries no signature and the mode does not ask for one.
 - `held_pending_signature` — a `Required`-mode artifact found unsigned
   where a signature of its own is the thing it is waiting for. No event;
   `complete_provenance` appends nothing and the artifact stays
@@ -3595,7 +3726,7 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   allowed-unsigned `no_attestation` no-op. The hold is **indefinite**
   (ADR 0039 D4): the window is not a signing deadline, and the only exits
   are a signature (directly or via the §11 cascade) or an operator
-  authority — admin release, curator waiver, deletion. Watch the standing
+  authority — a curator waiver or deletion. Watch the standing
   population via the projection surface (the admin curation queue today;
   retention's overview once it exists) — this counter counts verify
   *events*, not the standing population.
@@ -3611,6 +3742,42 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   misdirect an operator into checking their signer. A sustained non-zero
   rate with no `verified` follow-through means blobs are arriving whose
   manifests never do.
+- `held_indeterminate` — a `Required`-mode artifact whose verification
+  **could not be carried out**: a trust root with no usable key for the
+  check (no Rekor key for the entry's log, unparseable key bytes, or no
+  Fulcio certs / CTFE keys at all), attestation material that could never
+  be fetched, or a dispatched verifier that returned no verdict. Held
+  `Quarantined` exactly as the
+  two values above are, and for a stronger reason — nothing about the
+  artifact was established, so nothing was disproved and nothing may
+  terminalise (ADR 0039 D4). The only one of the three holds whose
+  operator action is on **our** side: fix the trust root or the verifier,
+  or let the fetch retry. A trust root carrying no Fulcio certs is
+  nonetheless a **boot** refusal rather than a population on this
+  counter: the worker declines to start on one, because a scope-wide hold
+  with nothing terminal to point at is harder to notice than the
+  rejections it replaced. Despite the name this is the *opposite* of the scan axis's
+  terminal `scan_indeterminate` status; the `held_` prefix is the
+  distinction. A rate that tracks a deploy is a provisioning regression,
+  not a publisher problem — which is precisely the misdiagnosis the split
+  from `held_pending_signature` exists to prevent.
+- `allowed_indeterminate` — the same could-not-check verdict under a mode
+  that does **not** require one to succeed (`VerifyIfPresent` / `Off`):
+  no event, no status change, and the artifact runs its normal quarantine
+  window and **releases**. Separable from `held_indeterminate` because
+  nothing is held — the `held_` / `allowed_` prefixes are the whole
+  distinction, and conflating them would make a release look like a
+  stall. Separable from `no_attestation` because that value says *the
+  artifact carries no signature*, and here the artifact's signature is
+  not what failed: our trust root had no usable key, the attestation
+  material never arrived, or our verifier returned no verdict. A
+  permissive scope whose upstream is
+  unreachable, reported as `no_attestation`, sends an operator to the
+  publisher's signing pipeline — the one place the fault is not. Read it
+  the way you read `held_indeterminate`: a rate that tracks a deploy or
+  an upstream outage is ours to fix, and it is the *only* value on this
+  counter that reports a released artifact whose provenance was never
+  established.
 
 **`reason` semantics** (`hort_provenance_reject_total`) — one per
 `ProvenanceRejectReason` variant:
@@ -3627,14 +3794,69 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   current build means the code has regressed to the terminal arm.
 - `untrusted_identity` — a cryptographically valid signature whose
   `{issuer, san}` matched no allowed `provenance_identities` pattern.
-- `rekor_not_found` — the bundle's Rekor inclusion proof / SET could not
-  be validated offline (also the fail-closed verdict on a `Required`-mode
-  bundle-fetch / CAS-read exhaustion). Never a fall-back to
-  a live Rekor fetch.
+- `rekor_not_found` — the bundle's Rekor inclusion proof / checkpoint
+  signature was present, readable, and did **not** verify offline against
+  the trust root's Rekor key: a forged or non-included entry. Never a
+  fall-back to a live Rekor fetch. **Four** neighbouring failures do
+  **not** reach this label (ADR 0039 D4): a trust root holding no usable
+  Rekor key for the entry is a fault on our side and ticks
+  `held_indeterminate`; transparency-log material that is structurally
+  absent, unparseable or impossible (a negative tree size among them)
+  proved nothing and is skipped onto
+  `hort_provenance_unreadable_skipped_total`; a bundle-fetch /
+  CAS-read exhaustion under `Required` — which this label carried until
+  it held instead — ticks `held_indeterminate` too (and
+  `allowed_indeterminate` under the permissive modes); and so does a
+  dispatched verifier that returned no verdict, this label's **last**
+  orchestration-side producer. The last two were the use the "never a
+  live Rekor fetch" sentence forbids: nothing
+  offline or cryptographic had happened at all. Rows carrying
+  `rekor_not_found` from a fetch exhaustion or a verifier error are
+  historical, exactly as
+  `unsigned`'s are, and a dashboard spanning the boundary sees traffic
+  move from here to `held_indeterminate` rather than vanish. What
+  remains is a single producer — the keyless verifier's offline
+  inclusion check — so every current row under this label is a proof
+  that was read and did not verify.
 - `cert_chain_invalid` — the Fulcio certificate chain failed validation
-  against the cached trust root.
+  against the cached trust root. A chain that was **examined and
+  rejected**: a trust root so unusable that no verifier could be built to
+  examine any chain at all carried this label until it held instead, and
+  now ticks `held_indeterminate` (`allowed_indeterminate` under the
+  permissive modes). Rows carrying `cert_chain_invalid` from that cause
+  are historical; a dashboard spanning the boundary sees the traffic move
+  rather than vanish, and the move is the difference between "this
+  publisher's certificate is not trustworthy" and "we have no trust root
+  to judge it with".
 - `bundle_malformed` — the bundle is structurally malformed or carries no
-  offline-verifiable material.
+  offline-verifiable material. **No longer produced from material a
+  verifier could not read** (ADR 0039 D4): an unparseable bundle, a missing
+  or undecodable leaf certificate, an unreadable identity, an undecodable
+  keyed DSSE payload and a non-DER signature blob are all skipped instead,
+  and are counted on
+  `hort_provenance_unreadable_skipped_total`. Rows carrying
+  `bundle_malformed` from those causes are historical, exactly as
+  `unsigned`'s are. **Nothing produces it at all now:** its last
+  producer, the keyed verifier's digest-binding failure, reports
+  `digest_mismatch` (see the next bullet). The label value is retained so
+  a dashboard querying historical data keeps resolving; a non-zero *rate*
+  on a current build means the code has regressed.
+- `digest_mismatch` — a signature that verifies, against a pinned key or a
+  trusted chain, but covers a **different digest** than the artifact being
+  served: the re-tag attack (the `sha256-<hex>.sig` carriage tag is
+  attacker-writable in the registry). The strongest disproof the pipeline
+  can state. The keyed verifier's digest-binding failure reports here
+  now; it rode `bundle_malformed` until that producer moved, so a
+  dashboard comparing across the boundary sees traffic shift between the
+  two values rather than appear from nowhere. A non-zero rate here is an
+  attack signal — which is the point of the move: the same rows under
+  `bundle_malformed` were indistinguishable from a corrupt upload.
+
+  No label exists for a check that could not be *carried out* — that is
+  not a rejection, so it never reaches this counter; it ticks
+  `held_indeterminate` (under `Required`) or `allowed_indeterminate`
+  (under `VerifyIfPresent` / `Off`) on `hort_provenance_verify_total`
+  instead.
 
 **Forbidden labels.** No `artifact_id`, `content_hash`, `version`,
 `repository`, `package`, or signer identity (`issuer`/`san`) — those would
@@ -3645,8 +3867,9 @@ accompanying `info!` audit line on the `ProvenanceVerified` /
 not `err`).
 
 Cardinality: `hort_provenance_verify_total` ≤ `backend` (~few) × `mode`
-(3) × `result` (6); `hort_provenance_reject_total` ≤ `backend` × `reason`
-(5); `hort_provenance_late_joiner_cleared_total` ≤ `backend`. All three
+(3) × `result` (9); `hort_provenance_reject_total` ≤ `backend` × `reason`
+(6); `hort_provenance_late_joiner_cleared_total` and
+`hort_provenance_unreadable_skipped_total` ≤ `backend` each. All four
 are tiny in Tier 1 (one backend). The two hold gauges are 2 series each
 (`hold`, unlabelled otherwise) regardless of deployment size.
 
@@ -3773,10 +3996,22 @@ with the per-kind reason.
 - `result="completed"` — handler returned
   `TaskOutcome::Completed`; `mark_completed` was called on the jobs row.
 - `result="failed_retry"` — handler returned
-  `TaskOutcome::Failed { retry: true }`; `reschedule` was called with
-  exponential backoff (base 30 s, cap 24 h).
-- `result="failed_terminal"` — handler returned
-  `TaskOutcome::Failed { retry: false }`; `mark_failed` was called.
+  `TaskOutcome::Failed { retry: true }` (or an `Err`, which the
+  dispatcher records as one) on a row that still had attempt budget
+  left; `reschedule` was called with the shared retry curve's wait for
+  that attempt (`hort_app::retry_backoff::compute_backoff` — 1, 5, 30,
+  then 60 minutes, the scan pipeline's own schedule). A five-attempt
+  budget therefore spans **96 minutes** from the first failure to the
+  terminal row.
+- `result="failed_terminal"` — `mark_failed` was called, so the row is
+  a terminal `failed` row carrying its last error. Two triggers reach
+  it: the handler returned `TaskOutcome::Failed { retry: false }`, or
+  it asked to be retried on a row whose `attempts` had reached the
+  dispatcher's attempt cap (`JOB_ATTEMPT_CAP`, 5 — the same number the
+  abandoned-lease sweep spends). The label reports what the dispatcher
+  did to the row, not what the handler asked for: a job that keeps
+  failing the same way counts `failed_retry` four times and
+  `failed_terminal` once, then stops being claimed.
 
 Note: for `kind="scan"`, `ScanTaskHandler::run` also calls
 `ScanOrchestrationUseCase::record_outcome` internally, which emits the
@@ -3873,9 +4108,14 @@ for `pass` / `no_change` outcomes (no violations).
 - `require-signature` — promotion gate observed the artifact had no
   signature while the policy demanded one. Emitted by the promotion
   decision point.
-- `max-artifact-age` — promotion gate observed the artifact was older
-  than the policy's `max_artifact_age_secs`. Emitted by the promotion
-  decision point.
+- `max-artifact-age` — the artifact was older than the policy's
+  `max_artifact_age_secs`. **No decision point emits it today**: the
+  evaluator (`hort_domain::policy::evaluate_age_gates`) has no
+  production caller, which is why declaring `maxArtifactAge` is an
+  apply-time rejection (`scan_policy_max_artifact_age_not_implemented`,
+  row 13 of the linter-row matrix) rather than a control. The key stays
+  in the closed label set — it is the domain's own stable rule id, and
+  the series appears the moment a caller wires the evaluator in.
 - `curation-block` — curation rule with `action: Block` matched the
   ingest coords or a pre-existing artifact (retroactive pass). Emitted
   by curation and curation_retroactive decision points.
@@ -3934,8 +4174,8 @@ same change (architect anti-pattern checklist).
 **`decision` semantics** (closed taxonomy of 5):
 
 - `waive` — `CurationUseCase::waive`. Curator-driven release
-  of a quarantined or held artifact, mirroring `admin_release`. One
-  tick per call.
+  of a quarantined or held artifact — the manual release authority
+  (ADR 0007). One tick per call.
 - `block` — `CurationUseCase::block`. Curator-driven
   rejection. For `BlockTarget::Artifact` emits one tick per call; for
   `BlockTarget::VersionList` (continue-on-error)
@@ -4095,7 +4335,7 @@ emit nothing):
   `quarantined`; GC-protected, not evaluated.
 - `skipped_rejected` — the artifact is `rejected` or
   `scan_indeterminate` (evidence / terminal-failure); content stays
-  until manual admin override, not evaluated.
+  until a curator decision or deletion, not evaluated.
 - `error` — a port read (`read_stream` / `list_findings` /
   `append_expired`) failed for this pair. The sweep records it and
   continues with the next pair (one bad row never aborts the pass;
@@ -4126,8 +4366,8 @@ emit_retention_expired, RetentionEvaluationResult}`;
 
 The two-stage split's second stage: for each `ArtifactExpired` event
 with no following `ArtifactPurged`, the GC walk decrements
-`content_references`, deletes the CAS blob when the cross-`kind`
-refcount hits `0`, and emits `ArtifactPurged`. One
+`content_references`, deletes the CAS blob when nothing claims the hash
+under the blob lock, and emits `ArtifactPurged`. One
 `hort_retention_purged_total` emission per content-hash decision.
 
 **No `policy_id` label on this metric.** Unlike the two evaluation
@@ -4147,14 +4387,25 @@ on this series. Cardinality ceiling is a fixed `result_arity (4)`.
 `result` value semantics (one emission per content-hash purge
 decision; an empty pending set emits nothing):
 
-- `success` — the cross-`kind` `content_references` count for the hash
-  reached `0`, the CAS blob was deleted via `StoragePort::delete`
+- `success` — nothing claimed the hash under the blob lock, the CAS blob
+  was deleted via `StoragePort::delete`
   (idempotent: an already-absent blob is also `success`), and
   `ArtifactPurged{refs_remaining=0}` was appended.
-- `blob_kept` — a still-live reference (a promoted ref, or an OCI
-  `oci_subject` row) keeps the blob alive (`refs_remaining > 0`); only
-  this artifact's reference was removed and the blob was deliberately
-  NOT deleted. `ArtifactPurged{refs_remaining=N}` was appended.
+- `blob_kept` — a claim on the hash held under the lock
+  (`refs_remaining > 0`); only this artifact's reference was removed
+  and the blob was deliberately NOT deleted.
+  `ArtifactPurged{refs_remaining=N}` was appended. Two kinds of claim
+  land on this one value: a still-live `content_references` row (a
+  promoted ref, or an OCI `oci_subject` row), or — when the row count
+  is `0` — a GC-protected artifact (`quarantined` / `rejected` /
+  `scan_indeterminate`) whose primary content or metadata blob is this
+  hash. The second kind has no reference edge to count, by design: the
+  refcount repair mints none for retained evidence, and CAS shares its
+  bytes with every artifact of the same content, so a released
+  sibling's purge would otherwise delete them. The `result` label does
+  not separate the two — that would raise `result_arity` for a
+  distinction no alert acts on; the `tracing` line at the decision
+  names which claim held.
 - `storage_error` — `StoragePort::delete` failed transiently for a
   refcount-0 blob. **The `ArtifactExpired` decision is not lost**: no
   `ArtifactPurged` is emitted, the `content_references` rows are not
@@ -4182,9 +4433,10 @@ RetentionPurgedResult}`.
 The audit-retention sweep: for each enumerated candidate stream
 whose per-category retention rule + the compliance retention floor are
 satisfied, the stream is sealed via the `seal_and_remove` chokepoint
-(`delete_stream` for `StreamRetentionMode::Delete`, `archive_stream`
-for `Archive`) — the `StreamSealed` tombstone is emitted by the
-adapter, never by this metric path. One
+(`delete_stream` for `StreamRetentionMode::Delete` — the only mode
+config parsing accepts; `archive_stream` for the config-refused
+`Archive`, see the `archived` note below) — the `StreamSealed` tombstone
+is emitted by the adapter, never by this metric path. One
 `hort_event_store_streams_archived_total` emission per candidate-stream
 decision (sealed or skipped).
 
@@ -4212,16 +4464,28 @@ decision; an empty candidate set emits nothing):
 
 - `archived` — the stream was sealed via `EventStore::archive_stream`
   (`StreamRetentionMode::Archive`); the chokepoint emitted the
-  `StreamSealed` tombstone and moved the stream to the configured cold-
-  storage target prefix (the cold-storage *write* is a named
-  follow-on; v1 only threads the target through the chokepoint).
+  `StreamSealed` tombstone and **removed the live rows**, carrying the
+  configured target prefix no further than a `tracing` field. **Never
+  emitted by a shipped deployment:** the cold-storage *write* is deferred
+  post-v1, so `HORT_RETENTION_STREAM_MODE=archive` is refused at config
+  parsing in both binaries and the `Archive` mode is unreachable. Do not
+  build a "cold-storage offload" dashboard or alert on this series — it
+  stays documented as the value this seal mode will emit once a
+  cold-storage writer backs it.
 - `deleted` — the stream was sealed via `EventStore::delete_stream`
   (`StreamRetentionMode::Delete`, the v1 default); the chokepoint
   emitted the `StreamSealed` tombstone and removed the live rows.
 - `skipped` — a precondition stopped the seal this pass: the meta-
   stream guard (`StreamId::eventstore_retention()`), a non-terminal
   tail (`TerminalGated`), the retention floor not yet elapsed, an already-
-  sealed empty-read (idempotent re-run), or an unregistered category.
+  sealed empty-read (idempotent re-run), an unregistered category, or the
+  chokepoint refusing because the stream moved past the tail the sweep
+  proved it at (`SealOutcome::NotAtProvenVersion` — an event landed
+  between the proof and the seal; summary field
+  `skipped_stream_changed`). That last one is deliberately a `skipped`
+  and not an `errors` increment: nothing failed and nothing was removed,
+  so a late event on a healthy system must not make the sweep read as
+  broken.
   One emission per skipped candidate regardless of which precondition
   fired — the precise reason is a `tracing` field, never a metric
   label (cardinality hard-block). A per-stream chokepoint failure is
@@ -4656,22 +4920,29 @@ backend label on `hort_storage_operations_total`:
 
 - `ok` — re-computed SHA-256 matched the CAS key. No log (per-blob
   success is high-volume; metric is the dashboard signal).
-- `hash_mismatch` — re-computed SHA-256 differed from the CAS key.
-  Companion `CasIntegrityMismatch` domain event appended to a per-hash
-  synthetic artifact stream; companion `tracing::warn!` with
-  `content_hash`, `backend`, and `observed_hash`. **Flag only — the
-  scrubber never quarantines on mismatch** (the operator
-  decides the response).
+- `hash_mismatch` — the bytes did not hash to the CAS key. The digest
+  comes from whichever of the two comparisons reached a verdict: the
+  verifying reader's, recovered from the `CasIntegrityFailure` payload on
+  its EOF failure (the production path on both backends), or the
+  scrubber's own re-hash when the stream reached a clean EOF (a
+  `StoragePort` that does not verify). Companion `CasIntegrityMismatch`
+  domain event appended to a per-hash synthetic artifact stream; companion
+  `tracing::warn!` with `content_hash`, `backend`, `observed_hash` and the
+  configured `action`. The response is operator-chosen via
+  `HORT_CAS_SCRUB_ACTION_ON_MISMATCH`: `alert` (the default) is flag-only
+  and leaves the artifact row alone, `tombstone` additionally transitions
+  the artifact to `quarantine_status = 'rejected'`.
 - `missing` — the hash appeared in `list_all` but `get(&hash)` returned
   `NotFound`. A concurrent GC, a racing delete, or an inconsistent
   backend listing. Companion `tracing::warn!`.
 - `read_error` — either `list_all` yielded a `StreamItem::ReadError`
   (malformed key, EACCES on a shard directory) or the streaming read
-  from `get()` failed mid-flight. Companion `tracing::warn!`.
-  Integrity-reader EOF failures land here too, NOT under `hash_mismatch`
-  — the re-hash short-circuited and the scrubber has no observed digest
-  to attest; operators cross-reference
-  `hort_storage_integrity_failures_total`, which DID fire for that blob.
+  from `get()` failed **without an integrity verdict** — i.e. a genuine
+  backend failure, not corruption. Companion `tracing::warn!`. The
+  discriminator is the typed `CasIntegrityFailure` payload, not the
+  error's `io::ErrorKind`: a backend is free to raise `InvalidData` for
+  its own reasons, and classifying by kind would report every such
+  complaint as corruption (and escalate the exit code for it).
 
 **Exit code** (`hort-server scrub`): `0` when `result="hash_mismatch"`
 count for the run was zero, `1` otherwise. `missing` and `read_error`

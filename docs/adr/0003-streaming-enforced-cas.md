@@ -28,6 +28,34 @@ SHA-256 is computed **incrementally** as chunks flow through `put`; a 2 GB image
 - Memory use is bounded and independent of artifact size.
 - Format handlers that think in coordinates must translate to/from content hashes at the index layer; they cannot pass a path to storage.
 
+## Amendment (2026-10-08, issue #341) — a read-verification failure is distinguishable and carries the computed digest
+
+The decision above is unchanged; it was only ever half-stated. A CAS read
+does not merely verify, it **reports**: the reader `get` hands back
+accumulates SHA-256 as bytes flow and, at EOF, fails the read instead of
+signalling a clean end-of-stream when the accumulated digest differs from
+the requested key — and that failure is **distinguishable from a backend
+I/O failure** and **carries the digest the delivered bytes actually hashed
+to**. The shape is `hort_domain::ports::storage::CasIntegrityFailure
+{ expected, computed }`, travelling as the typed payload of an
+`io::ErrorKind::InvalidData` error (`into_io_error` is the single wrap,
+`from_io_error` the single recovery), and its single production
+construction point is `VerifyingReader::poll_read` in
+`crates/hort-adapters-storage/src/integrity.rs`. A consumer may rely on
+exactly three things, and no more: a `get` stream that reached a clean EOF
+has delivered bytes that hash to the key it asked for; a failure carrying the
+payload is at-rest corruption, with `computed` as the observed digest; and
+a failure without one is an I/O failure that says nothing about integrity
+— the `InvalidData` kind alone is not the discriminator, because a backend
+may raise that kind for its own reasons. Stating this is what makes it
+binding rather than incidental: while it was only implemented, an adapter
+returning its backend's raw stream from `get` violated no recorded
+decision, compiled, and made corruption indistinguishable from a clean
+read for every consumer. `crates/hort-app/tests/cas_reads_are_verified.rs`
+now holds it structurally — every `impl StoragePort for` under
+`crates/hort-adapters-*/src` constructs the verifier inside its own `get`,
+with no allow-list.
+
 ## Alternatives considered
 
 - **`put(key, bytes)` (caller supplies key + buffered content).** Rejected on both axes: breaks the CAS guarantee and OOMs on large artifacts.

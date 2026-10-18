@@ -76,20 +76,66 @@
 //!
 //! # Write path
 //!
-//! On manifest `PUT`, the use case parses the manifest JSON, and
-//! if `.subject.digest` is set, calls
-//! [`ContentReferenceIndex::insert`] with
-//! `(source = manifest_artifact_id, target = subject_hash,
-//! kind = "oci_subject", metadata = {"artifact_type": …, "media_type": …})`.
-//! Insert is **upsert-on-PK** (`(repository_id, source_artifact_id,
-//! kind)`) — re-pushing the same manifest under the same kind refreshes
-//! the row rather than failing; inserting under a different kind adds a
-//! sibling row.
+//! A row here is a **claim on bytes**: the storage GC deletes a CAS blob
+//! exactly when no row targets its hash. So the writer set divides by
+//! *when* a row is recorded, not by what it says, and that division is the
+//! thing to understand before adding a writer.
 //!
-//! Refcounting widens the writer set: every successful `ArtifactIngested`
-//! commit also writes a `kind = "primary_content"` row, and the
-//! HashReference-strategy ingests additionally write a
-//! `kind = "metadata_blob"` row.
+//! **Every minting path records its edges in the claiming artifact's own
+//! transaction.** Each hands them to
+//! [`ArtifactLifecyclePort::commit_transition_with_enqueues`], which
+//! commits them with the events, the artifact row, its metadata and its
+//! job-queue rows or commits nothing at all. That covers each artifact's
+//! own `primary_content`, the HashReference strategy's `metadata_blob`, the
+//! PEP 658 `wheel_metadata` edge, and — passed in by the caller as a
+//! [`ContentReferenceClaim`], because the source id does not exist yet —
+//! every OCI tree edge: the manifest-PUT's `oci_subject` and its
+//! `oci_config` / `oci_layer` / `oci_index_member` membership edges, the
+//! eager index-child ingest's membership edges, the pull-through legs'
+//! (both leader legs and the coalesced follower), and the provenance
+//! orchestrator's `oci_subject` for a landed upstream referrer. A failed
+//! edge fails the mint: the operation is retriable, an edgeless committed
+//! artifact is not.
+//!
+//! **Nothing on a minting path writes an edge afterwards, and a new one
+//! would be a defect.** An edge recorded through
+//! [`ContentReferenceIndex::insert`] after its referrer committed is a
+//! window in which the referrer is live and its target carries one fewer
+//! claim. For `primary_content` / `metadata_blob` the refcount-reconcile
+//! sweep converges that from `artifacts` / `artifact_metadata`; for a
+//! **tree** edge it cannot, because no relational row records what a
+//! manifest references — so the gap is permanent and the referrer cannot
+//! re-assert it.
+//!
+//! The two **backfill** handlers (`oci_membership_edge_backfill`,
+//! `wheel_metadata_backfill`) are the only remaining production callers of
+//! [`ContentReferenceIndex::insert`], and they are not an exception to the
+//! rule so much as its consequence: they repair referrers that committed
+//! edgeless in an earlier release, so writing the edge after the fact is
+//! their entire purpose. Neither is precedent for a minting path.
+//!
+//! One ordering question falls out of moving a tree edge into the mint, and
+//! the OCI manifest PUT is where it was answered: `oci_config` /
+//! `oci_layer` / `oci_index_member` are kinds the
+//! referenced-tree-descendant predicate counts, so an edge naming a blob
+//! the repository does not hold would let that blob's own later ingest see
+//! itself already referenced and take the zero-window quarantine carve-out.
+//! The resolution of the declared references therefore runs **before** the
+//! mint and the membership claims are built only from a complete one; a
+//! manifest referencing blobs the client has not pushed yet is still minted
+//! (ADR 0043's retry contract) and simply claims nothing. Pull-through is
+//! the deliberate opposite and claims by digest without resolving, because
+//! that edge is the mechanism behind the zero-window anchor for a proxy
+//! descendant (ADR 0007) and a proxied constituent legitimately is not
+//! present yet.
+//!
+//! Insert is **upsert-on-PK** `(repository_id, source_artifact_id,
+//! target_content_hash, kind)` on both routes — re-pushing the same
+//! manifest refreshes the row rather than failing; a different kind or a
+//! different target adds a sibling row.
+//!
+//! [`ArtifactLifecyclePort::commit_transition_with_enqueues`]:
+//!     crate::ports::artifact_lifecycle::ArtifactLifecyclePort::commit_transition_with_enqueues
 //!
 //! # Read path
 //!
@@ -153,6 +199,68 @@ pub struct ContentReference {
     pub metadata: serde_json::Value,
     pub repository_id: Uuid,
     pub recorded_at: DateTime<Utc>,
+}
+
+/// A content-reference edge whose **source artifact does not exist yet**.
+///
+/// [`ContentReference`] names its source by id, so a caller that already
+/// knows which bytes an artifact is going to claim — an OCI manifest's
+/// `subject.digest`, its config and layer descriptors, an image index's
+/// children — cannot build one *before* the mint: `source_artifact_id` is
+/// assigned inside it. This is that edge minus the three fields the mint
+/// supplies, so the claim can travel **into** the transition that creates
+/// the claiming artifact instead of chasing it afterwards.
+///
+/// Why that matters is not bookkeeping latency. A `content_references` row
+/// is the claim that keeps bytes alive — the storage GC deletes a CAS blob
+/// exactly when no row targets its hash — so an edge written after its
+/// referrer committed leaves a window in which the claim does not exist,
+/// with the referrer already live and unable to re-assert it. For an edge
+/// onto *foreign* bytes (a subject image, an index's children, a manifest's
+/// layers) nothing repairs that: the refcount-reconcile sweep converges
+/// `primary_content` and `metadata_blob` from the artifact row and mints no
+/// tree edge, because no artifact row records one.
+///
+/// Consumed by the [`ArtifactLifecyclePort`] creation transitions via the
+/// minting use case, which resolves each claim against the artifact it just
+/// built and hands the resulting [`ContentReference`] set to the same
+/// transaction as the events and the artifact row.
+///
+/// [`ArtifactLifecyclePort`]: crate::ports::artifact_lifecycle::ArtifactLifecyclePort
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentReferenceClaim {
+    /// The bytes being claimed — see
+    /// [`ContentReference::target_content_hash`].
+    pub target_content_hash: ContentHash,
+    /// The edge kind — see [`ContentReference::kind`] and the allocated
+    /// values listed on this module.
+    pub kind: String,
+    /// The per-row JSON sidecar — see [`ContentReference::metadata`].
+    pub metadata: serde_json::Value,
+}
+
+impl ContentReferenceClaim {
+    /// Complete the claim into the row the projection stores, now that the
+    /// artifact carrying it has an id.
+    ///
+    /// `recorded_at` is the minting instant the caller already stamped on the
+    /// artifact and its sibling edges, passed in rather than read here so
+    /// every edge of one transition carries one timestamp.
+    pub fn resolve(
+        &self,
+        source_artifact_id: Uuid,
+        repository_id: Uuid,
+        recorded_at: DateTime<Utc>,
+    ) -> ContentReference {
+        ContentReference {
+            source_artifact_id,
+            target_content_hash: self.target_content_hash.clone(),
+            kind: self.kind.clone(),
+            metadata: self.metadata.clone(),
+            repository_id,
+            recorded_at,
+        }
+    }
 }
 
 /// Projection port for the content-reference index.

@@ -63,7 +63,9 @@
 //! `Rejected`-reaching transition without a companion now fails this
 //! guard, which is the outcome the guard exists to produce.
 
-use hort_domain::entities::artifact::{has_terminal_rejection_event, Artifact, QuarantineStatus};
+use hort_domain::entities::artifact::{
+    has_terminal_rejection_event, Artifact, QuarantineStatus, ReleaseOrigin,
+};
 use hort_domain::entities::quarantine_transitions::{self, QuarantineEvent};
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::events::{ArtifactCorrupted, DomainEvent, PolicyViolation, RejectionReason};
@@ -137,8 +139,7 @@ fn classify(event: QuarantineEvent) -> RejectedArmVerdict {
         // ── never reach Rejected (see quarantine_transitions::classify) ──
         QuarantineEvent::Quarantine => Unreachable,
         QuarantineEvent::RecordCleanScan => Unreachable,
-        QuarantineEvent::ReleaseCuratorWaiver => Unreachable,
-        QuarantineEvent::ReleaseGeneral => Unreachable,
+        QuarantineEvent::Release => Unreachable,
         QuarantineEvent::CascadeProvenanceClearance => Unreachable,
         QuarantineEvent::FailScanIndeterminate => Unreachable,
         // Leaves Rejected (Quarantined/Released), never reaches it.
@@ -237,7 +238,7 @@ fn exercise(event: QuarantineEvent) -> Vec<DomainEvent> {
         QuarantineEvent::RejectFromScan => {
             let mut a = quarantined_artifact();
             let ev = a
-                .reject_from_scan("scan finding".into())
+                .reject_from_scan("scan finding".into(), ReleaseOrigin::NeverReleased)
                 .expect("Quarantined -> RejectFromScan is an allowed transition");
             vec![DomainEvent::ArtifactRejected(ev)]
         }
@@ -278,8 +279,7 @@ fn exercise(event: QuarantineEvent) -> Vec<DomainEvent> {
         }
         QuarantineEvent::Quarantine
         | QuarantineEvent::RecordCleanScan
-        | QuarantineEvent::ReleaseCuratorWaiver
-        | QuarantineEvent::ReleaseGeneral
+        | QuarantineEvent::Release
         | QuarantineEvent::CascadeProvenanceClearance
         | QuarantineEvent::FailScanIndeterminate
         | QuarantineEvent::ReEvaluate

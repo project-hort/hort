@@ -5,15 +5,18 @@
 //!
 //! 1. **Category match.** `event.stream_id.category ∈ filter.categories`.
 //! 2. **Event-type match.** `EventTypeFilter::matches` against the event.
-//! 3. **Repository scope.** Structural check against
-//!    `EventTypeKind::repository_id(&event.event)`. Events without a
-//!    repository association fall through to step 4 unconditionally for
-//!    `OwnedByActor` / `All`, and are rejected outright for `Some(_)`.
+//! 3. **Repository disclosure.** The shared
+//!    [`EventRepositoryIndex`](crate::use_cases::event_visibility::EventRepositoryIndex)
+//!    answers which repositories the event discloses — resolving the
+//!    artifact / artifact-group aggregate when the payload names one
+//!    instead of carrying a repository id. Steps 3 and 4 are decided
+//!    together from that one answer (see the `base_authz_ok` match).
 //! 4. **Live authz.** `RbacEvaluator::authorize(owner, perm, repo)` — the
 //!    owner's *current* grants intersected with the stored filter scope.
-//!    `OwnedByActor` / `Some(_)` check `Permission::Read`; `All` checks
-//!    `Permission::Admin`. Events without a repository association skip
-//!    this step **unless** the event's category is privileged
+//!    `OwnedByActor` / `Some(_)` check `Permission::Read` on **every**
+//!    disclosed repository; `All` checks `Permission::Admin`. An event
+//!    with no repository association skips the per-repo check **unless**
+//!    its category is privileged
 //!    (`StreamCategory::requires_admin` — the `ADMIN_CATEGORIES` set
 //!    `{Policy, Admin, Authorization, User, AuthAttempts}`): such an
 //!    event is delivered only if the synthesised owner principal
@@ -40,6 +43,14 @@
 //! batch and passes it down via [`FilterContext`] so every per-event
 //! check sees a consistent evaluator without re-loading.
 //!
+//! **The disclosure answer is resolved per batch, not per event.** The
+//! dispatcher's catch-up pass builds one
+//! [`EventRepositoryIndex`](crate::use_cases::event_visibility::EventRepositoryIndex)
+//! for the page it just read and hands it down through [`FilterContext`]
+//! — the same shape as the evaluator snapshot, and for the same reason:
+//! this function runs once per `(subscription, event)` pair and cannot
+//! afford a round trip.
+//!
 //! No `tracing` — filter evaluation runs once per `(subscription, event)`
 //! pair on the dispatcher hot path; per-event log records would tank
 //! throughput. The dispatcher emits aggregate counters; per-event match
@@ -49,13 +60,12 @@ use std::sync::Arc;
 
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
-use hort_domain::entities::subscription::{
-    EventTypeKind, NamedPredicate, RepositoryScope, SubscriptionFilter,
-};
+use hort_domain::entities::subscription::{NamedPredicate, RepositoryScope, SubscriptionFilter};
 use hort_domain::events::PersistedEvent;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 
 use crate::rbac::RbacEvaluator;
+use crate::use_cases::event_visibility::{EventDisclosure, EventRepositoryIndex};
 
 /// Resolved-once context the dispatcher carries through a delivery batch.
 ///
@@ -73,11 +83,20 @@ pub struct FilterContext<'a> {
     /// the field is held but never consulted. Future predicate variants
     /// that need repository metadata reach for it through this port.
     pub repositories: &'a Arc<dyn RepositoryRepository>,
-    /// Owner principal resolved against the current evaluator. The
-    /// dispatcher constructs this once per delivery batch from the
-    /// owner's `User` row + the evaluator's role resolution so the
-    /// `authorize` call shape matches the one used at creation time.
+    /// Owner principal, synthesised from the owner's `User` row +
+    /// `snapshot_claims` so the `authorize` call shape matches the one
+    /// used at creation time. The dispatcher re-synthesises it on every
+    /// reconcile pass and the delivery task loads the current value
+    /// alongside `rbac` for each event, so the two inputs this context
+    /// authorizes with are the same age — a revoked `User.is_admin`
+    /// reaches the gate below on the reconcile cadence, just as a
+    /// revoked grant reaches it on the evaluator's refresh cadence.
     pub owner_principal: &'a CallerPrincipal,
+    /// Aggregate→repository lookups for the page this event came from,
+    /// resolved in one round trip before the per-event walk. Shared with
+    /// the `GET /api/v1/events` read gate — one primitive, two call
+    /// sites, no second implementation of the same rule.
+    pub repository_index: &'a EventRepositoryIndex,
 }
 
 /// Evaluate a subscription filter against a persisted event.
@@ -101,101 +120,101 @@ pub async fn matches(
         return false;
     }
 
-    // Step 3 — repository scope (structural). `EventTypeKind::repository_id`
-    // is the exhaustive closed-enum extractor; events without a repo
-    // association return `None`.
-    let event_repo = EventTypeKind::repository_id(&event.event);
-
-    let repo_for_authz: Option<uuid::Uuid> = match (&filter.repositories, event_repo) {
-        // OwnedByActor: any event with a repo association proceeds to
-        // step 4's authz check; events without a repo association fall
-        // through (no per-repo restriction to apply).
-        (RepositoryScope::OwnedByActor, repo) => repo,
-        // Some(allowed) with event in the allow-list: proceed.
-        (RepositoryScope::Some(allowed), Some(repo_id)) if allowed.contains(&repo_id) => {
-            Some(repo_id)
-        }
-        // Some(allowed) with event outside the allow-list, or no repo
-        // association: hard reject. An explicit allow-list cannot match
-        // an event that has no repo association.
-        (RepositoryScope::Some(_), _) => return false,
-        // All: admin-scope; structurally passes. Step 4 re-verifies the
-        // owner still holds Admin.
-        (RepositoryScope::All, repo) => repo,
-    };
-
-    // Step 4 — live authz. Filter scope is the upper bound; the owner's
-    // current grants are the floor.
+    // Steps 3 + 4 — repository disclosure and live authz, decided
+    // together from the one disclosure answer.
     //
-    // - `repo_for_authz = None` → the event has no repo association.
-    //   An unconditional authz skip here would be a
-    //   privileged-category hole: a `None`-repo event whose category is
-    //   privileged (`StreamCategory::requires_admin` — the
-    //   `ADMIN_CATEGORIES` set) is delivered ONLY if the synthesised
-    //   owner principal *currently* satisfies `Permission::Admin`. This
-    //   re-derives authority against live owner state, never trusting
-    //   the `snapshot_claims` floor (the dispatcher's
+    // The three dispositions, and what each means here:
+    //
+    // - `Repositories(ids)` → the event discloses these repositories.
+    //   `Some(allowed)` additionally requires every disclosed repository
+    //   to be inside the stored allow-list; `All` is admin scope and
+    //   checks global `Permission::Admin` instead; everything else
+    //   requires live `Permission::Read` on **each** disclosed
+    //   repository. The conjunction is the point: the promotion chain
+    //   discloses a source and a target, and the delivered payload
+    //   carries both identities, so `Read` on one of them is not
+    //   authority to receive it.
+    //
+    // - `Global` → the event has no repository association at all
+    //   (policy / auth / token / subscription / identity lifecycle). An
+    //   unconditional authz skip here would be a privileged-category
+    //   hole, so a `Global` event whose category is privileged
+    //   (`StreamCategory::requires_admin` — the `ADMIN_CATEGORIES` set)
+    //   is delivered ONLY if the synthesised owner principal
+    //   *currently* satisfies `Permission::Admin`. This re-derives
+    //   authority against live owner state, never trusting the
+    //   `snapshot_claims` floor (the dispatcher's
     //   `synthesise_principal` strips any stale snapshot `"admin"` so a
     //   PATCH-via-PAT-elevated, owner-no-longer-admin subscription
     //   delivers nothing privileged — closed by construction).
-    //   Non-privileged `None`-repo categories keep the
-    //   pass-through. The category predicate is the
-    //   single hoisted `hort-domain` `StreamCategory::requires_admin`
-    //   (`hort-app` does not re-encode the set nor import
-    //   `hort-http-events`).
-    // - `RepositoryScope::All` + `Some(_)` → admin scope; require global
-    //   `Permission::Admin`. Repo is not used for the authz check (admin
-    //   is global).
-    // - everything else with `Some(repo)` → require `Permission::Read`
-    //   on that repo.
+    //   Non-privileged `Global` categories keep the pass-through. A
+    //   `Some(_)` allow-list, however, cannot match an event that names
+    //   no repository — that stays a hard reject.
+    //
+    // - `Unresolved` → repository-scoped but no repository could be
+    //   established (`CasIntegrityMismatch`, or an aggregate whose
+    //   projection row went away with its repository). Fail closed on
+    //   live `Permission::Admin`, whatever the stored scope says: the
+    //   scope cannot be checked against an unknown repository, and
+    //   guessing in the permissive direction is the defect this
+    //   primitive exists to prevent.
     //
     // **Type-not-category** admin gate.
     // Some privileged event *types* ride a non-admin stream category:
     // `PermissionGrant{Applied,Revoked}` / `RepositoryUpstreamMappingChanged`
-    // route to `StreamCategory::Repository` when repo-scoped (so the
-    // `(_, None)` category re-check never fires — they have `Some(repo)`),
-    // and `ArtifactDownloaded` is repo-associated on `DownloadAudit` (so the
-    // None-repo re-check never sees it). The two domain predicates classify
-    // the type irrespective of category; when either is `true` the event is
-    // delivered ONLY to an owner who *currently* satisfies `Permission::Admin`
-    // — folded into the existing `authz_ok`/`return false` denial path below
-    // so the same dispatch-deny machinery (and `SubscriptionDisabled` /
-    // failure accounting) applies. Mirrors the live-authority
-    // posture (never trusts `snapshot_claims`).
+    // route to `StreamCategory::Repository` when repo-scoped, and
+    // `ArtifactDownloaded` is repo-associated on `DownloadAudit`. The two
+    // domain predicates classify the type irrespective of category; when
+    // either is `true` the event is delivered ONLY to an owner who
+    // *currently* satisfies `Permission::Admin` — folded into the existing
+    // `authz_ok`/`return false` denial path below so the same dispatch-deny
+    // machinery (and `SubscriptionDisabled` / failure accounting) applies.
+    // Mirrors the live-authority posture (never trusts `snapshot_claims`).
     let type_requires_admin =
         event.event.is_authorization_model_mutation() || event.event.is_privileged_audit();
 
-    let base_authz_ok = match (&filter.repositories, repo_for_authz) {
-        (_, None) => {
-            // Privileged-category re-check.
-            // `event.stream_id.category` is the authoritative
-            // category for the gate — the same field step 1 matched.
-            if event.stream_id.category.requires_admin() {
-                ctx.rbac
-                    .authorize(ctx.owner_principal, Permission::Admin, None)
-            } else {
-                true
-            }
+    let owner_is_admin = || {
+        ctx.rbac
+            .authorize(ctx.owner_principal, Permission::Admin, None)
+    };
+    let owner_can_read = |repo| {
+        ctx.rbac
+            .authorize(ctx.owner_principal, Permission::Read, Some(repo))
+    };
+
+    let base_authz_ok = match (
+        &filter.repositories,
+        ctx.repository_index.disclosure(&event.event),
+    ) {
+        // Fail closed on an unresolvable disclosure, before any scope
+        // arm gets to interpret it.
+        (_, EventDisclosure::Unresolved) => owner_is_admin(),
+        // An explicit allow-list cannot match an event that names no
+        // repository.
+        (RepositoryScope::Some(_), EventDisclosure::Global) => false,
+        // Privileged-category re-check. `event.stream_id.category` is
+        // the authoritative category for the gate — the same field
+        // step 1 matched.
+        (_, EventDisclosure::Global) => {
+            !event.stream_id.category.requires_admin() || owner_is_admin()
         }
-        (RepositoryScope::All, Some(_)) => {
-            ctx.rbac
-                .authorize(ctx.owner_principal, Permission::Admin, None)
+        // Admin scope; the repositories are not used for the check
+        // (admin is global).
+        (RepositoryScope::All, EventDisclosure::Repositories(_)) => owner_is_admin(),
+        (RepositoryScope::Some(allowed), EventDisclosure::Repositories(ids)) => {
+            ids.all(|repo| allowed.contains(&repo)) && ids.all(owner_can_read)
         }
-        (_, Some(repo)) => ctx
-            .rbac
-            .authorize(ctx.owner_principal, Permission::Read, Some(repo)),
+        (RepositoryScope::OwnedByActor, EventDisclosure::Repositories(ids)) => {
+            ids.all(owner_can_read)
+        }
     };
 
     // Type-based admin requirement is strictly additive to the
-    // category/scope decision: an authorization-model-mutation or
-    // privileged-audit type must additionally clear a live `Permission::Admin`
-    // check regardless of the carrying stream's category (both the `(_, None)`
-    // and `(_, Some(repo))` arms above).
-    let authz_ok = base_authz_ok
-        && (!type_requires_admin
-            || ctx
-                .rbac
-                .authorize(ctx.owner_principal, Permission::Admin, None));
+    // disclosure/scope decision: an authorization-model-mutation or
+    // privileged-audit type must additionally clear a live
+    // `Permission::Admin` check regardless of the carrying stream's
+    // category and regardless of which disclosure arm decided above.
+    let authz_ok = base_authz_ok && (!type_requires_admin || owner_is_admin());
     if !authz_ok {
         return false;
     }
@@ -231,26 +250,32 @@ async fn evaluate_named_predicate(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
 
     use chrono::Utc;
     use uuid::Uuid;
 
+    use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
     use hort_domain::entities::caller::CallerPrincipal;
     use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
     use hort_domain::entities::subscription::{
         EventTypeFilter, EventTypeKind, RepositoryScope, SubscriptionFilter,
     };
     use hort_domain::events::{
-        Actor, ApiActor, ArtifactIngested, DomainEvent, FilterSummary, PersistedEvent,
-        RepositoryScopeKind, StreamCategory, StreamId, SubscriptionCreated, TargetKindWire,
+        Actor, ApiActor, ArtifactIngested, ArtifactQuarantined, DomainEvent, FilterSummary,
+        PersistedEvent, RepositoryScopeKind, StreamCategory, StreamId, SubscriptionCreated,
+        TargetKindWire,
     };
     use hort_domain::ports::repository_repository::RepositoryRepository;
     use hort_domain::types::ContentHash;
 
     use super::*;
     use crate::rbac::RbacEvaluator;
-    use crate::use_cases::test_support::MockRepositoryRepository;
+    use crate::use_cases::event_visibility::EventVisibilityUseCase;
+    use crate::use_cases::test_support::{
+        MockArtifactGroupRepository, MockArtifactRepository, MockEventRepositoryResolver,
+        MockRepositoryRepository,
+    };
 
     // -- Helpers -----------------------------------------------------------
 
@@ -291,6 +316,86 @@ mod tests {
 
     fn repos() -> Arc<dyn RepositoryRepository> {
         Arc::new(MockRepositoryRepository::new())
+    }
+
+    /// An index that resolves nothing — correct for every test whose
+    /// event carries its repository in the payload, and the fail-closed
+    /// input for one whose event does not.
+    static EMPTY_INDEX: LazyLock<EventRepositoryIndex> = LazyLock::new(EventRepositoryIndex::empty);
+
+    /// Build an index that resolves `artifact_id` to `repo_id`, the way
+    /// the dispatcher's per-page resolution does for a real artifact.
+    ///
+    /// Routed through the production `EventVisibilityUseCase` + the
+    /// harness's `MockEventRepositoryResolver` rather than hand-building
+    /// the index, so these tests exercise the same classify → batch →
+    /// resolve path the dispatcher runs.
+    async fn index_resolving(artifact_id: Uuid, repo_id: Uuid) -> EventRepositoryIndex {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        artifacts.insert(seed_artifact(artifact_id, repo_id));
+        let resolver = Arc::new(MockEventRepositoryResolver::new(
+            artifacts,
+            Arc::new(MockArtifactGroupRepository::new()),
+        ));
+        EventVisibilityUseCase::new(resolver)
+            .index(&[quarantined_event(artifact_id)])
+            .await
+            .expect("the mock resolver cannot fail")
+    }
+
+    /// Minimal artifact row for the resolver mock to answer from.
+    fn seed_artifact(id: Uuid, repository_id: Uuid) -> Artifact {
+        Artifact {
+            id,
+            repository_id,
+            name: "pkg".into(),
+            name_as_published: "pkg".into(),
+            version: Some("1.0.0".into()),
+            path: "pkg/1.0.0/pkg-1.0.0.tar.gz".into(),
+            size_bytes: 1,
+            sha256_checksum: test_hash(),
+            sha1_checksum: None,
+            md5_checksum: None,
+            content_type: "application/octet-stream".into(),
+            quarantine_status: QuarantineStatus::Released,
+            rejection_reason: None,
+            quarantine_window_start: None,
+            quarantine_deadline: None,
+            provenance_hold_indefinite: false,
+            upstream_published_at: None,
+            uploaded_by: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            deleted_at: None,
+        }
+    }
+
+    /// `ArtifactQuarantined` on the artifact's own stream — the
+    /// canonical "payload names the artifact, not the repository" case.
+    fn quarantined_event(artifact_id: Uuid) -> PersistedEvent {
+        PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: StreamId::artifact(artifact_id),
+            stream_position: 0,
+            global_position: 1,
+            event: DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
+                artifact_id,
+                quarantine_window_start: Utc::now(),
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: Actor::Api(ApiActor {
+                user_id: Uuid::new_v4(),
+            }),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }
+    }
+
+    fn test_hash() -> ContentHash {
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .parse()
+            .unwrap()
     }
 
     /// Build a `PersistedEvent` carrying an `ArtifactIngested` payload —
@@ -416,6 +521,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         // Filter wants Artifact only; event is on the User stream.
@@ -440,6 +546,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = owned_artifact_filter();
@@ -460,6 +567,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         // Filter wants ArtifactPromoted only; event is ArtifactIngested.
@@ -484,6 +592,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = owned_artifact_filter();
@@ -502,6 +611,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = SubscriptionFilter {
@@ -517,29 +627,238 @@ mod tests {
 
     // -- Step 3: repository scope -----------------------------------------
 
+    /// An `OwnedByActor` owner with no `Read` grant anywhere does NOT
+    /// receive an artifact-lifecycle event, even though its payload
+    /// carries no repository column.
+    ///
+    /// This replaces (renamed and inverted) the test that asserted the
+    /// opposite —
+    /// `owned_by_actor_with_event_no_repo_association_falls_through_to_authz_skip`
+    /// — which encoded the convention that produced the bypass: an
+    /// artifact-stream event's missing `repository_id` was read as "no
+    /// repository, therefore no gate", and a claimless owner received
+    /// every repository's quarantine, scan-verdict and release events.
+    /// `ArtifactQuarantined` now discloses its artifact, the artifact
+    /// aggregate resolves to a repository, and the owner's live grants
+    /// decide.
     #[tokio::test]
-    async fn owned_by_actor_with_event_no_repo_association_falls_through_to_authz_skip() {
-        // ArtifactQuarantined carries no repository association and its
-        // category (`Artifact`) is NON-privileged. OwnedByActor + no
-        // repo + non-privileged category → step 4 skip → matches, even
-        // for an empty (non-admin) principal. (The `User`-stream
-        // `SubscriptionCreated` event is NOT a usable fixture here: `User` ∈
-        // `ADMIN_CATEGORIES`, so that path requires admin — the
-        // privileged variant is covered by
-        // `privileged_category_none_repo_event_not_delivered_to_non_admin_owner`.
-        // The no-repo-skip *mechanic* this test documents holds only
-        // for non-privileged categories, so the fixture uses one.)
-        use hort_domain::events::ArtifactQuarantined;
+    async fn owned_by_actor_without_read_does_not_receive_an_artifact_event() {
+        let repo_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
         let eval = empty_eval();
         let repos_arc = repos();
-        let user_id = Uuid::new_v4();
-        let principal = principal_with_roles(user_id, &[]);
+        let principal = principal_with_roles(Uuid::new_v4(), &[]);
+        let index = index_resolving(artifact_id, repo_id).await;
         let ctx = FilterContext {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &index,
         };
 
+        let filter = SubscriptionFilter {
+            categories: vec![StreamCategory::Artifact],
+            event_types: EventTypeFilter::All,
+            repositories: RepositoryScope::OwnedByActor,
+            named_predicates: vec![],
+        };
+
+        assert!(
+            !matches(&filter, &quarantined_event(artifact_id), &ctx).await,
+            "an owner with no Read grant must not receive another repository's \
+             artifact-lifecycle events"
+        );
+    }
+
+    /// The other half of the same fix: an owner who DOES hold `Read` on
+    /// the repository the artifact belongs to receives the event. A
+    /// change that only stopped the disclosure (`None => false`) would
+    /// fail here, which is why both directions are one fix.
+    #[tokio::test]
+    async fn owned_by_actor_with_read_receives_an_artifact_event() {
+        let repo_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let eval = eval_with_repo_read("dev", repo_id);
+        let repos_arc = repos();
+        let principal = principal_with_roles(Uuid::new_v4(), &["dev"]);
+        let index = index_resolving(artifact_id, repo_id).await;
+        let ctx = FilterContext {
+            rbac: &eval,
+            repositories: &repos_arc,
+            owner_principal: &principal,
+            repository_index: &index,
+        };
+
+        let filter = SubscriptionFilter {
+            categories: vec![StreamCategory::Artifact],
+            event_types: EventTypeFilter::All,
+            repositories: RepositoryScope::OwnedByActor,
+            named_predicates: vec![],
+        };
+
+        assert!(
+            matches(&filter, &quarantined_event(artifact_id), &ctx).await,
+            "a Read-granted owner must receive the artifact-lifecycle events of \
+             the repository the artifact belongs to"
+        );
+    }
+
+    /// **The symmetry half of the defect.** A correctly-restricted
+    /// `RepositoryScope::Some([repo])` subscriber used to lose every
+    /// artifact-lifecycle event of that very repository: the missing
+    /// `repository_id` could not be in an allow-list, so the structural
+    /// arm rejected it outright. The same absent value both over-shared
+    /// and under-delivered; resolving the artifact aggregate fixes both.
+    #[tokio::test]
+    async fn some_scope_receives_the_allowed_repositorys_artifact_events() {
+        let repo_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let eval = eval_with_repo_read("dev", repo_id);
+        let repos_arc = repos();
+        let principal = principal_with_roles(Uuid::new_v4(), &["dev"]);
+        let index = index_resolving(artifact_id, repo_id).await;
+        let ctx = FilterContext {
+            rbac: &eval,
+            repositories: &repos_arc,
+            owner_principal: &principal,
+            repository_index: &index,
+        };
+
+        let filter = SubscriptionFilter {
+            categories: vec![StreamCategory::Artifact],
+            event_types: EventTypeFilter::All,
+            repositories: RepositoryScope::Some(vec![repo_id]),
+            named_predicates: vec![],
+        };
+
+        assert!(
+            matches(&filter, &quarantined_event(artifact_id), &ctx).await,
+            "an allow-list naming the artifact's repository must deliver that \
+             repository's lifecycle events"
+        );
+    }
+
+    /// And an allow-list that does NOT name the artifact's repository
+    /// still rejects — the allow-list is now actually evaluated against
+    /// a resolved repository rather than short-circuited on absence.
+    #[tokio::test]
+    async fn some_scope_rejects_an_artifact_event_outside_the_allow_list() {
+        let artifact_repo = Uuid::new_v4();
+        let allowed_repo = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        // Read on BOTH repositories, so the rejection can only come from
+        // the allow-list and not from a missing grant.
+        let eval = RbacEvaluator::new(vec![
+            PermissionGrant {
+                id: Uuid::new_v4(),
+                subject: GrantSubject::Claims(vec!["dev".into()]),
+                repository_id: Some(artifact_repo),
+                permission: Permission::Read,
+                created_at: Utc::now(),
+                managed_by: hort_domain::entities::managed_by::ManagedBy::Local,
+                managed_by_digest: None,
+            },
+            PermissionGrant {
+                id: Uuid::new_v4(),
+                subject: GrantSubject::Claims(vec!["dev".into()]),
+                repository_id: Some(allowed_repo),
+                permission: Permission::Read,
+                created_at: Utc::now(),
+                managed_by: hort_domain::entities::managed_by::ManagedBy::Local,
+                managed_by_digest: None,
+            },
+        ]);
+        let repos_arc = repos();
+        let principal = principal_with_roles(Uuid::new_v4(), &["dev"]);
+        let index = index_resolving(artifact_id, artifact_repo).await;
+        let ctx = FilterContext {
+            rbac: &eval,
+            repositories: &repos_arc,
+            owner_principal: &principal,
+            repository_index: &index,
+        };
+
+        let filter = SubscriptionFilter {
+            categories: vec![StreamCategory::Artifact],
+            event_types: EventTypeFilter::All,
+            repositories: RepositoryScope::Some(vec![allowed_repo]),
+            named_predicates: vec![],
+        };
+
+        assert!(
+            !matches(&filter, &quarantined_event(artifact_id), &ctx).await,
+            "the stored allow-list is the upper bound and must still exclude \
+             another repository's artifact events"
+        );
+    }
+
+    /// An aggregate the index cannot resolve fails closed: a non-admin
+    /// owner gets nothing. The empty index stands in for "the artifact's
+    /// projection row is gone" (its repository was deleted, cascading
+    /// the artifacts away).
+    #[tokio::test]
+    async fn an_unresolvable_artifact_event_is_withheld_from_a_non_admin_owner() {
+        let eval = eval_with_repo_read("dev", Uuid::new_v4());
+        let repos_arc = repos();
+        let principal = principal_with_roles(Uuid::new_v4(), &["dev"]);
+        let ctx = FilterContext {
+            rbac: &eval,
+            repositories: &repos_arc,
+            owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
+        };
+
+        let filter = SubscriptionFilter {
+            categories: vec![StreamCategory::Artifact],
+            event_types: EventTypeFilter::All,
+            repositories: RepositoryScope::OwnedByActor,
+            named_predicates: vec![],
+        };
+
+        assert!(
+            !matches(&filter, &quarantined_event(Uuid::new_v4()), &ctx).await,
+            "an unresolvable disclosure must fail closed, not pass through"
+        );
+    }
+
+    /// …and an admin owner still receives it, so an unresolvable audit
+    /// fact stays reachable rather than disappearing from delivery
+    /// entirely.
+    #[tokio::test]
+    async fn an_unresolvable_artifact_event_still_reaches_an_admin_owner() {
+        let eval = empty_eval();
+        let repos_arc = repos();
+        let principal = principal_with_roles(Uuid::new_v4(), &["admin"]);
+        let ctx = FilterContext {
+            rbac: &eval,
+            repositories: &repos_arc,
+            owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
+        };
+
+        let filter = SubscriptionFilter {
+            categories: vec![StreamCategory::Artifact],
+            event_types: EventTypeFilter::All,
+            repositories: RepositoryScope::OwnedByActor,
+            named_predicates: vec![],
+        };
+
+        assert!(
+            matches(&filter, &quarantined_event(Uuid::new_v4()), &ctx).await,
+            "fail-closed means admin-only, not dropped for everyone"
+        );
+    }
+
+    /// A promotion names a source AND a target. An owner with `Read` on
+    /// only one of them must not receive it — the delivered payload
+    /// carries both repository identities.
+    #[tokio::test]
+    async fn promotion_requires_read_on_both_repositories() {
+        use hort_domain::events::ArtifactPromoted;
+        let source = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let repos_arc = repos();
+        let principal = principal_with_roles(Uuid::new_v4(), &["dev"]);
         let filter = SubscriptionFilter {
             categories: vec![StreamCategory::Artifact],
             event_types: EventTypeFilter::All,
@@ -551,9 +870,10 @@ mod tests {
             stream_id: StreamId::artifact(Uuid::new_v4()),
             stream_position: 0,
             global_position: 1,
-            event: DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
+            event: DomainEvent::ArtifactPromoted(ArtifactPromoted {
                 artifact_id: Uuid::new_v4(),
-                quarantine_window_start: Utc::now(),
+                source_repository_id: source,
+                target_repository_id: target,
             }),
             correlation_id: Uuid::new_v4(),
             causation_id: None,
@@ -564,7 +884,51 @@ mod tests {
             stored_at: Utc::now(),
         };
 
-        assert!(matches(&filter, &event, &ctx).await);
+        // Read on the source only → withheld.
+        let source_only = eval_with_repo_read("dev", source);
+        let ctx = FilterContext {
+            rbac: &source_only,
+            repositories: &repos_arc,
+            owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
+        };
+        assert!(
+            !matches(&filter, &event, &ctx).await,
+            "Read on the source alone is not authority over an event that also \
+             names the target"
+        );
+
+        // Read on both → delivered.
+        let both = RbacEvaluator::new(vec![
+            PermissionGrant {
+                id: Uuid::new_v4(),
+                subject: GrantSubject::Claims(vec!["dev".into()]),
+                repository_id: Some(source),
+                permission: Permission::Read,
+                created_at: Utc::now(),
+                managed_by: hort_domain::entities::managed_by::ManagedBy::Local,
+                managed_by_digest: None,
+            },
+            PermissionGrant {
+                id: Uuid::new_v4(),
+                subject: GrantSubject::Claims(vec!["dev".into()]),
+                repository_id: Some(target),
+                permission: Permission::Read,
+                created_at: Utc::now(),
+                managed_by: hort_domain::entities::managed_by::ManagedBy::Local,
+                managed_by_digest: None,
+            },
+        ]);
+        let ctx = FilterContext {
+            rbac: &both,
+            repositories: &repos_arc,
+            owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
+        };
+        assert!(
+            matches(&filter, &event, &ctx).await,
+            "Read on both disclosed repositories must deliver the promotion"
+        );
     }
 
     #[tokio::test]
@@ -577,6 +941,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = SubscriptionFilter {
@@ -601,6 +966,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = SubscriptionFilter {
@@ -628,6 +994,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = SubscriptionFilter {
@@ -652,6 +1019,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = SubscriptionFilter {
@@ -665,26 +1033,31 @@ mod tests {
         assert!(matches(&filter, &event, &ctx).await);
     }
 
+    /// `RepositoryScope::All` is admin scope, and an artifact-lifecycle
+    /// event now resolves to a repository — so a non-admin owner holding
+    /// an `All` subscription receives nothing.
+    ///
+    /// This replaces (renamed and inverted) `all_scope_event_without_repo_skips_authz`,
+    /// which asserted the opposite for the same reason the
+    /// `OwnedByActor` test did: the event's missing `repository_id` sent
+    /// it down the "no repository, no gate" arm, so an `All`-scoped
+    /// subscription owned by a claimless user received every
+    /// repository's artifact lifecycle.
     #[tokio::test]
-    async fn all_scope_event_without_repo_skips_authz() {
-        // RepositoryScope::All + a NON-privileged (`Artifact`) event
-        // without repo association → step 4 skipped → matches even
-        // though the principal has no roles. (The `User`-stream
-        // `SubscriptionCreated` event is NOT a usable fixture: `User` ∈
-        // `ADMIN_CATEGORIES`, so a non-admin owner is gated on
-        // that path — see
-        // `privileged_category_none_repo_event_not_delivered_to_non_admin_owner`.
-        // The no-repo-skip mechanic this test documents holds for
-        // non-privileged categories, so the fixture uses one.)
-        use hort_domain::events::ArtifactQuarantined;
-        let eval = empty_eval();
+    async fn all_scope_artifact_event_is_withheld_from_a_non_admin_owner() {
+        let repo_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        // Read on the repository, deliberately: `All` scope demands
+        // Admin, so Read must not be enough.
+        let eval = eval_with_repo_read("dev", repo_id);
         let repos_arc = repos();
-        let user_id = Uuid::new_v4();
-        let principal = principal_with_roles(user_id, &[]);
+        let principal = principal_with_roles(Uuid::new_v4(), &["dev"]);
+        let index = index_resolving(artifact_id, repo_id).await;
         let ctx = FilterContext {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &index,
         };
 
         let filter = SubscriptionFilter {
@@ -693,25 +1066,41 @@ mod tests {
             repositories: RepositoryScope::All,
             named_predicates: vec![],
         };
-        let event = PersistedEvent {
-            event_id: Uuid::new_v4(),
-            stream_id: StreamId::artifact(Uuid::new_v4()),
-            stream_position: 0,
-            global_position: 1,
-            event: DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
-                artifact_id: Uuid::new_v4(),
-                quarantine_window_start: Utc::now(),
-            }),
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: Actor::Api(ApiActor {
-                user_id: Uuid::new_v4(),
-            }),
-            event_version: 1,
-            stored_at: Utc::now(),
+
+        assert!(
+            !matches(&filter, &quarantined_event(artifact_id), &ctx).await,
+            "All is admin scope; a non-admin owner must receive nothing under it"
+        );
+    }
+
+    /// The admin half: the same `All`-scoped subscription owned by an
+    /// admin does receive the artifact event.
+    #[tokio::test]
+    async fn all_scope_artifact_event_reaches_an_admin_owner() {
+        let repo_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let eval = empty_eval();
+        let repos_arc = repos();
+        let principal = principal_with_roles(Uuid::new_v4(), &["admin"]);
+        let index = index_resolving(artifact_id, repo_id).await;
+        let ctx = FilterContext {
+            rbac: &eval,
+            repositories: &repos_arc,
+            owner_principal: &principal,
+            repository_index: &index,
         };
 
-        assert!(matches(&filter, &event, &ctx).await);
+        let filter = SubscriptionFilter {
+            categories: vec![StreamCategory::Artifact],
+            event_types: EventTypeFilter::All,
+            repositories: RepositoryScope::All,
+            named_predicates: vec![],
+        };
+
+        assert!(
+            matches(&filter, &quarantined_event(artifact_id), &ctx).await,
+            "an admin owner under All scope receives the resolved artifact event"
+        );
     }
 
     // -- Step 4: live authz -----------------------------------------------
@@ -728,6 +1117,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = owned_artifact_filter();
@@ -746,6 +1136,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = owned_artifact_filter();
@@ -767,6 +1158,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = SubscriptionFilter {
@@ -791,6 +1183,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = SubscriptionFilter {
@@ -824,6 +1217,7 @@ mod tests {
             rbac: &eval_granted,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
         assert!(matches(&filter, &event, &ctx_granted).await);
 
@@ -833,6 +1227,7 @@ mod tests {
             rbac: &eval_revoked,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
         assert!(!matches(&filter, &event, &ctx_revoked).await);
     }
@@ -852,6 +1247,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = SubscriptionFilter {
@@ -913,6 +1309,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &non_admin,
+            repository_index: &EMPTY_INDEX,
         };
         assert!(
             !matches(&filter, &event, &ctx_non_admin).await,
@@ -926,6 +1323,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &admin,
+            repository_index: &EMPTY_INDEX,
         };
         assert!(
             matches(&filter, &event, &ctx_admin).await,
@@ -957,6 +1355,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = authorization_owned_filter();
@@ -984,6 +1383,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = authorization_owned_filter();
@@ -1015,6 +1415,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &admin_principal,
+            repository_index: &EMPTY_INDEX,
         };
         assert!(matches(&filter, &event, &ctx_admin).await);
 
@@ -1026,6 +1427,7 @@ mod tests {
             rbac: &eval2,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
         assert!(
             !matches(&filter, &event, &ctx_revoked).await,
@@ -1164,6 +1566,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = owned_repository_filter();
@@ -1186,6 +1589,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = owned_repository_filter();
@@ -1210,6 +1614,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = owned_download_audit_filter();
@@ -1233,6 +1638,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = owned_repository_filter();
@@ -1256,6 +1662,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         let filter = owned_download_audit_filter();
@@ -1281,6 +1688,7 @@ mod tests {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
+            repository_index: &EMPTY_INDEX,
         };
 
         // ArtifactIngested is neither auth-model-mutation nor
@@ -1294,42 +1702,34 @@ mod tests {
         );
     }
 
-    /// No-regression for the non-privileged `None`-repo edge: an
-    /// `Artifact`-category event with no repository association
-    /// (`StreamCategory::Artifact` ∉ `ADMIN_CATEGORIES`) keeps the
-    /// pre-fix `(_, None) => true` behaviour — delivered without an
-    /// admin re-check, even to a non-admin owner with no claims.
+    /// **Renamed and inverted**, not deleted. As
+    /// `non_privileged_category_none_repo_event_unchanged_for_non_admin`
+    /// this test asserted that an `Artifact`-category event with no
+    /// repository column reaches a non-admin owner with **no claims at
+    /// all** — it pinned the `(_, None) => true` pass-through as the
+    /// intended contract. That pass-through *is* the bypass: the owner
+    /// received every repository's quarantine windows, scanner names,
+    /// severity counts and release justifications without holding a
+    /// single `Read` grant. The event's repository is resolved from the
+    /// artifact aggregate now, and a claimless owner gets nothing.
+    ///
+    /// Kept pointed at the same fixture (`ArtifactQuarantined` on a
+    /// non-privileged category, claimless owner) so the inversion is
+    /// visible as an inversion rather than as a deletion plus an
+    /// unrelated new test.
     #[tokio::test]
-    async fn non_privileged_category_none_repo_event_unchanged_for_non_admin() {
-        use hort_domain::events::ArtifactQuarantined;
+    async fn non_privileged_category_artifact_event_withheld_from_claimless_owner() {
+        let repo_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
         let eval = empty_eval();
         let repos_arc = repos();
         let principal = principal_with_roles(Uuid::new_v4(), &[]);
+        let index = index_resolving(artifact_id, repo_id).await;
         let ctx = FilterContext {
             rbac: &eval,
             repositories: &repos_arc,
             owner_principal: &principal,
-        };
-
-        // ArtifactQuarantined on the Artifact stream — a
-        // non-`ADMIN_CATEGORIES` category whose `repository_id`
-        // extractor returns `None`.
-        let event = PersistedEvent {
-            event_id: Uuid::new_v4(),
-            stream_id: StreamId::artifact(Uuid::new_v4()),
-            stream_position: 0,
-            global_position: 1,
-            event: DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
-                artifact_id: Uuid::new_v4(),
-                quarantine_window_start: Utc::now(),
-            }),
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: Actor::Api(ApiActor {
-                user_id: Uuid::new_v4(),
-            }),
-            event_version: 1,
-            stored_at: Utc::now(),
+            repository_index: &index,
         };
 
         let filter = SubscriptionFilter {
@@ -1340,8 +1740,10 @@ mod tests {
         };
 
         assert!(
-            matches(&filter, &event, &ctx).await,
-            "non-privileged None-repo events keep the existing pass-through"
+            !matches(&filter, &quarantined_event(artifact_id), &ctx).await,
+            "a non-privileged category is not a licence to skip the repository \
+             gate: the artifact aggregate names the repository, and a claimless \
+             owner holds no Read on it"
         );
     }
 }

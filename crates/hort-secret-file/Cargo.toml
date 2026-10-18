@@ -1,0 +1,33 @@
+[package]
+name = "hort-secret-file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hort atomic 0600 secret-file write — the one way a hort binary puts a plaintext credential on disk"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
+
+[lints]
+workspace = true
+
+# Zero `hort-*` dependencies and zero third-party dependencies,
+# deliberately. Both sinks that put a plaintext credential on disk live in
+# crates that cannot share code any other way: `hort-cli` is a pure HTTP
+# client with no `hort-domain` / `hort-app` / `hort-adapters-*` deps
+# (enforced by `cargo tree -p hort-cli`), and `hort-server` is the
+# composition root. Putting this helper in `hort-domain` (a zero-I/O layer
+# that must not grow a filesystem surface) or `hort-app` would either
+# break that layer's contract or drag `hort-cli`'s isolation guarantee down
+# with it — the same reasoning that produced `hort-attribution`
+# (ADR 0047, D2). No `tokio`: the write is a few syscalls on a path the
+# operator named, so a blocking `std::fs` call is the honest shape and
+# keeps the crate usable from both the sync CLI paths and an async one.
+[dependencies]
+
+[dev-dependencies]
+# The behaviour under test is a property of a real filesystem — the mode
+# bits of the resulting inode and whether a symlink at the target was
+# followed — so the tests need a real scratch directory, not a mock.
+# Already in `Cargo.lock` at the workspace pin; `about.toml` sets
+# `ignore-dev-dependencies`, so no third-party attribution change.
+tempfile = { workspace = true }

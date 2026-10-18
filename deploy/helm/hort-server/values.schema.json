@@ -655,7 +655,7 @@
         "maxInflight": {"type": "integer", "minimum": 0},
         "maxInflightPerIp": {"type": "integer", "minimum": 0},
         "publishBodyMaxSize": {
-          "description": "HORT_PUBLISH_BODY_MAX_SIZE — per-publish body-size ceiling as a human-readable size string (e.g. \"300Mi\", \"1Gi\", or a bare byte integer). Empty leaves the env var unset (binary default, 300 MiB); an explicit \"0\" is the refuse-all-publishes kill-switch.",
+          "description": "HORT_PUBLISH_BODY_MAX_SIZE — per-publish body-size ceiling as a human-readable size string (e.g. \"300Mi\", \"1Gi\", or a bare byte integer). Empty leaves the env var unset (binary default, 300 MiB). A size applies to npm, PyPI and Maven; cargo keeps its own fixed 200 MiB ceiling and the OCI push path takes no ceiling from it. An explicit \"0\" is the refuse-all-publishes kill-switch: it closes every publish surface — all four hosted formats plus OCI push — answering 503 (no Retry-After) on the publish methods, while reads and deletions keep working.",
           "type": "string",
           "pattern": "^([0-9]+(\\.[0-9]+)?([KkMmGgTt]i?)?[Bb]?)?$"
         }

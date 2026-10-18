@@ -21,6 +21,13 @@ path = "src/main.rs"
 # hort-domain / hort-app / hort-adapters-* in the dep graph) — see that
 # crate's Cargo.toml. Backs the `license` / `attribution` subcommands.
 hort-attribution = { workspace = true }
+# Atomic 0600 secret-file write, shared with `hort-server`'s
+# `admin --output=file:` sink. Backs `auth login`'s
+# `~/.hort/config.toml` write: the bearer must land in an inode this
+# process created at 0600, never in a pre-existing file whose mode or
+# type it inherited. Another std-only leaf crate with zero `hort-*` deps
+# of its own, so it does not touch hort-cli's isolation guarantee either.
+hort-secret-file = { workspace = true }
 # HTTP client — pure HTTP, no DSN, no hort-domain / hort-app / hort-adapters-* deps.
 reqwest    = { workspace = true, features = ["rustls", "json", "form"] }
 clap       = { workspace = true, features = ["derive", "env"] }

@@ -60,6 +60,8 @@ impl TaskHandler for RetentionPurgeHandler {
                         purged_events = s.purged_events,
                         skipped_protected = s.skipped_protected,
                         skipped_tag_exempt = s.skipped_tag_exempt,
+                        skipped_protected_under_lock = s.skipped_protected_under_lock,
+                        skipped_tag_exempt_under_lock = s.skipped_tag_exempt_under_lock,
                         user_deletes_visited = s.user_deletes_visited,
                         errors = s.errors,
                         "retention-purge sweep complete"
@@ -73,6 +75,8 @@ impl TaskHandler for RetentionPurgeHandler {
                             "purged_events": s.purged_events,
                             "skipped_protected": s.skipped_protected,
                             "skipped_tag_exempt": s.skipped_tag_exempt,
+                            "skipped_protected_under_lock": s.skipped_protected_under_lock,
+                            "skipped_tag_exempt_under_lock": s.skipped_tag_exempt_under_lock,
                             "user_deletes_visited": s.user_deletes_visited,
                             "errors": s.errors,
                         }),
@@ -110,7 +114,7 @@ mod tests {
     use hort_domain::error::DomainError;
     use hort_domain::events::system_actor;
     use hort_domain::ports::event_store::AppendEvents;
-    use hort_domain::ports::purge_gc::{BlobReclaim, PendingPurge, PurgeGcPort, PurgedRef};
+    use hort_domain::ports::purge_gc::{BlobReclaim, PendingPurge, PurgeGcPort, PurgePreparation};
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
     use uuid::Uuid;
 
@@ -143,8 +147,8 @@ mod tests {
             };
             Box::pin(async move { Ok(v) })
         }
-        fn purge_artifact_refs(&self, _a: Uuid) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
-            Box::pin(async { Ok(Vec::new()) })
+        fn purge_artifact_refs(&self, _a: Uuid) -> BoxFuture<'_, DomainResult<PurgePreparation>> {
+            Box::pin(async { Ok(PurgePreparation::Prepared(Vec::new())) })
         }
         fn begin_blob_reclaim(
             &self,
@@ -296,8 +300,11 @@ mod tests {
             ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
                 Box::pin(async { Err(DomainError::Invariant("db down".into())) })
             }
-            fn purge_artifact_refs(&self, _a: Uuid) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
-                Box::pin(async { Ok(Vec::new()) })
+            fn purge_artifact_refs(
+                &self,
+                _a: Uuid,
+            ) -> BoxFuture<'_, DomainResult<PurgePreparation>> {
+                Box::pin(async { Ok(PurgePreparation::Prepared(Vec::new())) })
             }
             fn begin_blob_reclaim(
                 &self,

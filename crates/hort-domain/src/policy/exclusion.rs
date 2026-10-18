@@ -28,6 +28,10 @@
 //!    each appear in `matched_exclusion_ids` — operators want the full
 //!    audit trail.
 //!
+//! `ExclusionProjection.scope` is **not** one of the matching inputs —
+//! see [`SCOPE_NOT_ENFORCED`]. Every writer refuses a non-global scope
+//! so the field cannot carry an assurance this filter does not honour.
+//!
 //! ## Glob matcher
 //!
 //! `pattern_matches` is a deliberately tiny `*`-only matcher — `*`
@@ -44,6 +48,60 @@ use uuid::Uuid;
 use crate::entities::scan_policy::{ExclusionProjection, SeverityThreshold};
 use crate::events::SeveritySummary;
 use crate::types::{ArtifactCoords, Finding};
+
+/// Why a repository-scoped exclusion is refused by every writer, in the
+/// operator's words.
+///
+/// [`filter_excluded_findings`] matches on `expires_at`, `cve_id` and
+/// `package_pattern` and never reads `ExclusionProjection.scope` — it
+/// could not, because the [`ArtifactCoords`] it matches against carry
+/// no repository identity. Everything in front of the filter honours
+/// the field (the HTTP writer accepts it, the `ExclusionAdded` event
+/// records it, the projection stores it, the listing renders it), which
+/// is exactly what makes it dangerous: an operator narrowing a CVE
+/// waiver to one repository gets that waiver applied to every
+/// repository the parent policy governs.
+///
+/// ## The refusal is on the write, not on the removal
+///
+/// Only *storing* a non-global scope is refused —
+/// `PolicyUseCase::add_exclusion`, the seam every inbound writer passes
+/// through, and the gitops apply-time linter row. **Removing** such a
+/// row is refused nowhere: not by `PolicyUseCase::remove_exclusion`, not
+/// by the HTTP `DELETE`, and not by a gitops envelope leaving the
+/// declared tree.
+///
+/// The two directions are not symmetric and must not be made so. Writing
+/// one creates an assurance the filter cannot honour: the operator
+/// believes a CVE is waived in one repository while it is waived in every
+/// repository the parent policy governs. Removing one withdraws that
+/// assurance — it only ever stops suppressing a finding, so it is the
+/// tightening direction and there is no fail-closed reading under which
+/// blocking it is the safe choice. Refusing the removal instead made a
+/// false assurance *unremovable* while it went on clearing its CVE
+/// everywhere.
+///
+/// What a removal does owe the operator is its real reach, which is not
+/// the one the row advertises: the scope narrowed nothing, so the removal
+/// lands in every repository the parent policy governs rather than the
+/// one named. Every removal surface states that, with this rationale
+/// verbatim.
+///
+/// One `const` rather than one sentence per writer because the refusal
+/// has to read the same wherever the operator meets it — the gitops
+/// apply-time linter row
+/// (`hort_config::desired::validate_exclusion_scope_not_implemented`)
+/// and the HTTP write surface both state this rationale verbatim and
+/// then add their own surface-specific pointer. Delete the const
+/// together with the refusals when per-repository scoping is
+/// implemented — a rationale kept past the defect it describes is worse
+/// than none, because the next reader has to re-derive whether it still
+/// holds.
+pub const SCOPE_NOT_ENFORCED: &str =
+    "a repository-scoped exclusion is not enforced: the finding filter never reads the \
+     exclusion's scope — the artifact coordinates it matches against carry no \
+     repository identity — so an exclusion narrowed to one repository suppresses its \
+     CVE for every repository the parent policy governs";
 
 /// Result of [`filter_excluded_findings`]: the surviving findings, the
 /// derived post-exclusion severity summary, plus audit metadata for
@@ -301,6 +359,7 @@ mod tests {
     use super::*;
     use crate::entities::repository::RepositoryFormat;
     use crate::events::PolicyScope;
+    use crate::types::ComponentRelation;
 
     fn ts(secs: i64) -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(secs, 0).expect("fixed timestamp")
@@ -348,6 +407,7 @@ mod tests {
             aliases: vec![],
             informational_class: None,
             severity_basis: crate::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 
@@ -368,6 +428,7 @@ mod tests {
             aliases: vec![alias.into()],
             informational_class: None,
             severity_basis: crate::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 

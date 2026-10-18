@@ -33,10 +33,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Extension, Router};
-use chrono::Utc;
 
 use hort_app::use_cases::repository_access::AccessLevel;
-use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::events::ApiActor;
@@ -44,11 +42,15 @@ use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::types::ArtifactCoords;
 use hort_formats::npm::NpmFormatHandler;
 
+use hort_http_core::artifact_gate::non_servable_response;
 use hort_http_core::authz::write::{reject_write_to_virtual, resolve_actor_user_id};
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
-use hort_http_core::limits::{BoundedPath, DEFAULT_PUBLISH_BODY_LIMIT};
+use hort_http_core::limits::{
+    publish_disabled_response, refuse_publishes_when_disabled, BoundedPath,
+    DEFAULT_PUBLISH_BODY_LIMIT,
+};
 use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 use hort_http_core::middleware::trust::RequestTrust;
 
@@ -122,11 +124,24 @@ pub fn npm_routes() -> Router<Arc<AppContext>> {
 /// `DefaultBodyLimit::max(limit)` on the layer stack as
 /// defence-in-depth for any future non-streaming extractor (or for
 /// the per-route limit extractor on GET handlers, which read no body).
+///
+/// All of that is the **size** meaning. A zero limit is the
+/// refuse-all-publishes kill switch instead, answered by
+/// `hort_http_core::limits::refuse_publishes_when_disabled` — `503`,
+/// before any publish reaches a handler — and not by either byte
+/// counter. Through the counters a zero-byte publish was refused only
+/// because the decoder found no attachment, which is a property of the
+/// payload grammar and not a promise the limit made. The guard is
+/// method-scoped and wraps the whole subtree, so it also holds the
+/// dist-tag `PUT` — a dist-tag write retargets what `npm install`
+/// resolves to, and its own small per-route body limit would otherwise
+/// let it through — while leaving every GET and the dist-tag `DELETE`
+/// untouched.
 pub fn npm_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
     // Scoped (more-specific) routes are registered first. axum's matchit
     // disambiguates by segment count, but ordering first preserves intent
     // and guards against a future matcher rule change.
-    Router::new()
+    let routes = Router::new()
         // Maintainer dist-tag writes. Six segments with three literals
         // (`-`, `package`, `dist-tags`), so they cannot collide with any
         // of the all-param read routes below (2–5 segments). `{pkg}`
@@ -167,7 +182,8 @@ pub fn npm_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
         .layer(DefaultBodyLimit::max(limit))
         // Propagate the same value to the streaming publish decoder
         // so it can emit 413 itself when counting body bytes.
-        .layer(Extension(NpmPublishLimit(limit)))
+        .layer(Extension(NpmPublishLimit(limit)));
+    refuse_publishes_when_disabled(routes, limit, publish_disabled_response)
 }
 
 /// Router-scoped marker carrying the configured publish body limit.
@@ -451,9 +467,10 @@ async fn serve_tarball(
     render_artifact_response(ctx, artifact, actor).await
 }
 
-/// Render the final tarball HTTP response for a resolved artifact: surface
-/// the quarantine gate (`Quarantined` → 503 + `Retry-After`,
-/// `Rejected` / `ScanIndeterminate` → 403) or stream the bytes from CAS.
+/// Render the final tarball HTTP response for a resolved artifact:
+/// surface the per-artifact status gate
+/// ([`hort_http_core::artifact_gate::non_servable_response`] — the one
+/// definition the content routes share) or stream the bytes from CAS.
 ///
 /// Shared by the hosted/proxy direct path and the virtual aggregation path
 /// (ADR 0031) so the gate render + streaming live in exactly one place; the
@@ -463,47 +480,8 @@ async fn render_artifact_response(
     artifact: hort_domain::entities::artifact::Artifact,
     actor: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
-    match artifact.quarantine_status {
-        QuarantineStatus::Quarantined => {
-            // The use-case layer hydrates the transient computed
-            // `quarantine_deadline`; the format crate never computes it
-            // (it cannot resolve a `ScanPolicy`).
-            let retry_after = artifact
-                .quarantine_deadline
-                .map(|deadline| {
-                    let secs = (deadline - Utc::now()).num_seconds().max(1);
-                    secs.to_string()
-                })
-                .unwrap_or_else(|| "3600".to_string());
-            return Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("Retry-After", retry_after)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact is quarantined"}).to_string(),
-                ))
-                .unwrap());
-        }
-        QuarantineStatus::Rejected => {
-            return Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact is rejected"}).to_string(),
-                ))
-                .unwrap());
-        }
-        // Terminal scan failure (scanner could not decide). Fail-closed:
-        // a terminal block like `Rejected`, not a timed hold (no
-        // Retry-After). The scanning-pipeline design (ADR 0007) governs
-        // the `scan_indeterminate` HTTP shape.
-        QuarantineStatus::ScanIndeterminate => {
-            return Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact scan is indeterminate"}).to_string(),
-                ))
-                .unwrap());
-        }
-        QuarantineStatus::None | QuarantineStatus::Released => {}
+    if let Some(blocked) = non_servable_response(&artifact) {
+        return Ok(blocked);
     }
 
     // Thread the resolved principal for opt-in download-audit attribution.
@@ -1260,6 +1238,7 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use base64::Engine as _;
+    use chrono::Utc;
     use sha1::{Digest as _, Sha1};
     use tower::ServiceExt;
     use uuid::Uuid;
@@ -1278,7 +1257,10 @@ mod tests {
     use super::*;
     use hort_http_core::context::AppContext;
     use hort_http_core::test_support::{
-        build_mock_ctx, trust_config_untrusted_peer_fallback, with_trust_config,
+        assert_axis_is_the_wire_kind_for_every_variant,
+        assert_axis_less_refusal_emits_no_axis_field, assert_refusal_leaks_no_uuid_or_cve,
+        build_mock_ctx, seed_indefinite_hold_policy, seed_timed_hold_policy,
+        trust_config_untrusted_peer_fallback, with_provenance_hold_hydration, with_trust_config,
     };
 
     struct TestHarness {
@@ -1299,6 +1281,14 @@ mod tests {
         /// `RefMoved` / `RefRetired` batches a write produced.
         refs: Arc<hort_app::use_cases::test_support::MockRefRegistryPort>,
         ref_lifecycle: Arc<hort_app::use_cases::test_support::MockRefLifecyclePort>,
+        /// Artifact-stream seed handle for the status-gate tests: the
+        /// rejection axis and the indefinite-hold flag are both derived
+        /// from the stream, never from a fixture field.
+        events: Arc<hort_app::use_cases::test_support::MockEventStore>,
+        /// Scan-policy seed handle for the status-gate tests — the
+        /// observation window and the provenance mode decide which of
+        /// the two holds a quarantined artifact is in.
+        policy_projections: Arc<hort_app::use_cases::test_support::MockPolicyProjectionRepository>,
     }
 
     fn harness() -> TestHarness {
@@ -1321,6 +1311,8 @@ mod tests {
             curation_rules: mocks.curation_rules,
             refs: mocks.refs,
             ref_lifecycle: mocks.ref_lifecycle,
+            events: mocks.events,
+            policy_projections: mocks.policy_projections,
         }
     }
 
@@ -3374,6 +3366,189 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
+    // -- the status gate: the axis, and the hold with no deadline ---------
+    //
+    // These drive the real tarball route, not the gate function, which
+    // is the point: the axis and the indefinite-hold flag are hydrated by
+    // the use-case layer during the load, so a test that hands the gate a
+    // hand-built artifact proves only that the gate reads two fields. The
+    // question here is whether npm's own download path arrives at the
+    // gate carrying them.
+
+    /// Seed a `Rejected` tarball whose stream carries `axis` (or, for
+    /// `None`, carries nothing at all — the ADR 0039 D6 illegal state),
+    /// pull it, and return the refusal.
+    ///
+    /// The fixture entity's `rejection_reason` is deliberately never set:
+    /// `MockArtifactRepository` clears it on read exactly as the one
+    /// `row -> Artifact` mapper in `hort-adapters-postgres` does, so only
+    /// `ArtifactUseCase`'s hydration can put it back — which is what
+    /// makes this about the production derivation and not about the
+    /// fixture.
+    async fn rejected_tarball_response(
+        axis: Option<hort_domain::events::RejectionReason>,
+    ) -> (StatusCode, serde_json::Value) {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        let artifact = insert_tarball_artifact(
+            &h,
+            repo.id,
+            "express",
+            "1.0.0",
+            "express-1.0.0.tgz",
+            b"x",
+            None,
+            QuarantineStatus::Rejected,
+        );
+        h.events.set_stream(
+            &hort_domain::events::StreamId::artifact(artifact.id),
+            axis.map(|reason| {
+                vec![
+                    hort_app::use_cases::test_support::persisted_artifact_rejected(
+                        artifact.id,
+                        reason,
+                        1,
+                    ),
+                ]
+            })
+            .unwrap_or_default(),
+        );
+        // Opt into the read-path hydration: without the event-store
+        // handle wired the axis cannot be recovered and the route would
+        // answer the axis-less form for a harness reason rather than a
+        // production one.
+        let router = router(with_provenance_hold_hydration(&h.ctx));
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/express/-/express-1.0.0.tgz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// **Every** `RejectionReason` variant reaches an npm client as its
+    /// own `wire_kind()` token, iterated off `ALL_KIND_SAMPLES` rather
+    /// than a hand-written list — so a variant added tomorrow is covered
+    /// the moment it joins that constant, and cannot reach a client
+    /// undecided.
+    #[tokio::test]
+    async fn download_rejected_403_names_the_axis_for_every_variant() {
+        assert_axis_is_the_wire_kind_for_every_variant(rejected_tarball_response).await;
+    }
+
+    /// The refusal is a diagnosis of an artifact, not a disclosure about
+    /// a person, a rule, or a weakness. Asserted over every variant,
+    /// which is what makes it meaningful: `Curator { curator_id }` and
+    /// `CurationRetroactive { rule_id }` are the two that carry a uuid,
+    /// so a body built from the payload rather than the discriminator
+    /// would leak here and nowhere else.
+    #[tokio::test]
+    async fn download_rejected_403_leaks_no_uuid_and_no_cve_identifier() {
+        assert_refusal_leaks_no_uuid_or_cve(rejected_tarball_response).await;
+    }
+
+    /// ADR 0039 D6's illegal state: the projection says `Rejected` and no
+    /// `ArtifactRejected` stands behind it on the stream. The caller is
+    /// still refused — but no axis field is emitted and no `unknown`
+    /// token is invented, because a token would make an inconsistency
+    /// read as a verdict.
+    #[tokio::test]
+    async fn download_rejected_without_an_axis_on_the_stream_names_none() {
+        assert_axis_less_refusal_emits_no_axis_field(rejected_tarball_response).await;
+    }
+
+    /// ADR 0039 D5 — a quarantined tarball still waiting on a signature
+    /// after its observation window elapsed has no deadline to advertise:
+    /// what it waits for is an external event, not the clock. Before
+    /// this, npm answered `Retry-After: 1` on every pull of such a
+    /// tarball, forever.
+    #[tokio::test]
+    async fn download_indefinite_hold_is_503_with_no_retry_after() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        seed_indefinite_hold_policy(&h.policy_projections, repo.id);
+        // No `ProvenanceVerified` seeded on the artifact's stream, so the
+        // read-path clearance stays `Pending` under `Required`.
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "express",
+            "1.0.0",
+            "express-1.0.0.tgz",
+            b"x",
+            None,
+            QuarantineStatus::Quarantined,
+        );
+        let router = router(with_provenance_hold_hydration(&h.ctx));
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/express/-/express-1.0.0.tgz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            res.headers().get("Retry-After").is_none(),
+            "an unsigned hold past its window has no self-resolving deadline"
+        );
+        let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Same body as the time-bounded hold: which hold this is stays
+        // opaque to the client.
+        assert_eq!(parsed["error"], "artifact is quarantined");
+    }
+
+    /// The converse, on the same wiring: a hold still inside its window
+    /// has a real deadline, so its `Retry-After` is correct and useful
+    /// and must survive.
+    #[tokio::test]
+    async fn download_hold_inside_its_window_keeps_its_retry_after() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        seed_timed_hold_policy(&h.policy_projections, repo.id);
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "express",
+            "1.0.0",
+            "express-1.0.0.tgz",
+            b"x",
+            None,
+            QuarantineStatus::Quarantined,
+        );
+        let router = router(with_provenance_hold_hydration(&h.ctx));
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/express/-/express-1.0.0.tgz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let secs: i64 = res
+            .headers()
+            .get("Retry-After")
+            .expect("an in-window hold keeps its computed Retry-After")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (1..=3600).contains(&secs),
+            "retry-after out of range: {secs}"
+        );
+    }
+
     #[tokio::test]
     async fn download_scoped_quarantined_returns_503() {
         let h = harness();
@@ -3586,6 +3761,8 @@ mod tests {
                 curation_rules: h.curation_rules,
                 refs: h.refs,
                 ref_lifecycle: h.ref_lifecycle,
+                events: h.events,
+                policy_projections: h.policy_projections,
             }
         }
 
@@ -3830,6 +4007,8 @@ mod tests {
                 curation_rules: base.curation_rules,
                 refs: base.refs,
                 ref_lifecycle: base.ref_lifecycle,
+                events: base.events,
+                policy_projections: base.policy_projections,
             };
 
             let repo = insert_private_repo(&h, "private-npm");
@@ -4283,6 +4462,7 @@ mod tests {
                 mtls_key_ref: None,
                 ca_bundle_ref: None,
                 pinned_cert_sha256: None,
+                allowed_realm_hosts: Vec::new(),
                 created_at: now,
                 updated_at: now,
             });

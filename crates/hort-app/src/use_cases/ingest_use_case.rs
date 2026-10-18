@@ -23,7 +23,9 @@ use hort_domain::policy::quarantine_anchor::{
 use hort_domain::policy::scan::DefaultPolicy;
 use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
-use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
+use hort_domain::ports::content_reference_index::{
+    ContentReference, ContentReferenceClaim, ContentReferenceIndex,
+};
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 
@@ -51,8 +53,8 @@ use crate::use_cases::provenance_cascade::ProvenanceCascade;
 use crate::use_cases::quarantine_hold::{resolve_transient_hold, TransientHold};
 use crate::use_cases::referenced_descendant::resolve_referenced_tree_descendant_fail_safe;
 use crate::use_cases::{
-    append_any_with_conflict_retry, event_append_backoff, read_expected_version,
-    EVENT_APPEND_RETRY_ATTEMPTS,
+    append_any_with_conflict_retry, event_append_backoff, read_unpaired_append_version,
+    UnpairedAppend, EVENT_APPEND_RETRY_ATTEMPTS,
 };
 
 /// Enqueue priority for **clearance-gating** `provenance-verify` jobs — the
@@ -153,6 +155,30 @@ pub struct IngestRequest {
     /// output of `FormatHandler::parse_download_path` and has a different
     /// lifecycle — see the coords type's docstring.
     pub payload_metadata: serde_json::Value,
+    /// Content-reference edges the artifact this request mints claims on
+    /// **foreign** bytes — bytes some other artifact's row owns.
+    ///
+    /// The minting path always claims its own content (and its CAS-resident
+    /// metadata blob, and a PEP 658 METADATA blob when it extracted one);
+    /// those it derives itself and no caller supplies them. What a caller
+    /// supplies here is what only the caller can know: an OCI manifest's
+    /// `subject.digest`, its config and layer descriptors, an image index's
+    /// children — relationships read out of the body being ingested.
+    ///
+    /// They are [`ContentReferenceClaim`]s rather than
+    /// [`ContentReference`](hort_domain::ports::content_reference_index::ContentReference)s
+    /// because the source artifact does not exist yet; `ingest_inner` and
+    /// `register_by_hash_inner` resolve each against the row they mint and
+    /// commit the result in that row's own transaction. A
+    /// `content_references` row is the claim that keeps bytes alive, so an
+    /// edge inserted after its referrer committed is a window in which the
+    /// claim does not exist and the storage GC may collect the bytes with
+    /// the referrer live — and for an edge onto foreign bytes nothing
+    /// repairs it (the refcount-reconcile sweep derives `primary_content` /
+    /// `metadata_blob` from the artifact row and mints no tree edge).
+    ///
+    /// Empty for every caller that claims nothing beyond its own content.
+    pub claimed_edges: Vec<ContentReferenceClaim>,
 }
 
 /// Internal context threaded through `ingest_with_verification` so the
@@ -182,6 +208,24 @@ struct VerificationContext {
     upstream_value: String,
     sha512_handle: Option<Sha512DigestHandle>,
     sha1_handle: Option<Sha1DigestHandle>,
+}
+
+impl VerificationContext {
+    /// Whether this request declared an upstream-published digest whose
+    /// comparison lives in the post-`storage.put` arms
+    /// ([`IngestUseCase::verify_sha512_upstream`] /
+    /// [`IngestUseCase::verify_sha1_upstream`]) rather than in the
+    /// declared-SHA-256 decision.
+    ///
+    /// The SHA-256 arms leave both handles `None` and are verified by the
+    /// `declared_sha256` machinery — which a same-path dedup decision
+    /// performs itself, because a dedup hit *is* `existing.sha256_checksum
+    /// == declared` and that stored value is the CAS hash of the stored
+    /// bytes. A handle-bearing arm has no such shortcut: its digest only
+    /// exists once the bytes have flowed through the hashing wrapper.
+    fn has_pending_upstream_digest(&self) -> bool {
+        self.sha512_handle.is_some() || self.sha1_handle.is_some()
+    }
 }
 
 /// Lowercase-hex-encode a byte slice. Used for SHA-512 digest values
@@ -255,6 +299,24 @@ pub struct RegisterExistingCasBlobRequest {
     /// `None` for every existing caller (OCI cross-mount,
     /// post-coalesce follower) — backwards-compatible.
     pub seed_import_quarantine_anchor: Option<DateTime<Utc>>,
+    /// Content-reference edges the registered row claims on **foreign**
+    /// bytes — see [`IngestRequest::claimed_edges`], which this field is
+    /// forwarded to verbatim.
+    ///
+    /// Registering an existing CAS blob is mostly a claim on nothing but
+    /// its own content, and most callers pass `Vec::new()`. The exception
+    /// is the OCI pull-through's coalesced follower: it mints a manifest
+    /// row, and a manifest's `oci_config` / `oci_layer` /
+    /// `oci_index_member` edges are claims on OTHER artifacts' bytes which
+    /// no reconcile sweep re-derives. The follower reads the manifest from
+    /// CAS before this call and hands the derived claims in here, so they
+    /// commit in the row's own transaction rather than beside it.
+    ///
+    /// A required field rather than a `Default`: an optional edge-carrying
+    /// parameter that callers forget is how edges came to be written after
+    /// their referrer in the first place, so every call site names it —
+    /// including the majority that pass an empty set.
+    pub claimed_edges: Vec<ContentReferenceClaim>,
 }
 
 /// Request payload for `IngestUseCase::ingest_verified` (ADR 0006).
@@ -578,20 +640,25 @@ pub struct IngestUseCase {
     /// anything" — a documented escape hatch used primarily by tests
     /// that exercise the CAS round-trip without worrying about ceilings.
     metadata_blob_max_bytes: usize,
-    /// Refcount projection writer. Every successful
-    /// `ArtifactIngested` commit writes one `kind = "primary_content"`
-    /// row pointing at `artifact.sha256_checksum`. HashReference-strategy
-    /// ingests additionally write a `kind = "metadata_blob"` row pointing
-    /// at the metadata blob hash. Held as the raw port handle (not via
+    /// Refcount index — **read-only** from this use case. Every edge any
+    /// minting path in here records rides
+    /// `commit_transition_with_enqueues`, so it commits in the transaction
+    /// of the artifact that claims it (see [`Self::ingest_edges`]: a
+    /// committed artifact with no row claiming its bytes is a blob the
+    /// storage GC may delete, which is why a failed edge fails the ingest).
+    /// That covers all three minting entry points — `ingest_inner`,
+    /// `register_by_hash_inner` and `ingest_signature_manifest` — and the
+    /// foreign-byte claims their callers declare on
+    /// [`IngestRequest::claimed_edges`].
+    ///
+    /// The reads are the quarantine-anchor carve-out's inbound-reference
+    /// lookup and the provenance parent-gate predicate.
+    ///
+    /// Held as the raw port handle (not via
     /// `ContentReferenceUseCase`) because `ContentReferenceUseCase` is
     /// constructed AFTER `IngestUseCase` in the composition root —
     /// `IngestUseCase`'s established pattern is to hold raw port handles
     /// for primitives it must call without authz.
-    ///
-    /// Failure here is recoverable — the artifact is already
-    /// persisted-and-valid; the refcount row is eventual. An operator-
-    /// side reconcile sweep catches divergence. We
-    /// do NOT abort the ingest on insert failure.
     content_references: Arc<dyn ContentReferenceIndex>,
     /// Ingest-time scan auto-enqueue. When the
     /// inbound artifact's repository matches an active `ScanPolicy`
@@ -1194,6 +1261,11 @@ impl IngestUseCase {
                 legacy_sha1,
                 legacy_md5,
                 declared_sha256,
+                // A direct upload declares no relationship to other
+                // artifacts' bytes — `DirectIngestRequest` carries no claim
+                // field at all, and the artifact's own content edge is
+                // derived inside.
+                &[],
                 metadata_decision,
                 had_payload_metadata,
                 handler,
@@ -1314,10 +1386,32 @@ impl IngestUseCase {
     /// atomic with the mint. The audit invariant: every artifact
     /// ingested via `ingest_verified` has exactly one
     /// `ChecksumVerified` event in its stream.
-    #[tracing::instrument(skip(self, request, stream, handler))]
+    ///
+    /// # `claimed_edges`
+    ///
+    /// The content-reference edges this artifact claims on bytes it does
+    /// **not** own — an OCI manifest's `subject.digest`, its config and
+    /// layer descriptors, an image index's children. The artifact's own
+    /// `primary_content` (and `metadata_blob`, and PEP 658
+    /// `wheel_metadata`) edges are derived inside and are never a caller's
+    /// business; these are the ones only the caller can read out of the
+    /// body it is handing over.
+    ///
+    /// Every caller names the parameter, including the overwhelming
+    /// majority that pass `&[]`, because the alternative — an edge-less
+    /// convenience entry point beside an edge-carrying one — is how the
+    /// hazard this parameter exists to close got everywhere in the first
+    /// place: a `content_references` row is the claim that keeps bytes
+    /// alive, the storage GC deletes a CAS blob exactly when no row targets
+    /// its hash, and a caller that writes its edge *after* this call
+    /// returns has a live referrer and a collectable target. Passing the
+    /// claims here puts them in the minting transaction, so the referrer
+    /// and its claims commit together or not at all.
+    #[tracing::instrument(skip(self, request, claimed_edges, stream, handler))]
     pub async fn ingest_verified(
         &self,
         request: VerifiedIngestRequest,
+        claimed_edges: &[ContentReferenceClaim],
         stream: Box<dyn AsyncRead + Send + Unpin>,
         handler: &dyn FormatHandler,
     ) -> AppResult<IngestOutcome> {
@@ -1344,6 +1438,7 @@ impl IngestUseCase {
                     HashAlgorithm::Sha256,
                     upstream_published_at,
                     trust_upstream_publish_time,
+                    claimed_edges,
                     stream,
                     handler,
                 )
@@ -1375,6 +1470,7 @@ impl IngestUseCase {
                         HashAlgorithm::Sha256,
                         upstream_published_at,
                         trust_upstream_publish_time,
+                        claimed_edges,
                         stream,
                         handler,
                     )
@@ -1390,6 +1486,7 @@ impl IngestUseCase {
                         upstream_checksum.hex().to_string(),
                         upstream_published_at,
                         trust_upstream_publish_time,
+                        claimed_edges,
                         stream,
                         handler,
                     )
@@ -1415,6 +1512,7 @@ impl IngestUseCase {
                         upstream_checksum.hex().to_string(),
                         upstream_published_at,
                         trust_upstream_publish_time,
+                        claimed_edges,
                         stream,
                         handler,
                     )
@@ -1469,8 +1567,17 @@ impl IngestUseCase {
     /// subject, or an enqueue failure is a warn-and-continue no-op — the
     /// signature manifest ingest itself never fails on the hook, and the
     /// S4 expiry backstop covers a lost enqueue.
+    ///
+    /// `claimed_edges` carries the content-reference edges the pushed
+    /// manifest claims on bytes it does not own — on this path, the
+    /// `oci_subject` edge onto the subject image. Same contract as
+    /// [`Self::ingest_verified`]'s parameter of the same name: they ride the
+    /// minting transition rather than being written after it, because a
+    /// `content_references` row is the claim that keeps bytes alive and
+    /// nothing re-derives a tree edge for an artifact that committed
+    /// without one.
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, payload_metadata, stream))]
+    #[tracing::instrument(skip(self, payload_metadata, claimed_edges, stream))]
     pub async fn ingest_signature_manifest(
         &self,
         repository_id: Uuid,
@@ -1480,6 +1587,7 @@ impl IngestUseCase {
         payload_metadata: serde_json::Value,
         declared_digest: ContentHash,
         subject_content_hash: Option<ContentHash>,
+        claimed_edges: &[ContentReferenceClaim],
         stream: Box<dyn AsyncRead + Send + Unpin>,
     ) -> AppResult<IngestOutcome> {
         // 1. Store the manifest bytes in CAS. `put` returns the SHA-256 of
@@ -1531,10 +1639,24 @@ impl IngestUseCase {
             updated_at: now,
         };
 
-        // 4. Emit `ArtifactIngested` + persist the artifact atomically via
-        //    `commit_transition` — the SAME create primitive the verified
-        //    path uses. NO `jobs.enqueue_*` (scan / provenance) and NO
-        //    quarantine transition: that is the entire point.
+        // 4. Emit `ArtifactIngested` + persist the artifact and its
+        //    content-reference edges atomically via
+        //    `commit_transition_with_enqueues` — the SAME create primitive
+        //    the verified path uses, with an empty enqueue set: NO
+        //    `jobs.enqueue_*` (scan / provenance) and NO quarantine
+        //    transition, which is the entire point of this narrow path.
+        //
+        //    The edges are not optional bookkeeping. The storage GC deletes
+        //    a CAS blob exactly when no `content_references` row targets its
+        //    hash, so this artifact needs its own `primary_content` claim —
+        //    a signature manifest's bytes are CAS bytes like any other, and
+        //    an artifact that counts zero against its own content is
+        //    collectable the moment a sibling sharing those bytes is purged.
+        //    The caller's `oci_subject` claim rides the same transaction for
+        //    the sharper version of the same reason: it claims the SUBJECT
+        //    image's bytes, which no reconcile re-derives, so a referrer
+        //    committed without it is a live signature over a collectable
+        //    subject.
         let stream_id = StreamId::artifact(artifact_id);
         let ingested_event_id = Uuid::new_v4();
         let ingested_event = ArtifactIngested {
@@ -1558,10 +1680,18 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, true).await?;
+        let expected_version = read_unpaired_append_version(
+            &*self.events,
+            &stream_id,
+            true,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await?;
+
+        let edges = Self::ingest_edges(&artifact, repository_id, None, claimed_edges, now);
 
         self.lifecycle
-            .commit_transition(
+            .commit_transition_with_enqueues(
                 &artifact,
                 AppendEvents {
                     stream_id,
@@ -1575,6 +1705,11 @@ impl IngestUseCase {
                     actor: Actor::Api(actor),
                 },
                 Some(artifact_metadata),
+                // No ingest-time jobs: a Sigstore bundle's validity is
+                // deterministic, so there is no scan and no provenance gate
+                // to enqueue (see this method's docstring).
+                &[],
+                &edges,
             )
             .await
             .map_err(AppError::Domain)?;
@@ -1681,6 +1816,10 @@ impl IngestUseCase {
         // Serving mapping's opt-in flag; consumed by
         // ingest_inner's quarantine-anchor resolution.
         trust_upstream_publish_time: bool,
+        // Forwarded onto the synthesised `IngestRequest`; see
+        // [`Self::ingest_verified`] for what a claim is and why it cannot
+        // be written after this call returns.
+        claimed_edges: &[ContentReferenceClaim],
         stream: Box<dyn AsyncRead + Send + Unpin>,
         handler: &dyn FormatHandler,
     ) -> AppResult<IngestOutcome> {
@@ -1704,6 +1843,7 @@ impl IngestUseCase {
             legacy_md5: None,
             declared_sha256: Some(upstream_digest),
             payload_metadata,
+            claimed_edges: claimed_edges.to_vec(),
         };
 
         self.ingest_with_verification(
@@ -1754,6 +1894,10 @@ impl IngestUseCase {
         // Serving mapping's opt-in flag; consumed by
         // ingest_inner's quarantine-anchor resolution.
         trust_upstream_publish_time: bool,
+        // Forwarded onto the synthesised `IngestRequest`; see
+        // [`Self::ingest_verified`] for what a claim is and why it cannot
+        // be written after this call returns.
+        claimed_edges: &[ContentReferenceClaim],
         stream: Box<dyn AsyncRead + Send + Unpin>,
         handler: &dyn FormatHandler,
     ) -> AppResult<IngestOutcome> {
@@ -1784,6 +1928,7 @@ impl IngestUseCase {
             legacy_md5: None,
             declared_sha256: None,
             payload_metadata,
+            claimed_edges: claimed_edges.to_vec(),
         };
 
         self.ingest_with_verification(
@@ -1839,6 +1984,10 @@ impl IngestUseCase {
         // Serving mapping's opt-in flag; consumed by
         // ingest_inner's quarantine-anchor resolution.
         trust_upstream_publish_time: bool,
+        // Forwarded onto the synthesised `IngestRequest`; see
+        // [`Self::ingest_verified`] for what a claim is and why it cannot
+        // be written after this call returns.
+        claimed_edges: &[ContentReferenceClaim],
         stream: Box<dyn AsyncRead + Send + Unpin>,
         handler: &dyn FormatHandler,
     ) -> AppResult<IngestOutcome> {
@@ -1884,6 +2033,7 @@ impl IngestUseCase {
             legacy_md5: None,
             declared_sha256: None,
             payload_metadata,
+            claimed_edges: claimed_edges.to_vec(),
         };
 
         self.ingest_with_verification(
@@ -1948,6 +2098,7 @@ impl IngestUseCase {
             legacy_md5,
             declared_sha256,
             payload_metadata,
+            claimed_edges,
         } = request;
         let format = coords.format.to_string();
 
@@ -2054,6 +2205,7 @@ impl IngestUseCase {
                 legacy_sha1,
                 legacy_md5,
                 declared_sha256,
+                &claimed_edges,
                 metadata_decision,
                 had_payload_metadata,
                 handler,
@@ -2286,7 +2438,7 @@ impl IngestUseCase {
         // requires uncapped emission on the repository aggregate.
         //
         // Issue #88: this unbounded stream must NOT derive its append
-        // version from `read_expected_version`'s capped forward-scan —
+        // version from `read_unpaired_append_version`'s capped forward-scan —
         // past 201 accumulated events (exactly the "sustained tampering"
         // case above) that read returns a STALE position and every
         // subsequent append fails `Conflict` deterministically and
@@ -2350,6 +2502,50 @@ impl IngestUseCase {
         Ok(repo)
     }
 
+    /// Build the success tuple for a same-path dedup hit — the **single
+    /// construction site** of a deduplicated `ingest_inner` success, and
+    /// the reason a dedup hit can no longer report a verification it did
+    /// not perform.
+    ///
+    /// A dedup hit returns `Ok` to a caller that declared an
+    /// upstream-published checksum, and `ingest_with_verification` ticks
+    /// `hort_upstream_checksum_total{result=verified}` on that `Ok`. ADR
+    /// 0006 admits no operator opt-out and no "already verified once, by
+    /// someone else" clause: the bytes in CAS were verified against
+    /// whatever digest the FIRST ingest declared, which says nothing about
+    /// the algorithm or value THIS request declared. So the comparison
+    /// runs here, on the dedup path, before the success exists.
+    ///
+    /// It is free. Both arms read a digest the `Sha512HashingRead` /
+    /// `Sha1HashingRead` wrapper already accumulated while `storage.put`
+    /// drained the request's own stream — `finalize()` plus a hex encode,
+    /// no CAS read and no second pass over the bytes. The `put_hash` the
+    /// arms take for their rollback guard is `existing.sha256_checksum`,
+    /// which on a hit is by definition the hash just computed; the guard
+    /// (`find_by_checksum`) therefore finds the existing row and skips the
+    /// delete, so a refusal here never removes the blob a live row is
+    /// serving.
+    ///
+    /// Calling this from a point where the stream has NOT been drained
+    /// compares against the digest of the empty input and refuses a
+    /// legitimate ingest — loudly, and fail-closed. That asymmetry is
+    /// deliberate: the hazard a dedup short-circuit creates is a *success*
+    /// that compared nothing, and routing every such success through here
+    /// makes that unreachable.
+    async fn dedup_ok(
+        &self,
+        existing: Artifact,
+        repo_key: &str,
+        verification: Option<&VerificationContext>,
+    ) -> Result<IngestInnerOk, IngestInnerError> {
+        let stored_hash = existing.sha256_checksum.clone();
+        self.verify_sha512_upstream(verification, &stored_hash, repo_key)
+            .await?;
+        self.verify_sha1_upstream(verification, &stored_hash, repo_key)
+            .await?;
+        Ok((existing, true, repo_key.to_string(), Uuid::new_v4()))
+    }
+
     /// Step 3: look up any existing artifact at the same logical path
     /// BEFORE writing bytes. When the caller supplies `declared_sha256`,
     /// this short-circuits both the dedup and conflict decisions with zero
@@ -2363,11 +2559,25 @@ impl IngestUseCase {
     /// Returns `ControlFlow::Break` with `ingest_inner`'s full success
     /// tuple on a declared-hash dedup hit, `ControlFlow::Continue` with the
     /// looked-up (possibly `None`) existing artifact otherwise.
+    ///
+    /// Nothing has been read at this point, so a request that ALSO
+    /// declared a handle-bearing upstream digest (SHA-512 / SHA-1) cannot
+    /// have it compared here: the handle has seen zero bytes, and
+    /// finalising it would yield the digest of the EMPTY input rather than
+    /// of the stored content. Such a request therefore does not get the
+    /// short-circuit — it falls through to the normal path, which drains
+    /// the stream and reaches the comparison in
+    /// [`Self::put_and_check_post_dedup`]. The declared SHA-256 needs no
+    /// such treatment: the hit *is* `existing.sha256_checksum ==
+    /// declared`, and that stored value is the CAS hash of the stored
+    /// bytes, so the comparison this request asked for has been performed
+    /// against the bytes it asked about.
     async fn find_existing_and_check_declared_dedup(
         &self,
         repository_id: Uuid,
         coords: &ArtifactCoords,
         declared_sha256: Option<&ContentHash>,
+        verification: Option<&VerificationContext>,
         repo_key: &str,
     ) -> Result<ControlFlow<IngestInnerOk, Option<Artifact>>, IngestInnerError> {
         let existing = self
@@ -2384,16 +2594,22 @@ impl IngestUseCase {
 
         if let (Some(existing), Some(declared)) = (existing.as_ref(), declared_sha256) {
             if existing.sha256_checksum == *declared {
+                if verification.is_some_and(VerificationContext::has_pending_upstream_digest) {
+                    // An upstream digest is declared and uncomparable
+                    // here. Decline the short-circuit rather than return a
+                    // success that claims it: the fall-through pays one
+                    // `storage.put` of bytes the request is already
+                    // streaming, and the comparison then runs for free.
+                    return Ok(ControlFlow::Continue(Some(existing.clone())));
+                }
+                let early_ok = self
+                    .dedup_ok(existing.clone(), repo_key, verification)
+                    .await?;
                 tracing::debug!(
                     artifact_id = %existing.id,
                     "deduplicated via declared hash"
                 );
-                return Ok(ControlFlow::Break((
-                    existing.clone(),
-                    true,
-                    repo_key.to_string(),
-                    Uuid::new_v4(),
-                )));
+                return Ok(ControlFlow::Break(early_ok));
             }
             return Err((
                 InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
@@ -2412,11 +2628,17 @@ impl IngestUseCase {
     /// error explicitly so metric classification can distinguish storage
     /// failures from domain errors.
     ///
-    /// Step 5: post-put duplicate check by path — only reached when the
-    /// caller supplied no `declared_sha256` (or when `declared_sha256` was
-    /// set but [`Self::find_existing_and_check_declared_dedup`] found no
-    /// existing row to compare against). Behaviour unchanged from the
-    /// original flow.
+    /// Step 5: post-put duplicate check by path — reached when the caller
+    /// supplied no `declared_sha256`, when `declared_sha256` was set but
+    /// [`Self::find_existing_and_check_declared_dedup`] found no existing
+    /// row to compare against, and when that function declined to claim a
+    /// hit because an upstream-published digest was still uncompared.
+    ///
+    /// The dedup hit is claimed through [`Self::dedup_ok`], which runs the
+    /// request's upstream comparison: `storage.put` above has drained the
+    /// stream through the `Sha512HashingRead` / `Sha1HashingRead` wrapper,
+    /// so the digest already exists and the comparison costs one
+    /// `finalize()` — the dedup hit still performs no CAS read.
     ///
     /// Returns `ControlFlow::Break` with `ingest_inner`'s full success
     /// tuple on a post-put dedup hit, `ControlFlow::Continue` with the
@@ -2426,6 +2648,7 @@ impl IngestUseCase {
         stream: Box<dyn AsyncRead + Send + Unpin>,
         existing: Option<Artifact>,
         coords_path: &str,
+        verification: Option<&VerificationContext>,
         repo_key: &str,
     ) -> Result<ControlFlow<IngestInnerOk, PutResult>, IngestInnerError> {
         let put_result = self.storage.put(stream).await.map_err(|e| {
@@ -2438,16 +2661,14 @@ impl IngestUseCase {
 
         if let Some(existing) = existing {
             if existing.sha256_checksum == put_result.hash {
-                tracing::debug!(
-                    artifact_id = %existing.id,
-                    "deduplicated"
-                );
-                return Ok(ControlFlow::Break((
-                    existing,
-                    true,
-                    repo_key.to_string(),
-                    Uuid::new_v4(),
-                )));
+                // Log the dedup AFTER the comparison clears: a refused
+                // hit is not a deduplication, and a log line that says it
+                // was would be the same false claim in the trace that
+                // this path no longer makes in its return value.
+                let artifact_id = existing.id;
+                let early_ok = self.dedup_ok(existing, repo_key, verification).await?;
+                tracing::debug!(artifact_id = %artifact_id, "deduplicated");
+                return Ok(ControlFlow::Break(early_ok));
             }
             return Err((
                 InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
@@ -2780,10 +3001,10 @@ impl IngestUseCase {
     /// `register_by_hash_inner`'s identical carve-out through
     /// `resolve_referenced_tree_descendant_fail_safe`, so the two minting
     /// paths cannot drift either. This lookup does NOT depend on this
-    /// ingest's OWN `content_references` rows (written post-commit) — it
-    /// only ever matches rows written by OTHER, already-ingested
-    /// artifacts, so resolving it before this ingest's own commit is
-    /// safe.
+    /// ingest's OWN `content_references` rows — those are resolved further
+    /// down and committed by the transition itself, so nothing this ingest
+    /// claims is visible here. It only ever matches rows written by OTHER,
+    /// already-ingested artifacts.
     ///
     /// Resolves the quarantine-window anchor (`quarantine_window_start`)
     /// as the MINIMUM of the applicable age sources (ADR 0054), in the one
@@ -2956,76 +3177,79 @@ impl IngestUseCase {
         artifact.provenance_hold_indefinite = hold.hold_indefinite;
     }
 
-    /// Refcount projection writes. Run AFTER `commit_transition` succeeds
-    /// (the artifact is persisted-and-valid by this point). Insert failure
-    /// is recoverable: the refcount row is eventual; an operator-side
-    /// reconcile sweep catches any divergence. We do NOT abort the ingest
-    /// on refcount-insert failure — the artifact is already alive and
-    /// downloadable, and a missing refcount row only delays GC, it doesn't
-    /// break correctness. Mirrors the warn shape used by the OCI
-    /// manifest-PUT content_references insert (see
-    /// `crates/hort-http-oci/src/manifests_write.rs` near `stage =
-    /// "content_references_insert"`).
-    async fn write_ingest_refcounts(
-        &self,
+    /// The refcount edges this ingest's artifact claims: its own content
+    /// (`primary_content`); when the metadata strategy split the payload into
+    /// CAS, the metadata blob (`metadata_blob`); and whatever the caller
+    /// declared in [`IngestRequest::claimed_edges`] — the foreign bytes only
+    /// the caller can know this artifact claims (an OCI manifest's subject,
+    /// config, layers, an index's children).
+    ///
+    /// Built for — not written by — the artifact's own transition. A
+    /// `content_references` row is a **claim on bytes**: the storage GC
+    /// deletes a CAS blob exactly when no row targets its hash. So a missing
+    /// row does not postpone collection, it brings it forward. The artifact
+    /// counts zero against its own content, and because CAS deduplicates, a
+    /// released sibling carrying the same bytes drives the observed count to
+    /// zero and authorises the delete — leaving a live, servable artifact
+    /// pointing at bytes that are gone.
+    ///
+    /// These edges therefore ride `commit_transition_with_enqueues`, which
+    /// commits them in the same transaction as the events, the artifact row,
+    /// its metadata and its job-queue rows, or commits nothing at all. A
+    /// failed edge fails the ingest: the upload is retriable, an edgeless
+    /// committed artifact is not.
+    fn ingest_edges(
         artifact: &Artifact,
         repository_id: Uuid,
-        metadata_blob_for_refcount: Option<ContentHash>,
-        now_for_refcount: DateTime<Utc>,
-    ) {
-        if let Err(e) = self
-            .content_references
-            .insert(ContentReference {
-                source_artifact_id: artifact.id,
-                target_content_hash: artifact.sha256_checksum.clone(),
-                kind: "primary_content".to_string(),
-                metadata: serde_json::Value::Object(serde_json::Map::new()),
-                repository_id,
-                recorded_at: now_for_refcount,
-            })
-            .await
-        {
-            tracing::warn!(
-                artifact_id = %artifact.id,
-                kind = "primary_content",
-                error = %e,
-                stage = "content_references_insert",
-                "content_references insert failed; refcount eventual — operator reconcile is future work"
-            );
+        metadata_blob: Option<ContentHash>,
+        claimed: &[ContentReferenceClaim],
+        recorded_at: DateTime<Utc>,
+    ) -> Vec<ContentReference> {
+        let edge = |target_content_hash: ContentHash, kind: &str| ContentReference {
+            source_artifact_id: artifact.id,
+            target_content_hash,
+            kind: kind.to_string(),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            repository_id,
+            recorded_at,
+        };
+        let mut edges = vec![edge(artifact.sha256_checksum.clone(), "primary_content")];
+        if let Some(blob_hash) = metadata_blob {
+            edges.push(edge(blob_hash, "metadata_blob"));
         }
-        if let Some(blob_hash) = metadata_blob_for_refcount {
-            if let Err(e) = self
-                .content_references
-                .insert(ContentReference {
-                    source_artifact_id: artifact.id,
-                    target_content_hash: blob_hash,
-                    kind: "metadata_blob".to_string(),
-                    metadata: serde_json::Value::Object(serde_json::Map::new()),
-                    repository_id,
-                    recorded_at: now_for_refcount,
-                })
-                .await
-            {
-                tracing::warn!(
-                    artifact_id = %artifact.id,
-                    kind = "metadata_blob",
-                    error = %e,
-                    stage = "content_references_insert",
-                    "content_references insert failed; refcount eventual — operator reconcile is future work"
-                );
-            }
-        }
+        // The caller's claims last and resolved against the row just minted:
+        // the artifact's own bookkeeping is derived here and cannot be
+        // overridden by a caller, and a claim that happens to name the same
+        // `(target, kind)` as a sibling is an upsert at the adapter rather
+        // than a duplicate-key failure.
+        edges.extend(
+            claimed
+                .iter()
+                .map(|c| c.resolve(artifact.id, repository_id, recorded_at)),
+        );
+        edges
     }
 
     /// PEP 658 wheel-metadata extraction hook.
     ///
-    /// After `ArtifactIngested` lands and the refcount rows are written,
-    /// re-read the just-stored content from CAS, hand it to
+    /// Re-read the just-stored content from CAS, hand it to
     /// `FormatHandler::extract_wheel_metadata_bytes`, and on a
     /// `Some(bytes)` return: stream the bytes into CAS via
-    /// `StoragePort::put` and link them back to the parent wheel via a
-    /// `kind = "wheel_metadata"` row on the `content_references`
-    /// projection.
+    /// `StoragePort::put` and build the `kind = "wheel_metadata"` edge that
+    /// links them back to the parent wheel. Returns the edge and the METADATA
+    /// byte count (for the log the caller emits once the edge is durable), or
+    /// `None` when PEP 658 does not apply to this artifact.
+    ///
+    /// **Runs before the artifact's transition commits, and returns the edge
+    /// instead of writing it.** Nothing here needs the artifact to be
+    /// persisted: the primary `storage.put` has already happened, so the
+    /// wheel's bytes are in CAS, and the extraction is otherwise a pure
+    /// handler call plus a CAS write. The edge is a claim on bytes against
+    /// the storage GC, so it belongs in the transaction that creates the
+    /// artifact claiming them, exactly like `primary_content` — see
+    /// [`Self::ingest_edges`]. Writing it afterwards left the one case where
+    /// the edge insert failed with a durable wheel and an `Err` to the
+    /// caller: an artifact serving bytes it did not count.
     ///
     /// The re-read from CAS is unavoidable: the upstream `storage.put`
     /// consumed the inbound stream, and the existing
@@ -3047,20 +3271,29 @@ impl IngestUseCase {
     /// deliberately stays lean.
     ///
     /// **Failure semantics:**
-    /// - `Ok(None)` (sdist / corrupt wheel / no METADATA member) → silent
-    ///   no-op; the wheel ingest itself succeeded and PEP 658 simply does
-    ///   not apply for this artifact.
+    /// - `Ok(None)` (sdist / corrupt wheel / no METADATA member) → no edge;
+    ///   the wheel ingest proceeds and PEP 658 simply does not apply for
+    ///   this artifact.
     /// - `Err(DomainError::Validation(_))` (oversized METADATA per the
     ///   extractor's 1 MiB cap) → `warn!` + tick
     ///   `hort_ingest_total{result="wheel_metadata_extract_failed"}`.
-    ///   Non-fatal — the wheel ingest stays successful.
-    /// - `Err(_)` (infrastructure-class) → propagate. This surfaces the
-    ///   failure to the caller even though `ArtifactIngested` is already
-    ///   durable; reads as "the wheel-metadata pipeline did not complete."
-    ///   Same shape for CAS `storage.put` failure and ContentReference
-    ///   `insert` failure on the wheel-metadata blob.
+    ///   Non-fatal — the wheel ingest stays successful, with no edge.
+    /// - `Err(_)` (infrastructure-class) → propagate, and the ingest fails
+    ///   before anything is committed. Same shape for a CAS `storage.put`
+    ///   failure on the METADATA bytes.
+    ///
+    /// A METADATA `put` that lands and is then followed by a failure leaves
+    /// bytes in CAS that nothing references — exactly the posture every
+    /// failed ingest already has, because the primary content's own
+    /// `storage.put` likewise precedes the commit. Nothing reclaims such
+    /// bytes today: the CAS scrubber checks integrity, and the storage GC
+    /// walks artifacts rather than the object store. Deferring the METADATA
+    /// `put` to after the commit would avoid the orphan at the cost of
+    /// putting the edge back outside the transaction, which is the whole
+    /// hazard being closed — so the orphan is the deliberate side the
+    /// trade-off falls on.
     #[allow(clippy::too_many_arguments)]
-    async fn extract_and_link_wheel_metadata(
+    async fn extract_wheel_metadata_edge(
         &self,
         coords: &ArtifactCoords,
         handler: &dyn FormatHandler,
@@ -3068,10 +3301,10 @@ impl IngestUseCase {
         repository_id: Uuid,
         repo_key: &str,
         format: &str,
-        now_for_refcount: DateTime<Utc>,
-    ) -> Result<(), IngestInnerError> {
+        recorded_at: DateTime<Utc>,
+    ) -> Result<Option<(ContentReference, usize)>, IngestInnerError> {
         if !coords.path.ends_with(".whl") {
-            return Ok(());
+            return Ok(None);
         }
 
         // Re-read the just-ingested content. The 1 MiB cap on METADATA is
@@ -3116,39 +3349,26 @@ impl IngestUseCase {
                                 ));
                             }
                         };
-                        // Link to parent wheel — kind="wheel_metadata".
-                        // Upsert on `(repo, source, kind)` per the
-                        // existing port semantics.
-                        if let Err(e) = self
-                            .content_references
-                            .insert(ContentReference {
+                        // The link back to the parent wheel. Handed to the
+                        // caller rather than written here, so it commits
+                        // with the artifact that claims those bytes.
+                        Ok(Some((
+                            ContentReference {
                                 source_artifact_id: artifact.id,
-                                target_content_hash: metadata_hash.clone(),
+                                target_content_hash: metadata_hash,
                                 kind: "wheel_metadata".to_string(),
                                 metadata: serde_json::Value::Object(serde_json::Map::new()),
                                 repository_id,
-                                recorded_at: now_for_refcount,
-                            })
-                            .await
-                        {
-                            return Err((
-                                InnerIngestError::Other(AppError::Domain(e)),
-                                Some(repo_key.to_string()),
-                                None,
-                            ));
-                        }
-                        tracing::info!(
-                            artifact_id = %artifact.id,
-                            repository_id = %repository_id,
-                            metadata_hash = %metadata_hash,
-                            metadata_bytes = metadata_len,
-                            "wheel_metadata extracted and persisted (PEP 658)"
-                        );
+                                recorded_at,
+                            },
+                            metadata_len,
+                        )))
                     }
                     Ok(None) => {
-                        // Sdist / corrupt wheel / no METADATA member —
-                        // silent no-op. Wheel ingest succeeded; PEP 658 is
+                        // Sdist / corrupt wheel / no METADATA member — no
+                        // edge. The wheel ingest proceeds; PEP 658 is
                         // simply not advertised for this artifact.
+                        Ok(None)
                     }
                     Err(DomainError::Validation(reason)) => {
                         tracing::warn!(
@@ -3165,29 +3385,27 @@ impl IngestUseCase {
                             labels::RESULT => IngestResult::WheelMetadataExtractFailed.as_str(),
                         )
                         .increment(1);
+                        Ok(None)
                     }
-                    Err(e) => {
-                        return Err((
-                            InnerIngestError::Other(AppError::Domain(e)),
-                            Some(repo_key.to_string()),
-                            None,
-                        ));
-                    }
+                    Err(e) => Err((
+                        InnerIngestError::Other(AppError::Domain(e)),
+                        Some(repo_key.to_string()),
+                        None,
+                    )),
                 }
             }
             Err(e) => {
                 // Infrastructure-class CAS read failure — propagate. The
-                // `ArtifactIngested` event is durable but the
-                // wheel-metadata extraction pipeline could not run.
-                return Err((
+                // wheel-metadata extraction pipeline could not run, and
+                // nothing has been committed, so the ingest fails whole
+                // and the client retries.
+                Err((
                     InnerIngestError::Other(AppError::Domain(e)),
                     Some(repo_key.to_string()),
                     None,
-                ));
+                ))
             }
         }
-
-        Ok(())
     }
 
     /// Post-commit group-membership hook.
@@ -3488,6 +3706,13 @@ impl IngestUseCase {
         legacy_sha1: Option<String>,
         legacy_md5: Option<String>,
         declared_sha256: Option<ContentHash>,
+        // The foreign-byte claims the caller declared on the request
+        // ([`IngestRequest::claimed_edges`]). Resolved against the minted
+        // row and committed in its transaction by [`Self::ingest_edges`] —
+        // never written beside it, because a `content_references` row is the
+        // claim that keeps bytes alive and nothing re-derives a tree edge
+        // for an artifact that committed without one.
+        claimed_edges: &[ContentReferenceClaim],
         metadata_decision: MetadataDecision,
         // Whether the caller passed payload
         // metadata at all. Gates emission of
@@ -3566,6 +3791,7 @@ impl IngestUseCase {
                 repository_id,
                 &coords,
                 declared_sha256.as_ref(),
+                verification.as_ref(),
                 &repo_key,
             )
             .await?
@@ -3575,7 +3801,13 @@ impl IngestUseCase {
         };
 
         let put_result = match self
-            .put_and_check_post_dedup(stream, existing, &coords.path, &repo_key)
+            .put_and_check_post_dedup(
+                stream,
+                existing,
+                &coords.path,
+                verification.as_ref(),
+                &repo_key,
+            )
             .await?
         {
             ControlFlow::Break(early_ok) => return Ok(early_ok),
@@ -3651,9 +3883,9 @@ impl IngestUseCase {
         let actor_for_group = actor.clone();
 
         // Snapshot the metadata-blob hash before it's moved
-        // into the projection row below. Used post-commit to write the
-        // `kind = "metadata_blob"` refcount row (Some) or skip the
-        // metadata-blob refcount write (None).
+        // into the projection row below. Used to build the
+        // `kind = "metadata_blob"` refcount edge (Some) or omit it from the
+        // transition's edge set (None).
         let metadata_blob_for_refcount = final_blob.clone();
 
         let ingested_event = ArtifactIngested {
@@ -3717,9 +3949,14 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, true)
-            .await
-            .map_err(|e| (InnerIngestError::Other(e), Some(repo_key.clone()), None))?;
+        let expected_version = read_unpaired_append_version(
+            &*self.events,
+            &stream_id,
+            true,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await
+        .map_err(|e| (InnerIngestError::Other(e), Some(repo_key.clone()), None))?;
 
         let mut events = vec![EventToAppend {
             event_id: artifact_ingested_event_id,
@@ -3798,14 +4035,49 @@ impl IngestUseCase {
             });
         }
 
-        // Ingest-time job enqueues, committed **atomically** with the
-        // transition (ADR 0002/0004 no-strand): `commit_transition_with_enqueues`
+        // The artifact's claims on the bytes it serves — its own content,
+        // the CAS-resident metadata blob when the strategy split, and the
+        // PEP 658 wheel METADATA when the format extracted one. Resolved
+        // BEFORE the commit so they ride it: see [`Self::ingest_edges`] for
+        // why an edge written afterwards is not a lagging projection but a
+        // blob the GC may collect out from under a live artifact.
+        //
+        // The wheel extraction needs only the bytes the primary
+        // `storage.put` already placed in CAS, so there is nothing here that
+        // has to wait for the artifact row.
+        let mut edges = Self::ingest_edges(
+            &artifact,
+            repository_id,
+            metadata_blob_for_refcount,
+            claimed_edges,
+            now,
+        );
+        let wheel_metadata = self
+            .extract_wheel_metadata_edge(
+                &coords,
+                handler,
+                &artifact,
+                repository_id,
+                &repo_key,
+                &format,
+                now,
+            )
+            .await?;
+        edges.extend(wheel_metadata.as_ref().map(|(edge, _)| edge.clone()));
+
+        // Ingest-time job enqueues and refcount edges, committed
+        // **atomically** with the transition (ADR 0002/0004 no-strand):
+        // `commit_transition_with_enqueues`
         // lands the `ScanRequested` / provenance-gate events, the artifact
-        // projection, and these `jobs` rows in one transaction, so a
+        // projection, these `jobs` rows and these `content_references` rows
+        // in one transaction, so a
         // crash/failure can never leave the artifact ingested-but-unscanned
         // (the dual-write strand that previously needed an operator manual
-        // rescan to recover). The scan enqueue is idempotent at the adapter
-        // (`ON CONFLICT DO NOTHING`); any other enqueue failure aborts the
+        // rescan to recover) and can never leave it ingested without the row
+        // that keeps its bytes out of the storage GC. The scan enqueue is
+        // idempotent at the adapter
+        // (`ON CONFLICT DO NOTHING`) and so is the edge upsert; any other
+        // enqueue or edge failure aborts the
         // whole ingest (retriable by the client), never a partial commit.
         self.lifecycle
             .commit_transition_with_enqueues(
@@ -3820,6 +4092,7 @@ impl IngestUseCase {
                 },
                 Some(artifact_metadata),
                 &enqueues,
+                &edges,
             )
             .await
             .map_err(|e| {
@@ -3829,6 +4102,16 @@ impl IngestUseCase {
                     None,
                 )
             })?;
+
+        if let Some((edge, metadata_len)) = wheel_metadata {
+            tracing::info!(
+                artifact_id = %artifact.id,
+                %repository_id,
+                metadata_hash = %edge.target_content_hash,
+                metadata_bytes = metadata_len,
+                "wheel_metadata extracted and persisted (PEP 658)"
+            );
+        }
 
         // Late-joiner provenance self-clear. Runs AFTER the quarantine
         // transition is durable, so a constituent that arrives once its
@@ -3841,26 +4124,6 @@ impl IngestUseCase {
             &scan_enqueue_format,
         )
         .await;
-
-        let now_for_refcount = Utc::now();
-        self.write_ingest_refcounts(
-            &artifact,
-            repository_id,
-            metadata_blob_for_refcount,
-            now_for_refcount,
-        )
-        .await;
-
-        self.extract_and_link_wheel_metadata(
-            &coords,
-            handler,
-            &artifact,
-            repository_id,
-            &repo_key,
-            &format,
-            now_for_refcount,
-        )
-        .await?;
 
         self.link_group_membership(
             handler,
@@ -4173,6 +4436,7 @@ impl IngestUseCase {
             payload_metadata,
             content_hash,
             seed_import_quarantine_anchor,
+            claimed_edges,
         } = req;
 
         // Audit (not error): a follower registering its own per-repo
@@ -4220,6 +4484,12 @@ impl IngestUseCase {
                 legacy_md5: None,
                 declared_sha256: None,
                 payload_metadata,
+                // Forwarded, not derived here: the cross-mount and
+                // seed-import callers register bytes and claim nothing
+                // beyond their own content, while the coalesced follower
+                // registers a MANIFEST and so claims its config / layer /
+                // index-member bytes. Only the caller knows which it is.
+                claimed_edges,
             },
             content_hash,
             None,
@@ -4251,6 +4521,7 @@ impl IngestUseCase {
             legacy_md5,
             declared_sha256: _,
             payload_metadata,
+            claimed_edges,
         } = req;
 
         // Metadata size cap — mirror of `ingest`'s pre-dispatch check.
@@ -4368,12 +4639,14 @@ impl IngestUseCase {
                 // observation blob is not a laundering bypass. `Released`
                 // and the (structurally unreachable here) `None` also
                 // proceed unchanged.
-                Ok(Some(a))
-                    if matches!(
-                        a.quarantine_status,
-                        QuarantineStatus::Rejected | QuarantineStatus::ScanIndeterminate
-                    ) =>
-                {
+                //
+                // "Terminally blocked" is read through
+                // `QuarantineStatus::is_terminal` rather than re-matched
+                // here: the class has one wildcard-free definition in the
+                // domain, so a future sixth variant forces a decision
+                // there instead of silently joining the mountable side at
+                // each site that re-spells it.
+                Ok(Some(a)) if a.quarantine_status.is_terminal() => {
                     tracing::info!(
                         source_repository_id = %src,
                         hash = %existing_hash,
@@ -4513,15 +4786,44 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, true)
-            .await
-            .map_err(|e| RegisterError::Other {
-                err: e,
-                repo_key: Some(repo_key.clone()),
-            })?;
+        let expected_version = read_unpaired_append_version(
+            &*self.events,
+            &stream_id,
+            true,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await
+        .map_err(|e| RegisterError::Other {
+            err: e,
+            repo_key: Some(repo_key.clone()),
+        })?;
+
+        // The registration's refcount edges, committed WITH the row that
+        // claims them. This path mints a per-repo artifact over a CAS blob
+        // the source repository's artifact already holds, so the new row
+        // needs its own `primary_content` claim: CAS deduplicates, and
+        // without this edge the new artifact counts zero against bytes it
+        // shares with the source. Release and purge that sibling and the
+        // storage GC's count reaches zero with this artifact still live and
+        // servable — a missing edge does not delay collection, it brings it
+        // forward. No `metadata_blob` edge: `register_by_hash` never splits
+        // (the bytes are already in CAS, owned by the source).
+        //
+        // A failed edge now fails the registration, which is the recoverable
+        // direction: the mount/follower/seed caller retries, where an
+        // edgeless committed artifact cannot be repaired from the artifact
+        // row alone by anything in the request path.
+        let edges = Self::ingest_edges(
+            &artifact,
+            repository_id,
+            // `register_by_hash` never splits the payload metadata into CAS.
+            None,
+            &claimed_edges,
+            now,
+        );
 
         self.lifecycle
-            .commit_transition(
+            .commit_transition_with_enqueues(
                 &artifact,
                 AppendEvents {
                     stream_id: stream_id.clone(),
@@ -4535,6 +4837,10 @@ impl IngestUseCase {
                     actor: Actor::Api(actor.clone()),
                 },
                 Some(artifact_metadata),
+                // The gate's scan / provenance enqueues ride the follow-on
+                // commit below, which is where that decision is resolved.
+                &[],
+                &edges,
             )
             .await
             .map_err(|e| RegisterError::Other {
@@ -4688,7 +4994,7 @@ impl IngestUseCase {
             // The descendant carve-out, evaluated exactly as
             // `ingest_inner` evaluates it. Like there, the lookup cannot
             // match this registration's OWN `primary_content` row — that
-            // is written post-commit, below — so it only ever sees edges
+            // is written below, after the mint — so it only ever sees edges
             // written by OTHER, already-ingested artifacts.
             //
             // Both probes are skipped entirely when an explicit anchor is
@@ -4789,12 +5095,17 @@ impl IngestUseCase {
         }
 
         if !events.is_empty() || !enqueues.is_empty() {
-            let expected_version = read_expected_version(&*self.events, &stream_id, true)
-                .await
-                .map_err(|e| RegisterError::Other {
-                    err: e,
-                    repo_key: Some(repo_key.clone()),
-                })?;
+            let expected_version = read_unpaired_append_version(
+                &*self.events,
+                &stream_id,
+                true,
+                UnpairedAppend::SameCallFollowUp,
+            )
+            .await
+            .map_err(|e| RegisterError::Other {
+                err: e,
+                repo_key: Some(repo_key.clone()),
+            })?;
 
             self.lifecycle
                 .commit_transition_with_enqueues(
@@ -4813,6 +5124,11 @@ impl IngestUseCase {
                     },
                     None, // metadata was persisted on the preceding ingest transition
                     &enqueues,
+                    // No edges: this is the gate follow-up, not the mint.
+                    // The registration's own `primary_content` edge is
+                    // written below, against the `commit_transition` that
+                    // minted the row.
+                    &[],
                 )
                 .await
                 .map_err(|e| RegisterError::Other {
@@ -4842,34 +5158,6 @@ impl IngestUseCase {
             &scan_enqueue_format,
         )
         .await;
-
-        // Refcount projection write. The OCI cross-repo
-        // blob mount path takes this branch; the new repository's
-        // artifact row needs its own `primary_content` refcount
-        // (separate from the source repository's row). No metadata-
-        // blob row — `register_by_hash` never splits (the bytes are
-        // already in CAS owned by the source). Failure is recoverable
-        // — see `ingest_inner` for the same-shape rationale.
-        if let Err(e) = self
-            .content_references
-            .insert(ContentReference {
-                source_artifact_id: artifact.id,
-                target_content_hash: artifact.sha256_checksum.clone(),
-                kind: "primary_content".to_string(),
-                metadata: serde_json::Value::Object(serde_json::Map::new()),
-                repository_id,
-                recorded_at: Utc::now(),
-            })
-            .await
-        {
-            tracing::warn!(
-                artifact_id = %artifact.id,
-                kind = "primary_content",
-                error = %e,
-                stage = "content_references_insert",
-                "content_references insert failed; refcount eventual — operator reconcile is future work"
-            );
-        }
 
         tracing::info!(
             %artifact_id,
@@ -5217,7 +5505,11 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone())
+                .with_content_references(content_references.clone()),
+        );
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -5238,7 +5530,6 @@ mod tests {
         // `MockContentReferenceIndex` is fine for every existing test
         // that does not specifically assert on the refcount surface;
         // tests that DO assert use `make_use_case_with_content_refs`.
-        let content_references = Arc::new(MockContentReferenceIndex::new());
         // Seed a permissive global policy so tests that don't
         // exercise quarantine-by-default keep
         // a no-quarantine-on-ingest baseline. Tests
@@ -5295,7 +5586,11 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone())
+                .with_content_references(content_references.clone()),
+        );
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -5306,7 +5601,6 @@ mod tests {
             include_repository_label,
         ));
         let curation_rules = Arc::new(MockCurationRuleRepository::new());
-        let content_references = Arc::new(MockContentReferenceIndex::new());
         // Permissive global policy seed; mirrors
         // `make_use_case_with_group_lifecycle`.
         let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
@@ -5359,7 +5653,11 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone())
+                .with_content_references(content_references.clone()),
+        );
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -5370,7 +5668,6 @@ mod tests {
             include_repository_label,
         ));
         let curation_rules = Arc::new(MockCurationRuleRepository::new());
-        let content_references = Arc::new(MockContentReferenceIndex::new());
 
         // Permissive global policy seed; mirrors
         // `make_use_case_with_group_lifecycle`.
@@ -5473,6 +5770,7 @@ mod tests {
             legacy_md5: None,
             declared_sha256: None,
             payload_metadata: serde_json::Value::Null,
+            claimed_edges: Vec::new(),
         }
     }
 
@@ -5491,6 +5789,7 @@ mod tests {
             // Existing recb tests are not seed-import
             // exercises; quarantine stays untouched (legacy behaviour).
             seed_import_quarantine_anchor: None,
+            claimed_edges: Vec::new(),
         }
     }
 
@@ -6480,7 +6779,7 @@ mod tests {
             })
             .await
             .unwrap();
-        // Call 0 is `read_expected_version`'s own read; call 1 is the
+        // Call 0 is `read_unpaired_append_version`'s own read; call 1 is the
         // clearance lookup. Failing call 0 instead would abort the ingest
         // before the quarantine decision — a different path.
         events.fail_read_stream_at(1, DomainError::Invariant("event store down".into()));
@@ -6734,7 +7033,11 @@ mod tests {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let artifacts = Arc::new(MockArtifactRepository::new());
                 let events = Arc::new(MockEventStore::new());
-                let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+                let content_references = Arc::new(MockContentReferenceIndex::new());
+                let lifecycle = Arc::new(
+                    MockArtifactLifecycle::new(artifacts.clone())
+                        .with_content_references(content_references.clone()),
+                );
                 let storage: Arc<dyn StoragePort> = Arc::new(FailingStoragePort);
                 let repos = Arc::new(MockRepositoryRepository::new());
                 let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -6742,7 +7045,6 @@ mod tests {
                 let group_use_case =
                     Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
                 let curation_rules = Arc::new(MockCurationRuleRepository::new());
-                let content_references = Arc::new(MockContentReferenceIndex::new());
 
                 // Permissive global policy seed
                 // (the storage-error test asserts only on the error
@@ -8059,7 +8361,11 @@ mod tests {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let artifacts = Arc::new(MockArtifactRepository::new());
                 let events = Arc::new(MockEventStore::new());
-                let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+                let content_references = Arc::new(MockContentReferenceIndex::new());
+                let lifecycle = Arc::new(
+                    MockArtifactLifecycle::new(artifacts.clone())
+                        .with_content_references(content_references.clone()),
+                );
                 let storage: Arc<dyn StoragePort> = Arc::new(FailingStoragePort);
                 let repos = Arc::new(MockRepositoryRepository::new());
                 let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -8067,7 +8373,6 @@ mod tests {
                 let group_use_case =
                     Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
                 let curation_rules = Arc::new(MockCurationRuleRepository::new());
-                let content_references = Arc::new(MockContentReferenceIndex::new());
 
                 // Permissive global policy seed
                 // (storage-failure test; permissive keeps the inline
@@ -9190,16 +9495,19 @@ mod tests {
             assert_eq!(transitions.len(), 2, "{transitions:?}");
 
             // Default policy (no operator policy resolved — the lookup
-            // failed) still scans by default.
+            // failed) still scans by default. Index 0 is the mint, which
+            // rides the same method to carry its `primary_content` edge and
+            // enqueues nothing.
             let enqueues = lifecycle.ingest_enqueues();
-            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+            assert_eq!(enqueues.len(), 2, "{enqueues:?}");
+            assert!(enqueues[0].1.is_empty(), "the mint enqueues nothing");
             assert!(
-                enqueues[0].1.iter().any(|e| matches!(
+                enqueues[1].1.iter().any(|e| matches!(
                     e,
                     IngestEnqueue::Scan { trigger_source, .. } if trigger_source == "seed-import"
                 )),
                 "policy-lookup failure must still fall back to the scanning DefaultPolicy: {:?}",
-                enqueues[0].1
+                enqueues[1].1
             );
         });
     }
@@ -9889,18 +10197,22 @@ mod tests {
         });
     }
 
-    // -- branch coverage for the refcount warn-on-fail arms
+    // -- the refcount edges ride the artifact's transition
 
-    /// Acceptance — coverage gap-fill for the warn-on-fail arm at
-    /// `ingest_inner` `primary_content` insert. The refcount projection
-    /// is post-commit eventual — when the
-    /// projection write fails, the outer `ingest_direct` MUST still
-    /// return `Ok` because the artifact is already persisted-and-valid
-    /// and is downloadable. The test would fail if a future change
-    /// aborts the ingest on insert-failure, which is the design choice
-    /// this branch test is here to lock in.
+    /// **Acceptance.** A failing `primary_content` edge fails the whole
+    /// ingest: no artifact, no event, no row.
+    ///
+    /// This replaces the warn-and-continue posture it used to pin. That
+    /// posture rested on a claim that reads backwards — "a missing refcount
+    /// row only delays GC" — when in fact the storage GC deletes a blob
+    /// exactly when no `content_references` row targets its hash, so a
+    /// missing row makes the bytes collectable *sooner*: the artifact counts
+    /// zero against its own content, and a released sibling carrying the
+    /// same bytes (CAS deduplicates) drives the count to zero. A failed
+    /// upload is retriable; a live artifact whose bytes the GC is free to
+    /// delete is not.
     #[test]
-    fn ingest_direct_primary_content_refcount_failure_is_warn_only() {
+    fn ingest_direct_primary_content_edge_failure_aborts_the_ingest() {
         let repo = pypi_repository();
         let repo_id = repo.id;
         tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -9908,58 +10220,52 @@ mod tests {
                 make_use_case_with_content_refs(true);
             repos.insert(repo);
 
-            // Arm a one-shot insert failure — this is the FIRST insert
-            // call for the inline path (only `primary_content`; no
+            // Arm a one-shot insert failure — this is the FIRST edge
+            // committed for the inline path (only `primary_content`; no
             // metadata blob), so the toggle hits exactly that arm.
             content_refs.fail_next_insert(DomainError::Invariant(
                 "synthetic failure: primary_content insert".into(),
             ));
 
-            // The ingest itself must still succeed: the artifact has
-            // landed via `commit_transition` before the refcount write
-            // is attempted. A future change that turned the warn into
-            // an abort would flip this expectation and fail the test.
-            uc.ingest_direct(
-                req(repo_id),
-                content_stream(b"hello-init27-warn-arm"),
-                &test_handler(),
-            )
-            .await
-            .expect("ingest_direct must succeed even when refcount insert fails");
-
-            // The artifact transition committed (the rejection-on-fail
-            // posture would have produced zero transitions).
-            assert_eq!(
-                lifecycle.committed_transitions().len(),
-                1,
-                "ArtifactIngested must still commit when refcount insert fails"
+            let err = uc
+                .ingest_direct(
+                    req(repo_id),
+                    content_stream(b"hello-edge-in-transaction"),
+                    &test_handler(),
+                )
+                .await
+                .expect_err("a failed primary_content edge must fail the ingest");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Invariant(_))),
+                "expected AppError::Domain(Invariant), got {err:?}"
             );
 
-            // No refcount row landed — the failed insert was warned
-            // and skipped, not retried. The reconcile sweep
-            // is the documented catch-up.
+            // Nothing committed. Not "the row is missing" — the transition
+            // never happened, so there is no artifact for the GC to outlive.
+            assert_eq!(
+                lifecycle.committed_transitions().len(),
+                0,
+                "the transition must roll back with the failed edge"
+            );
             assert_eq!(
                 content_refs.entry_count(),
                 0,
-                "warn-on-fail must NOT write the row; reconcile is future work"
+                "and no edge row survives either"
             );
         });
     }
 
-    /// Acceptance — coverage gap-fill for the warn-on-fail arm at
-    /// `ingest_inner` `metadata_blob` insert. Exercises the second
-    /// insert call on the HashReference-strategy split path: the
-    /// `primary_content` write succeeds, the `metadata_blob` write
-    /// fails, and the outer ingest still returns `Ok`. After the
-    /// dust settles the projection holds the `primary_content` row
-    /// but NOT the `metadata_blob` row — exactly the drift the
-    /// reconcile sweep is designed to repair.
+    /// **Acceptance.** The same rollback when the FIRST edge is fine and a
+    /// LATER one fails: the HashReference-strategy split path commits
+    /// `primary_content` *and* `metadata_blob`, and a failure on the second
+    /// must take the first with it. This is the case a per-edge write would
+    /// have left half-applied.
     ///
     /// Uses the kind-targeted toggle (`fail_next_insert_for_kind`)
-    /// so the failure fires precisely on the metadata_blob call,
-    /// without contaminating the preceding primary_content call.
+    /// so the failure fires precisely on the metadata_blob edge,
+    /// without contaminating the preceding primary_content one.
     #[test]
-    fn ingest_direct_metadata_blob_refcount_failure_is_warn_only() {
+    fn ingest_direct_metadata_blob_edge_failure_aborts_the_ingest() {
         let repo = pypi_repository();
         let repo_id = repo.id;
 
@@ -9988,70 +10294,121 @@ mod tests {
                 })
                 .with_summary(summary);
 
-            // Arm a kind-targeted failure: the primary_content insert
-            // (issued first) passes through; the metadata_blob insert
-            // (issued second) consumes the toggle and returns Err.
+            // Arm a kind-targeted failure: the primary_content edge
+            // (committed first) passes through; the metadata_blob edge
+            // (committed second) consumes the toggle and returns Err.
             content_refs.fail_next_insert_for_kind(
                 "metadata_blob",
                 DomainError::Invariant("synthetic failure: metadata_blob insert".into()),
             );
 
-            uc.ingest_direct(
-                DirectIngestRequest {
-                    payload_metadata: payload.clone(),
-                    ..req(repo_id)
-                },
-                content_stream(b"split-payload"),
-                &handler,
-            )
-            .await
-            .expect("ingest_direct must succeed even when metadata_blob refcount insert fails");
+            let err = uc
+                .ingest_direct(
+                    DirectIngestRequest {
+                        payload_metadata: payload.clone(),
+                        ..req(repo_id)
+                    },
+                    content_stream(b"split-payload"),
+                    &handler,
+                )
+                .await
+                .expect_err("a failed metadata_blob edge must fail the ingest");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Invariant(_))),
+                "expected AppError::Domain(Invariant), got {err:?}"
+            );
 
-            // The artifact transition committed — the warn-on-fail
-            // arm did not abort the ingest.
             assert_eq!(
                 lifecycle.committed_transitions().len(),
-                1,
-                "ArtifactIngested must still commit when metadata_blob refcount insert fails"
+                0,
+                "the transition must roll back with the failed metadata_blob edge"
             );
 
-            // Exactly ONE refcount row: the primary_content write
-            // landed; the metadata_blob write failed and was
-            // skipped. A future change that aborts on
-            // metadata_blob-insert-failure would either prevent the
-            // ingest commit (zero rows) or leave the primary_content
-            // row in a state inconsistent with the partial commit —
-            // either branch fails the count assertion below.
+            // Zero rows, not one: the `primary_content` edge that was
+            // written before the `metadata_blob` edge failed goes back with
+            // it. One row here would be the half-applied edge set the
+            // transaction exists to make unreachable.
             assert_eq!(
                 content_refs.entry_count(),
-                1,
-                "warn-on-fail must leave primary_content row but NOT metadata_blob"
+                0,
+                "the earlier primary_content edge rolls back with the failed one"
             );
-
-            let transitions = lifecycle.committed_transitions();
-            let artifact = &transitions[0].0;
-
-            let primary_rows = content_refs
-                .find_by_target(repo_id, &artifact.sha256_checksum, Some("primary_content"))
-                .await
-                .unwrap();
-            assert_eq!(
-                primary_rows.len(),
-                1,
-                "primary_content row landed before the metadata_blob arm fired"
-            );
-
-            // Load-bearing: the metadata_blob row is absent. Drift
-            // is left for the reconcile sweep to repair.
             let blob_rows = content_refs
                 .find_by_target(repo_id, &expected_blob_hash, Some("metadata_blob"))
                 .await
                 .unwrap();
-            assert_eq!(
-                blob_rows.len(),
-                0,
-                "metadata_blob row absent — drift left for reconcile to repair"
+            assert!(
+                blob_rows.is_empty(),
+                "and the metadata_blob edge itself never landed"
             );
+        });
+    }
+
+    /// The happy-path counterpart of the two rollback pins above: the
+    /// HashReference split commits BOTH edges with the artifact, in one
+    /// lifecycle call. Without this the rollback assertions would hold just
+    /// as well against an ingest that had stopped writing edges at all.
+    #[test]
+    fn ingest_direct_commits_both_refcount_edges_with_the_transition() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        let payload = serde_json::json!({ "pad": "a".repeat(500) });
+        let expected_blob_hash: ContentHash = {
+            let serialised = serde_json::to_vec(&payload).unwrap();
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&serialised))
+                .parse()
+                .unwrap()
+        };
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, lifecycle, _storage, repos, content_refs) =
+                make_use_case_with_content_refs(true);
+            repos.insert(repo);
+
+            let handler = StubFormatHandler::new("pypi")
+                .with_max_bytes(10 * 1024 * 1024)
+                .with_strategy(MetadataStrategy::HashReference {
+                    inline_threshold_bytes: 128,
+                })
+                .with_summary(serde_json::json!({ "pad-summary": "x" }));
+
+            let outcome = uc
+                .ingest_direct(
+                    DirectIngestRequest {
+                        payload_metadata: payload.clone(),
+                        ..req(repo_id)
+                    },
+                    content_stream(b"split-payload"),
+                    &handler,
+                )
+                .await
+                .expect("ingest_direct must succeed");
+            let artifact = outcome.artifact;
+
+            // ONE lifecycle call carrying BOTH edges — not two calls, and
+            // not edges written beside the transition.
+            let edges = lifecycle.ingest_edges();
+            assert_eq!(edges.len(), 1, "one transition carries the whole edge set");
+            assert_eq!(
+                lifecycle.ingest_edge_kinds(),
+                vec![
+                    (
+                        artifact.id,
+                        "primary_content".to_string(),
+                        artifact.sha256_checksum.as_ref().to_owned()
+                    ),
+                    (
+                        artifact.id,
+                        "metadata_blob".to_string(),
+                        expected_blob_hash.as_ref().to_owned()
+                    ),
+                ],
+                "both edges commit with the artifact, each targeting its own hash"
+            );
+            // And they reached the projection.
+            assert_eq!(content_refs.entry_count(), 2);
         });
     }
 
@@ -10075,7 +10432,7 @@ mod tests {
 
     /// Build a `.whl`-shaped `DirectIngestRequest` for the wheel-metadata
     /// ingest-hook tests. Mirrors [`req`] but pins `coords.path` to a
-    /// PEP 427-shaped wheel filename so the post-commit
+    /// PEP 427-shaped wheel filename so the extraction hook's
     /// `coords.path.ends_with(".whl")` gate fires.
     fn req_wheel(repo_id: Uuid) -> DirectIngestRequest {
         DirectIngestRequest {
@@ -10375,11 +10732,12 @@ mod tests {
         );
     }
 
-    /// A CAS write failure on the extracted-METADATA
-    /// blob propagates from the ingest use case. The wheel
-    /// `ArtifactIngested` event is durable but the caller sees `Err`;
-    /// this reads as "wheel-metadata pipeline did
-    /// not complete." No `wheel_metadata` row is written.
+    /// A CAS write failure on the extracted-METADATA blob fails the ingest
+    /// before anything is committed. The extraction now runs ahead of the
+    /// transition (it needs only the bytes the primary `storage.put` already
+    /// placed in CAS), so an infrastructure-class failure here leaves no
+    /// artifact and no event — where it used to leave a durable
+    /// `ArtifactIngested` plus an `Err` to the caller.
     ///
     /// Targets the SECOND put (the wheel-metadata CAS write) via
     /// [`MockStoragePort::fail_put_after_calls`] — `fail_next_put`
@@ -10418,37 +10776,34 @@ mod tests {
                 "expected AppError::Storage(_), got {err:?}"
             );
 
-            // ArtifactIngested already committed by the time the
-            // wheel-metadata put runs — the event is durable even
-            // though `ingest_direct` returned Err.
+            // Nothing committed: the extraction runs before the transition,
+            // so its failure takes the whole ingest with it and the client
+            // retries a clean upload.
             assert_eq!(
                 lifecycle.committed_transitions().len(),
-                1,
-                "wheel ArtifactIngested commits before the wheel-metadata put failure"
+                0,
+                "the wheel-metadata put failure must abort before the transition"
             );
-
-            // No wheel_metadata row landed.
-            let transitions = lifecycle.committed_transitions();
-            let artifact = &transitions[0].0;
-            let rows = content_refs
-                .find_by_target(repo_id, &artifact.sha256_checksum, Some("wheel_metadata"))
-                .await
-                .unwrap();
-            assert!(
-                rows.is_empty(),
-                "no wheel_metadata row when the CAS put failed"
+            assert_eq!(
+                content_refs.entry_count(),
+                0,
+                "and no edge of any kind survives"
             );
         });
     }
 
-    /// A ContentReference `insert` failure on the
-    /// `wheel_metadata` row propagates from the ingest use case. The
-    /// METADATA bytes landed in CAS but the linkage row was not
-    /// written; the caller sees `Err`. (The
-    /// CAS-orphan blob is reaped by the GC reconcile
-    /// sweep — a use-case-side rollback is not required here.)
+    /// **Acceptance** for the third edge: a failing `wheel_metadata` edge
+    /// rolls the whole ingest back, the same as `primary_content` and
+    /// `metadata_blob`. The edge rides the artifact's transition rather than
+    /// following it, so the wheel is not committed either.
+    ///
+    /// The METADATA bytes did reach CAS before the failure and nothing now
+    /// references them — the same orphan every failed ingest already leaves
+    /// behind through the primary content's own pre-commit `put`. See
+    /// [`IngestUseCase::extract_wheel_metadata_edge`] for why that side of
+    /// the trade-off is the chosen one.
     #[test]
-    fn ingest_wheel_metadata_content_reference_insert_failure_propagates_err() {
+    fn ingest_wheel_metadata_edge_failure_aborts_the_ingest() {
         let repo = pypi_repository();
         let repo_id = repo.id;
 
@@ -10463,8 +10818,8 @@ mod tests {
                 .with_max_bytes(10 * 1024 * 1024)
                 .with_wheel_metadata(WheelMetadataStubBehaviour::EmitBytes(metadata_bytes));
 
-            // Arm a kind-targeted failure: the first insert
-            // (`primary_content`) succeeds; the next insert with
+            // Arm a kind-targeted failure: the `primary_content` edge
+            // (committed first) succeeds; the next with
             // `kind = "wheel_metadata"` consumes the toggle and
             // returns Err. The `metadata_blob` arm is not in scope
             // because the payload is `Value::Null` (Inline strategy,
@@ -10477,10 +10832,7 @@ mod tests {
             let err = uc
                 .ingest_direct(req_wheel(repo_id), content_stream(b"wheel-bytes"), &handler)
                 .await
-                .expect_err(
-                    "wheel_metadata ContentReference insert failure must propagate from \
-                     ingest_direct",
-                );
+                .expect_err("a failed wheel_metadata edge must fail the ingest");
 
             // Port returns DomainError → wrapped as AppError::Domain.
             assert!(
@@ -10488,45 +10840,91 @@ mod tests {
                 "expected AppError::Domain(Invariant), got {err:?}"
             );
 
-            // ArtifactIngested is durable; ONLY the wheel_metadata
-            // linkage row failed.
             assert_eq!(
                 lifecycle.committed_transitions().len(),
-                1,
-                "wheel ArtifactIngested commits before the wheel_metadata insert failure"
+                0,
+                "the transition must roll back with the failed wheel_metadata edge"
             );
-
-            // Exactly one ContentReference row — primary_content
-            // landed before the wheel_metadata arm fired.
             assert_eq!(
                 content_refs.entry_count(),
-                1,
-                "primary_content row landed but wheel_metadata did not"
-            );
-            let transitions = lifecycle.committed_transitions();
-            let artifact = &transitions[0].0;
-            let primary_rows = content_refs
-                .find_by_target(repo_id, &artifact.sha256_checksum, Some("primary_content"))
-                .await
-                .unwrap();
-            assert_eq!(
-                primary_rows.len(),
-                1,
-                "primary_content insert happened before the wheel_metadata failure"
+                0,
+                "the earlier primary_content edge rolls back with it"
             );
         });
     }
 
-    /// Acceptance — coverage gap-fill for the warn-on-fail arm at
-    /// `register_by_hash_inner` `primary_content` insert. The
-    /// `register_by_hash` path takes a single insert call (no
-    /// metadata-blob split), so a one-shot toggle cleanly targets the
-    /// only refcount write site on this path. Same invariant as the
-    /// ingest path: refcount write failure does NOT abort the outer
-    /// `register_by_hash`; the artifact is committed, drift is left
-    /// for the reconcile sweep.
+    /// **The acceptance.** A failed `primary_content` edge rolls the whole
+    /// registration back: no artifact, no event, no edge — not a warn and a
+    /// committed row.
+    ///
+    /// The `register_by_hash` path commits a single edge (it never splits
+    /// metadata), so a one-shot toggle targets exactly it. What the test
+    /// proves is not that the edge is missing — it is that nothing is left
+    /// behind that could out-live it. A committed artifact with no row
+    /// claiming its bytes is a blob the storage GC may delete: CAS
+    /// deduplicates, so this registration shares its bytes with the source
+    /// repository's artifact, and once that sibling is released and purged
+    /// the observed count reaches zero while this row is still live and
+    /// servable. The failed registration is retriable by its caller
+    /// (mount / coalesce follower / seed import); the edgeless committed
+    /// artifact was not repairable from the request path at all.
     #[test]
-    fn register_by_hash_refcount_failure_is_warn_only() {
+    fn register_by_hash_refcount_failure_rolls_back_the_registration() {
+        let target = pypi_repository();
+        let target_id = target.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, events, lifecycle, storage, repos, content_refs) =
+                make_use_case_with_content_refs(true);
+            repos.insert(target);
+            storage.insert_content(hash.clone(), b"already-in-cas".to_vec());
+
+            content_refs.fail_next_insert(DomainError::Invariant(
+                "synthetic failure: register_by_hash insert".into(),
+            ));
+
+            let err = uc
+                .register_by_hash(req_legacy(target_id), hash.clone(), None, &test_handler())
+                .await
+                .expect_err("a failed primary_content edge must fail the registration");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Invariant(_))),
+                "expected AppError::Domain(Invariant), got {err:?}"
+            );
+
+            assert_eq!(
+                lifecycle.committed_transitions().len(),
+                0,
+                "no transition may commit — not the mint, and therefore not the \
+                 generalized gate's follow-on either"
+            );
+            assert_eq!(
+                content_refs.entry_count(),
+                0,
+                "the failed edge leaves no row"
+            );
+            assert!(
+                artifacts
+                    .find_by_repo_and_checksum(target_id, &hash)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no artifact row may survive the rolled-back registration"
+            );
+            assert!(
+                events.appended_batches().is_empty(),
+                "no event may survive the rolled-back registration"
+            );
+        });
+    }
+
+    /// The counter-assertion to the rollback above: on the happy path ONE
+    /// lifecycle call carries the artifact AND its `primary_content` edge.
+    /// Without this, the rollback test would pass just as well against a
+    /// registration that never recorded an edge at all.
+    #[test]
+    fn register_by_hash_commits_its_primary_content_edge_with_the_transition() {
         let target = pypi_repository();
         let target_id = target.id;
         let hash: ContentHash = ZERO_HASH.parse().unwrap();
@@ -10537,40 +10935,24 @@ mod tests {
             repos.insert(target);
             storage.insert_content(hash.clone(), b"already-in-cas".to_vec());
 
-            content_refs.fail_next_insert(DomainError::Invariant(
-                "synthetic failure: register_by_hash insert".into(),
-            ));
-
             let outcome = uc
                 .register_by_hash(req_legacy(target_id), hash.clone(), None, &test_handler())
                 .await
-                .expect("register_by_hash must succeed even when refcount insert fails");
+                .expect("register_by_hash must succeed");
+            let artifact = outcome.artifact;
 
+            // The mint carries the edge; the gate's follow-on commit carries
+            // none (it is a transition over an artifact that already exists).
             assert_eq!(
-                lifecycle.committed_transitions().len(),
-                2,
-                "ArtifactIngested must still commit on register_by_hash when refcount insert fails \
-                 (plus the generalized gate's follow-on ScanRequested commit, issue #107 Item 1)"
+                lifecycle.ingest_edge_kinds(),
+                vec![(
+                    artifact.id,
+                    "primary_content".to_string(),
+                    artifact.sha256_checksum.as_ref().to_owned()
+                )],
+                "exactly one edge, on the transition that minted the row"
             );
-
-            // No refcount row landed — the failed insert was warned
-            // and skipped. Drift is left for the reconcile sweep.
-            assert_eq!(
-                content_refs.entry_count(),
-                0,
-                "warn-on-fail on register_by_hash must NOT write the row"
-            );
-
-            // Belt-and-braces: confirm that targeting the artifact's
-            // hash returns no rows.
-            let rows = content_refs
-                .find_by_target(target_id, &outcome.artifact.sha256_checksum, None)
-                .await
-                .unwrap();
-            assert!(
-                rows.is_empty(),
-                "no refcount rows for the just-registered artifact"
-            );
+            assert_eq!(content_refs.entry_count(), 1, "and it reached the index");
         });
     }
 
@@ -11030,7 +11412,7 @@ mod tests {
             };
 
             let outcome = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest should succeed when hashes match");
 
@@ -11088,7 +11470,7 @@ mod tests {
             };
 
             let outcome = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest should succeed when hashes match");
 
@@ -11141,7 +11523,7 @@ mod tests {
             };
 
             let outcome = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest should succeed with absent publish hint");
 
@@ -11183,7 +11565,7 @@ mod tests {
             };
 
             let outcome = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("upstream-published sha256 ingest should succeed");
 
@@ -11230,7 +11612,7 @@ mod tests {
                 trust_upstream_publish_time: false,
             };
 
-            uc.ingest_verified(req, content_stream(content), &test_handler())
+            uc.ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest should succeed when hashes match");
 
@@ -11295,7 +11677,7 @@ mod tests {
                 trust_upstream_publish_time: false,
             };
 
-            uc.ingest_verified(req, content_stream(content), &test_handler())
+            uc.ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest should succeed with absent publish hint");
 
@@ -11396,7 +11778,7 @@ mod tests {
             };
 
             let artifact = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest must succeed")
                 .artifact;
@@ -11476,7 +11858,7 @@ mod tests {
             };
 
             let artifact = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest must succeed")
                 .artifact;
@@ -11539,7 +11921,7 @@ mod tests {
             };
 
             let artifact = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest must succeed")
                 .artifact;
@@ -11611,7 +11993,7 @@ mod tests {
             };
 
             let artifact = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest must succeed — None upstream hint is best-effort")
                 .artifact;
@@ -11674,7 +12056,7 @@ mod tests {
             };
 
             let artifact = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest must succeed")
                 .artifact;
@@ -11848,6 +12230,7 @@ mod tests {
             let artifact = uc
                 .ingest_verified(
                     native_req(repo_id, hash_hex.parse().unwrap(), None, false),
+                    &[],
                     content_stream(content),
                     &test_handler(),
                 )
@@ -11925,6 +12308,7 @@ mod tests {
                         // its own — the only such value anywhere in the
                         // instance is the other repository's.
                         native_req(repo_id, hash_hex.parse().unwrap(), None, own_opt_in),
+                        &[],
                         content_stream(content),
                         &test_handler(),
                     )
@@ -11971,6 +12355,7 @@ mod tests {
             let leader = uc
                 .ingest_verified(
                     native_req(leader_repo_id, hash.clone(), None, false),
+                    &[],
                     content_stream(content),
                     &test_handler(),
                 )
@@ -12072,6 +12457,7 @@ mod tests {
             let artifact = uc
                 .ingest_verified(
                     native_req(repo_id, hash_hex.parse().unwrap(), None, false),
+                    &[],
                     content_stream(content),
                     &test_handler(),
                 )
@@ -12453,7 +12839,7 @@ mod tests {
             };
 
             let err = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect_err("mismatch must fail");
 
@@ -12526,7 +12912,7 @@ mod tests {
             };
 
             let outcome = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("upstream-published sha256 success");
 
@@ -12593,7 +12979,7 @@ mod tests {
             };
 
             let outcome = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("sha512 success path");
 
@@ -12685,7 +13071,7 @@ mod tests {
             };
 
             let outcome = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("sha1 floor success path");
 
@@ -12775,7 +13161,7 @@ mod tests {
             };
 
             let err = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect_err("sha1 floor mismatch must fail");
 
@@ -12852,6 +13238,459 @@ mod tests {
             );
         });
     }
+    // ---- A dedup hit may claim only the comparisons it ran (ADR 0006) ----
+    //
+    // The post-put dedup short-circuit in `put_and_check_post_dedup`
+    // returns `ingest_inner`'s success tuple BEFORE the
+    // upstream-published comparison arms run, and
+    // `ingest_with_verification` then ticks
+    // `hort_upstream_checksum_total{result=verified}` on that success.
+    // On the npm-SRI / Maven-floor arms (`declared_sha256: None`, a
+    // SHA-512 / SHA-1 digest handle on the `VerificationContext`) nothing
+    // had been compared for THIS request: the bytes in CAS were verified
+    // against whatever digest the FIRST ingest declared. ADR 0006 has no
+    // "already verified once, by someone else" clause, so the comparison
+    // runs on the dedup path too. It is free there — `storage.put` has
+    // already drained the hashing wrapper, so `finalize()` reads a digest
+    // that is already computed and no blob is re-read.
+
+    /// A second ingest at the same path declaring an upstream SHA-512
+    /// that does NOT match the stored bytes must be refused — the dedup
+    /// hit cannot inherit the first ingest's verification. The blob is
+    /// NOT rolled back: the existing row references it, so
+    /// `rollback_unreferenced_cas`'s `find_by_checksum` guard holds and
+    /// deleting would corrupt the row that is serving those bytes.
+    #[test]
+    fn dedup_hit_refuses_mismatched_upstream_sha512() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let bad_sha512_hex = "0".repeat(128);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, events, _lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            // First ingest plants the row and the bytes at this path.
+            let first = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .expect("first ingest must succeed")
+                .artifact;
+
+            let upstream_checksum =
+                UpstreamPublishedChecksum::new(HashAlgorithm::Sha512, bad_sha512_hex.clone())
+                    .unwrap();
+            let verified_req = VerifiedIngestRequest::UpstreamPublished {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: serde_json::Value::Null,
+                upstream_checksum,
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let err = uc
+                .ingest_verified(verified_req, &[], content_stream(content), &test_handler())
+                .await
+                .expect_err(
+                    "a dedup hit whose declared upstream SHA-512 disagrees with the \
+                     stored bytes must be refused, not reported as verified",
+                );
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Conflict(_))),
+                "expected Conflict, got {err:?}"
+            );
+
+            // The refusal is audited on the repository stream, exactly as
+            // a fresh-ingest mismatch is.
+            let batches = events.appended_batches();
+            let mismatch_events: Vec<_> = batches
+                .iter()
+                .filter(|b| b.stream_id.category == StreamCategory::Repository)
+                .flat_map(|b| b.events.iter())
+                .filter_map(|e| match &e.event {
+                    DomainEvent::ChecksumMismatch(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                mismatch_events.len(),
+                1,
+                "exactly one ChecksumMismatch must land on the repository stream"
+            );
+            let mm = &mismatch_events[0];
+            assert_eq!(mm.algorithm, HashAlgorithm::Sha512);
+            assert_eq!(mm.upstream_value, bad_sha512_hex);
+            assert_eq!(
+                mm.computed_value,
+                sha512_of(content),
+                "computed_value is the digest of the bytes that actually flowed, \
+                 recovered from the hashing wrapper `storage.put` drained"
+            );
+
+            // The existing row survives: a dedup-path refusal must never
+            // delete the blob the live row is serving.
+            assert_eq!(
+                storage.delete_call_count(),
+                0,
+                "the blob is referenced by the existing row — rollback must be skipped"
+            );
+            let row = artifacts
+                .find_by_id(first.id)
+                .await
+                .expect("the existing artifact row must survive the refusal");
+            assert_eq!(row.sha256_checksum, first.sha256_checksum);
+        });
+    }
+
+    /// A second ingest at the same path declaring an upstream SHA-512
+    /// that DOES match the stored bytes still dedups — and does so
+    /// without re-reading the blob. `storage.get` is never called: the
+    /// digest the comparison needs was computed while `storage.put`
+    /// drained the request's own stream, so closing the gap costs one
+    /// `finalize()` and no CAS read.
+    #[test]
+    fn dedup_hit_accepts_matching_upstream_sha512_without_reading_the_blob() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let sha512_hex = sha512_of(content);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, _lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            let first = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .expect("first ingest must succeed")
+                .artifact;
+            let gets_after_first = storage.get_call_count();
+
+            let upstream_checksum =
+                UpstreamPublishedChecksum::new(HashAlgorithm::Sha512, sha512_hex.clone()).unwrap();
+            let verified_req = VerifiedIngestRequest::UpstreamPublished {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: serde_json::Value::Null,
+                upstream_checksum,
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let second = uc
+                .ingest_verified(verified_req, &[], content_stream(content), &test_handler())
+                .await
+                .expect("a dedup hit whose upstream SHA-512 agrees must succeed")
+                .artifact;
+
+            assert_eq!(
+                second.id, first.id,
+                "the dedup hit must still return the existing row"
+            );
+            assert_eq!(
+                storage.get_call_count(),
+                gets_after_first,
+                "the comparison must not re-read the blob — the digest was already \
+                 computed by the hashing wrapper that `storage.put` drained"
+            );
+        });
+    }
+
+    /// A second ingest declaring NO upstream digest keeps today's
+    /// behaviour: the comparison arms are inert, the dedup hit returns
+    /// the existing row, and no CAS read is added. This is the
+    /// assertion that stops the fix quietly taxing every dedup hit.
+    #[test]
+    fn dedup_hit_without_an_upstream_digest_stays_free() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, _lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            let first = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .expect("first ingest must succeed")
+                .artifact;
+            let gets_after_first = storage.get_call_count();
+            let deletes_after_first = storage.delete_call_count();
+
+            let second = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .expect("an unverified dedup hit must keep succeeding")
+                .artifact;
+
+            assert_eq!(second.id, first.id);
+            assert_eq!(
+                storage.get_call_count(),
+                gets_after_first,
+                "a dedup hit with nothing to compare must add no CAS read"
+            );
+            assert_eq!(
+                storage.delete_call_count(),
+                deletes_after_first,
+                "a dedup hit with nothing to compare must roll nothing back"
+            );
+        });
+    }
+    /// The SHA-1 floor sibling (ADR 0033, Maven `.sha1` sidecar): a
+    /// second ingest at the same path declaring an upstream SHA-1 that
+    /// does NOT match the stored bytes is refused too. The floor is the
+    /// weaker digest, which is exactly why a dedup hit must not be
+    /// allowed to skip it — a format that cannot verify cannot proxy, and
+    /// "someone else verified these bytes once" is not a verification of
+    /// what THIS request declared.
+    #[test]
+    fn dedup_hit_refuses_mismatched_upstream_sha1() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let bad_sha1_hex = "0".repeat(40);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, events, _lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            uc.ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .expect("first ingest must succeed");
+
+            let upstream_checksum =
+                UpstreamPublishedChecksum::new(HashAlgorithm::Sha1, bad_sha1_hex.clone()).unwrap();
+            let verified_req = VerifiedIngestRequest::UpstreamPublished {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: serde_json::Value::Null,
+                upstream_checksum,
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let err = uc
+                .ingest_verified(verified_req, &[], content_stream(content), &test_handler())
+                .await
+                .expect_err("a dedup hit with a mismatched SHA-1 floor must be refused");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Conflict(_))),
+                "expected Conflict, got {err:?}"
+            );
+
+            let batches = events.appended_batches();
+            let mismatch: Vec<_> = batches
+                .iter()
+                .filter(|b| b.stream_id.category == StreamCategory::Repository)
+                .flat_map(|b| b.events.iter())
+                .filter_map(|e| match &e.event {
+                    DomainEvent::ChecksumMismatch(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(mismatch.len(), 1);
+            assert_eq!(mismatch[0].algorithm, HashAlgorithm::Sha1);
+            assert_eq!(mismatch[0].computed_value, sha1_of(content));
+            assert_eq!(
+                storage.delete_call_count(),
+                0,
+                "the blob is referenced by the existing row — rollback must be skipped"
+            );
+        });
+    }
+
+    /// The declared-SHA-256 short-circuit stays free: a `ProtocolNative`
+    /// dedup hit returns the existing row without a `storage.put` at all.
+    /// Closing the upstream-digest gap must not cost this path the
+    /// zero-I/O property it exists for — the digest it declared IS the
+    /// CAS hash, and the dedup decision compared it against the stored
+    /// row's own CAS hash.
+    #[test]
+    fn protocol_native_dedup_hit_still_short_circuits_before_put() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let hash_hex = sha256_of(content);
+        let upstream_digest: ContentHash = hash_hex.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _events, lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+            let existing = insert_existing_artifact(&artifacts, repo_id, &hash_hex);
+
+            let verified_req = VerifiedIngestRequest::ProtocolNative {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: serde_json::Value::Null,
+                upstream_digest,
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let outcome = uc
+                .ingest_verified(verified_req, &[], content_stream(content), &test_handler())
+                .await
+                .expect("a declared-hash dedup hit must succeed");
+
+            assert_eq!(outcome.artifact.id, existing.id);
+            assert_eq!(
+                storage.put_call_count(),
+                0,
+                "the declared-hash short-circuit must stay free of storage I/O"
+            );
+            assert_eq!(storage.get_call_count(), 0, "and free of CAS reads");
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "a dedup hit mints nothing"
+            );
+        });
+    }
+
+    /// The pre-`storage.put` short-circuit is declined — not taken and
+    /// not compared — while a handle-bearing upstream digest is still
+    /// uncompared. No production caller pairs `declared_sha256` with a
+    /// SHA-512 / SHA-1 handle today (the three `VerificationContext`
+    /// construction sites make them mutually exclusive), so this drives
+    /// `find_existing_and_check_declared_dedup` directly: the guard is
+    /// what keeps a future caller that pairs them from inheriting a
+    /// silent skip.
+    ///
+    /// Declining is the only sound answer here. Taking the short-circuit
+    /// would report a verification nothing performed; running the
+    /// comparison would finalise a handle that has seen zero bytes and
+    /// refuse a legitimate ingest against the digest of the empty input.
+    #[test]
+    fn declared_hash_dedup_declines_while_an_upstream_digest_is_uncompared() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let hash_hex = sha256_of(content);
+        let declared: ContentHash = hash_hex.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _events, _lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+            let existing = insert_existing_artifact(&artifacts, repo_id, &hash_hex);
+
+            // A digest handle in exactly the state a pre-put dedup
+            // decision finds it in: constructed, boxed nowhere, fed
+            // nothing.
+            let wrapper = Sha512HashingRead::new(tokio::io::empty());
+            let verification = VerificationContext {
+                algorithm: HashAlgorithm::Sha512,
+                upstream_value: sha512_of(content),
+                sha512_handle: Some(wrapper.digest_handle()),
+                sha1_handle: None,
+            };
+
+            let flow = uc
+                .find_existing_and_check_declared_dedup(
+                    repo_id,
+                    &sample_coords(),
+                    Some(&declared),
+                    Some(&verification),
+                    "repo-key",
+                )
+                .await;
+            // `InnerIngestError` carries no `Debug`, so match rather
+            // than `expect`. An error here is the OTHER failure mode this
+            // guard exists to prevent: the comparison ran against a
+            // handle that has absorbed no bytes — i.e. against the digest
+            // of the EMPTY input — and refused a legitimate ingest.
+            let Ok(flow) = flow else {
+                panic!(
+                    "declining must not be an error: a refusal here means the upstream \
+                     comparison ran against the digest of the empty input and rejected \
+                     an ingest whose bytes were never read"
+                )
+            };
+
+            match flow {
+                ControlFlow::Continue(carried) => assert_eq!(
+                    carried
+                        .expect("the existing row is carried into the normal path")
+                        .id,
+                    existing.id,
+                    "the declined hit must hand the existing row forward so the \
+                     post-put comparison still sees it"
+                ),
+                ControlFlow::Break(_) => panic!(
+                    "the short-circuit must be declined while an upstream digest is \
+                     uncompared — this is the success that would claim a verification \
+                     nothing performed"
+                ),
+            }
+            assert_eq!(
+                storage.put_call_count(),
+                0,
+                "declining is a decision, not I/O — the caller does the put"
+            );
+        });
+    }
+
+    /// Control for the test above: with the SAME existing row and the
+    /// SAME declared hash, a `VerificationContext` carrying no handle
+    /// (the SHA-256 arms, whose digest the dedup decision already
+    /// compared) DOES take the short-circuit. Without this the guard
+    /// above could be satisfied by declining everything, and the
+    /// zero-I/O dedup path would be gone.
+    #[test]
+    fn declared_hash_dedup_takes_the_short_circuit_when_nothing_is_left_to_compare() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let hash_hex = sha256_of(content);
+        let declared: ContentHash = hash_hex.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _events, _lifecycle, _storage, repos) = make_use_case();
+            repos.insert(repo);
+            let existing = insert_existing_artifact(&artifacts, repo_id, &hash_hex);
+
+            let verification = VerificationContext {
+                algorithm: HashAlgorithm::Sha256,
+                upstream_value: hash_hex.clone(),
+                sha512_handle: None,
+                sha1_handle: None,
+            };
+
+            let flow = uc
+                .find_existing_and_check_declared_dedup(
+                    repo_id,
+                    &sample_coords(),
+                    Some(&declared),
+                    Some(&verification),
+                    "repo-key",
+                )
+                .await;
+            let Ok(flow) = flow else {
+                panic!("the lookup must succeed")
+            };
+
+            match flow {
+                ControlFlow::Break((artifact, was_duplicate, repo_key, _)) => {
+                    assert_eq!(artifact.id, existing.id);
+                    assert!(was_duplicate);
+                    assert_eq!(repo_key, "repo-key");
+                }
+                ControlFlow::Continue(_) => panic!(
+                    "a SHA-256-arm dedup hit has nothing left to compare and must keep \
+                     its zero-I/O short-circuit"
+                ),
+            }
+        });
+    }
 
     /// UpstreamPublished(Sha512) mismatch: the finalised SHA-512
     /// disagrees with the upstream-published hex — `Conflict` must
@@ -12888,7 +13727,7 @@ mod tests {
             };
 
             let err = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect_err("sha512 mismatch must fail");
 
@@ -13031,7 +13870,7 @@ mod tests {
             };
 
             let err = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect_err("sha256 verification mismatch must fail");
 
@@ -13120,7 +13959,7 @@ mod tests {
 
                     trust_upstream_publish_time: false,
                 };
-                uc.ingest_verified(req, content_stream(content), &test_handler())
+                uc.ingest_verified(req, &[], content_stream(content), &test_handler())
                     .await
                     .expect("sha512 success");
             });
@@ -13160,7 +13999,7 @@ mod tests {
                     trust_upstream_publish_time: false,
                 };
                 let _ = uc
-                    .ingest_verified(req, content_stream(b"actual content"), &test_handler())
+                    .ingest_verified(req, &[], content_stream(b"actual content"), &test_handler())
                     .await;
             });
         });
@@ -13198,7 +14037,7 @@ mod tests {
 
                     trust_upstream_publish_time: false,
                 };
-                uc.ingest_verified(req, content_stream(content), &test_handler())
+                uc.ingest_verified(req, &[], content_stream(content), &test_handler())
                     .await
                     .expect("verified");
             });
@@ -13237,7 +14076,7 @@ mod tests {
                     trust_upstream_publish_time: false,
                 };
                 let _ = uc
-                    .ingest_verified(req, content_stream(b"actual content"), &test_handler())
+                    .ingest_verified(req, &[], content_stream(b"actual content"), &test_handler())
                     .await;
             });
         });
@@ -13259,7 +14098,7 @@ mod tests {
     /// audit trail matters most (sustained tampering = many events).
     ///
     /// Issue #88 revised the mechanism entirely: `append_repository_event`
-    /// no longer calls `read_expected_version` (whose capped forward-scan
+    /// no longer calls `read_unpaired_append_version` (whose capped forward-scan
     /// is only correct for a *bounded* stream) at all — it appends at
     /// `ExpectedVersion::Any` with bounded conflict-retry. This test
     /// drives 250 (`STREAM_EVENT_CAP + 50`) consecutive `ChecksumMismatch`
@@ -13270,7 +14109,7 @@ mod tests {
     /// append past #201 fail `Conflict` under the pre-#88 mechanism, since
     /// that mechanism's version-number read was a truncated,
     /// increasingly-stale scan-from-start — see the mod.rs doc on
-    /// `read_expected_version` for the full mechanism).
+    /// `read_unpaired_append_version` for the full mechanism).
     #[tokio::test]
     async fn repository_audit_stream_accepts_more_than_stream_event_cap_events() {
         use crate::use_cases::STREAM_EVENT_CAP;
@@ -13490,14 +14329,17 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone())
+                .with_content_references(content_references.clone()),
+        );
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
         let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
         let group_use_case = Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
         let curation_rules = Arc::new(MockCurationRuleRepository::new());
-        let content_references = Arc::new(MockContentReferenceIndex::new());
         let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
         let jobs = Arc::new(MockJobsRepository::default());
 
@@ -13561,7 +14403,7 @@ mod tests {
             };
 
             let outcome = uc
-                .ingest_verified(req, content_stream(content), &test_handler())
+                .ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("ingest must succeed with valid upstream digest");
 
@@ -13647,7 +14489,7 @@ mod tests {
                 trust_upstream_publish_time: false,
             };
 
-            uc.ingest_verified(req, content_stream(content), &test_handler())
+            uc.ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("ingest must succeed under permissive policy");
 
@@ -13718,7 +14560,7 @@ mod tests {
                 trust_upstream_publish_time: false,
             };
 
-            uc.ingest_verified(req, content_stream(content), &test_handler())
+            uc.ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("ingest must succeed");
 
@@ -13798,7 +14640,7 @@ mod tests {
                 trust_upstream_publish_time: false,
             };
 
-            uc.ingest_verified(req, content_stream(content), &test_handler())
+            uc.ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("ingest must succeed");
 
@@ -13947,7 +14789,7 @@ mod tests {
                 upstream_published_at: None,
                 trust_upstream_publish_time: false,
             };
-            uc.ingest_verified(req, content_stream(content), &test_handler())
+            uc.ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest");
 
@@ -13993,7 +14835,7 @@ mod tests {
                 upstream_published_at: None,
                 trust_upstream_publish_time: false,
             };
-            uc.ingest_verified(req, content_stream(content), &test_handler())
+            uc.ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("verified ingest");
 
@@ -14058,14 +14900,17 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone())
+                .with_content_references(content_references.clone()),
+        );
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
         let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
         let group_use_case = Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
         let curation_rules = Arc::new(MockCurationRuleRepository::new());
-        let content_references = Arc::new(MockContentReferenceIndex::new());
         let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
         let jobs = Arc::new(MockJobsRepository::default());
 
@@ -14104,14 +14949,17 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone())
+                .with_content_references(content_references.clone()),
+        );
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
         let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
         let group_use_case = Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
         let curation_rules = Arc::new(MockCurationRuleRepository::new());
-        let content_references = Arc::new(MockContentReferenceIndex::new());
         let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
         let jobs = Arc::new(MockJobsRepository::default());
 
@@ -14148,6 +14996,7 @@ mod tests {
             legacy_md5: None,
             declared_sha256: None,
             payload_metadata: serde_json::Value::Null,
+            claimed_edges: Vec::new(),
         }
     }
 
@@ -14215,16 +15064,21 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.event, DomainEvent::ScanRequested(_))));
 
+            // Index 0 is the mint: the genesis commit rides
+            // `commit_transition_with_enqueues` too — not for enqueues (it
+            // has none) but to carry the artifact's `primary_content` edge
+            // in its own transaction. The gate's batch is index 1.
             let enqueues = lifecycle.ingest_enqueues();
-            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+            assert_eq!(enqueues.len(), 2, "{enqueues:?}");
+            assert!(enqueues[0].1.is_empty(), "the mint enqueues nothing");
             assert!(
-                enqueues[0].1.iter().any(|e| matches!(
+                enqueues[1].1.iter().any(|e| matches!(
                     e,
                     IngestEnqueue::Scan { trigger_source, .. } if trigger_source == "register-by-hash"
                 )),
                 "non-seed caller's enqueue must carry trigger_source=register-by-hash, \
                  not seed-import: {:?}",
-                enqueues[0].1
+                enqueues[1].1
             );
         });
     }
@@ -14274,11 +15128,13 @@ mod tests {
             // `commit_transition_with_enqueues` records a `(id, enqueues)`
             // entry on EVERY call, including ones with an empty `enqueues`
             // slice (the call happened; nothing was requested) — assert
-            // the SLICE is empty, not that no call was recorded.
+            // the SLICES are empty, not that no call was recorded. Two
+            // calls: the mint (riding this method for its `primary_content`
+            // edge) and the gate's quarantine commit.
             let enqueues = lifecycle.ingest_enqueues();
-            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+            assert_eq!(enqueues.len(), 2, "{enqueues:?}");
             assert!(
-                enqueues[0].1.is_empty(),
+                enqueues.iter().all(|(_, e)| e.is_empty()),
                 "no Scan job enqueue under an explicit scan_backends:[] waiver: {enqueues:?}"
             );
         });
@@ -14371,8 +15227,13 @@ mod tests {
                  entirely, not sent empty: {:?}",
                 lifecycle.committed_transitions()
             );
+            // One recorded call — the mint, which carries the artifact's
+            // `primary_content` edge and no enqueue at all.
             assert!(
-                lifecycle.ingest_enqueues().is_empty(),
+                lifecycle
+                    .ingest_enqueues()
+                    .iter()
+                    .all(|(_, e)| e.is_empty()),
                 "{:?}",
                 lifecycle.ingest_enqueues()
             );
@@ -14725,6 +15586,7 @@ mod tests {
 
             uc.ingest_verified(
                 oci_verified_req(repo_id, content),
+                &[],
                 content_stream(content),
                 &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
             )
@@ -14763,7 +15625,7 @@ mod tests {
                 upstream_published_at: None,
                 trust_upstream_publish_time: false,
             };
-            uc.ingest_verified(req, content_stream(content), &test_handler())
+            uc.ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("ingest must succeed");
 
@@ -14789,7 +15651,7 @@ mod tests {
 
             let outcome = uc
                 .ingest_verified(
-                    oci_verified_req(repo_id, content),
+                    oci_verified_req(repo_id, content), &[],
                     content_stream(content),
                     &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
                 )
@@ -14820,6 +15682,7 @@ mod tests {
 
             uc.ingest_verified(
                 oci_verified_req(repo_id, content),
+                &[],
                 content_stream(content),
                 &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
             )
@@ -14860,14 +15723,17 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone())
+                .with_content_references(content_references.clone()),
+        );
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
         let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
         let group_use_case = Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
         let curation_rules = Arc::new(MockCurationRuleRepository::new());
-        let content_references = Arc::new(MockContentReferenceIndex::new());
         let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
         let jobs = Arc::new(MockJobsRepository::default());
 
@@ -15026,6 +15892,7 @@ mod tests {
                 let outcome = uc
                     .ingest_verified(
                         oci_verified_req(repo_id, content),
+                        &[],
                         content_stream(content),
                         &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
                     )
@@ -15079,6 +15946,7 @@ mod tests {
 
             uc.ingest_verified(
                 oci_verified_req(repo_id, content),
+                &[],
                 content_stream(content),
                 &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
             )
@@ -15121,7 +15989,7 @@ mod tests {
                 upstream_published_at: None,
                 trust_upstream_publish_time: false,
             };
-            uc.ingest_verified(req, content_stream(content), &test_handler())
+            uc.ingest_verified(req, &[], content_stream(content), &test_handler())
                 .await
                 .expect("ingest must succeed");
 
@@ -15150,6 +16018,7 @@ mod tests {
 
             uc.ingest_verified(
                 oci_verified_req(repo_id, content),
+                &[],
                 content_stream(content),
                 &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
             )
@@ -15184,6 +16053,7 @@ mod tests {
             let outcome = uc
                 .ingest_verified(
                     oci_verified_req(repo_id, content),
+                    &[],
                     content_stream(content),
                     &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
                 )
@@ -15257,7 +16127,7 @@ mod tests {
             // ProvenanceMode (VerifyIfPresent) would BOTH fire on the
             // generic path — proving the narrow path actively suppresses
             // all three.
-            let (uc, lifecycle, _storage, repos, _projections, jobs, _artifacts) =
+            let (uc, lifecycle, _storage, repos, _projections, jobs, _artifacts, _refs) =
                 sig_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
@@ -15271,7 +16141,8 @@ mod tests {
                     sample_actor(),
                     serde_json::Value::Null,
                     upstream_digest.clone(),
-                    None, // no subject in scope — the S3 hook is a no-op here
+                    None,
+                    &[], // no subject in scope — the S3 hook is a no-op here
                     content_stream(content),
                 )
                 .await
@@ -15321,6 +16192,142 @@ mod tests {
         });
     }
 
+    /// **The acceptance for the signature path's claims.** One lifecycle
+    /// call carries the referrer manifest, its own `primary_content` edge
+    /// and the caller's `oci_subject` claim on the subject image.
+    ///
+    /// Both halves matter. The subject claim is the sharper one — it is a
+    /// claim on the SUBJECT's bytes, and nothing re-derives a tree edge, so
+    /// a referrer committed without it leaves a live signature over a
+    /// collectable subject. The referrer's own `primary_content` edge is the
+    /// one this narrow path never recorded at all: it commits status-`None`,
+    /// outside the scan/quarantine lifecycle, which also means outside the
+    /// GC's protected-evidence rule, so its bytes counted zero against
+    /// themselves until the next refcount-reconcile sweep converged them.
+    #[test]
+    fn ingest_signature_manifest_commits_its_edges_with_the_transition() {
+        let content: &[u8] = b"signature manifest with a subject claim";
+        let upstream_digest: ContentHash = sha256_of(content).parse().unwrap();
+        let subject: ContentHash = ZERO_HASH.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, lifecycle, _storage, repos, _projections, _jobs, _artifacts, refs) =
+                sig_make_use_case();
+            let repo = oci_repo();
+            let repo_id = repo.id;
+            repos.insert(repo);
+
+            let outcome = uc
+                .ingest_signature_manifest(
+                    repo_id,
+                    oci_coords(),
+                    "application/vnd.oci.image.manifest.v1+json".into(),
+                    sample_actor(),
+                    serde_json::Value::Null,
+                    upstream_digest.clone(),
+                    // `None` so the S3 re-verify hook stays a no-op: this
+                    // test is about the edge, not the enqueue.
+                    None,
+                    &[ContentReferenceClaim {
+                        target_content_hash: subject.clone(),
+                        kind: "oci_subject".into(),
+                        metadata: serde_json::json!({}),
+                    }],
+                    content_stream(content),
+                )
+                .await
+                .expect("signature-manifest ingest must succeed");
+            let artifact = outcome.artifact;
+
+            assert_eq!(
+                lifecycle.ingest_edges().len(),
+                1,
+                "one transition carries the whole set"
+            );
+            assert_eq!(
+                lifecycle.ingest_edge_kinds(),
+                vec![
+                    (
+                        artifact.id,
+                        "primary_content".to_string(),
+                        upstream_digest.as_ref().to_owned()
+                    ),
+                    (
+                        artifact.id,
+                        "oci_subject".to_string(),
+                        subject.as_ref().to_owned()
+                    ),
+                ],
+                "the referrer's claim on its own bytes and on its subject's"
+            );
+            assert_eq!(refs.entry_count(), 2, "and both reached the index");
+        });
+    }
+
+    /// The rollback half: a failed `oci_subject` edge fails the
+    /// signature-manifest ingest outright, leaving no artifact and no event
+    /// — not a committed referrer whose subject lost a claim.
+    #[test]
+    fn ingest_signature_manifest_failing_edge_rolls_back_the_transition() {
+        let content: &[u8] = b"signature manifest whose subject claim fails";
+        let upstream_digest: ContentHash = sha256_of(content).parse().unwrap();
+        let subject: ContentHash = ZERO_HASH.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, lifecycle, _storage, repos, _projections, _jobs, artifacts, refs) =
+                sig_make_use_case();
+            let repo = oci_repo();
+            let repo_id = repo.id;
+            repos.insert(repo);
+
+            refs.fail_next_insert_for_kind(
+                "oci_subject",
+                DomainError::Invariant("synthetic failure: oci_subject insert".into()),
+            );
+
+            let err = uc
+                .ingest_signature_manifest(
+                    repo_id,
+                    oci_coords(),
+                    "application/vnd.oci.image.manifest.v1+json".into(),
+                    sample_actor(),
+                    serde_json::Value::Null,
+                    upstream_digest.clone(),
+                    None,
+                    &[ContentReferenceClaim {
+                        target_content_hash: subject,
+                        kind: "oci_subject".into(),
+                        metadata: serde_json::json!({}),
+                    }],
+                    content_stream(content),
+                )
+                .await
+                .expect_err("a failed subject claim must fail the ingest");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Invariant(_))),
+                "expected AppError::Domain(Invariant), got {err:?}"
+            );
+
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "no transition may commit"
+            );
+            assert_eq!(
+                refs.entry_count(),
+                0,
+                "the referrer's own primary_content edge, applied first, rolls back too"
+            );
+            assert!(
+                artifacts
+                    .find_by_repo_and_checksum(repo_id, &upstream_digest)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no artifact row may survive"
+            );
+        });
+    }
+
     /// Returns the `IngestOutcome.ingested_event_id` of a committed
     /// `ArtifactIngested` so the caller can chain `oci_subject` causation —
     /// matching `ingest_verified`'s `IngestOutcome` return shape.
@@ -15330,7 +16337,7 @@ mod tests {
         let upstream_digest: ContentHash = sha256_of(content).parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, lifecycle, _storage, repos, _projections, jobs, _artifacts) =
+            let (uc, lifecycle, _storage, repos, _projections, jobs, _artifacts, _refs) =
                 sig_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
@@ -15344,7 +16351,7 @@ mod tests {
                     sample_actor(),
                     serde_json::Value::Null,
                     upstream_digest,
-                    None, // no subject in scope — the S3 hook is a no-op here
+                    None, &[], // no subject in scope — the S3 hook is a no-op here
                     content_stream(content),
                 )
                 .await
@@ -15392,7 +16399,7 @@ mod tests {
         let wrong_digest: ContentHash = ("a".repeat(64)).parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, lifecycle, _storage, repos, _projections, jobs, _artifacts) =
+            let (uc, lifecycle, _storage, repos, _projections, jobs, _artifacts, _refs) =
                 sig_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
@@ -15406,7 +16413,8 @@ mod tests {
                     sample_actor(),
                     serde_json::Value::Null,
                     wrong_digest,
-                    None, // no subject in scope — the S3 hook is a no-op here
+                    None,
+                    &[], // no subject in scope — the S3 hook is a no-op here
                     content_stream(content),
                 )
                 .await
@@ -15444,7 +16452,7 @@ mod tests {
         let subject_hash: ContentHash = ("b".repeat(64)).parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _lifecycle, _storage, repos, _projections, jobs, artifacts) =
+            let (uc, _lifecycle, _storage, repos, _projections, jobs, artifacts, _refs) =
                 sig_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
@@ -15465,7 +16473,7 @@ mod tests {
                 sample_actor(),
                 serde_json::Value::Null,
                 upstream_digest,
-                Some(subject_hash),
+                Some(subject_hash), &[],
                 content_stream(content),
             )
             .await
@@ -15514,7 +16522,7 @@ mod tests {
         let subject_hash: ContentHash = ("c".repeat(64)).parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _lifecycle, _storage, repos, _projections, jobs, _artifacts) =
+            let (uc, _lifecycle, _storage, repos, _projections, jobs, _artifacts, _refs) =
                 sig_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
@@ -15530,6 +16538,7 @@ mod tests {
                     serde_json::Value::Null,
                     upstream_digest,
                     Some(subject_hash),
+                    &[],
                     content_stream(content),
                 )
                 .await
@@ -15553,7 +16562,7 @@ mod tests {
         let subject_hash: ContentHash = ("d".repeat(64)).parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _lifecycle, _storage, repos, _projections, jobs, artifacts) =
+            let (uc, _lifecycle, _storage, repos, _projections, jobs, artifacts, _refs) =
                 sig_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
@@ -15576,6 +16585,7 @@ mod tests {
                     serde_json::Value::Null,
                     upstream_digest,
                     Some(subject_hash),
+                    &[],
                     content_stream(content),
                 )
                 .await
@@ -15605,17 +16615,21 @@ mod tests {
         Arc<MockPolicyProjectionRepository>,
         Arc<MockJobsRepository>,
         Arc<MockArtifactRepository>,
+        Arc<MockContentReferenceIndex>,
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone())
+                .with_content_references(content_references.clone()),
+        );
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
         let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
         let group_use_case = Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
         let curation_rules = Arc::new(MockCurationRuleRepository::new());
-        let content_references = Arc::new(MockContentReferenceIndex::new());
         let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
         let jobs = Arc::new(MockJobsRepository::default());
 
@@ -15630,7 +16644,7 @@ mod tests {
             true,
             HashMap::new(),
             0,
-            content_references,
+            content_references.clone(),
             policy_projections.clone(),
             jobs.clone(),
         );
@@ -15643,6 +16657,7 @@ mod tests {
             policy_projections,
             jobs,
             artifacts,
+            content_references,
         )
     }
 }

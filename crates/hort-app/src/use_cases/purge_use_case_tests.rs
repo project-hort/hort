@@ -15,7 +15,7 @@ use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{retention_scheduler_actor, ArtifactPurged, DomainEvent};
 use hort_domain::ports::event_store::AppendEvents;
 use hort_domain::ports::purge_gc::{
-    BlobReclaim, BlobReclaimGuard, PendingPurge, PurgeGcPort, PurgedRef,
+    BlobReclaim, BlobReclaimGuard, PendingPurge, PurgeGcPort, PurgePreparation, PurgedRef,
 };
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::BoxFuture;
@@ -76,6 +76,11 @@ struct MockPurgeGc {
     completed_batches: Mutex<Vec<AppendEvents>>,
     retired: Mutex<HashSet<Uuid>>,
     list_calls: AtomicUsize,
+    /// Per-artifact script for `purge_artifact_refs`. Absent ⇒
+    /// `Prepared` with whatever [`Self::refs`] holds. Present ⇒ the
+    /// answer the adapter gives when the read it takes under the
+    /// artifact lock disagrees with the page row the sweep is carrying.
+    prepare_script: Mutex<HashMap<Uuid, PurgePreparation>>,
     /// Per-hash script for `begin_blob_reclaim`. Absent ⇒ `Granted`.
     reclaim_script: Mutex<HashMap<ContentHash, Reclaim>>,
     reclaim_calls: Mutex<Vec<(Uuid, ContentHash)>>,
@@ -93,6 +98,9 @@ enum Reclaim {
     Granted,
     Contended,
     Referenced(u32),
+    /// Zero reference rows, but N GC-protected artifacts claim the
+    /// hash — the claim the refcount structurally cannot show.
+    ProtectedClaim(u32),
     Err,
     /// Granted, but the guard fails to release. The delete still
     /// happened; the sweep must not treat the release failure as a
@@ -159,6 +167,15 @@ impl MockPurgeGc {
         self
     }
 
+    /// Script what the under-lock re-read answers for `artifact_id`.
+    fn prepares(self, artifact_id: Uuid, outcome: PurgePreparation) -> Self {
+        self.prepare_script
+            .lock()
+            .unwrap()
+            .insert(artifact_id, outcome);
+        self
+    }
+
     fn with_list_err(self) -> Self {
         self.list_err.store(true, Ordering::SeqCst);
         self
@@ -197,6 +214,22 @@ impl MockPurgeGc {
 
     fn completed_batches(&self) -> Vec<AppendEvents> {
         self.completed_batches.lock().unwrap().clone()
+    }
+
+    /// The adapter corrects the worklist row under the lock on **both**
+    /// keep paths; mirror that so a retry reads the same thing the use
+    /// case just adopted, and so the terminal batch still agrees with
+    /// the worklist it is validated against.
+    fn refresh_worklist(&self, artifact_id: Uuid, content_hash: &ContentHash, refs: u32) {
+        if let Some(item) = self
+            .refs
+            .lock()
+            .unwrap()
+            .get_mut(&artifact_id)
+            .and_then(|v| v.iter_mut().find(|item| item.content_hash == *content_hash))
+        {
+            item.refs_remaining = refs;
+        }
     }
 }
 
@@ -259,19 +292,12 @@ impl PurgeGcPort for MockPurgeGc {
             }
             Reclaim::Contended => Ok(BlobReclaim::Contended),
             Reclaim::Referenced(n) => {
-                // The adapter refreshes the worklist row under the
-                // lock; mirror that so a retry reads the same thing the
-                // use case just adopted.
-                if let Some(item) = self
-                    .refs
-                    .lock()
-                    .unwrap()
-                    .get_mut(&artifact_id)
-                    .and_then(|v| v.iter_mut().find(|item| item.content_hash == *content_hash))
-                {
-                    item.refs_remaining = n;
-                }
+                self.refresh_worklist(artifact_id, content_hash, n);
                 Ok(BlobReclaim::Referenced { refs_now: n })
+            }
+            Reclaim::ProtectedClaim(n) => {
+                self.refresh_worklist(artifact_id, content_hash, n);
+                Ok(BlobReclaim::ProtectedClaim { claimants: n })
             }
             Reclaim::Err => Err(DomainError::Invariant("lease failed".into())),
         };
@@ -281,9 +307,15 @@ impl PurgeGcPort for MockPurgeGc {
     fn purge_artifact_refs(
         &self,
         artifact_id: Uuid,
-    ) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
+    ) -> BoxFuture<'_, DomainResult<PurgePreparation>> {
         self.purge_calls.lock().unwrap().push(artifact_id);
         let fail = self.purge_err_for.lock().unwrap().contains(&artifact_id);
+        let scripted = self
+            .prepare_script
+            .lock()
+            .unwrap()
+            .get(&artifact_id)
+            .cloned();
         let refs = self
             .refs
             .lock()
@@ -295,7 +327,7 @@ impl PurgeGcPort for MockPurgeGc {
             if fail {
                 Err(DomainError::Invariant("prepare failed".into()))
             } else {
-                Ok(refs)
+                Ok(scripted.unwrap_or(PurgePreparation::Prepared(refs)))
             }
         })
     }
@@ -1089,6 +1121,178 @@ async fn a_tagged_artifact_expired_by_another_predicate_is_still_purged() {
 }
 
 // ===========================================================================
+// The page is a snapshot: the re-read under the artifact lock decides
+// ===========================================================================
+
+/// The page row said the artifact was collectable; the read the
+/// adapter takes under the artifact lock said it had become retained
+/// evidence. The sweep has to take the second answer, count it apart
+/// from the steady-state skip, and leave everything alone.
+#[tokio::test]
+async fn a_protection_refusal_under_the_lock_stops_the_artifact_and_is_counted_apart() {
+    for status in [
+        QuarantineStatus::Quarantined,
+        QuarantineStatus::Rejected,
+        QuarantineStatus::ScanIndeterminate,
+    ] {
+        let artifact_id = Uuid::new_v4();
+        let content_hash = hash(HASH_PRIMARY);
+        let h = build(
+            MockPurgeGc::new()
+                // Collectable on the page — the pre-exit cannot catch
+                // this, which is the whole point of the fixture.
+                .with_pending(vec![pending(artifact_id, false, true)])
+                .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+                .prepares(artifact_id, PurgePreparation::Protected { status }),
+            MockStorage::new().with_present(content_hash),
+            MockReconcileGate::converged(),
+        );
+
+        let summary = h.uc.process_expired(ts(8100)).await.unwrap();
+
+        assert_eq!(summary.artifacts_visited, 1, "{status}");
+        assert_eq!(
+            summary.skipped_protected_under_lock, 1,
+            "{status}: the refusal came from the reader that decides"
+        );
+        assert_eq!(
+            summary.skipped_protected, 0,
+            "{status}: the page-row pre-exit saw nothing, and the two \
+             readers are counted apart so this stays visible"
+        );
+        assert_eq!(summary.errors, 0, "{status}: a refusal is not an error");
+        assert_eq!(summary.blobs_deleted, 0, "{status}");
+        assert_eq!(summary.blobs_kept, 0, "{status}");
+        assert_eq!(summary.purged_events, 0, "{status}");
+        // The lock *was* taken — this is not the pre-exit — and
+        // nothing past it ran.
+        assert_eq!(h.gc.purge_call_count(), 1, "{status}");
+        assert!(h.gc.reclaim_calls().is_empty(), "{status}");
+        assert!(h.storage.delete_attempts().is_empty(), "{status}");
+        assert_eq!(h.gc.complete_call_count(), 0, "{status}");
+        assert!(!h.gc.is_retired(artifact_id), "{status}");
+    }
+}
+
+/// The same shape for the other rule: a ref came to resolve to a
+/// `KeepLastN`-expired artifact after its page row was read.
+#[tokio::test]
+async fn a_tag_exemption_under_the_lock_stops_the_artifact_and_is_counted_apart() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![pending(artifact_id, false, true)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+            .prepares(artifact_id, PurgePreparation::TagExempt),
+        MockStorage::new().with_present(content_hash),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(8200)).await.unwrap();
+
+    assert_eq!(summary.skipped_tag_exempt_under_lock, 1);
+    assert_eq!(
+        summary.skipped_tag_exempt, 0,
+        "the page row carried no ref; the two readers are counted apart"
+    );
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.purged_events, 0);
+    assert_eq!(h.gc.purge_call_count(), 1);
+    assert!(h.storage.delete_attempts().is_empty());
+    assert!(!h.gc.is_retired(artifact_id));
+}
+
+/// `NoArtifact` is neither of the refusals and neither is it an error:
+/// the row the page offered is gone, so there are no bytes left to
+/// release through it. It must not land in a protection counter — an
+/// operator reading `skipped_protected_under_lock` is reading "a
+/// protection held", and a vanished row is not that.
+#[tokio::test]
+async fn a_vanished_artifact_row_is_not_a_protection_refusal() {
+    let artifact_id = Uuid::new_v4();
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![plain_pending(artifact_id)])
+            .prepares(artifact_id, PurgePreparation::NoArtifact),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(8300)).await.unwrap();
+
+    assert_eq!(summary.artifacts_visited, 1);
+    assert_eq!(summary.skipped_protected_under_lock, 0);
+    assert_eq!(summary.skipped_tag_exempt_under_lock, 0);
+    assert_eq!(summary.skipped_protected, 0);
+    assert_eq!(summary.skipped_tag_exempt, 0);
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.purged_events, 0);
+    assert_eq!(h.gc.complete_call_count(), 0);
+}
+
+/// The counter-test: a `Prepared` answer from the same reader purges
+/// normally, with every skip counter still at zero. Without it, a
+/// re-read that refused everything would satisfy the three tests above.
+#[tokio::test]
+async fn an_artifact_the_fresh_read_still_clears_is_purged_normally() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![pending(artifact_id, false, true)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)]),
+        MockStorage::new().with_present(content_hash.clone()),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(8400)).await.unwrap();
+
+    assert_eq!(summary.blobs_deleted, 1);
+    assert_eq!(summary.purged_events, 1);
+    assert_eq!(summary.skipped_protected_under_lock, 0);
+    assert_eq!(summary.skipped_tag_exempt_under_lock, 0);
+    assert_eq!(summary.skipped_protected, 0);
+    assert_eq!(summary.skipped_tag_exempt, 0);
+    assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
+    assert!(h.gc.is_retired(artifact_id));
+}
+
+/// A refusal is per-artifact: the sweep keeps walking the page and
+/// collects the artifacts behind it. (The real hazard runs the other
+/// way round — the items *ahead* of an artifact are what make its
+/// window long — but a refusal that aborted the page would starve
+/// everything behind a single tagged artifact.)
+#[tokio::test]
+async fn a_refusal_does_not_stop_the_rest_of_the_page() {
+    let ids = sorted_ids(2);
+    let (refused, collected) = (ids[0], ids[1]);
+    let content_hash = hash(HASH_PRIMARY);
+    let other_hash = hash(HASH_META);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![
+                pending(refused, false, true),
+                pending(collected, false, true),
+            ])
+            .with_refs(refused, vec![work(content_hash, 0)])
+            .with_refs(collected, vec![work(other_hash.clone(), 0)])
+            .prepares(refused, PurgePreparation::TagExempt),
+        MockStorage::new().with_present(other_hash.clone()),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(8500)).await.unwrap();
+
+    assert_eq!(summary.artifacts_visited, 2);
+    assert_eq!(summary.skipped_tag_exempt_under_lock, 1);
+    assert_eq!(summary.blobs_deleted, 1);
+    assert_eq!(h.storage.delete_attempts(), vec![other_hash]);
+    assert!(!h.gc.is_retired(refused));
+    assert!(h.gc.is_retired(collected));
+}
+
+// ===========================================================================
 // The caller-facing delete as a byte-release work item
 // ===========================================================================
 
@@ -1414,6 +1618,43 @@ async fn a_recount_that_is_no_longer_zero_keeps_the_blob_and_states_the_count() 
     );
     assert!(h.gc.is_retired(artifact_id));
     assert_eq!(purged_events(&h.gc)[0].refs_remaining, 2);
+}
+
+/// The refcount was genuinely zero and the bytes are still claimed:
+/// retained scan evidence holds this hash with no reference edge to
+/// count, because the refcount repair deliberately mints none for a
+/// protected artifact. The blob stays, the sibling's purge still
+/// finishes (a `rejected` artifact is permanent, so re-asking would
+/// never get a different answer), and the terminal event carries the
+/// claim count — `refs_remaining > 0` is what makes "the blob stays"
+/// readable from the stream.
+#[tokio::test]
+async fn a_protected_claim_on_the_shared_bytes_keeps_the_blob_and_states_the_count() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![plain_pending(artifact_id)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+            .reclaim(content_hash.clone(), Reclaim::ProtectedClaim(1)),
+        MockStorage::new().with_present(content_hash),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.blobs_deleted, 0);
+    assert_eq!(summary.blobs_kept, 1);
+    assert_eq!(
+        summary.blobs_deferred, 0,
+        "a protected claim is a keep, not a deferral — re-asking would          never finish the sibling's purge"
+    );
+    assert_eq!(summary.purged_events, 1);
+    assert!(
+        h.storage.delete_attempts().is_empty(),
+        "bytes retained evidence claims must not be deleted"
+    );
+    assert!(h.gc.is_retired(artifact_id));
+    assert_eq!(purged_events(&h.gc)[0].refs_remaining, 1);
 }
 
 /// A lease that cannot be taken at all (port/infra failure) is an

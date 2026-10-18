@@ -464,151 +464,252 @@ impl EventTypeKind {
         }
     }
 
-    /// Extract the repository association from an event payload.
+    /// Every repository an event payload discloses, and how to get it.
     ///
-    /// **Exhaustive match — no `_ =>` arm.** Returns `Some(uuid)` only when
-    /// the payload carries a single `repository_id` field. Payloads with
-    /// `source_repository_id` + `target_repository_id` pairs (promotion
-    /// events) return `None` for v1 — the dispatcher then falls through to
-    /// the `RepositoryScope::OwnedByActor` no-op step ("for
-    /// events without a repository association ... the predicate downstream
-    /// falls back to no repo association"). Subscription-lifecycle /
-    /// user-lifecycle / policy-lifecycle / auth-event variants return
-    /// `None`.
-    pub fn repository_id(event: &DomainEvent) -> Option<Uuid> {
+    /// **Exhaustive match — no `_ =>` arm.** A new [`DomainEvent`]
+    /// variant fails to compile here until its disclosure is decided, so
+    /// a variant cannot silently default into the most permissive answer.
+    ///
+    /// This is the single resolution primitive the events-read gate
+    /// (`hort-http-events`) and the subscription delivery filter
+    /// (`hort-app`) both consult. It replaces an earlier
+    /// single-`Option<Uuid>` extractor whose `None` meant three
+    /// different things at once — "no repository exists", "the
+    /// repository is reachable through the aggregate", and "there are
+    /// two repositories" — and which both call sites read as *visible
+    /// to everyone*. The three are now distinct:
+    ///
+    /// - [`DisclosedRepositories::global`] — no repository association
+    ///   exists. Policy / auth / token / subscription / OIDC-issuer /
+    ///   service-account / retention lifecycle, and the global claim
+    ///   mappings. Every one of these rides a `requires_admin()`
+    ///   category or is additionally type-gated, so "no repository" is
+    ///   not "no gate".
+    /// - a [`RepositoryRef`] set — the repositories the event discloses.
+    ///   [`RepositoryRef::Direct`] when the payload carries the id;
+    ///   [`RepositoryRef::OfArtifact`] / [`RepositoryRef::OfArtifactGroup`]
+    ///   when it names the aggregate instead and a resolver has to map it.
+    ///   A caller sees the event only if it may read **every** disclosed
+    ///   repository: the promotion chain names a source *and* a target,
+    ///   and both identities are in the payload the reader gets.
+    /// - [`DisclosedRepositories::unattributable`] — the event is about
+    ///   content that no single repository owns, so there is nothing to
+    ///   resolve and no scope to check against. `CasIntegrityMismatch`
+    ///   is the only one: it is keyed on a CAS content hash that any
+    ///   number of repositories' artifacts may point at, and its stream
+    ///   `entity_id` is derived from that hash rather than being an
+    ///   artifact id. Consumers fail closed on it.
+    #[must_use]
+    pub fn disclosed_repositories(event: &DomainEvent) -> DisclosedRepositories {
         match event {
-            // -- Artifact lifecycle: only ArtifactIngested carries a direct
-            // repository_id; the rest live on artifact streams and identify
-            // repo indirectly via the artifact aggregate.
-            DomainEvent::ArtifactIngested(e) => Some(e.repository_id),
-            DomainEvent::ChecksumVerified(_) => None,
-            DomainEvent::ChecksumMismatch(e) => Some(e.repository_id),
-            DomainEvent::ArtifactQuarantined(_) => None,
-            DomainEvent::ScanRequested(_) => None,
-            DomainEvent::ScanCompleted(_) => None,
-            DomainEvent::ArtifactBecameVulnerable(_) => None,
-            DomainEvent::ArtifactReleased(_) => None,
-            DomainEvent::ArtifactRejected(_) => None,
-            DomainEvent::ScanIndeterminate(_) => None,
-            // Provenance events land on the artifact stream; the
-            // artifact aggregate identifies the repo indirectly (no
-            // direct repository_id), same posture as the other
-            // post-ingest artifact-lifecycle events.
-            DomainEvent::ProvenanceVerified(_) => None,
-            DomainEvent::ProvenanceRejected(_) => None,
-            DomainEvent::ArtifactReEvaluated(_) => None,
-            // Promotion events carry source + target repos; no single
-            // repository_id, so v1 returns None per the task spec.
-            DomainEvent::PromotionRequested(_) => None,
-            DomainEvent::PolicyEvaluated(_) => None,
-            DomainEvent::ApprovalRequested(_) => None,
-            DomainEvent::ApprovalDecided(_) => None,
-            DomainEvent::ArtifactPromoted(_) => None,
-            DomainEvent::PromotionRejected(_) => None,
-            // Retention lifecycle: lands on
-            // the artifact stream; the artifact aggregate identifies the
-            // repo indirectly, so no direct repository_id — same as the
-            // other post-ingest artifact-lifecycle events above.
-            DomainEvent::ArtifactExpired(_) => None,
-            DomainEvent::ArtifactPurged(_) => None,
-            // Deletion is the one post-ingest artifact-lifecycle event
-            // that carries its repository directly: the payload
-            // denormalises `repository_id` precisely so an audit /
-            // subscription consumer never has to resolve the projection
-            // row the deletion retired.
-            DomainEvent::ArtifactDeleted(e) => Some(e.repository_id),
-            // Download audit: the payload carries
-            // the repository_id directly (it is the stream-sharding
-            // key). Returned here for the dispatcher's repo-scope
-            // filter even though the event type is in
-            // HIGH_VOLUME_EVENT_TYPES and is therefore
-            // subscription-excluded at issuance regardless.
-            DomainEvent::ArtifactDownloaded(e) => Some(e.repository_id),
+            // -- Artifact lifecycle. Ingest, the checksum-mismatch
+            // observation, deletion and the download audit carry the
+            // repository in the payload; every other artifact-lifecycle
+            // event names the artifact, and the artifact aggregate owns
+            // exactly one repository.
+            DomainEvent::ArtifactIngested(e) => {
+                DisclosedRepositories::one(RepositoryRef::Direct(e.repository_id))
+            }
+            DomainEvent::ChecksumVerified(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ChecksumMismatch(e) => {
+                DisclosedRepositories::one(RepositoryRef::Direct(e.repository_id))
+            }
+            DomainEvent::ArtifactQuarantined(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ScanRequested(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ScanCompleted(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ArtifactBecameVulnerable(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ArtifactReleased(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ArtifactRejected(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ScanIndeterminate(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ProvenanceVerified(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ProvenanceRejected(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ArtifactReEvaluated(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            // Promotion chain: the payload names BOTH repositories, and
+            // the reader of the event learns both identities. The
+            // disclosure is therefore the pair, not the source alone —
+            // resolving it through the artifact aggregate would answer
+            // with one repository for an event that names two.
+            DomainEvent::PromotionRequested(e) => DisclosedRepositories::two(
+                RepositoryRef::Direct(e.source_repository_id),
+                RepositoryRef::Direct(e.target_repository_id),
+            ),
+            DomainEvent::PolicyEvaluated(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ApprovalRequested(e) => DisclosedRepositories::two(
+                RepositoryRef::Direct(e.source_repository_id),
+                RepositoryRef::Direct(e.target_repository_id),
+            ),
+            DomainEvent::ApprovalDecided(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ArtifactPromoted(e) => DisclosedRepositories::two(
+                RepositoryRef::Direct(e.source_repository_id),
+                RepositoryRef::Direct(e.target_repository_id),
+            ),
+            DomainEvent::PromotionRejected(e) => DisclosedRepositories::two(
+                RepositoryRef::Direct(e.source_repository_id),
+                RepositoryRef::Direct(e.target_repository_id),
+            ),
+            // Retention lifecycle. Purge retires the projection row
+            // (`artifacts.deleted_at`) rather than removing it, so the
+            // artifact aggregate still answers for a purged artifact's
+            // repository — a resolver must look the row up by identity,
+            // never filtered on liveness.
+            DomainEvent::ArtifactExpired(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ArtifactPurged(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            // Deletion denormalises the repository into the payload
+            // precisely so an audit / subscription consumer never has to
+            // resolve the projection row the deletion retired.
+            DomainEvent::ArtifactDeleted(e) => {
+                DisclosedRepositories::one(RepositoryRef::Direct(e.repository_id))
+            }
+            // Download audit: the payload carries the repository (it is
+            // the stream-sharding key).
+            DomainEvent::ArtifactDownloaded(e) => {
+                DisclosedRepositories::one(RepositoryRef::Direct(e.repository_id))
+            }
 
-            // -- Policy lifecycle: no repository association.
-            DomainEvent::PolicyCreated(_) => None,
-            DomainEvent::PolicyUpdated(_) => None,
-            DomainEvent::ExclusionAdded(_) => None,
-            DomainEvent::ExclusionRemoved(_) => None,
-            DomainEvent::PolicyArchived(_) => None,
-            DomainEvent::PolicyReactivated(_) => None,
+            // -- Policy lifecycle: no repository association. A scan
+            // policy's scope may name repositories, but the event
+            // carries the policy, not a repository.
+            DomainEvent::PolicyCreated(_)
+            | DomainEvent::PolicyUpdated(_)
+            | DomainEvent::ExclusionAdded(_)
+            | DomainEvent::ExclusionRemoved(_)
+            | DomainEvent::PolicyArchived(_)
+            | DomainEvent::PolicyReactivated(_) => DisclosedRepositories::global(),
 
-            // -- CAS-integrity / auth: no repository association.
-            DomainEvent::CasIntegrityMismatch(_) => None,
-            DomainEvent::ArtifactCorrupted(_) => None,
-            DomainEvent::AuthenticationAttempted(_) => None,
-            DomainEvent::OidcKeyRotated(_) => None,
-            DomainEvent::AdminStatusChanged(_) => None,
+            // -- CAS integrity: keyed on a content hash, not an
+            // artifact. Any number of repositories' artifacts may point
+            // at that hash, and the synthetic stream `entity_id` is
+            // derived from the hash — there is no aggregate to resolve.
+            DomainEvent::CasIntegrityMismatch(_) => DisclosedRepositories::unattributable(),
+            // The corruption tombstone, by contrast, names the artifact.
+            DomainEvent::ArtifactCorrupted(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+
+            // -- Auth / admin-bit audit: no repository association.
+            DomainEvent::AuthenticationAttempted(_)
+            | DomainEvent::OidcKeyRotated(_)
+            | DomainEvent::AdminStatusChanged(_) => DisclosedRepositories::global(),
 
             // -- Mutable-ref lifecycle: directly repo-scoped.
-            DomainEvent::RefMoved(e) => Some(e.repository_id),
-            DomainEvent::RefRetired(e) => Some(e.repository_id),
+            DomainEvent::RefMoved(e) => {
+                DisclosedRepositories::one(RepositoryRef::Direct(e.repository_id))
+            }
+            DomainEvent::RefRetired(e) => {
+                DisclosedRepositories::one(RepositoryRef::Direct(e.repository_id))
+            }
 
-            // -- Artifact-group lifecycle: only `ArtifactGroupInitiated`
-            // carries the repo; the per-group member events identify it
-            // indirectly via the group aggregate.
-            DomainEvent::ArtifactGroupInitiated(e) => Some(e.repository_id),
-            DomainEvent::ArtifactGroupMemberAdded(_) => None,
-            DomainEvent::ArtifactGroupMemberRemoved(_) => None,
-            DomainEvent::ArtifactGroupPrimaryRoleAssigned(_) => None,
+            // -- Artifact-group lifecycle. The group aggregate owns one
+            // repository; the member events additionally name the
+            // artifact, and both identities reach the reader, so both
+            // are disclosed.
+            DomainEvent::ArtifactGroupInitiated(e) => {
+                DisclosedRepositories::one(RepositoryRef::Direct(e.repository_id))
+            }
+            DomainEvent::ArtifactGroupMemberAdded(e) => DisclosedRepositories::two(
+                RepositoryRef::OfArtifactGroup(e.group_id),
+                RepositoryRef::OfArtifact(e.artifact_id),
+            ),
+            DomainEvent::ArtifactGroupMemberRemoved(e) => DisclosedRepositories::two(
+                RepositoryRef::OfArtifactGroup(e.group_id),
+                RepositoryRef::OfArtifact(e.artifact_id),
+            ),
+            DomainEvent::ArtifactGroupPrimaryRoleAssigned(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifactGroup(e.group_id))
+            }
 
             // -- Curation decisions: directly repo-scoped.
-            DomainEvent::CurationApplied(e) => Some(e.repository_id),
+            DomainEvent::CurationApplied(e) => {
+                DisclosedRepositories::one(RepositoryRef::Direct(e.repository_id))
+            }
 
             // -- Authorization model: per-event optional repo. Global
-            // role / mapping events have no repo association.
-            DomainEvent::ClaimMappingApplied(_) => None,
-            DomainEvent::ClaimMappingRevoked(_) => None,
-            DomainEvent::PermissionGrantApplied(e) => e.repository_id,
-            DomainEvent::PermissionGrantRevoked(e) => e.repository_id,
-            DomainEvent::RepositoryUpstreamMappingChanged(e) => Some(e.repository_id),
+            // role / mapping events have no repository association.
+            DomainEvent::ClaimMappingApplied(_) | DomainEvent::ClaimMappingRevoked(_) => {
+                DisclosedRepositories::global()
+            }
+            DomainEvent::PermissionGrantApplied(e) => match e.repository_id {
+                Some(repo) => DisclosedRepositories::one(RepositoryRef::Direct(repo)),
+                None => DisclosedRepositories::global(),
+            },
+            DomainEvent::PermissionGrantRevoked(e) => match e.repository_id {
+                Some(repo) => DisclosedRepositories::one(RepositoryRef::Direct(repo)),
+                None => DisclosedRepositories::global(),
+            },
+            DomainEvent::RepositoryUpstreamMappingChanged(e) => {
+                DisclosedRepositories::one(RepositoryRef::Direct(e.repository_id))
+            }
 
-            // -- Native API token + admin-task audit: user-scoped, not repo.
-            DomainEvent::ApiTokenIssued(_) => None,
-            DomainEvent::ApiTokenRevoked(_) => None,
-            DomainEvent::ApiTokenIssuanceDenied(_) => None,
-            // Token-use audit: a token use has
-            // NO repository association (the explicit contrast to
-            // `ArtifactDownloaded` → `Some(repo)`); the stream
-            // is sharded per-(token_id, UTC-date), not per-repo.
-            DomainEvent::ApiTokenUsed(_) => None,
-            DomainEvent::TaskInvoked(_) => None,
-            DomainEvent::TaskFailed(_) => None,
+            // -- Native API token + admin-task audit: user-scoped, not
+            // repo-scoped. A token use has NO repository association
+            // (the explicit contrast to `ArtifactDownloaded`); the
+            // stream is sharded per-(token_id, UTC-date).
+            DomainEvent::ApiTokenIssued(_)
+            | DomainEvent::ApiTokenRevoked(_)
+            | DomainEvent::ApiTokenIssuanceDenied(_)
+            | DomainEvent::ApiTokenUsed(_)
+            | DomainEvent::TaskInvoked(_)
+            | DomainEvent::TaskFailed(_) => DisclosedRepositories::global(),
 
             // -- OIDC issuer + service-account lifecycle (ADR 0018):
             // gitops / machine-identity events, no repository
-            // association (same posture as the policy + auth groups).
-            DomainEvent::OidcIssuerCreated(_) => None,
-            DomainEvent::OidcIssuerUpdated(_) => None,
-            DomainEvent::OidcIssuerDeleted(_) => None,
-            DomainEvent::ServiceAccountCreated(_) => None,
-            DomainEvent::ServiceAccountUpdated(_) => None,
-            DomainEvent::ServiceAccountDeleted(_) => None,
-            DomainEvent::ServiceAccountTokenRotated(_) => None,
+            // association.
+            DomainEvent::OidcIssuerCreated(_)
+            | DomainEvent::OidcIssuerUpdated(_)
+            | DomainEvent::OidcIssuerDeleted(_)
+            | DomainEvent::ServiceAccountCreated(_)
+            | DomainEvent::ServiceAccountUpdated(_)
+            | DomainEvent::ServiceAccountDeleted(_)
+            | DomainEvent::ServiceAccountTokenRotated(_) => DisclosedRepositories::global(),
 
-            // -- Subscription lifecycle: owner's
-            // user stream, not repo-scoped. Every subscription
-            // lifecycle variant returns None.
-            DomainEvent::SubscriptionCreated(_) => None,
-            DomainEvent::SubscriptionCreationDenied(_) => None,
-            DomainEvent::SubscriptionUpdated(_) => None,
-            DomainEvent::SubscriptionPaused(_) => None,
-            DomainEvent::SubscriptionResumed(_) => None,
-            DomainEvent::SubscriptionDeleted(_) => None,
-            DomainEvent::SubscriptionDisabled(_) => None,
+            // -- Subscription lifecycle: the owner's user stream.
+            DomainEvent::SubscriptionCreated(_)
+            | DomainEvent::SubscriptionCreationDenied(_)
+            | DomainEvent::SubscriptionUpdated(_)
+            | DomainEvent::SubscriptionPaused(_)
+            | DomainEvent::SubscriptionResumed(_)
+            | DomainEvent::SubscriptionDeleted(_)
+            | DomainEvent::SubscriptionDisabled(_) => DisclosedRepositories::global(),
 
-            // -- Event-store retention sealing:
-            // global `admin-eventstore-retention` audit-meta stream,
-            // not repo-scoped.
-            DomainEvent::StreamSealed(_) => None,
+            // -- Event-store retention sealing: the global
+            // `admin-eventstore-retention` audit-meta stream.
+            DomainEvent::StreamSealed(_) => DisclosedRepositories::global(),
 
-            // -- Retention-policy lifecycle:
-            // a retention policy's scope may name repositories
-            // (`RetentionScope::Repos`) but there is no single
-            // `repository_id` field — same as the scan-policy
-            // lifecycle, which also returns None. The event is
-            // admin-only policy audit, not a per-repo subscribable.
-            DomainEvent::RetentionPolicyChanged(_) => None,
+            // -- Retention-policy lifecycle: a retention policy's scope
+            // may name repositories (`RetentionScope::Repos`) but the
+            // event carries the policy, not a repository — same shape as
+            // the scan-policy lifecycle above.
+            DomainEvent::RetentionPolicyChanged(_) => DisclosedRepositories::global(),
         }
     }
 
@@ -622,6 +723,127 @@ impl EventTypeKind {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Repository disclosure
+// ---------------------------------------------------------------------------
+
+/// One repository an event discloses, as the payload names it.
+///
+/// `Direct` is already an answer; the two `Of*` variants are a question
+/// a resolver answers against the aggregate's projection row. Keeping
+/// the distinction in the type is what lets the hot read path batch
+/// every outstanding question of a page into one round trip instead of
+/// resolving per event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RepositoryRef {
+    /// The payload carries the repository id itself.
+    Direct(Uuid),
+    /// The payload names an artifact. The repository is the one that
+    /// artifact belongs to — resolved by identity, **not** filtered on
+    /// liveness: a retired (deleted / purged) artifact still answers for
+    /// the repository whose events a reader is being gated against.
+    OfArtifact(Uuid),
+    /// The payload names an artifact group. The repository is the one
+    /// that group belongs to.
+    OfArtifactGroup(Uuid),
+}
+
+/// Fixed capacity of [`DisclosedRepositories`].
+///
+/// Two is the widest disclosure in the event vocabulary — the promotion
+/// chain's `(source, target)` pair and the group-member events'
+/// `(group, artifact)` pair. The array shape keeps the classifier
+/// allocation-free on the read hot path; a future event that disclosed
+/// three repositories would need this raised, and the constructors are
+/// the only way in.
+pub const MAX_DISCLOSED_REPOSITORIES: usize = 2;
+
+/// The set of repositories one event discloses.
+///
+/// Three states, deliberately distinct (see
+/// [`EventTypeKind::disclosed_repositories`] for why collapsing them
+/// into one `Option<Uuid>` was the defect):
+///
+/// - **global** — no repository association exists.
+/// - **one or two [`RepositoryRef`]s** — a caller may see the event only
+///   if it may read *every* one of them.
+/// - **unattributable** — repository-scoped in substance, but no single
+///   repository owns it and there is no aggregate to resolve. Consumers
+///   fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisclosedRepositories {
+    /// `None` entries are padding; `Some` entries are dense from index 0.
+    refs: [Option<RepositoryRef>; MAX_DISCLOSED_REPOSITORIES],
+    /// Set when the event is repository-scoped in substance but names no
+    /// resolvable owner. Mutually exclusive with a non-empty `refs`.
+    unattributable: bool,
+}
+
+impl DisclosedRepositories {
+    /// No repository association exists.
+    #[must_use]
+    pub const fn global() -> Self {
+        Self {
+            refs: [None, None],
+            unattributable: false,
+        }
+    }
+
+    /// The event discloses exactly one repository.
+    #[must_use]
+    pub const fn one(r: RepositoryRef) -> Self {
+        Self {
+            refs: [Some(r), None],
+            unattributable: false,
+        }
+    }
+
+    /// The event discloses two repositories; a caller needs both.
+    ///
+    /// Identical refs collapse to one — the pair is a *set*, and a
+    /// promotion whose source and target are the same repository
+    /// discloses one repository, not two.
+    #[must_use]
+    pub fn two(a: RepositoryRef, b: RepositoryRef) -> Self {
+        if a == b {
+            return Self::one(a);
+        }
+        Self {
+            refs: [Some(a), Some(b)],
+            unattributable: false,
+        }
+    }
+
+    /// The event is repository-scoped in substance but no single
+    /// repository owns it. Consumers fail closed.
+    #[must_use]
+    pub const fn unattributable() -> Self {
+        Self {
+            refs: [None, None],
+            unattributable: true,
+        }
+    }
+
+    /// True when no repository association exists.
+    #[must_use]
+    pub const fn is_global(&self) -> bool {
+        !self.unattributable && self.refs[0].is_none()
+    }
+
+    /// True when the event is repository-scoped but unresolvable.
+    #[must_use]
+    pub const fn is_unattributable(&self) -> bool {
+        self.unattributable
+    }
+
+    /// The disclosed references, in declaration order. Empty for both
+    /// [`Self::global`] and [`Self::unattributable`] — callers must
+    /// check [`Self::is_unattributable`] before reading emptiness as
+    /// "no gate applies".
+    pub fn refs(&self) -> impl Iterator<Item = RepositoryRef> + '_ {
+        self.refs.iter().filter_map(|r| *r)
+    }
+}
 /// High-volume event-type exclusion list.
 ///
 /// Subscriptions whose filter requests any of these are rejected at
@@ -981,7 +1203,7 @@ mod tests {
         SubscriptionUpdated, TargetKindWire, TaskFailed, TaskInvoked, UpstreamMappingChange,
     };
     use crate::retention::ExpirationReason;
-    use crate::types::{ArtifactCoords, ContentHash, Finding};
+    use crate::types::{ArtifactCoords, ComponentRelation, ContentHash, Finding};
     use chrono::Utc;
 
     fn sha256() -> ContentHash {
@@ -1235,12 +1457,23 @@ mod tests {
         assert!(!EventTypeKind::ApiTokenIssued.is_high_volume());
     }
 
-    // -------- EventTypeKind::of / repository_id — exhaustive coverage --------
+    // -------- EventTypeKind::of / disclosed_repositories — coverage --------
 
-    /// Build one minimal-valid `DomainEvent` per variant. The returned vec
-    /// length therefore must match the `DomainEvent` variant count, and
-    /// every arm of `EventTypeKind::of` / `EventTypeKind::repository_id`
-    /// is exercised below.
+    /// Build one minimal-valid `DomainEvent` per variant covered here.
+    ///
+    /// The third tuple element is **the repository the payload carries
+    /// directly**, if it carries exactly one — not "the repository the
+    /// event belongs to". The two differ for every post-ingest
+    /// artifact-lifecycle event, and conflating them is the defect
+    /// `disclosed_repositories` exists to prevent, so the column keeps
+    /// the narrow meaning and
+    /// `payload_carried_repository_is_disclosed_directly` is what reads
+    /// it.
+    ///
+    /// This list is **not** exhaustive over `DomainEvent` (it predates
+    /// several variants). Exhaustiveness over the enum is carried by
+    /// `events::domain_event::tests::all_test_variants`, which
+    /// `every_event_variant_discloses_or_is_explicitly_unscoped` walks.
     fn one_of_each_domain_event(repo: Uuid) -> Vec<(DomainEvent, EventTypeKind, Option<Uuid>)> {
         vec![
             (
@@ -1326,6 +1559,7 @@ mod tests {
                         aliases: vec![],
                         informational_class: None,
                         severity_basis: crate::types::SeverityBasis::Assessed,
+                        component_relation: ComponentRelation::NotEstablished,
                     }],
                     previously_clean_at: Utc::now(),
                 }),
@@ -1852,25 +2086,265 @@ mod tests {
     }
 
     #[test]
-    fn event_type_kind_of_and_repository_id_match_table() {
+    fn event_type_kind_of_matches_table() {
         let repo = Uuid::new_v4();
         let entries = one_of_each_domain_event(repo);
-        for (event, expected_kind, expected_repo) in &entries {
+        for (event, expected_kind, _) in &entries {
             assert_eq!(
                 EventTypeKind::of(event),
                 *expected_kind,
                 "event_type_kind::of mismatch for {expected_kind:?}",
             );
+        }
+    }
+
+    /// A payload that carries its repository id must disclose exactly
+    /// that repository, directly — no lookup, no second entry. This is
+    /// the half of the disclosure table the table's own third column
+    /// already states, asserted against the classifier so the two
+    /// cannot drift.
+    #[test]
+    fn payload_carried_repository_is_disclosed_directly() {
+        let repo = Uuid::new_v4();
+        for (event, kind, payload_repo) in one_of_each_domain_event(repo) {
+            let Some(carried) = payload_repo else {
+                continue;
+            };
             assert_eq!(
-                EventTypeKind::repository_id(event),
-                *expected_repo,
-                "event_type_kind::repository_id mismatch for {expected_kind:?}",
+                EventTypeKind::disclosed_repositories(&event),
+                DisclosedRepositories::one(RepositoryRef::Direct(carried)),
+                "{kind:?} carries its repository in the payload and must \
+                 disclose exactly it",
             );
         }
     }
 
+    /// Every `DomainEvent` variant whose disclosure is **global** — no
+    /// repository association exists at all.
+    ///
+    /// The list is the reviewed, explicit statement of "this event has
+    /// no repository"; it is **not** a convenience default. The defect
+    /// this replaces was exactly a default: nine artifact-lifecycle
+    /// kinds answered "no repository" because nobody resolved the
+    /// artifact aggregate, and two call sites read that as "visible to
+    /// everyone". Anything absent from this list must disclose at least
+    /// one reference or declare itself unattributable.
+    fn globally_scoped_event_kinds() -> &'static [EventTypeKind] {
+        &[
+            // Policy lifecycle.
+            EventTypeKind::PolicyCreated,
+            EventTypeKind::PolicyUpdated,
+            EventTypeKind::ExclusionAdded,
+            EventTypeKind::ExclusionRemoved,
+            EventTypeKind::PolicyArchived,
+            EventTypeKind::PolicyReactivated,
+            // Auth / admin-bit audit.
+            EventTypeKind::AuthenticationAttempted,
+            EventTypeKind::OidcKeyRotated,
+            EventTypeKind::AdminStatusChanged,
+            // Global authorization model.
+            EventTypeKind::ClaimMappingApplied,
+            EventTypeKind::ClaimMappingRevoked,
+            // Token + admin-task audit.
+            EventTypeKind::ApiTokenIssued,
+            EventTypeKind::ApiTokenRevoked,
+            EventTypeKind::ApiTokenIssuanceDenied,
+            EventTypeKind::ApiTokenUsed,
+            EventTypeKind::TaskInvoked,
+            EventTypeKind::TaskFailed,
+            // Identity provisioning (ADR 0018).
+            EventTypeKind::OidcIssuerCreated,
+            EventTypeKind::OidcIssuerUpdated,
+            EventTypeKind::OidcIssuerDeleted,
+            EventTypeKind::ServiceAccountCreated,
+            EventTypeKind::ServiceAccountUpdated,
+            EventTypeKind::ServiceAccountDeleted,
+            EventTypeKind::ServiceAccountTokenRotated,
+            // Subscription lifecycle.
+            EventTypeKind::SubscriptionCreated,
+            EventTypeKind::SubscriptionCreationDenied,
+            EventTypeKind::SubscriptionUpdated,
+            EventTypeKind::SubscriptionPaused,
+            EventTypeKind::SubscriptionResumed,
+            EventTypeKind::SubscriptionDeleted,
+            EventTypeKind::SubscriptionDisabled,
+            // Event-store retention.
+            EventTypeKind::StreamSealed,
+            EventTypeKind::RetentionPolicyChanged,
+        ]
+    }
+
+    /// Every `DomainEvent` variant whose disclosure is
+    /// **unattributable** — repository-scoped in substance, owned by no
+    /// single repository, nothing to resolve. Consumers fail closed on
+    /// these, so the list is deliberately a list and not a predicate.
+    fn unattributable_event_kinds() -> &'static [EventTypeKind] {
+        &[EventTypeKind::CasIntegrityMismatch]
+    }
+
+    /// Variants whose disclosure is decided **per payload**, so a single
+    /// instance cannot state the kind's disposition: a permission grant
+    /// is global when `repository_id` is `None` and repo-scoped when it
+    /// is `Some`. Both shapes are pinned by
+    /// `permission_grant_applied_with_no_repo_is_global` and
+    /// `permission_grant_revoked_with_repo_discloses_it`; the
+    /// one-instance-per-variant walk below skips them because whichever
+    /// instance the corpus happens to hold would assert the wrong half.
+    fn payload_conditional_event_kinds() -> &'static [EventTypeKind] {
+        &[
+            EventTypeKind::PermissionGrantApplied,
+            EventTypeKind::PermissionGrantRevoked,
+        ]
+    }
+
+    /// Exhaustiveness guard over the WHOLE enum, not the local table:
+    /// `all_test_variants()` is the canonical one-instance-per-variant
+    /// corpus, so a future `DomainEvent` variant lands here and forces a
+    /// decision — either it discloses a repository, or its kind is added
+    /// to one of the two reviewed lists above.
+    ///
+    /// The compile-time half of the guard is the classifier's exhaustive
+    /// no-wildcard match; this is the runtime half, and it is the one
+    /// that catches "classified, but classified as global".
     #[test]
-    fn permission_grant_applied_with_no_repo_returns_none() {
+    fn every_event_variant_discloses_or_is_explicitly_unscoped() {
+        for event in crate::events::domain_event::tests::all_test_variants() {
+            let kind = EventTypeKind::of(&event);
+            if payload_conditional_event_kinds().contains(&kind) {
+                continue;
+            }
+            let disclosed = EventTypeKind::disclosed_repositories(&event);
+            let expected_global = globally_scoped_event_kinds().contains(&kind);
+            let expected_unattributable = unattributable_event_kinds().contains(&kind);
+            assert!(
+                !(expected_global && expected_unattributable),
+                "{kind:?} is in both reviewed lists",
+            );
+            if expected_global {
+                assert!(
+                    disclosed.is_global(),
+                    "{kind:?} is listed as globally scoped but discloses a repository",
+                );
+            } else if expected_unattributable {
+                assert!(
+                    disclosed.is_unattributable(),
+                    "{kind:?} is listed as unattributable but did not classify as one",
+                );
+            } else {
+                assert!(
+                    !disclosed.is_global() && !disclosed.is_unattributable(),
+                    "{kind:?} discloses nothing and is in neither reviewed list — a \
+                     repository-scoped event that answers 'no repository' is the \
+                     visibility bypass this classifier exists to prevent",
+                );
+            }
+        }
+    }
+
+    /// Post-ingest artifact-lifecycle events name the artifact, not the
+    /// repository: the disclosure is an `OfArtifact` question for a
+    /// resolver, never a bare "no repository".
+    #[test]
+    fn post_ingest_artifact_events_disclose_their_artifact() {
+        let artifact = Uuid::new_v4();
+        let events = vec![
+            DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
+                artifact_id: artifact,
+                quarantine_window_start: Utc::now(),
+            }),
+            DomainEvent::ScanRequested(ScanRequested {
+                artifact_id: artifact,
+                scanner: "trivy".into(),
+            }),
+            DomainEvent::ArtifactReleased(ArtifactReleased {
+                artifact_id: artifact,
+                released_by: ReleaseReason::Timer,
+                released_by_user_id: None,
+                justification: None,
+            }),
+            DomainEvent::ArtifactRejected(ArtifactRejected {
+                artifact_id: artifact,
+                rejected_by: RejectionReason::Scanner,
+                reason: "CVE-2024-0001".into(),
+            }),
+            DomainEvent::ArtifactPurged(ArtifactPurged {
+                artifact_id: artifact,
+                content_hash: sha256(),
+                refs_remaining: 0,
+                purged_at: Utc::now(),
+            }),
+        ];
+        for event in events {
+            let kind = EventTypeKind::of(&event);
+            assert_eq!(
+                EventTypeKind::disclosed_repositories(&event),
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(artifact)),
+                "{kind:?} must disclose its artifact for resolution",
+            );
+        }
+    }
+
+    /// The promotion chain names a source AND a target, and the reader
+    /// of the event learns both. Both are disclosed.
+    #[test]
+    fn promotion_discloses_both_source_and_target() {
+        let source = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let event = DomainEvent::ArtifactPromoted(ArtifactPromoted {
+            artifact_id: Uuid::new_v4(),
+            source_repository_id: source,
+            target_repository_id: target,
+        });
+        let disclosed = EventTypeKind::disclosed_repositories(&event);
+        let refs: Vec<RepositoryRef> = disclosed.refs().collect();
+        assert_eq!(
+            refs,
+            vec![RepositoryRef::Direct(source), RepositoryRef::Direct(target)],
+        );
+    }
+
+    /// A promotion within one repository discloses one repository, not
+    /// the same one twice — the disclosure is a set.
+    #[test]
+    fn promotion_within_one_repository_collapses_to_one_reference() {
+        let repo = Uuid::new_v4();
+        let event = DomainEvent::PromotionRejected(PromotionRejected {
+            artifact_id: Uuid::new_v4(),
+            source_repository_id: repo,
+            target_repository_id: repo,
+            reason: "policy".into(),
+        });
+        assert_eq!(
+            EventTypeKind::disclosed_repositories(&event),
+            DisclosedRepositories::one(RepositoryRef::Direct(repo)),
+        );
+    }
+
+    /// A group-member event names both aggregates, and both reach the
+    /// reader.
+    #[test]
+    fn group_member_event_discloses_group_and_artifact() {
+        let group = Uuid::new_v4();
+        let artifact = Uuid::new_v4();
+        let event = DomainEvent::ArtifactGroupMemberAdded(ArtifactGroupMemberAdded {
+            group_id: group,
+            role: "jar".into(),
+            artifact_id: artifact,
+        });
+        let refs: Vec<RepositoryRef> = EventTypeKind::disclosed_repositories(&event)
+            .refs()
+            .collect();
+        assert_eq!(
+            refs,
+            vec![
+                RepositoryRef::OfArtifactGroup(group),
+                RepositoryRef::OfArtifact(artifact)
+            ],
+        );
+    }
+
+    #[test]
+    fn permission_grant_applied_with_no_repo_is_global() {
         let ev = DomainEvent::PermissionGrantApplied(PermissionGrantApplied {
             grant_id: Uuid::nil(),
             subject: GrantSubjectRecord::Claims {
@@ -1879,11 +2353,11 @@ mod tests {
             permission: Permission::Read,
             repository_id: None,
         });
-        assert_eq!(EventTypeKind::repository_id(&ev), None);
+        assert!(EventTypeKind::disclosed_repositories(&ev).is_global());
     }
 
     #[test]
-    fn permission_grant_revoked_with_repo_returns_some() {
+    fn permission_grant_revoked_with_repo_discloses_it() {
         let repo = Uuid::new_v4();
         let ev = DomainEvent::PermissionGrantRevoked(PermissionGrantRevoked {
             grant_id: Uuid::nil(),
@@ -1893,7 +2367,27 @@ mod tests {
             permission: Permission::Read,
             repository_id: Some(repo),
         });
-        assert_eq!(EventTypeKind::repository_id(&ev), Some(repo));
+        assert_eq!(
+            EventTypeKind::disclosed_repositories(&ev),
+            DisclosedRepositories::one(RepositoryRef::Direct(repo)),
+        );
+    }
+
+    /// `global()` and `unattributable()` both carry no references; the
+    /// predicates are what tells them apart, and a consumer that reads
+    /// emptiness as "no gate applies" would fail OPEN on the
+    /// unattributable one.
+    #[test]
+    fn global_and_unattributable_are_distinguishable_despite_both_being_empty() {
+        let global = DisclosedRepositories::global();
+        let unattributable = DisclosedRepositories::unattributable();
+        assert_eq!(global.refs().count(), 0);
+        assert_eq!(unattributable.refs().count(), 0);
+        assert!(global.is_global());
+        assert!(!global.is_unattributable());
+        assert!(unattributable.is_unattributable());
+        assert!(!unattributable.is_global());
+        assert_ne!(global, unattributable);
     }
 
     // -------- RepositoryScope smoke --------

@@ -17,10 +17,12 @@
 //! The use case needs, per candidate stream: the rendered stream id,
 //! its [`StreamCategory`], the oldest event's `stored_at` (the floor
 //! anchor — every later event is at-or-after it), the newest
-//! event's `stored_at`, and the tail event's
+//! event's `stored_at`, the tail event's
 //! [`DomainEvent::event_type`](crate::events::DomainEvent::event_type)
-//! (the terminal-gate input). That is exactly
-//! [`TerminalStreamCandidate`].
+//! (the terminal-gate input) and that tail's `stream_position` (the
+//! version the seal is authorized against — see
+//! [`SealAuthority`](super::event_store::SealAuthority)). That is
+//! exactly [`TerminalStreamCandidate`].
 //!
 //! # Why a *new, separate* additive port (not extra methods on
 //! [`EventStore`](super::event_store::EventStore))
@@ -80,6 +82,19 @@ pub struct TerminalStreamCandidate {
     /// input for `TerminalGated` categories. Ignored for `AgeGated`
     /// categories (rotated audit streams have no terminal).
     pub last_event_type: String,
+    /// `stream_position` of that same tail event — the version this
+    /// enumeration's facts were read at.
+    ///
+    /// It is what an `AgeGated` candidate's seal is authorized against
+    /// (`SealAuthority`): the floor was proven from `first_event_at`,
+    /// which only ever gets older, so the one thing that can invalidate
+    /// the proof is a *new* event — an event younger than the floor the
+    /// seal would otherwise remove. A `TerminalGated` candidate is
+    /// re-read by the use case to prove its terminal, and that fresher
+    /// read's tail is the authority there; this field is still the tail
+    /// of the row the two aggregate timestamps came from, so the trace
+    /// and the facts describe one observation.
+    pub last_stream_position: u64,
 }
 
 /// Read-only stream-enumeration outbound port for the
@@ -168,12 +183,14 @@ mod tests {
             first_event_at: ts(1000),
             last_event_at: ts(2000),
             last_event_type: "ArtifactPurged".to_owned(),
+            last_stream_position: 4,
         };
         assert_eq!(c.clone(), c);
         assert_eq!(c.category, StreamCategory::Artifact);
         assert_eq!(c.first_event_at, ts(1000));
         assert_eq!(c.last_event_at, ts(2000));
         assert_eq!(c.last_event_type, "ArtifactPurged");
+        assert_eq!(c.last_stream_position, 4);
         assert!(c.stream_id.starts_with("artifact-"));
 
         let other = TerminalStreamCandidate {
@@ -181,5 +198,14 @@ mod tests {
             ..c.clone()
         };
         assert_ne!(other, c);
+
+        // The tail position is part of the candidate's identity: it is
+        // what an age-gated seal is authorized against, so two
+        // candidates differing only there are not the same candidate.
+        let grown = TerminalStreamCandidate {
+            last_stream_position: 5,
+            ..c.clone()
+        };
+        assert_ne!(grown, c);
     }
 }

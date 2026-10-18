@@ -14,9 +14,14 @@ pub mod artifact_group_repository;
 pub mod artifact_lifecycle;
 pub mod artifact_metadata_repository;
 pub mod artifact_repository;
+// Atomic authority-row-plus-audit-event commit port (ADR 0012 / 0018):
+// a grant, claim-mapping or issuer mutation and the events that attest
+// it commit in one transaction, so neither can land without the other.
+pub mod authority_lifecycle;
 pub mod checkpoint_anchor;
 pub mod checkpoint_emitter;
 pub mod claim_mapping_repository;
+pub mod constituent_status;
 pub mod content_reference_index;
 // Three curation read-surface ports that `CurationUseCase` holds as
 // `Arc<dyn _>` from construction; the Postgres adapter implements the
@@ -29,6 +34,7 @@ pub mod ephemeral_store;
 pub mod event_chain_head_reader;
 pub mod event_chain_reader;
 pub mod event_notifier;
+pub mod event_repository_resolver;
 pub mod event_store;
 pub mod federated_jwt_validator;
 pub mod format_handler;
@@ -38,6 +44,13 @@ pub mod format_handler;
 pub mod identity_provider;
 pub mod jobs_repository;
 pub mod kubernetes_secret_writer;
+// The list-surface counterpart of `constituent_status`: same question
+// ("would this registry refuse this?"), asked about a set of manifests a
+// hort-built document is about to name, with the closure resolved from
+// the membership projection rather than from bytes the caller does not
+// hold. ADR 0062's omission shape for the OCI referrers index and
+// `tags/list`.
+pub mod list_deliverability;
 pub mod metadata_mirror_store;
 pub mod oidc_issuer_repository;
 pub mod patch_candidate_repository;

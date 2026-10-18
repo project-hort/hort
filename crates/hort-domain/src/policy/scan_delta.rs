@@ -64,6 +64,7 @@ pub fn compute_added_findings<'a>(prior: &'a [Finding], current: &'a [Finding]) 
 mod tests {
     use super::*;
     use crate::entities::scan_policy::SeverityThreshold;
+    use crate::types::ComponentRelation;
 
     fn finding(purl: &str, vuln: &str) -> Finding {
         Finding {
@@ -78,6 +79,7 @@ mod tests {
             aliases: vec![],
             informational_class: None,
             severity_basis: crate::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
         }
     }
 

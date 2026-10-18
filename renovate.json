@@ -36,6 +36,11 @@
       "enabled": false
     },
     {
+      "description": "Cap hyper-util at 0.1.20 until the instance can serve 0.1.21 again. 0.1.21 is scan-rejected on the dogfood registry over an advisory about a component that is not in the crate: a cargo SBOM is built from the published .crate's embedded Cargo.lock, which is the foreign maintainer's dev resolve, so a finding about h2 0.4.13 condemned hyper-util itself. The narrowing that fixes it is commit 39b3a447 (a finding may condemn only an artifact that carries the named component) and it is in no published release yet - so a release build resolving through the proxy cannot see 0.1.21, while the fix can only reach the instance through such a build. 0.1.20 breaks that cycle: it is the version the last final release carried, so the proxy already holds it released, and the requirement is ^0.1 so the cap needs no manifest change. Unpark once a release carrying 39b3a447 runs on the instance AND a rescan has released 0.1.21 there - verify by requesting the version through the proxy, not by assuming the rescan ran.",
+      "matchPackageNames": ["hyper-util"],
+      "allowedVersions": "<=0.1.20"
+    },
+    {
       "description": "Resolve crate versions through hort's crates-proxy sparse index instead of crates.io: the pull-through proxy that fires the on_dist_tag_move prefetch on each index read, warming the newest versions off the build's critical path. (cargo-virtual is the CI build source but aggregates crates-proxy, and its serve-path is still in progress, so crates-proxy is the reliable trigger point; warmed content lives here regardless.) Auth (hostRules matchHost hort.kdp.kloni.cloud, hostType crate, plus a hort read token) comes from the renovate-runner; this repo config carries only the routing. Note: crates-proxy uses indexMode include_pending, so not-yet-warmed upstream versions are visible — the read starts the quarantine clock early but does not guarantee a proposed version is released by the first build's fetch. Renovate's supplementary /api/v1/crates/ metadata probe 404s on hort (non-fatal noise, thinner changelog).",
       "matchDatasources": ["crate"],
       "registryUrls": ["sparse+https://hort.kdp.kloni.cloud/cargo/crates-proxy/"]

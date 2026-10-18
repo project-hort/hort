@@ -13,11 +13,17 @@
 //! because this sender cannot see every persisted event: an event
 //! appended inside a caller-owned transaction
 //! (`PgEventStore::append_in_tx`, reached through the artifact / ref /
-//! artifact-group lifecycle ports) never reaches
+//! artifact-group / authority lifecycle ports) never reaches
 //! [`append`](EventStore::append) at all, and the channel is per-process
 //! so it carries nothing another replica wrote. What a `send` buys is
 //! latency: a consumer learns there is something to read sooner than
 //! its own poll would have told it.
+//!
+//! The authority port is the newest entry in that list, and its
+//! gitops-apply audit events are the least affected by it: the apply
+//! runs at boot, before any dispatcher exists, so those appends were
+//! already reaching a publisher with no subscribers
+//! (`EventStorePublisher::without_broadcast` in `gitops_boot`).
 //!
 //! # Best-effort contract
 //!
@@ -43,7 +49,7 @@ use tokio::sync::broadcast;
 use hort_domain::error::DomainResult;
 use hort_domain::events::{PersistedEvent, StreamCategory, StreamId};
 use hort_domain::ports::event_store::{
-    AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
+    AppendEvents, AppendResult, EventStore, ReadFrom, SealAuthority, SealOutcome, SubscribeFrom,
 };
 use hort_domain::ports::BoxFuture;
 
@@ -211,12 +217,21 @@ impl EventStore for EventStorePublisher {
         self.inner.health_check()
     }
 
-    fn delete_stream(&self, stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
-        self.inner.delete_stream(stream_id)
+    fn delete_stream(
+        &self,
+        stream_id: StreamId,
+        authority: SealAuthority,
+    ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
+        self.inner.delete_stream(stream_id, authority)
     }
 
-    fn archive_stream(&self, stream_id: StreamId, target: &str) -> BoxFuture<'_, DomainResult<()>> {
-        self.inner.archive_stream(stream_id, target)
+    fn archive_stream(
+        &self,
+        stream_id: StreamId,
+        target: &str,
+        authority: SealAuthority,
+    ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
+        self.inner.archive_stream(stream_id, target, authority)
     }
 }
 
@@ -309,16 +324,21 @@ mod tests {
             Box::pin(async { Ok(Vec::new()) })
         }
 
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
+            Box::pin(async { Ok(SealOutcome::Sealed) })
         }
 
         fn archive_stream(
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+            _authority: SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
+            Box::pin(async { Ok(SealOutcome::Sealed) })
         }
     }
 

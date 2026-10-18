@@ -129,6 +129,12 @@ pub(crate) enum ExtractError {
     EntryCap { cap: usize },
     #[error("archive entry path is not contained in the workspace")]
     UncontainedPath,
+    /// A ZIP entry carries a name this process cannot decode, so the name
+    /// cannot be evaluated against the containment rule at all. Carries
+    /// the entry index and nothing else: the undecodable bytes are not
+    /// reproduced in a message.
+    #[error("archive entry {index} has a name that cannot be decoded")]
+    UndecodableEntryName { index: usize },
     #[error("archive could not be read: {0}")]
     Malformed(String),
 }
@@ -415,7 +421,39 @@ pub(crate) fn extract_zip<R: Read + io::Seek>(
         // containment check as a tar path rather than through the zip
         // crate's own sanitiser, so one rule governs both containers and
         // a hostile name is a refusal in both.
-        let raw = PathBuf::from(entry.name());
+        //
+        // A ZIP entry name is a byte string, not text, so decoding one
+        // can fail — and here the name becomes a filesystem path, which
+        // means a name that cannot be decoded cannot be put to the
+        // containment rule at all. An unevaluable name is not a weaker
+        // case than one that fails the rule, and that one refuses the
+        // whole archive. Dropping the single entry instead would have a
+        // consequence it does not have in an in-memory metadata read:
+        // the scanner would go on to judge a tree with a file missing
+        // from it that nobody ever looked at, and report "clean" over
+        // unexamined material. So the archive is refused. Substituting an
+        // empty or lossily-decoded name is worse than either, because it
+        // turns bytes nobody could read into a path on this disk.
+        //
+        // This arm does not fire with `zip` 9.0.3, and it must not be read
+        // as a guarantee that every materialised path came from a name the
+        // producer wrote: `name()` falls back to CP437, which is total over
+        // bytes, so a non-UTF-8 name is transliterated rather than refused
+        // and lands on disk under the transliteration. The arm is what this
+        // extractor does when a decode *does* fail. The probe test
+        // `extract_zip_undecodable_name_probe_zip9_materialises_a_cp437_path`
+        // pins the current behaviour and goes red if it changes.
+        let raw = match entry.name() {
+            Ok(name) => PathBuf::from(name.as_ref()),
+            Err(source) => {
+                tracing::warn!(
+                    entry_index = i,
+                    error = %source,
+                    "zip entry name could not be decoded; refusing the archive"
+                );
+                return Err(ExtractError::UndecodableEntryName { index: i });
+            }
+        };
         let rel = match contained_relative_path(&raw) {
             None => return Err(ExtractError::UncontainedPath),
             Some(PathContainment::Root) => {
@@ -1141,9 +1179,132 @@ mod tests {
         assert!(ExtractError::UncontainedPath
             .to_string()
             .contains("not contained"));
+        assert!(ExtractError::UndecodableEntryName { index: 4 }
+            .to_string()
+            .contains("cannot be decoded"));
         assert!(ExtractError::Malformed("why".into())
             .to_string()
             .contains("why"));
+    }
+
+    /// Overwrite an ASCII placeholder name in a built archive with bytes
+    /// that are not valid UTF-8, and set general-purpose bit 11 — the flag
+    /// by which a producer declares "the name in this header is UTF-8" —
+    /// in the header the name belongs to.
+    ///
+    /// The name is stored twice (local file header, central directory) and
+    /// both copies must agree, so the rewrite is driven by scanning for
+    /// the placeholder; the returned count is how many headers were
+    /// rewritten, which lets a caller prove it hit real name fields and
+    /// not a coincidental byte run in compressed data. Flags sit at +6 of
+    /// a local file header (name at +30) and +8 of a central directory
+    /// record (name at +46); bit 11 is `0x08` of that u16's high byte.
+    fn forge_non_utf8_name(bytes: &mut [u8], placeholder: &[u8], replacement: &[u8]) -> usize {
+        assert_eq!(
+            placeholder.len(),
+            replacement.len(),
+            "name length is declared"
+        );
+        let headers: [(&[u8], usize, usize); 2] = [
+            (&[0x50, 0x4b, 0x03, 0x04], 30, 6),
+            (&[0x50, 0x4b, 0x01, 0x02], 46, 8),
+        ];
+        let mut patched = 0;
+        let mut at = 0;
+        while at + placeholder.len() <= bytes.len() {
+            let hit = &bytes[at..at + placeholder.len()] == placeholder;
+            let header = headers.iter().find(|(sig, name_off, _)| {
+                hit && at >= *name_off && &bytes[at - name_off..at - name_off + 4] == *sig
+            });
+            match header {
+                Some((_, name_off, flags_off)) => {
+                    let flags_at = at - name_off + flags_off;
+                    bytes[at..at + placeholder.len()].copy_from_slice(replacement);
+                    bytes[flags_at + 1] |= 0x08;
+                    patched += 1;
+                    at += placeholder.len();
+                }
+                None => at += 1,
+            }
+        }
+        patched
+    }
+
+    /// The condition `ExtractError::UndecodableEntryName` is about, driven
+    /// as far as this `zip` version permits — and a tripwire for the day
+    /// it permits further.
+    ///
+    /// Measured against zip 9.0.3: `ZipFile::name()` is fallible in its
+    /// signature but unconditionally `Ok` in its body. It tries UTF-8 and
+    /// otherwise decodes CP437, which is total over bytes — all 256 values
+    /// map to a character — and it never consults the UTF-8 flag. So a
+    /// name that declares itself UTF-8 and is not UTF-8 is transliterated
+    /// rather than refused, the refusal arm is unreachable through the
+    /// crate's public reader, and what this archive actually produces is a
+    /// file materialised under an **invented** path.
+    ///
+    /// This test asserts that outcome, because asserting the refusal would
+    /// be asserting something no input can cause. If a future `zip` makes
+    /// the decode fail, the `expect` below goes red and names the arm that
+    /// has become live.
+    #[test]
+    fn extract_zip_undecodable_name_probe_zip9_materialises_a_cp437_path() {
+        let mut bytes = zip_bytes(&[("NAME.txt", b"payload")]);
+        let patched = forge_non_utf8_name(&mut bytes, b"NAME", &[0xff, 0xfe, 0xff, 0xfe]);
+        assert_eq!(
+            patched, 2,
+            "the forged name must land in both the local header and the central directory"
+        );
+
+        let mut archive =
+            zip::ZipArchive::new(Cursor::new(bytes.clone())).expect("forged archive still opens");
+        let forged = archive.by_index(0).expect("forged entry opens");
+        assert!(
+            std::str::from_utf8(forged.name_raw()).is_err(),
+            "the forged name bytes must not be valid UTF-8, or the probe proves nothing"
+        );
+        let decoded = forged
+            .name()
+            .expect(
+                "zip 9.0.3 decodes any name byte sequence via CP437; an Err here means the \
+                 crate became fallible in fact as well as in signature — rewrite this probe to \
+                 assert ExtractError::UndecodableEntryName and an empty extraction root, which \
+                 is then reachable",
+            )
+            .into_owned();
+        assert_eq!(decoded, "\u{a0}\u{25a0}\u{a0}\u{25a0}.txt");
+        drop(forged);
+
+        // Consequence for materialisation: the entry is written, under the
+        // name CP437 invented for it.
+        let dir = root();
+        let len = bytes.len() as u64;
+        let stats = extract_zip(
+            Cursor::new(bytes),
+            len,
+            dir.path(),
+            ExtractBounds::default_for_scan_materialisation(),
+        )
+        .expect("zip 9.0.3 raises no undecodable name, so the archive is accepted");
+        assert_eq!(stats.entries, 1);
+        assert_eq!(
+            fs::read(dir.path().join(&decoded)).expect("the invented path was materialised"),
+            b"payload"
+        );
+    }
+
+    /// The refusal is terminal and carries the entry index, so an operator
+    /// reading the `UnusableArchive` log line can tell which member of the
+    /// archive could not be evaluated — without the undecodable bytes
+    /// themselves being reproduced anywhere.
+    #[test]
+    fn undecodable_entry_name_refusal_names_the_index_and_not_the_bytes() {
+        let e = ExtractError::UndecodableEntryName { index: 17 };
+        let rendered = e.to_string();
+        assert!(rendered.contains("17"), "{rendered}");
+        assert!(rendered.contains("cannot be decoded"), "{rendered}");
+        assert_ne!(e, ExtractError::UncontainedPath);
+        assert_eq!(e, ExtractError::UndecodableEntryName { index: 17 });
     }
 
     #[test]

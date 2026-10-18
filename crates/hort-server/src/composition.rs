@@ -72,6 +72,9 @@ use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 // endpoint use case. Wraps the pure `PrefetchUseCase` planner above
 // with the I/O-bearing orchestration (the pure
 // planner stays untouched).
+use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
+use hort_app::use_cases::list_deliverability::ListDeliverabilityUseCase;
+use hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase;
 use hort_app::use_cases::promotion_use_case::PromotionUseCase;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::rbac_resolve_use_case::RbacResolveUseCase;
@@ -1708,6 +1711,7 @@ async fn build_notification_runtime(
     user_repo: Arc<dyn UserRepository>,
     subscription_repo: Arc<dyn hort_domain::ports::subscription_repository::SubscriptionRepository>,
     repo_repo: Arc<dyn hort_domain::ports::repository_repository::RepositoryRepository>,
+    event_visibility: Arc<EventVisibilityUseCase>,
     webhook_notifier: Arc<hort_notifier_webhook::WebhookNotifier>,
 ) -> Option<NotificationRuntime> {
     if !notify_config.enabled {
@@ -1760,6 +1764,7 @@ async fn build_notification_runtime(
         user_repo,
         subscription_repo,
         repo_repo,
+        event_visibility,
         change_listener,
         notifiers,
     );
@@ -2790,6 +2795,42 @@ pub async fn build_app_context(
         },
     ));
 
+    // The repository-visibility primitive shared by the
+    // `GET /api/v1/events` read gate and the notification dispatcher's
+    // delivery filter. ONE instance for both: the post-ingest artifact
+    // lifecycle carries no repository column, and two independent
+    // resolutions of "which repository does this event disclose" would
+    // be free to drift apart.
+    let event_visibility_use_case = Arc::new(EventVisibilityUseCase::new(Arc::new(
+        hort_adapters_postgres::event_repository_resolver::PgEventRepositoryResolver::new(
+            db.clone(),
+        ),
+    )));
+
+    // ADR 0062's constituent half for the OCI manifest read paths:
+    // "is every artifact in this manifest's closure still deliverable?".
+    // The closure is derived from the manifest's own CAS bytes (ADR 0039 —
+    // edges nominate, the bytes decide), and the catalog is then asked
+    // once, through a single statement whose terminal-status set is bound
+    // from `QuarantineStatus::is_terminal` rather than written into SQL.
+    let manifest_deliverability_use_case = Arc::new(ManifestDeliverabilityUseCase::new(
+        storage.clone(),
+        Arc::new(
+            hort_adapters_postgres::constituent_status::PgConstituentStatusReader::new(db.clone()),
+        ),
+    ));
+
+    // ADR 0062's **omission** half for the OCI surfaces hort builds out
+    // of manifest digests (the referrers index, `tags/list`): "which of
+    // these would the pull refuse?". Same question as the resolution
+    // above, different authority — a list holds no bytes to derive a
+    // closure from, so the closure comes from the `content_references`
+    // membership projection in one recursive statement. The split is
+    // the decision; see the use case's module doc before unifying them.
+    let list_deliverability_use_case = Arc::new(ListDeliverabilityUseCase::new(Arc::new(
+        hort_adapters_postgres::list_deliverability::PgListDeliverabilityCensus::new(db.clone()),
+    )));
+
     // Boot-time unsafe-config gauges for the two webhook-safety
     // operator opt-ins — see `emit_webhook_unsafe_config_gauges`.
     emit_webhook_unsafe_config_gauges(&notify_config);
@@ -2808,6 +2849,7 @@ pub async fn build_app_context(
         user_repo.clone(),
         subscription_repo.clone(),
         repo_repo.clone(),
+        event_visibility_use_case.clone(),
         webhook_notifier.clone(),
     )
     .await;
@@ -2847,11 +2889,14 @@ pub async fn build_app_context(
         // `Retry-After` is the configured observation window rather than
         // the bare anchor.
         .with_policy_projections(policy_projections.clone())
-        // ADR 0039 D5: lets the same hydration answer whether an
-        // already-expired hold is waiting on a signature, so the OCI 503
-        // sites can drop a `Retry-After` that would otherwise advertise
-        // a retry schedule the hold does not have.
-        .with_provenance_clearance_events(event_store.clone()),
+        // The artifact's own stream, for the transient read-path fields
+        // no `row -> Artifact` load can carry: whether an
+        // already-expired hold is waiting on a signature (ADR 0039 D5),
+        // so the content-route 503 sites can drop a `Retry-After` that would
+        // otherwise advertise a retry schedule the hold does not have;
+        // and the axis a `Rejected` artifact was rejected on, which
+        // lives only on its `ArtifactRejected` event.
+        .with_artifact_stream_events(event_store.clone()),
     );
 
     // `CurationUseCase` backing the
@@ -2861,8 +2906,9 @@ pub async fn build_app_context(
     // Composes:
     //   - `event_publisher` — single per-call audit append site
     //   - `artifact_repo` + `lifecycle` — atomic state-transition write
-    //     path through `commit_transition_with_score` (mirrors
-    //     `QuarantineUseCase::admin_release`)
+    //     path through `commit_transition_with_score` (the same
+    //     chokepoint every per-artifact state transition in `hort-app`
+    //     commits through)
     //   - `policy_projections` — held for future per-row deadline
     //     resolution
     //   - the three Pg curation list repos — read surfaces
@@ -3051,6 +3097,11 @@ pub async fn build_app_context(
         // mounts the `/api/v1/subscriptions` + `/api/v1/events`
         // routes.
         subscription_use_case,
+        event_visibility_use_case,
+        // The OCI manifest read paths' constituent gate; `hort-http-oci`
+        // calls it from `serve` for GET and HEAD alike.
+        manifest_deliverability_use_case,
+        list_deliverability_use_case,
         // Curator decision authority over quarantined /
         // non-terminal artifacts; HTTP decision handlers mount under
         // `/api/v1/admin/curation/...`.
@@ -4235,6 +4286,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

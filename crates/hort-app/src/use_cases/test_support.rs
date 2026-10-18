@@ -23,7 +23,9 @@ use hort_domain::entities::mutable_ref::{MutableRef, RefTarget};
 use hort_domain::entities::repository::{
     IndexMode, PrefetchPolicy, ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
-use hort_domain::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection};
+use hort_domain::entities::scan_policy::{
+    ExclusionProjection, ScanPolicyProjection, SeverityThreshold,
+};
 use hort_domain::entities::user::{AuthProvider, User};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{
@@ -41,22 +43,30 @@ use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
 use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
+use hort_domain::ports::constituent_status::{
+    terminal_statuses_by_refusal_precedence, ConstituentStatusReader, TerminalConstituent,
+};
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
 use hort_domain::ports::curation_queue_repository::{
     CurationQueueEntry, CurationQueueFilter, CurationQueueRepository,
 };
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
+use hort_domain::ports::event_repository_resolver::{
+    EventAggregateRepositories, EventRepositoryResolver,
+};
 use hort_domain::ports::event_store::{
-    AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
+    AppendEvents, AppendResult, EventStore, ExpectedVersion, ReadFrom, SealAuthority, SealOutcome,
+    SubscribeFrom,
 };
 use hort_domain::ports::format_handler::{FormatHandler, GroupMembership, MetadataStrategy};
 use hort_domain::ports::identity_provider::{IdentityProvider, IdpClaims, OidcValidationError};
 use hort_domain::ports::jobs_repository::{
-    JobRow, JobsRepository, ListJobsFilter, ListJobsPage, ScanJob,
+    CompensatingDelete, JobRow, JobsRepository, ListJobsFilter, ListJobsPage, ScanJob,
 };
 use hort_domain::ports::kubernetes_secret_writer::{
     KubernetesSecretWriter, ManagedSecret, ManagedSecretSpec,
 };
+use hort_domain::ports::list_deliverability::{ListDeliverabilityCensus, CLOSURE_EDGE_KINDS};
 use hort_domain::ports::oidc_issuer_repository::OidcIssuerRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::ref_lifecycle::{RefCommitOutcome, RefLifecyclePort};
@@ -71,8 +81,8 @@ use hort_domain::ports::repository_upstream_mapping_repository::{
 };
 use hort_domain::ports::scan_findings_repository::{ScanFindingsRepository, ScanFindingsRow};
 use hort_domain::ports::service_account_repository::ServiceAccountRepository;
-use hort_domain::ports::stateful_upload_staging::StatefulUploadStagingPort;
-use hort_domain::ports::storage::{PutResult, StoragePort, StreamItem};
+use hort_domain::ports::stateful_upload_staging::{StagingAppend, StatefulUploadStagingPort};
+use hort_domain::ports::storage::{CasIntegrityFailure, PutResult, StoragePort, StreamItem};
 use hort_domain::ports::upstream_proxy::{
     ArtifactFetch, BlobFetch, BlobStream, ManifestFetch, ManifestFetchOutcome,
     MetadataFetchOutcome, ReferrerDescriptor, UpstreamProxy,
@@ -165,6 +175,14 @@ pub struct MockArtifactRepository {
     /// Mirrors [`Self::pypi_calls`] for
     /// [`find_oci_image_manifests_without_kind`](ArtifactRepository::find_oci_image_manifests_without_kind).
     oci_calls: Mutex<Vec<CandidacyCall>>,
+    /// FIFO of injected errors for
+    /// [`package_version_status`](ArtifactRepository::package_version_status).
+    /// Each call pops the front and returns it verbatim. Lets a test
+    /// drive the per-format index sources' behaviour when the hold-state
+    /// read fails: an empty status map is the claim "hort holds nothing
+    /// non-servable here", so a source that substituted one would
+    /// re-advertise every version hort is holding back.
+    package_version_status_errors: Mutex<std::collections::VecDeque<DomainError>>,
 }
 
 /// One recorded call to either backfill-candidacy query. See
@@ -191,6 +209,7 @@ impl MockArtifactRepository {
             delete_errors: Mutex::new(std::collections::VecDeque::new()),
             pypi_calls: Mutex::new(Vec::new()),
             oci_calls: Mutex::new(Vec::new()),
+            package_version_status_errors: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -220,6 +239,17 @@ impl MockArtifactRepository {
     /// failures.
     pub fn fail_next_find_by_repo_and_checksum(&self, err: DomainError) {
         self.find_by_repo_and_checksum_errors
+            .lock()
+            .unwrap()
+            .push_back(err);
+    }
+
+    /// Arm the next
+    /// [`package_version_status`](ArtifactRepository::package_version_status)
+    /// call to fail with `err`. Queued, so a test can arm several
+    /// consecutive failures.
+    pub fn fail_next_package_version_status(&self, err: DomainError) {
+        self.package_version_status_errors
             .lock()
             .unwrap()
             .push_back(err);
@@ -286,6 +316,10 @@ impl MockArtifactRepository {
     /// Every write reaches the map through here, including
     /// `MockArtifactLifecycle`'s `commit_transition*`, so this is the only
     /// place the clear has to happen.
+    ///
+    /// The third non-column field, `rejection_reason`, is cleared on the
+    /// **read** side instead — see [`Self::projected`] for why the two
+    /// sit on opposite sides of the map.
     pub fn insert(&self, artifact: Artifact) {
         let mut row = artifact;
         row.quarantine_deadline = None;
@@ -293,11 +327,91 @@ impl MockArtifactRepository {
         self.artifacts.lock().unwrap().insert(row.id, row);
     }
 
+    /// Hand `artifact` out of a **read** method the way the real
+    /// projection load does, clearing `rejection_reason`.
+    ///
+    /// The structured rejection axis is not a column on the `artifacts`
+    /// projection — it lives on the artifact's `ArtifactRejected` event —
+    /// so `hort-adapters-postgres`'s one `row -> Artifact` mapper reads
+    /// `rejection_reason: None` as a constant. A mock that handed the
+    /// seeded entity back verbatim would therefore serve a state **no
+    /// producer in the system can write**, and a test standing on it
+    /// would prove a behaviour production cannot show: the axis would
+    /// appear on a read path that never derived it, and a consumer that
+    /// stopped deriving it from the stream would still look correct here.
+    ///
+    /// The clear belongs on the read side rather than in [`Self::insert`]
+    /// — unlike the transient hold pair, which is cleared on write — so a
+    /// fixture can still seed the field and assert on what a write path
+    /// stored (`Self::get` / `Self::snapshot_all` are the harness's own
+    /// view of the map, not the port). Production draws the same line in
+    /// the same place: the column does not exist, so the value is lost at
+    /// the load, and a caller that needs the axis re-derives it from the
+    /// stream.
+    fn projected(artifact: &Artifact) -> Artifact {
+        let mut row = artifact.clone();
+        row.rejection_reason = None;
+        row
+    }
+
+    /// The repository a seeded artifact belongs to, by identity — the
+    /// read [`MockEventRepositoryResolver`] serves from, so the harness
+    /// keeps ONE source of truth for "which repo owns this artifact".
+    /// Deliberately ignores `is_deleted`: resolution is identity, and a
+    /// retired artifact's events still have to be gated against the
+    /// repository that owned it.
+    pub fn repository_of(&self, artifact_id: Uuid) -> Option<Uuid> {
+        self.artifacts
+            .lock()
+            .unwrap()
+            .get(&artifact_id)
+            .map(|a| a.repository_id)
+    }
+
     /// Friendly alias for [`Self::insert`] for the
     /// cascade tests, which read "seed this artifact" more clearly
     /// than "insert this artifact".
     pub fn seed_artifact(&self, artifact: Artifact) {
         self.insert(artifact);
+    }
+
+    /// The status of `hash` inside `repo` as a **deliverability** read
+    /// sees it: repository-scoped and `deleted_at`-filtered, which is
+    /// what the Postgres constituent statement does and what every live
+    /// `ArtifactRepository` read does.
+    ///
+    /// Deliberately narrower than this mock's own
+    /// `find_by_repo_and_checksum`, which does not filter retirement.
+    /// [`MockConstituentStatusReader`] serves from here so a test cannot
+    /// prove a manifest withheld by a row no read path can see.
+    pub fn live_status_in_repo(&self, repo: Uuid, hash: &ContentHash) -> Option<QuarantineStatus> {
+        self.live_row_in_repo(repo, hash)
+            .map(|(_id, status)| status)
+    }
+
+    /// The same live, repository-scoped row as
+    /// [`Self::live_status_in_repo`], but carrying its **id** as well.
+    ///
+    /// [`MockListDeliverabilityCensus`] needs the id because the
+    /// membership projection keys its edges on `source_artifact_id`, so
+    /// descending from a content hash means resolving the hash to a row
+    /// first — the same two-step the Postgres census does with
+    /// `artifacts.checksum_sha256 → artifacts.id`. Returning the pair
+    /// keeps the retirement and repository filters in **one** place
+    /// rather than letting a second helper drift.
+    pub fn live_row_in_repo(
+        &self,
+        repo: Uuid,
+        hash: &ContentHash,
+    ) -> Option<(Uuid, QuarantineStatus)> {
+        self.artifacts
+            .lock()
+            .unwrap()
+            .values()
+            .find(|a| {
+                a.repository_id == repo && a.sha256_checksum == *hash && a.deleted_at.is_none()
+            })
+            .map(|a| (a.id, a.quarantine_status))
     }
 
     /// Seed a synthetic `(name, version, status)`
@@ -412,7 +526,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .lock()
             .unwrap()
             .get(&id)
-            .cloned()
+            .map(Self::projected)
             .ok_or_else(|| DomainError::NotFound {
                 entity: "Artifact",
                 id: id.to_string(),
@@ -428,7 +542,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .find(|a| a.sha256_checksum.as_ref() == sha)
-            .cloned();
+            .map(Self::projected);
         Box::pin(async move { Ok(result) })
     }
 
@@ -452,7 +566,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .find(|a| a.repository_id == repository_id && a.sha256_checksum.as_ref() == sha)
-            .cloned();
+            .map(Self::projected);
         Box::pin(async move { Ok(result) })
     }
 
@@ -489,7 +603,7 @@ impl ArtifactRepository for MockArtifactRepository {
         let mut items: Vec<Artifact> = all
             .values()
             .filter(|a| a.repository_id == repository_id)
-            .cloned()
+            .map(Self::projected)
             .collect();
         items.sort_by(|a, b| a.name.cmp(&b.name));
         let total = items.len() as u64;
@@ -540,7 +654,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .find(|a| a.repository_id == repository_id && a.path == path)
-            .cloned();
+            .map(Self::projected);
         Box::pin(async move { Ok(result) })
     }
 
@@ -581,7 +695,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .filter(|a| a.repository_id == repository_id && a.name == normalized_name)
-            .cloned()
+            .map(Self::projected)
             .collect();
         items.sort_by(|a, b| a.version.cmp(&b.version));
         let total = items.len() as u64;
@@ -605,7 +719,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .filter(|a| a.repository_id == repository_id && a.name_as_published == raw_name)
-            .cloned()
+            .map(Self::projected)
             .collect();
         items.sort_by(|a, b| a.version.cmp(&b.version));
         let total = items.len() as u64;
@@ -659,7 +773,7 @@ impl ArtifactRepository for MockArtifactRepository {
                         QuarantineStatus::Quarantined | QuarantineStatus::Released
                     )
             })
-            .cloned()
+            .map(Self::projected)
             .collect();
         // Mock truncates at the same `LIMIT_LIST_MAX_ITEMS` cap as
         // production so use-case tests behave identically. The over-fetch
@@ -707,7 +821,7 @@ impl ArtifactRepository for MockArtifactRepository {
                         None => true,
                     }
             })
-            .cloned()
+            .map(Self::projected)
             .collect();
         let cap = hort_domain::types::LIMIT_LIST_MAX_ITEMS as usize;
         Box::pin(async move { Ok(LimitedList::from_overfetch(items, cap)) })
@@ -751,7 +865,7 @@ impl ArtifactRepository for MockArtifactRepository {
                     None => true,
                 }
             })
-            .cloned()
+            .map(Self::projected)
             .collect();
         // Stable order so the offset/limit window is deterministic across
         // pages — the adapter does not guarantee order, but a stable order
@@ -781,6 +895,14 @@ impl ArtifactRepository for MockArtifactRepository {
         // `artifact.quarantine_deadline`; the SQL adapter projects the
         // same column. Discovery uses it to discriminate `Quarantined`
         // from `QuarantinedAwaitingRelease`.
+        if let Some(err) = self
+            .package_version_status_errors
+            .lock()
+            .unwrap()
+            .pop_front()
+        {
+            return Box::pin(async move { Err(err) });
+        }
         let pkg = package.to_owned();
         let mut triples: Vec<(String, QuarantineStatus, Option<DateTime<Utc>>)> = self
             .artifacts
@@ -905,7 +1027,7 @@ impl ArtifactRepository for MockArtifactRepository {
                     // Keyset cursor — mirrors the adapter's `id > $after`.
                     && after.is_none_or(|cursor| a.id > cursor)
             })
-            .cloned()
+            .map(Self::projected)
             .collect();
         // Stable order for test assertions — sort by id so repeated
         // invocations on the same seeded state return the same prefix.
@@ -953,7 +1075,7 @@ impl ArtifactRepository for MockArtifactRepository {
                     // Keyset cursor — mirrors the adapter's `id > $after`.
                     && after.is_none_or(|cursor| a.id > cursor)
             })
-            .cloned()
+            .map(Self::projected)
             .collect();
         items.sort_by_key(|a| a.id);
         items.truncate(limit as usize);
@@ -1961,9 +2083,11 @@ impl UserRepository for MockUserRepository {
 // ---------------------------------------------------------------------------
 
 /// In-memory [`PermissionGrantRepository`] for use-case and inbound-HTTP
-/// handler tests. `list_all` returns the seeded set; the gitops
-/// reconcile surface (`list_managed_by_gitops` / `save_managed`) is a
-/// no-op because the effective-permissions read path never touches it.
+/// handler tests. `list_all` returns the seeded set;
+/// `list_managed_by_gitops` is a no-op because the
+/// effective-permissions read path never touches it. The port carries
+/// no write method — the gitops reconcile is
+/// `AuthorityLifecyclePort::commit_permission_grants`.
 pub struct MockPermissionGrantRepository {
     grants: Mutex<Vec<hort_domain::entities::rbac::PermissionGrant>>,
 }
@@ -2002,13 +2126,6 @@ impl hort_domain::ports::permission_grant_repository::PermissionGrantRepository
     ) -> BoxFut<'_, DomainResult<Vec<hort_domain::entities::rbac::PermissionGrant>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
-
-    fn save_managed(
-        &self,
-        _items: &[hort_domain::entities::rbac::PermissionGrant],
-    ) -> BoxFut<'_, DomainResult<()>> {
-        Box::pin(async { Ok(()) })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2017,9 +2134,10 @@ impl hort_domain::ports::permission_grant_repository::PermissionGrantRepository
 
 /// In-memory [`ClaimMappingRepository`](hort_domain::ports::claim_mapping_repository::ClaimMappingRepository)
 /// for use-case and inbound-HTTP handler tests. `list_all` returns the
-/// seeded set; the gitops reconcile surface (`list_managed_by_gitops` /
-/// `save_managed`) is a no-op because the what-if resolver read path
-/// (`RbacResolveUseCase`) only calls `list_all`.
+/// seeded set; `list_managed_by_gitops` is a no-op because the what-if
+/// resolver read path (`RbacResolveUseCase`) only calls `list_all`. The
+/// port carries no write method — the gitops reconcile is
+/// `AuthorityLifecyclePort::commit_claim_mappings`.
 pub struct MockClaimMappingRepository {
     mappings: Mutex<Vec<hort_domain::entities::rbac::ClaimMapping>>,
 }
@@ -2055,13 +2173,6 @@ impl hort_domain::ports::claim_mapping_repository::ClaimMappingRepository
         &self,
     ) -> BoxFut<'_, DomainResult<Vec<hort_domain::entities::rbac::ClaimMapping>>> {
         Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn save_managed(
-        &self,
-        _items: &[hort_domain::entities::rbac::ClaimMapping],
-    ) -> BoxFut<'_, DomainResult<()>> {
-        Box::pin(async { Ok(()) })
     }
 }
 
@@ -2337,6 +2448,29 @@ impl MockEventStore {
             .insert(stream_id.to_string(), events);
     }
 
+    /// The events currently seeded for `stream_id`, read off the state
+    /// map rather than through [`EventStore::read_stream`] — the same
+    /// rationale as [`StreamTail::current_expected_version`]: the probe
+    /// consumes no one-shot injection and does not move the read
+    /// counter, so a test asserting "this path observed the stream
+    /// exactly once" stays meaningful while the harness looks at the
+    /// stream behind its back.
+    ///
+    /// Paired with [`Self::set_stream`] by a harness that has to make a
+    /// batch this mock recorded through [`Self::appended_batches`]
+    /// visible to a LATER read — `append` records batches without
+    /// folding them into this map, so "the scan committed, then the
+    /// sweep read the stream" is a sequence a test has to settle
+    /// explicitly.
+    pub fn stream_snapshot(&self, stream_id: &StreamId) -> Vec<PersistedEvent> {
+        self.streams
+            .lock()
+            .unwrap()
+            .get(&stream_id.to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Arm a one-shot stream replacement: the NEXT `read_stream` of
     /// `stream_id` serves the CURRENT content, then `events` replaces it
     /// so every subsequent read sees the new state. Models a concurrent
@@ -2377,6 +2511,41 @@ impl MockEventStore {
     }
 }
 
+/// An event-store mock that can report a stream's current tail without
+/// going through [`EventStore::read_stream`].
+///
+/// Exists so [`MockArtifactLifecycle::with_optimistic_concurrency`] can
+/// check an append's `ExpectedVersion` against whichever event-store mock
+/// a test is using — this crate has more than one, and the use cases whose
+/// interleaving behaviour needs pinning are reached through harnesses
+/// built on a file-local mock.
+///
+/// Answering off the seeded state rather than through `read_stream` is the
+/// point: the probe consumes no one-shot injection and does not move the
+/// read counter, so a test asserting "this path observed the stream
+/// exactly once" stays meaningful while the harness checks versions behind
+/// its back.
+pub trait StreamTail: Send + Sync {
+    /// The `ExpectedVersion` an append against `stream_id` must carry to
+    /// be ordered immediately after the stream's current content.
+    fn current_expected_version(&self, stream_id: &StreamId) -> ExpectedVersion;
+}
+
+impl StreamTail for MockEventStore {
+    fn current_expected_version(&self, stream_id: &StreamId) -> ExpectedVersion {
+        match self
+            .streams
+            .lock()
+            .unwrap()
+            .get(&stream_id.to_string())
+            .and_then(|events| events.last())
+        {
+            Some(last) => ExpectedVersion::Exact(last.stream_position),
+            None => ExpectedVersion::NoStream,
+        }
+    }
+}
+
 impl EventStore for MockEventStore {
     fn append(&self, batch: AppendEvents) -> BoxFut<'_, DomainResult<AppendResult>> {
         if let Some(err) = self.fail_all_appends.lock().unwrap().clone() {
@@ -2384,6 +2553,25 @@ impl EventStore for MockEventStore {
         }
         if let Some(err) = self.fail_next_append.lock().unwrap().take() {
             return Box::pin(async move { Err(err) });
+        }
+        // This double round-trips: `read_stream` serves what `append`
+        // accepted, so what a test seeds here is what production code
+        // reads back and decides on. It therefore has to refuse exactly
+        // what the production adapter refuses — `validate_and_serialize`
+        // calls `validate()` on every event of every batch, so an event
+        // this accepts and the adapter would not is an event no producer
+        // in the system can write, and a test standing on one proves a
+        // behaviour production cannot show.
+        //
+        // That is not hypothetical: the authority-derivation corpus held
+        // `ScanCompleted` events whose `finding_count` disagreed with
+        // their severity summary, which `validate()` rejects, and the
+        // two release paths appeared to agree because the fixture made
+        // them agree.
+        for to_append in &batch.events {
+            if let Err(e) = to_append.event.validate() {
+                return Box::pin(async move { Err(e) });
+            }
         }
         let count = batch.events.len() as u64;
         self.appended.lock().unwrap().push(batch);
@@ -2484,11 +2672,20 @@ impl EventStore for MockEventStore {
     // Retention stubs: this is the workhorse mock for hort-app tests. No
     // current test reaches the retention paths, so a panic flags
     // accidental misuse rather than silently masking a coverage hole.
-    fn delete_stream(&self, _stream_id: StreamId) -> BoxFut<'_, DomainResult<()>> {
+    fn delete_stream(
+        &self,
+        _stream_id: StreamId,
+        _authority: SealAuthority,
+    ) -> BoxFut<'_, DomainResult<SealOutcome>> {
         Box::pin(async { unimplemented!("retention path not exercised by these tests") })
     }
 
-    fn archive_stream(&self, _stream_id: StreamId, _target: &str) -> BoxFut<'_, DomainResult<()>> {
+    fn archive_stream(
+        &self,
+        _stream_id: StreamId,
+        _target: &str,
+        _authority: SealAuthority,
+    ) -> BoxFut<'_, DomainResult<SealOutcome>> {
         Box::pin(async { unimplemented!("retention path not exercised by these tests") })
     }
 }
@@ -2560,6 +2757,31 @@ pub struct MockArtifactLifecycle {
     /// use this snapshot — the enqueues no longer flow through the `jobs`
     /// mock, they ride the lifecycle call so they commit atomically.
     ingest_enqueues: Mutex<Vec<(Uuid, Vec<IngestEnqueue>)>>,
+    /// Every `(artifact_id, edges)` passed to
+    /// `commit_transition_with_enqueues`, in call order. Tests asserting the
+    /// ingest path committed the right refcount edges use this snapshot —
+    /// the use case no longer calls `ContentReferenceIndex::insert` for them
+    /// itself; they ride the lifecycle call so they commit atomically with
+    /// the artifact.
+    ingest_edges: Mutex<Vec<(Uuid, Vec<ContentReference>)>>,
+    /// Optional handle to the paired [`MockContentReferenceIndex`] so the
+    /// `commit_transition_with_enqueues` override actually applies the edges
+    /// it was handed — mirroring the Postgres adapter, which writes them in
+    /// the same transaction as the artifact. Wired, it also means an armed
+    /// insert failure on that mock fails the commit, which is how the
+    /// app-layer pins assert the whole transition rolls back.
+    content_references: Mutex<Option<Arc<MockContentReferenceIndex>>>,
+    /// When `Some`, every commit method checks its `AppendEvents`'
+    /// `expected_version` against the paired event store's CURRENT stream
+    /// state and returns `DomainError::Conflict` on a mismatch — the
+    /// optimistic-concurrency check the Postgres adapter gets for free
+    /// from the event-store append inside its transaction.
+    ///
+    /// Opt-in via [`with_optimistic_concurrency`](Self::with_optimistic_concurrency):
+    /// the default mock accepts any version, which is what every test
+    /// that is not about interleaving wants (most seed a stream and
+    /// append with a version they never computed from it).
+    optimistic_concurrency: Mutex<Option<Arc<dyn StreamTail>>>,
     /// FIFO of injected errors: each `commit_transition` call pops the
     /// front and returns it verbatim without recording the transition.
     /// Used by tests exercising error-path metric emission (e.g.
@@ -2583,8 +2805,46 @@ impl MockArtifactLifecycle {
             score_deltas: Mutex::new(Vec::new()),
             sbom_replace_calls: Mutex::new(Vec::new()),
             ingest_enqueues: Mutex::new(Vec::new()),
+            ingest_edges: Mutex::new(Vec::new()),
+            content_references: Mutex::new(None),
+            optimistic_concurrency: Mutex::new(None),
             next_error: Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Make every commit method honour its batch's `ExpectedVersion`
+    /// against `events`' current stream state, returning
+    /// `DomainError::Conflict` on a mismatch.
+    ///
+    /// This is what lets a test construct the interleaving the
+    /// `ArtifactAtVersion` contract is about: pair a decision with a
+    /// version, let a concurrent verdict land on the stream (e.g. via
+    /// [`MockEventStore::set_stream_after_next_read`]), and watch the
+    /// stale decision's append lose. Without it the mock accepts any
+    /// version and every such test would pass vacuously.
+    pub fn with_optimistic_concurrency(self, events: Arc<dyn StreamTail>) -> Self {
+        *self.optimistic_concurrency.lock().unwrap() = Some(events);
+        self
+    }
+
+    /// `Err(Conflict)` when optimistic concurrency is armed and `batch`'s
+    /// `expected_version` does not match the paired store's current tail.
+    /// `ExpectedVersion::Any` is no check by definition and always passes.
+    fn check_expected_version(&self, batch: &AppendEvents) -> DomainResult<()> {
+        let Some(events) = self.optimistic_concurrency.lock().unwrap().clone() else {
+            return Ok(());
+        };
+        if batch.expected_version == ExpectedVersion::Any {
+            return Ok(());
+        }
+        let current = events.current_expected_version(&batch.stream_id);
+        if current == batch.expected_version {
+            return Ok(());
+        }
+        Err(DomainError::Conflict(format!(
+            "stream {} is at {:?}, append expected {:?}",
+            batch.stream_id, current, batch.expected_version
+        )))
     }
 
     /// Wire the mock lifecycle to a [`MockArtifactMetadataRepository`]
@@ -2594,6 +2854,16 @@ impl MockArtifactLifecycle {
     /// stay one expression.
     pub fn with_metadata_repo(self, repo: Arc<MockArtifactMetadataRepository>) -> Self {
         *self.artifact_metadata.lock().unwrap() = Some(repo);
+        self
+    }
+
+    /// Wire the mock lifecycle to a [`MockContentReferenceIndex`] so
+    /// `commit_transition_with_enqueues`' `edges` argument lands in the
+    /// index — matching the real Postgres adapter, which upserts those rows
+    /// in the same transaction as the artifact and rolls the whole
+    /// transition back when one of them fails. Builder-style.
+    pub fn with_content_references(self, refs: Arc<MockContentReferenceIndex>) -> Self {
+        *self.content_references.lock().unwrap() = Some(refs);
         self
     }
 
@@ -2649,6 +2919,36 @@ impl MockArtifactLifecycle {
     /// (these no longer flow through the `jobs` mock).
     pub fn ingest_enqueues(&self) -> Vec<(Uuid, Vec<IngestEnqueue>)> {
         self.ingest_enqueues.lock().unwrap().clone()
+    }
+
+    /// Every `(artifact_id, edges)` passed to
+    /// `commit_transition_with_enqueues`, in call order. Tests assert the
+    /// ingest path committed the right refcount edges atomically with the
+    /// artifact — rather than asserting on the index's contents, which say
+    /// nothing about *which* write put them there.
+    pub fn ingest_edges(&self) -> Vec<(Uuid, Vec<ContentReference>)> {
+        self.ingest_edges.lock().unwrap().clone()
+    }
+
+    /// Flattened `(artifact_id, kind, target_content_hash)` for every
+    /// recorded edge — the shape most assertions want, since the per-edge
+    /// `metadata` is an empty object on every ingest edge and
+    /// `recorded_at` is a wall-clock value no test pins.
+    pub fn ingest_edge_kinds(&self) -> Vec<(Uuid, String, String)> {
+        self.ingest_edges
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(aid, edges)| {
+                edges.iter().map(move |e| {
+                    (
+                        *aid,
+                        e.kind.clone(),
+                        e.target_content_hash.as_ref().to_owned(),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Flattened `(artifact_id, format, priority, trigger_source)` for every
@@ -2772,6 +3072,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
+        if let Err(e) = self.check_expected_version(&events) {
+            return Box::pin(async move { Err(e) });
+        }
         let count = events.events.len() as u64;
         // Propagate the metadata into the paired metadata repo (when
         // wired). Done before recording the transition so the
@@ -2816,6 +3119,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
+        if let Err(e) = self.check_expected_version(&events) {
+            return Box::pin(async move { Err(e) });
+        }
         // The conditional status write is resolved BEFORE the transition
         // is recorded, so a `Conflict` leaves no stray entry behind —
         // same ordering as the failure-injection guard above, and same
@@ -2841,26 +3147,50 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
     }
 
     /// Override the lossy default so the mock records the atomic enqueues
-    /// (and still performs the transition work) — mirrors the real Postgres
-    /// adapter committing the `jobs` rows in the same transaction.
+    /// and edges (and still performs the transition work) — mirrors the real
+    /// Postgres adapter committing the `jobs` rows and the
+    /// `content_references` rows in the same transaction.
+    ///
+    /// The edges go through the paired [`MockContentReferenceIndex`] when one
+    /// is wired, **before** anything is recorded and all-or-nothing: that
+    /// mock's armed insert failures therefore fail the whole call and leave
+    /// no transition, no enqueue, no artifact and no earlier edge behind —
+    /// which is the property the adapter gets from the transaction and the
+    /// app-layer pins assert here.
     fn commit_transition_with_enqueues<'a>(
         &'a self,
         artifact: &'a Artifact,
         events: AppendEvents,
         metadata: Option<ArtifactMetadata>,
         enqueues: &'a [IngestEnqueue],
+        edges: &'a [ContentReference],
     ) -> BoxFut<'a, DomainResult<AppendResult>> {
         let recorded = enqueues.to_vec();
+        let recorded_edges = edges.to_vec();
         Box::pin(async move {
             // Failure-injection up front (mirrors `commit_transition`), before
             // recording anything, so a forced error leaves no stray enqueue.
             if let Some(err) = self.next_error.lock().unwrap().pop_front() {
                 return Err(err);
             }
+            self.check_expected_version(&events)?;
+            // The edges first, so a failing one aborts before any of the
+            // transition's other effects are visible. The real adapter
+            // applies them last (the FK needs the artifact row) and gets the
+            // same all-or-nothing from the rollback; the mock has no
+            // rollback, so it orders the fallible part first instead.
+            let paired_refs = self.content_references.lock().unwrap().clone();
+            if let Some(refs) = paired_refs {
+                refs.insert_all_or_nothing(&recorded_edges).await?;
+            }
             self.ingest_enqueues
                 .lock()
                 .unwrap()
                 .push((artifact.id, recorded));
+            self.ingest_edges
+                .lock()
+                .unwrap()
+                .push((artifact.id, recorded_edges));
             let count = events.events.len() as u64;
             if let (Some(meta), Some(repo)) = (
                 metadata.as_ref(),
@@ -2899,6 +3229,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
             if let Some(err) = self.next_error.lock().unwrap().pop_front() {
                 return Err(err);
             }
+            self.check_expected_version(&events)?;
             if let Some((repo_id, delta)) = score_delta {
                 self.score_deltas.lock().unwrap().push((repo_id, delta));
             }
@@ -2947,6 +3278,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         // forced error doesn't leave a stray entry in the snapshot.
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
+        }
+        if let Err(e) = self.check_expected_version(&events_clone) {
+            return Box::pin(async move { Err(e) });
         }
 
         // Conditional status write resolved before ANY state is recorded
@@ -3085,27 +3419,65 @@ impl RepoSecurityScoreRepository for MockRepoSecurityScoreRepository {
 // MockStoragePort
 // ---------------------------------------------------------------------------
 
-/// `AsyncRead` that delivers a fixed prefix of valid bytes and then
-/// yields `io::ErrorKind::InvalidData` at EOF.
+/// `AsyncRead` that delivers a fixed prefix of bytes and then fails at
+/// EOF instead of signalling end-of-stream.
 ///
-/// This is a faithful, dependency-free reproduction of the failure
-/// shape `hort_adapters_storage::VerifyingReader` produces when a stored
-/// blob has been tampered: bytes flow through normally, and the final
-/// (would-be-EOF) `poll_read` errors with `InvalidData` instead of
-/// signalling end-of-stream. Used only by `MockStoragePort` when armed
-/// via [`MockStoragePort::fail_next_get_truncated`]; it intentionally
-/// does NOT depend on `hort-adapters-storage` so the per-format
-/// adapter-free dep graph is preserved.
+/// This is a faithful, dependency-free reproduction of the failure shape
+/// `hort_adapters_storage::VerifyingReader` produces: bytes flow through
+/// normally, and the final (would-be-EOF) `poll_read` errors. It
+/// intentionally does NOT depend on `hort-adapters-storage` so the
+/// per-format adapter-free dep graph is preserved — which makes keeping
+/// the two in step a review obligation, not a compile-time one.
+///
+/// `verdict` decides which of the two failure *classes* is reproduced,
+/// and the distinction is the whole point of the double: with `Some`, the
+/// error carries a [`CasIntegrityFailure`] payload exactly as a verifying
+/// adapter's does, and a consumer can recover the observed digest; with
+/// `None`, it is a backend read failure that happens to share the
+/// `InvalidData` kind and carries no verdict. A double that only ever
+/// produced the first would let a consumer pass its tests by matching on
+/// the kind — and a consumer that matched on the kind would read every
+/// backend complaint as corruption.
 struct TruncatingReader {
     prefix: std::io::Cursor<Vec<u8>>,
     errored: bool,
+    verdict: Option<CasIntegrityFailure>,
 }
 
 impl TruncatingReader {
-    fn new(prefix: Vec<u8>) -> Self {
+    /// Reader whose EOF failure is an integrity verdict: the delivered
+    /// bytes are `prefix`, the CAS key claims `expected`, and the
+    /// computed digest the verdict carries is the real SHA-256 of what
+    /// was delivered — the same value a production verifier would have
+    /// accumulated.
+    fn verifying(prefix: Vec<u8>, expected: ContentHash) -> Self {
+        let computed: ContentHash = hex::encode(Sha256::digest(&prefix))
+            .parse()
+            .expect("SHA-256 digest is always valid ContentHash hex");
         Self {
             prefix: std::io::Cursor::new(prefix),
             errored: false,
+            verdict: Some(CasIntegrityFailure { expected, computed }),
+        }
+    }
+
+    /// Reader whose EOF failure is a plain backend I/O failure — same
+    /// `InvalidData` kind, no verdict attached.
+    fn without_verdict(prefix: Vec<u8>) -> Self {
+        Self {
+            prefix: std::io::Cursor::new(prefix),
+            errored: false,
+            verdict: None,
+        }
+    }
+
+    fn failure(&self) -> std::io::Error {
+        match &self.verdict {
+            Some(v) => v.clone().into_io_error(),
+            None => std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "simulated backend read failure (no integrity verdict)",
+            ),
         }
     }
 }
@@ -3120,10 +3492,7 @@ impl AsyncRead for TruncatingReader {
             // Defensive: a well-behaved consumer stops after the error,
             // but if polled again keep returning the same error rather
             // than spuriously signalling clean EOF.
-            return std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "CAS integrity failure (simulated): blob tampered",
-            )));
+            return std::task::Poll::Ready(Err(self.failure()));
         }
         let before = buf.filled().len();
         match Pin::new(&mut self.prefix).poll_read(cx, buf) {
@@ -3133,10 +3502,7 @@ impl AsyncRead for TruncatingReader {
                     // reader; instead error, exactly as `VerifyingReader`
                     // does on an EOF hash mismatch.
                     self.errored = true;
-                    std::task::Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "CAS integrity failure (simulated): blob tampered",
-                    )))
+                    std::task::Poll::Ready(Err(self.failure()))
                 } else {
                     std::task::Poll::Ready(Ok(()))
                 }
@@ -3166,7 +3532,22 @@ pub struct MockStoragePort {
     /// is the hash the CAS says the content should be, the value is
     /// the actual (wrong) bytes. Allows the scrub tests to exercise
     /// the `hash_mismatch` path without needing a real collision.
+    ///
+    /// `get` serves these through a *verifying* reader, like both
+    /// production adapters: the wrong bytes flow and the read then fails
+    /// at EOF with the integrity verdict. See
+    /// [`MockStoragePort::inject_tampered`].
     tampered: Mutex<HashMap<ContentHash, Vec<u8>>>,
+    /// Hashes served as raw wrong bytes with **no** verification —
+    /// a `StoragePort` implementation that does not honour the ADR 0003
+    /// read contract. Distinct from `tampered` because the two drive
+    /// different halves of the scrub's classification; see
+    /// [`MockStoragePort::inject_tampered_unverified`].
+    tampered_unverified: Mutex<HashMap<ContentHash, Vec<u8>>>,
+    /// Hashes whose `get` stream fails with a plain backend I/O error —
+    /// no integrity verdict attached. See
+    /// [`MockStoragePort::inject_read_failure`].
+    read_failures: Mutex<HashMap<ContentHash, Vec<u8>>>,
     /// Keys that should appear in `list_all` as `ShardTruncated` —
     /// injected by scrub-use-case tests to
     /// exercise the `shards_truncated` rollup without needing a real
@@ -3242,6 +3623,8 @@ impl MockStoragePort {
             list_errors: Mutex::new(Vec::new()),
             missing_keys: Mutex::new(Vec::new()),
             tampered: Mutex::new(HashMap::new()),
+            tampered_unverified: Mutex::new(HashMap::new()),
+            read_failures: Mutex::new(HashMap::new()),
             shard_truncations: Mutex::new(Vec::new()),
             put_calls: AtomicUsize::new(0),
             get_calls: AtomicUsize::new(0),
@@ -3336,11 +3719,50 @@ impl MockStoragePort {
     }
 
     /// Register a hash that `list_all` will report as present, and whose
-    /// `get()` returns `content` — but `content` hashes to something
-    /// different, simulating a tampered blob. Used by scrub-use-case
-    /// tests to exercise the `result="hash_mismatch"` emission path.
+    /// `get()` serves `content` — bytes that hash to something other than
+    /// `hash`, simulating a tampered blob. Used by scrub-use-case tests
+    /// to exercise the `result="hash_mismatch"` emission path.
+    ///
+    /// **The reader honours the production read contract** (ADR 0003): the
+    /// wrong bytes flow through and the read then fails at EOF with the
+    /// integrity verdict, exactly as `FilesystemStorage::get` and
+    /// `ObjectStoreStorage::get` do. Handing back a bare `Cursor` over the
+    /// wrong bytes instead would exercise a reader shape that no shipped
+    /// adapter produces — and a consumer that only works against that
+    /// shape passes its tests while being unable to classify a real
+    /// corrupted blob at all. Use
+    /// [`inject_tampered_unverified`](Self::inject_tampered_unverified)
+    /// when the non-verifying shape is deliberately what is under test.
     pub fn inject_tampered(&self, hash: ContentHash, content: Vec<u8>) {
         self.tampered.lock().unwrap().insert(hash, content);
+    }
+
+    /// Register a tampered hash served as **raw wrong bytes with no
+    /// verification** — a `StoragePort` implementation that does not
+    /// honour the ADR 0003 read contract.
+    ///
+    /// Not the shape of any shipped adapter, and deliberately so: it is
+    /// the case the `CasScrubUseCase`'s own re-hash exists to catch, since
+    /// a verifier cannot detect its own absence. Scrub tests use this to
+    /// prove corruption is still classified when nothing beneath the scrub
+    /// checks it.
+    pub fn inject_tampered_unverified(&self, hash: ContentHash, content: Vec<u8>) {
+        self.tampered_unverified
+            .lock()
+            .unwrap()
+            .insert(hash, content);
+    }
+
+    /// Register a hash whose `get()` stream delivers `prefix` and then
+    /// fails with a **plain backend I/O error carrying no integrity
+    /// verdict** — at the same `io::ErrorKind::InvalidData` a verifying
+    /// reader uses.
+    ///
+    /// The kind collision is the point: a consumer that classified by
+    /// `ErrorKind` would call this corruption. It is a read failure, and
+    /// the scrub must keep reporting it as one.
+    pub fn inject_read_failure(&self, hash: ContentHash, prefix: Vec<u8>) {
+        self.read_failures.lock().unwrap().insert(hash, prefix);
     }
 
     /// Register a synthetic `StreamItem::ShardTruncated` for `list_all`
@@ -3483,16 +3905,35 @@ impl StoragePort for MockStoragePort {
         // surfaces only when the HTTP handler streams the body), which
         // is precisely the wiring under test.
         if let Some(prefix) = self.inject_get_truncated.lock().unwrap().remove(hash) {
-            let reader = TruncatingReader::new(prefix);
+            let reader = TruncatingReader::verifying(prefix, hash.clone());
             return Box::pin(
                 async move { Ok(Box::new(reader) as Box<dyn AsyncRead + Send + Unpin>) },
             );
         }
-        // Tampered entries take precedence: the mock returns the
-        // (wrong) bytes the test pre-registered so the scrub use case
-        // computes an observed_hash that differs from `hash`.
-        let tampered = self.tampered.lock().unwrap().get(hash).cloned();
-        let result = tampered.or_else(|| self.data.lock().unwrap().get(hash).cloned());
+        // A backend read failure with no integrity verdict, at the same
+        // `InvalidData` kind a verifying reader uses — persistent (not
+        // consumed) so a retrying consumer fails on every attempt.
+        if let Some(prefix) = self.read_failures.lock().unwrap().get(hash).cloned() {
+            let reader = TruncatingReader::without_verdict(prefix);
+            return Box::pin(
+                async move { Ok(Box::new(reader) as Box<dyn AsyncRead + Send + Unpin>) },
+            );
+        }
+        // Tampered entries take precedence over stored content: the mock
+        // serves the (wrong) bytes the test pre-registered through a
+        // verifying reader, so the consumer sees what a production
+        // adapter would hand it — the wrong bytes, then an EOF failure
+        // carrying the digest they actually hashed to.
+        if let Some(content) = self.tampered.lock().unwrap().get(hash).cloned() {
+            let reader = TruncatingReader::verifying(content, hash.clone());
+            return Box::pin(
+                async move { Ok(Box::new(reader) as Box<dyn AsyncRead + Send + Unpin>) },
+            );
+        }
+        // Wrong bytes with no verification at all — a port implementation
+        // that ignores the ADR 0003 read contract.
+        let unverified = self.tampered_unverified.lock().unwrap().get(hash).cloned();
+        let result = unverified.or_else(|| self.data.lock().unwrap().get(hash).cloned());
         let hash_display = hash.to_string();
         Box::pin(async move {
             match result {
@@ -3579,8 +4020,10 @@ impl StoragePort for MockStoragePort {
     fn list_all(&self) -> BoxFuture<'_, DomainResult<BoxStream<'_, StreamItem>>> {
         // Union of:
         //   - hashes in `data` (normal CAS entries)
-        //   - tampered hashes (they "exist" per `list_all` but `get`
-        //     returns wrong bytes)
+        //   - tampered hashes, verifying and unverified (they "exist" per
+        //     `list_all` but `get` serves wrong bytes)
+        //   - injected read-failure hashes (they "exist" but `get`'s
+        //     stream fails with no integrity verdict)
         //   - injected missing hashes (they "exist" per `list_all` but
         //     `get` returns NotFound)
         //   - injected list errors (yield as ReadError before hashes).
@@ -3604,6 +4047,12 @@ impl StoragePort for MockStoragePort {
             items.push(StreamItem::Hash(h.clone()));
         }
         for h in self.tampered.lock().unwrap().keys() {
+            items.push(StreamItem::Hash(h.clone()));
+        }
+        for h in self.tampered_unverified.lock().unwrap().keys() {
+            items.push(StreamItem::Hash(h.clone()));
+        }
+        for h in self.read_failures.lock().unwrap().keys() {
             items.push(StreamItem::Hash(h.clone()));
         }
         for h in self.missing_keys.lock().unwrap().iter() {
@@ -3668,6 +4117,40 @@ pub fn sample_artifact(status: QuarantineStatus) -> Artifact {
     }
 }
 
+/// The finding-free severity summary — every tier zero. The only shape
+/// whose finding count is 0, and the one a clean `ScanCompleted`
+/// carries.
+pub fn no_findings() -> SeveritySummary {
+    SeveritySummary {
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+        negligible: 0,
+    }
+}
+
+/// `count` findings, all of them in `tier`.
+///
+/// Shared by every fixture that builds a `ScanCompleted`, because the
+/// tier is the fact those fixtures have to be able to state: against a
+/// `Critical` threshold, `High`/`Medium` findings are **present and
+/// permitted** while `Critical` ones **block**, and the two cases
+/// differ in nothing else. A fixture that takes only a count cannot
+/// express the production case where the scanner found things and the
+/// verdict let them through — which is exactly the case the release
+/// gate's two paths once disagreed about.
+pub fn findings_in_tier(count: u32, tier: SeverityThreshold) -> SeveritySummary {
+    let mut summary = no_findings();
+    match tier {
+        SeverityThreshold::Critical => summary.critical = count,
+        SeverityThreshold::High => summary.high = count,
+        SeverityThreshold::Medium => summary.medium = count,
+        SeverityThreshold::Low => summary.low = count,
+    }
+    summary
+}
+
 pub fn sample_repository() -> Repository {
     Repository {
         id: Uuid::new_v4(),
@@ -3729,7 +4212,7 @@ pub fn dummy_persisted_event(
 /// (placeholder) blob hash, a zero count gets `None`. Shared by every
 /// `Rejected`-artifact re-evaluation test — the policy-mutation pass and
 /// the curator-invoked `CurationUseCase::reevaluate` both read this
-/// event shape via `scan_history::read_last_scan_completed`.
+/// event shape via `scan_history::last_scan_completed`.
 pub fn persisted_scan_completed(
     artifact_id: Uuid,
     critical: u32,
@@ -3770,7 +4253,7 @@ pub fn persisted_scan_completed(
 /// Build an `ArtifactRejected` `PersistedEvent` carrying `rejected_by`.
 /// Every `Rejected`-artifact re-evaluation caller re-hydrates the
 /// rejection reason from this event shape (ADR 0041 invariant #6(a)) via
-/// `scan_history::read_last_rejection_reason`.
+/// `scan_history::last_rejection_reason`.
 pub fn persisted_artifact_rejected(
     artifact_id: Uuid,
     rejected_by: RejectionReason,
@@ -3789,6 +4272,37 @@ pub fn persisted_artifact_rejected(
         correlation_id: Uuid::new_v4(),
         causation_id: None,
         actor: Actor::Api(api_actor()),
+        event_version: 1,
+        stored_at: Utc::now(),
+    }
+}
+
+/// Build a `ProvenanceVerified` `PersistedEvent`. The provenance leg of
+/// the release gate (ADR 0027) is `Cleared` iff one of these is anywhere
+/// on the artifact's stream, so every test that needs the gate to clear
+/// seeds this shape.
+pub fn persisted_provenance_verified(artifact_id: Uuid, stream_position: u64) -> PersistedEvent {
+    use hort_domain::events::ProvenanceVerified;
+    use hort_domain::ports::provenance::SignerIdentity;
+    PersistedEvent {
+        event_id: Uuid::new_v4(),
+        stream_id: StreamId::artifact(artifact_id),
+        stream_position,
+        global_position: stream_position,
+        event: DomainEvent::ProvenanceVerified(ProvenanceVerified {
+            artifact_id,
+            content_hash: VALID_SHA256.parse().unwrap(),
+            backend: "cosign".into(),
+            signer: SignerIdentity {
+                issuer: "iss".into(),
+                san: "san".into(),
+            },
+            predicate_type: None,
+            cascaded_from: None,
+        }),
+        correlation_id: Uuid::new_v4(),
+        causation_id: None,
+        actor: hort_domain::events::system_actor(),
         event_version: 1,
         stored_at: Utc::now(),
     }
@@ -4571,6 +5085,284 @@ impl MockArtifactGroupRepository {
         );
         self.by_coords.lock().unwrap().insert(key, updated);
     }
+
+    /// The repository a seeded group belongs to, by group id. The read
+    /// [`MockEventRepositoryResolver`] serves from — see
+    /// [`MockArtifactRepository::repository_of`] for why the harness
+    /// resolves out of the seeded rows rather than a second map.
+    pub fn repository_of(&self, group_id: Uuid) -> Option<Uuid> {
+        self.by_id
+            .lock()
+            .unwrap()
+            .get(&group_id)
+            .map(|g| g.repository_id)
+    }
+}
+
+/// [`EventRepositoryResolver`] over the harness's own seeded rows.
+///
+/// Deliberately **not** a third seedable map: it reads
+/// [`MockArtifactRepository`] / [`MockArtifactGroupRepository`], so a
+/// test that seeds an artifact has already told the resolver which
+/// repository owns it, and the harness cannot drift into a state where
+/// the artifact store and the visibility gate disagree. An id with no
+/// seeded row is absent from the answer — which is what makes the
+/// consumers' fail-closed path testable without a second knob.
+pub struct MockEventRepositoryResolver {
+    artifacts: Arc<MockArtifactRepository>,
+    groups: Arc<MockArtifactGroupRepository>,
+    /// FIFO of injected errors. Each call pops the front and returns it
+    /// verbatim, so a test can drive a consumer's
+    /// resolution-failed arm.
+    errors: Mutex<std::collections::VecDeque<DomainError>>,
+}
+
+impl MockEventRepositoryResolver {
+    #[must_use]
+    pub fn new(
+        artifacts: Arc<MockArtifactRepository>,
+        groups: Arc<MockArtifactGroupRepository>,
+    ) -> Self {
+        Self {
+            artifacts,
+            groups,
+            errors: Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Arm the next resolution call to fail with `err`. Queued, so a
+    /// test can arm several consecutive failures.
+    pub fn fail_next(&self, err: DomainError) {
+        self.errors.lock().unwrap().push_back(err);
+    }
+}
+
+impl EventRepositoryResolver for MockEventRepositoryResolver {
+    fn resolve_event_aggregates<'a>(
+        &'a self,
+        artifact_ids: &'a [Uuid],
+        artifact_group_ids: &'a [Uuid],
+    ) -> BoxFuture<'a, DomainResult<EventAggregateRepositories>> {
+        if let Some(err) = self.errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
+        let artifacts = artifact_ids
+            .iter()
+            .filter_map(|id| self.artifacts.repository_of(*id).map(|repo| (*id, repo)))
+            .collect();
+        let groups = artifact_group_ids
+            .iter()
+            .filter_map(|id| self.groups.repository_of(*id).map(|repo| (*id, repo)))
+            .collect();
+        Box::pin(async move {
+            Ok(EventAggregateRepositories {
+                artifacts,
+                artifact_groups: groups,
+            })
+        })
+    }
+}
+
+/// [`ConstituentStatusReader`] over the harness's own seeded artifact
+/// rows.
+///
+/// Deliberately **not** a second seedable map, for the same reason
+/// [`MockEventRepositoryResolver`] is not: a test that seeds a
+/// constituent has already told the deliverability resolution what state
+/// that constituent is in, so the harness cannot drift into a state
+/// where the artifact store and the gate disagree. A hash with no seeded
+/// row is absent from the answer — which is what makes the
+/// "absence is not a hold" arm testable without a knob.
+///
+/// The three decisions it mirrors from the Postgres statement, because a
+/// double that answered them differently would let a handler test stand
+/// on behaviour production does not have:
+///
+/// - **repository scope** and **retirement** — served through
+///   [`MockArtifactRepository::live_status_in_repo`];
+/// - **which statuses are terminal** — filtered through
+///   `QuarantineStatus::is_terminal`, never a written-out list;
+/// - **which verdict wins, and which constituent is named** — the
+///   domain's refusal precedence first, then the caller's own closure
+///   ordering, so `HEAD` and `GET` name the same constituent.
+pub struct MockConstituentStatusReader {
+    artifacts: Arc<MockArtifactRepository>,
+    /// FIFO of injected errors. Each call pops the front and returns it
+    /// verbatim, so a test can drive a consumer's fail-closed arm.
+    errors: Mutex<std::collections::VecDeque<DomainError>>,
+    calls: AtomicUsize,
+}
+
+impl MockConstituentStatusReader {
+    #[must_use]
+    pub fn new(artifacts: Arc<MockArtifactRepository>) -> Self {
+        Self {
+            artifacts,
+            errors: Mutex::new(std::collections::VecDeque::new()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Arm the next resolution call to fail with `err`. Queued, so a
+    /// test can arm several consecutive failures.
+    pub fn fail_next(&self, err: DomainError) {
+        self.errors.lock().unwrap().push_back(err);
+    }
+
+    /// How many times the reader was asked — the handle for the
+    /// "one lookup, not one per constituent" assertion.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl ConstituentStatusReader for MockConstituentStatusReader {
+    fn strongest_terminal_constituent<'a>(
+        &'a self,
+        repository_id: Uuid,
+        constituents: &'a [ContentHash],
+    ) -> BoxFut<'a, DomainResult<Option<TerminalConstituent>>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(err) = self.errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
+        // Rank by the domain's refusal precedence, then by the caller's
+        // closure position — the statement's `ORDER BY t.precedence,
+        // w.position`.
+        let precedence = terminal_statuses_by_refusal_precedence();
+        let answer = constituents
+            .iter()
+            .enumerate()
+            .filter_map(|(position, hash)| {
+                let status = self.artifacts.live_status_in_repo(repository_id, hash)?;
+                let rank = precedence.iter().position(|s| *s == status)?;
+                Some((rank, position, hash.clone(), status))
+            })
+            .min_by_key(|(rank, position, _, _)| (*rank, *position))
+            .map(|(_, _, content_hash, status)| TerminalConstituent {
+                content_hash,
+                status,
+            });
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+/// [`ListDeliverabilityCensus`] over the harness's own seeded artifact
+/// rows and membership edges.
+///
+/// Deliberately **not** a seedable answer map, for the same reason
+/// [`MockConstituentStatusReader`] is not: a test that seeds an entry's
+/// closure has already told the census what it needs, so the harness
+/// cannot drift into a state where the artifact store, the edge
+/// projection and the gate disagree. A candidate with no seeded row is
+/// absent from the answer — which is what makes the "absence is not a
+/// verdict" arm testable without a knob.
+///
+/// The four decisions it mirrors from the Postgres statement, because a
+/// double that answered them differently would let a handler test stand
+/// on behaviour production does not have:
+///
+/// - **where the closure comes from** — the `content_references` edges
+///   the harness holds, restricted to
+///   [`CLOSURE_EDGE_KINDS`], descended transitively;
+/// - **repository scope** and **retirement** — served through
+///   [`MockArtifactRepository::live_row_in_repo`], on the descent and on
+///   the verdict alike;
+/// - **which statuses are terminal** — filtered through
+///   `QuarantineStatus::is_terminal`, never a written-out list;
+/// - **termination** — a `seen` set, the in-memory equal of the
+///   statement's `UNION` distinctness, so a cyclic edge set answers
+///   instead of spinning.
+pub struct MockListDeliverabilityCensus {
+    artifacts: Arc<MockArtifactRepository>,
+    content_references: Arc<MockContentReferenceIndex>,
+    /// FIFO of injected errors. Each call pops the front and returns it
+    /// verbatim, so a test can drive a consumer's fail-closed arm.
+    errors: Mutex<std::collections::VecDeque<DomainError>>,
+    calls: AtomicUsize,
+    last_candidates: Mutex<Vec<ContentHash>>,
+}
+
+impl MockListDeliverabilityCensus {
+    #[must_use]
+    pub fn new(
+        artifacts: Arc<MockArtifactRepository>,
+        content_references: Arc<MockContentReferenceIndex>,
+    ) -> Self {
+        Self {
+            artifacts,
+            content_references,
+            errors: Mutex::new(std::collections::VecDeque::new()),
+            calls: AtomicUsize::new(0),
+            last_candidates: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Arm the next census call to fail with `err`. Queued, so a test
+    /// can arm several consecutive failures.
+    pub fn fail_next(&self, err: DomainError) {
+        self.errors.lock().unwrap().push_back(err);
+    }
+
+    /// How many times the census was asked — the handle for the
+    /// "one call for the batch, not one per entry" assertion.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    /// The candidate set the most recent call carried, in the caller's
+    /// own order. The handle for asserting **which** entries a surface
+    /// asked about — e.g. that a `tags/list` page left its
+    /// version-targeted refs out of the ask entirely.
+    pub fn last_candidates(&self) -> Vec<ContentHash> {
+        self.last_candidates.lock().unwrap().clone()
+    }
+}
+
+impl ListDeliverabilityCensus for MockListDeliverabilityCensus {
+    fn non_deliverable_in<'a>(
+        &'a self,
+        repository_id: Uuid,
+        candidates: &'a [ContentHash],
+    ) -> BoxFut<'a, DomainResult<std::collections::HashSet<ContentHash>>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        *self.last_candidates.lock().unwrap() = candidates.to_vec();
+        if let Some(err) = self.errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
+        let mut withheld: std::collections::HashSet<ContentHash> = std::collections::HashSet::new();
+        for candidate in candidates {
+            // Breadth-first over the candidate's own hash plus its
+            // membership closure, stopping at hashes already visited —
+            // the statement's `UNION` distinctness.
+            let mut seen: std::collections::HashSet<ContentHash> =
+                std::collections::HashSet::from([candidate.clone()]);
+            let mut frontier: Vec<ContentHash> = vec![candidate.clone()];
+            while let Some(member) = frontier.pop() {
+                let Some((source_id, status)) =
+                    self.artifacts.live_row_in_repo(repository_id, &member)
+                else {
+                    // Absent — not local yet, or retired. Neither a
+                    // verdict nor a node with edges to descend.
+                    continue;
+                };
+                if status.is_terminal() {
+                    withheld.insert(candidate.clone());
+                    break;
+                }
+                for target in self.content_references.closure_targets_of(
+                    repository_id,
+                    source_id,
+                    &CLOSURE_EDGE_KINDS,
+                ) {
+                    if seen.insert(target.clone()) {
+                        frontier.push(target);
+                    }
+                }
+            }
+        }
+        Box::pin(async move { Ok(withheld) })
+    }
 }
 
 impl ArtifactGroupRepository for MockArtifactGroupRepository {
@@ -4791,11 +5583,13 @@ impl ArtifactGroupLifecyclePort for MockArtifactGroupLifecyclePort {
 // cost for unit tests.
 // ---------------------------------------------------------------------------
 
-/// In-memory mock for [`StatefulUploadStagingPort`]. Appends accumulate
-/// in a `Vec<u8>` per session id; `stream_read` returns an `AsyncRead`
-/// wrapping a cursor over the bytes; `delete` is idempotent. Matches
-/// the real `FilesystemStatefulUploadStaging`'s semantics without
-/// touching disk.
+/// In-memory mock for [`StatefulUploadStagingPort`]. Writes land at the
+/// caller's asserted offset in a `Vec<u8>` per session id; `stream_read`
+/// returns an `AsyncRead` wrapping a cursor over the bytes; `delete` is
+/// idempotent. Matches the real `FilesystemStatefulUploadStaging`'s
+/// semantics — including the gap refusal, the unaccounted-tail
+/// truncation and the `truncated` over-budget signal — without touching
+/// disk.
 pub struct MockStatefulUploadStagingPort {
     chunks: Mutex<HashMap<Uuid, Vec<u8>>>,
 }
@@ -4822,20 +5616,47 @@ impl MockStatefulUploadStagingPort {
 }
 
 impl StatefulUploadStagingPort for MockStatefulUploadStagingPort {
-    fn append(
+    fn append_at(
         &self,
         session_id: Uuid,
+        offset: u64,
+        limit: u64,
         mut stream: Box<dyn AsyncRead + Send + Unpin>,
-    ) -> BoxFuture<'_, DomainResult<u64>> {
+    ) -> BoxFuture<'_, DomainResult<StagingAppend>> {
         Box::pin(async move {
+            // Read one byte past the budget so the mock can report
+            // `truncated` the way the filesystem adapter does — and, like
+            // it, keep that surplus byte out of the staged bytes.
             let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.map_err(|e| {
-                DomainError::Invariant(format!("mock stateful upload staging read failed: {e}"))
-            })?;
+            (&mut stream)
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut buf)
+                .await
+                .map_err(|e| {
+                    DomainError::Invariant(format!("mock stateful upload staging read failed: {e}"))
+                })?;
+            let truncated = buf.len() as u64 > limit;
+            if truncated {
+                buf.truncate(limit as usize);
+            }
+
             let mut chunks = self.chunks.lock().unwrap();
             let entry = chunks.entry(session_id).or_default();
+            let current = entry.len() as u64;
+            // Position-checked write, same three cases as the filesystem
+            // adapter: refuse a gap, drop an unaccounted tail, then write.
+            if current < offset {
+                return Err(DomainError::Invariant(format!(
+                    "stateful upload staging write at offset {offset} would leave a gap: \
+                     staging holds {current} bytes"
+                )));
+            }
+            entry.truncate(offset as usize);
             entry.extend_from_slice(&buf);
-            Ok(entry.len() as u64)
+            Ok(StagingAppend {
+                total: entry.len() as u64,
+                truncated,
+            })
         })
     }
 
@@ -4913,20 +5734,37 @@ impl StatefulUploadStagingPort for MockStatefulUploadStagingPort {
 /// target.
 ///
 /// Failure-injection hooks (`fail_next_insert`, `fail_next_insert_for_kind`,
-/// `fail_next_delete`) cover the warn-on-fail arms in
-/// `IngestUseCase`, `QuarantineUseCase`, and `ApplyConfigUseCase`.
-/// Those arms log a `tracing::warn!` and return `Ok(())` from the
-/// outer use case — the projection write is intentionally post-commit
-/// and post-event-append (eventual consistency; the
-/// `RefcountReconcileUseCase` sweep heals drift).
+/// `fail_next_delete`) drive two different postures, and which one a test is
+/// pinning matters:
+///
+/// - **Every mint path aborts.** `ingest_inner` and `register_by_hash_inner`
+///   hand their whole edge set — each artifact's own `primary_content`, the
+///   `metadata_blob` / `wheel_metadata` edges, and the caller-supplied
+///   `claimed_edges` (`oci_subject`, `oci_config`, `oci_layer`,
+///   `oci_index_member`) — to the lifecycle transition, so an armed insert
+///   failure there fails the whole mint and leaves no artifact, no event and
+///   no earlier edge behind. Reached through
+///   [`Self::insert_all_or_nothing`], which is what gives the mock the
+///   rollback the Postgres adapter gets from its transaction. A
+///   `content_references` row is a claim on bytes — the storage GC deletes a
+///   blob exactly when no row targets its hash — so a committed artifact
+///   without its edge is collectable, not merely un-projected.
+/// - **The warn-on-fail arms that remain are DELETES, not inserts**: the
+///   reject-side `delete_by_source` sweeps in `QuarantineUseCase` and
+///   `ApplyConfigUseCase`. Those log a `tracing::warn!` and return `Ok(())`
+///   from the outer use case. No production mint path warns-and-continues on
+///   an insert any more; the only post-commit *inserters* left are the two
+///   backfill handlers, whose job is repairing referrers that committed
+///   edgeless in an earlier release.
+///
 /// The toggles let tests branch-cover the `if let Err(e) = …` arms
 /// without abandoning the happy-path semantics every other test
 /// relies on. The hooks are one-shot: they fire on the next matching
 /// call, then clear themselves. `fail_next_insert_for_kind` is the
 /// version that targets a specific `kind` value — the only way to
-/// reliably exercise the second insert in `ingest_inner` (the
+/// reliably exercise the second edge of `ingest_inner`'s set (the
 /// `metadata_blob` arm) without also failing the preceding
-/// `primary_content` arm.
+/// `primary_content` one.
 pub struct MockContentReferenceIndex {
     entries: Mutex<HashMap<(Uuid, Uuid, String, String), ContentReference>>,
     next_insert_error: Mutex<Option<DomainError>>,
@@ -4966,15 +5804,76 @@ impl MockContentReferenceIndex {
         self.entries.lock().unwrap().len()
     }
 
+    /// Every target `source` points at under one of `kinds`, inside
+    /// `repo` — the harness's own view of one descent step in the
+    /// membership projection.
+    ///
+    /// Not a port method, and deliberately so: no production caller
+    /// reads "all targets of a source across several kinds" through the
+    /// `ContentReferenceIndex` trait, because the one consumer that
+    /// needs that walk does it inside a single SQL statement
+    /// (`hort_adapters_postgres::list_deliverability`). Adding a trait
+    /// method for it would put a port on the interface that nothing
+    /// implements for a reason. [`MockListDeliverabilityCensus`] uses
+    /// this to mirror that statement's descent in memory.
+    ///
+    /// Ordering is `recorded_at` then target hash, so a test that seeds
+    /// several edges gets a stable walk.
+    pub fn closure_targets_of(&self, repo: Uuid, source: Uuid, kinds: &[&str]) -> Vec<ContentHash> {
+        let mut rows: Vec<ContentReference> = self
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| {
+                e.repository_id == repo
+                    && e.source_artifact_id == source
+                    && kinds.contains(&e.kind.as_str())
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.recorded_at.cmp(&b.recorded_at).then_with(|| {
+                a.target_content_hash
+                    .as_ref()
+                    .cmp(b.target_content_hash.as_ref())
+            })
+        });
+        rows.into_iter().map(|e| e.target_content_hash).collect()
+    }
+
+    /// Upsert `edges` as **one all-or-nothing** write: on the first failure
+    /// the map is restored to exactly what it held before the call.
+    ///
+    /// The counterpart of the Postgres adapter committing an artifact's
+    /// `content_references` edges inside the artifact's own transaction —
+    /// the rollback is what makes a half-applied edge set unreachable there,
+    /// and a mock that left the earlier edges behind would let an app-layer
+    /// pin assert a state production cannot produce. Used by
+    /// [`MockArtifactLifecycle`]'s `commit_transition_with_enqueues`
+    /// override; the per-edge [`ContentReferenceIndex::insert`] stays as it
+    /// was for the paths that genuinely write one edge at a time.
+    pub async fn insert_all_or_nothing(&self, edges: &[ContentReference]) -> DomainResult<()> {
+        // Cloned, not held: `insert` below takes the same lock.
+        let before = self.entries.lock().unwrap().clone();
+        for edge in edges {
+            if let Err(e) = self.insert(edge.clone()).await {
+                *self.entries.lock().unwrap() = before;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     /// Arm a one-shot failure on the **next** [`ContentReferenceIndex::insert`]
     /// call regardless of `kind`. The error is consumed by the next call;
     /// subsequent calls succeed unless re-armed. Used by branch-coverage
-    /// tests for the warn-on-fail arms when the path under
-    /// test only issues one insert call (e.g. the inline-strategy
-    /// `ingest_direct` path or `register_by_hash`). For the
-    /// `HashReference`-strategy split path, which issues two insert
-    /// calls in `(primary_content, metadata_blob)` order, prefer
-    /// [`Self::fail_next_insert_for_kind`] to target one arm in
+    /// tests when the path under test commits or writes a single edge (the
+    /// inline-strategy `ingest_direct` path, which carries only
+    /// `primary_content`, or `register_by_hash`). For the
+    /// `HashReference`-strategy split path, whose transition carries
+    /// `(primary_content, metadata_blob)` in that order, prefer
+    /// [`Self::fail_next_insert_for_kind`] to target one edge in
     /// isolation.
     pub fn fail_next_insert(&self, err: DomainError) {
         *self.next_insert_error.lock().unwrap() = Some(err);
@@ -4984,9 +5883,11 @@ impl MockContentReferenceIndex {
     /// [`ContentReferenceIndex::insert`] call **whose `kind` matches**.
     /// Inserts with a different `kind` are unaffected (they pass through
     /// to the happy path). The error is consumed by the next matching
-    /// call. Used by the metadata-blob warn-on-fail branch test to fail
-    /// the second insert call on the HashReference split path while
-    /// letting the preceding `primary_content` insert succeed.
+    /// call. Used by the metadata-blob and wheel-metadata rollback pins to
+    /// fail the second or third edge of `ingest_inner`'s set while letting
+    /// the preceding `primary_content` one through — which is what makes
+    /// those pins about the rollback of an *earlier* edge rather than about
+    /// a single-edge failure.
     pub fn fail_next_insert_for_kind(&self, kind: &str, err: DomainError) {
         *self.next_insert_error_for_kind.lock().unwrap() = Some((kind.to_string(), err));
     }
@@ -5153,6 +6054,10 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
 /// unique constraint exactly. Upsert semantics fall out of
 /// `HashMap::insert`; delete is a `remove` call; both forms of `list`
 /// scan the values.
+///
+/// The gitops-partition writes are the inherent
+/// [`Self::write_managed_row`] / [`Self::delete_managed_row`], not
+/// trait methods — see those docstrings.
 pub struct MockRepositoryUpstreamMappingRepository {
     entries: Mutex<HashMap<(Uuid, String), RepositoryUpstreamMapping>>,
 }
@@ -5166,6 +6071,62 @@ impl MockRepositoryUpstreamMappingRepository {
 
     pub fn entry_count(&self) -> usize {
         self.entries.lock().unwrap().len()
+    }
+
+    /// The gitops-partition row write, as an **inherent** method.
+    ///
+    /// [`RepositoryUpstreamMappingRepository`] carries no managed-write
+    /// method any more — the write is
+    /// `AuthorityLifecyclePort::commit_upstream_mappings`, which
+    /// commits the rows with their audit events in one transaction. The
+    /// mock authority port in
+    /// `apply_config_use_case::tests::MockAuthorityLifecycle` writes
+    /// through here, exactly as the Postgres adapter writes through
+    /// `repository_upstream_mapping_repo::save_managed_in_tx`: the body
+    /// stays, the trait wrapper is what went away.
+    ///
+    /// Mirrors the adapter's invariant guard and its stable-id
+    /// contract (`ON CONFLICT (repository_id, path_prefix) DO UPDATE`
+    /// keeps the existing row's id and `created_at`).
+    pub fn write_managed_row(&self, mapping: &RepositoryUpstreamMapping) -> DomainResult<()> {
+        use hort_domain::entities::managed_by::ManagedBy;
+        let mb = mapping.managed_by;
+        if mb != ManagedBy::GitOps {
+            return Err(DomainError::Invariant(format!(
+                "a managed upstream mapping must carry managed_by=GitOps, got {mb}"
+            )));
+        }
+        if mapping.managed_by_digest.is_none() {
+            return Err(DomainError::Invariant(
+                "a managed upstream mapping must carry managed_by_digest".into(),
+            ));
+        }
+
+        let mut to_store = mapping.clone();
+        let key = (to_store.repository_id, to_store.path_prefix.clone());
+        let mut guard = self.entries.lock().unwrap();
+        if let Some(existing) = guard.get(&key) {
+            to_store.id = existing.id;
+            to_store.created_at = existing.created_at;
+        }
+        to_store.updated_at = Utc::now();
+        guard.insert(key, to_store);
+        Ok(())
+    }
+
+    /// The gitops-partition row delete, as an inherent method — see
+    /// [`Self::write_managed_row`]. Defensive like the adapter's
+    /// statement: a non-gitops row at that id is left alone.
+    pub fn delete_managed_row(&self, id: Uuid) {
+        use hort_domain::entities::managed_by::ManagedBy;
+        let mut guard = self.entries.lock().unwrap();
+        let key_to_remove = guard
+            .iter()
+            .find(|(_, m)| m.id == id && m.managed_by == ManagedBy::GitOps)
+            .map(|(k, _)| k.clone());
+        if let Some(key) = key_to_remove {
+            guard.remove(&key);
+        }
     }
 }
 
@@ -5251,52 +6212,6 @@ impl RepositoryUpstreamMappingRepository for MockRepositoryUpstreamMappingReposi
                 .then_with(|| a.id.cmp(&b.id))
         });
         Box::pin(async move { Ok(out) })
-    }
-
-    fn save_managed(&self, mapping: &RepositoryUpstreamMapping) -> BoxFuture<'_, DomainResult<()>> {
-        use hort_domain::entities::managed_by::ManagedBy;
-        // Mirror the adapter's invariant guard.
-        let mb = mapping.managed_by;
-        if mb != ManagedBy::GitOps {
-            return Box::pin(async move {
-                Err(DomainError::Invariant(format!(
-                    "save_managed called with managed_by={mb} (expected GitOps)"
-                )))
-            });
-        }
-        if mapping.managed_by_digest.is_none() {
-            return Box::pin(async move {
-                Err(DomainError::Invariant(
-                    "save_managed called without managed_by_digest".into(),
-                ))
-            });
-        }
-
-        let mut to_store = mapping.clone();
-        let key = (to_store.repository_id, to_store.path_prefix.clone());
-        let mut guard = self.entries.lock().unwrap();
-        if let Some(existing) = guard.get(&key) {
-            // Stable-id contract.
-            to_store.id = existing.id;
-            to_store.created_at = existing.created_at;
-        }
-        to_store.updated_at = Utc::now();
-        guard.insert(key, to_store);
-        Box::pin(async move { Ok(()) })
-    }
-
-    fn delete_managed_by_id(&self, id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
-        use hort_domain::entities::managed_by::ManagedBy;
-        // Defensive: only remove if the row is gitops-managed.
-        let mut guard = self.entries.lock().unwrap();
-        let key_to_remove = guard
-            .iter()
-            .find(|(_, m)| m.id == id && m.managed_by == ManagedBy::GitOps)
-            .map(|(k, _)| k.clone());
-        if let Some(key) = key_to_remove {
-            guard.remove(&key);
-        }
-        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -5423,6 +6338,12 @@ pub struct MockUpstreamProxy {
     metadata: Mutex<HashMap<(String, String), Vec<u8>>>,
     /// One-shot failure for the next `fetch_metadata` call.
     next_metadata_error: Mutex<Option<DomainError>>,
+    /// Total `fetch_metadata` calls, counted whether or not a fixture
+    /// matched. Lets a test assert that a consumer actually went to the
+    /// upstream rather than answering from one of its own caches — the
+    /// only observation that distinguishes "the cache entry is gone"
+    /// from "something else served the same bytes".
+    metadata_calls: AtomicUsize,
     /// Artifact-fetch fixtures keyed by (path_prefix, path). The
     /// stored body is wrapped in a single-chunk BlobStream on read.
     artifacts: Mutex<HashMap<(String, String), MockArtifactEntry>>,
@@ -5465,6 +6386,7 @@ impl MockUpstreamProxy {
             next_manifest_error: Mutex::new(None),
             metadata: Mutex::new(HashMap::new()),
             next_metadata_error: Mutex::new(None),
+            metadata_calls: AtomicUsize::new(0),
             artifacts: Mutex::new(HashMap::new()),
             next_artifact_error: Mutex::new(None),
             referrers: Mutex::new(HashMap::new()),
@@ -5489,6 +6411,13 @@ impl MockUpstreamProxy {
     /// Seed a one-shot failure on the next `fetch_metadata` call.
     pub fn fail_next_metadata_with(&self, err: DomainError) {
         *self.next_metadata_error.lock().unwrap() = Some(err);
+    }
+
+    /// Total `fetch_metadata` calls so far, fixture-match or not. Use it
+    /// to assert a consumer actually reached the upstream rather than
+    /// answering from one of its own caches.
+    pub fn metadata_calls(&self) -> usize {
+        self.metadata_calls.load(Ordering::SeqCst)
     }
 
     /// Seed an artifact-stream fixture keyed by `(path_prefix, path)`.
@@ -5782,6 +6711,7 @@ impl UpstreamProxy for MockUpstreamProxy {
         // `MetadataFetchOutcome` shape. Tests calling
         // `metadata_body_bytes` against the outcome get the same bytes
         // back and the tempfile is cleaned up after.
+        self.metadata_calls.fetch_add(1, Ordering::SeqCst);
         let injected = self.next_metadata_error.lock().unwrap().take();
         let key = (mapping.path_prefix, path);
         let entry = self.metadata.lock().unwrap().get(&key).cloned();
@@ -6005,6 +6935,7 @@ mod upstream_metadata_mock_tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -6225,6 +7156,12 @@ impl ScanFindingsRepository for MockScanFindingsRepository {
 ///   per call, each time recording the call).
 /// - `list_jobs` returns a seeded `Vec<JobRow>`.
 /// - `get_job` returns a seeded `HashMap<Uuid, JobRow>`.
+/// - `delete_job` records the id and always reports
+///   [`CompensatingDelete::RolledBack`]. It is deliberately not seedable:
+///   the claimed-row outcome changes what the *use case* logs, not what a
+///   handler returns, and it is pinned there over the use case's own
+///   doubles (`use_cases::task_use_case`). A handler test that needs the
+///   distinction should assert it at that layer instead.
 ///
 /// All other `JobsRepository` methods delegate to the trait defaults
 /// (which return `Err(Invariant)`) to keep the mock minimal.
@@ -6803,9 +7740,9 @@ impl JobsRepository for MockJobsRepository {
         }
     }
 
-    fn delete_job<'a>(&'a self, job_id: Uuid) -> BoxFuture<'a, DomainResult<()>> {
+    fn delete_job<'a>(&'a self, job_id: Uuid) -> BoxFuture<'a, DomainResult<CompensatingDelete>> {
         self.delete_calls.lock().unwrap().push(job_id);
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(CompensatingDelete::RolledBack) })
     }
 
     fn list_jobs<'a>(
@@ -7057,6 +7994,43 @@ impl MockOidcIssuerRepository {
         items.sort_by(|a, b| a.name.cmp(&b.name));
         items
     }
+
+    /// The issuer row upsert, as an **inherent** method.
+    ///
+    /// [`OidcIssuerRepository`] carries no write method any more — the
+    /// write is `AuthorityLifecyclePort::commit_oidc_issuers`, which
+    /// commits the row with its audit event in one transaction. The
+    /// mock authority port in
+    /// `apply_config_use_case::tests::MockAuthorityLifecycle` writes
+    /// through here, exactly as the Postgres adapter writes through
+    /// `oidc_issuer_repo::upsert_in_tx`.
+    ///
+    /// Upsert on name: the apply pipeline's create path may have minted
+    /// a fresh UUID for a row whose name already exists, so the
+    /// existing id is reused to match the adapter's
+    /// `ON CONFLICT (name) DO UPDATE` semantics. Unlike [`Self::seed`],
+    /// which inserts by the issuer's own id.
+    pub fn upsert_row(&self, issuer: &hort_domain::entities::oidc_issuer::OidcIssuer) {
+        let mut issuers = self.issuers.lock().unwrap();
+        let existing_id = issuers
+            .values()
+            .find(|i| i.name == issuer.name)
+            .map(|i| i.id);
+        let id = existing_id.unwrap_or(issuer.id);
+        let mut stored = issuer.clone();
+        stored.id = id;
+        issuers.insert(id, stored);
+    }
+
+    /// The issuer row delete, as an inherent method — see
+    /// [`Self::upsert_row`]. Deleting a name that is not present is a
+    /// no-op, like the adapter's statement.
+    pub fn delete_row(&self, name: &str) {
+        let mut issuers = self.issuers.lock().unwrap();
+        if let Some(id) = issuers.values().find(|i| i.name == name).map(|i| i.id) {
+            issuers.remove(&id);
+        }
+    }
 }
 
 impl OidcIssuerRepository for MockOidcIssuerRepository {
@@ -7086,34 +8060,6 @@ impl OidcIssuerRepository for MockOidcIssuerRepository {
         let result = issuers.values().find(|i| i.issuer_url == url).cloned();
         Box::pin(async move { Ok(result) })
     }
-
-    fn upsert(
-        &self,
-        issuer: &hort_domain::entities::oidc_issuer::OidcIssuer,
-    ) -> BoxFuture<'_, DomainResult<()>> {
-        let mut issuers = self.issuers.lock().unwrap();
-        // Upsert on name — the apply pipeline's create-path may have
-        // minted a fresh UUID for a row whose name already exists, so
-        // we reuse the existing id to match the Postgres adapter's
-        // `ON CONFLICT (name) DO UPDATE` semantics.
-        let existing_id = issuers
-            .values()
-            .find(|i| i.name == issuer.name)
-            .map(|i| i.id);
-        let id = existing_id.unwrap_or(issuer.id);
-        let mut stored = issuer.clone();
-        stored.id = id;
-        issuers.insert(id, stored);
-        Box::pin(async { Ok(()) })
-    }
-
-    fn delete_by_name(&self, name: &str) -> BoxFuture<'_, DomainResult<()>> {
-        let mut issuers = self.issuers.lock().unwrap();
-        if let Some(id) = issuers.values().find(|i| i.name == name).map(|i| i.id) {
-            issuers.remove(&id);
-        }
-        Box::pin(async { Ok(()) })
-    }
 }
 
 /// Mock [`ReplayGuardPort`] with a
@@ -7123,7 +8069,10 @@ impl OidcIssuerRepository for MockOidcIssuerRepository {
 /// constructors drive the deny paths.
 pub struct MockReplayGuardPort {
     outcome: Mutex<Result<ReplayClaim, ReplayGuardError>>,
-    calls: Mutex<usize>,
+    /// Every observed `claim` TTL horizon, in call order. One field
+    /// rather than a counter beside a log so the count and the recorded
+    /// horizons cannot drift apart; `call_count` reads its length.
+    claims: Mutex<Vec<DateTime<Utc>>>,
 }
 
 impl Default for MockReplayGuardPort {
@@ -7137,26 +8086,32 @@ impl MockReplayGuardPort {
     pub fn first_seen() -> Self {
         Self {
             outcome: Mutex::new(Ok(ReplayClaim::FirstSeen)),
-            calls: Mutex::new(0),
+            claims: Mutex::new(Vec::new()),
         }
     }
     /// Guard reports a replay.
     pub fn replayed() -> Self {
         Self {
             outcome: Mutex::new(Ok(ReplayClaim::Replayed)),
-            calls: Mutex::new(0),
+            claims: Mutex::new(Vec::new()),
         }
     }
     /// Guard is unreachable — drives the fail-CLOSED path.
     pub fn unavailable() -> Self {
         Self {
             outcome: Mutex::new(Err(ReplayGuardError::Unavailable("mock outage".into()))),
-            calls: Mutex::new(0),
+            claims: Mutex::new(Vec::new()),
         }
     }
     /// Number of `claim` calls observed.
     pub fn call_count(&self) -> usize {
-        *self.calls.lock().unwrap()
+        self.claims.lock().unwrap().len()
+    }
+    /// The TTL horizon each `claim` was called with, in call order —
+    /// the seen-set row's own expiry, which a test asserts against the
+    /// source JWT's `exp` (never the minted bearer's lifetime).
+    pub fn claimed_expiries(&self) -> Vec<DateTime<Utc>> {
+        self.claims.lock().unwrap().clone()
     }
 }
 
@@ -7164,16 +8119,17 @@ impl ReplayGuardPort for MockReplayGuardPort {
     fn claim<'a>(
         &'a self,
         _key: &'a ReplayKey,
-        _expires_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
     ) -> BoxFuture<'a, Result<ReplayClaim, ReplayGuardError>> {
-        *self.calls.lock().unwrap() += 1;
+        self.claims.lock().unwrap().push(expires_at);
         let out = self.outcome.lock().unwrap().clone();
         Box::pin(async move { out })
     }
 }
 
 /// In-memory mock for [`ServiceAccountRepository`]. Stores the full
-/// aggregate; the test-side `upsert` follows the same name-as-identity
+/// aggregate; the test-side write ([`Self::upsert_row`], an inherent
+/// method — see its docstring) follows the same name-as-identity
 /// semantics as the Postgres adapter.
 pub struct MockServiceAccountRepository {
     sas: Mutex<HashMap<Uuid, hort_domain::entities::service_account::ServiceAccount>>,
@@ -7198,12 +8154,44 @@ impl MockServiceAccountRepository {
         items
     }
 
-    /// Synchronous test helper — pre-populate the mock without going
-    /// through the async `upsert` path. Used by the
-    /// rotation handler tests to seed a set of SAs before invoking
-    /// the handler.
+    /// Synchronous test helper — pre-populate the mock by the SA's own
+    /// id. Used by the rotation handler tests to seed a set of SAs
+    /// before invoking the handler.
     pub fn insert(&self, sa: hort_domain::entities::service_account::ServiceAccount) {
         self.sas.lock().unwrap().insert(sa.id, sa);
+    }
+
+    /// The SA aggregate upsert, as an **inherent** method.
+    ///
+    /// [`ServiceAccountRepository`] carries no write method any more —
+    /// the write is
+    /// `AuthorityLifecyclePort::commit_service_accounts`, which commits
+    /// the aggregate with its audit event in one transaction. The mock
+    /// authority port in
+    /// `apply_config_use_case::tests::MockAuthorityLifecycle` writes
+    /// through here, exactly as the Postgres adapter writes through
+    /// `service_account_repo::upsert_in_tx`.
+    ///
+    /// Name-as-identity, like the adapter's
+    /// `ON CONFLICT (name) DO UPDATE`: an existing row's id is
+    /// preserved. Unlike [`Self::insert`], which keys on the id.
+    pub fn upsert_row(&self, sa: &hort_domain::entities::service_account::ServiceAccount) {
+        let mut sas = self.sas.lock().unwrap();
+        let existing_id = sas.values().find(|s| s.name == sa.name).map(|s| s.id);
+        let id = existing_id.unwrap_or(sa.id);
+        let mut stored = sa.clone();
+        stored.id = id;
+        sas.insert(id, stored);
+    }
+
+    /// The SA aggregate delete, as an inherent method — see
+    /// [`Self::upsert_row`]. Deleting a name that is not present is a
+    /// no-op, like the adapter's statement.
+    pub fn delete_row(&self, name: &str) {
+        let mut sas = self.sas.lock().unwrap();
+        if let Some(id) = sas.values().find(|s| s.name == name).map(|s| s.id) {
+            sas.remove(&id);
+        }
     }
 }
 
@@ -7225,27 +8213,6 @@ impl ServiceAccountRepository for MockServiceAccountRepository {
         let sas = self.sas.lock().unwrap();
         let result = sas.values().find(|s| s.name == name).cloned();
         Box::pin(async move { Ok(result) })
-    }
-
-    fn upsert(
-        &self,
-        sa: &hort_domain::entities::service_account::ServiceAccount,
-    ) -> BoxFuture<'_, DomainResult<()>> {
-        let mut sas = self.sas.lock().unwrap();
-        let existing_id = sas.values().find(|s| s.name == sa.name).map(|s| s.id);
-        let id = existing_id.unwrap_or(sa.id);
-        let mut stored = sa.clone();
-        stored.id = id;
-        sas.insert(id, stored);
-        Box::pin(async { Ok(()) })
-    }
-
-    fn delete_by_name(&self, name: &str) -> BoxFuture<'_, DomainResult<()>> {
-        let mut sas = self.sas.lock().unwrap();
-        if let Some(id) = sas.values().find(|s| s.name == name).map(|s| s.id) {
-            sas.remove(&id);
-        }
-        Box::pin(async { Ok(()) })
     }
 }
 
@@ -7548,18 +8515,84 @@ mod tests {
     const VALID_SHA256_B: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
     const VALID_SHA256_C: &str = "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae";
 
+    /// The upstream-mapping mock's gitops-write guard mirrors the
+    /// adapter's, and that mirroring is load-bearing: the app-layer
+    /// apply tests assert through this mock, so if it silently accepted
+    /// a `managed_by = Local` row or a digest-less one, a branch that
+    /// regressed into writing either would pass them.
+    #[test]
+    fn mock_upstream_mapping_write_refuses_a_non_gitops_row() {
+        use hort_domain::entities::managed_by::ManagedBy;
+        let mock = MockRepositoryUpstreamMappingRepository::new();
+        let now = Utc::now();
+        let base = RepositoryUpstreamMapping {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            path_prefix: "dockerhub/".into(),
+            upstream_url: "https://registry-1.docker.io".into(),
+            upstream_name_prefix: None,
+            upstream_auth:
+                hort_domain::ports::repository_upstream_mapping_repository::UpstreamAuth::Anonymous,
+            secret_ref: None,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+            insecure_upstream_url: false,
+            trust_upstream_publish_time: false,
+            mtls_cert_ref: None,
+            mtls_key_ref: None,
+            ca_bundle_ref: None,
+            pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let err = mock
+            .write_managed_row(&base)
+            .expect_err("a Local row must be refused");
+        assert!(
+            err.to_string().contains("managed_by"),
+            "the error must name the offending column, got: {err}"
+        );
+
+        // GitOps without a digest is the other half of the pairing.
+        let digestless = RepositoryUpstreamMapping {
+            managed_by: ManagedBy::GitOps,
+            ..base.clone()
+        };
+        let err = mock
+            .write_managed_row(&digestless)
+            .expect_err("a digest-less managed row must be refused");
+        assert!(
+            err.to_string().contains("managed_by_digest"),
+            "the error must name the missing column, got: {err}"
+        );
+        assert_eq!(mock.entry_count(), 0, "neither refusal may have written");
+
+        // And the accepted shape still writes.
+        let good = RepositoryUpstreamMapping {
+            managed_by: ManagedBy::GitOps,
+            managed_by_digest: Some([0x11; 32]),
+            ..base
+        };
+        mock.write_managed_row(&good)
+            .expect("a managed row with a digest is accepted");
+        assert_eq!(mock.entry_count(), 1);
+    }
+
     #[tokio::test]
     async fn mock_staging_stream_read_returns_appended_bytes() {
         let staging = MockStatefulUploadStagingPort::new();
         let session_id = Uuid::new_v4();
 
-        // Two appends: the second must concatenate onto the first.
+        // Two writes at successive offsets: the second must concatenate
+        // onto the first.
         let first: Box<dyn AsyncRead + Send + Unpin> =
             Box::new(std::io::Cursor::new(b"hello ".to_vec()));
-        staging.append(session_id, first).await.unwrap();
+        staging.append_at(session_id, 0, 6, first).await.unwrap();
         let second: Box<dyn AsyncRead + Send + Unpin> =
             Box::new(std::io::Cursor::new(b"world".to_vec()));
-        staging.append(session_id, second).await.unwrap();
+        staging.append_at(session_id, 6, 5, second).await.unwrap();
 
         let mut reader = staging.stream_read(session_id).await.unwrap();
         let mut buf = Vec::new();
@@ -7594,7 +8627,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let payload: Box<dyn AsyncRead + Send + Unpin> =
             Box::new(std::io::Cursor::new(b"payload".to_vec()));
-        staging.append(session_id, payload).await.unwrap();
+        staging.append_at(session_id, 0, 7, payload).await.unwrap();
         staging.delete(session_id).await.unwrap();
         // Second delete of the same id must also be OK.
         staging.delete(session_id).await.unwrap();
@@ -8059,6 +9092,97 @@ mod tests {
             .expect_err("empty-prefix armed reader must error immediately");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(sink.is_empty(), "no bytes must flow for an empty prefix");
+        // The failure is an integrity verdict, and it names the digest the
+        // delivered (empty) prefix hashes to — what a real verifying
+        // adapter would have accumulated.
+        let verdict =
+            CasIntegrityFailure::from_io_error(&err).expect("verdict must be recoverable");
+        assert_eq!(verdict.expected, hash);
+        assert_eq!(verdict.computed, sha256_of(&[]));
+    }
+
+    // -- MockStoragePort tamper doubles: parity with the real readers --------
+
+    fn sha256_of(bytes: &[u8]) -> ContentHash {
+        hex::encode(Sha256::digest(bytes))
+            .parse()
+            .expect("SHA-256 digest is always valid ContentHash hex")
+    }
+
+    /// [`MockStoragePort::inject_tampered`] must honour the same read
+    /// contract as `FilesystemStorage::get` / `ObjectStoreStorage::get`:
+    /// the wrong bytes flow, and the read then fails at EOF carrying a
+    /// recoverable [`CasIntegrityFailure`] naming the digest they hash to.
+    ///
+    /// This is the double's load-bearing property. Served as a bare cursor
+    /// over the wrong bytes instead, it would let a consumer that cannot
+    /// classify a real corrupted blob pass its tests — which is precisely
+    /// how the scrub shipped recording corruption as a read error.
+    #[tokio::test]
+    async fn mock_storage_inject_tampered_matches_the_real_verifying_readers() {
+        let mock = MockStoragePort::new();
+        let cas_key: ContentHash = VALID_SHA256_A.parse().unwrap();
+        mock.inject_tampered(cas_key.clone(), b"wrong bytes".to_vec());
+
+        let mut r = mock.get(&cas_key).await.expect("get itself resolves Ok");
+        let mut delivered = Vec::new();
+        let err = r
+            .read_to_end(&mut delivered)
+            .await
+            .expect_err("EOF must fail, not signal clean end-of-stream");
+        assert_eq!(
+            &delivered, b"wrong bytes",
+            "the wrong bytes flow through before the failure"
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let verdict =
+            CasIntegrityFailure::from_io_error(&err).expect("verdict must be recoverable");
+        assert_eq!(verdict.expected, cas_key);
+        assert_eq!(verdict.computed, sha256_of(b"wrong bytes"));
+    }
+
+    /// [`MockStoragePort::inject_tampered_unverified`] is the deliberate
+    /// opposite: raw wrong bytes, clean EOF, no verdict — a port
+    /// implementation that does not verify on read.
+    #[tokio::test]
+    async fn mock_storage_inject_tampered_unverified_delivers_raw_bytes_cleanly() {
+        let mock = MockStoragePort::new();
+        let cas_key: ContentHash = VALID_SHA256_A.parse().unwrap();
+        mock.inject_tampered_unverified(cas_key.clone(), b"wrong bytes".to_vec());
+
+        let mut r = mock.get(&cas_key).await.unwrap();
+        let mut delivered = Vec::new();
+        r.read_to_end(&mut delivered)
+            .await
+            .expect("an unverifying reader reaches a clean EOF");
+        assert_eq!(&delivered, b"wrong bytes");
+    }
+
+    /// [`MockStoragePort::inject_read_failure`] fails at the same
+    /// `InvalidData` kind a verifying reader uses but carries **no**
+    /// verdict, and is persistent rather than one-shot. A consumer that
+    /// classified by `ErrorKind` would call this corruption.
+    #[tokio::test]
+    async fn mock_storage_inject_read_failure_carries_no_verdict_and_persists() {
+        let mock = MockStoragePort::new();
+        let cas_key: ContentHash = VALID_SHA256_A.parse().unwrap();
+        mock.inject_read_failure(cas_key.clone(), b"part".to_vec());
+
+        for attempt in 0..2 {
+            let mut r = mock.get(&cas_key).await.unwrap();
+            let mut delivered = Vec::new();
+            let err = match r.read_to_end(&mut delivered).await {
+                Err(e) => e,
+                Ok(n) => panic!("attempt {attempt} must fail, read {n} bytes cleanly"),
+            };
+            assert_eq!(&delivered, b"part");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                CasIntegrityFailure::from_io_error(&err).is_none(),
+                "a backend read failure must not look like an integrity verdict"
+            );
+        }
     }
 
     // -- MockKubernetesSecretWriter -------------------------
@@ -8191,6 +9315,7 @@ mod tests {
                 mtls_key_ref: None,
                 ca_bundle_ref: None,
                 pinned_cert_sha256: None,
+                allowed_realm_hosts: Vec::new(),
                 created_at: now,
                 updated_at: now,
             }
@@ -8302,5 +9427,413 @@ mod tests {
             }
         }
         assert_ne!(unkeyed[0], unkeyed[1]);
+    }
+
+    /// The **other half** of the pair the test below mirrors, read off
+    /// the adapter's source: `hort-adapters-postgres`'s one
+    /// `row -> Artifact` conversion still reads the axis as the constant
+    /// `None`.
+    ///
+    /// The double mirrors a constant, and a constant can be changed. If
+    /// the axis is ever denormalised onto the `artifacts` projection, the
+    /// mapper starts carrying a real value and the clear below becomes
+    /// the divergence instead of the mirror — so the pair is pinned from
+    /// both ends rather than one. A source scan because this crate
+    /// cannot depend on an adapter (ADR 0008): the dependency runs the
+    /// other way, and that is the layering, not an inconvenience.
+    #[test]
+    fn the_projection_load_the_double_mirrors_still_reads_the_axis_as_none() {
+        let mapper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("CARGO_MANIFEST_DIR resolves under crates/hort-app")
+            .join("hort-adapters-postgres/src/mappers.rs");
+        let src = std::fs::read_to_string(&mapper)
+            .unwrap_or_else(|e| panic!("the row mapper must be readable at {mapper:?}: {e}"));
+        assert!(
+            src.contains("impl TryFrom<ArtifactRow> for Artifact"),
+            "the scanned conversion was renamed or moved; re-point this assertion \
+             before trusting it"
+        );
+        assert!(
+            src.contains("rejection_reason: None,"),
+            "the row mapper no longer loads the rejection axis as `None` — \
+             `MockArtifactRepository::projected` mirrors that constant and now \
+             diverges from it"
+        );
+    }
+
+    /// `MockArtifactRepository`'s reads mirror the projection load:
+    /// every artifact-returning port method hands the entity back with
+    /// `rejection_reason` cleared, whatever the fixture seeded.
+    ///
+    /// The mirrored contract is
+    /// `crates/hort-adapters-postgres/src/mappers.rs`'s one
+    /// `row -> Artifact` conversion, which reads `rejection_reason: None`
+    /// as a **constant** because the structured axis is not a column on
+    /// the `artifacts` projection — it lives on the artifact's
+    /// `ArtifactRejected` event. So the only `Rejected` artifact any
+    /// producer in the system can hand a reader is one with the axis
+    /// unset, and a double that served the seeded value would let a test
+    /// stand on a state production cannot reach: the axis would appear on
+    /// a read path that never derived it, and a consumer that stopped
+    /// deriving it from the stream would still look correct.
+    ///
+    /// Every read method is asserted rather than one, because the clear
+    /// is per-method — the divergence comes back one method at a time.
+    #[tokio::test]
+    async fn mock_artifact_repository_reads_clear_the_rejection_axis() {
+        use hort_domain::events::RejectionReason;
+
+        let repo_id = Uuid::new_v4();
+        let policy_id = Uuid::new_v4();
+        let mut seeded = sample_artifact(QuarantineStatus::Rejected);
+        seeded.repository_id = repo_id;
+        seeded.path = "manifests/sha256:abc".into();
+        assert!(
+            seeded.rejection_reason.is_some(),
+            "the fixture must seed an axis, or this test proves nothing: \
+             `sample_artifact` deliberately populates it (the ADR 0041 \
+             re-evaluation fixtures need a seeded reason) and the clear \
+             belongs at the repository boundary, where Postgres does it"
+        );
+        let id = seeded.id;
+        let sha = seeded.sha256_checksum.clone();
+        let repo = MockArtifactRepository::new();
+        repo.insert(seeded.clone());
+        repo.seed_rejected_for_policy(policy_id, vec![repo_id]);
+
+        let mut reads: Vec<(&str, Vec<Artifact>)> = Vec::new();
+        reads.push(("find_by_id", vec![repo.find_by_id(id).await.unwrap()]));
+        reads.push((
+            "find_by_checksum",
+            repo.find_by_checksum(&sha)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect(),
+        ));
+        reads.push((
+            "find_by_repo_and_checksum",
+            repo.find_by_repo_and_checksum(repo_id, &sha)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect(),
+        ));
+        reads.push((
+            "find_by_path",
+            repo.find_by_path(repo_id, &seeded.path)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect(),
+        ));
+        let page = || PageRequest {
+            offset: 0,
+            limit: 10,
+        };
+        reads.push((
+            "list_by_repository",
+            repo.list_by_repository(repo_id, page())
+                .await
+                .unwrap()
+                .items,
+        ));
+        reads.push((
+            "find_by_name_in_repo",
+            repo.find_by_name_in_repo(repo_id, &seeded.name, page())
+                .await
+                .unwrap()
+                .items,
+        ));
+        reads.push((
+            "find_by_name_as_published",
+            repo.find_by_name_as_published(repo_id, &seeded.name_as_published, page())
+                .await
+                .unwrap()
+                .items,
+        ));
+        reads.push((
+            "list_rejected_for_policy",
+            repo.list_rejected_for_policy(policy_id)
+                .await
+                .unwrap()
+                .items,
+        ));
+        reads.push((
+            "find_oci_image_manifests_without_kind",
+            repo.find_oci_image_manifests_without_kind("oci_config", 10, None, None)
+                .await
+                .unwrap(),
+        ));
+
+        for (method, rows) in &reads {
+            assert!(
+                !rows.is_empty(),
+                "{method} returned nothing — the assertion below would be vacuous"
+            );
+            for row in rows {
+                assert_eq!(
+                    row.rejection_reason, None,
+                    "{method} must hand the axis back cleared, like \
+                     `hort-adapters-postgres`'s row mapper does"
+                );
+            }
+        }
+
+        // The seeded value is still in the map: the clear is a property
+        // of the port's reads, not of the write, so a fixture can still
+        // assert what a write path stored.
+        assert_eq!(
+            repo.get(id).unwrap().rejection_reason,
+            Some(RejectionReason::Scanner)
+        );
+
+        // The two `Quarantined`/`Released`-scoped reads need a row in
+        // one of those statuses; the same clear applies there.
+        let mut active = sample_artifact(QuarantineStatus::Rejected);
+        active.repository_id = repo_id;
+        active.quarantine_status = QuarantineStatus::Quarantined;
+        active.path = "pkg/2.0.0/pkg.tar.gz".into();
+        repo.insert(active);
+        repo.seed_active_for_policy(policy_id, vec![repo_id]);
+        for row in repo.list_active_for_repo(repo_id).await.unwrap().items {
+            assert_eq!(row.rejection_reason, None, "list_active_for_repo");
+        }
+        for row in repo
+            .list_active_for_policy(policy_id, page())
+            .await
+            .unwrap()
+            .items
+        {
+            assert_eq!(row.rejection_reason, None, "list_active_for_policy");
+        }
+
+        let mut wheel = sample_artifact(QuarantineStatus::Rejected);
+        wheel.repository_id = repo_id;
+        wheel.path = "pkg-1.0.0-py3-none-any.whl".into();
+        repo.insert(wheel);
+        let wheels = repo
+            .find_pypi_wheels_without_kind("wheel_metadata", 10, None, None)
+            .await
+            .unwrap();
+        assert!(!wheels.is_empty(), "find_pypi_wheels_without_kind");
+        for row in wheels {
+            assert_eq!(row.rejection_reason, None, "find_pypi_wheels_without_kind");
+        }
+    }
+}
+
+// ===========================================================================
+// Tracing capture harness for the named audit-log invariants.
+// ===========================================================================
+
+/// Capture harness for asserting that **a named audit invariant's field is
+/// actually emitted**.
+///
+/// Several use cases carry an invariant of the form "the success line of this
+/// security-relevant operation names the acting identity" (`AUDIT-info-1`:
+/// `CurationUseCase::waive`'s success line carries `actor_id`) or "…carries
+/// the correlation id" (`AUDIT-info-2`). Such an invariant lives entirely in
+/// a `tracing::info!` field list, which nothing else in the suite reads — so
+/// without a capture subscriber, an edit that drops the field is green. This
+/// module is the one place that machinery lives, so the next use case needing
+/// the assertion does not grow another private copy of it.
+///
+/// # What it captures
+///
+/// Each event's `target`, `level` and rendered fields — including `message`,
+/// which `tracing` records as an ordinary field. Fields are kept as a **map,
+/// not a flattened string**, so an assertion can say *this field equals this
+/// value* instead of *this text appears somewhere on the line*. The
+/// difference is load-bearing for an audit assertion: a sibling field often
+/// renders the same uuid (`waive` logs `artifact_id` beside `actor_id`), and
+/// a longer field name contains the asserted one as a substring
+/// (`filter_actor_id` contains `actor_id`), so a flattened-string check stays
+/// green exactly when the field under assertion is gone.
+///
+/// # Limits — what is NOT in scope
+///
+/// - **Only what this test's own subscriber sees.** The capture is a
+///   thread-local default subscriber installed for the duration of
+///   [`tracing_capture::capture_audit_events`]'s closure. An event emitted on
+///   another thread — a spawned task, a multi-thread runtime's worker — never
+///   reaches the buffer, which is why the closure drives async code on a
+///   current-thread runtime's `block_on`.
+/// - **Events only, never span fields.** `#[tracing::instrument]` puts a
+///   function's arguments on a *span*; this layer implements `on_event`
+///   alone. A field that exists only because of the `instrument` attribute
+///   will not appear here. That is the honest scope — a consumer reading one
+///   log line sees that event's own fields — but it means an invariant meant
+///   to ride the span needs a different harness, not this one.
+/// - **No filtering at all.** Every event from every crate in the process
+///   lands in the buffer, so select the line under assertion by `target` and
+///   message rather than indexing into it.
+#[cfg(test)]
+pub mod tracing_capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Registry;
+
+    /// One captured `tracing` event.
+    #[derive(Debug, Clone)]
+    pub struct CapturedEvent {
+        /// The event's target — `module_path!()` of the emitting callsite
+        /// unless the macro overrode it. Asserting on it pins that the
+        /// captured line is the production module's and not a test helper's.
+        pub target: String,
+        pub level: tracing::Level,
+        /// Rendered fields keyed by field name. `%x` and `?x` values render
+        /// through `Display` / `Debug` exactly as a `fmt` subscriber would
+        /// print them, and the format string arrives under the name
+        /// `message`.
+        pub fields: BTreeMap<String, String>,
+    }
+
+    impl CapturedEvent {
+        /// The rendered value of `name`, or `None` when the line carries no
+        /// such field. An audit assertion wants exactly this distinction: a
+        /// missing field and an empty one are different failures.
+        pub fn field(&self, name: &str) -> Option<&str> {
+            self.fields.get(name).map(String::as_str)
+        }
+
+        /// The event's message, or `""` for a field-only event.
+        pub fn message(&self) -> &str {
+            self.field("message").unwrap_or_default()
+        }
+    }
+
+    /// `Layer` recording every event it is offered into a shared buffer.
+    #[derive(Clone, Default)]
+    pub struct AuditCapturingLayer {
+        pub events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for AuditCapturingLayer
+    where
+        S: tracing::Subscriber,
+    {
+        /// Force per-event re-evaluation instead of letting the global
+        /// callsite cache decide once and for all that nobody listens.
+        /// `tracing` caches the first `Interest` observed per callsite, and
+        /// under libtest's parallelism that first observation can come from
+        /// a sibling test firing the same callsite while this test's
+        /// thread-local subscriber is not yet installed.
+        /// `Interest::sometimes()` opts into per-event `enabled()`, so the
+        /// cache cannot lock the capture out.
+        fn register_callsite(
+            &self,
+            _meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(
+            &self,
+            _meta: &tracing::Metadata<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(CapturedEvent {
+                    target: event.metadata().target().to_string(),
+                    level: *event.metadata().level(),
+                    fields: visitor.fields,
+                });
+        }
+    }
+
+    /// Renders each field into the map. `record_debug` is `Visit`'s only
+    /// required method and every other value type defaults to it, so the two
+    /// impls below cover the whole field taxonomy; the `record_str` override
+    /// exists only to keep a string value free of `Debug`'s quotes.
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    /// The one lock serialising captures.
+    ///
+    /// `tracing` caches per-callsite `Interest` **globally**, so installing a
+    /// subscriber on one thread while another fires the same callsite races.
+    /// It is deliberately private and reachable only through
+    /// [`capture_audit_events`]: two independent serialisations do not
+    /// compose into one order, so a second lock beside this one would let a
+    /// test holding only that lock run against a test holding only this one.
+    static AUDIT_TRACING_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Install, once per process, a global subscriber that returns
+    /// `Interest::sometimes()` for every callsite.
+    ///
+    /// This poisons the global callsite-interest cache with `sometimes`,
+    /// which forces `tracing` to consult the **current** thread-local
+    /// subscriber on every event instead of trusting a once-cached `Never`
+    /// from whichever thread reached the callsite first. Without it, a
+    /// capture races against parallel siblings firing the same callsite
+    /// under the no-op default subscriber, and loses.
+    pub fn install_audit_passthrough_subscriber() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let global_subscriber = Registry::default().with(AuditCapturingLayer::default());
+            // A sibling crate may already hold the global slot; the
+            // thread-local `with_default` re-ask below still gets us the
+            // `sometimes()` cache entry.
+            let _ = tracing::subscriber::set_global_default(global_subscriber);
+        });
+    }
+
+    /// Run `body` with a capturing subscriber installed and return its value
+    /// alongside every event the subscriber saw.
+    ///
+    /// `body` is synchronous on purpose: the serialising guard is a
+    /// `std::sync::Mutex` guard and must not cross an `.await` (clippy's
+    /// `await_holding_lock` would block the build), so a test drives async
+    /// code with a current-thread runtime's `block_on` *inside* the closure.
+    pub fn capture_audit_events<R>(body: impl FnOnce() -> R) -> (R, Vec<CapturedEvent>) {
+        install_audit_passthrough_subscriber();
+        let _serial = AUDIT_TRACING_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
+        let layer = AuditCapturingLayer::default();
+        let captured = Arc::clone(&layer.events);
+        let subscriber = Registry::default().with(layer);
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            // After the thread-local default is in place, force every
+            // callsite's interest to be re-evaluated so the layer's
+            // `register_callsite` runs before the event under assertion
+            // fires.
+            tracing::callsite::rebuild_interest_cache();
+            body()
+        });
+
+        let events = std::mem::take(&mut *captured.lock().unwrap_or_else(PoisonError::into_inner));
+        (outcome, events)
     }
 }

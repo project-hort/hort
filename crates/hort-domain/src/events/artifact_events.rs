@@ -558,11 +558,17 @@ impl ArtifactReleased {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReleaseReason {
     /// Quarantine period expired (background sweep).
     Timer,
-    /// Admin explicitly released despite findings.
+    /// Admin explicitly released despite findings. **No path mints
+    /// this any more** — one authority owns the manual release and it
+    /// is the curator's (ADR 0007, "One authority owns the manual
+    /// release"); the reason stays in the vocabulary because the stream
+    /// is append-only (ADR 0002), historical events carry it, and
+    /// [`crate::entities::artifact::ReleaseOrigin::permits_scan_reblock`]
+    /// must keep honouring the decision behind one.
     Admin,
     /// Policy re-evaluation after exclusion removed the block.
     PolicyReEvaluation,
@@ -924,11 +930,14 @@ impl ProvenanceRejected {
 /// transitions the artifact to
 /// [`QuarantineStatus::Rejected`](crate::entities::artifact::QuarantineStatus::Rejected),
 /// reusing the existing vocabulary rather than introducing a fourth
-/// status value. The admin-release override
-/// (`POST /quarantine/:artifact_id/release`) provides the human-review
-/// escape hatch for false-positive corruption (e.g. operator restored
-/// the blob from a known-good backup). The policy-re-evaluation override
-/// path is N/A — no policy can resolve a content-hash divergence.
+/// status value. **No manual release withdraws it**: `Rejected` is not a
+/// source state for `Artifact::release`, and ADR 0007 records the
+/// corruption axis as the one a manual release never reaches even where
+/// the state allows one — bytes that disagree with the hash naming them
+/// make the curator's own instrument (this content hash against the
+/// publisher's release page) answer about content hort does not hold.
+/// The policy-re-evaluation override path is N/A for the same kind of
+/// reason — no policy can resolve a content-hash divergence.
 ///
 /// **No PII or admin actor.** The scrub is a system-initiated cron job;
 /// the actor on the persisted-event envelope is `Actor::Internal(System)`.
@@ -1075,9 +1084,19 @@ pub enum RejectionReason {
     /// **Not scan-clearable (ADR 0041 invariant #6(a)).** Bytes that do
     /// not match their content hash do not become servable because a scan
     /// later passed — there is nothing a scanner can observe that bears on
-    /// a hash mismatch at all. The admin-release override remains the
-    /// human-review escape hatch for a false positive (e.g. the operator
-    /// restored the blob from a known-good backup).
+    /// a hash mismatch at all.
+    ///
+    /// **And not overridable by a human either** — this is the one
+    /// rejection axis the manual release never reaches
+    /// ([`is_curator_overridable`](crate::entities::artifact::is_curator_overridable),
+    /// ADR 0007's axis boundary). The out-of-band comparison a curator can
+    /// perform — this content hash against the publisher's release page —
+    /// confirms nothing here, because the bytes hort holds are by
+    /// definition not the bytes that hash names, and the storage adapters'
+    /// `VerifyingReader` fails the read regardless (ADR 0003's
+    /// read-verification amendment). An override would not be a risky
+    /// decision but a meaningless one. Recovering a false positive means
+    /// re-ingesting the restored blob.
     Corruption,
 }
 
@@ -1419,12 +1438,12 @@ impl ArtifactExpired {
 /// release its `content_references` source edges through the one
 /// storage-GC sweep.
 ///
-/// `refs_remaining` is the GC algorithm's post-decrement
-/// cross-`kind` refcount for `content_hash` (tied to
-/// `content_references`): `0` means the blob itself was deleted;
-/// `> 0` means a still-live reference (e.g. a promoted ref or an OCI
-/// `oci_subject` row) keeps the blob alive and only **this** artifact's
-/// reference was removed.
+/// `refs_remaining` is the **claims on `content_hash`** the sweep
+/// observed under the hash-scoped blob-reclamation lock, immediately
+/// before the storage decision: `0` means the blob itself was deleted;
+/// `> 0` means something still holds those bytes and only **this**
+/// artifact's reference was removed. See the field's own
+/// documentation for which claims count.
 ///
 /// # Idempotency
 ///
@@ -1445,9 +1464,30 @@ pub struct ArtifactPurged {
     /// [`ContentHash`] is 64 lowercase hex chars by construction, so no
     /// extra string bound is needed.
     pub content_hash: ContentHash,
-    /// Cross-`kind` `content_references` count for `content_hash`
-    /// **after** this artifact's reference was removed. `0`
-    /// ⇒ the blob was deleted; `> 0` ⇒ the blob stays, this ref is gone.
+    /// **Claims on `content_hash`** observed under the hash-scoped
+    /// blob-reclamation lock after this artifact's reference was
+    /// removed. `0` ⇒ the blob was deleted; `> 0` ⇒ the blob stays,
+    /// this ref is gone.
+    ///
+    /// A claim is either of:
+    ///
+    /// - a cross-`kind` `content_references` row still targeting the
+    ///   hash (a promoted ref, an OCI `oci_subject`/`oci_layer` edge, a
+    ///   sibling artifact's `primary_content`), or
+    /// - when there is **no** such row, a non-deleted artifact in a
+    ///   GC-protected quarantine state (`quarantined` / `rejected` /
+    ///   `scan_indeterminate`) whose primary content or metadata blob
+    ///   is this hash.
+    ///
+    /// The second kind exists because protected evidence deliberately
+    /// carries no `content_references` edge — the refcount repair mints
+    /// none for it, so that a repaired refcount cannot make a
+    /// quarantined blob look GC-protected for the wrong reason — while
+    /// CAS shares the bytes with every other artifact of the same
+    /// content. A row count alone would read `0` for bytes that are
+    /// being kept, which is the one thing this field may not say: it is
+    /// a single number with no second field to qualify it, so `0` has
+    /// to mean "deleted" on every path that emits it.
     pub refs_remaining: u32,
     /// Wall-clock at which the purge (or already-absent confirmation)
     /// completed. Distinct from the event store's `stored_at`, same
@@ -2153,5 +2193,92 @@ mod re_evaluated_event_tests {
         );
         assert_eq!(reason.wire_kind(), "corruption");
         assert!(RejectionReason::all_wire_kinds().contains(&"corruption"));
+    }
+}
+
+#[cfg(test)]
+mod provenance_rejected_wire_tests {
+    use super::*;
+    use crate::ports::provenance::ProvenanceRejectReason;
+
+    const HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// **Every reject reason that production streams already carry still
+    /// loads.** The payloads below are written the way the event store
+    /// holds them — a JSONB object with the reason as a bare string
+    /// discriminator — so this test fails if the variant is renamed,
+    /// reordered into a tuple/struct shape, or removed, each of which
+    /// would make an existing `ProvenanceRejected` row unreadable.
+    ///
+    /// `Unsigned` is in the corpus even though nothing produces it any
+    /// more: it is exactly the variant whose rows are historical, which is
+    /// why it must keep deserialising. `BundleMalformed` is now in the
+    /// same position — the keyless verifier's parse/decode gates and the
+    /// keyed verifier's undecodable outcomes skip instead of rejecting,
+    /// and the keyed digest-binding failure, its last producer, states
+    /// `DigestMismatch`. The variant and its wire string stay regardless;
+    /// losing a producer is not losing a reader.
+    #[test]
+    fn persisted_payload_loads_for_every_reject_reason() {
+        let persisted = [
+            ("Unsigned", ProvenanceRejectReason::Unsigned),
+            (
+                "UntrustedIdentity",
+                ProvenanceRejectReason::UntrustedIdentity,
+            ),
+            ("RekorNotFound", ProvenanceRejectReason::RekorNotFound),
+            ("CertChainInvalid", ProvenanceRejectReason::CertChainInvalid),
+            ("BundleMalformed", ProvenanceRejectReason::BundleMalformed),
+            // Forward-only: no stream carries this yet, and a build
+            // predating the variant cannot read one that does. Pinned here
+            // so the new reason's wire form is fixed from the start.
+            ("DigestMismatch", ProvenanceRejectReason::DigestMismatch),
+        ];
+
+        for (wire, expected) in persisted {
+            let payload = serde_json::json!({
+                "artifact_id": "7b3f1d2e-0000-4000-8000-000000000001",
+                "content_hash": HASH,
+                "backend": "cosign",
+                "reason": wire,
+            });
+            let loaded: ProvenanceRejected = serde_json::from_value(payload.clone())
+                .unwrap_or_else(|e| {
+                    panic!("persisted {wire} payload must still load: {e}");
+                });
+            assert_eq!(loaded.reason, expected);
+            assert_eq!(loaded.backend, "cosign");
+            assert_eq!(loaded.content_hash.to_string(), HASH);
+            loaded.validate().expect("a persisted payload is valid");
+
+            // Re-serialising gives back the same object, so a row rewritten
+            // by a current build is readable by the build that wrote it.
+            assert_eq!(serde_json::to_value(&loaded).unwrap(), payload);
+        }
+    }
+
+    /// The whole event, through the `DomainEvent` envelope the store
+    /// actually writes — the externally-tagged shape. Pinned because the
+    /// envelope's variant name is a second compatibility surface, distinct
+    /// from the reason string above.
+    #[test]
+    fn persisted_envelope_loads_through_domain_event() {
+        let envelope = serde_json::json!({
+            "ProvenanceRejected": {
+                "artifact_id": "7b3f1d2e-0000-4000-8000-000000000002",
+                "content_hash": HASH,
+                "backend": "cosign-key",
+                "reason": "BundleMalformed",
+            }
+        });
+        let loaded: crate::events::DomainEvent =
+            serde_json::from_value(envelope).expect("the envelope loads");
+        match loaded {
+            crate::events::DomainEvent::ProvenanceRejected(e) => {
+                assert_eq!(e.reason, ProvenanceRejectReason::BundleMalformed);
+                assert_eq!(e.backend, "cosign-key");
+            }
+            other => panic!("expected ProvenanceRejected, got {other:?}"),
+        }
     }
 }

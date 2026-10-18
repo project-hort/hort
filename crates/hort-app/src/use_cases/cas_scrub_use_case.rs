@@ -1,8 +1,11 @@
 //! CAS integrity scrubber use case.
 //!
-//! Walks every blob in the CAS via [`StoragePort::list_all`], re-hashes the
-//! bytes via streaming SHA-256, and compares against the CAS key. Emits
-//! [`CasIntegrityMismatch`] events + metrics on every mismatch.
+//! Walks every blob in the CAS via [`StoragePort::list_all`], streams each
+//! blob's bytes, and compares the SHA-256 they hash to against the CAS key.
+//! Emits [`CasIntegrityMismatch`] events + metrics on every mismatch. The
+//! comparison has two sources — the verifying reader's own verdict, which
+//! is authoritative, and the scrub's independent re-hash, which is what
+//! survives an adapter that does not verify; see [`check_one_hash`].
 //!
 //! **Action on mismatch**: operators choose
 //! between flag-only [`ActionOnMismatch::Alert`] (the default; the
@@ -39,7 +42,7 @@ use hort_domain::events::{
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
-use hort_domain::ports::storage::{StoragePort, StreamItem};
+use hort_domain::ports::storage::{CasIntegrityFailure, StoragePort, StreamItem};
 use hort_domain::types::ContentHash;
 
 use crate::error::{AppError, AppResult};
@@ -404,7 +407,7 @@ impl CasScrubUseCase {
     }
 }
 
-/// Re-hash a single blob. Emits the per-hash metric + (on mismatch) the
+/// Check a single blob. Emits the per-hash metric + (on mismatch) the
 /// `CasIntegrityMismatch` event + a `tracing::warn!`. When `action` is
 /// [`ActionOnMismatch::Tombstone`] AND `artifacts` + `lifecycle` are
 /// wired, additionally locates the artifact row and transitions it to
@@ -413,6 +416,31 @@ impl CasScrubUseCase {
 /// [`ArtifactCorrupted`] event on the artifact stream alongside the
 /// state change. Returns the classified outcome for the caller's
 /// report rollup.
+///
+/// **Where the observed digest comes from, and why there are two
+/// sources.** The reader `StoragePort::get` hands back verifies the bytes
+/// itself (ADR 0003) and fails the read at EOF on a mismatch, so for a
+/// corrupted blob the stream never reaches a clean end. Its verdict
+/// arrives as a [`CasIntegrityFailure`] payload on that error and is
+/// authoritative — same bytes, same comparison, reported by the component
+/// that actually ran it.
+///
+/// The scrub nevertheless keeps hashing the stream itself, and that is not
+/// redundant: it is the only check that survives a `StoragePort` which
+/// does **not** verify. A verifier cannot detect its own absence — drop
+/// the wrap from an adapter's `get` and a verdict-only scrub reports a
+/// clean sweep over corrupt storage, silently, which is the worst
+/// available failure mode for an integrity audit. The independent digest
+/// costs one extra SHA-256 pass over bytes already being read, on an
+/// operator-triggered job, and buys the scrub the property its whole
+/// purpose depends on: it is correct about the CAS whether or not the
+/// adapter under it is.
+///
+/// A read failure carrying no verdict stays a
+/// [`CasScrubResult::ReadError`]. The two must not collapse into each
+/// other — a mismatch escalates the CLI's exit code and may tombstone an
+/// artifact, a read error is observability-only — and the typed payload,
+/// rather than `io::ErrorKind::InvalidData`, is what keeps them apart.
 async fn check_one_hash(
     storage: &dyn StoragePort,
     events: &dyn EventStore,
@@ -445,83 +473,91 @@ async fn check_one_hash(
         }
     };
 
-    match stream_sha256(reader).await {
-        Ok(observed) => {
-            if observed == *hash {
-                emit_metric(backend, CasScrubResult::Ok);
-                CasScrubResult::Ok
-            } else {
-                // The `action` field is the configured response, so log
-                // shippers can distinguish an alert deployment
-                // from a tombstone deployment without parsing
-                // the deployment env.
-                //
-                // No `artifact_id = tracing::field::Empty` field — `Empty`
-                // is meaningful only on spans (later filled via
-                // `Span::current().record(...)`), but `warn!` creates
-                // an event, not a span. The artifact_id is also not
-                // known at this site (the function receives the
-                // content_hash; artifact lookup happens in the caller
-                // and the matching tombstone path emits its own
-                // tracing line with `artifact_id` in scope).
+    let observed = match stream_sha256(reader).await {
+        // The stream ran to a clean EOF, so the scrub's own digest is the
+        // only verdict available. Reached in production only if the
+        // adapter did not verify — see this function's doc comment.
+        Ok(observed) => observed,
+        Err(err) => match CasIntegrityFailure::from_io_error(&err) {
+            // The adapter's verifier already compared these bytes and is
+            // handing over the digest it computed, so the short-circuited
+            // read is a classified mismatch, not an unattributable
+            // failure. `expected` is the hash we asked for, so
+            // `computed` necessarily differs from it.
+            Some(verdict) => verdict.computed.clone(),
+            None => {
                 warn!(
                     backend,
-                    computed_hash = %observed,
-                    expected_hash = %hash,
-                    action = action.as_str(),
-                    "CAS integrity mismatch"
+                    content_hash = %hash,
+                    error = %err,
+                    "cas scrub read failed"
                 );
-                emit_metric(backend, CasScrubResult::HashMismatch);
-                // Fire-and-log on event-store failures — the scrub run
-                // continues. An event-store outage during a scrub
-                // should not abort the sweep; the metric + tracing are
-                // the primary observability, the event is the durable
-                // audit trail.
-                if let Err(err) = emit_mismatch_event(events, hash, &observed, backend).await {
-                    warn!(
-                        backend,
-                        content_hash = %hash,
-                        error = %err,
-                        "failed to append CasIntegrityMismatch event; metric and tracing still emitted"
-                    );
-                }
-                if action == ActionOnMismatch::Tombstone {
-                    if let Err(err) =
-                        try_tombstone_artifact(artifacts, lifecycle, hash, &observed, backend).await
-                    {
-                        warn!(
-                            backend,
-                            content_hash = %hash,
-                            error = %err,
-                            "tombstone-on-mismatch failed; CasIntegrityMismatch still emitted"
-                        );
-                    }
-                }
-                CasScrubResult::HashMismatch
+                emit_metric(backend, CasScrubResult::ReadError);
+                return CasScrubResult::ReadError;
             }
-        }
-        Err(err) => {
-            // Note: the adapter's `VerifyingReader` surfaces integrity
-            // failures as `io::ErrorKind::InvalidData`. Those land here
-            // as a `ReadError`, NOT a `HashMismatch`, because the scrub
-            // can't assert the observed hash — the inner reader
-            // short-circuited and we don't have a clean digest.
-            // Operators cross-reference with
-            // `hort_storage_integrity_failures_total` which DID fire.
+        },
+    };
+
+    if observed == *hash {
+        emit_metric(backend, CasScrubResult::Ok);
+        return CasScrubResult::Ok;
+    }
+
+    // The `action` field is the configured response, so log
+    // shippers can distinguish an alert deployment
+    // from a tombstone deployment without parsing
+    // the deployment env.
+    //
+    // No `artifact_id = tracing::field::Empty` field — `Empty`
+    // is meaningful only on spans (later filled via
+    // `Span::current().record(...)`), but `warn!` creates
+    // an event, not a span. The artifact_id is also not
+    // known at this site (the function receives the
+    // content_hash; artifact lookup happens in the caller
+    // and the matching tombstone path emits its own
+    // tracing line with `artifact_id` in scope).
+    warn!(
+        backend,
+        computed_hash = %observed,
+        expected_hash = %hash,
+        action = action.as_str(),
+        "CAS integrity mismatch"
+    );
+    emit_metric(backend, CasScrubResult::HashMismatch);
+    // Fire-and-log on event-store failures — the scrub run
+    // continues. An event-store outage during a scrub
+    // should not abort the sweep; the metric + tracing are
+    // the primary observability, the event is the durable
+    // audit trail.
+    if let Err(err) = emit_mismatch_event(events, hash, &observed, backend).await {
+        warn!(
+            backend,
+            content_hash = %hash,
+            error = %err,
+            "failed to append CasIntegrityMismatch event; metric and tracing still emitted"
+        );
+    }
+    if action == ActionOnMismatch::Tombstone {
+        if let Err(err) =
+            try_tombstone_artifact(artifacts, lifecycle, hash, &observed, backend).await
+        {
             warn!(
                 backend,
                 content_hash = %hash,
                 error = %err,
-                "cas scrub read failed"
+                "tombstone-on-mismatch failed; CasIntegrityMismatch still emitted"
             );
-            emit_metric(backend, CasScrubResult::ReadError);
-            CasScrubResult::ReadError
         }
     }
+    CasScrubResult::HashMismatch
 }
 
 /// Stream bytes through a SHA-256 hasher and return the resulting
 /// `ContentHash`. Memory-bounded at `CHUNK_SIZE` bytes.
+///
+/// Draining the stream is load-bearing independently of the digest: a
+/// verifying reader only compares at EOF, so a caller that stops short
+/// never learns the verdict.
 async fn stream_sha256(
     mut reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
 ) -> Result<ContentHash, std::io::Error> {
@@ -817,6 +853,12 @@ mod tests {
     // hash_mismatch — tampered blob.
     // ------------------------------------------------------------------
 
+    /// A tampered blob served through a reader that honours the
+    /// production read contract — bytes flow, then the read fails at EOF
+    /// carrying the integrity verdict. The scrub must classify that as a
+    /// mismatch and record the digest the verdict carries; before the
+    /// verdict travelled as data it recorded a `read_error` instead, which
+    /// the CLI treats as observability-only.
     #[tokio::test]
     async fn run_hash_mismatch_increments_counter_and_emits_event() {
         let (uc, storage, events) = make_case();
@@ -843,6 +885,155 @@ mod tests {
             }
             other => panic!("expected CasIntegrityMismatch, got {other:?}"),
         }
+    }
+
+    /// Corruption behind a `StoragePort` that does **not** verify on read
+    /// is still classified as a mismatch, from the scrub's own digest.
+    ///
+    /// This is the one thing the verifier's verdict cannot cover: a
+    /// verifier cannot detect its own absence, so a scrub that classified
+    /// only from the verdict would report a clean sweep over corrupt
+    /// storage the moment an adapter's `get` lost its verifying wrap.
+    #[tokio::test]
+    async fn unverified_storage_mismatch_is_caught_by_the_scrubs_own_hash() {
+        let (uc, storage, events) = make_case();
+        let tampered_hash = hash(HELLO_WORLD_SHA256);
+        // Raw wrong bytes, no EOF verification at all.
+        storage.inject_tampered_unverified(tampered_hash.clone(), Vec::new());
+
+        let report = uc.run(opts_sequential()).await.unwrap();
+        assert_eq!(report.mismatches, 1);
+        assert_eq!(report.read_errors, 0);
+        assert_eq!(report.checked, 1);
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 1);
+        match &batches[0].events[0].event {
+            DomainEvent::CasIntegrityMismatch(e) => {
+                assert_eq!(e.content_hash, tampered_hash);
+                assert_eq!(e.observed_hash, hash(EMPTY_SHA256));
+            }
+            other => panic!("expected CasIntegrityMismatch, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Fire-and-log: a failure in the mismatch *response* does not undo
+    // the mismatch *finding*.
+    //
+    // Both arms below were production-dead for as long as the mismatch
+    // branch itself was — the scrub reached neither, because a corrupted
+    // blob never got classified as corrupted. They are reachable now, so
+    // the "the sweep continues" guarantee is worth pinning.
+    // ------------------------------------------------------------------
+
+    /// An event-store outage during a mismatch must not abort the sweep
+    /// or downgrade the finding: the metric, the report count and the
+    /// exit-code-escalating `mismatches` all stand, with the failed
+    /// append logged.
+    #[tokio::test]
+    async fn mismatch_survives_an_event_store_append_failure() {
+        let (uc, storage, events) = make_case();
+        let tampered_hash = hash(HELLO_WORLD_SHA256);
+        storage.inject_tampered(tampered_hash.clone(), Vec::new());
+        events.fail_next_append(DomainError::Invariant("event store is down".into()));
+
+        let report = uc.run(opts_sequential()).await.unwrap();
+        assert_eq!(report.mismatches, 1, "the finding stands without its event");
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.read_errors, 0);
+        assert!(
+            events.appended_batches().is_empty(),
+            "the append failed, so no batch landed"
+        );
+    }
+
+    /// A failing tombstone transition likewise leaves the mismatch
+    /// intact: `CasIntegrityMismatch` is already durable, and a DB error
+    /// on the follow-up must not make the run report clean.
+    #[tokio::test]
+    async fn mismatch_survives_a_failing_tombstone_transition() {
+        let (uc, storage, events, artifacts, lifecycle) = make_case_tombstone();
+        let tampered_hash = hash(HELLO_WORLD_SHA256);
+        let mut artifact = sample_artifact(QuarantineStatus::Released);
+        artifact.sha256_checksum = tampered_hash.clone();
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        storage.inject_tampered(tampered_hash.clone(), Vec::new());
+        lifecycle.fail_next_commit(DomainError::Invariant("transition conflict".into()));
+
+        let report = uc.run(opts_sequential_tombstone()).await.unwrap();
+        assert_eq!(report.mismatches, 1);
+        // The audit fact landed even though the state change did not.
+        assert!(events.appended_batches().iter().any(|b| b
+            .events
+            .iter()
+            .any(|e| matches!(&e.event, DomainEvent::CasIntegrityMismatch(_)))));
+        // The row is unchanged — a failed transition must not be reported
+        // as a completed one.
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Released
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // read_error from the blob stream — must not collapse into mismatch.
+    // ------------------------------------------------------------------
+
+    /// A `get` stream that fails with no integrity verdict is a
+    /// `read_error`, even though it fails at the *same*
+    /// `io::ErrorKind::InvalidData` a verifying reader uses.
+    ///
+    /// The two outcomes must stay apart in both directions: a mismatch
+    /// escalates the CLI's exit code and can tombstone an artifact, a read
+    /// error is observability-only. Classifying by `ErrorKind` would read
+    /// every backend complaint as corruption; the typed payload is what
+    /// makes the distinction, and this test is what proves the code uses
+    /// the payload and not the kind.
+    #[tokio::test]
+    async fn stream_failure_without_a_verdict_is_a_read_error_not_a_mismatch() {
+        let (uc, storage, events) = make_case();
+        let h = hash(HELLO_WORLD_SHA256);
+        storage.inject_read_failure(h.clone(), b"hello ".to_vec());
+
+        let report = uc.run(opts_sequential()).await.unwrap();
+        assert_eq!(report.read_errors, 1);
+        assert_eq!(report.mismatches, 0);
+        assert_eq!(report.missing, 0);
+        // `checked` counts blobs the pipeline reached a verdict on; a read
+        // error produced none, so it stays at zero.
+        assert_eq!(report.checked, 0);
+        // No audit event: a read error is not an integrity finding, and
+        // the scrub has no observed digest to record.
+        assert!(events.appended_batches().is_empty());
+    }
+
+    /// Tombstone mode must not tombstone on a read failure. The artifact
+    /// row is the blast radius of getting this classification wrong: a
+    /// transient backend error would reject a healthy artifact
+    /// irreversibly.
+    #[tokio::test]
+    async fn read_failure_does_not_tombstone_in_tombstone_mode() {
+        let (uc, storage, _events, artifacts, lifecycle) = make_case_tombstone();
+        let h = hash(HELLO_WORLD_SHA256);
+        let mut artifact = sample_artifact(QuarantineStatus::Released);
+        artifact.sha256_checksum = h.clone();
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        storage.inject_read_failure(h.clone(), b"hello ".to_vec());
+
+        let report = uc.run(opts_sequential_tombstone()).await.unwrap();
+        assert_eq!(report.read_errors, 1);
+        assert_eq!(report.mismatches, 0);
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "a read failure must not transition the artifact"
+        );
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Released
+        );
     }
 
     // ------------------------------------------------------------------

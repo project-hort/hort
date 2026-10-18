@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
 use crate::error::DomainResult;
+use crate::ports::content_reference_index::ContentReference;
 use crate::ports::event_store::{AppendEvents, AppendResult};
 use crate::ports::repo_security_score_repository::ScoreDelta;
 use crate::ports::scan_findings_repository::ScanFindingsRow;
@@ -148,8 +149,9 @@ pub trait ArtifactLifecyclePort: Send + Sync {
         prior_status: QuarantineStatus,
     ) -> BoxFuture<'a, DomainResult<AppendResult>>;
 
-    /// Atomically commit a **creation transition** and enqueue its
-    /// ingest-time jobs (the auto-scan and the provenance gate).
+    /// Atomically commit a **creation transition**, enqueue its ingest-time
+    /// jobs (the auto-scan and the provenance gate), and record its
+    /// content-reference `edges`.
     ///
     /// ## No-strand guarantee (backend-defined)
     ///
@@ -160,6 +162,37 @@ pub trait ArtifactLifecyclePort: Send + Sync {
     /// provenance-gate event without its corresponding `jobs` row, which would
     /// strand it in quarantine (unscanned / unverified — fail-closed, but
     /// recoverable only by an operator-triggered manual rescan).
+    ///
+    /// ## No-edgeless-artifact guarantee
+    ///
+    /// Every [`ContentReference`] in `edges` is subject to the same
+    /// all-or-nothing rule, for a reason that points the other way: a
+    /// `content_references` row is a **claim on bytes**, and the storage GC
+    /// deletes a CAS blob precisely when no row targets its hash. An artifact
+    /// committed without its `primary_content` edge therefore counts **zero**
+    /// against its own content, and a released sibling carrying the same bytes
+    /// — CAS deduplicates, so the hash is shared — drives the observed count
+    /// to zero and authorises the delete. A missing edge does not postpone
+    /// collection, it brings it forward, and the artifact it belongs to is the
+    /// one left pointing at bytes that no longer exist. So an edge whose
+    /// insert fails rolls the whole transition back: the upload fails and is
+    /// retriable, which is recoverable, where an edgeless committed artifact
+    /// is not.
+    ///
+    /// What the contract requires is the all-or-nothing, not an order. A
+    /// backend that enforces referential integrity between an edge and its
+    /// source necessarily applies `edges` **after** the artifact state — the
+    /// Postgres adapter's `content_references.source_artifact_id` foreign key
+    /// does, so it writes them last; an in-memory double with no such
+    /// constraint is free to order them however makes its failure injection
+    /// faithful.
+    ///
+    /// Repeated `(repository_id, source_artifact_id, target_content_hash,
+    /// kind)` is an upsert, exactly as [`ContentReferenceIndex::insert`]
+    /// defines it, so a retried transition writes the same set.
+    ///
+    /// [`ContentReferenceIndex::insert`]:
+    ///     crate::ports::content_reference_index::ContentReferenceIndex::insert
     ///
     /// *How* the guarantee is met is the adapter's choice — it is **not** part
     /// of the contract, so callers must never assume a shared backend:
@@ -184,19 +217,20 @@ pub trait ArtifactLifecyclePort: Send + Sync {
     ///
     /// ## Default impl — test doubles only
     ///
-    /// The default forwards to [`Self::commit_transition`] and **drops** the
-    /// enqueues; it does **not** fulfil the no-strand guarantee and exists only
-    /// so transition-only test doubles compile (mirrors the lossy default on
-    /// [`Self::commit_transition_with_score`]). **Every production adapter MUST
-    /// override it.**
+    /// The default forwards to [`Self::commit_transition`] and **drops** both
+    /// the enqueues and the edges; it does **not** fulfil either guarantee and
+    /// exists only so transition-only test doubles compile (mirrors the lossy
+    /// default on [`Self::commit_transition_with_score`]). **Every production
+    /// adapter MUST override it.**
     fn commit_transition_with_enqueues<'a>(
         &'a self,
         artifact: &'a Artifact,
         events: AppendEvents,
         metadata: Option<ArtifactMetadata>,
         enqueues: &'a [IngestEnqueue],
+        edges: &'a [ContentReference],
     ) -> BoxFuture<'a, DomainResult<AppendResult>> {
-        let _ = enqueues;
+        let _ = (enqueues, edges);
         self.commit_transition(artifact, events, metadata)
     }
 
@@ -380,9 +414,9 @@ mod tests {
     }
 
     /// The defaulted `commit_transition_with_enqueues` forwards to
-    /// `commit_transition` and DROPS the enqueues — the test-double-only
-    /// behaviour (production adapters override to commit them atomically).
-    /// Also exercises the `IngestEnqueue` value type.
+    /// `commit_transition` and DROPS both the enqueues and the edges — the
+    /// test-double-only behaviour (production adapters override to commit them
+    /// atomically). Also exercises the `IngestEnqueue` value type.
     #[tokio::test]
     async fn default_commit_transition_with_enqueues_forwards_and_drops() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -472,12 +506,28 @@ mod tests {
             actor: crate::events::system_actor(),
         };
 
-        // The default forwards to commit_transition (dropping the enqueues).
-        l.commit_transition_with_enqueues(&artifact, events.clone(), None, &[scan, prov])
-            .await
-            .unwrap();
-        // Empty enqueues also forward.
-        l.commit_transition_with_enqueues(&artifact, events, None, &[])
+        let edge = ContentReference {
+            source_artifact_id: artifact.id,
+            target_content_hash: artifact.sha256_checksum.clone(),
+            kind: "primary_content".into(),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            repository_id: artifact.repository_id,
+            recorded_at: Utc::now(),
+        };
+
+        // The default forwards to commit_transition (dropping the enqueues
+        // and the edges alike).
+        l.commit_transition_with_enqueues(
+            &artifact,
+            events.clone(),
+            None,
+            &[scan, prov],
+            std::slice::from_ref(&edge),
+        )
+        .await
+        .unwrap();
+        // Empty enqueues and empty edges also forward.
+        l.commit_transition_with_enqueues(&artifact, events, None, &[], &[])
             .await
             .unwrap();
 

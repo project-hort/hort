@@ -422,6 +422,7 @@ impl DesiredState {
         push_init14_reference_errors(self, &declared_repos, &mut errors);
         push_per_policy_exclusion_duplicates(&self.exclusions, &mut errors);
         push_scan_policy_scope_duplicates(&self.scan_policies, &mut errors);
+        push_scan_policy_scope_reference_errors(self, &declared_repos, &mut errors);
         push_retention_policy_scope_reference_errors(self, &declared_repos, &mut errors);
         push_upstream_mapping_reference_errors(self, &declared_repos, &mut errors);
         push_upstream_mapping_identity_duplicates(&self.upstream_mappings, &mut errors);
@@ -538,8 +539,10 @@ enum ParsedFile {
 }
 
 fn parse_one_file(path: &std::path::Path, bytes: &[u8]) -> Result<ParsedFile, ParseError> {
-    // Peek at the raw YAML to decide which parser to invoke.
-    let raw: serde_yaml_ng::Value = serde_yaml_ng::from_slice(bytes)?;
+    // Peek at the raw YAML to decide which parser to invoke. Untyped
+    // because the envelope's `spec` shape is exactly what is not known
+    // yet; `serde_json::Value` is the crate's one untyped target.
+    let raw: serde_json::Value = crate::yaml::from_slice(bytes)?;
     let kind = raw.get("kind").and_then(|v| v.as_str());
     if let Some(kind_str) = kind {
         match kind_str {
@@ -1156,6 +1159,290 @@ fn predicate_mentions_unused_for(pred: &PolicyPredicate) -> bool {
     }
 }
 
+/// Apply-time linter rejecting a `ScanPolicy.licensePolicy` that
+/// declares licence rules the scan path cannot apply.
+///
+/// The field is accepted, stored on the projection and visible to an
+/// auditor, and decides nothing. `evaluate_scan_result` dispatches to
+/// [`evaluate_license_policy`](hort_domain::policy::evaluate_license_policy)
+/// with a hard-coded **empty** licence list — no port surfaces an
+/// artifact's licences — so a well-formed
+/// `{"denied_licenses":["GPL-3.0"],"action":"Block"}` compares the
+/// denied set against zero licences, produces zero violations, and
+/// leaves the scan clean whatever the artifact's licence actually is.
+/// The only thing the dispatch can still produce is a
+/// `license-policy-shape` advisory against a malformed value, which
+/// never blocks. An operator declaring a denied-licence list is making
+/// a compliance decision on the assumption the field gates releases;
+/// accepting a risk-significant field whose consumer silently ignores
+/// it is a hard architectural block (ADR 0015).
+///
+/// **The inert default is `null` or `{}`**, and both keep applying
+/// exactly as before:
+/// [`has_license_policy`](hort_domain::policy::has_license_policy) is
+/// the single definition
+/// of "declared" shared with the evaluator's own dispatch guard, so the
+/// set rejected here is exactly the set that would reach the evaluator.
+/// A tree that writes `licensePolicy: {}` (what every shipped example
+/// tree writes) is untouched.
+///
+/// **Retirement trigger.** This rejection is wrong the moment licences
+/// reach the evaluator. That happens when `evaluate_scan_result` stops
+/// passing `&[]` and feeds a real licence list from a port (an SBOM
+/// surface). Delete this function, its `LinterRule` row, its metric
+/// constant and its metrics-catalog entry **in that same commit**.
+///
+/// **Fail-closed.** No escape hatch: the operator either removes the
+/// field or drops the compliance claim until the licence input exists.
+///
+/// Pure function of `DesiredState`; one error per offending envelope.
+pub fn validate_scan_policy_license_policy_not_implemented(
+    state: &DesiredState,
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for env in &state.scan_policies {
+        if !hort_domain::policy::has_license_policy(&env.spec.license_policy) {
+            continue;
+        }
+        errors.push(ValidationError::Invalid {
+            kind: Kind::ScanPolicy,
+            name: env.metadata.name.clone(),
+            detail: format!(
+                "`licensePolicy` enforcement is not implemented: the scan path evaluates \
+                 the policy against an empty licence list (no port surfaces an artifact's \
+                 licences), so every rule in it matches nothing and the scan stays clean \
+                 whatever the artifact is licensed under. Remove the field — or write \
+                 `licensePolicy: {{}}` — to apply; a different value does not change \
+                 this. (scan policy: `{name}`)",
+                name = env.metadata.name,
+            ),
+        });
+    }
+    errors
+}
+
+/// Apply-time linter rejecting an `Exclusion.scope` that names a
+/// repository.
+///
+/// The rationale is
+/// [`SCOPE_NOT_ENFORCED`](hort_domain::policy::SCOPE_NOT_ENFORCED) —
+/// the finding filter never reads the scope, so a waiver narrowed to
+/// one repository silently clears its CVE everywhere the parent policy
+/// reaches. This is the ADR 0015 block with the blast radius pointing
+/// the wrong way: the operator's edit *looks* like a narrowing and acts
+/// like a widening.
+///
+/// **The inert default is `scope: global`** and keeps applying exactly
+/// as before. `scope` is a required field on the spec, so there is no
+/// "absent" case to consider.
+///
+/// This is one of **two** writers that has to refuse the scope — the
+/// other is `PolicyUseCase::add_exclusion`, which the HTTP write
+/// surface reaches outside the desired-tree lint. A linter row on its
+/// own would close the declared path and leave the API path open.
+///
+/// **Also what keeps `ExclusionsApplier::resolve_scope`'s panic
+/// unreachable.** That resolver maps a scope's repository name to an id
+/// through a map built from the declared repositories and treats a miss
+/// as an invariant violation; a panic is not a `GitopsBootError`, so
+/// the boot path cannot park on it and the pod crashloops with the
+/// earlier stages written. Rejecting *every* repository scope here is
+/// strictly stronger than a dangling-reference rule would be (which is
+/// why no such rule exists for this kind, unlike `ScanPolicy`'s own
+/// `push_scan_policy_scope_reference_errors`) — with this row in
+/// place no repository scope reaches the resolver at all.
+///
+/// **Fail-closed.** No escape hatch: the operator either says
+/// `scope: global` — which is what the deployment would actually do —
+/// or drops the exclusion until per-repository scoping is implemented.
+///
+/// Pure function of `DesiredState`; one error per offending envelope.
+pub fn validate_exclusion_scope_not_implemented(state: &DesiredState) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for env in &state.exclusions {
+        let crate::scope::ScopeSpec::Repository(scope) = &env.spec.scope else {
+            continue;
+        };
+        errors.push(ValidationError::Invalid {
+            kind: Kind::Exclusion,
+            name: env.metadata.name.clone(),
+            detail: format!(
+                "`spec.scope` names repository `{repository}`, but {rationale}. Write \
+                 `scope: global` if clearing this CVE everywhere the policy governs is \
+                 what was meant, or drop the exclusion until per-repository scoping is \
+                 implemented. (exclusion: `{name}`, parent policy: `{policy}`)",
+                repository = scope.repository,
+                rationale = hort_domain::policy::SCOPE_NOT_ENFORCED,
+                name = env.metadata.name,
+                policy = env.spec.policy,
+            ),
+        });
+    }
+    errors
+}
+
+/// Apply-time linter rejecting a `virtualMembers` entry whose format
+/// differs from the virtual repository's own.
+///
+/// Nothing compares the two. Cross-spec validation requires each member
+/// to be declared and non-virtual; the per-spec virtual-shape validator
+/// checks only the virtual's *own* format against
+/// `VIRTUAL_SERVE_SUPPORTED_FORMATS`; and at serve time
+/// `VirtualResolutionUseCase::resolve_members` re-checks Read
+/// visibility and repository type, not format. So a `pypi` hosted
+/// repository can be a member of an `npm` virtual, and — because a
+/// non-proxy member *owns* the names it holds (the name-level pinning
+/// rule, ADR 0031) — it can own a package name inside that npm
+/// virtual, suppressing the npm proxy for that name while holding
+/// nothing an npm client can install.
+///
+/// There is no format-compatibility model to appeal to: the operator
+/// composing a virtual is making a decision about what the endpoint
+/// serves, on the assumption that a member's format is checked against
+/// it. That assumption is the ADR 0015 block.
+///
+/// **The inert default is a member whose format matches**, which is
+/// every shipped example tree, and keeps applying exactly as before.
+/// Formats are compared through
+/// [`RepositoryFormat::from_str`](hort_domain::entities::repository::RepositoryFormat)
+/// rather than as raw strings, so the comparison normalises case the
+/// same way every runtime format lookup does — a member declaring
+/// `NPM` inside an `npm` virtual is the matching case, not a mismatch.
+///
+/// A member name that resolves to no declared repository is skipped:
+/// that error is `DanglingVirtualMember`'s, and naming a format for a
+/// repository the bundle does not declare would be a guess.
+///
+/// **Fail-closed.** No escape hatch: a cross-format aggregate needs one
+/// virtual per format.
+///
+/// Pure function of `DesiredState`; one error per offending
+/// (virtual, member) pair — each is a separate member line to fix.
+pub fn validate_virtual_member_formats_not_enforced(state: &DesiredState) -> Vec<ValidationError> {
+    use hort_domain::entities::repository::{RepositoryFormat, RepositoryType};
+
+    let declared_format_by_name: HashMap<&str, &str> = state
+        .repositories
+        .iter()
+        .map(|e| (e.metadata.name.as_str(), e.spec.format.as_str()))
+        .collect();
+
+    let mut errors = Vec::new();
+    for env in &state.repositories {
+        if !matches!(
+            RepositoryType::from_str(&env.spec.repo_type),
+            Ok(RepositoryType::Virtual)
+        ) {
+            continue;
+        }
+        // Infallible parse (unknown formats become `Other(lowercased)`),
+        // so an unknown format on either side still compares — row 0's
+        // own format rule is what rejects the unknown token.
+        let Ok(virtual_format) = RepositoryFormat::from_str(&env.spec.format);
+        for member in env.spec.virtual_members.as_deref().unwrap_or(&[]) {
+            let Some(member_format_str) = declared_format_by_name.get(member.as_str()) else {
+                continue;
+            };
+            let Ok(member_format) = RepositoryFormat::from_str(member_format_str);
+            if member_format == virtual_format {
+                continue;
+            }
+            errors.push(ValidationError::Invalid {
+                kind: Kind::ArtifactRepository,
+                name: env.metadata.name.clone(),
+                detail: format!(
+                    "`virtualMembers` entry `{member}` declares format \
+                     `{member_format_str}` while this virtual repository declares \
+                     `{virtual_format_str}`, and no format-compatibility check is \
+                     implemented — neither apply nor serve-time member resolution \
+                     compares the two, so the member is resolved for \
+                     `{virtual_format_str}` requests regardless, and a non-proxy \
+                     one additionally owns the names it holds there, suppressing \
+                     the virtual's other members for them. Remove the entry, or \
+                     aggregate it in a separate `{member_format_str}` virtual. \
+                     (virtual repository: `{name}`)",
+                    member = member,
+                    member_format_str = member_format_str,
+                    virtual_format_str = env.spec.format,
+                    name = env.metadata.name,
+                ),
+            });
+        }
+    }
+    errors
+}
+
+/// Apply-time linter rejecting a `ScanPolicy.maxArtifactAge` that
+/// declares a staleness cap nothing evaluates.
+///
+/// The field travels the whole configuration path and is read by
+/// nothing that decides: it is parsed, format-validated, converted to
+/// `max_artifact_age_secs` on the projection, diffed field-by-field,
+/// event-sourced onto the policy stream, persisted, and written into
+/// the config snapshot. The evaluator
+/// [`evaluate_age_gates`](hort_domain::policy::evaluate_age_gates)
+/// exists and would turn an exceeded cap into a `Medium`
+/// `max-artifact-age` violation — but it has **no production caller**,
+/// only its own unit tests. No scan-result evaluation, no release
+/// decision and no retention pass ever asks the question, so no
+/// artifact is ever flagged for age.
+///
+/// An operator writing `maxArtifactAge: 90d` has declared a staleness
+/// cap, can read it back from the policy and sees it in both the
+/// config snapshot and drift detection — while every artifact older
+/// than the cap keeps passing every gate. Accepting a risk-significant
+/// field whose consumer silently ignores it is a hard architectural
+/// block (ADR 0015); this is the same shape as
+/// [`validate_prefetch_max_age_days_not_implemented`] one policy kind
+/// over.
+///
+/// **The inert default is the absent field** (equivalently, an explicit
+/// `maxArtifactAge: null`, which deserialises to the same `None`).
+/// `max_artifact_age` is an `Option<String>` whose `None` the evaluator
+/// reads as "no cap", so **any** `Some` is the rejection: unlike row
+/// 10's `licensePolicy: {}` there is no value that declares nothing, and
+/// `0s` — which would flag everything if anything read it — is refused
+/// exactly like `90d`. A tree that never claimed an age cap applies
+/// exactly as before.
+///
+/// **Retirement trigger.** This rejection is wrong the moment a
+/// consumer exists. That happens when something feeds
+/// `ScanPolicyProjection.max_artifact_age_secs` and the artifact's
+/// ingest instant through `evaluate_age_gates` and folds the resulting
+/// violation into the accumulator. Delete this function, its
+/// `LinterRule` row, its metric constant and its metrics-catalog entry
+/// **in that same commit**; the format validation in
+/// `validate_scan_policy_env` stays either way.
+///
+/// **Fail-closed.** No escape hatch: the operator either removes the
+/// field or drops the staleness claim until the evaluator is wired.
+///
+/// Pure function of `DesiredState`; one error per offending envelope.
+pub fn validate_scan_policy_max_artifact_age_not_implemented(
+    state: &DesiredState,
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for env in &state.scan_policies {
+        let Some(age) = env.spec.max_artifact_age.as_ref() else {
+            continue;
+        };
+        errors.push(ValidationError::Invalid {
+            kind: Kind::ScanPolicy,
+            name: env.metadata.name.clone(),
+            detail: format!(
+                "`maxArtifactAge` enforcement is not implemented: the cap is stored on \
+                 the policy and never evaluated (the age evaluator has no caller on any \
+                 scan, release or retention path), so no artifact is ever flagged for \
+                 age however old it is. Remove the field to apply; a different duration \
+                 does not change this. (scan policy: `{name}`, declared cap: `{age}`)",
+                name = env.metadata.name,
+                age = age,
+            ),
+        });
+    }
+    errors
+}
+
 /// Every `UpstreamMapping.spec.repository` must resolve to a declared
 /// `ArtifactRepository.metadata.name`. The apply pipeline needs the
 /// repository_id for the row insert; a dangling reference at
@@ -1351,6 +1638,48 @@ fn push_scan_policy_scope_duplicates(
                      resolution has no deterministic way to choose between them",
                     group.len(),
                 ),
+            });
+        }
+    }
+}
+
+/// Cross-doc reference check for a `ScanPolicy`'s repository scope.
+///
+/// `scope: { repository: <metadata.name> }` names a repository the apply
+/// pipeline resolves to a UUID through `repo_id_by_name`, which is built
+/// from `DesiredState.repositories`. A name absent from that map has no
+/// id to resolve to, and both resolution sites — `resolve_scope` in
+/// `hort-app`'s apply pipeline and `ScanPolicyApplier::resolve_scope` —
+/// treat a miss as an invariant violation and panic. A panic is not a
+/// `GitopsBootError`, so the boot path cannot park not-ready on it: it
+/// crashloops, with the earlier stages of the same apply already
+/// written. An undeclared name therefore has to be rejected here, before
+/// any write. Mirrors `push_retention_policy_scope_reference_errors` and
+/// the `UpstreamMapping.spec.repository` rule: one `DanglingReference`
+/// per offending value, naming it.
+///
+/// Unlike the retention sibling there is no unparsable-scope case to
+/// skip: [`ScanPolicySpec::scope`] is a typed
+/// [`ScopeSpec`](crate::scope::ScopeSpec), so a scope that does not
+/// deserialize fails its own envelope's parse and never reaches a
+/// `DesiredState` at all.
+fn push_scan_policy_scope_reference_errors(
+    state: &DesiredState,
+    declared_repos: &std::collections::HashSet<&str>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for env in &state.scan_policies {
+        let Some(name) = env.spec.scope.repository_name() else {
+            // `Global` — no repository reference to resolve.
+            continue;
+        };
+        if !declared_repos.contains(name) {
+            errors.push(ValidationError::DanglingReference {
+                referrer_kind: Kind::ScanPolicy,
+                referrer_name: env.metadata.name.clone(),
+                field: "spec.scope.repository",
+                target_kind: Kind::ArtifactRepository,
+                missing_name: name.to_string(),
             });
         }
     }
@@ -1727,10 +2056,10 @@ spec: {}
         let mut state = DesiredState::default();
         state
             .repositories
-            .push(serde_yaml_ng::from_slice(&repo_yaml("ok", "hosted", None)).unwrap());
+            .push(crate::yaml::from_slice(&repo_yaml("ok", "hosted", None)).unwrap());
         state
             .claim_mappings
-            .push(serde_yaml_ng::from_slice(&cm_yaml("admins", "g", "admin")).unwrap());
+            .push(crate::yaml::from_slice(&cm_yaml("admins", "g", "admin")).unwrap());
         let err = state
             .validate_against(&CurrentSnapshot::default(), &env(EnvAuthProvider::Disabled))
             .unwrap_err();
@@ -2344,6 +2673,114 @@ spec:
         );
     }
 
+    // -- ScanPolicy scope reference rule ------------------------------------
+
+    #[test]
+    fn validate_accepts_scan_policy_scope_naming_a_repository_declared_in_the_same_bundle() {
+        // The ordering guarantee this pins: a scan policy may name a
+        // repository declared in the SAME desired state. Nothing has to
+        // pre-exist in the database.
+        let files = vec![
+            (p("repo.yaml"), repo_yaml("npm-internal", "hosted", None)),
+            (
+                p("sp.yaml"),
+                sp_yaml_with_scope_and_backends(
+                    "scan-npm",
+                    "{ repository: npm-internal }",
+                    &["trivy"],
+                ),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        state.validate().expect("declared repository resolves");
+    }
+
+    #[test]
+    fn validate_rejects_scan_policy_scope_naming_an_undeclared_repository() {
+        let files = vec![
+            (p("repo.yaml"), repo_yaml("npm-internal", "hosted", None)),
+            (
+                p("sp.yaml"),
+                sp_yaml_with_scope_and_backends(
+                    "scan-ghost",
+                    "{ repository: ghost-repo }",
+                    &["trivy"],
+                ),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        let err = state.validate().unwrap_err();
+        let dangling: Vec<&ValidationError> = err
+            .0
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ValidationError::DanglingReference {
+                        referrer_kind: Kind::ScanPolicy,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            dangling.len(),
+            1,
+            "only the undeclared name is an error, got: {:?}",
+            err.0
+        );
+        let rendered = dangling[0].to_string();
+        assert!(
+            rendered.contains("ghost-repo"),
+            "the message must name the offending value: {rendered}"
+        );
+        assert!(
+            rendered.contains("scan-ghost"),
+            "the message must name the referrer: {rendered}"
+        );
+        assert!(
+            rendered.contains("spec.scope.repository"),
+            "the message must name the field: {rendered}"
+        );
+    }
+
+    /// A `Global` scope references nothing, so the rule must stay silent
+    /// — the scope that resolves without a map lookup at all.
+    #[test]
+    fn validate_ignores_global_scan_policy_scopes() {
+        let files = vec![(p("sp.yaml"), sp_yaml("scan-everything"))];
+        let state = DesiredState::parse_files(files).unwrap();
+        state
+            .validate()
+            .expect("no repository reference to resolve");
+    }
+
+    /// An empty repository name is undeclared like any other: no
+    /// repository can carry a blank `metadata.name`, so the scope has no
+    /// id to resolve to and the rule must reject it rather than read the
+    /// blank as "unscoped".
+    #[test]
+    fn validate_rejects_a_blank_scan_policy_scope_repository() {
+        let files = vec![(
+            p("sp.yaml"),
+            sp_yaml_with_scope_and_backends("scan-blank", "{ repository: '' }", &["trivy"]),
+        )];
+        let state = DesiredState::parse_files(files).unwrap();
+        let err = state.validate().unwrap_err();
+        assert!(
+            err.0.iter().any(|e| matches!(
+                e,
+                ValidationError::DanglingReference {
+                    referrer_kind: Kind::ScanPolicy,
+                    referrer_name,
+                    ..
+                } if referrer_name == "scan-blank"
+            )),
+            "got: {:?}",
+            err.0
+        );
+    }
+
     // -- exclusion duplicate identity rules --------------------------------
 
     #[test]
@@ -2371,9 +2808,12 @@ spec:
         // CVE-pattern under multiple parent policies without conflict.
         // `p1`/`p2` need distinct scopes (only one ScanPolicy may be
         // active per scope) — scope has no bearing on exclusion
-        // identity, which is what this test actually exercises.
+        // identity, which is what this test actually exercises. `p2`'s
+        // scoped repository is declared because a scope naming an
+        // undeclared one is itself a validation error.
         let files = vec![
             (p("p1.yaml"), sp_yaml("p1")),
+            (p("repo.yaml"), repo_yaml("other-repo", "hosted", None)),
             (
                 p("p2.yaml"),
                 sp_yaml_with_scope_and_backends("p2", "{ repository: other-repo }", &["trivy"]),
@@ -3388,6 +3828,592 @@ spec:
             errors.len(),
             2,
             "on_dist_tag_move must not add a third error: {errors:?}"
+        );
+    }
+
+    // ======================================================================
+    // Three further ADR 0015 accepted-but-inert operator surfaces:
+    // `ScanPolicy.licensePolicy`, `Exclusion.scope`, and a
+    // `virtualMembers` entry's format. Each is accepted, stored, visible
+    // to an auditor, and decides nothing; each rejection names the field
+    // and says what is missing, so an operator does not retry with a
+    // different value.
+    // ======================================================================
+
+    /// A `ScanPolicy` envelope with an explicit `licensePolicy` body.
+    fn sp_yaml_with_license_policy(name: &str, license_policy_yaml: &str) -> Vec<u8> {
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: {name}
+spec:
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  licensePolicy: {license_policy_yaml}
+"
+        )
+        .into_bytes()
+    }
+
+    fn state_with_license_policies(entries: &[(&str, &str)]) -> DesiredState {
+        let files: Vec<(PathBuf, Vec<u8>)> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (name, lp))| {
+                (
+                    p(&format!("sp{i}.yaml")),
+                    sp_yaml_with_license_policy(name, lp),
+                )
+            })
+            .collect();
+        DesiredState::parse_files(files).unwrap()
+    }
+
+    #[test]
+    fn a_declared_license_policy_is_rejected() {
+        let state = state_with_license_policies(&[(
+            "prod-default",
+            r#"{ denied_licenses: ["GPL-3.0"], action: Block }"#,
+        )]);
+        let errors = validate_scan_policy_license_policy_not_implemented(&state);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        let rendered = errors[0].to_string();
+        assert!(
+            rendered.contains("prod-default"),
+            "must name the envelope: {rendered}"
+        );
+        assert!(
+            rendered.contains("licensePolicy"),
+            "must name the field: {rendered}"
+        );
+        assert!(
+            rendered.contains("not implemented") && rendered.contains("empty licence list"),
+            "must say what is missing, not just that the value is refused: {rendered}"
+        );
+        assert!(
+            rendered.contains("a different value does not change this"),
+            "must stop the operator retrying with another value: {rendered}"
+        );
+    }
+
+    /// The two inert forms. `{}` is what every shipped example tree
+    /// writes and an omitted field parses to `null`; both are the
+    /// evaluator's own "no policy declared" short-circuit, so both must
+    /// keep applying.
+    #[test]
+    fn the_inert_license_policy_forms_are_accepted() {
+        let state = state_with_license_policies(&[("empty-object", "{}")]);
+        assert!(
+            validate_scan_policy_license_policy_not_implemented(&state).is_empty(),
+            "`licensePolicy: {{}}` is the inert default"
+        );
+
+        // Omitted entirely — the field defaults to `Value::Null`.
+        let omitted = DesiredState::parse_files(vec![(p("sp.yaml"), sp_yaml("omitted"))]).unwrap();
+        assert!(
+            validate_scan_policy_license_policy_not_implemented(&omitted).is_empty(),
+            "an omitted licensePolicy is the inert default"
+        );
+        let none_at_all = DesiredState::default();
+        assert!(
+            validate_scan_policy_license_policy_not_implemented(&none_at_all).is_empty(),
+            "no ScanPolicy at all cannot produce a finding"
+        );
+    }
+
+    /// A malformed value (a bare list where an object belongs) is
+    /// rejected too. At runtime it reaches the evaluator and produces a
+    /// non-blocking `license-policy-shape` advisory — still no licence
+    /// decision — so leaving it accepted would keep exactly the assurance
+    /// this rule removes.
+    #[test]
+    fn a_malformed_license_policy_is_rejected_as_well() {
+        let state = state_with_license_policies(&[("typo", r#"["GPL-3.0"]"#)]);
+        assert_eq!(
+            validate_scan_policy_license_policy_not_implemented(&state).len(),
+            1,
+            "a non-object licensePolicy still declares an intent nothing honours"
+        );
+    }
+
+    #[test]
+    fn each_offending_scan_policy_gets_its_own_license_error() {
+        let state = state_with_license_policies(&[
+            ("declares-a", r#"{ action: Block }"#),
+            ("inert-b", "{}"),
+            ("declares-c", r#"{ allowed_licenses: ["MIT"] }"#),
+        ]);
+        let errors = validate_scan_policy_license_policy_not_implemented(&state);
+        assert_eq!(errors.len(), 2, "got: {errors:?}");
+        let rendered: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(rendered.iter().any(|e| e.contains("declares-a")));
+        assert!(rendered.iter().any(|e| e.contains("declares-c")));
+        assert!(
+            !rendered.iter().any(|e| e.contains("inert-b")),
+            "the inert default is untouched: {rendered:?}"
+        );
+    }
+
+    // -- Exclusion scope ---------------------------------------------------
+
+    /// An `Exclusion` envelope with an explicit `scope` body.
+    fn ex_yaml_with_scope(name: &str, policy: &str, cve_id: &str, scope_yaml: &str) -> Vec<u8> {
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: Exclusion
+metadata:
+  name: {name}
+spec:
+  policy: {policy}
+  cveId: {cve_id}
+  scope: {scope_yaml}
+  reason: test
+"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn an_exclusion_scoped_to_a_repository_is_rejected() {
+        let state = DesiredState::parse_files(vec![(
+            p("ex.yaml"),
+            ex_yaml_with_scope(
+                "cve-2024-3094-on-xz",
+                "prod-default",
+                "CVE-2024-3094",
+                "{ repository: npm-internal }",
+            ),
+        )])
+        .unwrap();
+        let errors = validate_exclusion_scope_not_implemented(&state);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        let rendered = errors[0].to_string();
+        assert!(
+            rendered.contains("cve-2024-3094-on-xz") && rendered.contains("prod-default"),
+            "must name the exclusion and its parent policy: {rendered}"
+        );
+        assert!(
+            rendered.contains("npm-internal"),
+            "must name the repository the operator scoped it to: {rendered}"
+        );
+        assert!(
+            rendered.contains("not enforced") && rendered.contains("never reads"),
+            "must say the control is missing, not merely that the value is refused: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("every repository the parent policy governs"),
+            "must say what the scope actually does today: {rendered}"
+        );
+        assert!(
+            rendered.contains("scope: global"),
+            "must name the one accepted form: {rendered}"
+        );
+    }
+
+    /// The rejection reaches a repository the bundle DOES declare too —
+    /// it is the scope that is refused, not a dangling reference. This is
+    /// what makes `ExclusionsApplier::resolve_scope`'s panic unreachable:
+    /// a dangling-reference rule would have let a resolvable name
+    /// through.
+    #[test]
+    fn an_exclusion_scoped_to_a_declared_repository_is_rejected_too() {
+        let state = DesiredState::parse_files(vec![
+            (p("r.yaml"), repo_yaml("npm-internal", "hosted", None)),
+            (p("sp.yaml"), sp_yaml("prod-default")),
+            (
+                p("ex.yaml"),
+                ex_yaml_with_scope(
+                    "cve-on-declared",
+                    "prod-default",
+                    "CVE-2024-0001",
+                    "{ repository: npm-internal }",
+                ),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            validate_exclusion_scope_not_implemented(&state).len(),
+            1,
+            "a declared repository name does not make the scope enforceable"
+        );
+    }
+
+    #[test]
+    fn a_global_exclusion_scope_is_accepted() {
+        let state = DesiredState::parse_files(vec![(
+            p("ex.yaml"),
+            ex_yaml("cve-global", "prod-default", "CVE-2024-0002", None),
+        )])
+        .unwrap();
+        assert!(
+            validate_exclusion_scope_not_implemented(&state).is_empty(),
+            "`scope: global` is the inert default"
+        );
+        assert!(
+            validate_exclusion_scope_not_implemented(&DesiredState::default()).is_empty(),
+            "no Exclusion at all cannot produce a finding"
+        );
+    }
+
+    #[test]
+    fn each_offending_exclusion_gets_its_own_scope_error() {
+        let state = DesiredState::parse_files(vec![
+            (
+                p("a.yaml"),
+                ex_yaml_with_scope("scoped-a", "p", "CVE-1", "{ repository: r1 }"),
+            ),
+            (p("b.yaml"), ex_yaml("global-b", "p", "CVE-2", None)),
+            (
+                p("c.yaml"),
+                ex_yaml_with_scope("scoped-c", "p", "CVE-3", "{ repository: r2 }"),
+            ),
+        ])
+        .unwrap();
+        let errors = validate_exclusion_scope_not_implemented(&state);
+        assert_eq!(errors.len(), 2, "got: {errors:?}");
+        let rendered: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(rendered.iter().any(|e| e.contains("scoped-a")));
+        assert!(rendered.iter().any(|e| e.contains("scoped-c")));
+        assert!(
+            !rendered.iter().any(|e| e.contains("global-b")),
+            "the global scope is untouched: {rendered:?}"
+        );
+    }
+
+    // -- virtualMembers format ---------------------------------------------
+
+    /// A `type: virtual` repository over `members`, on `format`.
+    fn virtual_repo_yaml(name: &str, format: &str, members: &[&str]) -> Vec<u8> {
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: {name}
+spec:
+  name: {name}
+  format: {format}
+  type: virtual
+  virtualMembers: [{members}]
+  isPublic: true
+  replicationPriority: on_demand
+",
+            members = members.join(", ")
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_virtual_member_on_another_format_is_rejected() {
+        let state = DesiredState::parse_files(vec![
+            (
+                p("v.yaml"),
+                virtual_repo_yaml("all-npm", "npm", &["py-lib"]),
+            ),
+            (
+                p("m.yaml"),
+                repo_yaml_with_format("py-lib", "pypi", "hosted"),
+            ),
+        ])
+        .unwrap();
+        let errors = validate_virtual_member_formats_not_enforced(&state);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        let rendered = errors[0].to_string();
+        assert!(
+            rendered.contains("all-npm") && rendered.contains("py-lib"),
+            "must name the virtual and the offending member: {rendered}"
+        );
+        assert!(
+            rendered.contains("pypi") && rendered.contains("npm"),
+            "must name both formats: {rendered}"
+        );
+        assert!(
+            rendered.contains("no format-compatibility check is implemented"),
+            "must say the control is missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("suppress"),
+            "must say what the accepted member would do — own names inside the \
+             virtual: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_same_format_virtual_member_is_accepted() {
+        let state = DesiredState::parse_files(vec![
+            (
+                p("v.yaml"),
+                virtual_repo_yaml("all-npm", "npm", &["npm-internal", "npm-public"]),
+            ),
+            (p("a.yaml"), repo_yaml("npm-internal", "hosted", None)),
+            (p("b.yaml"), repo_yaml("npm-public", "proxy", None)),
+        ])
+        .unwrap();
+        assert!(
+            validate_virtual_member_formats_not_enforced(&state).is_empty(),
+            "a format-homogeneous virtual is the inert default"
+        );
+    }
+
+    /// Case is normalised the same way every runtime format lookup
+    /// normalises it, so `NPM` inside an `npm` virtual is the matching
+    /// case rather than a mismatch the operator cannot explain.
+    #[test]
+    fn member_format_comparison_normalises_case() {
+        let state = DesiredState::parse_files(vec![
+            (
+                p("v.yaml"),
+                virtual_repo_yaml("all-npm", "npm", &["shouty"]),
+            ),
+            (
+                p("m.yaml"),
+                repo_yaml_with_format("shouty", "NPM", "hosted"),
+            ),
+        ])
+        .unwrap();
+        assert!(
+            validate_virtual_member_formats_not_enforced(&state).is_empty(),
+            "`NPM` and `npm` are the same format to every runtime lookup"
+        );
+    }
+
+    /// A member name that resolves to nothing is `DanglingVirtualMember`'s
+    /// error; naming a format for an undeclared repository would be a
+    /// guess.
+    #[test]
+    fn an_undeclared_virtual_member_produces_no_format_error() {
+        let state = DesiredState::parse_files(vec![(
+            p("v.yaml"),
+            virtual_repo_yaml("all-npm", "npm", &["never-declared"]),
+        )])
+        .unwrap();
+        assert!(
+            validate_virtual_member_formats_not_enforced(&state).is_empty(),
+            "the dangling-member rule owns this envelope's error"
+        );
+    }
+
+    /// A non-virtual repository is never inspected — `virtualMembers` on
+    /// one is already its own per-spec rejection.
+    #[test]
+    fn a_non_virtual_repository_is_not_inspected_for_member_formats() {
+        let state = DesiredState::parse_files(vec![
+            (
+                p("h.yaml"),
+                repo_yaml("hosted-with-members", "hosted", Some(&["py-lib"])),
+            ),
+            (
+                p("m.yaml"),
+                repo_yaml_with_format("py-lib", "pypi", "hosted"),
+            ),
+        ])
+        .unwrap();
+        assert!(
+            validate_virtual_member_formats_not_enforced(&state).is_empty(),
+            "only a type=virtual repository resolves members"
+        );
+    }
+
+    #[test]
+    fn each_offending_member_gets_its_own_format_error() {
+        let state = DesiredState::parse_files(vec![
+            (
+                p("v.yaml"),
+                virtual_repo_yaml("all-npm", "npm", &["npm-ok", "py-lib", "crate-lib"]),
+            ),
+            (p("a.yaml"), repo_yaml("npm-ok", "hosted", None)),
+            (
+                p("b.yaml"),
+                repo_yaml_with_format("py-lib", "pypi", "hosted"),
+            ),
+            (
+                p("c.yaml"),
+                repo_yaml_with_format("crate-lib", "cargo", "hosted"),
+            ),
+        ])
+        .unwrap();
+        let errors = validate_virtual_member_formats_not_enforced(&state);
+        assert_eq!(
+            errors.len(),
+            2,
+            "one error per offending member line, not one per virtual: {errors:?}"
+        );
+        let rendered: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(rendered.iter().any(|e| e.contains("py-lib")));
+        assert!(rendered.iter().any(|e| e.contains("crate-lib")));
+        assert!(
+            !rendered.iter().any(|e| e.contains("npm-ok")),
+            "the matching member is untouched: {rendered:?}"
+        );
+    }
+
+    // -- ScanPolicy.maxArtifactAge ----------------------------------------
+
+    /// A `ScanPolicy` envelope carrying an explicit `maxArtifactAge`.
+    /// `sp_yaml` omits the field, which is the inert default.
+    fn sp_yaml_with_max_artifact_age(name: &str, age: &str) -> Vec<u8> {
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: {name}
+spec:
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  maxArtifactAge: {age}
+  licensePolicy: {{}}
+"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_declared_max_artifact_age_is_rejected() {
+        let state = DesiredState::parse_files(vec![(
+            p("sp.yaml"),
+            sp_yaml_with_max_artifact_age("prod-default", "90d"),
+        )])
+        .unwrap();
+        let errors = validate_scan_policy_max_artifact_age_not_implemented(&state);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        let rendered = errors[0].to_string();
+        assert!(
+            rendered.contains("prod-default"),
+            "must name the envelope: {rendered}"
+        );
+        assert!(
+            rendered.contains("maxArtifactAge"),
+            "must name the field: {rendered}"
+        );
+        assert!(
+            rendered.contains("not implemented") && rendered.contains("never evaluated"),
+            "must say what is missing, not just that the value is refused: {rendered}"
+        );
+        assert!(
+            rendered.contains("Remove the field to apply"),
+            "must say how to apply: {rendered}"
+        );
+        assert!(
+            rendered.contains("a different duration does not change this"),
+            "must stop the operator retrying with another duration: {rendered}"
+        );
+        assert!(
+            rendered.contains("90d"),
+            "must echo the declared cap so the operator finds the line: {rendered}"
+        );
+    }
+
+    /// The only inert form is the absent field — `max_artifact_age` is an
+    /// `Option<String>` the evaluator reads as "no cap" when `None`, so
+    /// unlike row 10's `licensePolicy: {}` there is no accepted *value*.
+    /// An explicit `maxArtifactAge: null` is the same `None` and is
+    /// therefore accepted too; it is asserted because the doc comment
+    /// claims it, not because any tree writes it.
+    #[test]
+    fn an_omitted_max_artifact_age_is_accepted() {
+        let omitted = DesiredState::parse_files(vec![(p("sp.yaml"), sp_yaml("omitted"))]).unwrap();
+        assert!(
+            validate_scan_policy_max_artifact_age_not_implemented(&omitted).is_empty(),
+            "an omitted maxArtifactAge is the inert default"
+        );
+        let explicit_null = DesiredState::parse_files(vec![(
+            p("sp.yaml"),
+            sp_yaml_with_max_artifact_age("explicit-null", "null"),
+        )])
+        .unwrap();
+        assert!(
+            explicit_null.scan_policies[0]
+                .spec
+                .max_artifact_age
+                .is_none(),
+            "`maxArtifactAge: null` must deserialise to `None`, or the next \
+             assertion passes for the wrong reason"
+        );
+        assert!(
+            validate_scan_policy_max_artifact_age_not_implemented(&explicit_null).is_empty(),
+            "an explicit null is the same inert state as the absent field"
+        );
+        let none_at_all = DesiredState::default();
+        assert!(
+            validate_scan_policy_max_artifact_age_not_implemented(&none_at_all).is_empty(),
+            "no ScanPolicy at all cannot produce a finding"
+        );
+    }
+
+    /// Any duration is rejected, not just a long one: the rejection is
+    /// about the missing consumer, so a `0s` cap — which would flag
+    /// everything if anything read it — is refused the same way.
+    #[test]
+    fn every_duration_is_rejected_including_the_strictest() {
+        for age in ["0s", "1h", "90d", "10years"] {
+            let state = DesiredState::parse_files(vec![(
+                p("sp.yaml"),
+                sp_yaml_with_max_artifact_age("any-cap", age),
+            )])
+            .unwrap();
+            assert_eq!(
+                validate_scan_policy_max_artifact_age_not_implemented(&state).len(),
+                1,
+                "`{age}` must be rejected — the control is missing, not the value wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn each_offending_scan_policy_gets_its_own_max_artifact_age_error() {
+        let state = DesiredState::parse_files(vec![
+            (
+                p("sp0.yaml"),
+                sp_yaml_with_max_artifact_age("declares-a", "90d"),
+            ),
+            (p("sp1.yaml"), sp_yaml("inert-b")),
+            (
+                p("sp2.yaml"),
+                sp_yaml_with_max_artifact_age("declares-c", "7d"),
+            ),
+        ])
+        .unwrap();
+        let errors = validate_scan_policy_max_artifact_age_not_implemented(&state);
+        assert_eq!(errors.len(), 2, "got: {errors:?}");
+        let rendered: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(rendered.iter().any(|e| e.contains("declares-a")));
+        assert!(rendered.iter().any(|e| e.contains("declares-c")));
+        assert!(
+            !rendered.iter().any(|e| e.contains("inert-b")),
+            "the inert default is untouched: {rendered:?}"
+        );
+    }
+
+    /// The format validation this row sits beside is untouched: a
+    /// malformed duration is still the per-envelope validator's finding
+    /// (`validate_scan_policy_env`), which runs at row 0 — before this
+    /// row — and names the parse failure rather than the missing
+    /// consumer. Both fire on a malformed value; neither replaces the
+    /// other.
+    #[test]
+    fn a_malformed_duration_still_reaches_the_format_validator() {
+        let state = DesiredState::parse_files(vec![(
+            p("sp.yaml"),
+            sp_yaml_with_max_artifact_age("typo", "forever"),
+        )])
+        .unwrap();
+        let row_0 = state
+            .validate()
+            .expect_err("a malformed duration is still a row-0 error");
+        assert!(
+            row_0.to_string().contains("maxArtifactAge")
+                && row_0.to_string().contains("not a valid humantime duration"),
+            "the format check must survive this row: {row_0}"
+        );
+        assert_eq!(
+            validate_scan_policy_max_artifact_age_not_implemented(&state).len(),
+            1,
+            "and the declared-cap rejection still applies to it"
         );
     }
 }

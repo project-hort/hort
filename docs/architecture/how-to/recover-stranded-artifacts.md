@@ -25,7 +25,8 @@ reasons:
   and produced output hort could not parse or classify. This is a
   **terminal** failure under ADR 0007: the artifact transitions to
   `scan_indeterminate`, is never auto-rescanned, and only exits via
-  admin override or post-exclusion policy re-evaluation.
+  the curator's manual release or post-exclusion policy
+  re-evaluation.
 
 Before issue #6, both failure modes collapsed onto the same outcome: on
 retry exhaustion (`HORT_SCANNER_MAX_ATTEMPTS`, default 5), the artifact
@@ -76,8 +77,10 @@ special-cased for a recovered stranded artifact.
 - **Admin API**: `GET /api/v1/admin/tasks?kind=scan&status=failed` lists
   the `kind='scan'` jobs sitting in `failed` status — cross-reference
   against `GET /api/v1/admin/quarantine/patch-candidates` or a direct
-  artifact lookup to confirm `quarantine_status='quarantined'`. Requires
-  `Permission::Admin`.
+  artifact lookup to confirm `quarantine_status='quarantined'`. The task
+  listing requires `Permission::Admin`; the patch-candidate listing
+  requires `Permission::Curate` or `Permission::Admin` — it is the read
+  that grounds the manual release, which the curator owns (ADR 0007).
 
 ## 3. Manual recovery — the non-admin operator path
 
@@ -131,10 +134,15 @@ a last resort if the HTTP surface itself is unreachable.
 
 - **A genuinely `scan_indeterminate` artifact is not touched by any of
   the above.** That status is terminal by design (ADR 0007) — recover
-  it via admin override (`POST /api/v1/admin/quarantine/:artifact_id/release`,
-  admin-tier only — curator-waive is intentionally narrower and does
-  not reach `ScanIndeterminate`) or post-exclusion policy
-  re-evaluation. See [the curator workflow guide](curator-workflow.md).
+  it with the curator's manual release
+  (`hort-cli curation waive <artifact_id> --justification '…'`, or
+  `POST /api/v1/admin/curation/quarantine/:artifact_id/waive`), which
+  reaches `ScanIndeterminate` as well as `Quarantined`: one authority
+  owns the manual release, and what it requires is the source state
+  rather than a second permission tier. The gate is
+  `Permission::Curate` OR `Permission::Admin`, so an admin credential
+  works too. Post-exclusion policy re-evaluation is the other exit. See
+  [the curator workflow guide](curator-workflow.md).
 - **Waiting past `quarantine_until` does nothing on its own.** The
   release predicate has no timer-only authority (ADR 0007); a stranded
   artifact only releases once a scan actually succeeds.

@@ -17,18 +17,23 @@
 //! Sigstore v0.3 bundle format, whose inclusion proof always carries a
 //! checkpoint (`check_02_bundle` rejects a missing proof/checkpoint at
 //! parse). The older v0.1 SET / `inclusion_promise` path is **not**
-//! implemented — a bundle with no inclusion proof / no checkpoint is
-//! rejected here (fail-closed), matching the design's "no SET path"
-//! decision.
+//! implemented — a bundle with no inclusion proof / no checkpoint can
+//! never reach `Verified` here, matching the design's "no SET path"
+//! decision. It is not *rejected* either: absent log material is material
+//! nothing could be concluded from, so the candidate is skipped and the
+//! artifact holds as unsigned (see [`InclusionFailureSide`]).
 //!
 //! **Fail-closed, offline, no panic.** Every conversion that could fail
 //! (the `Vec<u8> → [u8; 32]` width narrowing on the root hash and each
-//! audit-path hash, the checkpoint-envelope parse, the `logID` key lookup,
-//! the SPKI key parse) returns an [`InclusionError`] rather than panicking;
-//! the caller maps any such failure to
-//! [`ProvenanceRejectReason::RekorNotFound`]. There is **no** live Rekor
-//! fetch — the proof + checkpoint the bundle already carries are verified
-//! against the in-memory trust-root key.
+//! audit-path hash, the `i64 → u64` narrowing on the tree size, the
+//! checkpoint-envelope parse, the `logID` key lookup, the SPKI key parse)
+//! returns an [`InclusionError`] rather than panicking.
+//! **No failure here can reach `Verified`**; which of three answers it
+//! does reach — a terminal rejection, a hold, or a skip — is
+//! [`InclusionError::side`]'s decision, because fail-closed is not the
+//! same thing as terminal. There is **no** live Rekor fetch — the proof +
+//! checkpoint the bundle already carries are verified against the
+//! in-memory trust-root key.
 
 use std::collections::BTreeMap;
 
@@ -49,38 +54,130 @@ fn key_id_hex(key_id: &[u8]) -> String {
     hex::encode(key_id)
 }
 
-/// Why offline inclusion verification failed. Every variant maps, at the
-/// caller, to [`ProvenanceRejectReason::RekorNotFound`]
-/// (`hort_provenance_reject_total{reason="rekor_not_found"}`); the variant
-/// exists only so the adapter-layer `debug!` can record *which* fail-closed
-/// branch tripped, never the key bytes.
+/// Why offline inclusion verification failed — and, through
+/// [`InclusionError::side`], which of three answers the candidate gives.
+///
+/// The variant used to be a label and nothing else: every one of them
+/// folded into [`ProvenanceRejectReason::RekorNotFound`]
+/// (`hort_provenance_reject_total{reason="rekor_not_found"}`) and the
+/// distinction survived only in an adapter-layer `debug!` line. It is
+/// load-bearing now, because only readable material from which something
+/// was actually proved may condemn an artifact (ADR 0039 D4) and these
+/// failures are not all of that kind: one is a disproof, two are faults in
+/// our own trust root, and seven are the bundle's own log material being
+/// absent, unparseable or structurally impossible. No variant carries key
+/// bytes, then or now.
 ///
 /// [`ProvenanceRejectReason::RekorNotFound`]: hort_domain::ports::provenance::ProvenanceRejectReason::RekorNotFound
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InclusionError {
     /// The bundle carries no transparency-log entry (no
-    /// `verification_material.tlog_entries[0]`).
+    /// `verification_material.tlog_entries[0]`) — so there was no log
+    /// material to check.
     NoTlogEntry,
     /// The tlog entry carries no inclusion proof (v0.1-shaped / SET-only)
-    /// — out of scope, fail closed.
+    /// — out of scope, fail closed: this verifier checks nothing on it and
+    /// concludes nothing from it.
     NoInclusionProof,
     /// The inclusion proof carries no checkpoint envelope (a v0.3 proof
     /// always must — `check_02_bundle` enforces it at parse; absence here
-    /// is treated as malformed-but-fail-closed).
+    /// is a malformed proof, and fail closed: there is no signed root to
+    /// fold the leaf against, so nothing can be concluded either way).
     NoCheckpoint,
     /// The checkpoint signed-note envelope did not parse.
     CheckpointParse,
     /// A `root_hash` / audit-path hash was not exactly 32 bytes (a
     /// fail-closed width check — never a panic on `try_into`).
     HashWidth,
+    /// The inclusion proof's `tree_size` is not a possible tree size: the
+    /// protobuf field is `i64` and the model's is `u64`, so a negative
+    /// value fails the narrowing (a fail-closed width check — never a
+    /// panic on `try_into`).
+    ///
+    /// A structurally absurd number in the bundle's own log material, in
+    /// the same family as [`Self::HashWidth`] and
+    /// [`Self::CheckpointParse`]: no Merkle fold was attempted against
+    /// it, so nothing was checked and nothing was proved. It wore
+    /// [`Self::VerifyFailed`] — the enum's one disproof — which claimed a
+    /// proof had been read and rejected by the cryptography.
+    ///
+    /// Narrow, and worth being clear how narrow: reaching it needs the
+    /// signer's own log entry to claim a negative tree size on a bundle
+    /// that already passed full Fulcio chain, SCT, signature and digest
+    /// verification. A hole in the rule rather than a reachable attack.
+    TreeSizeInvalid,
     /// The tlog entry carries no `logID.key_id`.
     NoLogId,
-    /// No Rekor key in the trust root matches the entry's `logID`.
+    /// No Rekor key in the trust root matches the entry's `logID` — a
+    /// trust-root misprovision.
     NoMatchingRekorKey,
     /// The trust-root Rekor key bytes did not parse as a verification key.
     KeyParse,
-    /// The cryptographic inclusion / checkpoint verification failed.
+    /// The cryptographic inclusion / checkpoint verification failed: the
+    /// proof was present, readable, and did not verify.
     VerifyFailed,
+}
+
+/// Whose side an [`InclusionError`] is a failure on.
+///
+/// That question is the whole of this type, and it is the test an eleventh
+/// [`InclusionError`] variant has to answer: *is this a failure of the
+/// material the publisher pushed, or of our own ability to check it — and
+/// if it is the material's, was anything actually proved about it?* Only
+/// the one answer where something was proved may condemn the artifact
+/// (ADR 0039 D4); the other two hold, and they hold for different reasons
+/// with different operator actions behind them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InclusionFailureSide {
+    /// **The material's, and something was proved against it.** A present,
+    /// readable proof that did not verify: a forged or non-included entry.
+    /// The only disproof this enum can state, and the only answer that is
+    /// terminal.
+    Disproof,
+    /// **Ours.** The trust root holds no usable key for this check, so the
+    /// check never ran. A publisher's correctly signed, log-included
+    /// artifact is not implicated by our inability to load a key, and the
+    /// remedy is in the operator's trust root rather than in the artifact
+    /// — so it is held, and it verifies on the next run once the key is
+    /// provisioned.
+    TrustRoot,
+    /// **The material's, and nothing was proved.** The bundle's own log
+    /// material is absent or unparseable: not garbage to be condemned, not
+    /// a forgery, nothing concluded. The candidate contributes nothing and
+    /// the artifact holds as unsigned — anyone who can write the referrer
+    /// surface can attach a bundle of this shape, so condemning on one
+    /// would let them reject somebody else's correctly-signed image.
+    NothingProved,
+}
+
+impl InclusionError {
+    /// Classify this failure by whose side it is on.
+    ///
+    /// **Wildcard-free on purpose:** an eleventh variant does not compile here
+    /// until it has answered [`InclusionFailureSide`]'s question. The
+    /// evidence for each row below is the variant's own doc comment.
+    pub(crate) fn side(&self) -> InclusionFailureSide {
+        match self {
+            // A proof we read, and the cryptography said no.
+            Self::VerifyFailed => InclusionFailureSide::Disproof,
+            // Our provisioning: no key for the entry's log, or key bytes
+            // of ours that do not parse. Neither says anything about the
+            // publisher's material — the check did not run.
+            Self::NoMatchingRekorKey | Self::KeyParse => InclusionFailureSide::TrustRoot,
+            // The bundle's own log material, absent, unparseable or
+            // structurally impossible: no entry, no proof, no checkpoint,
+            // an unparseable checkpoint, a hash of the wrong width, a
+            // negative tree size, no log id. Nothing was checked, so
+            // nothing was proved.
+            Self::NoTlogEntry
+            | Self::NoInclusionProof
+            | Self::NoCheckpoint
+            | Self::CheckpointParse
+            | Self::HashWidth
+            | Self::TreeSizeInvalid
+            | Self::NoLogId => InclusionFailureSide::NothingProved,
+        }
+    }
 }
 
 /// The minimal transparency-log material pulled out of a parsed `Bundle`
@@ -178,11 +275,15 @@ fn build_model_proof(material: &TlogInclusionMaterial) -> Result<InclusionProof,
         .collect::<Result<Vec<[u8; 32]>, _>>()?;
 
     // `tree_size` is i64 in the protobuf but u64 in the model; a negative
-    // value is nonsensical and fails closed.
+    // value is not a possible tree size and fails closed. It is the
+    // bundle's own material being structurally absurd — no fold was
+    // attempted against it — so it skips rather than condemning: the one
+    // variant that condemns means a proof we read and the cryptography
+    // rejected, which this is not.
     let tree_size: u64 = material
         .tree_size
         .try_into()
-        .map_err(|_| InclusionError::VerifyFailed)?;
+        .map_err(|_| InclusionError::TreeSizeInvalid)?;
 
     // Parse the signed-note envelope into a `SignedCheckpoint` via its
     // `Deserialize` impl (which calls the crate-private `decode`). The
@@ -203,8 +304,9 @@ fn build_model_proof(material: &TlogInclusionMaterial) -> Result<InclusionProof,
 }
 
 /// Select the Rekor verification key for this entry from the trust root's
-/// `rekor_keys()` map by the entry's `logID` (hex). No matching key →
-/// fail closed.
+/// `rekor_keys()` map by the entry's `logID` (hex). No matching key, or
+/// key bytes that do not parse → fail closed, and on *our* side of the
+/// line ([`InclusionFailureSide::TrustRoot`]): the check never ran.
 fn select_rekor_key(
     key_id_hex: &str,
     rekor_keys: &BTreeMap<String, Vec<u8>>,
@@ -228,8 +330,9 @@ fn select_rekor_key(
 ///    (RFC-6962 Merkle inclusion + checkpoint signature + root/size
 ///    consistency) over the `canonicalized_body` leaf.
 ///
-/// Any failure returns an [`InclusionError`] (the caller maps it to
-/// `RekorNotFound`). Never panics, never fetches.
+/// Any failure returns an [`InclusionError`]; the caller classifies it
+/// through [`InclusionError::side`], and only `VerifyFailed` is a finding
+/// about the artifact. Never panics, never fetches.
 pub(crate) fn verify_inclusion(
     material: &TlogInclusionMaterial,
     rekor_keys: &BTreeMap<String, Vec<u8>>,
@@ -249,7 +352,10 @@ pub(crate) fn verify_inclusion(
 ///
 /// Returns an empty map when the root carries no (time-valid) Rekor key —
 /// the §8 boot assertion treats that as a hard error when a verifier is
-/// registered, and a per-verify lookup against an empty map fails closed.
+/// registered, and it has to: a per-verify lookup against an empty map is
+/// `NoMatchingRekorKey`, a hold on our own provisioning, so without the
+/// boot refusal every artifact in the scope would hold indefinitely
+/// instead of the worker declining to start.
 pub(crate) fn collect_rekor_keys(trust_root: &SigstoreTrustRoot) -> BTreeMap<String, Vec<u8>> {
     trust_root
         .rekor_keys()
@@ -669,10 +775,18 @@ mod tests {
         ));
     }
 
-    /// A negative `tree_size` (nonsensical; the protobuf field is `i64`, the
-    /// model wants `u64`) → fail-closed at conversion, never a panic.
+    /// A negative `tree_size` (not a possible tree size; the protobuf
+    /// field is `i64`, the model wants `u64`) → fail-closed at
+    /// conversion, never a panic.
+    ///
+    /// **Changed variant.** This asserted `VerifyFailed`, which after the
+    /// side classification landed is the enum's *only* disproof — "a
+    /// proof we read, and the cryptography said no". No fold was ever
+    /// attempted against this number; the bundle's own material is
+    /// structurally absurd, which is `HashWidth`'s and
+    /// `CheckpointParse`'s family, and all three skip.
     #[test]
-    fn negative_tree_size_fails_closed() {
+    fn negative_tree_size_is_structurally_invalid_not_a_disproof() {
         let key = TestRekorKey::generate();
         let key_id = b"keyid-negtree";
         let mut material = single_leaf_material(b"body", &key, key_id);
@@ -680,7 +794,14 @@ mod tests {
         material.tree_size = -1;
         assert_eq!(
             verify_inclusion(&material, &keys),
-            Err(InclusionError::VerifyFailed)
+            Err(InclusionError::TreeSizeInvalid)
+        );
+        // The classification is what the change is about, so state it
+        // here too rather than only in the table: this condition must not
+        // be able to condemn the artifact.
+        assert_eq!(
+            InclusionError::TreeSizeInvalid.side(),
+            InclusionFailureSide::NothingProved,
         );
     }
 
@@ -769,5 +890,67 @@ mod tests {
             verify_inclusion(&material, &rekor_keys),
             Err(InclusionError::VerifyFailed)
         );
+    }
+
+    /// **Every variant, and whose side it is on.** One row per
+    /// `InclusionError`, each row the answer [`InclusionError::side`]
+    /// gives; the evidence for each is the variant's own doc comment, and
+    /// the tests above pin which *condition* produces which variant, so
+    /// the two together carry a failure all the way from its cause to its
+    /// verdict class.
+    ///
+    /// What forces an eleventh variant to be classified at all is
+    /// `side()`'s wildcard-free match, not this table — an eleventh
+    /// variant does not compile until it has an arm there. What the table
+    /// adds is that the ten answers are the intended ones, and the
+    /// counter-assertions below keep it from passing vacuously: a `side()`
+    /// that answered `NothingProved` for everything would satisfy seven
+    /// rows, and a table that quietly listed one variant twice would still
+    /// satisfy every row it listed.
+    #[test]
+    fn every_inclusion_error_variant_states_whose_side_it_is_on() {
+        use InclusionFailureSide::{Disproof, NothingProved, TrustRoot};
+        let table = [
+            // "The cryptographic inclusion / checkpoint verification
+            // failed" — the proof was there, we read it, and it did not
+            // verify. The one disproof in the enum.
+            (InclusionError::VerifyFailed, Disproof),
+            // "No Rekor key in the trust root matches the entry's logID"
+            // and "the trust-root Rekor key bytes did not parse" — both
+            // name our own trust root, not the pushed material.
+            (InclusionError::NoMatchingRekorKey, TrustRoot),
+            (InclusionError::KeyParse, TrustRoot),
+            // The bundle's own log material, absent, unparseable or
+            // structurally impossible: no tlog entry, no inclusion proof
+            // (the v0.1 SET-only shape), no checkpoint, an unparseable
+            // checkpoint, a hash of the wrong width, a negative tree size,
+            // no log id. Nothing was checked, so nothing was proved.
+            (InclusionError::NoTlogEntry, NothingProved),
+            (InclusionError::NoInclusionProof, NothingProved),
+            (InclusionError::NoCheckpoint, NothingProved),
+            (InclusionError::CheckpointParse, NothingProved),
+            (InclusionError::HashWidth, NothingProved),
+            (InclusionError::TreeSizeInvalid, NothingProved),
+            (InclusionError::NoLogId, NothingProved),
+        ];
+        for (err, expected) in &table {
+            assert_eq!(err.side(), *expected, "{err:?}");
+        }
+
+        // Counter-assertions. Ten rows, ten *distinct* variants (so no
+        // variant is standing in for another), and all three answers
+        // actually used (so the classification is a split and not a
+        // constant).
+        assert_eq!(table.len(), 10, "the enum has ten variants");
+        let mut variants: Vec<String> = table.iter().map(|(e, _)| format!("{e:?}")).collect();
+        variants.sort();
+        variants.dedup();
+        assert_eq!(variants.len(), 10, "each variant appears exactly once");
+        for answer in [Disproof, TrustRoot, NothingProved] {
+            assert!(
+                table.iter().any(|(_, s)| *s == answer),
+                "no variant answers {answer:?} — the split collapsed"
+            );
+        }
     }
 }

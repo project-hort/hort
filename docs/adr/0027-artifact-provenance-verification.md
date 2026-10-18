@@ -39,6 +39,27 @@ that demands it, exempts pure signature manifests from quarantine, and
 fetches upstream referrers on proxy scopes so hosted and proxied artifacts
 verify identically.**
 
+> **Descriptive text amended 2026-10-14.** Six sentences in this *Decision*
+> section described verdicts this design no longer produces: a trust root
+> that *"would reject every bundle `RekorNotFound`"* (§1), a bundle lacking
+> offline-verifiable material as `Rejected{BundleMalformed}` (§1), *"any
+> failure"* in the Rekor inclusion check as `Rejected{RekorNotFound}` (§1),
+> the `NoAttestation × Required` mapping (§3), bundle-fetch exhaustion that
+> *"fail-closes"* under one mode and *"degrades"* under the other (§4), and
+> a forged bundle's inertness (§7). Each is corrected in place. The
+> decision behind the corrections is
+> [ADR 0039](0039-keyed-provenance-verification.md)'s **2026-10-14
+> amendment** — *only readable material from which something was actually
+> proved can condemn an artifact* — which quotes all six and owns the
+> argument. Nothing here is a second decision.
+>
+> Three further passages were brought along in the same sweep but belong to
+> the **2026-09-12** amendment rather than to this one, and say so where
+> they stand: the observability point of the hold-until-signed amendment
+> below (which enumerated two hold reasons, and there are now three plus a
+> permissive-mode counterpart), and the two *Consequences* bullets that
+> still promised a terminal `Unsigned` at window expiry.
+
 1. **Offline bundle verification, pinned trust root — no live TUF or
    transparency-log fetch on the verify path.** The verifier
    (`crates/hort-adapters-provenance-sigstore/src/verifier.rs`) validates a
@@ -50,12 +71,20 @@ verify identically.**
    policy's allowed-identity patterns. The trust root is loaded **once at
    boot** from an operator-provisioned `trusted_root.json`
    (`HORT_PROVENANCE_TRUSTED_ROOT_FILE`); a missing, malformed, or stale file
-   is a hard boot error (`crates/hort-worker/src/composition.rs`), as is a
-   trust root carrying no Rekor public key (it would reject every bundle
-   `RekorNotFound`). The adapter's live-refresh helper exists but is
+   is a hard boot error (`crates/hort-worker/src/composition.rs`), as are
+   **two** unusable-trust-root shapes — a root carrying no Rekor public key,
+   and a root that cannot build an offline verifier at all (no Fulcio certs /
+   CTFE keys; `CachedTrustRoot::ensure_builds_verifier`). Neither would
+   *reject* a bundle: each **holds** every bundle in the scope
+   (`Indeterminate{TrustRootUnusable}` — our provisioning failed, so the
+   publisher's material was never examined and nothing about it was
+   disproved), which is a scope-wide stall with nothing terminal to point
+   at, and is what makes both refusals more important rather than less. The
+   adapter's live-refresh helper exists but is
    deliberately unwired — the root rotates through the release pipeline,
    never a runtime fetch. A bundle lacking offline-verifiable material is
-   `Rejected{BundleMalformed}`; an absent bundle is `NoAttestation`; neither
+   **skipped** — a candidate a verifier cannot read proves nothing, so it
+   contributes no verdict at all; an absent bundle is `NoAttestation`; neither
    ever falls back to a live lookup. Signature binding is to the artifact
    preimage: the verifier recomputes the digest from the bytes, so a valid
    bundle for a *different* digest can never yield `Verified`.
@@ -71,9 +100,19 @@ verify identically.**
    the crate's cryptographically-complete `InclusionProof::verify` — full
    RFC-6962 Merkle inclusion over the entry's `canonicalized_body` leaf, the
    checkpoint signature, and root/tree-size consistency — against the Rekor
-   public key selected from the pinned trust root by the entry's `logID`. Any
-   failure is fail-closed `Rejected{RekorNotFound}` (never a panic, skip, or
-   live fetch). Verification now attests *"a valid Fulcio cert + SCT for a
+   public key selected from the pinned trust root by the entry's `logID`. A
+   failure here is never a panic and never a live fetch, and none of them can
+   reach `Verified` — but they are not one answer either.
+   `InclusionError::side` sorts the enum's ten variants into the three
+   ADR 0039's 2026-10-14 amendment allows: `VerifyFailed` — a present,
+   readable proof that did not verify — is the enum's **one** disproof and
+   stays terminal `Rejected{RekorNotFound}`; a trust root holding no matching
+   Rekor key (or key bytes of ours that did not parse) is **ours**, so the
+   candidate is held `Indeterminate{TrustRootUnusable}`; and the remaining
+   seven — the bundle's own log material absent, unparseable or structurally
+   impossible — proved nothing and are **skipped**. The match is
+   wildcard-free, so an eleventh variant must be classified before it
+   compiles. Verification now attests *"a valid Fulcio cert + SCT for a
    policy-allowed signer signed these bytes **and** the entry is provably in
    the public Rekor transparency log."* The older v0.1 SET-only
    (`inclusion_promise`) path is out of scope and rejected. Route A (the
@@ -101,10 +140,16 @@ verify identically.**
    verdict → events `ProvenanceVerified` / `ProvenanceRejected`
    (`crates/hort-domain/src/events/artifact_events.rs:593`) → release gate).
    Verdicts are mode-applied by `Artifact::complete_provenance`
-   (`crates/hort-domain/src/entities/artifact.rs:615`): `Rejected` is
-   terminal (`rejected` status, any mode); `NoAttestation` is allowed under
-   `VerifyIfPresent` and maps to `ProvenanceRejected{Unsigned}` under
-   `Required`.
+   (`crates/hort-domain/src/entities/artifact.rs`): `Rejected` is terminal
+   (`rejected` status, any mode) and is only ever reached by a **positive
+   disproof** about material a verifier could read; `NoAttestation` is
+   allowed under `VerifyIfPresent` and **held** under `Required` — never
+   `ProvenanceRejected{Unsigned}`, per ADR 0039's 2026-09-12 amendment (D1);
+   and `Indeterminate` — the check could not be carried out at all — holds
+   under `Required` and is allowed through otherwise, per that ADR's
+   2026-10-14 amendment (D9). The hold is the **absence** of a transition in
+   both cases: the domain emits no event and writes no status, and the mode
+   is not consulted.
 4. **Release-gate integration is an AND-precondition on the timer arm,
    fail-closed in `Required` mode.** The release sweep computes a
    `ProvenanceClearance` per candidate
@@ -117,10 +162,22 @@ verify identically.**
    Explicit Admin / Curator / PolicyReEvaluation releases ignore the
    provenance parameter: provenance adds no new release authority to the
    ADR 0007 predicate and can never relax it, only tighten it. Bundle-fetch
-   exhaustion under `Required` fail-closes (`Rejected{RekorNotFound}`); under
-   `VerifyIfPresent` it degrades to `NoAttestation` so infrastructure
-   flakiness never blocks a proxy
-   (`crates/hort-app/src/use_cases/provenance_orchestration.rs:246`).
+   exhaustion is `Indeterminate{AttestationFetchFailed}` in **every** mode —
+   the material was never seen, so nothing about the artifact was
+   established — and the mode decides only the consequence: under `Required`
+   the artifact **holds**, and because no `ProvenanceVerified` is written the
+   clearance stays `Pending`, so a never-verified `Required` artifact still
+   never timer-releases (fail-closed, and not terminal — ADR 0039 D2/D4);
+   under `VerifyIfPresent` / `Off` it is allowed through, reported as
+   `allowed_indeterminate` rather than as an unsigned artifact, so
+   infrastructure flakiness never blocks a proxy. A dispatched verifier that
+   returns no verdict at all takes the same shape
+   (`Indeterminate{VerifierUnavailable}`). `ProvenanceRejectReason::RekorNotFound`
+   therefore has no producer in `hort-app` at all; its one remaining
+   appearance there is the metric label mapping, which still labels the
+   verifier-produced reason
+   (`ProvenanceOrchestrationUseCase::apply_fetch_failure` and
+   `dispatch_and_fold`).
 5. **Apply-time linting is fail-closed for the dangerous configurations.**
    The gitops apply path rejects: `Required` on a scope whose format has no
    verifier in the static backend→format capability map; any mode other than
@@ -147,8 +204,16 @@ verify identically.**
    predicate is the safety leg: a manifest carrying any non-bundle (runnable)
    layer fails it and stays on the full `ingest_verified` pipeline —
    scanned and quarantined. The exemption cannot smuggle runnable content,
-   and a forged "bundle" is verification-inert (it can only produce
-   `Rejected`/`BundleMalformed`, never `Verified`).
+   and a forged "bundle" is verification-inert — **more inert than this
+   sentence originally claimed**: it produces nothing at all rather than a
+   rejection, because a verifier skips a candidate it cannot read
+   (ADR 0039's 2026-10-14 amendment, D9). The reject reason the claim used
+   to name, `BundleMalformed`, now has no producer anywhere in the
+   workspace and is retained only so persisted `ProvenanceRejected` events
+   keep deserialising. A pushed manifest that
+   takes this exemption also has to clear a push-time **shape** check on
+   each declared signature layer's bytes (D12), which narrows the exemption
+   without touching the all-layers rule above.
 8. **Proxy scopes fetch upstream referrers lazily, inside the verify job.**
    When local bundles are empty and the repository resolves to an upstream,
    the orchestrator calls `UpstreamProxy::fetch_referrers`
@@ -257,6 +322,14 @@ any new release authority.
    counts verify *events*, not the standing population — is not the whole
    picture; the operator's view of the standing held set is the
    authoritative projection surface instead (ADR 0039 D4), never a metric.
+   A **third** hold value joined these two in ADR 0039's 2026-10-14
+   amendment: `held_indeterminate`, for an artifact whose check could not
+   be carried out at all (with `allowed_indeterminate` as its permissive-mode
+   counterpart — allowed through, not held). It is deliberately not split by
+   the constituent classification, because the thing to fix is our trust
+   root, our fetch or our verifier whatever shape the artifact has — and it
+   is the only one of the three whose operator action is on our side rather
+   than the publisher's. The closed taxonomy is `docs/metrics-catalog.md`'s.
    See ADR 0016's `provenance_mode: required` ×
    short-`quarantine_duration_secs` row.
 
@@ -276,15 +349,19 @@ expiry and opens the write-authorized manifest HEAD.
   of automatic rotation; a deployment that never updates the file eventually
   fails the worker's boot freshness check rather than silently verifying
   against a stale root.
-- `Required` is deliberately sharp: it rejects genuinely-unsigned upstream
+- `Required` is deliberately sharp: it withholds genuinely-unsigned upstream
   images on a proxy (that is what it means), and an operator who enables
   `Required` while leaving the worker verifier disabled gets artifacts that
-  stay `Pending` for the observation window and then reject `Unsigned` at
-  expiry (per the hold-until-signed amendment) — fail-closed, never fail-open,
-  but operationally surprising; the enablement how-to warns about it.
+  stay `Pending` **indefinitely** — fail-closed, never fail-open, but
+  operationally surprising; the enablement how-to warns about it. *(This
+  bullet said "rejects genuinely-unsigned upstream images" and "then reject
+  `Unsigned` at expiry" until ADR 0039's 2026-09-12 amendment, D1/D4, made
+  the hold indefinite and terminality reachable only from a positive
+  disproof. Unlike the rejection it replaces, the hold is recoverable: sign
+  the artifact and it clears.)*
 - Only the Sigstore v0.3 bundle format verifies. A signature published solely
   in the legacy cosign `simplesigning` shape yields `NoAttestation` (allowed
-  under `VerifyIfPresent`, rejected `Unsigned` under `Required`).
+  under `VerifyIfPresent`, **held** under `Required` — see the bullet above).
 - The lifecycle exemption is bounded to pure Sigstore-bundle referrers. SBOM
   referrers, other in-toto predicates, and arbitrary referrer types keep the
   full quarantine/scan lifecycle; widening the exemption is a new decision,

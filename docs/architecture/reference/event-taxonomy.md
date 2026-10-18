@@ -87,7 +87,7 @@ does not corrupt projected state.
 |---|---|---|
 | `artifact_id` | `Uuid` | The artifact whose reference was removed; equals the artifact stream's `entity_id`. |
 | `content_hash` | `ContentHash` | CAS content hash whose reference this purge removed (64 lowercase hex chars by construction). |
-| `refs_remaining` | `u32` | Cross-`kind` `content_references` count for `content_hash` **after** this artifact's reference was removed. `0` ⇒ the blob itself was deleted; `> 0` ⇒ a still-live reference keeps the blob and only this artifact's reference is gone. The count is the one observed under the hash-scoped blob-reclamation lock immediately before the storage decision, not the one the sweep's preparation transaction recorded earlier: a re-reference that lands in between corrects the value here and keeps the blob. |
+| `refs_remaining` | `u32` | **Claims on `content_hash`** observed under the hash-scoped blob-reclamation lock immediately before the storage decision — not the count the sweep's preparation transaction recorded earlier, which a re-reference landing in between corrects here. `0` ⇒ the blob itself was deleted; `> 0` ⇒ something still holds those bytes and only this artifact's reference is gone. A claim is either a cross-`kind` `content_references` row still targeting the hash, or — when there is no such row — a non-deleted artifact in a GC-protected quarantine state (`quarantined` / `rejected` / `scan_indeterminate`) whose primary content or metadata blob is this hash. The second kind exists because retained scan evidence deliberately carries no reference edge (the refcount repair mints none for it) while CAS shares its bytes with every artifact of the same content: a row count alone would read `0` for bytes that are being kept, and `0` has to mean "deleted" on every path that emits this field. |
 | `purged_at` | `DateTime<Utc>` | Wall-clock at which the purge (or already-absent confirmation) completed. Distinct from the event store's `stored_at`. |
 
 **Consumer contract.** A consumer reconstructing retention state keys on
@@ -98,13 +98,16 @@ stream terminates it. Because `ArtifactPurged` is idempotent, a consumer
 that sees it more than once (replay, or a retried already-absent purge)
 must treat the second and later occurrences as no-ops. `refs_remaining`
 is observational — it tells a consumer whether the underlying blob
-survived deduplication, not whether this artifact's purge succeeded
-(it always did, by the time the event is emitted).
+survived, not whether this artifact's purge succeeded
+(it always did, by the time the event is emitted). A consumer may read
+`refs_remaining > 0` as "the bytes are still there" but not as "some
+other artifact serves them": a protected claimant is quarantined
+evidence, which no read path serves.
 
 **Byte reclamation does not gate this event's meaning.** An artifact is
 externally gone once `ArtifactPurged` is on its stream; the bytes behind
 it are reclaimed by a best-effort sweep that declines to act whenever it
-cannot prove, under the blob lock, that nothing references them. A blob
+cannot prove, under the blob lock, that nothing claims them. A blob
 whose reclamation was deferred keeps its durable worklist row and is
 retried by the next run, so `refs_remaining` is a statement about what
 the sweep observed, never a promise about disk.

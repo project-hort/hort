@@ -12,6 +12,10 @@
 //! hexagonal boundary is enforced by the dep graph, not by review
 //! (ADR 0008).
 
+/// The per-artifact status gate (`Quarantined` / `Rejected` /
+/// `ScanIndeterminate`) shared by the non-OCI content routes. See the
+/// module docs.
+pub mod artifact_gate;
 pub mod authz;
 pub mod body;
 /// Generic pull-through projection-cache envelope shared by the

@@ -10,7 +10,7 @@
 #      → assert exactly one candidate row matching the seeded pair
 #        (vulnerable=pkg@1.0, quarantined=pkg@1.1, severity="high",
 #         finding count=1).
-#   5. `hort-cli admin quarantine release <pkg@1.1 id>
+#   5. `hort-cli curation waive <pkg@1.1 id>
 #         --justification "patch-candidate smoke release"` → assert exit 0.
 #   6. Assert artifacts.quarantine_status='released' for pkg@1.1.
 #   7. Assert the latest `ArtifactReleased` event on the
@@ -90,8 +90,9 @@ psql_count() {
 # tears down. The DELETE order respects FK direction:
 #   scan_findings → artifacts → repositories
 #   events → (no FK; filter by stream_id prefix)
-# `release_justification` is the join key for the events filter — the
-# admin_release path always sets it to a non-empty string.
+# The justification is the join key for the events filter — the manual
+# release always records a non-empty one (the curator variant invariant
+# on `ArtifactReleased` requires it).
 # -----------------------------------------------------------------------------
 
 # shellcheck disable=SC2317  # invoked indirectly via `trap ... EXIT`
@@ -425,21 +426,25 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# [4/5] hort-cli admin quarantine release <Q_ID> --justification ...
+# [4/5] hort-cli curation waive <Q_ID> --justification ...
 # -----------------------------------------------------------------------------
+# `curation waive` is the one manual release (ADR 0007, "One authority
+# owns the manual release"); it is gated by `Permission::Curate` OR
+# `Permission::Admin`, so the admin OIDC token this smoke already holds
+# passes the gate unchanged.
 
 log ""
-log "--> [4/5] hort-cli admin quarantine release ${Q_ID} --justification '${JUSTIFICATION}'"
+log "--> [4/5] hort-cli curation waive ${Q_ID} --justification '${JUSTIFICATION}'"
 
 REL_OUT=""
 REL_RC=0
-REL_OUT="$("$HORT_CLI" admin quarantine release "$Q_ID" \
+REL_OUT="$("$HORT_CLI" curation waive "$Q_ID" \
     --justification "$JUSTIFICATION" \
     --output json 2>&1)" || REL_RC=$?
 if [ "$REL_RC" -eq 0 ]; then
-    pass "hort-cli admin quarantine release exits 0"
+    pass "hort-cli curation waive exits 0"
 else
-    fail "hort-cli admin quarantine release exits 0" \
+    fail "hort-cli curation waive exits 0" \
         "exit=${REL_RC}, output: ${REL_OUT}"
     summary
 fi
@@ -453,7 +458,7 @@ log "--> [5/5] assert quarantine_status='released' + ArtifactReleased audit inva
 
 # The release endpoint is event-sourced; the artifacts projection
 # updates in the same Postgres transaction as the event append
-# (`QuarantineUseCase::admin_release` writes both via the projection
+# (`CurationUseCase::waive` writes both via the projection
 # runner's at-most-once write path). In practice the row is
 # `released` immediately on the next read, but use bounded_poll to be
 # robust to projection-runner clock skew (≤ 15s deadline so a stuck
@@ -472,7 +477,7 @@ fi
 
 # Audit-trail invariant. event_data is the typed-event envelope
 # `{ "type": ..., "data": { ... } }`, so the payload fields live under
-# `->'data'`. The releasing admin is recorded as `released_by_user_id`
+# `->'data'`. The deciding operator is recorded as `released_by_user_id`
 # (there is no `admin_id` field); the justification is captured verbatim:
 # `event_data->'data'->>'released_by_user_id' IS NOT NULL` AND
 # `event_data->'data'->>'justification' = '${JUSTIFICATION}'` on the latest

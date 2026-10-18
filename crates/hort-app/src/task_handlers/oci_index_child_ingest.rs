@@ -79,21 +79,27 @@
 //!    requested `child_digest`; the ingest itself is keyed on the requested
 //!    digest, so a body whose bytes hash to something else is rejected inside
 //!    `ingest_verified` before anything reaches CAS (mint-after-verify).
-//! 6. Ingest via [`IngestUseCase::ingest_verified`]. The cached body is read
-//!    into memory ONCE and both the ingest and the edge derivation in steps 7–8
-//!    consume those bytes — bounded work, not an unbounded buffer: the upstream
-//!    adapter already refused anything over its manifest body cap when it wrote
-//!    the tempfile, and the body has to be parsed here regardless. Same
-//!    reasoning [`super::oci_membership_edge_backfill`] records for the same
-//!    artifact class.
-//! 7. Register the child's own membership edges. A child image manifest ingested
-//!    by this path needs its `oci_config` and `oci_layer` rows or its blobs have
-//!    no GC keepalive — the exact defect
-//!    [`super::oci_membership_edge_backfill`] exists to repair. The edges are
-//!    re-derived through [`FormatHandler::extract_oci_manifest_blob_refs`], as
-//!    that handler does.
-//! 8. Recurse when the child is itself an index: enumerate its children with
-//!    [`index_child_digests`], register the `oci_index_member` rows, and enqueue
+//! 6. Derive the child's own membership edges from the body, **before** the
+//!    ingest. A child image manifest needs its `oci_config` and `oci_layer`
+//!    rows or its blobs have no GC keepalive — the exact defect
+//!    [`super::oci_membership_edge_backfill`] exists to repair; an index
+//!    needs one `oci_index_member` row per child. They come out of
+//!    [`FormatHandler::extract_oci_manifest_blob_refs`] /
+//!    [`index_child_digests`], as that handler does. The cached body is read
+//!    into memory ONCE and both this derivation and the ingest consume those
+//!    bytes — bounded work, not an unbounded buffer: the upstream adapter
+//!    already refused anything over its manifest body cap when it wrote the
+//!    tempfile, and the body has to be parsed here regardless. Same reasoning
+//!    the backfill handler records for the same artifact class.
+//! 7. Ingest via [`IngestUseCase::ingest_verified`], **carrying** those edges
+//!    as its `claimed_edges`. They therefore commit in the child's own
+//!    transaction: a `content_references` row is the claim that keeps a
+//!    constituent's bytes alive under the storage GC, and nothing re-derives
+//!    a tree edge afterwards — `artifacts` records a manifest's own hash, not
+//!    what it references. A failed edge fails this unit; the job row is
+//!    retried, where a committed manifest with a missing claim was only
+//!    repairable by re-reading manifest bodies out of CAS.
+//! 8. Recurse when the child is itself an index: enqueue
 //!    one `oci-index-child-ingest` row per grandchild — the whole level in one
 //!    [`JobsRepository::enqueue_idempotent_batch`] statement, never a row at a
 //!    time, because it is a cohort of up to the per-index child cap and each
@@ -104,7 +110,7 @@
 //!    rejects an over-cap index outright rather than truncating it), and
 //!    [`MAX_CHILD_INGEST_DEPTH`] bounds the chain of nested indexes. Neither is
 //!    operator-visible — both are constants, because a safety bound is not a
-//!    trade-off to tune. At the depth cap the member edges are still written and
+//!    trade-off to tune. At the depth cap the member edges are still claimed and
 //!    only the grandchild rows are refused; those grandchildren stay reachable
 //!    through the lazy pull path. A cycle (an index naming itself, directly or
 //!    transitively) terminates on step 3 well before the cap: the artifact is
@@ -166,12 +172,10 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::ApiActor;
@@ -180,7 +184,7 @@ use hort_domain::oci::{
     OCI_IMAGE_INDEX_MEDIA_TYPE,
 };
 use hort_domain::ports::artifact_repository::ArtifactRepository;
-use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
+use hort_domain::ports::content_reference_index::ContentReferenceClaim;
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::jobs_repository::{IdempotentEnqueueRow, JobsRepository};
 use hort_domain::ports::repository_repository::RepositoryRepository;
@@ -260,7 +264,14 @@ pub(crate) const CHILD_INGEST_ROOT_DEPTH: u32 = 0;
 /// Nothing is lost at the cap either — a child that is not eagerly ingested
 /// still reaches the repository through the lazy pull path with its own full
 /// quarantine window.
-const MAX_CHILD_INGEST_DEPTH: u32 = 4;
+///
+/// `pub(crate)` because the read path bounds the **same** tree with it:
+/// [`ManifestDeliverabilityUseCase`](crate::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase)
+/// walks a manifest's closure to answer whether every artifact in it is
+/// still deliverable, and a walk that reached deeper than the ingest ever
+/// does would be asking about children this registry declines to fetch.
+/// One bound, two walkers.
+pub(crate) const MAX_CHILD_INGEST_DEPTH: u32 = 4;
 
 /// The `Accept` list sent on the child-manifest fetch: both OCI and Docker
 /// single-image manifest and index media types, so an upstream that content-
@@ -482,16 +493,20 @@ impl ChildOutcome {
     }
 }
 
-/// Per-call counters threaded through the post-ingest membership-edge and
-/// recursion work. Every field is best-effort follow-up to an ingest that has
-/// already committed, so none of them can fail the call — they exist so an
-/// operator reading `result_summary` can tell "nothing to do" from "could not
-/// do it".
+/// Per-call counters threaded through the edge derivation and the recursion
+/// work, so an operator reading `result_summary` can tell "nothing to do" from
+/// "could not do it".
+///
+/// The grandchild counters are best-effort follow-up to an ingest that has
+/// already committed and cannot fail the call. `membership_edges_written` is
+/// not follow-up at all any more: those edges ride the child's own minting
+/// transition, so the number is what that transition carried — on a failure
+/// the whole unit reports `hard_failure` and this stays `0`.
 #[derive(Debug, Default)]
 struct ChildSummary {
     /// `true` when the ingested child was itself an image index.
     is_index: bool,
-    /// `content_references` rows written for this child (`oci_index_member`
+    /// `content_references` rows committed with this child (`oci_index_member`
     /// for an index, `oci_config` + `oci_layer` for an image manifest).
     membership_edges_written: u64,
     /// Grandchild rows that inserted.
@@ -506,6 +521,27 @@ struct ChildSummary {
     depth_capped: bool,
 }
 
+/// What the child's body says it claims, derived **before** the ingest.
+///
+/// Both halves come out of one parse, and they have opposite failure
+/// postures, which is why they travel together:
+///
+/// - `edges` are claims on bytes. They ride the child's own minting
+///   transition ([`IngestUseCase::ingest_verified`]'s `claimed_edges`),
+///   so the manifest and the rows that keep its constituents alive
+///   commit together or not at all. Written afterwards they would be a
+///   window in which a live child manifest references blobs the storage
+///   GC is free to collect, and no sweep re-derives them — `artifacts`
+///   records a manifest's own hash, never what it points at.
+/// - `grandchildren` are future work. They become `jobs` rows after the
+///   commit, best-effort: a lost one leaves that grandchild on the lazy
+///   pull path it was on before this kind existed.
+#[derive(Debug, Default)]
+struct ChildClaims {
+    edges: Vec<ContentReferenceClaim>,
+    grandchildren: Vec<ContentHash>,
+}
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -516,9 +552,13 @@ struct ChildSummary {
 /// pull-through needs, mirroring
 /// [`super::prefetch_ingest::PrefetchIngestHandler`]'s wiring shape and adding
 /// what an OCI child additionally requires: the artifact projection (the
-/// target-repository presence short-circuit), the content-reference index (the
-/// child's own membership edges) and the jobs repository (the grandchild
-/// enqueue when the child is itself an index).
+/// target-repository presence short-circuit) and the jobs repository (the
+/// grandchild enqueue when the child is itself an index).
+///
+/// It holds **no** content-reference port. The child's membership edges are
+/// claims on bytes, so they travel into the ingest's own transition as
+/// [`ContentReferenceClaim`]s rather than being written beside it; with no
+/// handle there is nothing here that could write one afterwards.
 pub struct OciIndexChildIngestHandler {
     repositories: Arc<dyn RepositoryRepository>,
     artifacts: Arc<dyn ArtifactRepository>,
@@ -526,7 +566,6 @@ pub struct OciIndexChildIngestHandler {
     /// The same resolver the rest of the worker uses, so a child resolves
     /// through exactly the mapping a client pull of that child would.
     upstream_resolver: Arc<dyn UpstreamResolver>,
-    content_references: Arc<dyn ContentReferenceIndex>,
     jobs: Arc<dyn JobsRepository>,
     /// OCI handler. This kind is OCI-only by design; the composition root wires
     /// the OCI handler in directly rather than threading the full per-format
@@ -547,7 +586,6 @@ impl OciIndexChildIngestHandler {
         artifacts: Arc<dyn ArtifactRepository>,
         upstream_proxy: Arc<dyn UpstreamProxy>,
         upstream_resolver: Arc<dyn UpstreamResolver>,
-        content_references: Arc<dyn ContentReferenceIndex>,
         jobs: Arc<dyn JobsRepository>,
         oci_handler: Arc<dyn FormatHandler>,
         ingest: Arc<IngestUseCase>,
@@ -557,7 +595,6 @@ impl OciIndexChildIngestHandler {
             artifacts,
             upstream_proxy,
             upstream_resolver,
-            content_references,
             jobs,
             oci_handler,
             ingest,
@@ -763,11 +800,25 @@ impl OciIndexChildIngestHandler {
             upstream_published_at: fetch.last_modified,
             trust_upstream_publish_time: mapping.trust_upstream_publish_time,
         };
+        // The child's membership edges, derived from the body BEFORE the
+        // ingest so they ride its transition. Everything the derivation
+        // needs is in hand: the body, its media type, and the digest the
+        // artifact's `sha256_checksum` will carry (the ingest is keyed on
+        // `child_hash` and mint-after-verify, so the two cannot differ).
+        // The edge is the claim that keeps a constituent's bytes alive under
+        // the storage GC, and nothing re-derives one for a manifest that
+        // committed without it — `artifacts` records a manifest's own hash,
+        // not what it references, which is exactly why
+        // `oci_membership_edge_backfill` has to re-read manifest bodies to
+        // repair this.
+        let claims = self.derive_claims(&repo, parsed, child_hash, &media_type, &body, summary);
+
         let ingested = match self
             .ingest
             .ingest_verified(
                 request,
-                Box::new(std::io::Cursor::new(body.clone())),
+                &claims.edges,
+                Box::new(std::io::Cursor::new(body)),
                 self.oci_handler.as_ref(),
             )
             .await
@@ -778,18 +829,34 @@ impl OciIndexChildIngestHandler {
                     error = %err,
                     repository = %repo.key,
                     child_digest = %parsed.child_digest,
-                    "oci-index-child-ingest: ingest_verified failed; nothing minted",
+                    "oci-index-child-ingest: ingest_verified failed; nothing minted, \
+                     no membership edge",
                 );
                 return Ok(ChildOutcome::HardFailure);
             }
         };
 
-        self.register_and_recurse(
+        // The transition committed, so every edge it carried is durable —
+        // there is no per-edge outcome left to count.
+        summary.membership_edges_written = claims.edges.len() as u64;
+        tracing::debug!(
+            repository = %repo.key,
+            artifact_id = %ingested.artifact.id,
+            child_digest = %parsed.child_digest,
+            membership_edges = summary.membership_edges_written,
+            "oci-index-child-ingest: child minted with its membership edges",
+        );
+
+        // The grandchild rows stay post-commit and best-effort. They are
+        // `jobs` rows, not claims on bytes: a lost one leaves its
+        // grandchild on the lazy pull path, which is where it was before
+        // this kind existed. `enqueue_grandchildren` is a no-op on the
+        // empty set the non-index and depth-capped paths leave behind.
+        self.enqueue_grandchildren(
             &repo,
             parsed,
-            &ingested.artifact,
-            &media_type,
-            &body,
+            &claims.grandchildren,
+            parsed.depth.saturating_add(1),
             summary,
         )
         .await;
@@ -801,27 +868,37 @@ impl OciIndexChildIngestHandler {
         })
     }
 
-    /// Post-ingest follow-up: write the child's own membership edges and, when
-    /// the child is itself an index, enqueue one row per grandchild. Every
-    /// failure in here is non-fatal — the child manifest is already committed.
-    async fn register_and_recurse(
+    /// Derive [`ChildClaims`] from the fetched body.
+    ///
+    /// The body's own shape decides which edges the child claims. The
+    /// upstream's declared media type is cross-checked against it and a
+    /// disagreement is reported, but the body wins: these are the bytes that
+    /// were hashed and stored, and a mis-declared `Content-Type` must not
+    /// misfile the edges.
+    ///
+    /// A derivation failure yields **no** claims and does not fail the
+    /// ingest: the bytes still match the digest the index bound, so the
+    /// child is still minted — with its own `primary_content` edge and
+    /// without membership edges, which is the state
+    /// [`super::oci_membership_edge_backfill`] exists to repair. The warn is
+    /// the report of it.
+    ///
+    /// No `&self` port is touched here and nothing is awaited: this is a
+    /// pure read of the body plus the format handler's parse, which is what
+    /// makes it safe to run ahead of the mint.
+    fn derive_claims(
         &self,
         repo: &Repository,
         parsed: &OciIndexChildIngestParams,
-        artifact: &Artifact,
+        child_hash: &ContentHash,
         media_type: &str,
         body: &[u8],
         summary: &mut ChildSummary,
-    ) {
-        // The body's own shape decides which edges to write. The upstream's
-        // declared media type is cross-checked against it and disagreement is
-        // reported, but the body wins: these are the bytes that were hashed and
-        // stored, and a mis-declared `Content-Type` must not misfile the edges.
+    ) -> ChildClaims {
         let body_is_index = is_image_index(body);
         if is_index_media_type(media_type) != body_is_index {
             tracing::warn!(
                 repository = %repo.key,
-                artifact_id = %artifact.id,
                 child_digest = %parsed.child_digest,
                 %media_type,
                 body_is_index,
@@ -838,54 +915,55 @@ impl OciIndexChildIngestHandler {
                     tracing::warn!(
                         error = %err,
                         repository = %repo.key,
-                        artifact_id = %artifact.id,
                         child_digest = %parsed.child_digest,
                         "oci-index-child-ingest: nested index children not derivable; \
                          no member edges, no grandchild rows",
                     );
-                    return;
+                    return ChildClaims::default();
                 }
             };
-            // The member edges are membership facts about an artifact that is
-            // already committed, so they are written at every depth. Only the
-            // grandchild ROWS are bounded — they are what makes the fan-out a
-            // tree that can grow without limit.
-            let grandchild_depth = parsed.depth.saturating_add(1);
-            summary.depth_capped = grandchild_depth > MAX_CHILD_INGEST_DEPTH;
+            // The member edges are membership facts about the manifest being
+            // minted, so they are claimed at every depth. Only the
+            // grandchild ROWS are bounded — they are what makes the fan-out
+            // a tree that can grow without limit.
+            summary.depth_capped = parsed.depth.saturating_add(1) > MAX_CHILD_INGEST_DEPTH;
             if summary.depth_capped {
                 tracing::warn!(
                     repository = %repo.key,
-                    artifact_id = %artifact.id,
                     child_digest = %parsed.child_digest,
                     depth = parsed.depth,
                     max_depth = MAX_CHILD_INGEST_DEPTH,
                     declared_children = children.len(),
                     "oci-index-child-ingest: nested index at the recursion depth cap; \
-                     member edges written but no grandchild rows enqueued — those \
+                     member edges claimed but no grandchild rows enqueued — those \
                      children stay on the lazy pull path",
                 );
             }
-            for grandchild in &children {
-                self.write_edge(
-                    artifact,
-                    OCI_INDEX_MEMBER_KIND,
-                    grandchild,
-                    json!({
+            let edges = children
+                .iter()
+                .map(|grandchild| ContentReferenceClaim {
+                    target_content_hash: grandchild.clone(),
+                    kind: OCI_INDEX_MEMBER_KIND.to_string(),
+                    metadata: json!({
                         "child_digest": oci_digest_ref(grandchild),
                         "media_type": media_type,
                     }),
-                    summary,
-                )
-                .await;
-            }
-            if !summary.depth_capped {
-                self.enqueue_grandchildren(repo, parsed, &children, grandchild_depth, summary)
-                    .await;
-            }
-            return;
+                })
+                .collect();
+            return ChildClaims {
+                edges,
+                grandchildren: if summary.depth_capped {
+                    Vec::new()
+                } else {
+                    children
+                },
+            };
         }
 
-        let coords = child_manifest_coords(&parsed.requested_name, &artifact.sha256_checksum);
+        // The coords the ingest is about to build, from the same digest: the
+        // request is keyed on `child_digest` and mint-after-verify, so the
+        // minted row's `sha256_checksum` cannot be anything else.
+        let coords = child_manifest_coords(&parsed.requested_name, child_hash);
         let refs = match self
             .oci_handler
             .extract_oci_manifest_blob_refs(&coords, &mut &body[..])
@@ -895,60 +973,30 @@ impl OciIndexChildIngestHandler {
                 tracing::warn!(
                     error = %err,
                     repository = %repo.key,
-                    artifact_id = %artifact.id,
                     child_digest = %parsed.child_digest,
                     "oci-index-child-ingest: manifest blob references not derivable; \
                      the child's config/layer blobs have no GC keepalive from this row",
                 );
-                return;
+                return ChildClaims::default();
             }
         };
-        for blob in &refs {
-            let kind = match blob.role {
-                ManifestBlobRole::Config => OCI_CONFIG_KIND,
-                ManifestBlobRole::Layer => OCI_LAYER_KIND,
-            };
-            let metadata = json!({
-                "digest": oci_digest_ref(&blob.hash),
-                "media_type": media_type,
-            });
-            self.write_edge(artifact, kind, &blob.hash, metadata, summary)
-                .await;
-        }
-    }
-
-    /// Insert one `content_references` row for `artifact` pointing at `hash`
-    /// under `kind`. Non-fatal on failure: `content_references` is eventually
-    /// authoritative (the refcount-reconcile sweep backstops it) and the
-    /// manifest is already committed.
-    async fn write_edge(
-        &self,
-        artifact: &Artifact,
-        kind: &str,
-        hash: &ContentHash,
-        metadata: serde_json::Value,
-        summary: &mut ChildSummary,
-    ) {
-        let row = ContentReference {
-            source_artifact_id: artifact.id,
-            target_content_hash: hash.clone(),
-            kind: kind.to_string(),
-            metadata,
-            repository_id: artifact.repository_id,
-            recorded_at: Utc::now(),
-        };
-        match self.content_references.insert(row).await {
-            Ok(()) => summary.membership_edges_written += 1,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    artifact_id = %artifact.id,
-                    kind,
-                    target = %hash,
-                    "oci-index-child-ingest: content_references insert failed; membership \
-                     edge not registered (non-fatal, eventual)",
-                );
-            }
+        ChildClaims {
+            edges: refs
+                .iter()
+                .map(|blob| ContentReferenceClaim {
+                    target_content_hash: blob.hash.clone(),
+                    kind: match blob.role {
+                        ManifestBlobRole::Config => OCI_CONFIG_KIND,
+                        ManifestBlobRole::Layer => OCI_LAYER_KIND,
+                    }
+                    .to_string(),
+                    metadata: json!({
+                        "digest": oci_digest_ref(&blob.hash),
+                        "media_type": media_type,
+                    }),
+                })
+                .collect(),
+            grandchildren: Vec::new(),
         }
     }
 
@@ -1123,12 +1171,13 @@ mod tests {
 
     use std::collections::HashMap as StdHashMap;
 
-    use chrono::{DateTime, TimeZone};
+    use chrono::{DateTime, TimeZone, Utc};
     use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::repository::Repository;
     use hort_domain::events::system_actor;
     use hort_domain::oci::{ManifestBlobRef, OCI_IMAGE_INDEX_MEDIA_TYPE};
+    use hort_domain::ports::content_reference_index::ContentReferenceIndex;
     use hort_domain::ports::jobs_repository::{JobRow, JobStatus, KindFields};
     use hort_domain::ports::repository_upstream_mapping_repository::{
         RepositoryUpstreamMapping, UpstreamAuth,
@@ -1213,6 +1262,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -1275,6 +1325,7 @@ mod tests {
         proxy: Arc<MockUpstreamProxy>,
         resolver: Arc<MockUpstreamResolver>,
         refs: Arc<MockContentReferenceIndex>,
+        lifecycle: Arc<MockArtifactLifecycle>,
         jobs: Arc<MockJobsRepository>,
         repo: Repository,
     }
@@ -1307,7 +1358,14 @@ mod tests {
         let jobs = Arc::new(MockJobsRepository::default());
 
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        // Wired to the reference index so the edges the ingest transition
+        // carries actually land there — the mock's stand-in for the Postgres
+        // adapter writing them in the artifact's own transaction. Without it
+        // the membership pins below would read an empty index and an armed
+        // insert failure could not abort the ingest.
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone()).with_content_references(refs.clone()),
+        );
         let storage = Arc::new(MockStoragePort::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
         let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
@@ -1317,7 +1375,7 @@ mod tests {
 
         let ingest = Arc::new(IngestUseCase::new(
             storage,
-            lifecycle,
+            lifecycle.clone(),
             artifacts.clone(),
             repos.clone(),
             crate::event_store_publisher::wrap_for_test(events),
@@ -1339,7 +1397,6 @@ mod tests {
             artifacts.clone(),
             proxy.clone(),
             resolver.clone(),
-            refs.clone(),
             jobs.clone(),
             oci_handler,
             ingest,
@@ -1351,6 +1408,7 @@ mod tests {
             proxy,
             resolver,
             refs,
+            lifecycle,
             jobs,
             repo,
         }
@@ -2183,16 +2241,29 @@ mod tests {
         assert_eq!(summary["membership_edges_written"], 0);
     }
 
-    /// A failed `content_references` insert is non-fatal — the manifest is
-    /// already committed and the index is eventually authoritative.
+    /// **The acceptance.** A failed membership edge takes the whole child
+    /// ingest with it: no artifact, no event, no edge — and the run reports
+    /// `hard_failure`, not `ingested`.
+    ///
+    /// The edges ride the child's own minting transition, so an armed insert
+    /// failure aborts it. What is pinned is not that the edge is missing; it
+    /// is that no committed manifest is left behind to out-live it. A live
+    /// child manifest whose `oci_config` row never landed has one fewer
+    /// claim on that blob's bytes, the storage GC deletes a CAS blob exactly
+    /// when no `content_references` row targets its hash, and no sweep
+    /// re-derives the edge — `artifacts` records a manifest's own hash, not
+    /// what it references. The job row is retried by the worker; the
+    /// edgeless manifest was only repairable by re-reading manifest bodies
+    /// out of CAS.
     #[tokio::test]
-    async fn run_with_failing_edge_insert_still_completes_as_ingested() {
+    async fn run_with_failing_edge_insert_rolls_back_the_child_ingest() {
         let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
             config_and_layer_refs(0),
         ))
         .await;
         let body = image_manifest_body();
         let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+        let child_hash: ContentHash = digest.trim_start_matches("sha256:").parse().unwrap();
         f.refs.fail_next_insert_for_kind(
             OCI_CONFIG_KIND,
             DomainError::Invariant("simulated oci_config insert failure".into()),
@@ -2203,8 +2274,72 @@ mod tests {
                 .await
                 .expect("Ok"),
         );
-        assert_eq!(summary["outcome"], "ingested");
+        assert_eq!(
+            summary["outcome"], "hard_failure",
+            "a failed claim on a constituent's bytes fails the ingest"
+        );
         assert_eq!(summary["membership_edges_written"], 0);
+        assert_eq!(
+            f.refs.entry_count(),
+            0,
+            "the whole edge set rolls back, including the layer edge the \
+             transition had already applied"
+        );
+        assert!(
+            f.artifacts
+                .find_by_repo_and_checksum(f.repo.id, &child_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "no child artifact row may survive the rolled-back ingest"
+        );
+    }
+
+    /// The counter-assertion: on the happy path the child's membership edges
+    /// are carried by the very transition that mints it — one lifecycle
+    /// call, not an insert afterwards. Without this the rollback test above
+    /// would pass against a handler that claimed nothing at all.
+    #[tokio::test]
+    async fn run_commits_the_membership_edges_with_the_child_transition() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_layer_refs(1),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+        let child_hash: ContentHash = digest.trim_start_matches("sha256:").parse().unwrap();
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
+        assert_eq!(summary["outcome"], "ingested");
+        assert_eq!(summary["membership_edges_written"], 2);
+
+        let minted = f
+            .artifacts
+            .find_by_repo_and_checksum(f.repo.id, &child_hash)
+            .await
+            .unwrap()
+            .expect("child minted");
+        let kinds = f.lifecycle.ingest_edge_kinds();
+        assert_eq!(
+            kinds.len(),
+            3,
+            "the child's own primary_content plus its config and layer claims, \
+             all on one call: {kinds:?}"
+        );
+        assert!(
+            kinds.iter().all(|(id, _, _)| *id == minted.id),
+            "every edge resolves against the minted row: {kinds:?}"
+        );
+        assert_eq!(
+            f.lifecycle.ingest_edges().len(),
+            1,
+            "one transition carries the whole set"
+        );
     }
 
     // =====================================================================

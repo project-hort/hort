@@ -1138,6 +1138,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         });
@@ -1569,6 +1570,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         });
@@ -1649,6 +1651,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         });
@@ -1736,6 +1739,63 @@ mod tests {
             serde_json::to_string(&json["dist-tags"]).unwrap(),
             serde_json::to_string(&upstream["dist-tags"]).unwrap(),
             "under a null gate hort's dist-tags must be upstream's, byte for byte"
+        );
+    }
+
+    /// A failed per-version status read fails the proxy serve; it does
+    /// not degrade to "no status known".
+    ///
+    /// The degradation this replaces looked harmless — an empty status
+    /// map, plus a WARN — but an empty map is not a weaker version of
+    /// the truth, it is a different claim. Under `IncludePending` the
+    /// filters drop only versions hort KNOWS are non-servable, so "hort
+    /// knows nothing" re-advertises every quarantined, rejected and
+    /// scan-indeterminate version of the package. The one condition
+    /// under which the status read is most likely to fail — a stored
+    /// status the domain cannot classify — is exactly the condition
+    /// under which serving the upstream catalog is least safe.
+    ///
+    /// The sibling PyPI and cargo proxy sources carried the identical
+    /// `unwrap_or_else(… Vec::new())` and were changed with this one.
+    /// Their shape is held by the structural guard
+    /// `crates/hort-app/tests/status_decode_fails_closed.rs`, which
+    /// plants this exact expression as a scanner self-test.
+    #[tokio::test]
+    async fn proxy_serve_fails_when_the_status_read_fails() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        insert_proxy_repo(&mocks, "npm-mirror", IndexMode::IncludePending);
+        let upstream = upstream_with_three_tags();
+        mocks
+            .upstream_proxy
+            .insert_metadata("", "/pkg", serde_json::to_vec(&upstream).unwrap());
+
+        // Control: with the status read working, the serve succeeds and
+        // advertises upstream's catalog. Without this half, the failure
+        // below could be the fixture rather than the read.
+        let trust = trust_for_tests();
+        let res = serve_packument_unified(&ctx, "npm-mirror", "pkg", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("control: the proxy serve must succeed"));
+        let json = body_json(res).await;
+        assert!(
+            json["versions"]["1.2.3"].is_object(),
+            "control: upstream's catalog must be advertised"
+        );
+
+        mocks.artifacts.fail_next_package_version_status(
+            hort_domain::error::DomainError::Invariant(
+                "unclassifiable quarantine_status \"unscanned\"".into(),
+            ),
+        );
+
+        let err = serve_packument_unified(&ctx, "npm-mirror", "pkg", &trust, None)
+            .await
+            .expect_err("a failed hold-state read must not serve the upstream catalog");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the request fails; it does not serve a catalog hort could not filter"
         );
     }
 

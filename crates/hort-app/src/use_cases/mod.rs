@@ -3,6 +3,12 @@ pub mod apply_config_use_case;
 pub mod artifact_group_use_case;
 pub mod artifact_use_case;
 pub mod authenticate_use_case;
+// The one bounded CAS read for the paths that re-derive a projection
+// from a stored document's bytes (the OCI follower's membership claims,
+// the manifest-closure deliverability walk). See the module doc for why
+// the ceiling refuses rather than truncates and why absence keeps its
+// `NotFound` shape.
+pub(crate) mod cas_bounded_read;
 pub mod cas_scrub_use_case;
 pub mod content_reference;
 // Curator decisions: `waive` + `block` (single-artifact and
@@ -35,6 +41,10 @@ pub mod effective_permissions_use_case;
 // `StreamSealed` tombstone is emitted by the adapter, never
 // reimplemented here). Two seal modes; registered with the worker via
 // the retention registration seam.
+/// The repository-visibility primitive shared by the
+/// `GET /api/v1/events` read gate and the subscription delivery filter.
+/// Both consult it; neither re-derives it.
+pub mod event_visibility;
 pub mod eventstore_retention_use_case;
 pub mod group_reconcile_use_case;
 // Shared `IndexFilter` implementations
@@ -59,12 +69,23 @@ pub mod index_serve;
 // `VersionOrdering` implementations.
 pub mod index_serve_filter;
 pub mod ingest_use_case;
+// ADR 0062's **omission** shape for the OCI surfaces hort builds out of
+// manifest digests (the referrers index, `tags/list`): which of the
+// entries a document is about to name would the pull refuse? The closure
+// comes from the membership projection here, because a list holds no
+// bytes to derive it from — see the module doc, and `manifest_
+// deliverability` for the same question answered from the bytes.
+pub mod list_deliverability;
 // `POST /api/v1/artifacts/:id/rescan` use case.
 // Lives in `hort-app` (not `hort-http-admin-security`) per the layered
 // architecture: use cases hold the RBAC / conflict-detection /
 // enqueue orchestration; the HTTP adapter is a thin wrapper that
 // extracts the principal + path and maps `AppError` → `ApiError`.
 pub mod manual_rescan_use_case;
+// "Is every artifact in this manifest's closure still deliverable?" —
+// ADR 0062's constituent half for the OCI read paths. One resolution,
+// derived from the manifest's own bytes, asked of the catalog once.
+pub mod manifest_deliverability;
 pub mod multi_hash;
 // The facade the OCI inbound-HTTP crate calls to queue eager ingest of
 // an image index's declared children. `AppContext::jobs` is `pub(crate)`
@@ -216,8 +237,10 @@ use std::time::Duration as StdDuration;
 
 use uuid::Uuid;
 
+use hort_domain::entities::artifact::Artifact;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{PersistedEvent, StreamCategory, StreamId};
+use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::event_store::{
     AppendEvents, AppendResult, EventStore, ExpectedVersion, ReadFrom,
 };
@@ -233,7 +256,7 @@ use crate::error::{AppError, AppResult};
 /// silently depends on, and the reason the number is enforced on both
 /// sides:
 ///
-/// - **Write side.** [`read_expected_version`] refuses to derive an
+/// - **Write side.** [`read_unpaired_append_version`] refuses to derive an
 ///   append version for a stream that already exceeds the cap, so every
 ///   `ExpectedVersion::Exact` writer is bounded by it. An
 ///   `ExpectedVersion::Any` append gets no version check from the
@@ -261,6 +284,101 @@ use crate::error::{AppError, AppResult};
 /// number would only move the point at which the same failure appears.
 const STREAM_EVENT_CAP: u64 = 200;
 
+/// One capped `ReadFrom::Start` read of a bounded artifact stream, plus
+/// the one fact a capped read cannot do without: whether its budget was
+/// exhausted.
+///
+/// This is the **only** bounded `EventStore::read_stream` in production
+/// code (pinned by the `capped_stream_reads` structural guard). Every
+/// question asked of an artifact's stream — the latest `ScanCompleted`
+/// and whether an `ArtifactRejected` followed it, whether a
+/// `ProvenanceVerified` exists, what version the next append must
+/// carry — is answered from a value produced here.
+#[derive(Debug)]
+struct CappedArtifactRead {
+    /// The events the read returned, truncated to the budget.
+    events: Vec<PersistedEvent>,
+    /// `true` when more than [`STREAM_EVENT_CAP`] events came back: the
+    /// budget was exhausted, so neither `events` nor the position derived
+    /// from its tail can be trusted to describe the end of the stream.
+    over_cap: bool,
+}
+
+impl CappedArtifactRead {
+    /// The `ExpectedVersion` an append ordered immediately after this
+    /// read must carry. `NoStream` for an empty stream, otherwise
+    /// `Exact(tail position)`.
+    ///
+    /// On an over-cap read this is the position of the prefix's last
+    /// event, not the stream's true tail — which is why the two version
+    /// consumers decide for themselves whether to accept one (see
+    /// [`read_unpaired_append_version`]'s `enforce_cap` and
+    /// [`OverCapStream`]).
+    fn expected_version(&self) -> ExpectedVersion {
+        match self.events.last() {
+            Some(last) => ExpectedVersion::Exact(last.stream_position),
+            None => ExpectedVersion::NoStream,
+        }
+    }
+}
+
+/// Read a bounded artifact stream with overflow detection.
+///
+/// Rejects any non-[`StreamCategory::Artifact`] `stream_id` before doing
+/// any I/O: a capped forward scan is only correct for a stream that is
+/// bounded by design, and today that is exclusively the per-artifact
+/// lifecycle stream. An unbounded-category caller that derived a version
+/// from such a read would get a STALE position the moment the stream
+/// passed the budget, and every subsequent `ExpectedVersion::Exact`
+/// append would then fail `Conflict` deterministically and permanently
+/// (the production instance was the per-user `ApiTokenIssued` stream).
+/// Such a caller must use `ExpectedVersion::Any` +
+/// [`append_any_with_conflict_retry`] instead — which the audit of every
+/// unbounded-stream caller found sufficient, because none of them
+/// protects a decision made from the stream's content.
+///
+/// This is a deliberate, narrower alternative to adding a true-tail read
+/// to the `EventStore` port: a port addition would have to be
+/// implemented by every mock in the workspace, for a capability no
+/// audited caller needs.
+async fn capped_artifact_read(
+    events: &dyn EventStore,
+    stream_id: &StreamId,
+) -> AppResult<CappedArtifactRead> {
+    if stream_id.category != StreamCategory::Artifact {
+        return Err(DomainError::Invariant(format!(
+            "capped artifact-stream read called on non-artifact stream \
+             {stream_id} (category {:?}) — capped forward-scan version \
+             derivation and full-stream reads are only correct for the \
+             bounded per-artifact lifecycle stream; use \
+             ExpectedVersion::Any + append_any_with_conflict_retry for any \
+             other (unbounded) stream category",
+            stream_id.category
+        ))
+        .into());
+    }
+
+    let stream_events = events
+        .read_stream(stream_id, ReadFrom::Start, STREAM_EVENT_CAP + 1)
+        .await?;
+
+    Ok(CappedArtifactRead {
+        over_cap: stream_events.len() as u64 > STREAM_EVENT_CAP,
+        events: stream_events,
+    })
+}
+
+/// The refusal an over-cap artifact stream earns when a decision was
+/// going to be derived from it.
+fn over_cap_refusal(stream_id: &StreamId) -> AppError {
+    DomainError::Invariant(format!(
+        "stream {stream_id} exceeds the {STREAM_EVENT_CAP}-event cap — \
+         a capped read cannot prove it reached the tail, so no decision \
+         is derived from it"
+    ))
+    .into()
+}
+
 /// Read a bounded artifact stream **in full**, or refuse.
 ///
 /// Every consumer that asks a question about an artifact's whole history
@@ -273,8 +391,9 @@ const STREAM_EVENT_CAP: u64 = 200;
 /// reading `n` events with a budget of `n` proves nothing about what
 /// comes after them.
 ///
-/// So this helper reads [`STREAM_EVENT_CAP`] `+ 1` events, making the
-/// two cases distinguishable, and refuses the second:
+/// So the read underneath reads [`STREAM_EVENT_CAP`] `+ 1` events,
+/// making the two cases distinguishable, and this helper refuses the
+/// second:
 ///
 /// - at most [`STREAM_EVENT_CAP`] events came back ⇒ the budget was not
 ///   exhausted, so the read reached the end of the stream — return it;
@@ -291,107 +410,322 @@ const STREAM_EVENT_CAP: u64 = 200;
 /// `Conflict` and nothing else — a `Conflict` here would let a
 /// retry-wrapped caller spend its entire budget waiting for a stream
 /// length to shrink.
+///
+/// **Reading the stream here and the append version separately is the
+/// wrong order when a decision sits between the two.** Use
+/// [`ArtifactAtVersion`] for that; see its contract. This helper is for
+/// the readers that derive no append from what they read.
 pub(crate) async fn read_artifact_stream(
     events: &dyn EventStore,
     stream_id: &StreamId,
 ) -> AppResult<Vec<PersistedEvent>> {
-    if stream_id.category != StreamCategory::Artifact {
-        return Err(DomainError::Invariant(format!(
-            "read_artifact_stream called on non-artifact stream {stream_id} \
-             (category {:?}) — a capped full-stream read is only correct for \
-             a stream bounded by STREAM_EVENT_CAP, which today is exclusively \
-             the per-artifact lifecycle stream; an unbounded category needs a \
-             paged or tail read, not a larger cap",
-            stream_id.category
-        ))
-        .into());
+    let read = capped_artifact_read(events, stream_id).await?;
+    if read.over_cap {
+        return Err(over_cap_refusal(stream_id));
     }
+    Ok(read.events)
+}
 
-    let stream_events = events
-        .read_stream(stream_id, ReadFrom::Start, STREAM_EVENT_CAP + 1)
-        .await?;
-
-    if stream_events.len() as u64 > STREAM_EVENT_CAP {
-        return Err(DomainError::Invariant(format!(
-            "stream {stream_id} exceeds the {STREAM_EVENT_CAP}-event cap — \
-             a capped read cannot prove it reached the tail, so no decision \
-             is derived from it"
-        ))
-        .into());
-    }
-
-    Ok(stream_events)
+/// Why a call site derives an append version **without** having read the
+/// artifact's stored evidence — the mandatory witness
+/// [`read_unpaired_append_version`] takes.
+///
+/// The pairing ([`ArtifactAtVersion`]) is the normal form for an artifact
+/// append, and this type exists so the exception is *stated* rather than
+/// merely spelled the same way. Before it, the paired and the unpaired
+/// read were one function with one name, and the legitimate unpaired
+/// sites were indistinguishable — to a reader and to a structural guard
+/// — from a site that had read the evidence and then went looking for a
+/// version. Naming the exception is what removes the innocent spelling:
+/// a caller holding evidence cannot reach this function without
+/// asserting one of the claims below, and none of them is true of it.
+///
+/// None of the variants is read at runtime. That is the point: it is a
+/// declaration by the call site, checked by review and by the reader,
+/// not a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnpairedAppend {
+    /// The artifact was minted in this call and its stream does not
+    /// exist yet, so there is no stored evidence to pair with: the
+    /// genesis event is the stream's first.
+    GenesisAppend,
+    /// A follow-up append on a stream **this same call** created, whose
+    /// content is derived from resolved configuration rather than from
+    /// anything on the stream. Nothing a previous writer put there is
+    /// read, because there is no previous writer.
+    SameCallFollowUp,
+    /// Every appended event's content comes from the caller's request.
+    /// The stream is not consulted, so there is no decision for the
+    /// version to protect beyond "this append is ordered after whatever
+    /// is there now".
+    CallerSuppliedPayload,
 }
 
 /// Read a stream's current position and compute the `ExpectedVersion` for
-/// the next append.
+/// the next append — for an append that protects **no decision read from
+/// the stream**, which the caller declares via `unpaired_because`.
 ///
 /// When `enforce_cap` is true, returns `DomainError::Conflict` if the stream
 /// exceeds [`STREAM_EVENT_CAP`] events.
 ///
-/// # Structural guard (issue #88)
+/// Rejects any non-[`StreamCategory::Artifact`] stream — see
+/// [`capped_artifact_read`] for why, and for what an unbounded-stream
+/// caller must do instead.
 ///
-/// The read here is a **capped forward-scan**
-/// (`read_stream(_, ReadFrom::Start, STREAM_EVENT_CAP + 1)`), which is
-/// correct ONLY for a stream that is bounded by design — today,
-/// exclusively [`StreamCategory::Artifact`] (`STREAM_EVENT_CAP` is that
-/// category's own intended abuse guard: an artifact's lifecycle
-/// realistically never approaches a few dozen events, let alone 200).
-/// For any OTHER (unbounded) stream category, a stream that has grown
-/// past `STREAM_EVENT_CAP + 1` events makes `.last()` return a STALE
-/// position instead of the true tail — every subsequent
-/// `ExpectedVersion::Exact` append then fails `Conflict` deterministically
-/// and permanently (issue #87 was the production instance: the per-user
-/// `ApiTokenIssued` stream; issue #88 is the cross-cutting audit that
-/// found and fixed every other such caller).
+/// # This is the exception, not the default
 ///
-/// This function therefore REJECTS any non-`Artifact` `stream_id` up
-/// front, before doing any I/O — making "derive a version from this
-/// capped read for an unbounded stream" a hard runtime error rather
-/// than a silent staleness bug. An unbounded-stream caller must use
-/// `ExpectedVersion::Any` + [`append_any_with_conflict_retry`] instead
-/// (the append protects no decision made from stream content in every
-/// audited case — see `backlog/056-expected-version-capped-read-audit.md`).
+/// **This helper is correct only where nothing the append protects was
+/// read before it.** The moment a decision is derived from state read
+/// earlier — the artifact row, the stream's own events, a findings blob
+/// — the version has to be read beside that state, not after it, or the
+/// append silently stops protecting the decision. [`ArtifactAtVersion`]
+/// is that pairing and carries the full contract; this helper remains
+/// for the appends that protect no such decision.
 ///
-/// This is a deliberate, narrower alternative to adding a new
-/// `EventStore` port method for a true-tail read (the backlog's other
-/// suggested option): a port addition would require updating every
-/// `EventStore` mock across the workspace (a dozen-plus implementors),
-/// for a capability no audited caller actually needs — every unbounded
-/// stream in this audit turned out to be decision-free, so `Any` +
-/// retry closes the bug with a strictly smaller blast radius.
-pub(crate) async fn read_expected_version(
+/// The name and the [`UnpairedAppend`] witness are load-bearing. A type
+/// cannot stop a new site from declining to use it, and a source scan
+/// cannot see a stream read that happened in another file — so the thing
+/// that has to be impossible is reaching this function *innocently*. A
+/// caller that read an artifact's evidence (directly, or through a
+/// read-path helper such as
+/// [`release_clearance::read_path_provenance_clearance`](crate::use_cases::release_clearance::read_path_provenance_clearance))
+/// and then wants a version has to name one of the witness's claims to
+/// get one, and each of them is false for it. The same applies to a
+/// caller that took a pairing via [`read_artifact_stream_at_version`],
+/// discarded its version and came here for a fresh one.
+pub(crate) async fn read_unpaired_append_version(
     events: &dyn EventStore,
     stream_id: &StreamId,
     enforce_cap: bool,
+    unpaired_because: UnpairedAppend,
 ) -> AppResult<ExpectedVersion> {
-    if stream_id.category != StreamCategory::Artifact {
-        return Err(DomainError::Invariant(format!(
-            "read_expected_version called on non-artifact stream {stream_id} \
-             (category {:?}) — capped forward-scan version derivation is only \
-             correct for the bounded per-artifact lifecycle stream; use \
-             ExpectedVersion::Any + append_any_with_conflict_retry for any \
-             other (unbounded) stream category (issue #88)",
-            stream_id.category
-        ))
-        .into());
-    }
+    // Declared by the call site, not consulted here — see
+    // `UnpairedAppend`. Named (rather than `_`-prefixed) so the
+    // parameter reads as a required argument wherever the signature is
+    // shown; discarded here because reading it would turn a declaration
+    // into a branch.
+    let _ = unpaired_because;
+    let read = capped_artifact_read(events, stream_id).await?;
 
-    let stream_events = events
-        .read_stream(stream_id, ReadFrom::Start, STREAM_EVENT_CAP + 1)
-        .await?;
-
-    if enforce_cap && stream_events.len() as u64 > STREAM_EVENT_CAP {
+    if enforce_cap && read.over_cap {
         return Err(DomainError::Conflict(format!(
             "stream {stream_id} exceeds {STREAM_EVENT_CAP}-event cap"
         ))
         .into());
     }
 
-    Ok(match stream_events.last() {
-        Some(last) => ExpectedVersion::Exact(last.stream_position),
-        None => ExpectedVersion::NoStream,
-    })
+    Ok(read.expected_version())
+}
+
+/// Read an artifact stream in full **and** the `ExpectedVersion` an
+/// append ordered immediately after it must carry — one observation, for
+/// a caller that decides from the stream but needs no artifact row.
+///
+/// This is [`ArtifactAtVersion`] minus the artifact, and it exists for
+/// the same reason: deriving the version from a *second* read of the
+/// stream the decision came from reopens the window that read closed.
+/// Both values come out of one call, so there is no order to get wrong.
+/// Refuses an over-cap stream exactly as [`read_artifact_stream`] does —
+/// a caller here is deriving a decision from the events, so a prefix is
+/// never an acceptable answer.
+pub(crate) async fn read_artifact_stream_at_version(
+    events: &dyn EventStore,
+    stream_id: &StreamId,
+) -> AppResult<(Vec<PersistedEvent>, ExpectedVersion)> {
+    let read = capped_artifact_read(events, stream_id).await?;
+    if read.over_cap {
+        return Err(over_cap_refusal(stream_id));
+    }
+    let expected_version = read.expected_version();
+    Ok((read.events, expected_version))
+}
+
+/// What an [`ArtifactAtVersion`] pairing does when the stream it read
+/// breached [`STREAM_EVENT_CAP`] — i.e. when the read's budget was
+/// exhausted and it cannot prove it reached the tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverCapStream {
+    /// Refuse the pairing with [`DomainError::Conflict`]. For a site
+    /// whose append must not even be attempted against a stream of
+    /// unknown length.
+    Refuse,
+    /// Pair anyway, with a version derived from the prefix's tail. The
+    /// append that carries it then fails `Conflict` against the true
+    /// tail, so the outcome is the same refusal one round trip later —
+    /// which is what the sites choosing this already observed before the
+    /// pairing existed.
+    ///
+    /// [`ArtifactAtVersion::evidence`] still refuses: tolerating an
+    /// unprovable *version* is fail-closed (the append loses), while
+    /// deriving a decision from an unprovable *prefix* is fail-open.
+    Tolerate,
+}
+
+/// An artifact, the complete event stream it was read with, and the
+/// `ExpectedVersion` the next append must carry — **one observation, not
+/// a read per question**.
+///
+/// # The contract
+///
+/// A site that decides an artifact's lifecycle outcome from stored
+/// evidence and commits that decision behind an optimistic append has
+/// exactly one correct order: read the expected stream version **beside**
+/// the state the decision rests on, then derive, then append.
+///
+/// Read the version *after* deriving and the append stops protecting the
+/// decision. A verdict that committed in the window — a `ScanCompleted`
+/// plus the `ArtifactRejected` it drove, an admin release, a curator
+/// block — is already contained in the version just read. So the append
+/// does **not** conflict, it succeeds, and the paired projection write
+/// puts the stale decision's status over the newer one: an artifact
+/// released on evidence that a later scan already superseded, or an
+/// artifact re-held over a clean verdict that landed after the evidence
+/// was read. The window is not theoretical — it is as long as whatever
+/// sits between the two reads: a policy and exclusion-set resolution, a
+/// findings-blob fetch from CAS, a signature-bundle round trip to an
+/// upstream, a per-artifact event append on another stream.
+///
+/// This type makes that order the only expressible one. The evidence and
+/// the version come back from **the same single capped read**, so there
+/// is no "before" left to get wrong: a caller holding the evidence
+/// necessarily already holds the version that read proves, and a caller
+/// that wants fresher evidence has to take a fresh pairing, which moves
+/// the version with it. Deriving a decision from an artifact stream read
+/// any other way — a bare [`read_artifact_stream`] next to a bare
+/// [`read_unpaired_append_version`] — is going around this type, and is the
+/// defect it exists to prevent.
+///
+/// # Error handling is the caller's
+///
+/// Constructing a pairing can fail (the stream read, the artifact load).
+/// What that failure means is deliberately **not** uniform: a
+/// single-artifact job propagates it so the dispatcher retries rather
+/// than silently dropping a result, while a bulk population pass logs
+/// and skips that artifact so one bad row never aborts the pass. Both
+/// shapes are correct for their caller; neither belongs here.
+#[derive(Debug)]
+pub(crate) struct ArtifactAtVersion {
+    artifact: Artifact,
+    /// The capped read's events, and whether its budget was exhausted —
+    /// the pair [`Self::evidence`] needs to refuse honestly.
+    read: CappedArtifactRead,
+    stream_id: StreamId,
+    expected_version: ExpectedVersion,
+}
+
+impl ArtifactAtVersion {
+    /// Pair a fresh artifact load with its stream version and evidence.
+    ///
+    /// The version read comes **first**, before the artifact row is
+    /// loaded. A concurrent event landing between the two is then in the
+    /// loaded artifact but not in the version, so the append loses —
+    /// fail-closed. The reverse order is the fail-open one this type
+    /// exists to remove.
+    pub(crate) async fn load(
+        artifacts: &dyn ArtifactRepository,
+        events: &dyn EventStore,
+        artifact_id: Uuid,
+        over_cap: OverCapStream,
+    ) -> AppResult<Self> {
+        let stream_id = StreamId::artifact(artifact_id);
+        let read = Self::read_or_refuse(events, &stream_id, over_cap).await?;
+        let artifact = artifacts
+            .find_by_id(artifact_id)
+            .await
+            .map_err(AppError::Domain)?;
+        Ok(Self::assemble(artifact, stream_id, read))
+    }
+
+    /// Pair an artifact the caller already holds — a row from a bulk
+    /// list page — with a stream version and evidence read now.
+    ///
+    /// The artifact row is as old as the page it came from; the pairing
+    /// does not refresh it, because refreshing would change *what* the
+    /// site decides. What it does fix is that everything the site reads
+    /// for itself from here on — the evidence — shares one observation
+    /// with the version its append will carry.
+    pub(crate) async fn pair(
+        events: &dyn EventStore,
+        artifact: Artifact,
+        over_cap: OverCapStream,
+    ) -> AppResult<Self> {
+        let stream_id = StreamId::artifact(artifact.id);
+        let read = Self::read_or_refuse(events, &stream_id, over_cap).await?;
+        Ok(Self::assemble(artifact, stream_id, read))
+    }
+
+    async fn read_or_refuse(
+        events: &dyn EventStore,
+        stream_id: &StreamId,
+        over_cap: OverCapStream,
+    ) -> AppResult<CappedArtifactRead> {
+        let read = capped_artifact_read(events, stream_id).await?;
+        if read.over_cap && over_cap == OverCapStream::Refuse {
+            return Err(DomainError::Conflict(format!(
+                "stream {stream_id} exceeds {STREAM_EVENT_CAP}-event cap"
+            ))
+            .into());
+        }
+        Ok(read)
+    }
+
+    fn assemble(artifact: Artifact, stream_id: StreamId, read: CappedArtifactRead) -> Self {
+        let expected_version = read.expected_version();
+        Self {
+            artifact,
+            read,
+            stream_id,
+            expected_version,
+        }
+    }
+
+    /// The artifact as loaded.
+    pub(crate) fn artifact(&self) -> &Artifact {
+        &self.artifact
+    }
+
+    /// The artifact, mutable — the domain transitions take `&mut self`
+    /// and mutate the entity as they produce their event.
+    pub(crate) fn artifact_mut(&mut self) -> &mut Artifact {
+        &mut self.artifact
+    }
+
+    /// The `ExpectedVersion` for an append that commits a decision
+    /// derived from [`Self::evidence`] (or from the artifact paired with
+    /// it). Carrying it is what makes a verdict committed since the
+    /// pairing fail this append instead of being overwritten by it.
+    pub(crate) fn expected_version(&self) -> ExpectedVersion {
+        self.expected_version
+    }
+
+    /// The artifact's stream in full — the evidence any decision at this
+    /// site rests on.
+    ///
+    /// Refuses with [`DomainError::Invariant`] when the stream breached
+    /// [`STREAM_EVENT_CAP`], for exactly the reason
+    /// [`read_artifact_stream`] refuses: a reverse scan over a truncated
+    /// prefix answers about the *oldest* events while looking like an
+    /// answer about the latest, so a superseded verdict reads as current.
+    /// The refusal holds even under [`OverCapStream::Tolerate`], which
+    /// only ever tolerated an unprovable *version*.
+    pub(crate) fn evidence(&self) -> AppResult<&[PersistedEvent]> {
+        if self.read.over_cap {
+            return Err(over_cap_refusal(&self.stream_id));
+        }
+        Ok(&self.read.events)
+    }
+
+    /// The artifact's stream id — the stream an append built from this
+    /// pairing must target.
+    pub(crate) fn stream_id(&self) -> &StreamId {
+        &self.stream_id
+    }
+
+    /// Take the artifact back out, dropping the pairing. For the commit
+    /// step, which hands the mutated entity to the lifecycle port.
+    pub(crate) fn into_artifact(self) -> Artifact {
+        self.artifact
+    }
 }
 
 /// Bounded CAS-retry budget shared by every `ExpectedVersion::Any` append
@@ -513,8 +847,11 @@ impl CallerPrivileges {
     /// `Permission::Curate` is the day-to-day decision authority over
     /// quarantined / rejected artifacts and finding-exclusions;
     /// `Permission::Admin` is a strict superset by design (admins can do
-    /// everything a curator can, plus more — including `admin_release`
-    /// of `ScanIndeterminate` artifacts, which curator cannot).
+    /// everything a curator can, plus the technical and operative
+    /// surfaces that carry no curator route at all — gitops
+    /// apply-status, effective-config reads, the
+    /// provenance-misrejection repair, all mounted behind
+    /// `AdminPrincipal`).
     /// Accept either authority so an admin is not forced to also carry
     /// the curator permission to perform a curator action.
     ///
@@ -544,7 +881,7 @@ impl CallerPrivileges {
 }
 
 #[cfg(test)]
-mod read_expected_version_tests {
+mod read_unpaired_append_version_tests {
     use std::sync::Arc;
 
     use hort_domain::events::StreamId;
@@ -558,9 +895,14 @@ mod read_expected_version_tests {
         let events = Arc::new(MockEventStore::new());
         let stream_id = StreamId::artifact(Uuid::new_v4());
 
-        let version = read_expected_version(&*events, &stream_id, false)
-            .await
-            .unwrap();
+        let version = read_unpaired_append_version(
+            &*events,
+            &stream_id,
+            false,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await
+        .unwrap();
         assert_eq!(version, ExpectedVersion::NoStream);
     }
 
@@ -575,9 +917,14 @@ mod read_expected_version_tests {
             .collect();
         events.set_stream(&stream_id, dummy);
 
-        let version = read_expected_version(&*events, &stream_id, false)
-            .await
-            .unwrap();
+        let version = read_unpaired_append_version(
+            &*events,
+            &stream_id,
+            false,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await
+        .unwrap();
         assert_eq!(version, ExpectedVersion::Exact(2));
     }
 
@@ -592,9 +939,10 @@ mod read_expected_version_tests {
             .collect();
         events.set_stream(&stream_id, dummy);
 
-        let err = read_expected_version(&*events, &stream_id, true)
-            .await
-            .unwrap_err();
+        let err =
+            read_unpaired_append_version(&*events, &stream_id, true, UnpairedAppend::GenesisAppend)
+                .await
+                .unwrap_err();
         assert!(err.to_string().contains("200-event cap"));
     }
 
@@ -611,9 +959,14 @@ mod read_expected_version_tests {
             .collect();
         events.set_stream(&stream_id, dummy);
 
-        let version = read_expected_version(&*events, &stream_id, false)
-            .await
-            .unwrap();
+        let version = read_unpaired_append_version(
+            &*events,
+            &stream_id,
+            false,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await
+        .unwrap();
         assert_eq!(version, ExpectedVersion::Exact(200));
     }
 
@@ -628,13 +981,14 @@ mod read_expected_version_tests {
             .collect();
         events.set_stream(&stream_id, dummy);
 
-        let version = read_expected_version(&*events, &stream_id, true)
-            .await
-            .unwrap();
+        let version =
+            read_unpaired_append_version(&*events, &stream_id, true, UnpairedAppend::GenesisAppend)
+                .await
+                .unwrap();
         assert_eq!(version, ExpectedVersion::Exact(199));
     }
 
-    /// Issue #88 structural guard: `read_expected_version`'s capped
+    /// Structural guard: `read_unpaired_append_version`'s capped
     /// forward-scan is only a correct version source for the bounded
     /// per-artifact stream. Any other category must be rejected up
     /// front — pinning this is the "fails if a future caller derives a
@@ -646,9 +1000,14 @@ mod read_expected_version_tests {
         let events = Arc::new(MockEventStore::new());
         let stream_id = StreamId::user(Uuid::new_v4());
 
-        let err = read_expected_version(&*events, &stream_id, false)
-            .await
-            .unwrap_err();
+        let err = read_unpaired_append_version(
+            &*events,
+            &stream_id,
+            false,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("non-artifact stream"), "got {err}");
         assert_eq!(
             events.read_stream_call_count(),
@@ -735,7 +1094,8 @@ mod read_artifact_stream_tests {
     /// A capped full-stream read is only correct for a stream the cap
     /// bounds. Rejecting any other category up front is what keeps a
     /// future unbounded-category caller from silently reading a prefix —
-    /// the same guard `read_expected_version` carries for the same reason.
+    /// the same guard `read_unpaired_append_version` carries for the same
+    /// reason.
     #[tokio::test]
     async fn rejects_non_artifact_stream_category() {
         let events = Arc::new(MockEventStore::new());
@@ -1013,5 +1373,283 @@ mod caller_privileges_tests {
     fn require_curate_or_admin_reviewer_alone_does_not_pass() {
         let err = reviewer_privileges().require_curate_or_admin().unwrap_err();
         assert!(err.to_string().contains("curate") || err.to_string().contains("admin"));
+    }
+}
+
+#[cfg(test)]
+mod artifact_at_version_tests {
+    use std::sync::Arc;
+
+    use hort_domain::entities::artifact::QuarantineStatus;
+    use hort_domain::events::StreamId;
+    use hort_domain::ports::event_store::ExpectedVersion;
+
+    use super::*;
+    use crate::use_cases::test_support::*;
+
+    /// Seed `count` events on `artifact_id`'s stream and return the id.
+    fn seed_stream(events: &Arc<MockEventStore>, artifact_id: Uuid, count: u64) -> StreamId {
+        let stream_id = StreamId::artifact(artifact_id);
+        let dummy: Vec<_> = (0..count)
+            .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
+            .collect();
+        events.set_stream(&stream_id, dummy);
+        stream_id
+    }
+
+    fn seeded_artifact(artifacts: &Arc<MockArtifactRepository>) -> Uuid {
+        let artifact = sample_artifact(QuarantineStatus::Quarantined);
+        let id = artifact.id;
+        artifacts.insert(artifact);
+        id
+    }
+
+    /// The defining property: the artifact, the evidence and the append
+    /// version come from **one** observation. One `read_stream` call
+    /// serves all three, so there is no window between the evidence a
+    /// decision is derived from and the version that protects it.
+    #[tokio::test]
+    async fn one_read_serves_the_artifact_the_evidence_and_the_version() {
+        let events = Arc::new(MockEventStore::new());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let artifact_id = seeded_artifact(&artifacts);
+        seed_stream(&events, artifact_id, 3);
+
+        let paired =
+            ArtifactAtVersion::load(&*artifacts, &*events, artifact_id, OverCapStream::Tolerate)
+                .await
+                .unwrap();
+
+        assert_eq!(paired.artifact().id, artifact_id);
+        assert_eq!(paired.evidence().unwrap().len(), 3);
+        assert_eq!(paired.expected_version(), ExpectedVersion::Exact(2));
+        assert_eq!(paired.stream_id(), &StreamId::artifact(artifact_id));
+        assert_eq!(
+            events.read_stream_call_count(),
+            1,
+            "two reads would be two observations, which is the defect"
+        );
+    }
+
+    /// An empty stream pairs as `NoStream` with no evidence.
+    #[tokio::test]
+    async fn empty_stream_pairs_as_no_stream() {
+        let events = Arc::new(MockEventStore::new());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let artifact_id = seeded_artifact(&artifacts);
+
+        let paired =
+            ArtifactAtVersion::load(&*artifacts, &*events, artifact_id, OverCapStream::Tolerate)
+                .await
+                .unwrap();
+
+        assert_eq!(paired.expected_version(), ExpectedVersion::NoStream);
+        assert!(paired.evidence().unwrap().is_empty());
+    }
+
+    /// The version read comes FIRST, before the artifact row is loaded:
+    /// an event landing between the two is then in the artifact but not
+    /// in the version, so the append loses — fail-closed. The reverse
+    /// order is the fail-open one.
+    ///
+    /// Observable here as: the stream read has already happened when the
+    /// artifact load fails.
+    #[tokio::test]
+    async fn the_version_is_read_before_the_artifact_row() {
+        let events = Arc::new(MockEventStore::new());
+        // No artifact seeded → `find_by_id` fails.
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let artifact_id = Uuid::new_v4();
+        seed_stream(&events, artifact_id, 2);
+
+        let err =
+            ArtifactAtVersion::load(&*artifacts, &*events, artifact_id, OverCapStream::Tolerate)
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Domain(DomainError::NotFound { .. })),
+            "got {err}"
+        );
+        assert_eq!(
+            events.read_stream_call_count(),
+            1,
+            "the stream read must already have happened when the load failed"
+        );
+    }
+
+    /// A read failure surfaces verbatim — what the caller does with it
+    /// (propagate or skip) is deliberately not decided here.
+    #[tokio::test]
+    async fn a_stream_read_failure_surfaces() {
+        let events = Arc::new(MockEventStore::new());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let artifact_id = seeded_artifact(&artifacts);
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+        let err =
+            ArtifactAtVersion::load(&*artifacts, &*events, artifact_id, OverCapStream::Tolerate)
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("event store down"));
+    }
+
+    /// `pair` takes an artifact the caller already holds (a bulk list
+    /// page's row) and reads the stream once for the version and the
+    /// evidence. The row is NOT refreshed — refreshing would change what
+    /// the site decides.
+    #[tokio::test]
+    async fn pair_uses_the_callers_row_and_reads_the_stream_once() {
+        let events = Arc::new(MockEventStore::new());
+        let mut artifact = sample_artifact(QuarantineStatus::Released);
+        artifact.name = "from-the-page".into();
+        let artifact_id = artifact.id;
+        seed_stream(&events, artifact_id, 5);
+
+        let paired = ArtifactAtVersion::pair(&*events, artifact, OverCapStream::Tolerate)
+            .await
+            .unwrap();
+
+        assert_eq!(paired.artifact().name, "from-the-page");
+        assert_eq!(paired.expected_version(), ExpectedVersion::Exact(4));
+        assert_eq!(events.read_stream_call_count(), 1);
+    }
+
+    /// `Refuse` rejects an over-cap stream at construction, with the
+    /// `Conflict` the capping version callers have always produced.
+    #[tokio::test]
+    async fn refuse_rejects_an_over_cap_stream_with_conflict() {
+        let events = Arc::new(MockEventStore::new());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let artifact_id = seeded_artifact(&artifacts);
+        seed_stream(&events, artifact_id, STREAM_EVENT_CAP + 1);
+
+        let err =
+            ArtifactAtVersion::load(&*artifacts, &*events, artifact_id, OverCapStream::Refuse)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Conflict(_))),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("200-event cap"));
+    }
+
+    /// A stream at exactly the cap is not over it — the `+ 1` budget was
+    /// not exhausted, so the read provably reached the tail.
+    #[tokio::test]
+    async fn a_stream_at_exactly_the_cap_pairs_under_refuse() {
+        let events = Arc::new(MockEventStore::new());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let artifact_id = seeded_artifact(&artifacts);
+        seed_stream(&events, artifact_id, STREAM_EVENT_CAP);
+
+        let paired =
+            ArtifactAtVersion::load(&*artifacts, &*events, artifact_id, OverCapStream::Refuse)
+                .await
+                .unwrap();
+        assert_eq!(
+            paired.expected_version(),
+            ExpectedVersion::Exact(STREAM_EVENT_CAP - 1)
+        );
+        assert_eq!(paired.evidence().unwrap().len() as u64, STREAM_EVENT_CAP);
+    }
+
+    /// `Tolerate` pairs an over-cap stream — tolerating an unprovable
+    /// *version* is fail-closed, since the append loses against the true
+    /// tail — but `evidence` still refuses, because deriving a decision
+    /// from an unprovable *prefix* is fail-open.
+    #[tokio::test]
+    async fn tolerate_yields_a_version_but_still_refuses_the_evidence() {
+        let events = Arc::new(MockEventStore::new());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let artifact_id = seeded_artifact(&artifacts);
+        seed_stream(&events, artifact_id, STREAM_EVENT_CAP + 1);
+
+        let paired =
+            ArtifactAtVersion::load(&*artifacts, &*events, artifact_id, OverCapStream::Tolerate)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            paired.expected_version(),
+            ExpectedVersion::Exact(STREAM_EVENT_CAP),
+            "the prefix's tail — stale against the real stream, so the \
+             append loses"
+        );
+        let err = paired.evidence().unwrap_err();
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Invariant(_))),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("200-event cap"));
+    }
+
+    /// The domain transitions mutate the entity as they produce their
+    /// event, and the commit step hands the mutated entity on.
+    #[tokio::test]
+    async fn the_artifact_is_mutable_and_can_be_taken_back_out() {
+        let events = Arc::new(MockEventStore::new());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let artifact_id = seeded_artifact(&artifacts);
+        seed_stream(&events, artifact_id, 1);
+
+        let mut paired =
+            ArtifactAtVersion::load(&*artifacts, &*events, artifact_id, OverCapStream::Tolerate)
+                .await
+                .unwrap();
+        paired.artifact_mut().quarantine_status = QuarantineStatus::Released;
+
+        let artifact = paired.into_artifact();
+        assert_eq!(artifact.id, artifact_id);
+        assert_eq!(artifact.quarantine_status, QuarantineStatus::Released);
+    }
+
+    /// The category guard fires before any I/O — a capped read is only a
+    /// correct version source for the bounded per-artifact stream.
+    #[tokio::test]
+    async fn pair_rejects_a_non_artifact_stream_before_any_read() {
+        let events = Arc::new(MockEventStore::new());
+        let err = read_artifact_stream_at_version(&*events, &StreamId::user(Uuid::new_v4()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-artifact stream"), "got {err}");
+        assert_eq!(events.read_stream_call_count(), 0);
+    }
+
+    /// The artifact-less form of the pairing, for a caller that decides
+    /// from the stream alone: both halves from one read.
+    #[tokio::test]
+    async fn stream_at_version_returns_both_halves_from_one_read() {
+        let events = Arc::new(MockEventStore::new());
+        let artifact_id = Uuid::new_v4();
+        let stream_id = seed_stream(&events, artifact_id, 4);
+
+        let (stream, version) = read_artifact_stream_at_version(&*events, &stream_id)
+            .await
+            .unwrap();
+        assert_eq!(stream.len(), 4);
+        assert_eq!(version, ExpectedVersion::Exact(3));
+        assert_eq!(events.read_stream_call_count(), 1);
+    }
+
+    /// The artifact-less form refuses an over-cap stream outright: its
+    /// caller is deriving a decision from the events, so a prefix is
+    /// never an acceptable answer and a stale version is not worth
+    /// returning beside one.
+    #[tokio::test]
+    async fn stream_at_version_refuses_an_over_cap_stream() {
+        let events = Arc::new(MockEventStore::new());
+        let artifact_id = Uuid::new_v4();
+        let stream_id = seed_stream(&events, artifact_id, STREAM_EVENT_CAP + 1);
+
+        let err = read_artifact_stream_at_version(&*events, &stream_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Invariant(_))),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("200-event cap"));
     }
 }

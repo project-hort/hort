@@ -383,6 +383,10 @@ impl SeedImportUseCase {
                     }),
                     content_hash: item.content_hash.clone(),
                     seed_import_quarantine_anchor: Some(anchor),
+                    // A seed-imported artifact registers bytes, not a
+                    // relationship to another artifact's: nothing to claim
+                    // beyond its own content, which the mint derives itself.
+                    claimed_edges: Vec::new(),
                 },
                 handler.as_ref(),
             )
@@ -423,7 +427,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Duration;
-    use hort_domain::entities::artifact::QuarantineStatus;
+    use hort_domain::entities::artifact::{QuarantineStatus, ReleaseOrigin};
     use hort_domain::entities::repository::Repository;
     use hort_domain::entities::scan_policy::{
         NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
@@ -757,7 +761,10 @@ mod tests {
         // (scan still gates). If seed-import had landed `Released`, the
         // transition would fail.
         let rejected = a
-            .reject_from_scan("simulated dirty scan finding".to_string())
+            .reject_from_scan(
+                "simulated dirty scan finding".to_string(),
+                ReleaseOrigin::NeverReleased,
+            )
             .expect("reject_from_scan must accept a seed-imported Quarantined artifact");
         assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
         assert_eq!(rejected.artifact_id, a.id);
@@ -965,15 +972,20 @@ mod tests {
             DomainEvent::ScanRequested(_)
         ));
 
+        // Index 0 is the mint. `register_by_hash`'s genesis commit rides
+        // `commit_transition_with_enqueues` too — not for enqueues (it has
+        // none) but to carry the artifact's `primary_content` edge in its
+        // own transaction — so the gate's batch is index 1.
         let enqueues = lifecycle.ingest_enqueues();
-        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+        assert_eq!(enqueues.len(), 2, "{enqueues:?}");
+        assert!(enqueues[0].1.is_empty(), "the mint enqueues nothing");
         assert!(
-            enqueues[0].1.iter().any(
+            enqueues[1].1.iter().any(
                 |e| matches!(e, IngestEnqueue::Scan { format, trigger_source, .. }
                     if format == "pypi" && trigger_source == "seed-import")
             ),
             "expected a seed-import Scan enqueue: {:?}",
-            enqueues[0].1
+            enqueues[1].1
         );
     }
 
@@ -1016,14 +1028,15 @@ mod tests {
 
         // `commit_transition_with_enqueues` still runs (and the mock
         // still logs the call) — `enqueues` is the empty slice, not "no
-        // call happened". Assert the CALL's recorded enqueue Vec is
-        // empty, not that no call was logged.
+        // call happened". Assert each CALL's recorded enqueue Vec is
+        // empty, not that no call was logged. Two calls: the mint (which
+        // rides this method to carry its `primary_content` edge) and the
+        // gate's own commit.
         let enqueues = lifecycle.ingest_enqueues();
-        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+        assert_eq!(enqueues.len(), 2, "{enqueues:?}");
         assert!(
-            enqueues[0].1.is_empty(),
-            "scan_backends:[] must enqueue nothing: {:?}",
-            enqueues[0].1
+            enqueues.iter().all(|(_, e)| e.is_empty()),
+            "scan_backends:[] must enqueue nothing: {enqueues:?}"
         );
     }
 
@@ -1051,16 +1064,21 @@ mod tests {
         let summary = uc.run(vec![item], api_actor()).await.unwrap();
         assert_eq!(summary.registered, 1, "{:?}", summary.errors);
 
+        // Index 0 is the mint. `register_by_hash`'s genesis commit rides
+        // `commit_transition_with_enqueues` too — not for enqueues (it has
+        // none) but to carry the artifact's `primary_content` edge in its
+        // own transaction — so the gate's batch is index 1.
         let enqueues = lifecycle.ingest_enqueues();
-        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+        assert_eq!(enqueues.len(), 2, "{enqueues:?}");
+        assert!(enqueues[0].1.is_empty(), "the mint enqueues nothing");
         assert!(
-            enqueues[0].1.iter().any(|e| matches!(
+            enqueues[1].1.iter().any(|e| matches!(
                 e,
                 IngestEnqueue::ProvenanceVerify { trigger_source, .. }
                     if trigger_source == "seed-import"
             )),
             "expected a seed-import ProvenanceVerify enqueue: {:?}",
-            enqueues[0].1
+            enqueues[1].1
         );
     }
 
@@ -1085,12 +1103,14 @@ mod tests {
         let summary = uc.run(vec![item], api_actor()).await.unwrap();
         assert_eq!(summary.registered, 1, "{:?}", summary.errors);
 
+        // Two calls: the mint (riding this method for its
+        // `primary_content` edge) and the gate's quarantine commit.
         let enqueues = lifecycle.ingest_enqueues();
-        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+        assert_eq!(enqueues.len(), 2, "{enqueues:?}");
         assert!(
-            enqueues[0].1.is_empty(),
+            enqueues.iter().all(|(_, e)| e.is_empty()),
             "provenance_mode: Off must never enqueue ProvenanceVerify: {:?}",
-            enqueues[0].1
+            enqueues
         );
     }
 
@@ -1116,12 +1136,14 @@ mod tests {
         let summary = uc.run(vec![item], api_actor()).await.unwrap();
         assert_eq!(summary.registered, 1, "{:?}", summary.errors);
 
+        // Two calls: the mint (riding this method for its
+        // `primary_content` edge) and the gate's quarantine commit.
         let enqueues = lifecycle.ingest_enqueues();
-        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+        assert_eq!(enqueues.len(), 2, "{enqueues:?}");
         assert!(
-            enqueues[0].1.is_empty(),
+            enqueues.iter().all(|(_, e)| e.is_empty()),
             "pypi is not provenance-capable in this fixture — must enqueue nothing: {:?}",
-            enqueues[0].1
+            enqueues
         );
     }
 

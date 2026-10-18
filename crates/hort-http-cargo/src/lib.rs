@@ -18,10 +18,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Extension, Router};
-use chrono::Utc;
 
 use hort_app::use_cases::repository_access::AccessLevel;
-use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{RepositoryFormat, RepositoryType};
 use hort_domain::events::ApiActor;
@@ -29,11 +27,15 @@ use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::types::ArtifactCoords;
 use hort_formats::cargo::CargoFormatHandler;
 
+use hort_http_core::artifact_gate::non_servable_response;
 use hort_http_core::authz::write::{reject_write_to_virtual, resolve_actor_user_id};
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
-use hort_http_core::limits::{BoundedPath, CARGO_PUBLISH_BODY_LIMIT};
+use hort_http_core::limits::{
+    publish_disabled_response, refuse_publishes_when_disabled, BoundedPath,
+    CARGO_PUBLISH_BODY_LIMIT,
+};
 use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 use hort_http_core::middleware::trust::RequestTrust;
 
@@ -82,19 +84,40 @@ pub(crate) mod serve;
 /// The default ([`CARGO_PUBLISH_BODY_LIMIT`] — 200 MiB) is large enough
 /// for nearly every real crate; blocks runaway uploads. Without an
 /// explicit override, axum's default 2 MiB limit rejects any non-
-/// trivial crate, so the limit must be set at the route layer. Not
-/// driven by `HORT_PUBLISH_BODY_MAX_SIZE` — see
-/// `hort_http_core::limits` for the rationale.
+/// trivial crate, so the limit must be set at the route layer. A *size*
+/// set through `HORT_PUBLISH_BODY_MAX_SIZE` does not move this ceiling,
+/// but a zero one does close this route — see
+/// `hort_http_core::limits::cargo_publish_body_limit`, which the
+/// composition root applies before calling
+/// [`cargo_routes_with_publish_limit`].
 pub fn cargo_routes() -> Router<Arc<AppContext>> {
     cargo_routes_with_publish_limit(CARGO_PUBLISH_BODY_LIMIT)
 }
 
 /// Build the Cargo route tree with a custom publish body limit (in bytes).
 ///
-/// Tests use this to exercise the body-limit reject path without actually
-/// sending hundreds of megabytes.
-pub(crate) fn cargo_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
-    Router::new()
+/// `http.rs::build_router` calls this with
+/// `hort_http_core::limits::cargo_publish_body_limit(effective_shared_limit)`
+/// — this crate does not re-derive the size-versus-kill-switch split,
+/// it takes the resolved number. Tests use it to exercise the
+/// body-limit reject path without actually sending hundreds of
+/// megabytes.
+///
+/// A **size** is carried by `DefaultBodyLimit` alone: [`publish`]
+/// consumes the body through the buffering `Bytes` extractor, which
+/// consults the `DefaultBodyLimit` marker, so there is no streaming
+/// consumer that would need the value handed to it a second time as an
+/// `Extension` (contrast npm, whose publish decoder reads a raw `Body`).
+///
+/// **Zero** is the refuse-all-publishes kill switch rather than a
+/// ceiling, and it is answered by
+/// `hort_http_core::limits::refuse_publishes_when_disabled` — `503`,
+/// before the PUT reaches the handler — not by the body limit. Through
+/// the body limit a zero-byte publish was refused only because the
+/// publish envelope failed to parse, which is a property of cargo's
+/// payload grammar and not a promise the limit made.
+pub fn cargo_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
+    let routes = Router::new()
         .route("/{repo_key}/config.json", get(config_json))
         .route(
             "/{repo_key}/api/v1/crates/{name}/{version}/download",
@@ -113,7 +136,8 @@ pub(crate) fn cargo_routes_with_publish_limit(limit: usize) -> Router<Arc<AppCon
         .route(
             "/{repo_key}/{aa}/{bb}/{crate_name}",
             get(sparse_index_4plus),
-        )
+        );
+    refuse_publishes_when_disabled(routes, limit, publish_disabled_response)
 }
 
 // ---------------------------------------------------------------------------
@@ -404,8 +428,9 @@ async fn download(
 }
 
 /// Render the final crate-file HTTP response for a resolved artifact:
-/// surface the quarantine gate (`Quarantined` → 503 + `Retry-After`,
-/// `Rejected` / `ScanIndeterminate` → 403) or stream the bytes from CAS.
+/// surface the per-artifact status gate
+/// ([`hort_http_core::artifact_gate::non_servable_response`] — the one
+/// definition the content routes share) or stream the bytes from CAS.
 ///
 /// Shared by the hosted/proxy direct path and the virtual aggregation path
 /// (ADR 0031) so the gate render + streaming live in exactly one place; the
@@ -415,50 +440,8 @@ async fn render_cargo_crate_response(
     artifact: hort_domain::entities::artifact::Artifact,
     actor: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
-    match artifact.quarantine_status {
-        QuarantineStatus::Quarantined => {
-            // The use-case layer hydrates the transient computed
-            // `quarantine_deadline` (ADR 0007); the format crate never
-            // computes it (it cannot resolve a `ScanPolicy`).
-            let retry_after = artifact
-                .quarantine_deadline
-                .map(|deadline| {
-                    let secs = (deadline - Utc::now()).num_seconds().max(1);
-                    secs.to_string()
-                })
-                .unwrap_or_else(|| "3600".to_string());
-
-            return Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("Retry-After", retry_after)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact is quarantined"}).to_string(),
-                ))
-                .unwrap());
-        }
-        QuarantineStatus::Rejected => {
-            return Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact is rejected"}).to_string(),
-                ))
-                .unwrap());
-        }
-        // Terminal scan failure (scanner could not decide). Fail-closed:
-        // a terminal block like `Rejected`, not a timed hold
-        // (`quarantine_until` does not apply, so no Retry-After). The
-        // Artifactory transparent-proxy 503 mapping for this state is a
-        // separate, deferred concern — this is the native-handler path
-        // (ADR 0007).
-        QuarantineStatus::ScanIndeterminate => {
-            return Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact scan is indeterminate"}).to_string(),
-                ))
-                .unwrap());
-        }
-        QuarantineStatus::None | QuarantineStatus::Released => {}
+    if let Some(blocked) = non_servable_response(&artifact) {
+        return Ok(blocked);
     }
 
     // Thread the resolved principal for opt-in download-audit attribution.
@@ -868,7 +851,10 @@ mod tests {
     use super::*;
     use hort_http_core::context::AppContext;
     use hort_http_core::test_support::{
-        build_mock_ctx, trust_config_untrusted_peer_fallback, with_trust_config,
+        assert_axis_is_the_wire_kind_for_every_variant,
+        assert_axis_less_refusal_emits_no_axis_field, assert_refusal_leaks_no_uuid_or_cve,
+        build_mock_ctx, seed_indefinite_hold_policy, seed_timed_hold_policy,
+        trust_config_untrusted_peer_fallback, with_provenance_hold_hydration, with_trust_config,
     };
 
     struct TestHarness {
@@ -882,6 +868,14 @@ mod tests {
         /// Read-back handle for what a publish persisted as the
         /// artifact's format metadata.
         artifact_metadata: Arc<hort_app::use_cases::test_support::MockArtifactMetadataRepository>,
+        /// Artifact-stream seed handle for the status-gate tests: the
+        /// rejection axis and the indefinite-hold flag are both derived
+        /// from the stream, never from a fixture field.
+        events: Arc<hort_app::use_cases::test_support::MockEventStore>,
+        /// Scan-policy seed handle for the status-gate tests — the
+        /// observation window and the provenance mode decide which of
+        /// the two holds a quarantined artifact is in.
+        policy_projections: Arc<hort_app::use_cases::test_support::MockPolicyProjectionRepository>,
     }
 
     fn harness() -> TestHarness {
@@ -903,6 +897,8 @@ mod tests {
             storage: mocks.storage,
             curation_rules: mocks.curation_rules,
             artifact_metadata: mocks.artifact_metadata,
+            events: mocks.events,
+            policy_projections: mocks.policy_projections,
         }
     }
 
@@ -1407,6 +1403,183 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
+    // -- the status gate: the axis, and the hold with no deadline ---------
+    //
+    // These drive the real download route, not the gate function, which
+    // is the point: the axis and the indefinite-hold flag are hydrated by
+    // the use-case layer during the load, so a test that hands the gate a
+    // hand-built artifact proves only that the gate reads two fields. The
+    // question here is whether cargo's own download path arrives at the
+    // gate carrying them.
+
+    /// Seed a `Rejected` crate whose stream carries `axis` (or, for
+    /// `None`, carries nothing at all — the ADR 0039 D6 illegal state),
+    /// pull it, and return the refusal.
+    ///
+    /// The fixture entity's `rejection_reason` is deliberately never set:
+    /// `MockArtifactRepository` clears it on read exactly as the one
+    /// `row -> Artifact` mapper in `hort-adapters-postgres` does, so only
+    /// `ArtifactUseCase`'s hydration can put it back — which is what
+    /// makes this about the production derivation and not about the
+    /// fixture.
+    async fn rejected_crate_response(
+        axis: Option<hort_domain::events::RejectionReason>,
+    ) -> (StatusCode, serde_json::Value) {
+        let h = harness();
+        let repo = insert_repo(&h, "cargo-test");
+        let artifact = insert_crate_artifact(
+            &h,
+            repo.id,
+            "serde",
+            "1.0.0",
+            b"payload",
+            QuarantineStatus::Rejected,
+        );
+        h.events.set_stream(
+            &hort_domain::events::StreamId::artifact(artifact.id),
+            axis.map(|reason| {
+                vec![
+                    hort_app::use_cases::test_support::persisted_artifact_rejected(
+                        artifact.id,
+                        reason,
+                        1,
+                    ),
+                ]
+            })
+            .unwrap_or_default(),
+        );
+        // Opt into the read-path hydration: without the event-store
+        // handle wired the axis cannot be recovered and the route would
+        // answer the axis-less form for a harness reason rather than a
+        // production one.
+        let router = router(with_provenance_hold_hydration(&h.ctx));
+        let res = router
+            .oneshot(
+                Request::get("/cargo/cargo-test/api/v1/crates/serde/1.0.0/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// **Every** `RejectionReason` variant reaches a cargo client as its
+    /// own `wire_kind()` token, iterated off `ALL_KIND_SAMPLES` rather
+    /// than a hand-written list — so a variant added tomorrow is covered
+    /// the moment it joins that constant, and cannot reach a client
+    /// undecided.
+    #[tokio::test]
+    async fn download_rejected_403_names_the_axis_for_every_variant() {
+        assert_axis_is_the_wire_kind_for_every_variant(rejected_crate_response).await;
+    }
+
+    /// The refusal is a diagnosis of an artifact, not a disclosure about
+    /// a person, a rule, or a weakness. Asserted over every variant,
+    /// which is what makes it meaningful: `Curator { curator_id }` and
+    /// `CurationRetroactive { rule_id }` are the two that carry a uuid,
+    /// so a body built from the payload rather than the discriminator
+    /// would leak here and nowhere else.
+    #[tokio::test]
+    async fn download_rejected_403_leaks_no_uuid_and_no_cve_identifier() {
+        assert_refusal_leaks_no_uuid_or_cve(rejected_crate_response).await;
+    }
+
+    /// ADR 0039 D6's illegal state: the projection says `Rejected` and no
+    /// `ArtifactRejected` stands behind it on the stream. The caller is
+    /// still refused — but no axis field is emitted and no `unknown`
+    /// token is invented, because a token would make an inconsistency
+    /// read as a verdict.
+    #[tokio::test]
+    async fn download_rejected_without_an_axis_on_the_stream_names_none() {
+        assert_axis_less_refusal_emits_no_axis_field(rejected_crate_response).await;
+    }
+
+    /// ADR 0039 D5 — a quarantined crate still waiting on a signature
+    /// after its observation window elapsed has no deadline to advertise:
+    /// what it waits for is an external event, not the clock. Before
+    /// this, cargo answered `Retry-After: 1` on every pull of such a
+    /// crate, forever.
+    #[tokio::test]
+    async fn download_indefinite_hold_is_503_with_no_retry_after() {
+        let h = harness();
+        let repo = insert_repo(&h, "cargo-test");
+        seed_indefinite_hold_policy(&h.policy_projections, repo.id);
+        // No `ProvenanceVerified` seeded on the artifact's stream, so the
+        // read-path clearance stays `Pending` under `Required`.
+        insert_crate_artifact(
+            &h,
+            repo.id,
+            "serde",
+            "1.0.0",
+            b"payload",
+            QuarantineStatus::Quarantined,
+        );
+        let router = router(with_provenance_hold_hydration(&h.ctx));
+
+        let res = router
+            .oneshot(
+                Request::get("/cargo/cargo-test/api/v1/crates/serde/1.0.0/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            res.headers().get("Retry-After").is_none(),
+            "an unsigned hold past its window has no self-resolving deadline"
+        );
+        let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Same body as the time-bounded hold: which hold this is stays
+        // opaque to the client.
+        assert_eq!(parsed["error"], "artifact is quarantined");
+    }
+
+    /// The converse, on the same wiring: a hold still inside its window
+    /// has a real deadline, so its `Retry-After` is correct and useful
+    /// and must survive.
+    #[tokio::test]
+    async fn download_hold_inside_its_window_keeps_its_retry_after() {
+        let h = harness();
+        let repo = insert_repo(&h, "cargo-test");
+        seed_timed_hold_policy(&h.policy_projections, repo.id);
+        insert_crate_artifact(
+            &h,
+            repo.id,
+            "serde",
+            "1.0.0",
+            b"payload",
+            QuarantineStatus::Quarantined,
+        );
+        let router = router(with_provenance_hold_hydration(&h.ctx));
+
+        let res = router
+            .oneshot(
+                Request::get("/cargo/cargo-test/api/v1/crates/serde/1.0.0/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let secs: i64 = res
+            .headers()
+            .get("Retry-After")
+            .expect("an in-window hold keeps its computed Retry-After")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (1..=3600).contains(&secs),
+            "retry-after out of range: {secs}"
+        );
+    }
+
     /// The download handler resolves via the single SSOT path constructor,
     /// which lowercases the name (`normalize_name`). A case-mismatched
     /// hand-constructed URL (`/Serde/1.0.0/download`) therefore RESOLVES
@@ -1530,6 +1703,7 @@ mod tests {
                 mtls_key_ref: None,
                 ca_bundle_ref: None,
                 pinned_cert_sha256: None,
+                allowed_realm_hosts: Vec::new(),
                 created_at: now,
                 updated_at: now,
             });
@@ -3291,6 +3465,8 @@ mod tests {
                 storage: h.storage,
                 curation_rules: h.curation_rules,
                 artifact_metadata: h.artifact_metadata,
+                events: h.events,
+                policy_projections: h.policy_projections,
             }
         }
 
@@ -3456,6 +3632,8 @@ mod tests {
                 storage: h.storage,
                 curation_rules: h.curation_rules,
                 artifact_metadata: h.artifact_metadata,
+                events: h.events,
+                policy_projections: h.policy_projections,
             }
         }
 
@@ -3747,6 +3925,8 @@ mod tests {
                 storage: base.storage,
                 curation_rules: base.curation_rules,
                 artifact_metadata: base.artifact_metadata,
+                events: base.events,
+                policy_projections: base.policy_projections,
             };
 
             let repo = insert_private_repo(&h, "private-cargo");

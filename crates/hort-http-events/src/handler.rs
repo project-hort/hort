@@ -28,8 +28,9 @@ use axum::Json;
 
 use hort_app::metrics::{emit_events_pull, EventsPullResult};
 
+use hort_app::use_cases::event_visibility::EventDisclosure;
+
 use hort_domain::entities::rbac::Permission;
-use hort_domain::entities::subscription::EventTypeKind;
 use hort_domain::events::StreamCategory;
 use hort_domain::ports::event_store::{EventStore, SubscribeFrom};
 
@@ -150,6 +151,21 @@ pub async fn get_events(
     //    subscription dispatch gate. (Admin-only categories never reach this
     //    branch; they already passed the upfront gate.)
     //
+    //    **Repository disclosure is resolved, not assumed.** The
+    //    post-ingest artifact lifecycle carries no repository column:
+    //    `ArtifactQuarantined`, `ScanCompleted`, `ArtifactReleased`,
+    //    `ArtifactRejected`, the provenance verdicts, `ArtifactExpired`
+    //    and `ArtifactPurged` name the *artifact*, and the artifact
+    //    aggregate owns exactly one repository. Reading that absence as
+    //    "no repository, therefore visible" is what let a caller with no
+    //    `Read` grant anywhere pull every repository's scanner names,
+    //    severity counts, findings-blob hashes and release
+    //    justifications off this endpoint. The shared
+    //    `EventVisibilityUseCase` resolves the page's aggregates — ONE
+    //    round trip for the whole page, never one per event — and the
+    //    subscription dispatcher's delivery filter consults the same
+    //    primitive, so the two gates cannot drift.
+    //
     //    `type_gated_drops` counts events dropped specifically by the
     //    type gate so we can emit ONE aggregate `info!` audit record per
     //    request — never per-event (that would tank the read hot path),
@@ -161,6 +177,17 @@ pub async fn get_events(
             AuthContext::Disabled => events.iter().map(map_event).collect(),
             AuthContext::Enabled { rbac, .. } | AuthContext::BearerOnly { rbac, .. } => {
                 let evaluator = rbac.load();
+                // Resolve the page's repository disclosures before the
+                // filter walk. A failure is a 500, not a degraded page:
+                // continuing with an unresolved index would quietly turn
+                // the caller's own repository's events into admin-only
+                // ones, and `next_after` is unfiltered, so the caller
+                // would never see them again.
+                let repository_index = ctx
+                    .event_visibility_use_case
+                    .index(&events)
+                    .await
+                    .map_err(EventsHandlerError::Infrastructure)?;
                 events
                     .iter()
                     .filter(|e| {
@@ -173,21 +200,39 @@ pub async fn get_events(
                             }
                             return allowed;
                         }
-                        // Per-event repo association via the same helper the
-                        // dispatcher uses. Events with no repo association
-                        // (e.g. `RefMoved` carries one, but
-                        // `ArtifactQuarantined` does not — see
-                        // `EventTypeKind::repository_id` for the full
-                        // table) pass through under the closed-list
-                        // categories: an artifact-stream event that lacks
-                        // a direct repo column still belongs to the
-                        // artifact aggregate; the dispatcher applies the
-                        // same convention.
-                        match EventTypeKind::repository_id(&e.event) {
-                            None => true,
-                            Some(repo_id) => {
-                                evaluator.authorize(&principal, Permission::Read, Some(repo_id))
+                        match repository_index.disclosure(&e.event) {
+                            // No repository association exists at all
+                            // (policy / auth / token / subscription /
+                            // identity lifecycle). Every such type rides
+                            // an admin-only category or the type gate
+                            // above, so this arm is the genuinely
+                            // unscoped remainder.
+                            EventDisclosure::Global => true,
+                            // Repository-scoped but unresolvable: a
+                            // `CasIntegrityMismatch` keyed on a CAS hash
+                            // no single repository owns, or an aggregate
+                            // whose projection row went away with its
+                            // repository. Fail closed on live Admin
+                            // rather than drop it — it is still an audit
+                            // fact an operator must be able to read, and
+                            // there is no repository to check instead.
+                            EventDisclosure::Unresolved => {
+                                let allowed =
+                                    evaluator.authorize(&principal, Permission::Admin, None);
+                                if !allowed {
+                                    type_gated_drops += 1;
+                                }
+                                allowed
                             }
+                            // Every disclosed repository must be
+                            // readable. The conjunction is the point:
+                            // the promotion chain discloses a source AND
+                            // a target and the served payload carries
+                            // both identities, so `Read` on one of them
+                            // is not authority to see it.
+                            EventDisclosure::Repositories(ids) => ids.all(|repo_id| {
+                                evaluator.authorize(&principal, Permission::Read, Some(repo_id))
+                            }),
                         }
                     })
                     .map(map_event)

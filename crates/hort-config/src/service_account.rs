@@ -139,7 +139,7 @@ pub fn parse_service_account(
     _path: &Path,
     bytes: &[u8],
 ) -> Result<Envelope<ServiceAccountSpec>, ParseError> {
-    let env: Envelope<ServiceAccountSpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<ServiceAccountSpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::ServiceAccount {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),

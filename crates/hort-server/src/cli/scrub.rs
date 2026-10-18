@@ -325,4 +325,300 @@ mod tests {
     fn default_sample_fraction_is_one() {
         assert!((DEFAULT_SAMPLE_FRACTION - 1.0).abs() < f64::EPSILON);
     }
+
+    // -- Composition: a real storage adapter driving the scrub --------------
+    //
+    // Every piece below is covered elsewhere in isolation — the adapters'
+    // own tamper tests assert the reader fails at EOF, the use case's tests
+    // assert the classification given a reader that does. What no other
+    // test covers is the two *composed*, which is where the defect lived:
+    // the shipped composition wrapped every read in a verifier whose
+    // short-circuit the scrub then filed as a read error, so a corrupted
+    // blob never reached `mismatches` and this CLI exited 0 over it.
+    //
+    // `report_to_exit_code` is deliberately exercised through the report
+    // the composition actually produced, not through a hand-built one: a
+    // hand-built `ScrubReport { mismatches: 1, .. }` cannot fail when the
+    // classification upstream of it is wrong, and that is exactly the
+    // shape the pre-existing exit-code tests have.
+
+    mod composition {
+        use std::io::Cursor;
+        use std::process::ExitCode;
+        use std::sync::Arc;
+
+        use hort_adapters_storage::metrics::values::BACKEND_MEMORY;
+        use hort_adapters_storage::{FilesystemStorage, ObjectStoreStorage};
+        use hort_app::event_store_publisher::wrap_for_test;
+        use hort_app::use_cases::cas_scrub_use_case::{
+            ActionOnMismatch, CasScrubUseCase, ScrubOpts, ScrubReport,
+        };
+        use hort_app::use_cases::test_support::{
+            sample_artifact, MockArtifactLifecycle, MockArtifactRepository, MockEventStore,
+        };
+        use hort_domain::entities::artifact::QuarantineStatus;
+        use hort_domain::events::DomainEvent;
+        use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
+        use hort_domain::ports::artifact_repository::ArtifactRepository;
+        use hort_domain::ports::storage::StoragePort;
+        use hort_domain::types::ContentHash;
+        use object_store::memory::InMemory;
+        use object_store::{ObjectStore, ObjectStoreExt};
+        use uuid::Uuid;
+
+        use super::super::report_to_exit_code;
+
+        /// SHA-256 of b"hello world" — the CAS key both tests store under.
+        const HELLO_WORLD_SHA256: &str =
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        /// Bytes written over the stored blob behind the port.
+        const TAMPERED_BYTES: &[u8] = b"TAMPERED";
+
+        /// CAS key layout of `hort-adapters-storage`:
+        /// `cas/{hash[0..2]}/{hash[2..4]}/{hash}`. Pinned by that crate's
+        /// `cas::tests`; reproduced here because the derivation is
+        /// adapter-internal and tampering means writing *behind* the port.
+        fn cas_key(hash: &ContentHash) -> String {
+            let h: &str = hash.as_ref();
+            format!("cas/{}/{}/{}", &h[0..2], &h[2..4], h)
+        }
+
+        /// Digest the adapters' verifiers will compute once the stored
+        /// bytes are `TAMPERED_BYTES`, derived by putting those bytes into
+        /// a throwaway CAS rather than hardcoded — so the assertion
+        /// compares two independent derivations of the same value instead
+        /// of a literal nobody re-checks.
+        async fn tampered_digest() -> ContentHash {
+            let scratch = ObjectStoreStorage::new(Arc::new(InMemory::new()), BACKEND_MEMORY);
+            scratch
+                .put(Box::new(Cursor::new(TAMPERED_BYTES.to_vec())))
+                .await
+                .unwrap()
+                .hash
+        }
+
+        /// Store b"hello world" through `storage` and return the CAS key
+        /// the adapter derived for it.
+        async fn put_hello_world(storage: &dyn StoragePort) -> ContentHash {
+            let put = storage
+                .put(Box::new(Cursor::new(b"hello world".to_vec())))
+                .await
+                .unwrap();
+            assert_eq!(put.hash.as_ref(), HELLO_WORLD_SHA256);
+            put.hash
+        }
+
+        /// Wire the scrub over `storage` with the artifact + lifecycle
+        /// ports the tombstone action needs, seed an artifact row at
+        /// `hash`, and return the pieces the assertions inspect.
+        fn tombstoning_scrub(
+            storage: Arc<dyn StoragePort>,
+            hash: &ContentHash,
+        ) -> (
+            CasScrubUseCase,
+            Arc<MockEventStore>,
+            Arc<MockArtifactRepository>,
+            Arc<MockArtifactLifecycle>,
+            Uuid,
+        ) {
+            let events = Arc::new(MockEventStore::new());
+            let artifacts = Arc::new(MockArtifactRepository::new());
+            let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+
+            let mut artifact = sample_artifact(QuarantineStatus::Released);
+            artifact.sha256_checksum = hash.clone();
+            let artifact_id = artifact.id;
+            artifacts.insert(artifact);
+
+            let uc = CasScrubUseCase::new(storage, wrap_for_test(events.clone()))
+                .with_artifact_lifecycle(
+                    artifacts.clone() as Arc<dyn ArtifactRepository>,
+                    lifecycle.clone() as Arc<dyn ArtifactLifecyclePort>,
+                );
+            (uc, events, artifacts, lifecycle, artifact_id)
+        }
+
+        fn tombstone_opts() -> ScrubOpts {
+            ScrubOpts {
+                concurrency: 1,
+                sample_fraction: 1.0,
+                action_on_mismatch: ActionOnMismatch::Tombstone,
+            }
+        }
+
+        /// Assertions shared by both backends: the tampered blob is a
+        /// mismatch, the audit event carries the digest the verifier
+        /// computed, the artifact is tombstoned, and the report this CLI
+        /// returns maps to a non-zero exit code.
+        fn assert_tampered_blob_escalates(
+            report: &ScrubReport,
+            events: &MockEventStore,
+            artifacts: &MockArtifactRepository,
+            lifecycle: &MockArtifactLifecycle,
+            expected_hash: &ContentHash,
+            observed_hash: &ContentHash,
+            artifact_id: Uuid,
+        ) {
+            assert_eq!(report.mismatches, 1, "tampered blob must be a mismatch");
+            assert_eq!(
+                report.read_errors, 0,
+                "the verifier's short-circuit is a classified mismatch, not a read error"
+            );
+
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(
+                transitions.len(),
+                1,
+                "action=tombstone must reach commit_transition"
+            );
+            let (_saved, artifact_append, _meta) = &transitions[0];
+            assert_eq!(
+                artifacts.get(artifact_id).unwrap().quarantine_status,
+                QuarantineStatus::Rejected
+            );
+
+            // Every event the run produced, across both streams: the
+            // synthetic per-hash stream the scrub appends to and the
+            // artifact stream the tombstone transition writes.
+            let batches = events.appended_batches();
+            let all_events: Vec<&DomainEvent> = batches
+                .iter()
+                .chain(std::iter::once(artifact_append))
+                .flat_map(|b| b.events.iter())
+                .map(|e| &e.event)
+                .collect();
+
+            let mismatches: Vec<_> = all_events
+                .iter()
+                .filter_map(|e| match e {
+                    DomainEvent::CasIntegrityMismatch(m) => Some(m),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                mismatches.len(),
+                1,
+                "exactly one CasIntegrityMismatch must be appended"
+            );
+            assert_eq!(mismatches[0].content_hash, *expected_hash);
+            assert_eq!(
+                mismatches[0].observed_hash, *observed_hash,
+                "the observed digest must be the one the verifier computed"
+            );
+
+            // The tombstone's own record carries the same digest — so the
+            // value the real verifier produced reaches the artifact's
+            // history, not just the scrub's audit stream.
+            let corrupted = all_events
+                .iter()
+                .find_map(|e| match e {
+                    DomainEvent::ArtifactCorrupted(c) => Some(c),
+                    _ => None,
+                })
+                .expect("ArtifactCorrupted must accompany the tombstone");
+            assert_eq!(corrupted.expected_hash, *expected_hash);
+            assert_eq!(corrupted.computed_hash, *observed_hash);
+            assert!(
+                all_events
+                    .iter()
+                    .any(|e| matches!(e, DomainEvent::ArtifactRejected(_))),
+                "a terminal Rejected status must have its companion event"
+            );
+
+            // Through `report_to_exit_code` exactly as it stands — the
+            // escalation comes from the classification being right, not
+            // from widening the exit-code posture.
+            assert_eq!(
+                format!("{:?}", report_to_exit_code(report)),
+                format!("{:?}", ExitCode::from(1)),
+                "hort-server scrub must exit non-zero over a corrupted blob"
+            );
+        }
+
+        /// Filesystem CAS: bytes swapped on disk behind the port.
+        #[tokio::test]
+        async fn filesystem_tampered_blob_is_a_mismatch_and_exits_non_zero() {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Arc::new(FilesystemStorage::new(dir.path().to_path_buf()));
+            let hash = put_hello_world(storage.as_ref()).await;
+
+            // Tamper: an operator or attacker with filesystem write access
+            // replaces the bytes at the CAS key. Equal length is not
+            // required — the verifier compares digests, not sizes.
+            std::fs::write(dir.path().join(cas_key(&hash)), TAMPERED_BYTES).unwrap();
+
+            let (uc, events, artifacts, lifecycle, artifact_id) =
+                tombstoning_scrub(storage as Arc<dyn StoragePort>, &hash);
+            let report = uc.run(tombstone_opts()).await.unwrap();
+
+            assert_tampered_blob_escalates(
+                &report,
+                &events,
+                &artifacts,
+                &lifecycle,
+                &hash,
+                &tampered_digest().await,
+                artifact_id,
+            );
+        }
+
+        /// Object-store CAS: the object overwritten through the backing
+        /// store handle, bypassing the adapter the same way a direct S3
+        /// PUT would.
+        #[tokio::test]
+        async fn object_store_tampered_blob_is_a_mismatch_and_exits_non_zero() {
+            let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let storage = Arc::new(ObjectStoreStorage::new(inner.clone(), BACKEND_MEMORY));
+            let hash = put_hello_world(storage.as_ref()).await;
+
+            let key: object_store::path::Path = cas_key(&hash).into();
+            inner
+                .put(&key, bytes::Bytes::from_static(TAMPERED_BYTES).into())
+                .await
+                .unwrap();
+
+            let (uc, events, artifacts, lifecycle, artifact_id) =
+                tombstoning_scrub(storage as Arc<dyn StoragePort>, &hash);
+            let report = uc.run(tombstone_opts()).await.unwrap();
+
+            assert_tampered_blob_escalates(
+                &report,
+                &events,
+                &artifacts,
+                &lifecycle,
+                &hash,
+                &tampered_digest().await,
+                artifact_id,
+            );
+        }
+
+        /// An intact CAS stays clean through the same composition, and the
+        /// CLI still exits 0. Counter-assertion: without it the two tests
+        /// above would also pass against a scrub that called *everything*
+        /// a mismatch.
+        #[tokio::test]
+        async fn intact_filesystem_blob_is_clean_and_exits_zero() {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Arc::new(FilesystemStorage::new(dir.path().to_path_buf()));
+            let hash = put_hello_world(storage.as_ref()).await;
+
+            let (uc, events, artifacts, lifecycle, artifact_id) =
+                tombstoning_scrub(storage as Arc<dyn StoragePort>, &hash);
+            let report = uc.run(tombstone_opts()).await.unwrap();
+
+            assert_eq!(report.checked, 1);
+            assert_eq!(report.mismatches, 0);
+            assert_eq!(report.read_errors, 0);
+            assert!(events.appended_batches().is_empty());
+            assert!(lifecycle.committed_transitions().is_empty());
+            assert_eq!(
+                artifacts.get(artifact_id).unwrap().quarantine_status,
+                QuarantineStatus::Released
+            );
+            assert_eq!(
+                format!("{:?}", report_to_exit_code(&report)),
+                format!("{:?}", ExitCode::SUCCESS)
+            );
+        }
+    }
 }

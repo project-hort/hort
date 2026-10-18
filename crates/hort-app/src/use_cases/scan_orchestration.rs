@@ -47,20 +47,27 @@ use hort_domain::ports::jobs_repository::{JobsRepository, ScanJob};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scanner::{
-    NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER,
+    EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort,
+    SCAN_REPORT_TOO_LARGE_MARKER,
 };
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::{
-    severity_label, ArtifactCoords, ArtifactKind, Finding, PayloadAccess, Sbom,
+    severity_label, ArtifactCoords, ArtifactKind, ComponentRelation, Finding, PayloadAccess, Sbom,
 };
 
 use crate::error::AppResult;
 use crate::metrics::{
-    emit_sbom_components_skipped, emit_sbom_extraction, emit_sbom_resolution, emit_scan_failure,
-    emit_scan_findings, emit_scan_jobs, emit_scan_terminal, observe_scan_duration,
-    SbomExtractionResult, SbomResolutionResult, ScanFailureResult, ScanJobsResult,
-    ScanTerminalResult,
+    emit_component_relation, emit_sbom_components_skipped, emit_sbom_extraction,
+    emit_sbom_resolution, emit_scan_failure, emit_scan_findings, emit_scan_jobs,
+    emit_scan_terminal, observe_scan_duration, SbomExtractionResult, SbomResolutionResult,
+    ScanFailureResult, ScanJobsResult, ScanTerminalResult,
 };
+// `record_outcome`'s `Failed` branch waits out the workspace's one
+// retry curve. The four-step shape used to be defined here and the task
+// dispatcher carried its own, differently-shaped copy behind the same
+// agreed attempt cap; the definition moved to `crate::retry_backoff` so
+// the number and the window it spans cannot diverge again.
+use crate::retry_backoff::compute_backoff;
 use crate::scanning::any_scan_backend_applies_to;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
@@ -389,6 +396,31 @@ impl ScanOrchestrationUseCase {
             .try_extract_sbom(&artifact, &subject, &job.format)
             .await;
 
+        // Two things only the artifact's own format handler can answer,
+        // resolved from the single lookup both need.
+        //
+        // `kind` — what the bytes are, so an adapter can materialise them
+        // the way its analyzers expect: a content scanner selects
+        // analyzers by file name and directory layout, and a bare content
+        // hash cannot answer "under what name?". `Other` when no handler
+        // is registered for the format, which is the honest "no
+        // materialisation applies" answer rather than a guess that would
+        // let an unexamined artifact look clean.
+        //
+        // `payload_contains_components` — whether the payload carries the
+        // code of the components its BOM lists, which is what decides
+        // whether a finding against a non-subject component is about this
+        // artifact at all (ADR 0056). With no handler registered the
+        // trait's fail-closed default applies: no evidence was gathered
+        // that would take authority away from a finding.
+        let handler = self.handlers.get(&job.format);
+        let kind = handler.map_or(ArtifactKind::Other, |h| h.scan_kind(&artifact));
+        let relations = ComponentRelations {
+            sbom: sbom.as_ref(),
+            payload_contains_components: handler.is_none_or(|h| h.payload_contains_components()),
+            format: &job.format,
+        };
+
         // Step 6: pre-scan advisory enrichment (best-effort).
         //
         // Advisory enrichment must cover BOTH the subject (the artifact
@@ -413,19 +445,6 @@ impl ScanOrchestrationUseCase {
             None => Vec::new(),
         };
 
-        // Describe the target, so an adapter can materialise the bytes
-        // the way its analyzers expect: a content scanner selects
-        // analyzers by file name and directory layout, and a bare content
-        // hash cannot answer "under what name?". `kind` is asked of the
-        // artifact's own format handler — the only component that knows
-        // its layout — and is `Other` when no handler is registered for
-        // the format, which is the honest "no materialisation applies"
-        // answer rather than a guess that would let an unexamined
-        // artifact look clean.
-        let kind = self
-            .handlers
-            .get(&job.format)
-            .map_or(ArtifactKind::Other, |handler| handler.scan_kind(&artifact));
         let target = ScanTarget {
             content_hash: &artifact.sha256_checksum,
             format: &job.format,
@@ -437,7 +456,12 @@ impl ScanOrchestrationUseCase {
         // `hort_scan_duration_seconds{scanner}` brackets
         // exactly the `ScannerPort::scan` call (start before, observe
         // after). Adjacent dedup / CAS persist run outside the timer.
-        let mut accumulated: Vec<Finding> = advisory_findings;
+        //
+        // Tagging site — the advisory half. The enrichment path is handed
+        // the component list and nothing else, so its evidence is the BOM
+        // by construction.
+        let mut accumulated: Vec<Finding> =
+            relations.tag(advisory_findings, EvidenceBasis::SuppliedSbom);
         let mut contributors: Vec<String> = Vec::new();
         let mut total_attempted: u32 = 0;
         let mut total_failed: u32 = 0;
@@ -505,9 +529,11 @@ impl ScanOrchestrationUseCase {
             let scan_result = scanner.scan(&target, sbom.as_ref()).await;
             observe_scan_duration(backend, started.elapsed());
             match scan_result {
-                Ok(ScanAnalysis::Analysed(mut findings)) => {
+                Ok(ScanAnalysis::Analysed(findings)) => {
                     contributors.push(backend.clone());
-                    accumulated.append(&mut findings);
+                    // Tagging site — the scanner half. The backend states
+                    // what it looked at; the orchestrator holds the SBOM.
+                    accumulated.extend(relations.tag(findings, scanner.evidence_basis()));
                     tracing::info!(
                         artifact_id = %artifact.id,
                         scanner = backend,
@@ -1212,26 +1238,101 @@ impl ScanOrchestrationUseCase {
 // Pure helpers (testable without the full use case)
 // ---------------------------------------------------------------------------
 
-/// Backoff schedule for `record_outcome`'s `Failed` branch.
+/// The join between a scan's findings and the artifact they were found
+/// on — **the one place** `Finding.component_relation` is decided.
 ///
-/// `attempts` is the value already on the job row at the time of the
-/// failure (the post-claim, pre-decision number). The schedule:
+/// # Why here and not in the producers
 ///
-/// - `attempts == 1` → 1 minute
-/// - `attempts == 2` → 5 minutes
-/// - `attempts == 3` → 30 minutes
-/// - `attempts == 4` → 60 minutes
-/// - `attempts >= 5` → 60 minutes (defensive cap; `max_attempts == 5`
-///   default would have routed to `mark_failed` instead)
-/// - `attempts == 0` → 1 minute (defensive — `claim_scan_jobs`
-///   increments attempts before we observe the row, so this branch is
-///   not normally reached).
-pub fn compute_backoff(attempts: u32) -> Duration {
-    match attempts {
-        0 | 1 => Duration::from_secs(60),
-        2 => Duration::from_secs(5 * 60),
-        3 => Duration::from_secs(30 * 60),
-        _ => Duration::from_secs(60 * 60),
+/// There are three producers of findings in this pipeline (two scanner
+/// adapters and the advisory-enrichment path) and they all return into
+/// `run_scan` with the same SBOM still in hand. A rule typed once per
+/// producer is the shape `crates/hort-app/tests/https_rule_is_single_sourced.rs`
+/// exists to prevent: the https-metadata rule had been re-typed five
+/// times before the consumer that carried no copy at all turned up. The
+/// adapters also sit below the format layer (ADR 0008) and cannot ask a
+/// `FormatHandler` whether the payload contains its components.
+///
+/// # The rule
+///
+/// The join key is the one [`hort_domain::types::SbomComponent`]'s own
+/// rustdoc declares, `Finding.purl == SbomComponent.purl`, compared
+/// verbatim and case-sensitively (the convention `merge_findings` and
+/// `compute_added_findings` already use for a PURL).
+///
+/// 1. The finding names the BOM's **subject** — the artifact itself, so
+///    [`ComponentRelation::Subject`].
+/// 2. The finding names a **listed component**. Whether the artifact
+///    carries that component's code is a property of the format, asked of
+///    the handler that declares it
+///    ([`FormatHandler::payload_contains_components`]): `Contained` for a
+///    payload that carries its closure, `NotContained` for one whose BOM
+///    merely *names* what a consumer will resolve elsewhere.
+/// 3. The finding names **nothing in the BOM**, and here the two kinds of
+///    producer mean opposite things — see [`EvidenceBasis`]. A backend
+///    that materialised the artifact's bytes found the package *in* the
+///    artifact, so `Contained`; a backend whose whole input was the BOM
+///    cannot have found it anywhere else, so the join failed and the
+///    relation is `NotEstablished`, which the counter then shows. Reading
+///    the first case as a failed join instead would silently disarm every
+///    payload-scanner finding the BOM happens not to list.
+///
+/// A scan with no SBOM at all (no handler, an opaque format, a failed
+/// extraction) lands on rule 3 for the same reason: there is nothing to
+/// join against, so the producer's evidence is all there is.
+struct ComponentRelations<'a> {
+    /// The BOM this scan extracted, if any.
+    sbom: Option<&'a Sbom>,
+    /// [`FormatHandler::payload_contains_components`] for this
+    /// artifact's format.
+    payload_contains_components: bool,
+    /// Format key — the `format` label on the relation counter.
+    format: &'a str,
+}
+
+impl ComponentRelations<'_> {
+    /// Decide one finding's relation. Pure: the counter is emitted by
+    /// [`Self::tag`], so this can be asserted directly.
+    fn relation_for(&self, purl: &str, evidence: EvidenceBasis) -> ComponentRelation {
+        let Some(sbom) = self.sbom else {
+            return Self::unjoined(evidence);
+        };
+        if sbom.subject.as_ref().is_some_and(|s| s.purl == purl) {
+            return ComponentRelation::Subject;
+        }
+        if sbom.components.iter().any(|c| c.purl == purl) {
+            return if self.payload_contains_components {
+                ComponentRelation::Contained
+            } else {
+                ComponentRelation::NotContained
+            };
+        }
+        Self::unjoined(evidence)
+    }
+
+    /// Rule 3: what a purl the BOM does not name means, which only the
+    /// producer's evidence can answer.
+    fn unjoined(evidence: EvidenceBasis) -> ComponentRelation {
+        match evidence {
+            EvidenceBasis::MaterialisedPayload => ComponentRelation::Contained,
+            EvidenceBasis::SuppliedSbom => ComponentRelation::NotEstablished,
+        }
+    }
+
+    /// Tag a producer's batch and emit
+    /// `hort_finding_component_relation_total{format, result}` once per
+    /// finding, before the cross-backend dedup — a tagging decision a
+    /// merge later discards was still made, and the counter's job is to
+    /// show the `not_established` rate honestly.
+    fn tag(&self, findings: Vec<Finding>, evidence: EvidenceBasis) -> Vec<Finding> {
+        findings
+            .into_iter()
+            .map(|mut f| {
+                let relation = self.relation_for(&f.purl, evidence);
+                emit_component_relation(self.format, relation);
+                f.component_relation = relation;
+                f
+            })
+            .collect()
     }
 }
 
@@ -1247,6 +1348,9 @@ pub fn compute_backoff(attempts: u32) -> Duration {
 /// entry. A SCORED finding is never informational, so it is never downgraded
 /// by this preference. Vulnerability id matching is case-insensitive; PURL
 /// matching is case-sensitive (matches `compute_added_findings`'s convention).
+///
+/// The surviving row's `component_relation` is resolved separately from the
+/// ranking — see the collision arm below.
 fn merge_findings(input: Vec<Finding>, allow_informed_downgrade: bool) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::with_capacity(input.len());
     let mut seen: Vec<(String, String, usize)> = Vec::with_capacity(input.len());
@@ -1259,10 +1363,29 @@ fn merge_findings(input: Vec<Finding>, allow_informed_downgrade: bool) -> Vec<Fi
             .map(|(_, _, idx)| *idx)
         {
             // Collision — apply the merge preference.
+            //
+            // The relation is resolved alongside the ranking, not by it.
+            // `prefer_replacement` ranks severity, information quality and
+            // CVSS and deliberately never reads the component relation,
+            // so the winner's relation would otherwise be whichever the
+            // severity comparison happened to carry along — and after the
+            // release gate reads the relation, that is a verdict decided
+            // on an axis nobody compared. The survivor keeps the more
+            // condemning of the two instead
+            // (`ComponentRelation::more_condemning`, the single
+            // definition of that order): authority is withheld only where
+            // non-containment was actually established. Applied before
+            // the replacement so it holds whichever row wins, and folded
+            // pairwise, so a third backend reporting the same advisory
+            // cannot walk it back down.
             let existing = &out[idx];
+            let relation = existing
+                .component_relation
+                .more_condemning(f.component_relation);
             if prefer_replacement(existing, &f, allow_informed_downgrade) {
                 out[idx] = f;
             }
+            out[idx].component_relation = relation;
         } else {
             let idx = out.len();
             out.push(f);
@@ -1282,6 +1405,14 @@ fn merge_findings(input: Vec<Finding>, allow_informed_downgrade: bool) -> Vec<Fi
 /// behaviour that predates ADR 0059. It is read here, on the merge path,
 /// because a config field the consumer ignores is an inert operator
 /// surface (ADR 0015).
+///
+/// **`component_relation` is deliberately not an input here.** Ranking on
+/// it would re-key the merge: a weakly-claimed Low would then outrank a
+/// well-evidenced Critical and the surviving row would carry a severity no
+/// backend reached, which is the failure ADR 0059's ordering exists to
+/// prevent. Which row survives is a question about information quality;
+/// which relation it carries is a separate one, resolved beside this call
+/// in [`merge_findings`].
 fn prefer_replacement(
     existing: &Finding,
     incoming: &Finding,

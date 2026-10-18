@@ -15,7 +15,7 @@ each phase below is tagged with the track(s) it applies to.
   an OIDC CLI session.
 - **Track B — OIDC (full features).** `HORT_AUTH_PROVIDER=oidc` against a
   bundled Keycloak (realm `hort`). Unlocks the claim-gated surfaces: OCI
-  push/pull, admin quarantine release, patch-candidate listing, and the
+  push/pull, patch-candidate listing, and the
   discovery/prefetch endpoints. Track B is a superset — everything in
   Track A still works, plus the OIDC-only features.
 
@@ -32,7 +32,6 @@ Pick a track at §1/§3/§4; §0, §2, §5, §6 are shared.
 | Curator workflow (waive/block/exclude) | ✅¹ | ✅ |
 | Admin tasks / event-chain / scrub (§12/§13) | ✅ | ✅ |
 | **OCI proxy / hosted** (§7.4) | ❌ | ✅ |
-| **Admin quarantine release** (§8.4) | ❌ | ✅ |
 | **Patch-candidate listing** (§11) | ❌ | ✅ |
 | **Discovery / prefetch** (§9) | ❌ | ✅² |
 
@@ -41,7 +40,7 @@ Pick a track at §1/§3/§4; §0, §2, §5, §6 are shared.
 ² Discovery/prefetch require a `TokenKind::CliSession` minted by
 `hort-cli auth login` against the OIDC provider, not a raw bearer.
 
-**Why OCI / admin-release / patch-candidate are Track-B-only:** PATs from
+**Why OCI / patch-candidate are Track-B-only:** PATs from
 `hort-server admin issue-svc-token` top out at `[write, read, delete,
 admin_task_invoke]` — there is **no way to mint a PAT with
 `Permission::Admin`** (by design: long-lived static tokens stay
@@ -629,22 +628,7 @@ The scanner flags `GHSA-mh6f-8j2x-4483` (the malicious `flatmap-stream` dep):
 (anti-enumeration); the version disappears from the served
 packument (the `NonServableStatusFilter`).
 
-### §8.4 — Admin release  *(Track B only)*
-
-Needs `Permission::Admin`. In Track B with `$ADMIN_TOKEN` (admin user):
-
-```bash
-hort-cli admin quarantine release "$ARTIFACT_ID" \
-    --justification "Alpha test — reviewed CVE manually, accepting risk."
-```
-
-**Assertions (§8.4.a):** emits `ArtifactReleased { authority: AdminOverride,
-released_by_user_id: <admin>, justification }`; artifact becomes downloadable;
-empty / > 512-byte justification rejected client-side.
-
-> For the curator equivalent reachable under PAT, see §11.5.2.
-
-### §8.5 — Advisory-watch + rescan  *(Track A+B)*
+### §8.4 — Advisory-watch + rescan  *(Track A+B)*
 
 ```bash
 hort-cli admin task invoke advisory-watch-tick
@@ -727,8 +711,9 @@ hort-cli admin quarantine list-patch-candidates --output table
 ```
 
 **Assertions (§11.a):** after §8.3 produced a rejected `event-stream@3.3.6`
-and a newer clean version exists, the listing surfaces the pair;
-`--justification` is required for `hort-cli admin quarantine release`.
+and a newer clean version exists, the listing surfaces the pair. The
+release that acts on a listed row is `hort-cli curation waive` (§11.5.2),
+which is where `--justification` is required.
 
 ---
 
@@ -769,7 +754,11 @@ Restart `hort-server` to apply (boot-time gitops). **Note:** in Track A,
 `hort-cli admin users effective-permissions "$SVC_USER_ID"` lists a `curate`
 grant rendered as `user:<uuid>`.
 
-### §11.5.2 — Waive a `Quarantined` artifact
+### §11.5.2 — Waive a held artifact — the one manual release
+
+`curation waive` is the whole manual-release surface (ADR 0007, "One
+authority owns the manual release"): there is no admin-side release route
+or command beside it.
 
 ```bash
 hort-cli curation queue --status quarantined --repo npm-proxy --output table
@@ -780,8 +769,10 @@ hort-cli curation waive "$ARTIFACT_ID" \
 **Assertions (§11.5.2.a):** emits `ArtifactReleased { authority: CuratorWaiver,
 released_by_user_id: $SVC_USER_ID, justification }`; artifact downloadable;
 `hort-cli curation decisions --type waive …` lists it; empty / > 512-byte
-justification rejected client-side. **Source-state guard:** waiving a
-`ScanIndeterminate` artifact returns `400` (that state is admin-only, §8.4).
+justification rejected client-side. **Source-state guard:** it reaches
+`Quarantined` **and** `ScanIndeterminate` (the stuck-scanner case — repeat
+the two commands above against a `--status scan_indeterminate` row);
+`Rejected` / `Released` / `None` answer `409`.
 
 ### §11.5.3 — Block (single + bulk)
 
@@ -918,7 +909,7 @@ unset HORT_TOKEN ADMIN_PAT ADMIN_TOKEN DEV_TOKEN READER_TOKEN \
 | `hort-server serve` exits `… GroupMapping object(s) are declared … HORT_AUTH_PROVIDER=disabled` | Track A is pointed at the full tree. Use `HORT_CONFIG_DIR=…/gitops-config/base` (alpha.env default), or switch to Track B (`alpha.env.oidc`). |
 | `migrate` fails "previously applied but has been modified" | Stale schema — recreate the DB (§2 drift note). |
 | `/metrics` returns `401`/`403`, or connection refused | `/metrics` always requires a bearer carrying `read_metrics` (no opt-out) and only exists when `HORT_METRICS_BIND` is set (alpha.env sets it). Mint a token: `hort-server admin issue-svc-token --name metrics-scraper --permission read_metrics`, then pass it as `Authorization: Bearer …` (§4.d). `403` with that token means `base/service-accounts/41-metrics-scraper-read-metrics.yaml` didn't apply — check the gitops boot log. |
-| `503` on every artifact download | Quarantine working; release via §8.2 sweep, §11.5.2 waive, or §8.4 admin-release. |
+| `503` on every artifact download | Quarantine working; release via the §8.2 sweep or the §11.5.2 waive. |
 | `404` on `/api/v1/...` for a repo you created | Restart `hort-server` after editing `$HORT_CONFIG_DIR` (startup-only). |
 | OCI `crane` fails `unauthorized` / `NotOurToken` | OCI needs Track B (`$ADMIN_TOKEN`), not a svc-token PAT (§7.4). |
 | Keycloak token `iss` mismatch / JWKS unreachable | `KC_HOSTNAME` and `HORT_OIDC_ISSUER_URL` must both be `http://localhost:25380/realms/hort`. |

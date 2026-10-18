@@ -1,7 +1,7 @@
 # 0007 — Fail-closed quarantine release predicate
 
 - **Status:** Accepted
-- **Enforced by:** the background sweep releases an artifact only when `quarantine_until <= now()` **AND** the application layer can supply a recognised release authority; the predicate accepts exactly six `(reason, authority)` pairs (five as originally decided, plus `ScanRecorded` — see the 2026-08-21 amendment) and denies every other. The predicate is implemented in `Artifact::release` (`crates/hort-domain/src/entities/artifact.rs`) with exhaustive per-authority tests; the architect anti-pattern *scanner clean → immediate release* is a review hard-block.
+- **Enforced by:** the background sweep releases an artifact only when `quarantine_until <= now()` **AND** the application layer can supply a recognised release authority; the predicate accepts exactly six `(reason, authority)` pairs (five as originally decided, plus `ScanRecorded` — 2026-08-21 — and `ScanCleared` — 2026-10-11, minus `AdminOverride`, folded into the single manual authority — 2026-10-11) and denies every other. The predicate is implemented in `Artifact::release` (`crates/hort-domain/src/entities/artifact.rs`) with exhaustive per-authority tests; the architect anti-pattern *scanner clean → immediate release* is a review hard-block.
 - **Supersedes:** —
 
 ## Context
@@ -14,16 +14,17 @@ Quarantine is the observation window that lets a scan run and lets a malicious p
 
 Downloads are blocked while `quarantine_status = 'quarantined'`, regardless of the timestamp — the **status** is the gate, the **timestamp** is only the sweep's candidacy filter.
 
-The background sweep transitions an artifact to `released` only when `quarantine_until <= now()` **AND** a release authority is available. The release predicate accepts **exactly five authorities** (six as of the 2026-08-21 `ScanRecorded` amendment below) and denies every other `(reason, authority)` pair:
+The background sweep transitions an artifact to `released` only when `quarantine_until <= now()` **AND** a release authority is available. The release predicate accepts **exactly six authorities** — the five originally decided, plus `ScanRecorded` (2026-08-21) and `ScanCleared` (2026-10-11), minus `AdminOverride`, which the 2026-10-11 one-authority amendment folded into the single manual authority — and denies every other `(reason, authority)` pair. Slot 3 below is struck rather than renumbered, so every ordinal this ADR cites still names the authority it named when it was written:
 
 1. `ScanSucceeded` — a successful `ScanCompleted` on the artifact stream.
 2. `ScanWaived` — the resolved `ScanPolicy` declares `scan_backends: []`.
-3. `AdminOverride` — explicit admin release.
-4. `CuratorWaiver` — curator waive (`Quarantined`-state only).
+3. ~~`AdminOverride` — explicit admin release.~~ Retired by the one-authority amendment below (2026-10-11): the manual release is item 4, in every state it reaches. `ReleaseReason::Admin` stays readable on historical streams — the stream is append-only (ADR 0002).
+4. `CuratorWaiver` — **the** manual release: a curator decided this artifact's case and recorded a justification. One authority for the whole manual surface, with a source-state rule in place of the second permission tier it used to share the surface with (one-authority amendment below — it reverses this item's former `Quarantined`-only bound).
 5. `PolicyReEvaluation` — post-exclusion policy re-evaluation.
 6. `ScanRecorded` — the artifact was scanned and the resolved `ScanPolicy` declares `enforcement: record` (added by the 2026-08-21 amendment below; not part of the original five).
+7. `ScanCleared` — the artifact was scanned, its findings exist, and the policy verdict recorded beside the scan did **not** block. Distinct from `ScanSucceeded`, which asserts an empty finding list, and from `ScanRecorded`, which asserts the operator declared a *blocking* verdict non-gating (added by the 2026-10-11 amendment below; not part of the original five).
 
-`ScanCompleted(clean)` does **not** clear `quarantine_until` or set `released`. `ScanCompleted(findings)` immediately sets `rejected` (time never reverses this). A scan job that exhausts retries fails closed — see the exhaustion split below.
+`ScanCompleted(clean)` does **not** clear `quarantine_until` or set `released`. `ScanCompleted(findings)` sets `rejected` **iff the policy verdict recorded beside it blocks** — the finding list is evidence, the `PolicyEvaluated` verdict is the decision (2026-10-11 amendment). Where it does block, time never reverses it. A scan job that exhausts retries fails closed — see the exhaustion split below.
 
 ### "A successful `ScanCompleted`" means the latest verdict, not mere presence (issue #108, amended 2026-08-05; human-approved via `workflow::ready`)
 
@@ -176,6 +177,99 @@ the same terms as a clean-scan one, and the inline fast-path release in
 same token the sweep's `resolve_release_authority` would mint for the same
 artifact.
 
+### A seventh authority: `ScanCleared` — findings are evidence, the verdict is the decision (issue #344, amended 2026-10-11)
+
+The release authority was derived in two places from two different facts. The
+scan-time fast path asked "did the policy block?" (`!violations.is_empty()`);
+the release sweep asked "did the scanner find anything?"
+(`finding_count == 0`), under a comment claiming it mirrored the resolver it
+contradicted. Both were wrong, in opposite directions, and the same artifact
+therefore released or hung forever depending on whether its scan completed
+**after** or **inside** its observation window — a behaviour no decision ever
+took, and the arithmetic of a divergence rather than a rule.
+
+**The sentence above is where it began.** "`ScanCompleted(findings)`
+immediately sets `rejected`" stopped being true when `enforcement: record`
+shipped, and was never true for findings below the configured threshold; it
+made the finding *count* the authority where the *policy* decides. It is
+corrected in the Decision above by the same amendment that adds this authority.
+
+The rule, as decided: an artifact whose latest scan carries findings
+**exclusively below** the configured threshold is released when the observation
+window ends, regardless of when that scan ran; the earliest release is the end
+of the window and the latest is the arrival of a non-blocking verdict. Without
+a scan result nothing releases (fail closed).
+
+Three consequences. **The verdict is recorded**: every `record_scan_result`
+appends a `PolicyEvaluated` — `Pass` or `Fail` — beside the `ScanCompleted`, so
+the durable record answers "what was decided?" without re-running the
+evaluator. **One predicate reads it**: both paths call `latest_scan_standing`,
+which takes the first verdict after the latest `ScanCompleted` and keeps "no
+observation" and "superseded by a later rejection" distinct from "holds", so
+`enforcement: record` can never un-gate a missing observation or another axis's
+rejection. **And the authority says what it checked**: `ScanCleared` exists
+because widening `ScanSucceeded` would have produced correct releases with a
+permanently false premise — that token asserts an empty finding list, and a
+release log reading `authority = scan_succeeded` over an artifact with findings
+is a record no operator can trust. It carries the same provenance
+AND-precondition as the other three timer authorities: a recorded,
+non-blocking scan verdict says nothing about provenance.
+
+The precondition behind all three was **#264** (fixed in 0.14.0): the Trivy
+adapter wrote every artifact as `<sha256>.bin`, Trivy matched no analyzer, and
+the empty finding list was recorded as a clean scan — for 54 days and 26,267
+scans. The authority rule was therefore never exercised against a non-empty
+finding list before, which is why a divergence this old surfaced only now.
+
+### One authority owns the manual release (issue #345, amended 2026-10-11)
+
+The predicate carried **two** manual authorities, told apart by permission and by source state: `AdminOverride` (`Permission::Admin`, from `Quarantined` or `ScanIndeterminate`) and `CuratorWaiver`. Item 4 of the enumeration above read, until this amendment:
+
+> 4. `CuratorWaiver` — curator waive (`Quarantined`-state only).
+
+and the operator guide argued that bound as deliberate (`docs/architecture/how-to/curator-workflow.md`, before this amendment):
+
+> *"The narrower source-state guard on waive is intentional. `ScanIndeterminate` means the scanner could not complete (a terminal scan failure, not a clean result); releasing such an artifact requires the broader deliberation that `admin_release` represents (the broader role, the emergency escalation context)."*
+
+**The decision (maintainer, confirmed 2026-10-11):**
+
+> **Admin serves technical and operative actions; the curator holds the domain's authority. A curator who may override known severe findings may also act when no finding exists yet.**
+
+The bound did not protect the greater power; it split one power across two roles. The two paths differed in exactly three things — the permission, the source state, and the `released_by` discriminator. Effect, attribution, the ignored provenance parameter, the event type and the re-blockability were identical, and each had exactly one production caller. And the state the narrower path was kept away from is not the graver one: `ScanIndeterminate` means *no* verdict was reached, while a waivable `Quarantined` artifact may carry findings a policy weighed and permitted. An authority trusted to decide with a verdict in view is not the weaker one for the case where there is nothing to see. The split in *kind* this completes is already named in `docs/glossary.md` ("Curator (`Permission::Curate`)"): a verdict about an artifact is a curation decision; a structurally invalid state being withdrawn is not.
+
+**The rule, as decided.** One authority — item 4 above — whose requirement depends on the **source state** rather than on a second permission tier:
+
+- **Permission:** `Permission::Curate`, in every state the authority reaches. An admin caller satisfies the same gate (`CurateOrAdminPrincipal` admits either, and the RBAC evaluator short-circuits admin globally), so this **removes a route from the admin-only gate** — it adds nothing to it.
+- **Source state:** `Quarantined`; `ScanIndeterminate`; and `Rejected` on the axes the next subsection enumerates. Never `None` and never `Released` — there is nothing there to release.
+- **Record:** a justification is required (non-empty, ≤ 512 bytes) and the `ArtifactReleased` carries `released_by: Curator` plus the deciding curator's user id. Who decided, and why, stays answerable from the stream alone (ADR 0002).
+- **A state the rule does not admit answers 409, never 500.** An operator can POST a release against an artifact in any state, so the refusal is a caller-reachable state precondition — `DomainError::InvalidState` (ADR 0025).
+
+**What keeps automation out is a grant nobody makes, not a token-kind check.** The deployed curator identity is itself a PAT-only `kind: ServiceAccount` carrying a global `curate` grant (`deploy/ansible/files/gitops/auth/service-accounts/maintainer-curator.yaml`), and service accounts are strictly non-admin (ADR 0038) — so `TokenKind::ServiceAccount` has never meant "a pipeline", and a principal-shape gate on this route would lock out the very operator it was meant to protect. ADR 0055 governs the question and answers it by refusing the grant: *"Granting `curate` to the release identity. Would work, and hands CI standing authority over other people's artifacts to solve a problem about its own."* That refusal is the control. This amendment does not reopen it, and the curator surface keeps its deliberate non-features (no bulk-waive, no rule-driven release).
+
+#### The axis boundary for a `Rejected` artifact: as far as the curator's instrument reaches
+
+`Rejected` is reached on four axes — scan (a fresh verdict, and the ADR 0041 retroactive tighten), curation (a curator's block, a retroactive rule), provenance (a positive disproof, ADR 0039's 2026-09-12 amendment) and corruption (the CAS integrity tombstone). The manual release overrides the first three and **never** the fourth. In the vocabulary the stream records (`RejectionReason`): `Scanner`, `ScanPolicyRetroactive`, `Curator { .. }`, `CurationRetroactive { .. }` and `Provenance` are overridable; `Corruption` is not. `Admin` keeps its place in the enum with no production minting path — admin does not make domain verdicts — so it needs no override arm.
+
+The boundary is **what the curator's instrument can reach**, not a ranking of severities. The instrument is the comparison the curator's job is built on: this content hash against the publisher's own release page. That answers exactly the question a signature answers, so it reaches a **missing** signature and a **disproved** one alike. A third party who attaches a broken signature to a genuine artifact leaves the bytes genuine, and the comparison confirms it. An attacker who modified the artifact and signed it with their own key fails that same comparison, so the curator does not override. The instrument works in both directions, which is why the provenance axis resolves here rather than staying deferred.
+
+It cannot reach bytes that disagree with the hash naming them. Whatever the publisher attests, the bytes hort holds are not those bytes: the comparison confirms nothing, and `VerifyingReader` fails the read regardless (ADR 0003's read-verification amendment). A corruption override would not be a risky decision but a meaningless one, so it stays refused — permanently, not pending a mechanism.
+
+**The provenance position was argued the other way first and withdrawn on that reasoning** (maintainer, 2026-10-11), so a later reader sees a decision and not a silence. The withdrawn position was that a missing signature leaves the artifact insufficiently identified, so a curator can hold no information that permits an alternative decision. It does not survive the answer: the artifact *is* identified — by its content hash, and on a pull-through path by a verified upstream checksum (ADR 0006). What provenance adds is **attribution**, and the hash comparison above is precisely the information the premise said could not exist.
+
+**ADR 0041's invariant #6(a) is untouched.** It bars a *scan re-judgement* from clearing a provenance rejection, and a curator's override is not a re-judgement of the evidence — which is why the override is a predicate of its own beside `is_scan_clearable` rather than a widening of it. A policy re-evaluation still must not clear a curator's block or a provenance disproof.
+
+ADR 0025's observation that `rejected` exits only through finding-exclusion re-evaluation describes the predicate *before* this amendment; the 409 contract it records, and its example, are about the status code a state precondition answers and are unaffected either way.
+
+#### What this amendment does not change
+
+The narrow reading is the one that survives.
+
+- **`Permission::Curate` stays strictly less than `Permission::Admin` for every other route.** The curate extractor's own contract refuses the inverse move — mounting an existing `/admin/...` route behind it would broaden the global admin gate to also accept curators (`crates/hort-http-core/src/authz/extractors.rs`). This amendment does the opposite: it takes one route *out* of the admin gate. No other admin surface moves, and the technical/operative ones (gitops status, effective config, the provenance-misrejection repair) stay admin-only.
+- **Curation keeps re-blocking a manually released artifact.** The partition that shipped with the 2026-10-11 scan-verdict amendment above is `ReleaseOrigin::permits_scan_reblock` (`crates/hort-domain/src/entities/artifact.rs`), consulted in exactly one place: the `Released` source state of `Artifact::reject_from_scan`. So a **fresh scan verdict** cannot re-block an artifact whose latest `ArtifactReleased` carries `Admin` or `Curator`, and can re-block one released by `Timer` or `PolicyReEvaluation` — or one with no release event at all. The protection is scan-axis-wide, not axis-wide: a curator's block, a retroactive curation rule, a provenance disproof and the corruption tombstone all still reach a `Released` artifact, whatever released it. Widening *who* may release widens none of that, because the partition is keyed on `released_by`, which a curator release already set.
+- **`ReleaseReason::Admin` stays in the vocabulary.** The stream is append-only (ADR 0002): the releases an admin granted are on it, they must still read back as manual human releases, and the re-block partition above must still honour them. What the implementing change retires is the *minting* path and the `(Admin, AdminOverride)` pairing row — never the ability to read the reason a past event carries.
+
+**Decision recorded ahead of the code.** This section is the standing decision. The `(Admin, AdminOverride)` pairing row, the `ReleaseCuratorWaiver` source-state table (`crates/hort-domain/src/entities/quarantine_transitions.rs`), the `Rejected` override predicate beside `is_scan_clearable`, and the admin route and CLI command the decision removes all land with the implementing change under the same issue. Until they do, the code still carries two manual paths and the narrower curator bound; this section, not the code, is what the decision says. The amendment sections *above* keep their contemporaneous wording, as every earlier amendment to this ADR has — where one of them counts five authorities or names `AdminOverride`, it is reporting the predicate as it stood on its own date.
+
 ### Read-path bounded-await pattern (issue #65, amended 2026-07-20)
 
 The zero-window carve-out above still leaves a **read-side** race: a cold pull-through blob GET resolves the just-ingested, still-`Quarantined` artifact and would 503 before that artifact's own async scan lands the `ScanSucceeded` that (per the carve-out) releases it almost immediately once it runs — the gap is the scan's own turnaround (~1–5s observed), not an observation window. `hort-http-oci::blobs::maybe_bounded_await_release` closes this by polling the artifact for up to a tunable bound (`HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS`, default 10s, `0` = off) before falling through to the existing `check_quarantine` 503 decision.
@@ -204,7 +298,9 @@ The zero-window carve-out above still leaves a **read-side** race: a cold pull-t
 - `crates/hort-domain/src/entities/artifact.rs` (`Artifact::release`) and `crates/hort-domain/src/ports/quarantine_release.rs` — the release predicate and `ScanIndeterminate` status.
 - `crates/hort-domain/src/ports/scanner.rs` (`NotAnalysable::gates_release`), `crates/hort-domain/src/events/artifact_events.rs` (`ScanAssessment`) and `ScanOrchestrationUseCase::run_scan`'s abstention partition — the 2026-09-18 "scannable surface" clarification above.
 - The architect skill → Quarantine Invariants; anti-pattern *scanner clean → immediate release*.
-- `docs/architecture/how-to/curator-workflow.md` — the curator-waiver authority in practice.
+- `docs/architecture/how-to/curator-workflow.md` — the one manual release authority in practice (§1, §2.1, §4); `docs/architecture/how-to/quarantine-patch-release.md` — the patch-release playbook that exercises it; `docs/glossary.md` ("Curator (`Permission::Curate`)") — the admin/curator split in kind.
+- `deploy/ansible/files/gitops/auth/service-accounts/maintainer-curator.yaml` and `docs/adr/0055-write-authorized-hold-read-generalised.md` (rejected alternative: *"Granting `curate` to the release identity"*), with `docs/adr/0038-admin-identity-model.md` — why the manual release carries no token-kind gate and what keeps automation out of it instead.
+- `crates/hort-domain/src/entities/quarantine_transitions.rs` (`ReleaseCuratorWaiver` / `ReleaseGeneral` source-state rows), `crates/hort-domain/src/entities/artifact.rs` (`is_scan_clearable`, `ReleaseOrigin::permits_scan_reblock`) and `crates/hort-http-core/src/authz/extractors.rs` (`CurateOrAdminPrincipal`) — the sites the issue #345 one-authority amendment above governs.
 - `docs/architecture/how-to/recover-stranded-artifacts.md`; `ScanOrchestrationUseCase::record_outcome` and `RescanCandidatesRepository::select_stranded` — the issue #6 exhaustion-split / stranded-scan recovery amended in above (commit `55a93e40`; ratified by decision issue #32, 2026-07-14).
 - `crates/hort-http-oci/src/blobs.rs` (`maybe_bounded_await_release`) and `crates/hort-app/src/use_cases/quarantine_use_case.rs` (`QuarantineUseCase::is_window_elapsed`) — the issue #65 read-path bounded-await pattern amended in above.
 - `crates/hort-app/src/use_cases/ingest_use_case.rs` (`IngestUseCase::ingest_inner`) — the referenced-tree-descendant zero-window anchor-backdating (issue #46, amended above); `docs/adr/0043-oci-image-index-support.md` — the `content_references` membership graph (`oci_index_member` / `oci_subject` / `oci_config` / `oci_layer`) the target-check reads.

@@ -50,12 +50,12 @@ pub enum AdminCommand {
     /// endpoint is per-artifact, not per-kind.
     Rescan(rescan::RescanArgs),
 
-    /// Quarantine operations: list patch-candidates, admin-release a
-    /// quarantined artifact.
+    /// Quarantine operations: list patch-candidates.
     ///
-    /// Surfaces the patch-candidate read endpoint and the admin override
-    /// release under one `admin quarantine` group. Mirrors the HTTP
-    /// surface, where both routes nest under `/admin/quarantine/...`.
+    /// Surfaces the patch-candidate read endpoint, mirroring the HTTP
+    /// surface where the route nests under `/admin/quarantine/...`. The
+    /// release is `hort-cli curation waive` — one authority owns the
+    /// manual release (ADR 0007).
     /// See `docs/architecture/how-to/quarantine-patch-release.md`.
     Quarantine(quarantine::QuarantineArgs),
 

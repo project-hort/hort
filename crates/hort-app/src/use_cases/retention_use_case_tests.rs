@@ -34,7 +34,7 @@ use hort_domain::retention::{
     BooleanOp, ExpirationReason, PolicyPredicate, RetentionEvaluationMode, RetentionPolicy,
     RetentionPolicyEvent, RetentionScope,
 };
-use hort_domain::types::Finding;
+use hort_domain::types::{ComponentRelation, Finding};
 
 use crate::event_store_publisher::wrap_for_test;
 use crate::use_cases::retention_use_case::{RetentionCandidate, RetentionUseCase};
@@ -126,6 +126,7 @@ fn finding(sev: SeverityThreshold, cvss: Option<f32>, fixed: Vec<&str>) -> Findi
         aliases: vec![],
         informational_class: None,
         severity_basis: hort_domain::types::SeverityBasis::Assessed,
+        component_relation: ComponentRelation::NotEstablished,
     }
 }
 
@@ -379,7 +380,7 @@ async fn dry_run_and_execute_select_identical_candidates_but_only_execute_append
 //
 // The expiry append is the one artifact-stream writer that appends at
 // `ExpectedVersion::Any`, so the adapter performs no version check on it
-// and it inherits none of the bound `read_expected_version` gives every
+// and it inherits none of the bound `read_unpaired_append_version` gives every
 // `Exact` writer. It therefore carries the refusal itself; without it the
 // daily sweep is the only writer able to push an artifact stream past
 // `STREAM_EVENT_CAP`, and past the cap every capped reader of that stream

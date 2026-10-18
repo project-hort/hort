@@ -43,6 +43,7 @@ use hort_domain::ports::repository_upstream_mapping_repository::{
     RepositoryUpstreamMapping, RepositoryUpstreamMappingArgs, RepositoryUpstreamMappingRepository,
     UpstreamAuth,
 };
+use hort_domain::ports::secret_port::SecretRef;
 
 use crate::{map_sqlx_error, BoxFuture};
 
@@ -67,6 +68,7 @@ const SELECT_COLS: &str = r#"
     upstream_auth_type, secret_ref, managed_by, managed_by_digest,
     insecure_upstream_url, trust_upstream_publish_time,
     mtls_cert_ref, mtls_key_ref, ca_bundle_ref, pinned_cert_sha256,
+    allowed_realm_hosts,
     created_at, updated_at
 "#;
 
@@ -138,6 +140,11 @@ struct UpstreamMappingRow {
     mtls_key_ref: Option<serde_json::Value>,
     ca_bundle_ref: Option<serde_json::Value>,
     pinned_cert_sha256: Option<String>,
+    /// Hosts the operator consents to as the realm of a credentialed
+    /// bearer-challenge exchange. `NOT NULL DEFAULT '{}'` in the
+    /// schema, so an absent allowance decodes as the empty list rather
+    /// than as `None`-means-what.
+    allowed_realm_hosts: Vec<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -150,7 +157,7 @@ fn decode_secret_ref_jsonb(
     value: Option<serde_json::Value>,
     field: &'static str,
     id: Uuid,
-) -> DomainResult<Option<hort_domain::ports::secret_port::SecretRef>> {
+) -> DomainResult<Option<SecretRef>> {
     match value {
         None => Ok(None),
         Some(v) => Some(serde_json::from_value(v).map_err(|e| {
@@ -228,6 +235,7 @@ fn row_to_mapping(row: UpstreamMappingRow) -> DomainResult<RepositoryUpstreamMap
         mtls_key_ref,
         ca_bundle_ref,
         pinned_cert_sha256: row.pinned_cert_sha256,
+        allowed_realm_hosts: row.allowed_realm_hosts,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -290,25 +298,11 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
                 "upsert"
             );
             let auth_db = auth_to_db(&mapping.upstream_auth);
-            // `SecretRef` Serialize is total — the codec just records
-            // {source, location}, both of which are infallibly
-            // serialisable. Materialise to NULL for `Anonymous`.
-            let secret_ref_json = mapping
-                .secret_ref
-                .as_ref()
-                .map(|s| serde_json::to_value(s).expect("SecretRef Serialize is total"));
-            let mtls_cert_ref_json = mapping
-                .mtls_cert_ref
-                .as_ref()
-                .map(|s| serde_json::to_value(s).expect("SecretRef Serialize is total"));
-            let mtls_key_ref_json = mapping
-                .mtls_key_ref
-                .as_ref()
-                .map(|s| serde_json::to_value(s).expect("SecretRef Serialize is total"));
-            let ca_bundle_ref_json = mapping
-                .ca_bundle_ref
-                .as_ref()
-                .map(|s| serde_json::to_value(s).expect("SecretRef Serialize is total"));
+            // NULL for the absent refs; see `secret_ref_to_json`.
+            let secret_ref_json = secret_ref_to_json(mapping.secret_ref.as_ref());
+            let mtls_cert_ref_json = secret_ref_to_json(mapping.mtls_cert_ref.as_ref());
+            let mtls_key_ref_json = secret_ref_to_json(mapping.mtls_key_ref.as_ref());
+            let ca_bundle_ref_json = secret_ref_to_json(mapping.ca_bundle_ref.as_ref());
             sqlx::query(
                 r#"INSERT INTO repository_upstream_mappings (
                        id, repository_id, path_prefix, upstream_url,
@@ -317,10 +311,11 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
                        managed_by, managed_by_digest,
                        insecure_upstream_url, trust_upstream_publish_time,
                        mtls_cert_ref, mtls_key_ref, ca_bundle_ref, pinned_cert_sha256,
+                       allowed_realm_hosts,
                        created_at, updated_at
                    ) VALUES (
                        $1, $2, $3, $4, $5, $6, $7, 'local', NULL, $8, $9,
-                       $10, $11, $12, $13, $14, $15
+                       $10, $11, $12, $13, $14, $15, $16
                    )
                    ON CONFLICT (repository_id, path_prefix) DO UPDATE SET
                        upstream_url                = EXCLUDED.upstream_url,
@@ -335,6 +330,7 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
                        mtls_key_ref                = EXCLUDED.mtls_key_ref,
                        ca_bundle_ref               = EXCLUDED.ca_bundle_ref,
                        pinned_cert_sha256          = EXCLUDED.pinned_cert_sha256,
+                       allowed_realm_hosts         = EXCLUDED.allowed_realm_hosts,
                        updated_at                  = NOW()"#,
             )
             .bind(mapping.id)
@@ -350,6 +346,7 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
             .bind(mtls_key_ref_json)
             .bind(ca_bundle_ref_json)
             .bind(mapping.pinned_cert_sha256.as_deref())
+            .bind(mapping.allowed_realm_hosts.as_slice())
             .bind(mapping.created_at)
             .bind(mapping.updated_at)
             .execute(&self.pool)
@@ -416,137 +413,158 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
             rows.into_iter().map(row_to_mapping).collect()
         })
     }
+}
 
-    fn save_managed(&self, mapping: &RepositoryUpstreamMapping) -> BoxFuture<'_, DomainResult<()>> {
-        // Validate the in-memory invariant before issuing SQL — adapters
-        // are the last line of defence against a caller widening the
-        // (managed_by=GitOps ↔ digest=Some(_)) pairing.
-        let bad_managed_by = mapping.managed_by;
-        if bad_managed_by != ManagedBy::GitOps {
-            return Box::pin(async move {
-                Err(DomainError::Invariant(format!(
-                    "save_managed called with managed_by={bad_managed_by} (expected GitOps)"
-                )))
-            });
-        }
-        let Some(digest) = mapping.managed_by_digest else {
-            return Box::pin(async move {
-                Err(DomainError::Invariant(
-                    "save_managed called without managed_by_digest".into(),
-                ))
-            });
-        };
+// ---------------------------------------------------------------------------
+// In-transaction writes — shared with the authority lifecycle adapter
+// ---------------------------------------------------------------------------
 
-        let id = mapping.id;
-        let repository_id = mapping.repository_id;
-        let path_prefix = mapping.path_prefix.clone();
-        let upstream_url = mapping.upstream_url.clone();
-        let upstream_name_prefix = mapping.upstream_name_prefix.clone();
-        let auth_db = auth_to_db(&mapping.upstream_auth);
-        let secret_ref_json = mapping
-            .secret_ref
-            .as_ref()
-            .map(|s| serde_json::to_value(s).expect("SecretRef Serialize is total"));
-        let mtls_cert_ref_json = mapping
-            .mtls_cert_ref
-            .as_ref()
-            .map(|s| serde_json::to_value(s).expect("SecretRef Serialize is total"));
-        let mtls_key_ref_json = mapping
-            .mtls_key_ref
-            .as_ref()
-            .map(|s| serde_json::to_value(s).expect("SecretRef Serialize is total"));
-        let ca_bundle_ref_json = mapping
-            .ca_bundle_ref
-            .as_ref()
-            .map(|s| serde_json::to_value(s).expect("SecretRef Serialize is total"));
-        let pinned_cert_sha256 = mapping.pinned_cert_sha256.clone();
-        let digest_vec = digest.to_vec();
-        let insecure = mapping.insecure_upstream_url;
-        let trust_publish_time = mapping.trust_upstream_publish_time;
-
-        Box::pin(async move {
-            tracing::debug!(
-                entity = "RepositoryUpstreamMapping",
-                %repository_id,
-                %path_prefix,
-                "save_managed"
-            );
-            sqlx::query(
-                r#"INSERT INTO repository_upstream_mappings (
-                       id, repository_id, path_prefix, upstream_url,
-                       upstream_name_prefix,
-                       upstream_auth_type, secret_ref,
-                       managed_by, managed_by_digest,
-                       insecure_upstream_url, trust_upstream_publish_time,
-                       mtls_cert_ref, mtls_key_ref, ca_bundle_ref, pinned_cert_sha256
-                   ) VALUES (
-                       $1, $2, $3, $4, $5, $6, $7, 'gitops', $8, $9, $10,
-                       $11, $12, $13, $14
-                   )
-                   ON CONFLICT (repository_id, path_prefix) DO UPDATE SET
-                       upstream_url                = EXCLUDED.upstream_url,
-                       upstream_name_prefix        = EXCLUDED.upstream_name_prefix,
-                       upstream_auth_type          = EXCLUDED.upstream_auth_type,
-                       secret_ref                  = EXCLUDED.secret_ref,
-                       managed_by                  = 'gitops',
-                       managed_by_digest           = EXCLUDED.managed_by_digest,
-                       insecure_upstream_url       = EXCLUDED.insecure_upstream_url,
-                       trust_upstream_publish_time = EXCLUDED.trust_upstream_publish_time,
-                       mtls_cert_ref               = EXCLUDED.mtls_cert_ref,
-                       mtls_key_ref                = EXCLUDED.mtls_key_ref,
-                       ca_bundle_ref               = EXCLUDED.ca_bundle_ref,
-                       pinned_cert_sha256          = EXCLUDED.pinned_cert_sha256,
-                       updated_at                  = NOW()"#,
-            )
-            .bind(id)
-            .bind(repository_id)
-            .bind(&path_prefix)
-            .bind(&upstream_url)
-            .bind(upstream_name_prefix.as_deref())
-            .bind(auth_db)
-            .bind(secret_ref_json)
-            .bind(&digest_vec)
-            .bind(insecure)
-            .bind(trust_publish_time)
-            .bind(mtls_cert_ref_json)
-            .bind(mtls_key_ref_json)
-            .bind(ca_bundle_ref_json)
-            .bind(pinned_cert_sha256.as_deref())
-            .execute(&self.pool)
-            .await
-            .map_err(|e| {
-                map_sqlx_error(
-                    &e,
-                    "RepositoryUpstreamMapping",
-                    &format!("{repository_id}/{path_prefix}"),
-                )
-            })?;
-            Ok(())
-        })
+/// INSERT-or-UPDATE one `managed_by = 'gitops'` mapping row on the
+/// caller's executor, keyed on the `(repository_id, path_prefix)`
+/// UNIQUE identity.
+///
+/// The only writer of this statement. It runs inside the
+/// authority-lifecycle transaction that also appends the attesting
+/// `RepositoryUpstreamMappingChanged` event
+/// (`crate::authority_lifecycle::PgAuthorityLifecycle`): a mapping
+/// names the upstream a proxy repository trusts, with its credential
+/// reference and TLS material, so the row and its audit event must not
+/// be able to land separately.
+///
+/// Generic over the executor for the same reason as
+/// [`crate::oidc_issuer_repo::upsert_in_tx`] — a single statement, so
+/// `&mut PgConnection` would force an `acquire()` on a caller that has
+/// a pool in hand.
+///
+/// The `(managed_by = GitOps ↔ digest = Some(_))` precondition is
+/// checked here rather than before the transaction opens: unlike the
+/// grant reconcile there is no prepared form to validate up front, and
+/// a refusal mid-transaction rolls the whole commit back, which is the
+/// same observable outcome (no row written, no event appended).
+pub(crate) async fn save_managed_in_tx<'e, E>(
+    exec: E,
+    mapping: &RepositoryUpstreamMapping,
+) -> DomainResult<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    // Adapters are the last line of defence against a caller widening
+    // the (managed_by=GitOps ↔ digest=Some(_)) pairing.
+    if mapping.managed_by != ManagedBy::GitOps {
+        return Err(DomainError::Invariant(format!(
+            "a managed upstream mapping must carry managed_by=GitOps, got {}",
+            mapping.managed_by
+        )));
     }
+    let Some(digest) = mapping.managed_by_digest else {
+        return Err(DomainError::Invariant(
+            "a managed upstream mapping must carry managed_by_digest".into(),
+        ));
+    };
 
-    fn delete_managed_by_id(&self, id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
-        Box::pin(async move {
-            tracing::debug!(
-                entity = "RepositoryUpstreamMapping",
-                %id,
-                "delete_managed_by_id"
-            );
-            // The `WHERE managed_by = 'gitops'` clause is the
-            // defence-in-depth: the diff layer never schedules a delete
-            // on a `local` row, but the port enforces the invariant if
-            // out-of-band SQL leaves a row in unexpected state.
-            sqlx::query(
-                r#"DELETE FROM repository_upstream_mappings
-                    WHERE id = $1 AND managed_by = 'gitops'"#,
-            )
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| map_sqlx_error(&e, "RepositoryUpstreamMapping", &id.to_string()))?;
-            Ok(())
-        })
-    }
+    let secret_ref_json = secret_ref_to_json(mapping.secret_ref.as_ref());
+    let mtls_cert_ref_json = secret_ref_to_json(mapping.mtls_cert_ref.as_ref());
+    let mtls_key_ref_json = secret_ref_to_json(mapping.mtls_key_ref.as_ref());
+    let ca_bundle_ref_json = secret_ref_to_json(mapping.ca_bundle_ref.as_ref());
+
+    tracing::debug!(
+        entity = "RepositoryUpstreamMapping",
+        repository_id = %mapping.repository_id,
+        path_prefix = %mapping.path_prefix,
+        "save_managed_in_tx"
+    );
+    sqlx::query(
+        r#"INSERT INTO repository_upstream_mappings (
+               id, repository_id, path_prefix, upstream_url,
+               upstream_name_prefix,
+               upstream_auth_type, secret_ref,
+               managed_by, managed_by_digest,
+               insecure_upstream_url, trust_upstream_publish_time,
+               mtls_cert_ref, mtls_key_ref, ca_bundle_ref, pinned_cert_sha256,
+               allowed_realm_hosts
+           ) VALUES (
+               $1, $2, $3, $4, $5, $6, $7, 'gitops', $8, $9, $10,
+               $11, $12, $13, $14, $15
+           )
+           ON CONFLICT (repository_id, path_prefix) DO UPDATE SET
+               upstream_url                = EXCLUDED.upstream_url,
+               upstream_name_prefix        = EXCLUDED.upstream_name_prefix,
+               upstream_auth_type          = EXCLUDED.upstream_auth_type,
+               secret_ref                  = EXCLUDED.secret_ref,
+               managed_by                  = 'gitops',
+               managed_by_digest           = EXCLUDED.managed_by_digest,
+               insecure_upstream_url       = EXCLUDED.insecure_upstream_url,
+               trust_upstream_publish_time = EXCLUDED.trust_upstream_publish_time,
+               mtls_cert_ref               = EXCLUDED.mtls_cert_ref,
+               mtls_key_ref                = EXCLUDED.mtls_key_ref,
+               ca_bundle_ref               = EXCLUDED.ca_bundle_ref,
+               pinned_cert_sha256          = EXCLUDED.pinned_cert_sha256,
+               allowed_realm_hosts         = EXCLUDED.allowed_realm_hosts,
+               updated_at                  = NOW()"#,
+    )
+    .bind(mapping.id)
+    .bind(mapping.repository_id)
+    .bind(&mapping.path_prefix)
+    .bind(&mapping.upstream_url)
+    .bind(mapping.upstream_name_prefix.as_deref())
+    .bind(auth_to_db(&mapping.upstream_auth))
+    .bind(secret_ref_json)
+    .bind(digest.to_vec())
+    .bind(mapping.insecure_upstream_url)
+    .bind(mapping.trust_upstream_publish_time)
+    .bind(mtls_cert_ref_json)
+    .bind(mtls_key_ref_json)
+    .bind(ca_bundle_ref_json)
+    .bind(mapping.pinned_cert_sha256.as_deref())
+    .bind(mapping.allowed_realm_hosts.as_slice())
+    .execute(exec)
+    .await
+    .map_err(|e| {
+        map_sqlx_error(
+            &e,
+            "RepositoryUpstreamMapping",
+            &format!("{}/{}", mapping.repository_id, mapping.path_prefix),
+        )
+    })?;
+    Ok(())
+}
+
+/// DELETE one `managed_by = 'gitops'` mapping row by primary key on the
+/// caller's executor. Generic for the same reason as
+/// [`save_managed_in_tx`].
+///
+/// The `managed_by = 'gitops'` predicate is the defence-in-depth: the
+/// diff layer never schedules a delete on a `local` row, but the
+/// statement enforces the invariant if out-of-band SQL leaves a row in
+/// an unexpected state. Deleting an id that no longer exists is a
+/// no-op.
+pub(crate) async fn delete_managed_by_id_in_tx<'e, E>(exec: E, id: Uuid) -> DomainResult<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    tracing::debug!(
+        entity = "RepositoryUpstreamMapping",
+        %id,
+        "delete_managed_by_id"
+    );
+    sqlx::query(
+        r#"DELETE FROM repository_upstream_mappings
+            WHERE id = $1 AND managed_by = 'gitops'"#,
+    )
+    .bind(id)
+    .execute(exec)
+    .await
+    .map_err(|e| map_sqlx_error(&e, "RepositoryUpstreamMapping", &id.to_string()))?;
+    Ok(())
+}
+
+/// `SecretRef` → JSONB column value, `None` → SQL NULL.
+///
+/// `Serialize` is total for [`SecretRef`] — the codec records
+/// `{source, location}`, both infallibly serialisable — so the
+/// conversion cannot fail and the `expect` is unreachable.
+fn secret_ref_to_json(secret_ref: Option<&SecretRef>) -> Option<serde_json::Value> {
+    secret_ref.map(|s| serde_json::to_value(s).expect("SecretRef Serialize is total"))
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +664,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -734,7 +753,7 @@ mod tests {
         path_prefix: &str,
         upstream_url: &str,
         auth: UpstreamAuth,
-        secret_ref: Option<hort_domain::ports::secret_port::SecretRef>,
+        secret_ref: Option<SecretRef>,
     ) -> RepositoryUpstreamMapping {
         let now = Utc::now();
         RepositoryUpstreamMapping {
@@ -753,6 +772,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -760,7 +780,7 @@ mod tests {
 
     /// Test fixture for the gitops-write path. Mirrors `make_mapping` but
     /// sets `managed_by = GitOps` + a deterministic 32-byte digest so
-    /// `save_managed`'s preconditions are satisfied.
+    /// [`save_managed_in_tx`]'s preconditions are satisfied.
     fn make_managed_mapping(
         repo: Uuid,
         path_prefix: &str,
@@ -785,6 +805,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -1120,10 +1141,18 @@ mod tests {
     // managed-write surface
     // -------------------------------------------------------------------
 
-    /// `save_managed` writes a row with managed_by=gitops + digest set;
-    /// `list_managed_by_gitops` returns it. Re-issuing `save_managed`
+    /// [`save_managed_in_tx`] writes a row with managed_by=gitops +
+    /// digest set; `list_managed_by_gitops` returns it. Re-issuing it
     /// with the same `(repository_id, path_prefix)` updates in place
-    /// without churning the row id.
+    /// without churning the row id — the property
+    /// `apply_upstream_mappings` relies on when it resolves a mapping's
+    /// audit `mapping_id` from the row at that identity.
+    ///
+    /// The transaction the production caller wraps these statements in
+    /// — together with the attesting audit event — is
+    /// `PgAuthorityLifecycle::commit_upstream_mappings`, pinned by
+    /// `tests/authority_audit_atomicity.rs`. What this test pins is the
+    /// statements themselves, so it passes the pool as the executor.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn save_managed_round_trip_then_list_filters_to_gitops() {
@@ -1141,7 +1170,9 @@ mod tests {
             [0xAB; 32],
         );
         let mapping_id = mapping.id;
-        adapter.save_managed(&mapping).await.expect("save_managed");
+        save_managed_in_tx(&pool, &mapping)
+            .await
+            .expect("save_managed");
 
         let listed = adapter
             .list_managed_by_gitops()
@@ -1162,8 +1193,7 @@ mod tests {
         updated.id = Uuid::new_v4(); // adapter must ignore the supplied id on update
         updated.upstream_url = "https://mirror.example.com".into();
         updated.managed_by_digest = Some([0xCD; 32]);
-        adapter
-            .save_managed(&updated)
+        save_managed_in_tx(&pool, &updated)
             .await
             .expect("re-save_managed");
 
@@ -1179,8 +1209,9 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 
-    /// `delete_managed_by_id` removes a gitops row; calling it on an
-    /// id that doesn't exist or that is `local` is a no-op (defensive).
+    /// [`delete_managed_by_id_in_tx`] removes a gitops row; calling it
+    /// on an id that doesn't exist or that is `local` is a no-op
+    /// (defensive).
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn delete_managed_by_id_only_removes_gitops_rows() {
@@ -1190,7 +1221,8 @@ mod tests {
         let repo = seed_repo(&pool).await;
         let adapter = PgRepositoryUpstreamMappingRepo::new(pool.clone());
 
-        // Seed a managed row via save_managed and a local row via upsert.
+        // Seed a managed row via the gitops statement and a local row
+        // via the non-gitops `upsert`.
         let managed = make_managed_mapping(
             repo,
             "ghcr/",
@@ -1199,7 +1231,7 @@ mod tests {
             [0x42; 32],
         );
         let managed_id = managed.id;
-        adapter.save_managed(&managed).await.unwrap();
+        save_managed_in_tx(&pool, &managed).await.unwrap();
 
         let local = make_mapping(
             repo,
@@ -1211,30 +1243,35 @@ mod tests {
         adapter.upsert(local).await.unwrap();
 
         // Deleting the managed row removes it.
-        adapter.delete_managed_by_id(managed_id).await.unwrap();
+        delete_managed_by_id_in_tx(&pool, managed_id).await.unwrap();
         let listed = adapter.list_managed_by_gitops().await.unwrap();
         assert!(listed.iter().all(|m| m.id != managed_id));
 
         // Deleting by the local row's id is a no-op (the WHERE clause
         // filters on managed_by='gitops'). The local row still listed
         // via list_for_repository.
-        adapter.delete_managed_by_id(local_id).await.unwrap();
+        delete_managed_by_id_in_tx(&pool, local_id).await.unwrap();
         let listed_local = adapter.list_for_repository(repo).await.unwrap();
         assert!(listed_local.iter().any(|m| m.id == local_id));
 
         // Deleting an unknown id is a no-op too.
-        adapter.delete_managed_by_id(Uuid::new_v4()).await.unwrap();
+        delete_managed_by_id_in_tx(&pool, Uuid::new_v4())
+            .await
+            .unwrap();
 
         cleanup_repo(&pool, repo).await;
     }
 
-    /// `save_managed` rejects a mapping carrying `ManagedBy::Local` —
-    /// adapters do not silently widen the invariant.
+    /// [`save_managed_in_tx`] rejects a mapping carrying
+    /// `ManagedBy::Local` — adapters do not silently widen the
+    /// invariant. Both arms are refused before any SQL is issued, which
+    /// is why a `connect_lazy` pool that cannot reach a server is
+    /// enough to drive this test (and why it carries no
+    /// `#[serial(hort_pg_db)]`: it opens no connection).
     #[tokio::test]
     async fn save_managed_rejects_local_mapping() {
         let pool = PgPool::connect_lazy("postgres://localhost/nonexistent")
             .expect("connect_lazy validates only the URL");
-        let adapter = PgRepositoryUpstreamMappingRepo::new(pool);
 
         let mut mapping = make_mapping(
             Uuid::new_v4(),
@@ -1246,7 +1283,7 @@ mod tests {
         // adapter refuses it before any SQL is issued.
         assert_eq!(mapping.managed_by, ManagedBy::Local);
 
-        let err = adapter.save_managed(&mapping).await.unwrap_err();
+        let err = save_managed_in_tx(&pool, &mapping).await.unwrap_err();
         match err {
             DomainError::Invariant(msg) => {
                 assert!(msg.contains("managed_by"), "msg={msg}");
@@ -1257,7 +1294,7 @@ mod tests {
         // Same rejection if managed_by is GitOps but digest is None.
         mapping.managed_by = ManagedBy::GitOps;
         mapping.managed_by_digest = None;
-        let err = adapter.save_managed(&mapping).await.unwrap_err();
+        let err = save_managed_in_tx(&pool, &mapping).await.unwrap_err();
         assert!(matches!(err, DomainError::Invariant(_)));
     }
 
@@ -1443,9 +1480,9 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 
-    /// `save_managed` (the gitops write path) also threads the column.
-    /// Adds a digest-bearing row with the prefix set, reads back, and
-    /// asserts the value survives.
+    /// [`save_managed_in_tx`] (the gitops write path) also threads the
+    /// column. Adds a digest-bearing row with the prefix set, reads
+    /// back, and asserts the value survives.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn save_managed_round_trips_upstream_name_prefix() {
@@ -1463,7 +1500,7 @@ mod tests {
             [9u8; 32],
         );
         m.upstream_name_prefix = Some("docker.io".into());
-        adapter.save_managed(&m).await.expect("save_managed");
+        save_managed_in_tx(&pool, &m).await.expect("save_managed");
 
         let listed = adapter.list_managed_by_gitops().await.unwrap();
         let row = listed
@@ -1626,8 +1663,8 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 
-    /// `save_managed` (the gitops write path) also threads the column.
-    /// Mirrors `save_managed_round_trips_upstream_name_prefix`.
+    /// [`save_managed_in_tx`] (the gitops write path) also threads the
+    /// column. Mirrors `save_managed_round_trips_upstream_name_prefix`.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn save_managed_round_trips_trust_upstream_publish_time() {
@@ -1645,7 +1682,7 @@ mod tests {
             [0x46; 32],
         );
         m.trust_upstream_publish_time = true;
-        adapter.save_managed(&m).await.expect("save_managed");
+        save_managed_in_tx(&pool, &m).await.expect("save_managed");
 
         let listed = adapter.list_managed_by_gitops().await.unwrap();
         let row = listed
@@ -1656,6 +1693,231 @@ mod tests {
             row.trust_upstream_publish_time,
             "save_managed must persist trust_upstream_publish_time"
         );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Column-to-field threading for `allowed_realm_hosts`, DB-free.
+    /// The schema's `NOT NULL DEFAULT '{}'` means an undeclared
+    /// allowance decodes as the empty list, never as an absent value a
+    /// consumer has to interpret.
+    #[test]
+    fn row_to_mapping_preserves_allowed_realm_hosts() {
+        let mut row = synthetic_row(None);
+        row.upstream_auth_type = AUTH_BEARER_CHALLENGE.into();
+        row.allowed_realm_hosts = vec!["auth.docker.io".into(), "gitlab.example.com".into()];
+        let m = row_to_mapping(row).expect("decode must succeed");
+        assert_eq!(
+            m.allowed_realm_hosts,
+            vec![
+                "auth.docker.io".to_string(),
+                "gitlab.example.com".to_string()
+            ]
+        );
+    }
+
+    /// The domain constructor is the last line of defence on the read
+    /// path too: a row that reached the table with an allowance on an
+    /// auth type that has no realm (out-of-band SQL bypassing the
+    /// schema CHECK) surfaces as a typed `DomainError::Validation`
+    /// rather than becoming a mapping the fetch path reads an
+    /// unenforceable list off.
+    #[test]
+    fn row_to_mapping_rejects_realm_hosts_on_an_auth_type_with_no_realm() {
+        let mut row = synthetic_row(None);
+        assert_eq!(row.upstream_auth_type, AUTH_ANONYMOUS);
+        row.allowed_realm_hosts = vec!["auth.docker.io".into()];
+        let err = row_to_mapping(row).expect_err("anonymous has no realm");
+        assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+    }
+
+    /// Round-trip through the `managed_by = 'gitops'` write — the only
+    /// production writer of this column — and back out through
+    /// `list_managed_by_gitops`, which is the query the fetch path's
+    /// resolver cache is filled from.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn save_managed_round_trips_allowed_realm_hosts() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = PgRepositoryUpstreamMappingRepo::new(pool.clone());
+
+        let mut m = make_managed_mapping(
+            repo,
+            "",
+            "https://upstream.example.com",
+            UpstreamAuth::BearerChallenge,
+            [0x5a; 32],
+        );
+        m.allowed_realm_hosts = vec!["auth.docker.io".into(), "gitlab.example.com".into()];
+        save_managed_in_tx(&pool, &m).await.expect("save_managed");
+
+        let listed = adapter.list_managed_by_gitops().await.unwrap();
+        let row = listed
+            .into_iter()
+            .find(|r| r.repository_id == repo)
+            .expect("seeded gitops row must be listed");
+        assert_eq!(
+            row.allowed_realm_hosts,
+            vec![
+                "auth.docker.io".to_string(),
+                "gitlab.example.com".to_string()
+            ],
+            "save_managed must persist allowed_realm_hosts in order"
+        );
+
+        // And the allowance can be withdrawn: an empty list on a
+        // re-apply clears the column rather than leaving the previous
+        // allowance in force.
+        m.allowed_realm_hosts.clear();
+        save_managed_in_tx(&pool, &m).await.expect("re-save");
+        let listed = adapter.list_managed_by_gitops().await.unwrap();
+        let row = listed
+            .into_iter()
+            .find(|r| r.repository_id == repo)
+            .expect("row still listed");
+        assert!(
+            row.allowed_realm_hosts.is_empty(),
+            "withdrawing the allowance must clear the column"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Round-trip through the `managed_by = 'local'` upsert, the other
+    /// writer on this port.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn allowed_realm_hosts_round_trips_through_upsert() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = PgRepositoryUpstreamMappingRepo::new(pool.clone());
+
+        let mut m = make_managed_mapping(
+            repo,
+            "",
+            "https://upstream.example.com",
+            UpstreamAuth::BearerChallenge,
+            [0x5b; 32],
+        );
+        m.managed_by = ManagedBy::Local;
+        m.managed_by_digest = None;
+        m.allowed_realm_hosts = vec!["auth.docker.io".into()];
+        adapter.upsert(m).await.expect("upsert");
+
+        let listed = adapter.list_for_repository(repo).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].allowed_realm_hosts,
+            vec!["auth.docker.io".to_string()]
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// The schema CHECKs mirror the value object, so out-of-band SQL
+    /// cannot write an allowance the fetch path would read and could
+    /// never act on. Two independent guards: the per-entry hostname
+    /// form, and "only `bearer_challenge` has a realm".
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn check_constraint_rejects_malformed_allowed_realm_hosts() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        for (hosts, auth, reason) in [
+            (vec!["https://auth.docker.io"], "bearer_challenge", "scheme"),
+            (vec!["auth.docker.io:443"], "bearer_challenge", "port"),
+            (vec!["auth.docker.io/token"], "bearer_challenge", "path"),
+            (vec![""], "bearer_challenge", "empty entry"),
+            (vec!["auth..docker.io"], "bearer_challenge", "empty label"),
+            (vec![".auth.docker.io"], "bearer_challenge", "leading dot"),
+            (
+                vec!["-auth.docker.io"],
+                "bearer_challenge",
+                "leading hyphen",
+            ),
+            (
+                vec!["auth.docker.io-"],
+                "bearer_challenge",
+                "trailing hyphen",
+            ),
+            (
+                vec!["ok.example", "bad:443"],
+                "bearer_challenge",
+                "one bad entry among good ones",
+            ),
+            (
+                vec!["auth.docker.io"],
+                "anonymous",
+                "an auth type with no realm",
+            ),
+            (
+                vec!["auth.docker.io"],
+                "basic",
+                "an auth type with no realm",
+            ),
+        ] {
+            let res = sqlx::query(
+                r#"INSERT INTO repository_upstream_mappings (
+                       id, repository_id, path_prefix, upstream_url,
+                       upstream_auth_type, allowed_realm_hosts
+                   ) VALUES ($1, $2, $3, $4, $5, $6)"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo)
+            .bind(format!("ck-{}", Uuid::new_v4().simple()))
+            .bind("https://registry.example.com")
+            .bind(auth)
+            .bind(&hosts)
+            .execute(&pool)
+            .await;
+            assert!(
+                res.is_err(),
+                "DB CHECK must reject allowed_realm_hosts={hosts:?} on \
+                 auth `{auth}` ({reason})"
+            );
+        }
+
+        // Counter-assertion: the guards are not rejecting everything.
+        // A bare hostname on a `bearer_challenge` row inserts cleanly,
+        // and so does the empty list on every auth type.
+        sqlx::query(
+            r#"INSERT INTO repository_upstream_mappings (
+                   id, repository_id, path_prefix, upstream_url,
+                   upstream_auth_type, allowed_realm_hosts
+               ) VALUES ($1, $2, $3, $4, 'bearer_challenge', $5)"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo)
+        .bind(format!("ok-{}", Uuid::new_v4().simple()))
+        .bind("https://registry.example.com")
+        .bind(vec!["auth.docker.io".to_string(), "a".to_string()])
+        .execute(&pool)
+        .await
+        .expect("a bare hostname list on bearer_challenge must insert");
+        for auth in ["anonymous", "bearer_challenge"] {
+            sqlx::query(
+                r#"INSERT INTO repository_upstream_mappings (
+                       id, repository_id, path_prefix, upstream_url,
+                       upstream_auth_type, allowed_realm_hosts
+                   ) VALUES ($1, $2, $3, $4, $5, '{}')"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo)
+            .bind(format!("ok-{}", Uuid::new_v4().simple()))
+            .bind("https://registry.example.com")
+            .bind(auth)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the empty list must insert on `{auth}`: {e}"));
+        }
 
         cleanup_repo(&pool, repo).await;
     }

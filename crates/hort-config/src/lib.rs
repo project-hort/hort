@@ -41,6 +41,10 @@ pub mod scope;
 pub mod service_account;
 pub mod upstream_mapping;
 pub mod user_agent;
+/// Private on purpose: the gitops parse is an implementation detail of
+/// this crate's entry points, and a caller able to build its own options
+/// would be a second definition of what an operator's file means.
+mod yaml;
 
 pub use claim_mapping::{parse_claim_mapping, ClaimMappingSpec};
 pub use curation_rule::{parse_curation_rule, validate_curation_rule, CurationRuleSpec};

@@ -1,8 +1,13 @@
-//! # hort-app::metrics — label names, value constants, result enums
+//! # hort-app::metrics — label names, value constants, result enums, emitters
 //!
-//! This module owns the metric label names and result enum taxonomies emitted
-//! by the application (use case) layer. It intentionally contains no emission
-//! code — only canonical string constants and enums.
+//! This module owns the metric vocabulary of the application (use case)
+//! layer — the label names, the enumerable label-value constants and the
+//! result enum taxonomies — *and* the `emit_*` functions that spell it.
+//! Keeping both here is what makes each metric name a single literal in the
+//! workspace: a use case calls the emitter, so a typo cannot fork a series,
+//! and an emitter shared by several use cases (`emit_release`, ticked by the
+//! timer, curator and re-evaluation release paths) needs no `pub(crate)`
+//! reach into a sibling module.
 //!
 //! The canonical metric catalog lives at `docs/metrics-catalog.md`. Every
 //! string in this module corresponds to a row in that catalog. A new metric
@@ -207,9 +212,21 @@ pub mod values {
 
     /// Quarantine-release reason: timer-driven expiry.
     pub const REASON_TIMER: &str = "timer";
-    /// Quarantine-release reason: administrator action.
+    /// Quarantine-release reason: the curator's manual release
+    /// (`CurationUseCase::waive`) — the one manual release surface
+    /// (ADR 0007, "One authority owns the manual release").
+    pub const REASON_CURATOR: &str = "curator";
+    /// Quarantine-release reason: administrator action. **Retired — no
+    /// production path emits it.** The admin release route was removed
+    /// when the curator became the single manual-release authority; the
+    /// constant stays so the catalog and this module still recognise
+    /// the label value on series recorded before that (mirrors the
+    /// catalog's retired-value convention).
     pub const REASON_ADMIN: &str = "admin";
-    /// Quarantine-release reason: policy re-evaluation after an exclusion.
+    /// Quarantine-release reason: the scan-policy re-evaluation release
+    /// (`PolicyUseCase::commit_re_evaluation`), which appends
+    /// `ArtifactReleased { PolicyReEvaluation }` and ticks
+    /// `hort_quarantine_released_total` once per released artifact.
     pub const REASON_POLICY_RE_EVALUATION: &str = "policy_re_evaluation";
 
     /// Sentinel emitted for the `repository` label when
@@ -2101,7 +2118,7 @@ pub fn emit_policy_violations(
 // ---------------------------------------------------------------------------
 
 /// `result` label value for `hort_provenance_verify_total`. Closed
-/// taxonomy of 6. String values are normative — they appear
+/// taxonomy of 9. String values are normative — they appear
 /// verbatim in `docs/metrics-catalog.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvenanceVerifyResult {
@@ -2133,6 +2150,51 @@ pub enum ProvenanceVerifyResult {
     /// `rejected`, which is why it carries its own label rather than
     /// folding into the window-open hold.
     HeldPendingSubject,
+    /// A `Required`-mode artifact that is the **signature material of a
+    /// subject the verifier accepts** (ADR 0039 D8): the folded verdict
+    /// was `NoAttestation`, and a signature manifest binding this
+    /// artifact's digest had its bundle verified against the subject it
+    /// names, so a cascaded `ProvenanceVerified` was committed instead of
+    /// a hold. Separable from `verified` because the artifact carries no
+    /// direct verification of its own — the authority is another
+    /// artifact's signature — and separable from `held_pending_subject`
+    /// because that subject has now arrived and been checked. A
+    /// `Required` scope publishing cosign signatures shows a steady low
+    /// rate here (two rows per signature: the `{}` config blob and the
+    /// payload layer); a zero rate on such a scope means the signature
+    /// payloads are stranding instead.
+    ClearedSignatureMaterial,
+    /// A `Required`-mode artifact whose verification **could not be
+    /// carried out** — no usable trust-root key, or attestation material
+    /// that could never be fetched
+    /// ([`hort_domain::ports::provenance::IndeterminateReason`]). Held
+    /// `Quarantined` exactly as the two `held_*` values above are, and for
+    /// a stronger reason: nothing about the artifact was established, so
+    /// nothing was disproved (ADR 0039 D4). Separable from
+    /// `held_pending_signature` because the operator action is on **our**
+    /// side — fix the trust root, or let the fetch retry — not on the
+    /// publisher's.
+    ///
+    /// Reads as a hold despite the `indeterminate` in its name; the
+    /// `held_` prefix is load-bearing, because `scan_indeterminate` on the
+    /// *scan* axis is a terminal status and this is its opposite.
+    HeldIndeterminate,
+    /// The same could-not-check verdict under a mode that does **not**
+    /// require one to succeed (`VerifyIfPresent` / `Off`): no event, no
+    /// status change, and the artifact runs its normal quarantine window
+    /// and releases — exactly as an unsigned one does.
+    ///
+    /// Separable from [`Self::NoAttestation`] because that value says
+    /// *the artifact carries no signature*, and here the artifact's
+    /// signature is not what failed: our trust root had no usable key, or
+    /// the attestation material never arrived. A permissive scope whose
+    /// upstream is unreachable reported as `no_attestation` sends an
+    /// operator to the publisher's signing pipeline, which is the one
+    /// place the fault is not. Separable from
+    /// [`Self::HeldIndeterminate`] because nothing is held — the `held_`
+    /// / `allowed_` prefixes are the whole distinction, and conflating
+    /// them would make a release look like a stall.
+    AllowedIndeterminate,
     /// `NoAttestation`×`Required` with a `None` `quarantine_window_start`
     /// on a `None`-status, recently-ingested artifact (issue #90
     /// defense-in-depth): no terminal verdict is applied — the task
@@ -2153,6 +2215,9 @@ impl ProvenanceVerifyResult {
             Self::NoAttestation => "no_attestation",
             Self::HeldPendingSignature => "held_pending_signature",
             Self::HeldPendingSubject => "held_pending_subject",
+            Self::HeldIndeterminate => "held_indeterminate",
+            Self::AllowedIndeterminate => "allowed_indeterminate",
+            Self::ClearedSignatureMaterial => "cleared_signature_material",
             Self::RequeuedNoAnchor => "requeued_no_anchor",
         }
     }
@@ -2160,10 +2225,16 @@ impl ProvenanceVerifyResult {
 
 /// Wire string for the `reason` label on `hort_provenance_reject_total`,
 /// one per [`hort_domain::ports::provenance::ProvenanceRejectReason`]
-/// variant. Closed taxonomy of 5; the exhaustive match means a future
+/// variant. Closed taxonomy of 6; the exhaustive match means a future
 /// reject variant cannot ship without a catalog entry here (the compiler
 /// flags the missing arm). String values are normative — they appear
 /// verbatim in `docs/metrics-catalog.md`.
+///
+/// There is no label here for a check that could not be carried out: that
+/// is not a rejection, so it never reaches this counter. It ticks
+/// [`ProvenanceVerifyResult::HeldIndeterminate`] (under `Required`) or
+/// [`ProvenanceVerifyResult::AllowedIndeterminate`] (under
+/// `VerifyIfPresent` / `Off`) on `hort_provenance_verify_total` instead.
 pub fn provenance_reject_reason_label(
     reason: hort_domain::ports::provenance::ProvenanceRejectReason,
 ) -> &'static str {
@@ -2174,6 +2245,7 @@ pub fn provenance_reject_reason_label(
         R::RekorNotFound => "rekor_not_found",
         R::CertChainInvalid => "cert_chain_invalid",
         R::BundleMalformed => "bundle_malformed",
+        R::DigestMismatch => "digest_mismatch",
     }
 }
 
@@ -2210,6 +2282,40 @@ pub fn emit_provenance_reject(
         labels::REASON => provenance_reject_reason_label(reason),
     )
     .increment(1);
+}
+
+/// Emit `hort_provenance_unreadable_skipped_total{backend}`, incremented
+/// by the number of attestation candidates the verifier(s) **could not
+/// read** and therefore did not consider while reaching one folded
+/// verdict. Single emission site:
+/// `ProvenanceOrchestrationUseCase::verify_artifact`, directly after the
+/// fold — the one point where the count is complete and ahead of every
+/// early return, so no verdict path can drop it.
+///
+/// Unreadable material contributes nothing to a verdict: not a rejection,
+/// not a hold, not evidence of any kind. This counter is what keeps *not
+/// considered* from becoming *not noticed* — a non-zero rate means
+/// somebody is attaching bytes that are not readable attestation
+/// material, which is either a broken publisher pipeline or junk written
+/// to the referrer surface.
+///
+/// **Not a `result` value on `hort_provenance_verify_total`.** A skip is
+/// orthogonal to the verdict — it can accompany any of the four,
+/// `verified` included — so it does not belong in a taxonomy where the
+/// values are mutually exclusive. It is also a count rather than an
+/// event, hence `increment(count)` on its own series rather than a
+/// per-run tick: the number of candidates skipped is the operator's
+/// signal, and a label carrying it would be unbounded cardinality (the
+/// forbidden-label rule below).
+///
+/// Emitted only when `count > 0`, so an absent series means nothing was
+/// ever skipped rather than nothing was ever verified.
+pub fn emit_provenance_unreadable_skipped(backend: &str, count: u32) {
+    metrics::counter!(
+        "hort_provenance_unreadable_skipped_total",
+        labels::BACKEND => backend.to_string(),
+    )
+    .increment(u64::from(count));
 }
 
 /// Emit `hort_provenance_late_joiner_cleared_total{backend}` once per
@@ -2851,6 +2957,43 @@ pub fn emit_sbom_resolution(format: &str, result: SbomResolutionResult) {
     .increment(1);
 }
 
+/// Emit `hort_finding_component_relation_total{format, result}` once per
+/// finding the scan path tags with a
+/// [`ComponentRelation`](hort_domain::types::ComponentRelation).
+///
+/// **The label taxonomy is the domain enum itself**, rendered by
+/// `hort_domain::types::component_relation_label` — the same precedent as
+/// the `severity` label on `hort_scan_findings_total`. A parallel
+/// label enum here would be a second four-arm taxonomy to hold in step
+/// with the one that is actually persisted on the finding, with nothing
+/// but review to keep them equal; `SbomResolutionResult` carries its own
+/// enum because it has two arms the handler vocabulary cannot express,
+/// and this counter has none.
+///
+/// **Why this counter exists.** `not_established` is the relation the
+/// scan path assigns when it could not join a finding to the artifact's
+/// BOM, and the stored finding treats it as condemning. That default is
+/// only defensible while it stays rare: every production SBOM builder
+/// derives its subject from the artifact's coordinates rather than its
+/// payload, so a fresh scan should essentially never produce one. A
+/// non-zero `not_established` rate on new scans is therefore a defect in
+/// the format's SBOM builder (or in the purl spelling on one side of the
+/// join), not a resting state — and without this series nothing would
+/// say so.
+///
+/// Emitted at tagging time, so it ticks once per **producer** finding —
+/// unlike `hort_scan_findings_total`, which ticks after the
+/// cross-backend dedup. That is deliberate: a tagging decision is what
+/// is being counted, and the one a merge discards was still made.
+pub fn emit_component_relation(format: &str, relation: hort_domain::types::ComponentRelation) {
+    metrics::counter!(
+        "hort_finding_component_relation_total",
+        labels::FORMAT => format.to_string(),
+        labels::RESULT => hort_domain::types::component_relation_label(relation),
+    )
+    .increment(1);
+}
+
 /// Add `count` to `hort_sbom_components_skipped_total{format}` — the
 /// dependencies a resolved closure walked through but could not emit,
 /// for having no registry coordinates (path- and git-sourced entries).
@@ -2983,6 +3126,15 @@ pub fn register_scan_metrics() {
          payload_unavailable / not_applicable)"
     );
     let _ = counter!("hort_sbom_resolution_total");
+
+    describe_counter!(
+        "hort_finding_component_relation_total",
+        Unit::Count,
+        "findings tagged by the scan path, by `format` and how the component the \
+         finding names relates to the artifact (`result`: subject / contained / \
+         not_contained / not_established)"
+    );
+    let _ = counter!("hort_finding_component_relation_total");
 
     describe_counter!(
         "hort_sbom_components_skipped_total",
@@ -3241,6 +3393,36 @@ pub fn emit_curation_decision(
         labels::DECISION => decision.as_str(),
         labels::REPOSITORY => repo_label.to_owned(),
         labels::RESULT => result.as_str(),
+    )
+    .increment(1);
+}
+
+// ---------------------------------------------------------------------------
+// Quarantine release counter
+// ---------------------------------------------------------------------------
+
+/// Emit `hort_quarantine_released_total` with the given reason.
+///
+/// The counter is about releases, not about any one use case, so the
+/// three authorities that release an artifact share this emitter: the
+/// timer paths in `QuarantineUseCase` tick it with
+/// [`values::REASON_TIMER`], the one manual release
+/// (`CurationUseCase::waive`) with [`values::REASON_CURATOR`], and the
+/// scan-policy re-evaluation release
+/// (`PolicyUseCase::commit_re_evaluation`) with
+/// [`values::REASON_POLICY_RE_EVALUATION`]. One emitter, one
+/// metric-name literal — a second
+/// `metrics::counter!("hort_quarantine_released_total", …)` spelled at
+/// a call site is how a typo becomes a silently separate time series.
+///
+/// Every caller ticks **after** its append succeeds and **per released
+/// artifact**: a sweep that releases seven artifacts ticks seven times,
+/// and an attempt whose append lost its optimistic-concurrency race
+/// released nothing and ticks nothing.
+pub fn emit_release(reason: &'static str) {
+    metrics::counter!(
+        "hort_quarantine_released_total",
+        labels::REASON => reason,
     )
     .increment(1);
 }
@@ -4059,12 +4241,21 @@ pub fn emit_retention_expired(policy_id: &str, reason: &'static str) {
 /// `result`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionPurgedResult {
-    /// Cross-`kind` refcount reached `0` and the CAS blob was deleted
-    /// (or confirmed already-absent — idempotent by design).
+    /// Nothing claimed the hash under the blob lock and the CAS blob
+    /// was deleted (or confirmed already-absent — idempotent by
+    /// design).
     Success,
-    /// A still-live reference (promoted ref / `oci_subject` row) keeps
-    /// the blob alive; only this artifact's reference was removed
+    /// A claim on the hash held under the lock, so the blob is alive;
+    /// only this artifact's reference was removed
     /// (`refs_remaining > 0`). The blob was deliberately NOT deleted.
+    ///
+    /// Covers both kinds of claim: a still-live `content_references`
+    /// row (promoted ref / `oci_subject` row), and — when there is no
+    /// such row — a GC-protected artifact holding the hash without
+    /// one, which the refcount structurally cannot show. They share
+    /// this one `result` value rather than splitting it, because
+    /// raising `result_arity` buys a distinction no alert acts on; the
+    /// `tracing` line at the decision names which claim held.
     BlobKept,
     /// `StoragePort::delete` failed transiently for a refcount-0 blob.
     /// The `ArtifactExpired` decision is NOT lost (no `ArtifactPurged`
@@ -4136,7 +4327,13 @@ pub fn emit_retention_purged(result: RetentionPurgedResult) {
 pub enum StreamsArchivedResult {
     /// The stream was sealed via `EventStore::archive_stream`
     /// (`StreamRetentionMode::Archive`) — the seal chokepoint emitted the
-    /// `StreamSealed` tombstone and moved the stream to cold storage.
+    /// `StreamSealed` tombstone and removed the live rows, carrying the
+    /// archive target no further than a `tracing` field. **Never emitted
+    /// by a shipped deployment:** the cold-storage write is deferred
+    /// post-v1, so `HORT_RETENTION_STREAM_MODE=archive` is refused at
+    /// config parsing and the `Archive` mode is unreachable. The label
+    /// value stays in the catalog as the one this seal mode will emit
+    /// once a cold-storage writer backs it.
     Archived,
     /// The stream was sealed via `EventStore::delete_stream`
     /// (`StreamRetentionMode::Delete`) — the seal chokepoint emitted the
@@ -4378,6 +4575,11 @@ mod tests {
     #[test]
     fn value_reason_timer_is_timer() {
         assert_eq!(values::REASON_TIMER, "timer");
+    }
+
+    #[test]
+    fn value_reason_curator_is_curator() {
+        assert_eq!(values::REASON_CURATOR, "curator");
     }
 
     #[test]
@@ -7114,6 +7316,7 @@ mod tests {
             "hort_advisory_query_total",
             "hort_sbom_extraction_total",
             "hort_sbom_resolution_total",
+            "hort_finding_component_relation_total",
             "hort_sbom_components_skipped_total",
             "hort_artifact_became_vulnerable_total",
             "hort_scan_record_outcome_failures_total",

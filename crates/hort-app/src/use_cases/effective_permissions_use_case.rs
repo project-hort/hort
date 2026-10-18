@@ -289,10 +289,6 @@ mod tests {
         fn list_managed_by_gitops(&self) -> BoxFuture<'_, DomainResult<Vec<PermissionGrant>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
-
-        fn save_managed(&self, _items: &[PermissionGrant]) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
     }
 
     fn user(id: Uuid, is_admin: bool) -> User {

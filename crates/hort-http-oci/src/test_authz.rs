@@ -1,9 +1,11 @@
-//! Test-only shared authz harness for the quarantine hold-exemption
-//! suites (`manifests` + `blobs`): RBAC-enabled `AppContext` builders
-//! over an explicit grant set, and the capability-token principal shape
-//! the `/v2/auth` consume path synthesizes. Extracted so the two
-//! mirrored test modules share one implementation instead of
-//! byte-identical copies.
+//! Test-only shared harness for the quarantine hold suites
+//! (`manifests` + `blobs` + `manifests_write`): RBAC-enabled
+//! `AppContext` builders over an explicit grant set, the
+//! capability-token principal shape the `/v2/auth` consume path
+//! synthesizes, and the `provenance_mode: Required` policy seed those
+//! suites need before a held row hydrates as an indefinite hold.
+//! Extracted so the mirrored test modules share one implementation
+//! instead of byte-identical copies.
 
 use std::sync::Arc;
 
@@ -16,12 +18,17 @@ use hort_app::rbac::RbacEvaluator;
 use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
 use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
 use hort_app::use_cases::test_support::{
-    MockIdentityProvider, MockRepositoryRepository, MockUserRepository,
+    MockIdentityProvider, MockPolicyProjectionRepository, MockRepositoryRepository,
+    MockUserRepository,
 };
 use hort_domain::entities::api_token::TokenCap;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+use hort_domain::entities::scan_policy::{
+    NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+};
+use hort_domain::events::PolicyScope;
 use hort_domain::ports::identity_provider::IdentityProvider;
 use hort_domain::ports::user_repository::UserRepository;
 use hort_http_core::context::{AppContext, AuthContext};
@@ -250,5 +257,96 @@ pub(crate) fn pull_scoped_cap_principal(uid: Uuid) -> CallerPrincipal {
             permissions: vec![Permission::Read],
             repository_ids: None,
         }),
+    }
+}
+
+/// Seed a repository-scoped `provenance_mode: Required` scan policy with
+/// an explicit observation window.
+///
+/// The fixture half of the hold suites that `rbac_grant_ctx` above is the
+/// authz half of: `ArtifactUseCase::hydrate_quarantine_deadline` resolves
+/// `provenance_mode` off the matched policy, so a quarantined row only
+/// hydrates as an **indefinite** hold (no self-resolving deadline, ADR
+/// 0039 D4/D5) when a `Required` policy is in play and the row's window
+/// anchor has already elapsed. Shared by the manifest read suite and the
+/// manifest-PUT reference-resolution suite so the two cannot drift into
+/// seeding materially different policies while claiming the same state.
+///
+/// Repository-scoped on purpose: it shadows the mock harness's permissive
+/// global seed by `resolve_active_policy_for_repo` precedence, so the
+/// global stays in place for every other test in the calling module.
+pub(crate) fn seed_required_provenance_policy(
+    projections: &MockPolicyProjectionRepository,
+    repo_id: Uuid,
+    quarantine_duration_secs: i64,
+) {
+    let now = Utc::now();
+    projections.insert(ScanPolicyProjection {
+        policy_id: Uuid::new_v4(),
+        name: "required-provenance".to_string(),
+        scope: PolicyScope::Repository(repo_id),
+        severity_threshold: SeverityThreshold::Critical,
+        quarantine_duration_secs,
+        require_approval: false,
+        provenance_mode: ProvenanceMode::Required,
+        provenance_backends: vec!["cosign".to_string()],
+        provenance_identities: Vec::new(),
+        max_artifact_age_secs: None,
+        license_policy: serde_json::Value::Null,
+        archived: false,
+        scan_backends: vec!["trivy".to_string()],
+        rescan_interval_hours: 24,
+        negligible_action: NegligibleAction::Ignore,
+        enforcement: ScanEnforcement::Reject,
+        stream_version: 0,
+        created_at: now,
+        updated_at: now,
+    });
+}
+
+/// Seed a repository-scoped **quarantining** scan policy with an explicit
+/// observation window and `provenance_mode: Off` — the plain timed hold,
+/// as opposed to [`seed_required_provenance_policy`]'s indefinite one.
+///
+/// Needed because the harness's pre-seeded permissive **global** policy
+/// carries `quarantine_duration_secs = 0`: once an `ArtifactUseCase` has
+/// the policy projections wired (which every `rbac_grant_ctx`-built
+/// context now does, as does
+/// `hort_http_core::test_support::with_provenance_hold_hydration`), a held
+/// row's computed deadline collapses onto its anchor and
+/// `check_quarantine`'s past-deadline clamp answers `Retry-After: 1`. A
+/// test whose subject is the advertised window therefore has to seed the
+/// window it means to assert; the resolver's `repo_scoped.or(global)`
+/// precedence (`resolve_active_policy_for_repo`) makes this shadow the
+/// global for this repository only, leaving every other test in the
+/// calling module on the permissive default.
+///
+/// Returns the projection rather than inserting it, so a caller holding
+/// several repositories in one test can seed per repository.
+pub(crate) fn quarantining_policy_with_window(
+    repo_id: Uuid,
+    window_secs: i64,
+) -> ScanPolicyProjection {
+    let now = Utc::now();
+    ScanPolicyProjection {
+        policy_id: Uuid::new_v4(),
+        name: format!("quarantining-{window_secs}s-{repo_id}"),
+        scope: PolicyScope::Repository(repo_id),
+        severity_threshold: SeverityThreshold::Critical,
+        quarantine_duration_secs: window_secs,
+        require_approval: false,
+        provenance_mode: ProvenanceMode::Off,
+        provenance_backends: Vec::new(),
+        provenance_identities: Vec::new(),
+        max_artifact_age_secs: None,
+        license_policy: serde_json::Value::Null,
+        archived: false,
+        scan_backends: vec!["trivy".to_string()],
+        rescan_interval_hours: 24,
+        negligible_action: NegligibleAction::Ignore,
+        enforcement: ScanEnforcement::Reject,
+        stream_version: 0,
+        created_at: now,
+        updated_at: now,
     }
 }

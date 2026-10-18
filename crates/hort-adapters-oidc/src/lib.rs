@@ -678,13 +678,15 @@ impl OidcProvider {
 
         // Bind the discovery-supplied `jwks_uri` to the issuer's own host
         // (same-host binding) BEFORE the fetch. Additive: the TLS pin +
-        // redirect cap on `self.http` (built by
-        // `internal::build_http_client`) are unchanged. A rejection
-        // surfaces as the SAME error + metric as any other JWKS-fetch
-        // failure on this path (`IdpUnavailable` / `FetchFailed`); no
-        // new wire error or metric variant. The routability leg was
-        // dropped post-E2E (it rejected the internal-IdP case); see
-        // `internal::check_jwks_uri_bound`.
+        // the same-host redirect policy on `self.http` (built by
+        // `internal::build_http_client`) are unchanged. This check owns
+        // the DECLARED url; `internal::same_host_redirect_policy` owns
+        // every hop the fetch then takes — neither reaches the other's
+        // half. A rejection surfaces as the SAME error + metric as any
+        // other JWKS-fetch failure on this path (`IdpUnavailable` /
+        // `FetchFailed`); no new wire error or metric variant. The
+        // routability leg was dropped post-E2E (it rejected the
+        // internal-IdP case); see `internal::check_jwks_uri_bound`.
         if let Err(e) = internal::check_jwks_uri_bound(&self.issuer_url, &discovery.jwks_uri) {
             emit_jwks_refresh(USER_LOGIN_ISSUER, JwksRefreshResult::FetchFailed);
             warn!(
@@ -1521,7 +1523,11 @@ FtBmFfStik03XAfEPVCRWBMc
         fn delete_stream(
             &self,
             _stream_id: StreamId,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<hort_domain::ports::event_store::SealOutcome>,
+        > {
             unimplemented!("CapturingEventStore::delete_stream — not on this test path")
         }
 
@@ -1529,7 +1535,11 @@ FtBmFfStik03XAfEPVCRWBMc
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<hort_domain::ports::event_store::SealOutcome>,
+        > {
             unimplemented!("CapturingEventStore::archive_stream — not on this test path")
         }
     }
@@ -3399,18 +3409,36 @@ FtBmFfStik03XAfEPVCRWBMc
         );
     }
 
-    // -- Redirect-cap hardening tests ----------------------------------------
+    // -- Redirect hardening tests --------------------------------------------
     //
-    // Redirect-cap regression for the OIDC reqwest client. The adapter
-    // must cap JWKS-fetch redirect chains at 3 hops. The connect-time DNS
-    // guard was considered but reverted — operator-pinned IdP URL has no
-    // SSRF surface; redirect cap + timeout remain as the defense-in-depth.
+    // Two properties on the OIDC fetch client, both layered in
+    // `internal::build_http_client` via `internal::same_host_redirect_policy`:
     //
-    // The test asserts `OidcValidationError::IdpUnavailable`. Any
-    // transport-level failure (redirect-cap exceeded, connect error, TLS
-    // failure) is classified as `IdpUnavailable` — the wire-level outcome
-    // is 401 and the auth metric records an IdP-outage, distinct from a
-    // forged-signature credential-stuffing campaign.
+    //   1. every redirect hop stays on the host of the URL the fetch was
+    //      asked for — discovery as well as JWKS, since a discovery
+    //      document fetched from a foreign host is an attacker-authored
+    //      description of the issuer; and
+    //   2. the chain gives up after `internal::HTTP_MAX_REDIRECTS` (3) hops.
+    //
+    // The operator pins the IdP URL, so the *first* request of a fetch has
+    // no SSRF surface — but a redirect target is not operator-pinned, and
+    // that is the half this test block's earlier rationale missed. A `302`
+    // from the issuer's own host used to move the fetch to any host at all
+    // within the cap, and the keys that decide every token's validity were
+    // read from there; the pre-fetch `jwks_uri` binding cannot see a
+    // redirect and a hop cap does not know about hosts.
+    //
+    // The connect-time DNS guard stays reverted: the canonical deployment
+    // runs the IdP internally, so an address-based control rejects the
+    // operator's own issuer (see `internal::check_jwks_uri_bound`'s
+    // `# Why no routability leg`). A hop that stays on the issuer's host is
+    // exactly as internal as the issuer.
+    //
+    // Every refusal below asserts `OidcValidationError::IdpUnavailable`:
+    // any transport-level outcome (off-host hop, redirect-cap exceeded,
+    // connect error, TLS failure) is classified as an IdP outage — the
+    // wire-level outcome is 401 and the auth metric records an IdP-outage,
+    // distinct from a forged-signature credential-stuffing campaign.
 
     /// Redirect-cap regression: the JWKS fetch must give up after 3 hops.
     /// We chain 5 redirects and assert the fetch fails without ever
@@ -3474,5 +3502,306 @@ FtBmFfStik03XAfEPVCRWBMc
             "redirect-cap exceeded must surface as IdpUnavailable \
              (transport failure — not a forged-signature signal)"
         );
+    }
+
+    // -- Per-hop host binding ------------------------------------------------
+    //
+    // The "foreign host" in these tests is a wiremock bound to `127.0.0.2`
+    // while the issuer's own server is on `127.0.0.1`. Both are the same
+    // loopback interface, so the foreign target is genuinely LIVE and
+    // reachable — which is the point: the only thing that stops a hop to it
+    // is the host literal in the `Location` header, and that literal is what
+    // an attacker controls. Each foreign mock carries `.expect(0)`, so
+    // "never reached" is asserted at the target rather than inferred from an
+    // error that an unreachable address would produce just as well.
+
+    use internal::{host_of, start_server_on_foreign_loopback_host};
+
+    #[tokio::test]
+    async fn jwks_fetch_refuses_a_redirect_off_the_requested_host() {
+        let foreign = start_server_on_foreign_loopback_host().await;
+        // A usable JWKS, so that following the hop would SUCCEED. The
+        // refusal is therefore not an accident of the target being broken.
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body_for(DEFAULT_KID, TEST_N)),
+            )
+            .expect(0)
+            .mount(&foreign)
+            .await;
+
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        assert_ne!(
+            host_of(&issuer),
+            host_of(&foreign.uri()),
+            "the two mock servers must sit on different host literals"
+        );
+
+        // `jwks_uri` is on the issuer's own host, so the pre-fetch binding
+        // in `internal::check_jwks_uri_bound` passes — this test is about
+        // what happens AFTER it, which is the gap the hop binding closes.
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/jwks", foreign.uri()).as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = default_provider(&issuer);
+        let claims = TestClaims::defaults(&issuer, "hort-server");
+        let token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+
+        let err = provider
+            .validate_token_impl(&token)
+            .await
+            .expect_err("a jwks hop off the requested host must be refused");
+        assert_eq!(
+            err,
+            OidcValidationError::IdpUnavailable,
+            "an off-host jwks hop is a fetch failure, not a forged signature"
+        );
+        // The assertion that matters: the foreign JWKS was never read.
+        foreign.verify().await;
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn discovery_fetch_refuses_a_redirect_off_the_requested_host() {
+        let foreign = start_server_on_foreign_loopback_host().await;
+        // A complete, attacker-authored description of the issuer: if the
+        // hop were followed, THIS is what would declare `jwks_uri` — which
+        // is why discovery is in scope for the hop binding, not just JWKS.
+        let foreign_base = foreign.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": foreign_base,
+                "jwks_uri": format!("{foreign_base}/jwks"),
+            })))
+            .expect(0)
+            .mount(&foreign)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body_for(DEFAULT_KID, TEST_N)),
+            )
+            .expect(0)
+            .mount(&foreign)
+            .await;
+
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        assert_ne!(
+            host_of(&issuer),
+            host_of(&foreign_base),
+            "the two mock servers must sit on different host literals"
+        );
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "Location",
+                format!("{foreign_base}/.well-known/openid-configuration").as_str(),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = default_provider(&issuer);
+        let claims = TestClaims::defaults(&issuer, "hort-server");
+        let token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+
+        let err = provider
+            .validate_token_impl(&token)
+            .await
+            .expect_err("a discovery hop off the requested host must be refused");
+        assert_eq!(
+            err,
+            OidcValidationError::IdpUnavailable,
+            "an off-host discovery hop is a fetch failure, not a forged signature"
+        );
+        foreign.verify().await;
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn jwks_fetch_follows_a_same_host_redirect_to_another_path() {
+        // Availability half of the control: an IdP that legitimately
+        // redirects its own `/jwks` to another path of its own must keep
+        // working.
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{issuer}/keys/live").as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/keys/live"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body_for(DEFAULT_KID, TEST_N)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = default_provider(&issuer);
+        let claims = TestClaims::defaults(&issuer, "hort-server");
+        let token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+
+        let out = provider
+            .validate_token_impl(&token)
+            .await
+            .expect("a same-host redirect must still be followed");
+        assert_eq!(out.subject, "subject-abc");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn jwks_fetch_follows_a_same_host_redirect_to_another_port() {
+        // The predicate is host-only, matching `check_jwks_uri_bound`'s
+        // own port tolerance: a split-port IdP (discovery on one listener,
+        // keys on another) is a legitimate topology.
+        let keys = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body_for(DEFAULT_KID, TEST_N)),
+            )
+            .expect(1)
+            .mount(&keys)
+            .await;
+
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        assert_eq!(
+            host_of(&issuer),
+            host_of(&keys.uri()),
+            "both listeners must share the host literal for this to be the port case"
+        );
+        assert_ne!(
+            server.address().port(),
+            keys.address().port(),
+            "the hop must cross a port boundary"
+        );
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/jwks", keys.uri()).as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = default_provider(&issuer);
+        let claims = TestClaims::defaults(&issuer, "hort-server");
+        let token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+
+        let out = provider
+            .validate_token_impl(&token)
+            .await
+            .expect("a same-host, different-port redirect must still be followed");
+        assert_eq!(out.subject, "subject-abc");
+        keys.verify().await;
+        server.verify().await;
+    }
+
+    /// Companion to `jwks_uri_redirect_chain_exceeding_three_hops_is_blocked`:
+    /// both end in `IdpUnavailable`, so the ERROR cannot tell a cap breach
+    /// from a host refusal. The hop COUNTS can. Here every hop is on the
+    /// issuer's own host, so the host leg follows three of them and the cap
+    /// is what cuts the chain — `/redirect/3` is requested (proving the
+    /// chain ran three hops deep) while `/redirect/4` and `/jwks` are not.
+    /// An off-host refusal stops at the first hop instead, which is what
+    /// the `.expect(0)` foreign targets above assert.
+    #[tokio::test]
+    async fn same_host_chain_past_the_cap_is_cut_by_the_hop_cap_not_the_host_leg() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/redirect/0"),
+            })))
+            .mount(&server)
+            .await;
+
+        // Requested: /redirect/0 (the fetch itself) then three followed
+        // hops /redirect/1../redirect/3. The fourth attempt breaches the cap.
+        for i in 0..4u32 {
+            Mock::given(method("GET"))
+                .and(path(format!("/redirect/{i}")))
+                .respond_with(
+                    ResponseTemplate::new(302)
+                        .insert_header("Location", format!("{issuer}/redirect/{}", i + 1).as_str()),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/redirect/4"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{issuer}/jwks").as_str()),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body_for(DEFAULT_KID, TEST_N)),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let provider = default_provider(&issuer);
+        let claims = TestClaims::defaults(&issuer, "hort-server");
+        let token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+
+        let err = provider
+            .validate_token_impl(&token)
+            .await
+            .expect_err("a five-hop same-host chain must still be cut by the cap");
+        assert_eq!(err, OidcValidationError::IdpUnavailable);
+        server.verify().await;
     }
 }

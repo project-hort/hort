@@ -26,6 +26,12 @@
 //!                                     # mapping so a single internal
 //!                                     # plaintext mirror does not silently
 //!                                     # widen posture for other upstreams.
+//!   # allowedRealmHosts:              # hosts that may be named as the
+//!   #   - auth.docker.io              # WWW-Authenticate realm of a
+//!                                     # CREDENTIALED bearer_challenge
+//!                                     # exchange. Bare hostnames; the
+//!                                     # mapping's own origin is always
+//!                                     # allowed and is never listed.
 //! ```
 //!
 //! # Identity
@@ -38,6 +44,7 @@
 
 use std::path::Path;
 
+use hort_domain::ports::repository_upstream_mapping_repository::allowed_realm_host_reason;
 use hort_domain::ports::secret_port::SecretRef;
 use serde::{Deserialize, Serialize};
 
@@ -129,7 +136,8 @@ pub struct UpstreamMappingSpec {
     /// Reference to a SecretPort-resolved PEM-encoded mTLS client
     /// certificate the proxy adapter presents on the outbound TLS
     /// handshake. Pairs with [`Self::mtls_key_ref`]: both must be set
-    /// together or neither.
+    /// together or neither, and either requires an `https://`
+    /// [`Self::upstream_url`] — see [`validate_upstream_mapping`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtls_cert_ref: Option<SecretRef>,
     /// Reference to a SecretPort-resolved PEM-encoded mTLS client
@@ -142,11 +150,38 @@ pub struct UpstreamMappingSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_bundle_ref: Option<SecretRef>,
     /// Pinned SHA-256 thumbprint of the upstream's leaf certificate
-    /// (DER bytes), as a 64-character lowercase hex string. Validated
-    /// at value-object construction time; schema CHECK mirrors the same
-    /// regex.
+    /// (DER bytes), as a 64-character lowercase hex string. Checked by
+    /// [`validate_upstream_mapping`] (pre-write, so the apply refuses the
+    /// bundle before writing anything) and again at value-object
+    /// construction time; the schema CHECK mirrors the same regex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_cert_sha256: Option<String>,
+    /// Hosts that may be named as the `WWW-Authenticate` realm of a
+    /// **credentialed** bearer-challenge exchange, in addition to this
+    /// mapping's own origin (always allowed, never listed here).
+    /// Default empty.
+    ///
+    /// Bare hostnames only — no scheme, no port, no path. Each entry is
+    /// checked by the domain's `allowed_realm_host_reason`, the same
+    /// function the value-object constructor calls, so this validator
+    /// and the constructor cannot drift.
+    ///
+    /// The realm arrives verbatim in the upstream's response header, so
+    /// it is upstream-controlled data, and the exchange is the request
+    /// that carries `Authorization: Basic base64("oauth2:<secret>")`.
+    /// The adapter's gate applies this list **iff** [`Self::secret_ref`]
+    /// is set: an anonymous exchange has no credential to leak and keeps
+    /// the scheme + routability gates alone, which is why an empty list
+    /// is a safe default for every public-registry proxy.
+    ///
+    /// Rejected at apply time on a mapping whose `auth.type` is not
+    /// `bearer_challenge` — nothing there can ever read it
+    /// ([ADR 0015](../../docs/adr/0015-apply-time-linter-inert-fields-and-naming.md)).
+    /// **Accepted** on a `bearer_challenge` mapping with no
+    /// `secretRef`: that consumer exists and reads the list the moment
+    /// a secret is added, so the field is conditional, not inert.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_realm_hosts: Vec<String>,
 }
 
 /// `serde(skip_serializing_if)` predicate for the default-`false`
@@ -186,7 +221,7 @@ pub fn parse_upstream_mapping(
     _path: &Path,
     bytes: &[u8],
 ) -> Result<Envelope<UpstreamMappingSpec>, ParseError> {
-    let env: Envelope<UpstreamMappingSpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<UpstreamMappingSpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::UpstreamMapping {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),
@@ -250,6 +285,146 @@ fn validate_upstream_name_prefix(prefix: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Gitops-side mirror of the TLS-field invariants enforced by
+/// `RepositoryUpstreamMapping::new`
+/// (`crates/hort-domain/src/ports/repository_upstream_mapping_repository.rs`).
+/// Returns one error per violated invariant (collect-all, like the rest of
+/// this validator).
+///
+/// The rejection set is exactly the constructor's: half an mTLS pair, any
+/// TLS field on a non-`https://` upstream, and a `pinnedCertSha256` that is
+/// not 64 lowercase hex characters. A custom CA alone, a pin alone and the
+/// full https combination stay **accepted** — the constructor accepts them,
+/// and a mirror that rejected more would refuse configurations the apply
+/// would have taken. The constructor keeps enforcing all three at the
+/// value-object boundary; this row only makes the same verdict reachable
+/// before the first write.
+///
+/// `https`-ness is decided by the same `https://` prefix test the
+/// `upstreamUrl` rule uses, not by a URL parse: on the set of URLs this
+/// validator admits (one of the two prefixes — checked above) the prefix
+/// and the parsed scheme agree, and `hort-config` deliberately carries no
+/// `url` dependency.
+///
+/// Like [`validate_upstream_name_prefix`], this is a hand-maintained
+/// mirror, so the drift it can suffer is a YAML that validates clean and
+/// then fails inside the constructor — the very failure mode the mirror
+/// exists to remove. What holds the two in sync is a corpus that drives
+/// both ends from one case list:
+/// `preflight_rejects_every_tls_combination_the_constructor_rejects` and
+/// `preflight_accepts_every_tls_combination_the_constructor_accepts` in
+/// `hort-app`'s `apply_config_use_case::upstream_mappings` tests assert
+/// agreement in both directions, so a rule changed on one side alone
+/// fails them.
+fn validate_tls_material(spec: &UpstreamMappingSpec, name: &str) -> Vec<ValidationError> {
+    let kind = Kind::UpstreamMapping;
+    let mut errors = Vec::new();
+
+    // 1. The mTLS pair is all-or-nothing: no usable rustls client config
+    //    can be built from half of it.
+    if spec.mtls_cert_ref.is_some() != spec.mtls_key_ref.is_some() {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: "spec.mtlsCertRef and spec.mtlsKeyRef must be set together: supply \
+                     both PEM references for outbound mTLS, or neither."
+                .into(),
+        });
+    }
+
+    // 2. TLS material on a plaintext upstream is incoherent — a pinned
+    //    certificate is never presented and a private CA is never consulted
+    //    on a connection that performs no TLS handshake, so the operator
+    //    believes a control is in force that cannot be.
+    let any_tls_field = spec.mtls_cert_ref.is_some()
+        || spec.mtls_key_ref.is_some()
+        || spec.ca_bundle_ref.is_some()
+        || spec.pinned_cert_sha256.is_some();
+    if any_tls_field && !spec.upstream_url.starts_with("https://") {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: format!(
+                "spec carries mTLS / CA-bundle / cert-pinning material but \
+                 spec.upstreamUrl `{}` is not https — these fields require https. \
+                 Switch the upstream to https:// or drop the TLS fields.",
+                spec.upstream_url
+            ),
+        });
+    }
+
+    // 3. A pin is the raw SHA-256 of the leaf certificate's DER bytes:
+    //    exactly 64 lowercase hex characters. The schema CHECK mirrors the
+    //    same shape as defence-in-depth.
+    if let Some(pin) = spec.pinned_cert_sha256.as_deref() {
+        if pin.len() != 64 || !pin.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+            errors.push(ValidationError::Invalid {
+                kind,
+                name: name.to_string(),
+                detail: format!(
+                    "spec.pinnedCertSha256 must be exactly 64 lowercase hex characters \
+                     (SHA-256 of the leaf certificate's DER bytes); got `{pin}` ({} chars)",
+                    pin.len()
+                ),
+            });
+        }
+    }
+
+    errors
+}
+
+/// Gitops-side realm-allowlist validation. Two rules, both mirrors of
+/// `RepositoryUpstreamMapping::new`:
+///
+///  1. the list is only readable on a `bearer_challenge` mapping, so a
+///     non-empty list on any other `auth.type` is rejected rather than
+///     accepted-and-ignored (ADR 0015);
+///  2. every entry is a bare hostname.
+///
+/// Rule 2 calls the domain's own [`allowed_realm_host_reason`] rather
+/// than restating it. The sibling mirrors on this type
+/// (`validate_upstream_name_prefix`, [`validate_tls_material`]) are
+/// hand-maintained copies kept honest by an agreement corpus; the
+/// failure they exist to prevent is a YAML that validates clean and then
+/// fails inside the constructor, and sharing the function removes that
+/// surface rather than testing for it.
+///
+/// A mapping with no `secretRef` is **not** rejected. The field's
+/// consumer is the credentialed realm exchange, which comes into being
+/// the moment a secret is added to the same mapping; refusing the
+/// allowance until then would force the operator to land the credential
+/// and the allowance in two applies, with the first of them being the
+/// one that fails closed at fetch time.
+fn validate_allowed_realm_hosts(spec: &UpstreamMappingSpec, name: &str) -> Vec<ValidationError> {
+    let kind = Kind::UpstreamMapping;
+    let mut errors = Vec::new();
+    if spec.allowed_realm_hosts.is_empty() {
+        return errors;
+    }
+    if spec.auth.r#type != AUTH_BEARER_CHALLENGE {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: format!(
+                "spec.allowedRealmHosts is only read on an `auth.type: \
+                 {AUTH_BEARER_CHALLENGE}` mapping — the realm it names exists \
+                 only in that flow. Drop the field, or switch auth.type to \
+                 {AUTH_BEARER_CHALLENGE}."
+            ),
+        });
+    }
+    for host in &spec.allowed_realm_hosts {
+        if let Some(reason) = allowed_realm_host_reason(host) {
+            errors.push(ValidationError::Invalid {
+                kind,
+                name: name.to_string(),
+                detail: format!("spec.allowedRealmHosts: {reason}"),
+            });
+        }
+    }
+    errors
 }
 
 /// Per-spec validation. Returns every violation rather than first-wins.
@@ -334,6 +509,23 @@ pub fn validate_upstream_mapping(env: &Envelope<UpstreamMappingSpec>) -> Vec<Val
             });
         }
     }
+
+    // TLS-material coherence — mirrors the three TLS invariants in the
+    // domain constructor `RepositoryUpstreamMapping::new`, for the same
+    // reason `validate_upstream_name_prefix` is mirrored above: the
+    // constructor runs in the apply's third stage, *after* the repository
+    // and policy rows of the same bundle have been written, so a rejection
+    // reachable only there leaves a partial apply behind — a refused
+    // tightening next to a committed loosening. All three rules are
+    // decidable from one envelope, so per-spec validation is the earliest
+    // place the verdict exists and the only one that is provably pre-write.
+    errors.extend(validate_tls_material(&env.spec, &name));
+
+    // Realm allowlist — same pre-write reasoning as the TLS mirror
+    // above: both rules are decidable from this one envelope, so this is
+    // the earliest place the verdict exists and the only one that is
+    // provably before the first write of the bundle.
+    errors.extend(validate_allowed_realm_hosts(&env.spec, &name));
 
     let auth_type = env.spec.auth.r#type.as_str();
     if !AUTH_VARIANTS.contains(&auth_type) {
@@ -754,9 +946,9 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
         };
-        let yaml_out =
-            serde_yaml_ng::to_string(&spec).expect("default spec must serialise to YAML");
+        let yaml_out = serde_saphyr::to_string(&spec).expect("default spec must serialise to YAML");
         assert!(
             !yaml_out.contains("trustUpstreamPublishTime"),
             "default `false` must skip-serialize; got:\n{yaml_out}"
@@ -768,7 +960,7 @@ mod tests {
             ..spec
         };
         let yaml_out_true =
-            serde_yaml_ng::to_string(&spec_true).expect("opted-in spec must serialise to YAML");
+            serde_saphyr::to_string(&spec_true).expect("opted-in spec must serialise to YAML");
         assert!(
             yaml_out_true.contains("trustUpstreamPublishTime"),
             "opt-in `true` must serialise; got:\n{yaml_out_true}"
@@ -968,5 +1160,403 @@ spec:
         // Wrong kind fails at deserialize because the spec shape doesn't
         // fit. The exact variant is not pinned; what matters is rejection.
         assert!(matches!(err, ParseError::Yaml(_)));
+    }
+
+    // -- TLS material (mirror of `RepositoryUpstreamMapping::new`) ------
+    //
+    // The three invariants the domain constructor enforces, mirrored at
+    // per-spec validation so the verdict is reachable before the apply's
+    // first write. The accept cases are as load-bearing as the rejects: a
+    // mirror that rejected more than the constructor would refuse
+    // configurations the apply would have taken.
+
+    /// Half an mTLS pair (cert without key) is rejected.
+    #[test]
+    fn validate_rejects_mtls_cert_without_key() {
+        let body = "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  mtlsCertRef:
+    source: env_var
+    location: CLIENT_CERT
+";
+        let env = parse_upstream_mapping(&p(), yaml("u", body).as_bytes()).unwrap();
+        let errs = validate_upstream_mapping(&env);
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("mtlsCertRef and spec.mtlsKeyRef")),
+            "got: {errs:?}"
+        );
+    }
+
+    /// The other half of the pair (key without cert) is rejected too.
+    #[test]
+    fn validate_rejects_mtls_key_without_cert() {
+        let body = "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  mtlsKeyRef:
+    source: env_var
+    location: CLIENT_KEY
+";
+        let env = parse_upstream_mapping(&p(), yaml("u", body).as_bytes()).unwrap();
+        let errs = validate_upstream_mapping(&env);
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("mtlsCertRef and spec.mtlsKeyRef")),
+            "got: {errs:?}"
+        );
+    }
+
+    /// The complete pair on an https upstream validates clean.
+    #[test]
+    fn validate_accepts_complete_mtls_pair_on_https() {
+        let body = "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  mtlsCertRef:
+    source: env_var
+    location: CLIENT_CERT
+  mtlsKeyRef:
+    source: env_var
+    location: CLIENT_KEY
+";
+        let env = parse_upstream_mapping(&p(), yaml("u", body).as_bytes()).unwrap();
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "a complete mTLS pair on https is exactly what the field is for"
+        );
+    }
+
+    /// Every TLS field is rejected on an opted-in plaintext upstream —
+    /// one case per field, because "any TLS field" is the rule and a
+    /// single-field test would not pin the others.
+    #[test]
+    fn validate_rejects_every_tls_field_on_plaintext_upstream() {
+        let pin = "a".repeat(64);
+        let tls_blocks = [
+            "  mtlsCertRef:\n    source: env_var\n    location: CLIENT_CERT\n  \
+             mtlsKeyRef:\n    source: env_var\n    location: CLIENT_KEY\n"
+                .to_string(),
+            "  caBundleRef:\n    source: env_var\n    location: CA_PEM\n".to_string(),
+            format!("  pinnedCertSha256: {pin}\n"),
+        ];
+        for tls in tls_blocks {
+            let body = format!(
+                "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: http://x.example.com
+  insecureUpstreamUrl: true
+  auth:
+    type: anonymous
+{tls}"
+            );
+            let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+            let errs = validate_upstream_mapping(&env);
+            assert!(
+                errs.iter().any(|e| e.to_string().contains("require https")),
+                "TLS material on a plaintext upstream must be rejected; block:\n{tls}\ngot: {errs:?}"
+            );
+        }
+    }
+
+    /// A CA bundle alone, and a pin alone, are both legitimate on an
+    /// https upstream: neither needs mTLS.
+    #[test]
+    fn validate_accepts_ca_bundle_alone_and_pin_alone_on_https() {
+        let body_ca = "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  caBundleRef:
+    source: env_var
+    location: CA_PEM
+";
+        let env = parse_upstream_mapping(&p(), yaml("u", body_ca).as_bytes()).unwrap();
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "a private CA without a client cert is the common operator shape"
+        );
+
+        let pin = "0123456789abcdef".repeat(4);
+        let body_pin = format!(
+            "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  pinnedCertSha256: {pin}
+"
+        );
+        let env = parse_upstream_mapping(&p(), yaml("u", &body_pin).as_bytes()).unwrap();
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "pinning without mTLS is defence-in-depth on CA trust, not an error"
+        );
+    }
+
+    /// A pin that is not exactly 64 lowercase hex characters is rejected:
+    /// too short, too long, uppercase, and a non-hex character.
+    #[test]
+    fn validate_rejects_malformed_pin() {
+        let cases = [
+            "deadbeef",
+            &"a".repeat(65),
+            &"A".repeat(64),
+            &format!("{}z", "a".repeat(63)),
+        ];
+        for pin in cases {
+            let body = format!(
+                "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  pinnedCertSha256: {pin}
+"
+            );
+            let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+            let errs = validate_upstream_mapping(&env);
+            assert!(
+                errs.iter()
+                    .any(|e| e.to_string().contains("pinnedCertSha256")),
+                "pin `{pin}` must be rejected; got: {errs:?}"
+            );
+        }
+    }
+
+    /// The full https combination — mTLS pair + custom CA + pin — is the
+    /// documented maximal shape and must validate clean.
+    #[test]
+    fn validate_accepts_full_https_tls_combination() {
+        let pin = "0123456789abcdef".repeat(4);
+        let body = format!(
+            "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  mtlsCertRef:
+    source: env_var
+    location: CLIENT_CERT
+  mtlsKeyRef:
+    source: env_var
+    location: CLIENT_KEY
+  caBundleRef:
+    source: env_var
+    location: CA_PEM
+  pinnedCertSha256: {pin}
+"
+        );
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "the maximal https TLS combination must stay accepted"
+        );
+    }
+
+    // -- `allowedRealmHosts` -------------------------------------------
+    //
+    // The hosts that may be named as the `WWW-Authenticate` realm of a
+    // credentialed bearer-challenge exchange. Rejected on an auth type
+    // that has no realm (ADR 0015 — the consumer cannot exist there),
+    // accepted without a `secretRef` (the consumer comes into being the
+    // moment one is added), and entry-by-entry a bare hostname.
+
+    fn realm_hosts_yaml(auth_type: &str, hosts: &[&str], secret: bool) -> String {
+        let list = if hosts.is_empty() {
+            String::new()
+        } else {
+            let entries: String = hosts
+                .iter()
+                .map(|h| format!("\n    - \"{h}\""))
+                .collect::<Vec<_>>()
+                .join("");
+            format!("\n  allowedRealmHosts:{entries}")
+        };
+        let secret_ref = if secret {
+            "\n  secretRef:\n    source: env_var\n    location: UPSTREAM_PAT"
+        } else {
+            ""
+        };
+        format!(
+            "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: {auth_type}{secret_ref}{list}
+"
+        )
+    }
+
+    #[test]
+    fn validate_accepts_realm_hosts_on_a_credentialed_bearer_challenge_mapping() {
+        let body = realm_hosts_yaml("bearer_challenge", &["auth.docker.io"], true);
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes())
+            .expect("the envelope must parse");
+        assert_eq!(
+            env.spec.allowed_realm_hosts,
+            vec!["auth.docker.io".to_string()]
+        );
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "the canonical authenticated-Docker-Hub shape must validate clean"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_realm_hosts_without_a_secret_ref() {
+        // Deliberately accepted: the field's consumer is the
+        // credentialed exchange, which exists the moment a secret is
+        // added to this same mapping. Rejecting it here would force the
+        // operator to land the credential and the allowance in two
+        // applies, the first of which fails closed at fetch time.
+        let body = realm_hosts_yaml("bearer_challenge", &["auth.docker.io"], false);
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+        assert!(env.spec.secret_ref.is_none(), "the point of this test");
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "an allowance may be declared before the credential it \
+             guards; got {:?}",
+            validate_upstream_mapping(&env)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_realm_hosts_on_an_auth_type_with_no_realm() {
+        for (auth, secret) in [("anonymous", false), ("basic", true)] {
+            let mut body = realm_hosts_yaml(auth, &["auth.docker.io"], secret);
+            if auth == "basic" {
+                body = body.replace("    type: basic", "    type: basic\n    username: alice");
+            }
+            let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+            let errs = validate_upstream_mapping(&env);
+            assert!(
+                errs.iter()
+                    .any(|e| e.to_string().contains("allowedRealmHosts")
+                        && e.to_string().contains("bearer_challenge")),
+                "`{auth}` has no realm, so the field has no reachable \
+                 consumer and must be rejected rather than ignored; got \
+                 {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_scheme_a_port_a_path_or_an_empty_realm_host() {
+        for bad in [
+            "https://auth.docker.io",
+            "auth.docker.io:443",
+            "auth.docker.io/token",
+            "",
+        ] {
+            let body = realm_hosts_yaml("bearer_challenge", &[bad], true);
+            let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+            let errs = validate_upstream_mapping(&env);
+            let joined = errs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(
+                joined.contains("allowedRealmHosts"),
+                "`{bad}` must be rejected and the message must name the \
+                 field; got {joined}"
+            );
+            assert!(
+                joined.contains("bare hostnames")
+                    && joined.contains("no scheme")
+                    && joined.contains("no port")
+                    && joined.contains("no path")
+                    && joined.contains("auth.docker.io"),
+                "the message must show the accepted form, so the \
+                 rejection is the remedy; got {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_collects_every_bad_realm_host_rather_than_first_wins() {
+        let body = realm_hosts_yaml(
+            "bearer_challenge",
+            &["https://a.example", "b.example:443", "good.example"],
+            true,
+        );
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+        let errs = validate_upstream_mapping(&env);
+        assert_eq!(
+            errs.iter()
+                .filter(|e| e.to_string().contains("allowedRealmHosts"))
+                .count(),
+            2,
+            "collect-all, like the rest of this validator; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn realm_hosts_skip_serialize_when_empty() {
+        // Digest stability: an operator's existing YAML must keep
+        // producing the same canonicalised-spec digest, so the empty
+        // default must not appear on the wire. Same invariant as
+        // `insecureUpstreamUrl` / `trustUpstreamPublishTime`.
+        let body = realm_hosts_yaml("bearer_challenge", &[], false);
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+        assert!(env.spec.allowed_realm_hosts.is_empty());
+        let out = serde_saphyr::to_string(&env.spec).expect("spec serialises");
+        assert!(
+            !out.contains("allowedRealmHosts"),
+            "the empty default must skip-serialize; got:\n{out}"
+        );
+
+        // …and a non-empty list does round-trip.
+        let body = realm_hosts_yaml("bearer_challenge", &["auth.docker.io"], false);
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+        let out = serde_saphyr::to_string(&env.spec).expect("spec serialises");
+        assert!(out.contains("allowedRealmHosts"), "got:\n{out}");
+        assert!(out.contains("auth.docker.io"), "got:\n{out}");
+    }
+
+    /// The gitops validator and the value-object constructor reach the
+    /// same verdict on every case, because they call the same function.
+    /// The sibling mirrors on this type are hand-maintained copies held
+    /// together by a corpus; this asserts the stronger property that
+    /// there is only one rule to agree with.
+    #[test]
+    fn the_validator_and_the_constructor_share_one_realm_host_rule() {
+        for host in [
+            "auth.docker.io",
+            "https://auth.docker.io",
+            "auth.docker.io:443",
+            "auth.docker.io/token",
+            "",
+            "a..b",
+        ] {
+            let body = realm_hosts_yaml("bearer_challenge", &[host], true);
+            let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+            let validator_rejects = validate_upstream_mapping(&env)
+                .iter()
+                .any(|e| e.to_string().contains("allowedRealmHosts"));
+            let domain_rejects = allowed_realm_host_reason(host).is_some();
+            assert_eq!(
+                validator_rejects, domain_rejects,
+                "the two must agree on `{host}`"
+            );
+        }
     }
 }

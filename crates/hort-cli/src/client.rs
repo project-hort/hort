@@ -181,8 +181,9 @@ impl AkClient {
 
     /// POST to `path` with `body` serialised as JSON; succeed on any 2xx
     /// without attempting to deserialise the response body. Used by
-    /// endpoints that return 204 No Content (e.g.
-    /// `POST /admin/quarantine/:artifact_id/release`).
+    /// endpoints that answer with an empty body (e.g.
+    /// `POST /admin/curation/quarantine/:artifact_id/waive`, which
+    /// answers 200 with nothing in it).
     ///
     /// On non-2xx, surfaces the same error shape as
     /// [`post`](Self::post): "HTTP <status>: <body text>".
@@ -219,8 +220,41 @@ impl AkClient {
     ///
     /// On non-2xx, surfaces the same error shape as
     /// [`post_no_response`](Self::post_no_response): "HTTP <status>:
-    /// <body text>".
+    /// <body text>". That is this method's whole difference from
+    /// [`delete_capturing_failure`](Self::delete_capturing_failure),
+    /// which it delegates to.
     pub async fn delete_no_response<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        match self.delete_capturing_failure(path, body).await? {
+            None => Ok(()),
+            Some(failure) => Err(failure.into_error()),
+        }
+    }
+
+    /// DELETE `path` with `body` serialised as JSON, handing back the
+    /// server's refusal instead of flattening it into an error message.
+    ///
+    /// Three outcomes, each distinct:
+    ///
+    /// - `Ok(None)` — the server answered 2xx; there is nothing to report.
+    /// - `Ok(Some(failure))` — the server answered non-2xx, and its status
+    ///   and body text are the caller's to interpret.
+    /// - `Err(_)` — the request never reached an answer (URL, transport).
+    ///
+    /// Exists because a route can answer a refusal with data the caller's
+    /// *next* request needs — an identifier it must name to make the
+    /// retry succeed. Recovering that from the "HTTP <status>: <body
+    /// text>" string every other call surfaces would mean parsing an
+    /// error sentence, and the alternative — teaching the shared
+    /// non-2xx path one route's body shape — puts a single caller's
+    /// vocabulary on every call in the CLI. A caller that only needs
+    /// the refusal surfaced should use
+    /// [`delete_no_response`](Self::delete_no_response), which is this
+    /// method plus [`HttpFailure::into_error`].
+    pub async fn delete_capturing_failure<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<Option<HttpFailure>> {
         let url = self.base_url.join(path).context("joining URL path")?;
         // SECURITY: only the URL is traced — no headers, no body.
         tracing::debug!(method = "DELETE", url = %url, "request");
@@ -231,11 +265,10 @@ impl AkClient {
             .send()
             .await
             .context("HTTP DELETE")?;
-        let status = resp.status();
-        if status.is_success() {
-            Ok(())
+        if resp.status().is_success() {
+            Ok(None)
         } else {
-            Err(Self::response_to_error(resp).await)
+            Ok(Some(HttpFailure::from_response(resp).await))
         }
     }
 
@@ -266,13 +299,49 @@ impl AkClient {
     /// `"<no body>"` when reading the bytes fails (network blip, transcoding
     /// error). Used by both `handle_response` and `post_no_response` to keep
     /// the wire error shape consistent across all client methods.
+    ///
+    /// Reads the response through [`HttpFailure`] so that the one caller
+    /// which interprets a refusal body structurally and the generic path
+    /// here cannot drift into two different renderings of the same
+    /// response.
     async fn response_to_error(resp: reqwest::Response) -> anyhow::Error {
+        HttpFailure::from_response(resp).await.into_error()
+    }
+}
+
+/// A non-2xx response, already read: its status and its body text.
+///
+/// The body has to be consumed to be seen, so a caller cannot be handed
+/// the `reqwest::Response` and asked to decide afterwards — this is that
+/// decision point, taken once. Callers that recognise the body act on it;
+/// everything else takes [`into_error`](Self::into_error), which is the
+/// single definition of the CLI's `"HTTP <status>: <body text>"` shape.
+#[derive(Debug)]
+pub struct HttpFailure {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl HttpFailure {
+    /// Read a non-2xx response into its status and body text. Body text
+    /// falls back to `"<no body>"` when reading the bytes fails (network
+    /// blip, transcoding error).
+    async fn from_response(resp: reqwest::Response) -> Self {
         let status = resp.status();
-        let text = resp
+        let body = resp
             .text()
             .await
             .unwrap_or_else(|_| "<no body>".to_string());
-        anyhow!("HTTP {status}: {text}")
+        Self { status, body }
+    }
+
+    /// The canonical CLI error for this response: `"HTTP <status>: <body
+    /// text>"`. A caller that tried to recognise the body and did not
+    /// must end here, so what the server said reaches the operator
+    /// verbatim rather than being swallowed by a parser that missed.
+    pub fn into_error(self) -> anyhow::Error {
+        let Self { status, body } = self;
+        anyhow!("HTTP {status}: {body}")
     }
 }
 

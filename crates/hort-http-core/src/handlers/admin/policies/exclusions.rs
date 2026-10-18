@@ -28,17 +28,68 @@
 //! `Validation(policy not exist)` 400 (from the use case) that would
 //! fire if a caller URL-encoded a stale policy id.
 //!
+//! A CVE can name **several** exclusions on one policy — the rows
+//! differ only in `package_pattern` — so that resolution is one-to-many
+//! and the row's identity is its `exclusion_id`, not its CVE. With more
+//! than one match the request must say which row it means, via the
+//! optional `exclusion_id` in [`RemoveExclusionRequestDto`]; without it
+//! the handler answers `409` and lists the candidates as members of the
+//! body (`exclusion_id` + `package_pattern` each), because the caller
+//! resolves the ambiguity by repeating the request with one of those
+//! ids. Resolving it here instead — taking the first match — would end
+//! a suppression the operator did not choose to end and leave the
+//! others unreachable through this route.
+//!
+//! The body's `exclusion_id` selects **within** the path's CVE. An id
+//! that names a row under a different CVE on the same policy is a
+//! `400`: the path stays the authority on which CVE is being withdrawn,
+//! and the body never overrides it silently.
+//!
+//! ## Repository scope is refused on the way in, not on the way out
+//!
+//! A `scope` naming a repository cannot be **written**.
+//! `hort_domain::policy::SCOPE_NOT_ENFORCED` is the rationale: the
+//! finding filter never reads the scope, so such an exclusion clears
+//! its CVE for every repository the parent policy governs rather than
+//! the one it names. The refusal lives in
+//! `PolicyUseCase::add_exclusion` — the application-layer write seam
+//! every inbound writer (this handler, the gitops apply pipeline)
+//! passes through, so the rule cannot be bypassed by a future caller.
+//! Surfaces here as `400`.
+//!
+//! **Removing** such a row is not refused, by this handler or by
+//! `PolicyUseCase::remove_exclusion`. The two directions are not
+//! symmetric: creating one records an assurance nothing honours,
+//! removing it withdraws that assurance. A removal only ever stops
+//! suppressing a finding — it releases nothing, so there is no
+//! fail-closed reading under which refusing it is the safe choice. It
+//! would also be a control the neighbour lifts: the same use-case
+//! method is the gitops applier's removal path and stays open, so
+//! refusing here would leave only the operator without a declared tree
+//! stuck with a row that keeps clearing its CVE globally. What the
+//! operator does need is the removal's real reach, which the handler
+//! writes to the log (`policy_id`, `cve_id`, the stored
+//! `repository_id`, and the rationale verbatim).
+//!
+//! Only a row written before the add-side refusal shipped can carry
+//! such a scope; nothing rewrites those rows.
+//!
 //! Status-code mapping:
 //! - **POST** — `201 Created` with `{ "exclusion_id": "<uuid>" }` on
 //!   success; `400` (validation — empty reason / oversize / bad
-//!   cve_id format / policy id mis-parsed); `403` (extractor); `404`
+//!   cve_id format / policy id mis-parsed / repository-scoped request);
+//!   `403` (extractor); `404`
 //!   (policy not found — note: the use case currently emits this as
 //!   `Validation` so it would surface as 400; the handler runs a
 //!   `policy_projections.find_by_id` pre-check that promotes the
 //!   missing-policy case to 404 BEFORE the use case is touched);
 //!   `409` (event-store conflict); `500` (infrastructure)
 //! - **DELETE** — `204 No Content` on success; `400` / `403` / `404`
-//!   / `409` / `500` (same shape)
+//!   / `409` / `500` (same shape), where the `400`s also cover an
+//!   `exclusion_id` that names no row under the path's CVE, and the
+//!   `409`s also cover an unqualified request whose CVE names several
+//!   rows (body: `cve_id` + `candidates[]`). A *stored* repository
+//!   scope is not among the `400`s — see above.
 //!
 //! **`#[tracing::instrument]` deliberately WITHOUT `err`** — denial
 //! and validation outcomes are info-level events (architect rule);
@@ -57,7 +108,8 @@ use uuid::Uuid;
 
 use hort_app::error::AppError;
 use hort_app::use_cases::{AddExclusionCommand, RemoveExclusionCommand};
-use hort_domain::error::DomainError;
+use hort_domain::entities::scan_policy::ExclusionProjection;
+use hort_domain::error::{DomainError, ExclusionCandidate};
 use hort_domain::events::{Actor, ApiActor, PolicyScope};
 
 use crate::authz::CurateOrAdminPrincipal;
@@ -86,6 +138,13 @@ use super::MAX_JUSTIFICATION_BYTES;
 /// Mirrors the `scope` projection in handlers/admin/curation/exclusions.rs
 /// (`CurationExclusionEntryDto`), so the read and write surfaces are
 /// byte-symmetric.
+///
+/// The `Repository` arm stays on the wire — the read surface renders it
+/// for rows stored before the add-side refusal, and dropping the arm
+/// would turn an operator's repository-scoped request into an
+/// unexplained deserialisation failure instead of the refusal that
+/// names what is missing. Writing such a scope is refused: see
+/// [`hort_domain::policy::SCOPE_NOT_ENFORCED`].
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScopeDto {
@@ -147,6 +206,18 @@ pub struct AddExclusionResponseDto {
 pub struct RemoveExclusionRequestDto {
     #[serde(default)]
     pub reason: String,
+    /// Which exclusion to remove, when the path's CVE names more than
+    /// one of them on this policy. Optional: a CVE that names exactly
+    /// one exclusion needs no disambiguator, so every body that worked
+    /// before this field existed still works.
+    ///
+    /// It selects **within** the path's CVE and never replaces it — an
+    /// id that is not among that CVE's rows is refused rather than
+    /// obeyed, so the path stays the authority on which CVE is being
+    /// withdrawn. The value is the one `POST` returned
+    /// ([`AddExclusionResponseDto::exclusion_id`]).
+    #[serde(default)]
+    pub exclusion_id: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +305,15 @@ pub async fn post_exclusion(
 /// matching exclusion's `policy_id` lookup confirms the policy
 /// exists).
 ///
+/// A CVE that names several of the policy's exclusions is answered with
+/// a 409 carrying the candidates, unless the body's optional
+/// `exclusion_id` says which row to remove — the row's identity, not
+/// its CVE, is what the removal acts on.
+///
+/// A *stored* repository scope does not block the removal — it is
+/// logged, not refused (see the module docs for why the add side and
+/// the removal side are deliberately asymmetric).
+///
 /// See module docs for the full status-code map.
 #[tracing::instrument(skip(ctx, principal, body))]
 pub async fn delete_exclusion(
@@ -270,22 +350,102 @@ pub async fn delete_exclusion(
         ))));
     }
 
-    // Resolve CVE → exclusion_id via the projection. A missing match
-    // is 404 (no exclusion with that CVE on this policy). The
-    // projection port's contract is `list_exclusions_for_policy`
-    // returns ONLY rows for `policy_id`, so the linear scan here is
-    // bounded by the number of exclusions on the policy (typically
-    // single digits in typical deployments).
+    // Resolve the CVE to the rows that carry it. The projection port's
+    // contract is `list_exclusions_for_policy` returns ONLY rows for
+    // `policy_id`, so the linear scan here is bounded by the number of
+    // exclusions on the policy (typically single digits in typical
+    // deployments).
     let exclusions = ctx
         .policy_projections
         .list_exclusions_for_policy(policy_id)
         .await?;
-    let Some(found) = exclusions.into_iter().find(|e| e.cve_id == cve_id) else {
-        return Err(ApiError(AppError::Domain(DomainError::NotFound {
-            entity: "Exclusion",
-            id: format!("policy={policy_id} cve={cve_id}"),
-        })));
+    let matches: Vec<ExclusionProjection> = exclusions
+        .into_iter()
+        .filter(|e| e.cve_id == cve_id)
+        .collect();
+
+    // A CVE names a *set* of exclusions, not one: a policy may hold one
+    // row per `package_pattern` for the same CVE. The row's identity is
+    // its `exclusion_id`, which is what `RemoveExclusionCommand` takes
+    // and what the POST hands back — so when the CVE names several rows
+    // the request has to say which, and the handler reports the
+    // ambiguity instead of letting the projection's ordering decide. The
+    // alternative is worse than a wrong answer: picking the first match
+    // ends a suppression the operator did not choose to end AND leaves
+    // the remaining rows unreachable through this route, so a
+    // suppression outlives the decision to withdraw it.
+    let found = match (body.exclusion_id, matches.as_slice()) {
+        // No row carries that CVE on this policy. The path target does
+        // not exist, whether or not the body named a row — an optional
+        // disambiguator that only narrows within the CVE must not change
+        // the answer for a CVE that is not there.
+        (_, []) => {
+            return Err(ApiError(AppError::Domain(DomainError::NotFound {
+                entity: "Exclusion",
+                id: format!("policy={policy_id} cve={cve_id}"),
+            })));
+        }
+        // The body names the row: selection happens within the CVE the
+        // path names, so an id that belongs to another of the policy's
+        // CVEs is refused. Obeying it would make the body a second,
+        // silently-winning way to say which row dies.
+        (Some(requested), rows) => {
+            let Some(found) = rows.iter().find(|e| e.exclusion_id == requested) else {
+                return Err(ApiError(AppError::Domain(DomainError::Validation(
+                    format!(
+                        "exclusion_id {requested} is not an exclusion for {cve_id} on this policy"
+                    ),
+                ))));
+            };
+            found.clone()
+        }
+        // Exactly one row carries the CVE — nothing to disambiguate.
+        (None, [single]) => single.clone(),
+        // Several rows and nothing said which: answered, not guessed.
+        // The candidates travel as data so the caller can repeat the
+        // request naming one of them.
+        (None, rows) => {
+            return Err(ApiError(AppError::Domain(
+                DomainError::AmbiguousExclusion {
+                    cve_id,
+                    candidates: rows
+                        .iter()
+                        .map(|e| ExclusionCandidate {
+                            exclusion_id: e.exclusion_id,
+                            package_pattern: e.package_pattern.clone(),
+                        })
+                        .collect(),
+                },
+            )));
+        }
     };
+
+    // A stored repository scope is reported, not refused. Writing one is
+    // refused (`PolicyUseCase::add_exclusion`) because it records an
+    // assurance the finding filter cannot honour; removing the row is
+    // what withdraws that assurance, and a removal only ever stops
+    // suppressing a finding. Refusing it would make such a row
+    // unremovable through the API while the same use-case method keeps
+    // draining it for the gitops applier — a control the neighbour lifts,
+    // paid for only by the operator without a declared tree.
+    //
+    // The removal's reach is still not the one the row advertises: the
+    // scope never narrowed anything, so the exclusion was live for every
+    // repository the parent policy governs and the removal re-rejects
+    // artifacts across all of them, not just the one named. That is real
+    // information about what is about to happen, so it goes to the log
+    // with the same rationale every other surface states.
+    if let PolicyScope::Repository(repo_id) = &found.scope {
+        tracing::info!(
+            policy_id = %policy_id,
+            cve_id = %cve_id,
+            repository_id = %repo_id,
+            rationale = hort_domain::policy::SCOPE_NOT_ENFORCED,
+            "delete_exclusion removing an exclusion that carries a repository scope: \
+             its reach is every repository the parent policy governs, not the one the \
+             scope names",
+        );
+    }
 
     let cmd = RemoveExclusionCommand {
         policy_id,
@@ -328,12 +488,15 @@ mod tests {
     use hort_domain::entities::caller::CallerPrincipal;
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+    use hort_domain::entities::repository::RepositoryFormat;
     use hort_domain::entities::scan_policy::{
-        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
-        ScanPolicyProjection, SeverityThreshold,
+        NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
     };
+    use hort_domain::policy::filter_excluded_findings;
     use hort_domain::ports::identity_provider::IdentityProvider;
+    use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
     use hort_domain::ports::user_repository::UserRepository;
+    use hort_domain::types::{ArtifactCoords, ComponentRelation, Finding, SeverityBasis};
 
     use crate::context::AuthContext;
     use crate::test_support::{build_mock_ctx, with_auth, MockPorts};
@@ -426,6 +589,17 @@ mod tests {
     /// Seed an exclusion for the given policy → returns
     /// (exclusion_id, cve_id). Used by the DELETE tests.
     fn seed_exclusion(mocks: &MockPorts, policy_id: Uuid, cve: &str) -> (Uuid, String) {
+        seed_exclusion_with_scope(mocks, policy_id, cve, PolicyScope::Global)
+    }
+
+    /// Seed an exclusion carrying `scope`. A `Repository` scope models a
+    /// row stored before the refusal shipped — nothing writes one now.
+    fn seed_exclusion_with_scope(
+        mocks: &MockPorts,
+        policy_id: Uuid,
+        cve: &str,
+        scope: PolicyScope,
+    ) -> (Uuid, String) {
         let exclusion_id = Uuid::new_v4();
         mocks
             .policy_projections
@@ -434,12 +608,112 @@ mod tests {
                 policy_id,
                 cve_id: cve.to_string(),
                 package_pattern: None,
-                scope: PolicyScope::Global,
+                scope,
                 reason: "seeded".into(),
                 added_by_actor_id: None,
                 expires_at: None,
             });
         (exclusion_id, cve.to_string())
+    }
+
+    /// Seed an exclusion for `cve` carrying `package_pattern` — the one
+    /// field that tells two rows for the same CVE apart, and so the one
+    /// the ambiguity report has to carry. Returns its id.
+    fn seed_exclusion_with_pattern(
+        mocks: &MockPorts,
+        policy_id: Uuid,
+        cve: &str,
+        package_pattern: &str,
+    ) -> Uuid {
+        let exclusion_id = Uuid::new_v4();
+        mocks
+            .policy_projections
+            .insert_exclusion(ExclusionProjection {
+                exclusion_id,
+                policy_id,
+                cve_id: cve.to_string(),
+                package_pattern: Some(package_pattern.to_string()),
+                scope: PolicyScope::Global,
+                reason: "seeded".into(),
+                added_by_actor_id: None,
+                expires_at: None,
+            });
+        exclusion_id
+    }
+
+    /// The exclusion ids currently on the policy, in projection order.
+    async fn remaining_exclusion_ids(mocks: &MockPorts, policy_id: Uuid) -> Vec<Uuid> {
+        mocks
+            .policy_projections
+            .list_exclusions_for_policy(policy_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.exclusion_id)
+            .collect()
+    }
+
+    /// One scan finding for `cve`, severity-assessed so nothing routes
+    /// it onto the non-enforcing negligible lane. Feeds
+    /// [`filter_excluded_findings`] in the end-to-end removal test.
+    fn finding_for(cve: &str) -> Finding {
+        Finding {
+            purl: "pkg:npm/left-pad@1.0.0".into(),
+            vulnerability_id: cve.to_string(),
+            severity: SeverityThreshold::Critical,
+            cvss_score: Some(9.8),
+            title: "seeded for the exclusion filter".into(),
+            fixed_versions: Vec::new(),
+            source_scanner: "trivy".into(),
+            references: Vec::new(),
+            aliases: Vec::new(),
+            informational_class: None,
+            severity_basis: SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
+        }
+    }
+
+    /// Coordinates for the artifact the filter is asked about. They
+    /// carry no repository identity — which is exactly why a stored
+    /// repository scope cannot narrow anything.
+    fn any_coords() -> ArtifactCoords {
+        ArtifactCoords {
+            name: "left-pad".into(),
+            name_as_published: "left-pad".into(),
+            version: Some("1.0.0".into()),
+            path: "left-pad/-/left-pad-1.0.0.tgz".into(),
+            format: RepositoryFormat::Npm,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    /// Drive a future to completion on a fresh current-thread runtime.
+    /// `#[tracing_test::traced_test]` installs its subscriber for the
+    /// scope of a sync test function, so a log-asserting test cannot be
+    /// a `#[tokio::test]`. Mirrors `authz::extractors::tests`.
+    fn run_async<F: std::future::Future<Output = T>, T>(f: F) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// The response body as a string — the refusal tests read the
+    /// rationale out of it, because "a 400 happened" is not evidence the
+    /// operator was told what is missing.
+    async fn body_text(resp: Response) -> String {
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// The response body parsed as JSON — the ambiguity tests read the
+    /// candidates out of it as *members*, because a caller that has to
+    /// parse an error sentence to recover a UUID has not been told
+    /// anything it can act on.
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).expect("response body must be JSON")
     }
 
     fn post_req(policy_id: Uuid, body: &str, p: Option<CallerPrincipal>) -> Request<Body> {
@@ -775,12 +1049,17 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    /// Scope `kind: repository` round-trips through the DTO mapping
-    /// and reaches the use case with the expected
-    /// `PolicyScope::Repository(uuid)`. Pins the alternate scope
-    /// projection so a regression that loses the variant trips here.
+    /// Scope `kind: repository` still round-trips through the DTO
+    /// mapping — and is then **refused** with the same rationale the
+    /// gitops apply path states: the finding filter never reads the
+    /// scope, so the waiver would clear its CVE for every repository the
+    /// policy governs.
+    ///
+    /// The DTO arm is deliberately still there (the read surface renders
+    /// it for rows stored before the refusal), so this test is what pins
+    /// that accepting the shape does not mean accepting the write.
     #[tokio::test]
-    async fn post_exclusion_repository_scope_threads_through() {
+    async fn post_exclusion_repository_scope_returns_400() {
         let (router, mocks) = harness();
         let policy_id = seed_policy(&mocks);
         let repo_id = Uuid::new_v4();
@@ -798,10 +1077,20 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let upserts = mocks.policy_projections.exclusion_upserts();
-        assert_eq!(upserts.len(), 1);
-        assert_eq!(upserts[0].scope, PolicyScope::Repository(repo_id));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(resp).await;
+        assert!(
+            body.contains("not enforced") && body.contains("never reads"),
+            "the refusal must carry the apply path's rationale: {body}"
+        );
+        assert!(
+            body.contains(&repo_id.to_string()),
+            "the refusal must name the repository the caller asked for: {body}"
+        );
+        assert!(
+            mocks.policy_projections.exclusion_upserts().is_empty(),
+            "a refused exclusion must write no projection row",
+        );
     }
 
     // -----------------------------------------------------------------
@@ -853,6 +1142,554 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// A stored repository scope → 204, and the row is gone.
+    ///
+    /// Only a row written before the add-side refusal can be in this
+    /// shape; nothing rewrites those rows, so the removal path is the
+    /// only way an operator without a declared gitops tree gets rid of
+    /// one. Refusing the removal would make a row that keeps clearing
+    /// its CVE for every repository the parent policy governs
+    /// unremovable through the API, while the same use-case method
+    /// stays open for the gitops applier — so this asserts the removal
+    /// succeeds, not that it is gated.
+    #[tokio::test]
+    async fn delete_exclusion_with_a_stored_repository_scope_returns_204() {
+        let (router, mocks) = harness();
+        let policy_id = seed_policy(&mocks);
+        let repo_id = Uuid::new_v4();
+        let (eid, cve) = seed_exclusion_with_scope(
+            &mocks,
+            policy_id,
+            "CVE-2026-9090",
+            PolicyScope::Repository(repo_id),
+        );
+
+        let resp = router
+            .oneshot(delete_req(
+                policy_id,
+                &cve,
+                r#"{"reason":"cleaning up a legacy row"}"#,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            mocks.policy_projections.exclusion_deletes(),
+            vec![eid],
+            "the removal must reach the use case with the resolved exclusion id",
+        );
+        assert!(
+            mocks
+                .policy_projections
+                .list_exclusions_for_policy(policy_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the stored row must be gone after the removal",
+        );
+    }
+
+    /// The whole way through, on the shape that made this endpoint
+    /// matter: a repository-scoped row exists (seeded past the add-side
+    /// refusal, which is how the stored ones came about), the finding
+    /// filter is suppressing its CVE, the API removes it, and the CVE
+    /// is enforced again.
+    ///
+    /// The *before* half is the defect itself — the filter drops the
+    /// finding although the artifact's coordinates belong to no
+    /// particular repository, which is what
+    /// [`hort_domain::policy::SCOPE_NOT_ENFORCED`] says and why the
+    /// write is refused. The *after* half is what this endpoint owes
+    /// the operator: one `DELETE` and the suppression is gone. An
+    /// assertion on the 204 alone would not have shown the second half.
+    #[tokio::test]
+    async fn removing_a_stored_repository_scoped_exclusion_re_enforces_the_cve() {
+        let (router, mocks) = harness();
+        let policy_id = seed_policy(&mocks);
+        let (_eid, cve) = seed_exclusion_with_scope(
+            &mocks,
+            policy_id,
+            "CVE-2026-7070",
+            PolicyScope::Repository(Uuid::new_v4()),
+        );
+        let findings = vec![finding_for(&cve)];
+        let coords = any_coords();
+        let now = Utc::now();
+
+        // Before: the stored row suppresses the CVE — for this
+        // artifact, and for every other one the policy governs.
+        let before = mocks
+            .policy_projections
+            .list_exclusions_for_policy(policy_id)
+            .await
+            .unwrap();
+        let filtered = filter_excluded_findings(&findings, &before, &coords, now);
+        assert_eq!(
+            filtered.excluded_count, 1,
+            "the seeded row must be suppressing the CVE before the removal",
+        );
+
+        let resp = router
+            .oneshot(delete_req(
+                policy_id,
+                &cve,
+                r#"{"reason":"the scope never narrowed anything"}"#,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // After: nothing excludes the CVE any more.
+        let after = mocks
+            .policy_projections
+            .list_exclusions_for_policy(policy_id)
+            .await
+            .unwrap();
+        let filtered = filter_excluded_findings(&findings, &after, &coords, now);
+        assert_eq!(
+            filtered.excluded_count, 0,
+            "the CVE must no longer be excluded after the removal",
+        );
+        assert_eq!(
+            filtered.remaining_findings, findings,
+            "the finding must survive the filter unchanged",
+        );
+    }
+
+    /// The removal states its real reach. The stored scope narrowed
+    /// nothing, so the row was live for every repository the parent
+    /// policy governs and the removal lands in all of them — that is
+    /// information the operator acts on, and the only place a `204 No
+    /// Content` can carry it is the log.
+    ///
+    /// Pins, on a single line, the three identifiers an operator
+    /// correlates on (`policy_id`, `cve_id`, the stored
+    /// `repository_id`) plus the shared rationale, so the line cannot
+    /// decay into a bare "removed an exclusion" while still looking
+    /// deliberate.
+    #[tracing_test::traced_test]
+    #[test]
+    fn delete_exclusion_logs_the_real_reach_of_a_stored_repository_scope() {
+        // `harness()` wires an in-memory `EphemeralStore` that spawns
+        // its reaper on construction, so the whole fixture has to be
+        // built inside the runtime.
+        let repo_id = Uuid::new_v4();
+        let (policy_id, cve, status) = run_async(async {
+            let (router, mocks) = harness();
+            let policy_id = seed_policy(&mocks);
+            let (_eid, cve) = seed_exclusion_with_scope(
+                &mocks,
+                policy_id,
+                "CVE-2026-6060",
+                PolicyScope::Repository(repo_id),
+            );
+            let status = router
+                .oneshot(delete_req(
+                    policy_id,
+                    &cve,
+                    r#"{"reason":"legacy row"}"#,
+                    Some(principal_with_claims(&["curate"])),
+                ))
+                .await
+                .unwrap()
+                .status();
+            (policy_id, cve, status)
+        });
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // On *one* line, not scattered across the span and the record:
+        // a correlation that needs two log lines joined is not the one
+        // an operator gets out of a log search.
+        logs_assert(|lines: &[&str]| {
+            let hits: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("carries a repository scope"))
+                .collect();
+            let [line] = hits[..] else {
+                return Err(format!("expected exactly one reach line, got {hits:?}"));
+            };
+            for needle in [
+                policy_id.to_string().as_str(),
+                cve.as_str(),
+                repo_id.to_string().as_str(),
+                // The rationale every other surface states verbatim.
+                "never reads",
+                // Not a denial: the row is on its way out.
+                "INFO",
+            ] {
+                if !line.contains(needle) {
+                    return Err(format!("reach line is missing {needle:?}: {line}"));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // DELETE resolves a row by its identity, not by its CVE
+    //
+    // A policy can hold several exclusions for one CVE differing only
+    // in `package_pattern`. Picking one of them by CVE lets the
+    // projection's ordering decide which suppression ends and strands
+    // the rest; the tests below pin that the ambiguity is reported with
+    // the candidates as data, and that every row stays reachable.
+    // -----------------------------------------------------------------
+
+    /// Two rows for one CVE and nothing saying which → `409`, and the
+    /// candidates are **members of the body**: a caller reads each
+    /// `exclusion_id` as a field and repeats the request with it.
+    ///
+    /// Kills: resolving the ambiguity server-side (any 2xx here means a
+    /// row the operator did not name was removed), and reporting it as
+    /// prose (the ids must not be reachable only by parsing the
+    /// message).
+    #[tokio::test]
+    async fn delete_exclusion_two_rows_for_one_cve_is_409_with_both_candidates() {
+        let (router, mocks) = harness();
+        let policy_id = seed_policy(&mocks);
+        let cve = "CVE-2026-8001";
+        let first = seed_exclusion_with_pattern(&mocks, policy_id, cve, "pkg:npm/left-pad@*");
+        let (second, _) = seed_exclusion(&mocks, policy_id, cve);
+
+        let resp = router
+            .oneshot(delete_req(
+                policy_id,
+                cve,
+                r#"{"reason":"withdrawing one of them"}"#,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .expect("Content-Type must be present")
+                .to_str()
+                .unwrap(),
+            "application/json",
+        );
+
+        let v = body_json(resp).await;
+        assert_eq!(v["cve_id"], cve);
+        let candidates = v["candidates"]
+            .as_array()
+            .expect("candidates must be a JSON array, not text inside the message");
+        assert_eq!(candidates.len(), 2, "both rows must be offered: {v}");
+
+        // Each candidate's identity is readable as a field, and so is
+        // the discriminator — including the `null` that says "this row
+        // carries no pattern", which a caller could not tell from a
+        // missing member.
+        let by_id: std::collections::HashMap<String, &serde_json::Value> = candidates
+            .iter()
+            .map(|c| {
+                (
+                    c["exclusion_id"]
+                        .as_str()
+                        .expect("exclusion_id must be a string member")
+                        .to_string(),
+                    &c["package_pattern"],
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_id.get(&first.to_string()).map(|p| p.as_str()),
+            Some(Some("pkg:npm/left-pad@*")),
+            "the patterned row must be offered with its pattern: {v}",
+        );
+        assert!(
+            by_id
+                .get(&second.to_string())
+                .expect("the pattern-less row must be offered too")
+                .is_null(),
+            "a row with no pattern must say so with null, not by omitting the member: {v}",
+        );
+
+        // The ids travel as data. If the message were the only place
+        // they appeared, every caller would be writing a parser.
+        let message = v["error"].as_str().expect("error must be a string member");
+        assert!(
+            !message.contains(&first.to_string()) && !message.contains(&second.to_string()),
+            "the candidates belong in the members, not in the message: {message}",
+        );
+
+        // Nothing was removed, and the use case was never reached.
+        assert!(
+            mocks.policy_projections.exclusion_deletes().is_empty(),
+            "an unanswered ambiguity must remove nothing",
+        );
+        assert_eq!(
+            remaining_exclusion_ids(&mocks, policy_id).await,
+            vec![first, second],
+            "both rows must survive a refused removal",
+        );
+    }
+
+    /// The acceptance case: with two rows for one CVE, each is
+    /// removable by naming its `exclusion_id` — and naming one removes
+    /// **exactly** that row.
+    ///
+    /// Kills the `find(|e| e.cve_id == cve_id)` predicate directly, and
+    /// does it without leaning on the read model's ordering: the first
+    /// request names the row the projection lists **second**, so a
+    /// predicate that resolves by CVE removes the other one and the
+    /// assertion fails. (Naming the first-listed row would have passed
+    /// on both the right implementation and the wrong one — which is
+    /// the whole shape of the defect: the ordering agreeing with the
+    /// caller's intent is luck, not behaviour.) The second request then
+    /// reaches the row the first left behind, so neither is stranded.
+    #[tokio::test]
+    async fn delete_exclusion_by_identity_reaches_each_of_two_rows_for_one_cve() {
+        let (router, mocks) = harness();
+        let policy_id = seed_policy(&mocks);
+        let cve = "CVE-2026-8002";
+        let listed_first =
+            seed_exclusion_with_pattern(&mocks, policy_id, cve, "pkg:npm/left-pad@*");
+        let listed_second =
+            seed_exclusion_with_pattern(&mocks, policy_id, cve, "pkg:npm/right-pad@*");
+        assert_eq!(
+            remaining_exclusion_ids(&mocks, policy_id).await,
+            vec![listed_first, listed_second],
+            "the test's premise is this listing order",
+        );
+
+        let body = serde_json::json!({
+            "reason": "right-pad is patched upstream",
+            "exclusion_id": listed_second,
+        })
+        .to_string();
+        let resp = router
+            .clone()
+            .oneshot(delete_req(
+                policy_id,
+                cve,
+                &body,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            mocks.policy_projections.exclusion_deletes(),
+            vec![listed_second],
+            "the named row, and only it, must reach the use case",
+        );
+        assert_eq!(
+            remaining_exclusion_ids(&mocks, policy_id).await,
+            vec![listed_first],
+            "the row the caller did not name must still be there",
+        );
+
+        // The CVE now names exactly one row, so the second removal
+        // needs no disambiguator — but naming it must work too, and
+        // must reach the row the first call left behind.
+        let body = serde_json::json!({
+            "reason": "left-pad too",
+            "exclusion_id": listed_first,
+        })
+        .to_string();
+        let resp = router
+            .oneshot(delete_req(
+                policy_id,
+                cve,
+                &body,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            mocks.policy_projections.exclusion_deletes(),
+            vec![listed_second, listed_first],
+            "both rows must be reachable; neither is stranded",
+        );
+        assert!(
+            remaining_exclusion_ids(&mocks, policy_id).await.is_empty(),
+            "the policy must hold no exclusion for the CVE afterwards",
+        );
+    }
+
+    /// An `exclusion_id` that exists on the policy but under a
+    /// different CVE → `400`, and the use case is not called.
+    ///
+    /// Kills the reading where the body is a second way to say which
+    /// row dies: on that reading this request would remove the other
+    /// CVE's row, which the path never named.
+    #[tokio::test]
+    async fn delete_exclusion_with_an_exclusion_id_from_another_cve_is_refused() {
+        let (router, mocks) = harness();
+        let policy_id = seed_policy(&mocks);
+        let (target_row, target_cve) = seed_exclusion(&mocks, policy_id, "CVE-2026-8003");
+        let (other_cve_row, _) = seed_exclusion(&mocks, policy_id, "CVE-2026-8004");
+
+        let body = serde_json::json!({
+            "reason": "wrong row named",
+            "exclusion_id": other_cve_row,
+        })
+        .to_string();
+        let resp = router
+            .oneshot(delete_req(
+                policy_id,
+                &target_cve,
+                &body,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            mocks.policy_projections.exclusion_deletes().is_empty(),
+            "a body naming another CVE's row must not reach the use case",
+        );
+        assert_eq!(
+            remaining_exclusion_ids(&mocks, policy_id).await,
+            vec![target_row, other_cve_row],
+            "neither the path's row nor the named row may be removed",
+        );
+    }
+
+    /// A CVE with no rows is `404` even when the body names a real
+    /// exclusion of the policy — the optional disambiguator narrows
+    /// within the path's CVE and cannot conjure a target for a CVE that
+    /// is not there.
+    #[tokio::test]
+    async fn delete_exclusion_unknown_cve_with_an_exclusion_id_is_still_404() {
+        let (router, mocks) = harness();
+        let policy_id = seed_policy(&mocks);
+        let (existing, _) = seed_exclusion(&mocks, policy_id, "CVE-2026-8005");
+
+        let body = serde_json::json!({
+            "reason": "valid",
+            "exclusion_id": existing,
+        })
+        .to_string();
+        let resp = router
+            .oneshot(delete_req(
+                policy_id,
+                "CVE-2026-NONE",
+                &body,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            remaining_exclusion_ids(&mocks, policy_id).await,
+            vec![existing],
+            "the row the body named must survive a 404 on another CVE",
+        );
+    }
+
+    /// The single-match path is byte-for-byte what it was: the use case
+    /// is driven with the same `RemoveExclusionCommand` — the policy,
+    /// the resolved exclusion id, and the body's reason verbatim — and
+    /// the request carries no `exclusion_id` at all.
+    ///
+    /// Read off the appended `ExclusionRemoved`, whose three fields
+    /// *are* the command's three fields, so the assertion cannot pass
+    /// on a command that lost one of them.
+    #[tokio::test]
+    async fn delete_exclusion_single_match_drives_the_unchanged_command() {
+        let (router, mocks) = harness();
+        let policy_id = seed_policy(&mocks);
+        let (eid, cve) = seed_exclusion(&mocks, policy_id, "CVE-2026-8006");
+
+        let resp = router
+            .oneshot(delete_req(
+                policy_id,
+                &cve,
+                r#"{"reason":"superseded by upstream patch"}"#,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let removed: Vec<hort_domain::events::ExclusionRemoved> = mocks
+            .events
+            .appended_batches()
+            .into_iter()
+            .flat_map(|b| b.events)
+            .filter_map(|e| match e.event {
+                hort_domain::events::DomainEvent::ExclusionRemoved(ev) => Some(ev),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed.len(), 1, "exactly one removal must be recorded");
+        assert_eq!(removed[0].policy_id, policy_id);
+        assert_eq!(
+            removed[0].exclusion_id, eid,
+            "the CVE → exclusion_id resolution must still drive the use case with the \
+             single matching row",
+        );
+        assert_eq!(removed[0].reason, "superseded by upstream patch");
+    }
+
+    /// Naming the row on a CVE that has only one is allowed, not
+    /// rejected as redundant — the field narrows, and the narrowing is
+    /// satisfied.
+    #[tokio::test]
+    async fn delete_exclusion_naming_the_only_row_for_a_cve_returns_204() {
+        let (router, mocks) = harness();
+        let policy_id = seed_policy(&mocks);
+        let (eid, cve) = seed_exclusion(&mocks, policy_id, "CVE-2026-8007");
+
+        let body = serde_json::json!({ "reason": "valid", "exclusion_id": eid }).to_string();
+        let resp = router
+            .oneshot(delete_req(
+                policy_id,
+                &cve,
+                &body,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(mocks.policy_projections.exclusion_deletes(), vec![eid]);
+    }
+
+    /// A malformed request against an ambiguous CVE is answered as
+    /// malformed: the `reason` gate runs before the lookup, so the
+    /// caller is told what is wrong with the request they sent rather
+    /// than being handed candidates for a request that could not have
+    /// succeeded anyway.
+    ///
+    /// Kills a reordering that hoists the ambiguity report above the
+    /// body validation — the 409 would then teach the caller to fix the
+    /// wrong thing, and a request with no justification would be one
+    /// `exclusion_id` away from removing a suppression unaudited.
+    #[tokio::test]
+    async fn delete_exclusion_empty_reason_beats_the_ambiguity_report() {
+        let (router, mocks) = harness();
+        let policy_id = seed_policy(&mocks);
+        let cve = "CVE-2026-8008";
+        let first = seed_exclusion_with_pattern(&mocks, policy_id, cve, "pkg:npm/left-pad@*");
+        let (second, _) = seed_exclusion(&mocks, policy_id, cve);
+
+        let resp = router
+            .oneshot(delete_req(
+                policy_id,
+                cve,
+                r#"{"reason":"   "}"#,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_text(resp).await.contains("reason"),
+            "the answer must name the malformed field, not the ambiguity",
+        );
+        assert_eq!(
+            remaining_exclusion_ids(&mocks, policy_id).await,
+            vec![first, second],
+            "nothing is removed either way",
+        );
     }
 
     /// Empty `reason` → 400.

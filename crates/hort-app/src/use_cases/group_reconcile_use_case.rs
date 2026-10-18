@@ -86,7 +86,7 @@ const DEFAULT_SINCE_DAYS: i64 = 7;
 
 /// Page size for `read_category` calls. Bounded so a misconfigured
 /// event store does not OOM the sweeper — matches the existing
-/// per-stream cap pattern in `use_cases::read_expected_version`.
+/// per-stream cap pattern in `use_cases::read_unpaired_append_version`.
 const PAGE_SIZE: u64 = 256;
 
 /// Summary of a reconciliation sweep. The CLI prints this as a single

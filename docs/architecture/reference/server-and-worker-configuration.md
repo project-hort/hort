@@ -106,7 +106,7 @@ plus `hort-cli auth login --paste`; see `crates/hort-server/README.md`.
 |---|---|---|---|
 | `--name` | String | _(required)_ | Logical token name; derives the gitops SA backing-user username `sa:<name>`. |
 | `--permission` | String (repeatable) | `["admin_task_invoke"]` | Permissions to grant. |
-| `--output` | String | `"stdout"` | `stdout` \| `file:<path>` (mode `0600`); `kube-secret` is rejected in v1. |
+| `--output` | String | `"stdout"` | `stdout` \| `file:<path>` — atomically placed as a file the process created at mode `0600`, replacing (never inheriting or following) whatever the path held; the parent directory must already exist and is left untouched. `kube-secret` is rejected in v1. |
 | `--rotate` | flag | off | Force revoke + re-mint; default is idempotent (exit 0, no rotation if it already exists). |
 | `--expires-in-days` | u32 | `365` | Token lifetime. |
 
@@ -129,7 +129,9 @@ linter rows via the same `StaticConfigValidator`
 to. Row 0 is literally the apply path's own function — `validate_against`
 delegates to it before adding its snapshot/env rules — so the offline
 verdict on those rules cannot drift from apply's. Implementation:
-`crates/hort-server/src/cli/validate_config.rs`. The CI-recipe
+`crates/hort-server/src/cli/validate_config.rs`. Every named lint row
+and what it rejects:
+[apply-time-linter-rows.md](apply-time-linter-rows.md). The CI-recipe
 walkthrough (deriving the env from Helm values) is in
 [declare-gitops-config.md §5a](../how-to/declare-gitops-config.md#5a-validate-your-config-before-applying-hort-server-validate-config).
 
@@ -213,7 +215,7 @@ surfaces the name `"DATABASE_URL"`. This is identical to the worker.
 | `HORT_HTTP_REQUEST_TIMEOUT_SECS` | u64 | `300` | No | Global per-handler runtime deadline. |
 | `HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS` | u64 | `3600` | No | Per-route override for OCI blob-upload `PATCH`/`PUT`. |
 | `HORT_SHUTDOWN_GRACE_SECS` | u64 | `60` | No | Graceful-drain wall-clock cap after SIGTERM/SIGINT. |
-| `HORT_PUBLISH_BODY_MAX_SIZE` | size string | _unset → 300 MiB_ | No | PyPI/npm publish body cap. Size string (`"300Mi"`, `"1Gi"`, or a bare byte integer). **`"0"` = refuse all publishes** (kill-switch; not rejected). |
+| `HORT_PUBLISH_BODY_MAX_SIZE` | size string | _unset → 300 MiB_ | No | npm/PyPI/Maven publish body cap. Size string (`"300Mi"`, `"1Gi"`, or a bare byte integer). Cargo keeps its own fixed 200 MiB ceiling against any non-zero value, and OCI push takes no ceiling from it. **`"0"` = refuse all publishes** (kill-switch; not rejected) — closes every publish surface, the four hosted formats and OCI push alike, answering `503` without `Retry-After` on `POST`/`PUT`/`PATCH`; reads and deletions keep working. |
 | `HORT_METADATA_BLOB_MAX_SIZE` | size string | `10Mi` (10 MiB) | No | CAS metadata-blob ceiling. Size string (`"10Mi"`, or a bare byte integer). **`"0"` = accept anything** (not rejected). |
 | `METADATA_CAP_BYTES_<FORMAT>` | usize | _unset → handler default_ | No | Per-format metadata-cap override; `<FORMAT>` suffix is lowercased to the format key. No `HORT_` prefix. |
 

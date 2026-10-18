@@ -74,6 +74,30 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 /// same `ParseError` classification.
 pub(crate) const CONNECT_SSRF_SENTINEL: &str = "hort-upstream-connect-ssrf-blocked";
 
+/// The crate's one **address**-permission predicate: a resolved
+/// [`SocketAddr`] may be dialed iff [`hort_net_egress::is_routable`]
+/// accepts its IP **or** the address appears in the crate's
+/// test-allowlist seam (always empty in production).
+///
+/// Two consumers apply this at two different moments — this module's
+/// connect-time resolver ([`GuardedDnsResolver::permit`]) and the
+/// per-hop redirect policy ([`crate::build_redirect_policy`]) — and
+/// until this function existed they were two copies of the same line.
+/// They agreed, which is exactly what made the duplication easy to
+/// keep: nothing failed while they did. One definition means a later
+/// edit cannot move one and leave the other behind.
+///
+/// The URL-validation-time check
+/// ([`crate::check_ssrf_safe_allowing`]) still spells its own loop. It
+/// asks this same address question, but inside a URL parse + host
+/// resolve whose refusal is a `DomainError::Validation` naming the
+/// *host* rather than an address-level verdict; folding it in would
+/// make this predicate fallible and URL-shaped for the two callers
+/// that only have an address.
+pub(crate) fn addr_is_dialable(addr: SocketAddr, allowlist: &[SocketAddr]) -> bool {
+    hort_net_egress::is_routable(addr.ip()) || allowlist.contains(&addr)
+}
+
 /// Connect-time guarded resolver bound to the upstream-http artifact /
 /// metadata / manifest `reqwest::Client`(s) at the two `Client::builder()`
 /// sites in this crate (see module docs for the scoping rationale).
@@ -109,12 +133,14 @@ impl GuardedDnsResolver {
 
     /// Pure decision: is this resolved `addr` permitted to be dialed?
     ///
-    /// Permitted iff routable OR explicitly allowlisted (test seam). This
-    /// is the single connect-time security predicate; extracted so it is
-    /// unit-testable without a live resolver. Mirrors the predicate
-    /// [`crate::build_redirect_policy`] applies per redirect hop.
+    /// Delegates to [`addr_is_dialable`], which is also what
+    /// [`crate::build_redirect_policy`] applies per redirect hop — one
+    /// predicate, not two that happen to agree. Kept as a method so the
+    /// connect-time decision stays unit-testable without a live
+    /// resolver and reads at the call site below as the resolver's own
+    /// gate.
     fn permit(&self, addr: SocketAddr) -> bool {
-        hort_net_egress::is_routable(addr.ip()) || self.allowlist.contains(&addr)
+        addr_is_dialable(addr, &self.allowlist)
     }
 }
 

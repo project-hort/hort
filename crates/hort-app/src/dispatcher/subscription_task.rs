@@ -15,7 +15,10 @@
 //!    channel is a wake-up that removes the tick's latency, and its
 //!    payload is never the thing delivered. Each event read is filtered
 //!    against [`SubscriptionFilter`] and dispatched via the first
-//!    [`EventNotifier`] that `supports` the target.
+//!    [`EventNotifier`] that `supports` the target. Both the filter and
+//!    the target come from the **live** row, not from the one the task
+//!    was spawned with — see *The row is not fixed for the task's
+//!    lifetime* below.
 //! 3. [`broadcast::error::RecvError::Lagged`] is a third trigger for the
 //!    same pass; overrunning the hint channel costs nothing but the
 //!    counter that records it.
@@ -96,6 +99,33 @@
 //! a bare high-water mark, which is a change to the position model
 //! itself and not to this loop.
 //!
+//! # The row is not fixed for the task's lifetime
+//!
+//! A task is spawned with one `Subscription`, but it takes only that
+//! row's **identity** and its **cursor seed** from it. What shapes
+//! delivery — the filter and the target — is read per event from
+//! [`SubscriptionTaskDeps::delivery_shape`], a [`DeliveryShape`] the
+//! dispatcher's reconcile pass republishes from the row it just listed.
+//! A target PATCHed away from a compromised webhook URL, and a filter
+//! narrowed to drop a category or an event type, therefore take effect
+//! for the next delivered event rather than at the next process
+//! restart.
+//!
+//! The projection is narrow for one specific reason: the task owns its
+//! own progress, and a republished `last_delivered_position` is behind
+//! the in-memory `ReadCursor` by up to the `PROGRESS_DEBOUNCE` floor.
+//! Re-seeding the cursor from a published row would re-deliver that
+//! window on every reconcile tick, so the published value carries
+//! neither the cursor nor the state column, the failure budget or the
+//! debouncer.
+//!
+//! A filter change applies **from the cursor forward**. Narrowing takes
+//! effect for everything the task has not yet walked; widening does not
+//! retroactively deliver events the task already walked past under the
+//! narrower filter, because those positions are below the mark and no
+//! read starts below it. That is inherent to a cursor-driven walk
+//! (ADR 0061), not a property of this republish.
+//!
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -107,7 +137,8 @@ use tokio_util::sync::CancellationToken;
 
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::subscription::{
-    DisableReason, Subscription, SubscriptionFailure, SubscriptionId, SubscriptionTarget,
+    DisableReason, Subscription, SubscriptionFailure, SubscriptionFilter, SubscriptionId,
+    SubscriptionTarget,
 };
 use hort_domain::events::PersistedEvent;
 use hort_domain::ports::event_notifier::{EventNotifier, NotifyOutcome};
@@ -121,6 +152,7 @@ use crate::metrics::{
     notify_outcome_label, target_kind_label,
 };
 use crate::rbac::RbacEvaluator;
+use crate::use_cases::event_visibility::{EventRepositoryIndex, EventVisibilityUseCase};
 use crate::use_cases::subscription_filter::{matches as filter_matches, FilterContext};
 use crate::use_cases::subscription_use_case::SubscriptionUseCase;
 
@@ -229,6 +261,56 @@ impl ReadCursor {
     }
 }
 
+/// The mutable part of a subscription row that shapes delivery: what
+/// matches, and where it goes.
+///
+/// This is the value the dispatcher publishes into a running task on
+/// every reconcile pass (see [`SubscriptionTaskDeps::delivery_shape`]),
+/// and it is deliberately **not** the whole [`Subscription`].
+///
+/// # Why a projection and not the row
+///
+/// The task owns its own progress. `last_delivered_position` on a
+/// freshly read row is whatever the last debounced write happened to
+/// persist, which is up to the `PROGRESS_DEBOUNCE` floor behind the
+/// task's own in-memory read cursor. A task that re-seeded its cursor
+/// from a republished row would therefore re-deliver the window in
+/// between on every reconcile tick, for as long as the debounce held
+/// the write back. Publishing only these two fields makes that
+/// impossible to write by accident rather than something a reader of
+/// the task has to remember: the cursor, the `state` column, the
+/// failure budget and the debouncer are not reachable from here.
+///
+/// `snapshot_claims` is absent for the same reason it is not *needed*:
+/// the reconcile pass already folds it into the owner principal it
+/// publishes alongside this value
+/// ([`SubscriptionTaskDeps::owner_principal`]), so a second copy here
+/// would be a second authority input ageing on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryShape {
+    /// Where matching events go. Resolved per event, so the first
+    /// delivery after a target PATCH already uses the new target.
+    ///
+    /// Not re-validated here: the create / update path validates a
+    /// webhook target — plaintext rule, URL grammar and the SSRF /
+    /// DNS guard — before it is persisted, so a row that reached the
+    /// database was admitted. Re-checking would put a DNS round trip
+    /// on the per-event path.
+    pub target: SubscriptionTarget,
+    /// What matches. Decides the categories a pass reads, the wake
+    /// predicate for a broadcast hint, and the per-event filter walk.
+    pub filter: SubscriptionFilter,
+}
+
+impl From<&Subscription> for DeliveryShape {
+    fn from(row: &Subscription) -> Self {
+        Self {
+            target: row.target.clone(),
+            filter: row.filter.clone(),
+        }
+    }
+}
+
 /// Wires the dependencies one [`run`] invocation needs.
 ///
 /// Constructed once per spawn — the dispatcher (top-level) reads from
@@ -249,30 +331,56 @@ pub struct SubscriptionTaskDeps {
     /// repository metadata. v1 ships zero variants; the field is held
     /// but never consulted by the v1 filter.
     pub repositories: Arc<dyn RepositoryRepository>,
-    /// Owner principal — synthesised **once at task spawn** from the
-    /// owner's `User` row + `snapshot_claims` (the stale-`"admin"`
-    /// strip + live-`is_admin` re-derivation happens at that synthesis
-    /// time; see [`crate::dispatcher::dispatcher`]
-    /// `synthesise_principal`). This value is then **frozen for the
-    /// life of the task** — it is captured into `SubscriptionTaskDeps`
-    /// at spawn and the per-event filter walk reuses it.
+    /// Resolves the repository a catch-up page's events disclose. The
+    /// post-ingest artifact lifecycle carries no repository column — the
+    /// artifact aggregate does — so without this the filter cannot tell
+    /// the owner's own repository's `ArtifactReleased` from another
+    /// tenant's. Resolved ONCE per page in [`catch_up`], not per event.
+    /// Shared with the `GET /api/v1/events` read gate.
+    pub event_visibility: Arc<EventVisibilityUseCase>,
+    /// Owner principal — synthesised from the owner's `User` row +
+    /// `snapshot_claims` (the stale-`"admin"` strip + live-`is_admin`
+    /// re-derivation; see [`crate::dispatcher::dispatcher`]
+    /// `synthesise_principal`) and **re-published by the dispatcher on
+    /// every reconcile pass**, for a running task as much as for a new
+    /// one. The per-event filter walk `load()`s it, so the authority a
+    /// delivery is decided under is at most one reconcile interval old.
     ///
-    /// The dispatcher's 30s reconcile cadence governs **add/remove of
-    /// tasks** (spawn for newly-active subscriptions, cancel on
-    /// vanish/disable) and disabled-row teardown — it does **NOT**
-    /// re-synthesise an already-running task's `owner_principal`
-    /// (`dispatcher.rs` skips re-synthesis via
-    /// `if tasks.contains_key(&sub.id) { continue; }`). A change to
-    /// the owner's `User` row (notably the `is_admin` bit) is picked
-    /// up only at the next **cancel+respawn** of the task, not on the
-    /// reconcile tick. There is no per-reconcile freshness guarantee
-    /// for a running task's principal. Live *grant* revocation is
-    /// still honored independently per delivered event by the
-    /// dispatch-time privileged-category gate, which reloads the
-    /// [`RbacEvaluator`] (`rbac` field) on every processed event;
-    /// only the spawn-frozen `user.is_admin` *bit* input is subject
-    /// to this freeze (an accepted residual).
-    pub owner_principal: CallerPrincipal,
+    /// Mirroring the `rbac` field above is the substance of this type,
+    /// not symmetry: both are inputs to the same `authorize` call in
+    /// [`crate::use_cases::subscription_filter::matches`], and two
+    /// inputs to one authorization decision have to age at the same
+    /// rate. Each is bounded by one refresh cadence — the reconcile
+    /// interval for this field, `HORT_RBAC_REFRESH_SECS` for the
+    /// evaluator — which is why revoking `User.is_admin` stops a
+    /// *running* task from delivering privileged-category events with
+    /// no cancel-and-respawn needed.
+    ///
+    /// A principal that stops resolving at all (owner row gone,
+    /// deactivated, or unreadable) is never published as a degraded
+    /// value here; the reconcile cancels the task instead, so this
+    /// field only ever holds authority the owner currently has.
+    pub owner_principal: Arc<ArcSwap<CallerPrincipal>>,
+    /// The live row's delivery-shaping fields — **re-published by the
+    /// dispatcher on every reconcile pass**, for a running task as much
+    /// as for a new one, from the row that pass listed.
+    ///
+    /// This is the third input to the same per-event decision the two
+    /// fields above feed, and it is here for the same reason: an input
+    /// to a per-event decision may not be older than the cadence the
+    /// rest of that decision runs on. `PATCH
+    /// /api/v1/subscriptions/:id` persists a new target and filter and
+    /// notifies the dispatcher, so without this the acknowledged row
+    /// would be visible through the API while delivery kept following
+    /// the one the task was spawned with — a rotation away from a
+    /// compromised webhook URL would keep feeding the old receiver, and
+    /// a narrowed filter would keep delivering the categories and event
+    /// types it removed, until the process restarted.
+    ///
+    /// See [`DeliveryShape`] for why this is a projection of the row
+    /// rather than the row: a republished `last_delivered_position`
+    /// would rewind a running task's cursor.
+    pub delivery_shape: Arc<ArcSwap<DeliveryShape>>,
     /// First-match notifier registry — the task walks this and uses
     /// the first `supports(target) == true` adapter. Empty registry
     /// drops every event with a warning (degraded state, not a panic).
@@ -332,17 +440,30 @@ pub async fn run(
     mut receiver: broadcast::Receiver<Arc<PersistedEvent>>,
     cancel: CancellationToken,
 ) {
-    let sub_id = subscription.id;
+    // Destructured, not borrowed: what the task takes from the row it
+    // was spawned with is its identity and its cursor seed, and nothing
+    // else. `target` and `filter` change under a running task — the
+    // reconcile pass republishes them into `deps.delivery_shape` and
+    // every consumer below reads them from there — so a copy taken here
+    // would be the stale value this task must not consult. Moving the
+    // row out makes consulting it a compile error rather than a rule to
+    // remember.
+    let Subscription {
+        id: sub_id,
+        owner_user_id,
+        last_delivered_position,
+        ..
+    } = subscription;
     tracing::info!(
         subscription_id = %sub_id.0,
-        owner_user_id = %subscription.owner_user_id,
+        owner_user_id = %owner_user_id,
         "dispatcher task starting"
     );
 
-    let mut cursor = ReadCursor::new(subscription.last_delivered_position);
+    let mut cursor = ReadCursor::new(last_delivered_position);
 
     // Step 1: catch-up.
-    if catch_up(&subscription, &deps, &cancel, &mut cursor).await {
+    if catch_up(sub_id, &deps, &cancel, &mut cursor).await {
         tracing::info!(subscription_id = %sub_id.0, "dispatcher task stopping after catch-up");
         return;
     }
@@ -379,12 +500,18 @@ pub async fn run(
                     // append to a category outside the filter cannot
                     // produce an event this task would deliver, so waking
                     // for it buys a store read and nothing else.
-                    let hinted = subscribes_to(&subscription, &event);
+                    //
+                    // The predicate reads the **live** filter: a
+                    // category a PATCH removed must stop buying store
+                    // reads, and one it added must start waking the
+                    // task rather than waiting for the next tick.
+                    let shape = deps.delivery_shape.load();
+                    let hinted = subscribes_to(&shape.filter, &event);
                     // Drained unconditionally, in its own binding: the
                     // queue has to be consumed whatever the first hint
                     // said, so this must never become the right-hand side
                     // of a short-circuiting `||`.
-                    let drained = drain_pending_hints(&mut receiver, &subscription);
+                    let drained = drain_pending_hints(&mut receiver, sub_id, &shape.filter);
                     if hinted || drained { Wake::Read } else { Wake::Skip }
                 }
                 // A lag is the one case where the categories that were
@@ -407,7 +534,7 @@ pub async fn run(
             continue;
         }
 
-        if catch_up(&subscription, &deps, &cancel, &mut cursor).await {
+        if catch_up(sub_id, &deps, &cancel, &mut cursor).await {
             return;
         }
     }
@@ -428,11 +555,12 @@ enum Wake {
 /// also sufficient: the pass that follows re-derives everything else from
 /// the store, and a hint for an unsubscribed category cannot change what
 /// that pass would return.
-fn subscribes_to(subscription: &Subscription, event: &PersistedEvent) -> bool {
-    subscription
-        .filter
-        .categories
-        .contains(&event.stream_id.category)
+///
+/// `filter` is the caller's snapshot of the live
+/// [`DeliveryShape::filter`], not a value captured at spawn — the
+/// categories a subscription reads change under a running task.
+fn subscribes_to(filter: &SubscriptionFilter, event: &PersistedEvent) -> bool {
+    filter.categories.contains(&event.stream_id.category)
 }
 
 /// Consume every hint already queued, so a burst of appends costs one
@@ -443,14 +571,15 @@ fn subscribes_to(subscription: &Subscription, event: &PersistedEvent) -> bool {
 /// unknown.
 fn drain_pending_hints(
     receiver: &mut broadcast::Receiver<Arc<PersistedEvent>>,
-    subscription: &Subscription,
+    sub_id: SubscriptionId,
+    filter: &SubscriptionFilter,
 ) -> bool {
     let mut relevant = false;
     loop {
         match receiver.try_recv() {
-            Ok(event) => relevant |= subscribes_to(subscription, &event),
+            Ok(event) => relevant |= subscribes_to(filter, &event),
             Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                note_lagged(subscription.id, skipped);
+                note_lagged(sub_id, skipped);
                 relevant = true;
             }
             Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
@@ -500,7 +629,7 @@ fn note_lagged(sub_id: SubscriptionId, skipped: u64) {
 /// would keep delivering to a subscription the dispatcher has already
 /// given up on.
 async fn catch_up(
-    subscription: &Subscription,
+    sub_id: SubscriptionId,
     deps: &SubscriptionTaskDeps,
     cancel: &CancellationToken,
     cursor: &mut ReadCursor,
@@ -510,9 +639,16 @@ async fn catch_up(
             return true;
         }
         let from = cursor.read_from();
+        // The categories come from the live row, not from the one this
+        // task was spawned with: a filter PATCH that adds a category has
+        // to reach the read for that category's events to be reachable
+        // at all, and one that removes a category must stop paying for
+        // its pages. Taken as an owned list per page so the `ArcSwap`
+        // guard is not held across the store round trip.
+        let categories = deps.delivery_shape.load().filter.categories.clone();
         let events = match deps
             .event_store
-            .read_categories(&subscription.filter.categories, from, CATCHUP_PAGE)
+            .read_categories(&categories, from, CATCHUP_PAGE)
             .await
         {
             Ok(evts) => evts,
@@ -525,8 +661,8 @@ async fn catch_up(
                 // out. `warn!` alone is not an alertable signal.
                 emit_subscription_read_error();
                 tracing::warn!(
-                    subscription_id = %subscription.id.0,
-                    categories = ?subscription.filter.categories,
+                    subscription_id = %sub_id.0,
+                    categories = ?categories,
                     error = %e,
                     "catch-up read failed; the pass stops and the next tick retries the same page"
                 );
@@ -537,6 +673,32 @@ async fn catch_up(
             return false;
         }
         let was_full_page = events.len() as u64 >= CATCHUP_PAGE;
+
+        // Resolve, for the whole page in one round trip, the repository
+        // every event discloses. This is the batch boundary the
+        // visibility primitive is built around: the per-event walk below
+        // consults the index without touching the database.
+        //
+        // Fail closed on a resolution failure the same way a failed read
+        // does — end the pass with the mark where it is, so the next tick
+        // retries this page. Continuing with an unresolved index would
+        // silently degrade the page to admin-only and, because the
+        // cursor would advance over it, drop the owner's own events for
+        // good.
+        let repository_index = match deps.event_visibility.index(&events).await {
+            Ok(index) => index,
+            Err(e) => {
+                emit_subscription_read_error();
+                tracing::warn!(
+                    subscription_id = %sub_id.0,
+                    error = %e,
+                    "event repository resolution failed; the pass stops and the next \
+                     tick retries the same page"
+                );
+                return false;
+            }
+        };
+
         for event in events {
             if cancel.is_cancelled() {
                 return true;
@@ -544,7 +706,15 @@ async fn catch_up(
             // The mark before this event: where a restart would resume if
             // this event is not consumed here.
             let resume_from = cursor.mark();
-            match process_event_for_subscription(&event, subscription, deps, resume_from).await {
+            match process_event_for_subscription(
+                &event,
+                sub_id,
+                deps,
+                resume_from,
+                &repository_index,
+            )
+            .await
+            {
                 Disposition::Consumed => {
                     // Advance only over an event this task is done with —
                     // delivered, filtered out, or dropped for want of a
@@ -586,35 +756,53 @@ enum Disposition {
 /// and because reads resume with a strict `>` the next pass would start
 /// above it. One transport attempt, ever, and a 30-second receiver outage
 /// would silently swallow every event that arrived in it.
+///
+/// `repository_index` is the page-wide aggregate→repository resolution
+/// [`catch_up`] built before the walk. Taking it as a parameter rather
+/// than resolving here is what keeps the per-event path free of I/O.
 async fn process_event_for_subscription(
     event: &PersistedEvent,
-    subscription: &Subscription,
+    sub_id: SubscriptionId,
     deps: &SubscriptionTaskDeps,
     resume_from: Option<u64>,
+    repository_index: &EventRepositoryIndex,
 ) -> Disposition {
-    // 1. Load the current evaluator snapshot. One `.load()` per event;
-    //    revocation propagates within the auth cache TTL.
+    // 1. Load the three inputs to this event's decision together — one
+    //    `.load()` each per event. The evaluator carries the owner's
+    //    grants, the principal carries the owner's live `is_admin` bit,
+    //    and the delivery shape carries the live row's filter and
+    //    target; steps 2 to 4 below decide one event against this one
+    //    snapshot. Taking them in one place is what keeps the three the
+    //    same age — any of them changing (a revoked grant, a revoked
+    //    admin bit, a PATCHed filter or target) reaches this walk
+    //    within its publisher's refresh cadence and no later.
     let evaluator_guard = deps.rbac.load();
     let evaluator = &**evaluator_guard;
+    let owner_principal_guard = deps.owner_principal.load();
+    let owner_principal = &**owner_principal_guard;
+    let shape_guard = deps.delivery_shape.load();
+    let shape = &**shape_guard;
 
     // 2. Filter via the pure subscription_filter helper.
     let ctx = FilterContext {
         rbac: evaluator,
         repositories: &deps.repositories,
-        owner_principal: &deps.owner_principal,
+        owner_principal,
+        repository_index,
     };
-    if !filter_matches(&subscription.filter, event, &ctx).await {
+    if !filter_matches(&shape.filter, event, &ctx).await {
         return Disposition::Consumed;
     }
 
-    // 3. Find a notifier that supports the target.
-    let notifier = deps
-        .notifiers
-        .iter()
-        .find(|n| n.supports(&subscription.target));
+    // 3. Find a notifier that supports the target. Resolved from the
+    //    live shape, so the first delivery after a target PATCH already
+    //    goes to the new target; the registry walk itself is unchanged,
+    //    and a target no adapter supports keeps its degraded-state
+    //    behaviour below.
+    let notifier = deps.notifiers.iter().find(|n| n.supports(&shape.target));
     let Some(notifier) = notifier else {
         tracing::warn!(
-            subscription_id = %subscription.id.0,
+            subscription_id = %sub_id.0,
             "no EventNotifier supports this target_kind; dropping event"
         );
         return Disposition::Consumed;
@@ -626,13 +814,11 @@ async fn process_event_for_subscription(
     // v1 keeps the per-event semantics simple.
     let _ = NOTIFY_BATCH_SIZE;
     let batch = std::slice::from_ref(event);
-    let outcome = notifier
-        .notify(&subscription.target, subscription.id, batch)
-        .await;
+    let outcome = notifier.notify(&shape.target, sub_id, batch).await;
     let elapsed_secs = started.elapsed().as_secs_f64();
 
     // 5. Emit metrics (cardinality-safe closed labels).
-    let target_kind = target_kind_label(&subscription.target);
+    let target_kind = target_kind_label(&shape.target);
     let result = notify_outcome_label(&outcome);
     emit_notify_delivery(target_kind, result, elapsed_secs);
 
@@ -648,7 +834,7 @@ async fn process_event_for_subscription(
             let exhausted = b.record_failure(now);
             let consecutive = b.count_at(now);
             tracing::warn!(
-                subscription_id = %subscription.id.0,
+                subscription_id = %sub_id.0,
                 consecutive_failures = consecutive,
                 "subscription delivery failure"
             );
@@ -680,11 +866,11 @@ async fn process_event_for_subscription(
     if should_persist {
         if let Err(e) = deps
             .use_case
-            .record_delivery_progress(subscription.id, position, failure_record.as_ref())
+            .record_delivery_progress(sub_id, position, failure_record.as_ref())
             .await
         {
             tracing::warn!(
-                subscription_id = %subscription.id.0,
+                subscription_id = %sub_id.0,
                 error = %e,
                 "record_delivery_progress failed"
             );
@@ -694,20 +880,17 @@ async fn process_event_for_subscription(
     // 8. Budget exhausted? Transition to Disabled and signal exit.
     if budget_exhausted {
         tracing::info!(
-            subscription_id = %subscription.id.0,
+            subscription_id = %sub_id.0,
             reason = "DeliveryFailureBudgetExhausted",
             "subscription disabled by dispatcher (budget exhausted)"
         );
         if let Err(e) = deps
             .use_case
-            .disable(
-                subscription.id,
-                DisableReason::DeliveryFailureBudgetExhausted,
-            )
+            .disable(sub_id, DisableReason::DeliveryFailureBudgetExhausted)
             .await
         {
             tracing::warn!(
-                subscription_id = %subscription.id.0,
+                subscription_id = %sub_id.0,
                 error = %e,
                 "disable on budget-exhaust failed; task will still exit"
             );
@@ -764,6 +947,7 @@ mod tests {
     use crate::rbac::RbacEvaluator;
     use crate::use_cases::subscription_use_case::{SubscriptionUseCase, SubscriptionUseCaseConfig};
     use crate::use_cases::test_support::{
+        MockArtifactGroupRepository, MockArtifactRepository, MockEventRepositoryResolver,
         MockEventStore, MockRepositoryRepository, MockUserRepository,
     };
 
@@ -1147,9 +1331,13 @@ mod tests {
         ))
     }
 
+    /// `sub` seeds the published [`DeliveryShape`] — the task reads its
+    /// filter and target from there, never from the row it is spawned
+    /// with, so a test that wants a particular filter or target has to
+    /// publish it here (which is exactly what the reconcile pass does).
     #[allow(clippy::needless_pass_by_value)]
     fn make_deps(
-        owner_user_id: Uuid,
+        sub: &Subscription,
         rbac: Arc<ArcSwap<RbacEvaluator>>,
         notifier: Arc<dyn EventNotifier>,
         sub_repo: Arc<MockSubRepo>,
@@ -1160,13 +1348,24 @@ mod tests {
             Arc::new(EventStorePublisher::without_broadcast(mock_event_store));
         let use_case = make_use_case(sub_repo, event_store_publisher.clone(), rbac.clone());
         let repos: Arc<dyn RepositoryRepository> = Arc::new(MockRepositoryRepository::new());
-        let _ = owner_user_id;
         SubscriptionTaskDeps {
             event_store: event_store_publisher,
             use_case,
             rbac,
             repositories: repos,
-            owner_principal: principal,
+            // Empty artifact / group stores: every event these tests
+            // drive is an `ArtifactIngested`, which carries its
+            // repository in the payload and therefore needs no
+            // resolution. The disclosure-resolving paths have their own
+            // tests below, which seed the stores.
+            event_visibility: Arc::new(EventVisibilityUseCase::new(Arc::new(
+                MockEventRepositoryResolver::new(
+                    Arc::new(MockArtifactRepository::new()),
+                    Arc::new(MockArtifactGroupRepository::new()),
+                ),
+            ))),
+            owner_principal: Arc::new(ArcSwap::from_pointee(principal)),
+            delivery_shape: Arc::new(ArcSwap::from_pointee(DeliveryShape::from(sub))),
             notifiers: vec![notifier],
             budget: Arc::new(Mutex::new(FailureBudget::new())),
             progress: Arc::new(Mutex::new(ProgressDebouncer::new(
@@ -1237,17 +1436,17 @@ mod tests {
         sub_repo.insert(sub.clone());
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier.clone(),
-            sub_repo,
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier.clone(), sub_repo, mock_es, principal);
         let event = ingested_event(repo_id, 1);
         // No budget exhaustion possible — single event, mismatched filter.
-        let disposition = process_event_for_subscription(&event, &sub, &deps, None).await;
+        let disposition = process_event_for_subscription(
+            &event,
+            sub.id,
+            &deps,
+            None,
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         assert!(
             matches!(disposition, Disposition::Consumed),
             "a filtered-out event is consumed, so the pass walks on past it"
@@ -1267,16 +1466,16 @@ mod tests {
         sub_repo.insert(sub.clone());
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier.clone(),
-            sub_repo,
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier.clone(), sub_repo, mock_es, principal);
         let event = ingested_event(repo_id, 5);
-        let disposition = process_event_for_subscription(&event, &sub, &deps, None).await;
+        let disposition = process_event_for_subscription(
+            &event,
+            sub.id,
+            &deps,
+            None,
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         assert!(matches!(disposition, Disposition::Consumed));
         let calls = notifier.calls();
         assert_eq!(calls.len(), 1, "exactly one notify call");
@@ -1298,17 +1497,17 @@ mod tests {
         sub_repo.insert(sub.clone());
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier,
-            sub_repo.clone(),
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier, sub_repo.clone(), mock_es, principal);
         // Zero-interval debouncer in make_deps → first success persists.
         let event = ingested_event(repo_id, 42);
-        let _ = process_event_for_subscription(&event, &sub, &deps, Some(41)).await;
+        let _ = process_event_for_subscription(
+            &event,
+            sub.id,
+            &deps,
+            Some(41),
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         let progress = sub_repo.progress_calls();
         assert_eq!(progress.len(), 1);
         assert_eq!(progress[0].0, sub.id);
@@ -1335,16 +1534,16 @@ mod tests {
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Failed {
             reason: NotifyFailureReason::Dns,
         }));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier,
-            sub_repo.clone(),
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier, sub_repo.clone(), mock_es, principal);
         let event = ingested_event(repo_id, 7);
-        let disposition = process_event_for_subscription(&event, &sub, &deps, Some(6)).await;
+        let disposition = process_event_for_subscription(
+            &event,
+            sub.id,
+            &deps,
+            Some(6),
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         assert!(
             matches!(disposition, Disposition::Halt),
             "a failed delivery halts the pass; a single failure does not exhaust the budget"
@@ -1377,22 +1576,21 @@ mod tests {
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Failed {
             reason: NotifyFailureReason::ConnectTimeout,
         }));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier,
-            sub_repo.clone(),
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier, sub_repo.clone(), mock_es, principal);
         // Cycle 100 events. In production each of these is a separate
         // pass retrying the same event; here the positions differ only so
         // the assertion can tell the calls apart.
         let mut exhausted = false;
         for i in 1..=100u64 {
             let event = ingested_event(repo_id, i);
-            let disposition =
-                process_event_for_subscription(&event, &sub, &deps, Some(i - 1)).await;
+            let disposition = process_event_for_subscription(
+                &event,
+                sub.id,
+                &deps,
+                Some(i - 1),
+                &EventRepositoryIndex::empty(),
+            )
+            .await;
             exhausted = matches!(disposition, Disposition::ExitTask);
             if exhausted {
                 break;
@@ -1416,7 +1614,7 @@ mod tests {
         let mock_es = Arc::new(MockEventStore::new());
         let unsupported: Arc<dyn EventNotifier> = Arc::new(UnsupportedNotifier);
         let mut deps = make_deps(
-            owner_user_id,
+            &sub,
             rbac,
             unsupported,
             sub_repo.clone(),
@@ -1426,7 +1624,14 @@ mod tests {
         // Replace with empty registry to also exercise the empty branch.
         deps.notifiers = vec![];
         let event = ingested_event(repo_id, 1);
-        let disposition = process_event_for_subscription(&event, &sub, &deps, None).await;
+        let disposition = process_event_for_subscription(
+            &event,
+            sub.id,
+            &deps,
+            None,
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         assert!(
             matches!(disposition, Disposition::Consumed),
             "an undeliverable target is not a delivery failure — it must not wedge the pass"
@@ -1450,16 +1655,16 @@ mod tests {
         sub_repo.insert(sub.clone());
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier.clone(),
-            sub_repo,
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier.clone(), sub_repo, mock_es, principal);
         let event = ingested_event(Uuid::new_v4(), 1);
-        let _ = process_event_for_subscription(&event, &sub, &deps, None).await;
+        let _ = process_event_for_subscription(
+            &event,
+            sub.id,
+            &deps,
+            None,
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         assert_eq!(notifier.calls().len(), 1);
     }
 
@@ -1480,17 +1685,10 @@ mod tests {
             vec![ingested_event(repo_id, 1), ingested_event(repo_id, 2)],
         );
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier.clone(),
-            sub_repo,
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier.clone(), sub_repo, mock_es, principal);
         let cancel = CancellationToken::new();
         let mut cursor = ReadCursor::new(sub.last_delivered_position);
-        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        let exit = catch_up(sub.id, &deps, &cancel, &mut cursor).await;
         assert!(!exit, "healthy catch-up must not signal task exit");
         assert_eq!(
             notifier.calls().len(),
@@ -1500,6 +1698,167 @@ mod tests {
         assert!(
             matches!(cursor.read_from(), SubscribeFrom::AfterGlobal(2)),
             "the cursor must have advanced over everything the pass read"
+        );
+    }
+
+    /// A counting resolver that answers from a fixed map and records
+    /// how many times it was called. Lets a test assert the page-level
+    /// batch boundary: ONE call for the whole page, never one per event.
+    struct CountingResolver {
+        artifacts: HashMap<Uuid, Uuid>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+
+    impl hort_domain::ports::event_repository_resolver::EventRepositoryResolver for CountingResolver {
+        fn resolve_event_aggregates<'a>(
+            &'a self,
+            artifact_ids: &'a [Uuid],
+            _artifact_group_ids: &'a [Uuid],
+        ) -> BoxFuture<
+            'a,
+            DomainResult<hort_domain::ports::event_repository_resolver::EventAggregateRepositories>,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Box::pin(async {
+                    Err(DomainError::Invariant("database error: down".into()))
+                });
+            }
+            let artifacts = artifact_ids
+                .iter()
+                .filter_map(|id| self.artifacts.get(id).map(|r| (*id, *r)))
+                .collect();
+            Box::pin(async move {
+                Ok(
+                    hort_domain::ports::event_repository_resolver::EventAggregateRepositories {
+                        artifacts,
+                        artifact_groups: HashMap::new(),
+                    },
+                )
+            })
+        }
+    }
+
+    /// `ArtifactQuarantined` on the artifact's own stream — payload
+    /// names the artifact, not the repository.
+    fn quarantined_event(artifact_id: Uuid, global_pos: u64) -> PersistedEvent {
+        PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: StreamId::artifact(artifact_id),
+            stream_position: 0,
+            global_position: global_pos,
+            event: DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+                artifact_id,
+                quarantine_window_start: Utc::now(),
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: Actor::Api(ApiActor {
+                user_id: Uuid::new_v4(),
+            }),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }
+    }
+
+    /// The catch-up pass resolves the whole page's repository
+    /// disclosures in ONE round trip and delivers the events the owner
+    /// holds `Read` on.
+    ///
+    /// Both halves matter: the delivery is the symmetry half of the fix
+    /// (these events used to be dropped outright for a
+    /// `RepositoryScope::Some` owner and delivered indiscriminately for
+    /// an `OwnedByActor` one), and the call count is the hot-path
+    /// constraint — a resolution per event would be four calls here.
+    #[tokio::test]
+    async fn catch_up_resolves_the_page_once_and_delivers_what_the_owner_may_read() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let artifact_a = Uuid::new_v4();
+        let artifact_b = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::Some(vec![repo_id]));
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(
+            StreamCategory::Artifact,
+            vec![
+                quarantined_event(artifact_a, 1),
+                quarantined_event(artifact_b, 2),
+                quarantined_event(artifact_a, 3),
+                quarantined_event(artifact_b, 4),
+            ],
+        );
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut deps = make_deps(&sub, rbac, notifier.clone(), sub_repo, mock_es, principal);
+        deps.event_visibility = Arc::new(EventVisibilityUseCase::new(Arc::new(CountingResolver {
+            artifacts: HashMap::from([(artifact_a, repo_id), (artifact_b, repo_id)]),
+            calls: calls.clone(),
+            fail: false,
+        })));
+
+        let cancel = CancellationToken::new();
+        let mut cursor = ReadCursor::new(sub.last_delivered_position);
+        let exit = catch_up(sub.id, &deps, &cancel, &mut cursor).await;
+
+        assert!(!exit);
+        assert_eq!(
+            notifier.calls().len(),
+            4,
+            "an allow-list naming the artifacts' repository must receive that \
+             repository's lifecycle events — the half the bypass fix must not lose"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the page must cost ONE resolution, not one per event"
+        );
+    }
+
+    /// A failed resolution ends the pass with the cursor where it is, so
+    /// the next tick retries the same page. Advancing over an unresolved
+    /// page would drop the owner's own events permanently: the
+    /// disclosure would read as unresolvable, the events would filter
+    /// out as `Consumed`, and the mark would move past them.
+    #[tokio::test]
+    async fn catch_up_stops_without_advancing_when_resolution_fails() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let artifact = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(
+            StreamCategory::Artifact,
+            vec![
+                quarantined_event(artifact, 1),
+                quarantined_event(artifact, 2),
+            ],
+        );
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let mut deps = make_deps(&sub, rbac, notifier.clone(), sub_repo, mock_es, principal);
+        deps.event_visibility = Arc::new(EventVisibilityUseCase::new(Arc::new(CountingResolver {
+            artifacts: HashMap::new(),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail: true,
+        })));
+
+        let cancel = CancellationToken::new();
+        let mut cursor = ReadCursor::new(sub.last_delivered_position);
+        let exit = catch_up(sub.id, &deps, &cancel, &mut cursor).await;
+
+        assert!(!exit, "a resolution failure is not task-fatal");
+        assert!(notifier.calls().is_empty(), "nothing is delivered");
+        assert!(
+            matches!(cursor.read_from(), SubscribeFrom::Start),
+            "the mark must not move, so the next tick retries the same page"
         );
     }
 
@@ -1515,17 +1874,10 @@ mod tests {
         let mock_es = Arc::new(MockEventStore::new());
         // No category data seeded — read_category returns empty.
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier.clone(),
-            sub_repo,
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier.clone(), sub_repo, mock_es, principal);
         let cancel = CancellationToken::new();
         let mut cursor = ReadCursor::new(sub.last_delivered_position);
-        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        let exit = catch_up(sub.id, &deps, &cancel, &mut cursor).await;
         assert!(!exit);
         assert!(notifier.calls().is_empty());
     }
@@ -1542,18 +1894,11 @@ mod tests {
         let mock_es = Arc::new(MockEventStore::new());
         mock_es.set_category(StreamCategory::Artifact, vec![ingested_event(repo_id, 1)]);
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier.clone(),
-            sub_repo,
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier.clone(), sub_repo, mock_es, principal);
         let cancel = CancellationToken::new();
         cancel.cancel();
         let mut cursor = ReadCursor::new(sub.last_delivered_position);
-        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        let exit = catch_up(sub.id, &deps, &cancel, &mut cursor).await;
         assert!(exit, "cancellation must signal task exit");
         assert!(notifier.calls().is_empty());
     }
@@ -1625,7 +1970,7 @@ mod tests {
                 .expect("receiver attached");
         }
         assert!(
-            drain_pending_hints(&mut receiver, &sub),
+            drain_pending_hints(&mut receiver, sub.id, &sub.filter),
             "a lag makes the drain relevant regardless of what it dropped"
         );
         assert!(
@@ -1638,7 +1983,7 @@ mod tests {
 
         // And it returns on a closed channel rather than spinning.
         drop(sender);
-        assert!(!drain_pending_hints(&mut receiver, &sub));
+        assert!(!drain_pending_hints(&mut receiver, sub.id, &sub.filter));
     }
 
     /// A drained hint for a category outside the filter is not a reason to
@@ -1654,7 +1999,7 @@ mod tests {
             .send(Arc::new(ingested_event(repo_id, 1)))
             .expect("receiver attached");
         assert!(
-            !drain_pending_hints(&mut receiver, &sub),
+            !drain_pending_hints(&mut receiver, sub.id, &sub.filter),
             "an Artifact hint says nothing to a Policy-only subscription"
         );
 
@@ -1664,7 +2009,7 @@ mod tests {
             entity_id: Uuid::new_v4(),
         };
         sender.send(Arc::new(policy)).expect("receiver attached");
-        assert!(drain_pending_hints(&mut receiver, &sub));
+        assert!(drain_pending_hints(&mut receiver, sub.id, &sub.filter));
     }
 
     // -- catch_up cursor / exit-signal tests ------------------------------
@@ -1686,17 +2031,10 @@ mod tests {
         mock_es.set_category(StreamCategory::Artifact, vec![ingested_event(repo_id, 6)]);
         mock_es.inject_category_error_after_global_position(5);
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier.clone(),
-            sub_repo,
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier.clone(), sub_repo, mock_es, principal);
         let cancel = CancellationToken::new();
         let mut cursor = ReadCursor::new(sub.last_delivered_position);
-        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        let exit = catch_up(sub.id, &deps, &cancel, &mut cursor).await;
         assert!(!exit, "a read error is not a reason to stop the task");
         assert!(
             notifier.calls().is_empty(),
@@ -1735,7 +2073,7 @@ mod tests {
             reason: NotifyFailureReason::Dns,
         }));
         let deps = make_deps(
-            owner_user_id,
+            &sub,
             rbac,
             notifier.clone(),
             sub_repo.clone(),
@@ -1747,7 +2085,7 @@ mod tests {
 
         // Pass 1: position 41 fails, the pass stops there, and position 42
         // is not touched.
-        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        let exit = catch_up(sub.id, &deps, &cancel, &mut cursor).await;
         assert!(!exit, "one failure is not a reason to stop the task");
         assert_eq!(
             notifier
@@ -1769,7 +2107,7 @@ mod tests {
         let mut passes = 1;
         loop {
             passes += 1;
-            if catch_up(&sub, &deps, &cancel, &mut cursor).await {
+            if catch_up(sub.id, &deps, &cancel, &mut cursor).await {
                 break;
             }
             assert!(passes < 200, "the budget must bound the retry");
@@ -1816,7 +2154,7 @@ mod tests {
             reason: NotifyFailureReason::Dns,
         }));
         let deps = make_deps(
-            owner_user_id,
+            &sub,
             rbac,
             notifier.clone(),
             sub_repo.clone(),
@@ -1829,7 +2167,7 @@ mod tests {
         // of them; the 100th must reach the caller as an exit signal.
         let mut exit = false;
         for _ in 0..100 {
-            exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+            exit = catch_up(sub.id, &deps, &cancel, &mut cursor).await;
             if exit {
                 break;
             }
@@ -1863,7 +2201,7 @@ mod tests {
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
         let deps = make_deps(
-            owner_user_id,
+            &sub,
             rbac,
             notifier.clone(),
             sub_repo,
@@ -1912,7 +2250,7 @@ mod tests {
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
         let deps = make_deps(
-            owner_user_id,
+            &sub,
             rbac,
             notifier.clone(),
             sub_repo,
@@ -1961,7 +2299,7 @@ mod tests {
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
         let deps = make_deps(
-            owner_user_id,
+            &sub,
             rbac,
             notifier.clone(),
             sub_repo,
@@ -2007,7 +2345,7 @@ mod tests {
         sub_repo.insert(sub.clone());
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
-        let deps = make_deps(owner_user_id, rbac, notifier, sub_repo, mock_es, principal);
+        let deps = make_deps(&sub, rbac, notifier, sub_repo, mock_es, principal);
         let (sender, receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -2035,14 +2373,7 @@ mod tests {
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
         let notifier_for_assert = notifier.clone();
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier,
-            sub_repo,
-            mock_es.clone(),
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier, sub_repo, mock_es.clone(), principal);
         let (sender, receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -2081,7 +2412,7 @@ mod tests {
         mock_es.set_category(StreamCategory::Artifact, vec![ingested_event(repo_id, 99)]);
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
         let notifier_for_assert = notifier.clone();
-        let deps = make_deps(owner_user_id, rbac, notifier, sub_repo, mock_es, principal);
+        let deps = make_deps(&sub, rbac, notifier, sub_repo, mock_es, principal);
         // Capacity 1 + no consumer at spawn time → second send returns
         // SendError; first send + slow recv triggers Lagged on overflow.
         // We construct the channel, get a receiver, send 2 events without
@@ -2130,7 +2461,7 @@ mod tests {
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
         let deps = make_deps(
-            owner_user_id,
+            &sub,
             rbac,
             notifier.clone(),
             sub_repo,
@@ -2199,14 +2530,7 @@ mod tests {
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Failed {
             reason: NotifyFailureReason::Dns,
         }));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier,
-            sub_repo.clone(),
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier, sub_repo.clone(), mock_es, principal);
         prime_budget_to_one_short_of_exhaustion(&deps);
         let (sender, receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
         // Never cancelled: the task must stop on its own.
@@ -2245,7 +2569,7 @@ mod tests {
             reason: NotifyFailureReason::Dns,
         }));
         let deps = make_deps(
-            owner_user_id,
+            &sub,
             rbac,
             notifier,
             sub_repo.clone(),
@@ -2322,7 +2646,7 @@ mod tests {
         let life1_cancel = CancellationToken::new();
         let life1_notifier = Arc::new(CancelAfterFirstDelivery::new(life1_cancel.clone()));
         let deps = make_deps(
-            owner_user_id,
+            &sub,
             rbac.clone(),
             life1_notifier.clone(),
             sub_repo.clone(),
@@ -2363,7 +2687,7 @@ mod tests {
         sub2.last_delivered_position = seed;
         let life2_notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
         let deps2 = make_deps(
-            owner_user_id,
+            &sub2,
             rbac,
             life2_notifier.clone(),
             sub_repo.clone(),
@@ -2421,17 +2745,10 @@ mod tests {
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Failed {
             reason: NotifyFailureReason::Dns,
         }));
-        let deps = make_deps(
-            owner_user_id,
-            rbac,
-            notifier,
-            sub_repo.clone(),
-            mock_es,
-            principal,
-        );
+        let deps = make_deps(&sub, rbac, notifier, sub_repo.clone(), mock_es, principal);
         let cancel = CancellationToken::new();
         let mut cursor = ReadCursor::new(sub.last_delivered_position);
-        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        let exit = catch_up(sub.id, &deps, &cancel, &mut cursor).await;
         assert!(!exit);
         let progress = sub_repo.progress_calls();
         assert_eq!(progress.len(), 1, "a failure persists immediately");
@@ -2468,7 +2785,7 @@ mod tests {
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
         let deps = make_deps(
-            owner_user_id,
+            &sub,
             rbac,
             notifier.clone(),
             sub_repo,
@@ -2548,11 +2865,10 @@ mod tests {
                         .set_category(StreamCategory::Artifact, vec![ingested_event(repo_id, 6)]);
                     mock_es.inject_category_error_after_global_position(5);
                     let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
-                    let deps =
-                        make_deps(owner_user_id, rbac, notifier, sub_repo, mock_es, principal);
+                    let deps = make_deps(&sub, rbac, notifier, sub_repo, mock_es, principal);
                     let cancel = CancellationToken::new();
                     let mut cursor = ReadCursor::new(sub.last_delivered_position);
-                    assert!(!catch_up(&sub, &deps, &cancel, &mut cursor).await);
+                    assert!(!catch_up(sub.id, &deps, &cancel, &mut cursor).await);
                 });
         });
 

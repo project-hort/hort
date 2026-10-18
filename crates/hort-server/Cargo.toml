@@ -33,6 +33,14 @@ hort-http-core         = { workspace = true }
 # compile time. Backs the `license` / `attribution` subcommands
 # (`src/cli/license.rs`, `src/cli/attribution.rs`).
 hort-attribution       = { workspace = true }
+# Atomic 0600 secret-file write, shared with `hort-cli`. Backs the
+# `admin issue-svc-token` / `admin bootstrap-session` `--output=file:`
+# sink: the plaintext bearer must land in an inode this process created at
+# 0600, never in a pre-existing file whose mode or type it inherited. A
+# std-only leaf crate with zero `hort-*` deps of its own — see that
+# crate's Cargo.toml for why the helper cannot live in `hort-domain` or
+# `hort-app`.
+hort-secret-file       = { workspace = true }
 # The per-format HTTP adapter crates (ADR 0008). Each one
 # depends only on hort-domain + hort-app + hort-formats + hort-http-core and
 # carries no adapter deps. hort-server is the only crate that lists all
@@ -131,10 +139,10 @@ hort-formats           = { workspace = true }
 
 anyhow                       = { workspace = true }
 axum                         = { workspace = true }
-# Note: `serde` and `serde_yaml_ng` were dropped from this crate
-# alongside the legacy
-# `HORT_GROUP_MAPPINGS_PATH` loader. YAML parsing now lives entirely in
-# `hort-config`; hort-server only orchestrates the boot apply.
+# Note: YAML parsing was dropped from this crate alongside the legacy
+# `HORT_GROUP_MAPPINGS_PATH` loader. It now lives entirely in
+# `hort-config`; hort-server only orchestrates the boot apply. (`serde`
+# itself came back further down, for the embedded contractions manifest.)
 sqlx                         = { workspace = true }
 # The `enqueue-quarantine-release-sweep` subcommand
 # constructs an empty `serde_json::Value` to pass to
@@ -240,8 +248,16 @@ cargo_metadata = "0.23"
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # `gitops_boot::tests` builds a temp dir of
 # YAMLs to verify the directory walk skips hidden files/dirs and
-# is case-insensitive on the extension.
+# is case-insensitive on the extension. `cli::scrub::tests` also uses it
+# for the filesystem-CAS root the scrub composition tests tamper with.
 tempfile = "3.10"
+# `cli::scrub::tests` needs an `ObjectStore` handle to stand up
+# `ObjectStoreStorage` on `InMemory` and to tamper a stored object behind
+# the adapter's back. `object_store` is a regular dependency of
+# `hort-adapters-storage`, which does not make the crate's own types
+# reachable from here — hence the explicit dev-dep. Same version the
+# workspace already resolves, so `Cargo.lock` is unchanged.
+object_store = { workspace = true }
 # Capture/inspect `hort_rbac_snapshot_reloads_total`
 # in unit tests for the refresh task.
 metrics-util = { workspace = true, features = ["debugging"] }

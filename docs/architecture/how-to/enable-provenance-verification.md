@@ -182,8 +182,13 @@ Sigstore referrer(s) (Referrers API + `.sig` tag fallback), ingests the
 referrer manifest and its bundle blob, and verifies. The `docker-proxy`
 example below is therefore truthful — it can return a real `verified` /
 `rejected` verdict, not only `no_attestation`. An upstream fetch error
-**degrades to `no_attestation`** under `verify_if_present` (never
-fail-closed — the proxy stays available on upstream flakiness).
+never makes the proxy fail closed: the artifact runs its normal
+quarantine window and releases. It is **not** reported as
+`no_attestation`, though — that value says *the artifact carries no
+signature*, and here the artifact's signature is not what failed. A
+fetch that never landed is reported `allowed_indeterminate` (*we could
+not look*), so an unreachable upstream does not send you to the
+publisher's signing pipeline, which is the one place the fault is not.
 
 > **Tier-1 verifies the Sigstore *new bundle format* (v0.3) only.** The
 > verifier parses
@@ -460,22 +465,49 @@ exemption — see
   HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE (keyed cosign-key) is set`.
 - Metrics (see `docs/metrics-catalog.md`):
   - `hort_provenance_verify_total{backend="cosign", mode, result}` —
-    `result ∈ {verified, rejected, no_attestation}`.
+    `result ∈ {verified, rejected, no_attestation,
+    held_pending_signature, held_pending_subject, held_indeterminate,
+    allowed_indeterminate, cleared_signature_material,
+    requeued_no_anchor}`. The closed taxonomy and the meaning of each
+    value live in `docs/metrics-catalog.md`, which is normative; the
+    three you will reach for are `held_pending_signature` (waiting for a
+    signature), `held_pending_subject` (a constituent waiting for its
+    parent's clearance) and `held_indeterminate` (hort could not carry
+    the check out — fix the trust root or the verifier, or let the fetch
+    retry).
   - `hort_provenance_reject_total{backend="cosign", reason}` — the
     per-reason breakdown of rejections.
+  - `hort_provenance_unreadable_skipped_total{backend}` — incremented by
+    the number of attestation candidates a verify could not read and
+    therefore did **not** take into account. Unreadable material is
+    skipped, never a rejection, so a non-zero rate here means somebody is
+    attaching bytes that are not readable attestation material (a broken
+    publisher pipeline, or junk written to the referrers surface) while
+    the artifact's own verdict stands on whatever *was* readable. No
+    series at all when nothing was ever skipped.
   These are emitted by the **worker** and are scrapeable from the worker's
   `/metrics` listener — see *Worker metrics* below. The standing held
   population itself is not a metric — see the admin curation queue.
 - Per-job verdict: the `provenance-verify` job records a compact
   `result_summary` on its job row, one of
   `{"result": "verified"}`,
-  `{"result": "rejected:<reason>"}` (e.g. `rejected:unsigned`,
-  `rejected:untrusted_identity`),
-  `{"result": "no_attestation"}`, or
+  `{"result": "rejected:<reason>"}` (e.g. `rejected:untrusted_identity`,
+  `rejected:digest_mismatch`),
+  `{"result": "no_attestation"}`,
+  `{"result": "held_pending_signature"}`,
+  `{"result": "held_pending_subject"}`,
+  `{"result": "held_indeterminate"}`,
+  `{"result": "allowed_indeterminate"}`,
+  `{"result": "cleared:signature_material"}`,
+  `{"result": "requeued:<why>"}`, or
   `{"result": "skipped:<why>"}`. This is the per-artifact forensic trail —
   in particular the only durable record of the `no_attestation` case
   (which intentionally emits **no** per-artifact `info!` log, to avoid a
-  firehose at proxy scale).
+  firehose at proxy scale). A row gains a second key,
+  `"unreadable_skipped": <n>`, when the verify skipped that many
+  unreadable candidates — the per-artifact half of the counter above, and
+  how you find *which* artifact had garbage attached. Absent, not `0`, on
+  the ordinary row.
 - Audit: each verdict emits an `info!` line (`provenance verified` /
   `provenance rejected` with the `reason`) and a durable
   `ProvenanceVerified` / `ProvenanceRejected` domain event on the
@@ -558,3 +590,6 @@ Why this is structured as one knob, not two:
 | No `hort_provenance_*` series in Prometheus | The worker `/metrics` listener is disabled (default) | Set `worker.metrics.enabled: true` + a `worker.metrics.scrapeFrom` Prometheus selector — the chart sets the bind, exposes the port, and co-renders the scrape NetworkPolicy (*Worker metrics* above). |
 | `cosign verify $HORT/image` 503s right after push (older builds) | Signature was quarantined — fixed: pushed Sigstore-bundle signatures land status `None` now | Upgrade to a build with the pure-bundle signature-manifest exemption; no quarantine wait for pure-signature pushes. |
 | `required` image never clears despite a `cosign sign` — stays held (503) indefinitely | Signed with the legacy `sha256-<hex>.sig` tag mode — not subject-linked on the hosted push path, so invisible to the verifier | Re-sign with `cosign sign --registry-referrers-mode=oci-1-1 <ref>@<digest>` (subject-based referrers). The window is not a deadline: a correct re-sign clears the image whenever it lands (*The push-then-sign CI flow* above). |
+| Pushing a signature manifest fails 400 `MANIFEST_INVALID`, `detail.reason` = "layer is not well-formed as the signature media type it declares" | The manifest declares every layer to be signature material — which is what earns it the scan/quarantine exemption — but a declared layer's **bytes** do not parse as that shape. `detail.layer_digest` names the layer | Fix the signing step that produced those bytes (a truncated upload, a wrong `mediaType`, a non-bundle blob). hort checks **shape only** at push, never validity — a well-formed but untrusted signature is accepted here and judged by the verifier against the subject. |
+| Verdict looks right but `result_summary` carries `"unreadable_skipped": <n>` | Something attached bytes to the referrers surface that no verifier could read. They contribute **nothing** to the verdict — never a rejection — but they are counted so the attempt is visible | Find the offending referrer and fix (or remove) whatever wrote it. A non-zero `hort_provenance_unreadable_skipped_total` rate on a scope you publish to is usually a broken publisher pipeline. |
+| `held_indeterminate` on `required` (or `allowed_indeterminate` on `verify_if_present`) | hort could not carry the check out: no usable trust-root key, attestation material it never obtained, or a verifier that returned no verdict. Nothing about the artifact was established, so nothing is terminal | The action is on **hort's** side, not the publisher's — check the pinned trust root and the worker's upstream reachability. A fetch failure retries on the next verify; a trust-root fault clears every held artifact in the scope once the root is fixed. |

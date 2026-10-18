@@ -202,9 +202,20 @@ merely prevents a different service's token from being replayed at hort.
 **The tag restriction on `gha-release` lives in the GitHub Actions `release`
 environment, not in hort.** A glob like `ref: refs/tags/v*` cannot be used in SA
 claims because matching is exact. The `release` environment is declared as a
-protected GitHub Actions environment whose protection rules require a tag ref and
-reviewer approval; GitHub then emits the exact `environment: release` claim,
-which the SA matches. CI must explicitly request `aud: hort-server` when minting
+protected GitHub Actions environment whose protection rules require a **tag
+ref** (`Deployment branches and tags` = tags matching `v*`); GitHub then emits
+the exact `environment: release` claim, which the SA matches. **No reviewer
+requirement**, deliberately: a single-maintainer project gains no second pair of
+eyes from self-approval, so that half would be friction without review. The tag
+rule is what does the work, and it does it mechanically.
+
+An earlier revision of this paragraph named reviewer approval as part of the
+enforcement. Note what that cost: the rule relied on here was not configured at
+all until 2026-10-07, so this ADR described a control that did not exist, and
+the only thing actually restricting which refs could mint the claim was the
+`if:` conditions in the publish workflows — checked-in, editable, and at the
+time absent from two of the jobs. The decision was sound; it simply was not
+switched on. CI must explicitly request `aud: hort-server` when minting
 the token (`core.getIDToken('hort-server')` on GitHub; `id_tokens: { …: { aud:
 hort-server } }` on GitLab).
 

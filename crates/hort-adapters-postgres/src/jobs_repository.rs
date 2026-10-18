@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::jobs_repository::{
-    EnqueueOutcome, JobRow, JobStatus, JobsRepository, KindFields, ListJobsFilter, ListJobsPage,
-    PendingKindBacklog, RequeueOutcome, RequeuedJob, ScanJob, ScanKindFields, TriggerSource,
+    CompensatingDelete, EnqueueOutcome, JobRow, JobStatus, JobsRepository, KindFields,
+    ListJobsFilter, ListJobsPage, PendingKindBacklog, RequeueOutcome, RequeuedJob, ScanJob,
+    ScanKindFields, TriggerSource,
 };
 use hort_domain::types::{ContentHash, IdempotencyKey};
 use serde_json::Value as JsonValue;
@@ -166,22 +167,49 @@ const CLAIM_PENDING_BY_KINDS_SQL: &str = "WITH oldest AS MATERIALIZED (\n\
                      attempts, created_at, updated_at, completed_at, last_error, result_summary,\n\
                      artifact_id, repository_id, content_hash, format";
 
+/// `DELETE` behind [`JobsRepository::delete_job`] — the compensating
+/// rollback of an `enqueue_task` insert whose `TaskInvoked` append failed.
+///
+/// `AND status = 'pending'` is the load-bearing half of the predicate, and
+/// it is the mirror image of [`CLAIM_PENDING_BY_KINDS_SQL`]'s `WHERE status
+/// = 'pending' ... SET status = 'running'`: between the insert and this
+/// delete lies a failed event-store append — a network round-trip — and a
+/// worker can claim the row inside that window and begin executing it.
+/// Without the predicate this statement removes the claimed row together
+/// with its durable single-flight idempotency key (ADR 0028), so a second
+/// authorised invoke inserts afresh under the same key and two executions
+/// of a destructive task can run with no `TaskInvoked` for the first.
+///
+/// `rows_affected() == 0` is therefore a real outcome
+/// ([`CompensatingDelete::NoLongerPending`]), not a no-op: the caller has
+/// to surface it.
+///
+/// Kept as a named constant so the DB-free `delete_pending_job_sql_*`
+/// tests can pin the predicate without a database.
+const DELETE_PENDING_JOB_SQL: &str = "DELETE FROM public.jobs WHERE id = $1 AND status = 'pending'";
+
 /// Not-before applied to a row the abandoned-lease sweep returns to
 /// `pending`.
 ///
-/// The same 30 seconds the dispatcher's `compute_backoff` starts from,
-/// and for the same reason its `return_to_pending` gives an
-/// undispatchable row a backoff at all: the sweeping replica is also a
-/// claiming replica, and a row released with a NULL lease is eligible on
-/// that same replica's very next poll. A worker killed by the task
-/// itself (an OOM on one oversized artifact) would then re-take the row
-/// immediately and die again, spending the whole attempt budget inside
-/// one sweep interval instead of across several.
+/// Exists for the same reason the dispatcher's `return_to_pending`
+/// gives an undispatchable row a backoff at all: the sweeping replica is
+/// also a claiming replica, and a row released with a NULL lease is
+/// eligible on that same replica's very next poll. A worker killed by
+/// the task itself (an OOM on one oversized artifact) would then re-take
+/// the row immediately and die again, spending the whole attempt budget
+/// inside one sweep interval instead of across several.
 ///
 /// Flat rather than exponential: the row has already waited a full lease
 /// plus the grace before it gets here, so the purpose of this delay is
 /// only to break the same-replica re-grab, and the attempt cap — not the
 /// spacing — is what bounds a crash loop.
+///
+/// Deliberately **not** the retry curve's first interval
+/// (`hort_app::retry_backoff::compute_backoff`, 60 s). That curve sets
+/// how long the system tolerates a dependency that keeps failing; this
+/// number only has to outlast one poll interval, and the lease plus its
+/// grace — half an hour at the defaults — has already supplied every
+/// bit of patience this row needs.
 const REQUEUE_BACKOFF: Duration = Duration::from_secs(30);
 
 /// `last_error` written onto a row the abandoned-lease sweep resolves.
@@ -1107,15 +1135,19 @@ impl JobsRepository for PgJobsRepository {
         })
     }
 
-    fn delete_job<'a>(&'a self, job_id: Uuid) -> BoxFuture<'a, DomainResult<()>> {
+    fn delete_job<'a>(&'a self, job_id: Uuid) -> BoxFuture<'a, DomainResult<CompensatingDelete>> {
         Box::pin(async move {
             tracing::debug!(%job_id, "delete_job (compensating)");
-            sqlx::query("DELETE FROM public.jobs WHERE id = $1")
+            let res = sqlx::query(DELETE_PENDING_JOB_SQL)
                 .bind(job_id)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Job", &job_id.to_string()))?;
-            Ok(())
+            if res.rows_affected() == 0 {
+                Ok(CompensatingDelete::NoLongerPending)
+            } else {
+                Ok(CompensatingDelete::RolledBack)
+            }
         })
     }
 
@@ -2017,6 +2049,56 @@ mod tests {
         );
     }
 
+    /// The compensating delete is status-scoped, and both halves of the
+    /// predicate are load-bearing: `id = $1` makes it reach exactly the
+    /// row the failed enqueue inserted, `status = 'pending'` makes it
+    /// refuse a row a worker has already claimed. A rewrite that drops the
+    /// status half compiles, passes clippy and passes every DB test that
+    /// only ever deletes an unclaimed row — and silently destroys the
+    /// durable single-flight idempotency key of a destructive task that is
+    /// at that moment executing.
+    #[test]
+    fn delete_pending_job_sql_carries_the_status_predicate() {
+        let sql = DELETE_PENDING_JOB_SQL;
+        assert!(
+            sql.starts_with("DELETE FROM public.jobs WHERE id = $1"),
+            "the compensating delete must address one row by bound id. Full SQL:\n{sql}"
+        );
+        assert!(
+            sql.contains("status = 'pending'"),
+            "without the status predicate the delete removes a claimed, executing row \
+             and frees its idempotency key, admitting a second destructive execution \
+             with no TaskInvoked for the first. Full SQL:\n{sql}"
+        );
+        assert!(
+            !sql.contains("status IN ("),
+            "the predicate is the single status `enqueue_task` inserts, not a set — \
+             `running` and the terminal statuses are exactly what it must refuse. \
+             Full SQL:\n{sql}"
+        );
+    }
+
+    /// Counter-assertion: the predicate the compensating delete refuses is
+    /// the same one the claim consumes. If a future edit renamed the
+    /// `pending` literal (a status-enum change, say) on only one side, the
+    /// pin above would keep passing against a statement that no longer
+    /// mirrors the claim.
+    #[test]
+    fn delete_pending_job_sql_mirrors_the_claim_predicate() {
+        assert!(
+            CLAIM_PENDING_BY_KINDS_SQL.contains("WHERE status = 'pending'")
+                && CLAIM_PENDING_BY_KINDS_SQL.contains("status = 'running'"),
+            "the claim must still be the `pending -> running` transition this delete \
+             is scoped against. Full SQL:\n{CLAIM_PENDING_BY_KINDS_SQL}"
+        );
+        assert!(
+            DELETE_PENDING_JOB_SQL.contains("'pending'")
+                && !DELETE_PENDING_JOB_SQL.contains("'running'"),
+            "the compensating delete names the pre-claim status and only that one. \
+             Full SQL:\n{DELETE_PENDING_JOB_SQL}"
+        );
+    }
+
     /// Two rows per kind are retained, not one, and the `completed` half
     /// is the one a "keep the newest terminal row" reading would drop.
     /// Dropping it makes `last_completed_at_by_kind` answer `None` —
@@ -2519,7 +2601,7 @@ mod tests {
     // Cascade tests against the real partial unique indexes
     // (`jobs_prefetch_unique` + `jobs_prefetch_dependencies_unique`)
     // and the retention sweep predicate. Carries `#[serial(hort_pg_db)]`
-    // per ADR 0019.
+    // per CLAUDE.md's parallel-safety contract.
     // -----------------------------------------------------------------
 
     use hort_domain::ports::jobs_repository::IdempotentEnqueueRow as IER;
@@ -2889,8 +2971,8 @@ mod tests {
     // -----------------------------------------------------------------
     // Generic (`other kind`) retention sweep — the horizon for every
     // `jobs.kind` the two kind-specific sweeps do not reach. Carries
-    // `#[serial(hort_pg_db)]` per ADR 0019; note that the per-test
-    // database `maybe_pool()` creates is NOT isolation from
+    // `#[serial(hort_pg_db)]` per CLAUDE.md's parallel-safety contract; note
+    // that the per-test database `maybe_pool()` creates is NOT isolation from
     // cluster-global work, which is what the serial key covers.
     // -----------------------------------------------------------------
 
@@ -3388,9 +3470,9 @@ mod tests {
 
     // -----------------------------------------------------------------
     // `record_run_completion` + `last_completed_at_by_kind` round-trip.
-    // Carries `#[serial(hort_pg_db)]` per ADR 0019 (the suite runs in
-    // parallel against one shared backend). Silently skips if
-    // `DATABASE_URL` is unset (expected locally).
+    // Carries `#[serial(hort_pg_db)]` per CLAUDE.md's parallel-safety
+    // contract (the suite runs in parallel against one shared backend).
+    // Silently skips if `DATABASE_URL` is unset (expected locally).
     // -----------------------------------------------------------------
 
     /// `record_run_completion` inserts a terminal `completed` row whose

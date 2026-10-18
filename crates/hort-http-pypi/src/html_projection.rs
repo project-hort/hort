@@ -123,18 +123,24 @@ impl MetadataProjector for HtmlSimpleIndexProjector {
                 Some(pos) => (&href[..pos], &href[pos + 1..]),
                 None => (href, ""),
             };
-            let filename = url_path.rsplit('/').next().unwrap_or(url_path).to_string();
+            // Un-escape AFTER the segment split, never before: the five
+            // entities `html_escape` emits do not include `&#47;`, so no
+            // decode can introduce a `/` that would have changed where
+            // the basename starts.
+            let filename = html_unescape(url_path.rsplit('/').next().unwrap_or(url_path));
             if filename.is_empty() {
                 continue;
             }
 
             // Hash: only the `sha256=` fragment form (PEP 503 §URL).
-            let sha256 = fragment.strip_prefix("sha256=").map(str::to_string);
+            // The fragment is part of the `href` attribute value, so it
+            // un-escapes on the same terms as the rest of it.
+            let sha256 = fragment.strip_prefix("sha256=").map(html_unescape);
 
             let requires_python = REQUIRES_PYTHON_RE
                 .captures(attrs)
                 .and_then(|c| c.get(1))
-                .map(|m| html_unescape_attr(m.as_str()));
+                .map(|m| html_unescape(m.as_str()));
 
             // PEP 658 advertisement — keep the upstream's
             // `data-dist-info-metadata="sha256=<hex>"` so the rebuilt
@@ -160,18 +166,40 @@ impl MetadataProjector for HtmlSimpleIndexProjector {
     }
 }
 
-/// HTML un-escape — the inverse of `html_escape_attr` in
-/// `hort-formats::pypi::index`. Mirrors the legacy
-/// `index_source::html_unescape_attr`: the builder emits HTML-escaped
-/// attribute values, so parsing upstream HTML must un-escape to recover
-/// the original PEP 503 `requires-python` string. Conservative — any
-/// unrecognised entity passes through verbatim.
-fn html_unescape_attr(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
+/// HTML un-escape — the inverse of `html_escape` in
+/// `hort-formats::pypi::index`, and named to match it. Mirrors the
+/// legacy `index_source::html_unescape_attr`: a conforming upstream
+/// HTML-escapes its attribute values, so parsing one must un-escape to
+/// recover the original bytes. Conservative — any unrecognised entity
+/// passes through verbatim.
+///
+/// Applied to **every** value this projector lifts out of an attribute
+/// — the `href`-derived filename as well as `requires-python`. The
+/// escape side is total (see `html_escape`'s escaping contract), so a
+/// partial inverse here would silently mangle a hort-behind-hort chain:
+/// the upstream's `foo&amp;bar-1.0.tar.gz` would project as the literal
+/// filename `foo&amp;bar-1.0.tar.gz`, get re-escaped to
+/// `foo&amp;amp;bar-1.0.tar.gz` on the way out, and the JSON arm — which
+/// does no escaping at all — would publish the mangled form directly in
+/// `files[].url`.
+///
+/// `data-dist-info-metadata` needs no un-escaping: its regex already
+/// constrains the capture to `[a-f0-9]{64}`.
+fn html_unescape(s: &str) -> String {
+    // `&amp;` LAST, and that order is the whole correctness of this
+    // function. Decoding it first turns `&amp;lt;` — which a conforming
+    // upstream writes for the literal four characters `&lt;` — into
+    // `&lt;` and then into `<`, so a value that was never a tag becomes
+    // one. Decoding the other four first leaves `&amp;lt;` untouched
+    // until the final step restores exactly one `&`.
+    //
+    // The escape side runs the mirror order (`&` first) for the mirror
+    // reason, which is what makes the pair a true round trip.
+    s.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 #[cfg(test)]
@@ -252,6 +280,48 @@ mod tests {
         let body = b"<a href=\"https://h/a.whl\">a</a>".to_vec(); // < 40 bytes
         let p = projector.project(Cursor::new(body)).expect("at-cap body");
         assert_eq!(p.files.len(), 1);
+    }
+
+    /// `html_unescape` is the exact inverse of `html_escape`, including
+    /// for a value that itself spells an entity.
+    ///
+    /// A conforming upstream writes `&amp;lt;` for the literal four
+    /// characters `&lt;`. Decoding `&amp;` before the others collapses
+    /// that to `<` — a value that was never a tag becomes one, and the
+    /// re-emitted page then carries a different filename than the
+    /// upstream published. Single-entity fixtures cannot see this: the
+    /// orders only diverge once a decoded `&` can re-form a second
+    /// entity with the text behind it.
+    #[test]
+    fn unescape_is_the_inverse_of_escape_for_a_nested_entity() {
+        // What the upstream means, what it therefore writes.
+        let literal = "req&lt;uests-1.0.tar.gz";
+        let on_the_wire = "req&amp;lt;uests-1.0.tar.gz";
+
+        assert_eq!(
+            html_unescape(on_the_wire),
+            literal,
+            "decoding must restore the upstream's literal, not re-read it as markup"
+        );
+        assert_eq!(
+            html_unescape("req&amp;uests-1.0.tar.gz"),
+            "req&uests-1.0.tar.gz",
+            "the ordinary single-entity case is unchanged"
+        );
+        // Round trip in the direction the proxy actually runs: project a
+        // conforming upstream's page, then re-emit it. `html_escape`
+        // lives in hort-formats; mirror it here rather than reaching
+        // across the crate boundary for a five-character replace.
+        let re_escaped = literal
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;");
+        assert_eq!(
+            re_escaped, on_the_wire,
+            "escape(unescape(x)) == x — the pair is a round trip, not two independent tables"
+        );
     }
 
     #[test]

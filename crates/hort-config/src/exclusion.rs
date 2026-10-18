@@ -36,10 +36,23 @@ pub struct ExclusionSpec {
     /// CVE (typical when the registry serves only one package family).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_pattern: Option<String>,
-    /// `global` or `{ repository: <metadata.name> }`. The cross-spec
-    /// validator does NOT resolve the repository reference here —
-    /// the apply pipeline inherits the resolution from the parent
-    /// policy's scope when present.
+    /// `global` — the only value apply accepts.
+    ///
+    /// `{ repository: <metadata.name> }` is still part of the shared
+    /// [`ScopeSpec`] shape (`ScanPolicy` uses it, and the Exclusion read
+    /// surface renders it for rows stored before the rule below), but
+    /// declaring one is rejected by
+    /// [`validate_exclusion_scope_not_implemented`](crate::desired::validate_exclusion_scope_not_implemented):
+    /// the finding filter never reads an exclusion's scope, so a waiver
+    /// narrowed to one repository clears its CVE for every repository
+    /// the parent policy governs (ADR 0015 —
+    /// [`SCOPE_NOT_ENFORCED`](hort_domain::policy::SCOPE_NOT_ENFORCED)).
+    /// That is also why there is no dangling-reference rule for the
+    /// name: a rule catching only the undeclared ones would be dead
+    /// behind this one.
+    ///
+    /// To waive a CVE for one repository, scope the parent `ScanPolicy`
+    /// to it — a policy scope *is* enforced.
     pub scope: ScopeSpec,
     /// Operator-facing rationale stored on the `ExclusionAdded`
     /// event. Mandatory by intent — empty rationale is an audit
@@ -54,7 +67,7 @@ pub struct ExclusionSpec {
 
 /// Parse one `Exclusion` envelope.
 pub fn parse_exclusion(_path: &Path, bytes: &[u8]) -> Result<Envelope<ExclusionSpec>, ParseError> {
-    let env: Envelope<ExclusionSpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<ExclusionSpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::Exclusion {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),

@@ -38,6 +38,7 @@ const SCAN_METRICS: &[&str] = &[
     "hort_advisory_query_total",
     "hort_sbom_extraction_total",
     "hort_sbom_resolution_total",
+    "hort_finding_component_relation_total",
     "hort_sbom_components_skipped_total",
     "hort_artifact_became_vulnerable_total",
     "hort_scan_record_outcome_failures_total",

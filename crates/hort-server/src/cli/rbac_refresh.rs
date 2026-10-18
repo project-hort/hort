@@ -387,12 +387,6 @@ mod tests {
             // complete trait impl.
             Box::pin(async { Ok(Vec::new()) })
         }
-
-        fn save_managed(&self, _items: &[PermissionGrant]) -> BoxFuture<'_, DomainResult<()>> {
-            // Not exercised by the refresh task (read-once-at-boot
-            // contract — the apply pipeline owns the write path).
-            Box::pin(async { Ok(()) })
-        }
     }
 
     // -- Fixture builders -------------------------------------------------

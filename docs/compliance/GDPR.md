@@ -49,9 +49,13 @@ imposes stricter floors (e.g. financial services, healthcare).
 All categories share one Postgres event-store table (`events`). Retention
 is enforced by an out-of-process retention runner that deletes **whole event
 streams** once their category's floor has elapsed: `delete_stream` emits a
-`StreamSealed` tombstone and removes the stream's rows
-(`DELETE FROM events WHERE stream_id = $1`) under the dedicated retention
-role — never a per-row delete, which would break the per-stream hash chain.
+`StreamSealed` tombstone and removes the stream's rows under the dedicated
+retention role — never a per-row delete, which would break the per-stream
+hash chain. The removal is conditional on the stream still being at the tail
+the runner proved it sealable at, so an event that arrives between the
+decision and the removal is not deleted along with the stream: that stream is
+left whole and re-evaluated on the next pass, which is what keeps an event
+from being removed before its own floor has elapsed.
 The runner is the single component with `DELETE` privilege on `events`; the
 application role does not. Append-only is enforced at the database level by a
 row-level trigger. The per-stream hash chain makes the audit log

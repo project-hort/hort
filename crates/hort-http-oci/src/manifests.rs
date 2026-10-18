@@ -69,12 +69,14 @@ use hort_app::error::AppError;
 use hort_app::metrics::{emit_upstream_checksum, UpstreamChecksumResult};
 use hort_app::pull_dedup::DedupKey;
 use hort_app::use_cases::ingest_use_case::{RegisterExistingCasBlobRequest, VerifiedIngestRequest};
+use hort_app::use_cases::manifest_deliverability::ManifestDeliverability;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::mutable_ref::RefTarget;
 use hort_domain::entities::repository::Repository;
 use hort_domain::error::DomainError;
-use hort_domain::events::ApiActor;
+use hort_domain::events::{ApiActor, RejectionReason};
+use hort_domain::ports::constituent_status::TerminalConstituent;
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::types::ContentHash;
 use hort_formats::oci::OciFormatHandler;
@@ -91,16 +93,16 @@ use hort_http_core::context::AppContext;
 /// Docker clients expect for single-image manifests.
 const DEFAULT_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
-/// Ceiling on the CAS re-read that re-derives a coalesced follower's
-/// membership edges (see [`register_follower_membership_edges`]).
+/// Ceiling on the CAS read that derives a coalesced follower's
+/// membership claims (see [`follower_manifest_bytes`]).
 ///
 /// Matches the default upstream manifest-body cap
 /// (`HORT_UPSTREAM_MANIFEST_CACHE_MAX_SIZE`, 16 MiB), so every manifest
 /// hort accepted through pull-through under the default configuration
-/// can be re-read here. An operator who raises that cap above this
-/// ceiling does not get an unbounded buffer: the re-read is refused and
-/// the edges are logged as skipped, the same fail-safe posture the rest
-/// of this best-effort registration takes.
+/// can be read here. An operator who raises that cap above this
+/// ceiling does not get an unbounded buffer: the read is refused and
+/// the claims are logged as skipped, the same fail-safe posture the rest
+/// of the derivation takes.
 const MANIFEST_PROJECTION_READ_CAP_BYTES: usize = 16 * 1024 * 1024;
 
 /// Serve an OCI manifest by `(repo_key, name, reference)`.
@@ -320,8 +322,51 @@ pub(super) async fn serve(
             // through to serve the manifest (HEAD and GET alike).
         }
         QuarantineStatus::Rejected => {
-            return OciError::ManifestUnknown {
-                reference: reference.to_string(),
+            // Same decision as the blob arm: a caller the read gate
+            // admitted would have received the manifest itself, so the
+            // reason it is withheld reveals strictly less (ADR 0055's
+            // 2026-10-12 clarification). The `MANIFEST_UNKNOWN` 404 this
+            // replaces was byte-identical to "no such tag", which cost
+            // the reporter days of distinguishing a blocked image from a
+            // broken registry. A caller the gate refuses never reaches
+            // here — step 1's repository challenge / `NAME_UNKNOWN`
+            // (ADR 0021 / 0045) is unchanged.
+            //
+            // Resolvability is NOT what changes. The manifest still never
+            // resolves to bytes, for anyone, publisher included — the
+            // write-authorized hold-read exemption (ADR 0039 §10) covers
+            // `Quarantined` and stops there, which is why this arm sits
+            // outside it. What the write-granted caller gains is the
+            // diagnosis, which they are owed for the same reason every
+            // admitted reader is: they certainly pass the read gate.
+            //
+            // The axis is a plain field — derived by `ArtifactUseCase`
+            // from the artifact's own `ArtifactRejected` event during the
+            // load, because the `artifacts` projection carries no such
+            // column and a format crate must not read a stream (ADR
+            // 0008).
+            let axis = artifact
+                .rejection_reason
+                .as_ref()
+                .map(RejectionReason::wire_kind);
+            if axis.is_none() {
+                // Refuse naming the subject and no axis: never an
+                // `unknown` token, which would make an inconsistency look
+                // like a verdict. `Rejected` with no rejection on the
+                // record is the illegal state ADR 0039 D6 names — the
+                // status is a projection, the stream is the record — and
+                // the use-case layer distinguishes "read the stream, no
+                // `ArtifactRejected` there" (`error!`) from "could not
+                // read it" (`warn!`) in its own log.
+                tracing::error!(
+                    artifact_id = %artifact.id,
+                    reference = %reference,
+                    "refusing a Rejected manifest with no rejection axis to report"
+                );
+            }
+            return OciError::ArtifactRejected {
+                subject: reference.to_string(),
+                axis,
             }
             .into_response();
         }
@@ -332,6 +377,33 @@ pub(super) async fn serve(
         QuarantineStatus::ScanIndeterminate => {
             return quarantine::check_scan_indeterminate();
         }
+    }
+
+    // 4b. Constituent deliverability (ADR 0062). Step 4 asked whether
+    //     this manifest's OWN status permits serving it; this asks
+    //     whether everything it binds does. A manifest is deliverable
+    //     only while every artifact in its closure is, because a
+    //     manifest that resolves and then fails at a layer spends the
+    //     client's pull and the operator's diagnosis on an answer the
+    //     registry already had — measured as five manifests serving
+    //     `200` beside a rejected layer, surfaced to the puller as
+    //     "failed to pull and unpack … not found".
+    //
+    //     Deliberately AHEAD of content negotiation, for the same reason
+    //     step 4 is: deliverability is a property of the artifact, and a
+    //     negotiated 406 about a document that will never be served
+    //     answers the wrong question.
+    //
+    //     No write-authorized exemption, and the next reader will ask why
+    //     — ADR 0039 §10 / ADR 0055 let a write-granted principal read a
+    //     *held* manifest so a subject can be signed. That exception does
+    //     not extend here: a hold resolves, a terminal verdict does not,
+    //     so no workflow the pusher completes makes this manifest
+    //     deliverable. The manifest write path already refuses to accept
+    //     a terminal reference, so this shape is not one a current push
+    //     can create.
+    if let Some(refusal) = constituent_deliverability_refusal(&ctx, &repo, &hash).await {
+        return refusal;
     }
 
     // 5. Media-type + content negotiation. The stored type comes from
@@ -392,6 +464,157 @@ pub(super) async fn serve(
         &media_type,
         Some(stream_blob(stream, DEFAULT_STREAM_CAPACITY)),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Constituent deliverability (ADR 0062)
+// ---------------------------------------------------------------------------
+
+/// The response this manifest owes its caller when something in its
+/// closure carries a terminal status, or [`None`] when the whole closure
+/// is still deliverable.
+///
+/// The question itself is resolved in one place for `GET` and `HEAD`
+/// alike — `ManifestDeliverabilityUseCase`, which derives the closure
+/// from the manifest's own CAS bytes and asks the catalog once. This
+/// function is only the mapping from its answer onto the wire, and it
+/// reuses the envelopes a manifest in that same state answers with: the
+/// constituent's verdict picks the arm, so a client meets a shape it
+/// already knows.
+///
+/// A resolution **failure** refuses too. Not knowing what a document
+/// binds is not the same as knowing it is safe (ADR 0007), and the
+/// alternative — serving on an unanswered question — is the exact
+/// posture this rule replaced.
+async fn constituent_deliverability_refusal(
+    ctx: &Arc<AppContext>,
+    repo: &Repository,
+    hash: &ContentHash,
+) -> Option<Response> {
+    match ctx
+        .manifest_deliverability_use_case
+        .resolve(repo.id, hash)
+        .await
+    {
+        Ok(ManifestDeliverability::Deliverable) => None,
+        Ok(ManifestDeliverability::TerminalConstituent(constituent)) => {
+            Some(terminal_constituent_response(ctx, repo, &constituent).await)
+        }
+        Err(e) => {
+            tracing::error!(
+                repo_key = %repo.key,
+                hash = %hash,
+                error = %e,
+                "OCI manifest: constituent deliverability could not be resolved; refusing to \
+                 serve the manifest"
+            );
+            Some(OciError::Internal.into_response())
+        }
+    }
+}
+
+/// Map one terminal constituent onto the refusal the caller receives.
+///
+/// The arm is the constituent's own verdict, lifted rather than
+/// flattened: a `Rejected` constituent answers `403 DENIED` naming it,
+/// an indeterminate one answers `503` with no `Retry-After` (that hold
+/// has no self-resolving deadline). Both are the envelopes a manifest in
+/// that state already answers with — no new error variant, and nothing
+/// for a client to learn.
+///
+/// **The refusal names the offending constituent**, and that is the one
+/// deliberate disclosure here. The digest is what identified the cause in
+/// the incident behind this rule: identical across repeated pulls of one
+/// manifest and different across manifests, which is how the reporter
+/// ruled out a shared base layer. A concealed answer would delete that
+/// signal for everyone who cannot read hort's logs, and a shared base
+/// layer would then make N unrelated images fail with nothing in common.
+/// The caller has already passed the read gate, so they would have
+/// received the manifest itself — the reason it is withheld reveals
+/// strictly less (ADR 0055).
+///
+/// The axis comes from the artifact load and from nowhere else: it is not
+/// a column, so `ArtifactUseCase` derives it from the constituent's own
+/// `ArtifactRejected` event during the load, at the single read-path
+/// hydration point every format shares. That costs one bounded stream
+/// read, paid **only** on a path that is already refusing rather than
+/// serving — the same trade the manifest's own `Rejected` arm makes.
+///
+/// A second read is not a second decision. The refusal was decided by the
+/// resolution above; this load only recovers the axis, so a constituent
+/// re-judged between the two reads does not flip the answer. Treating it
+/// as a re-decision would make the response depend on which of two reads
+/// won a race.
+async fn terminal_constituent_response(
+    ctx: &Arc<AppContext>,
+    repo: &Repository,
+    constituent: &TerminalConstituent,
+) -> Response {
+    let subject = format!("sha256:{}", constituent.content_hash);
+    match constituent.status {
+        QuarantineStatus::Rejected => {
+            let axis = match ctx
+                .artifact_use_case
+                .find_in_repo_by_hash(repo.id, &constituent.content_hash)
+                .await
+            {
+                // An absent axis emits no field and never an `unknown`
+                // token — a token would dress an inconsistency up as a
+                // verdict. The operator is told by the hydration itself,
+                // which distinguishes "no `ArtifactRejected` on the
+                // stream" (the illegal state ADR 0039 D6 names) from
+                // "could not read the stream" in its own log; repeating
+                // that line here would double-count one incident.
+                Ok(Some(artifact)) => artifact
+                    .rejection_reason
+                    .as_ref()
+                    .map(RejectionReason::wire_kind),
+                // The row the resolution just matched is gone or
+                // unreadable. The refusal stands — see the note above on
+                // why this is not a second decision — and the client is
+                // told the subject without an axis.
+                Ok(None) => {
+                    tracing::warn!(
+                        repo_key = %repo.key,
+                        constituent = %constituent.content_hash,
+                        "OCI manifest: the terminal constituent has no row to read its \
+                         rejection axis from; refusing without an axis"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        repo_key = %repo.key,
+                        constituent = %constituent.content_hash,
+                        error = %e,
+                        "OCI manifest: could not load the terminal constituent to recover \
+                         its rejection axis; refusing without an axis"
+                    );
+                    None
+                }
+            };
+            OciError::ArtifactRejected { subject, axis }.into_response()
+        }
+        QuarantineStatus::ScanIndeterminate => quarantine::check_scan_indeterminate(),
+        // Exhaustive with no wildcard arm, so a sixth `QuarantineStatus`
+        // variant is a compile error here rather than a fall-through.
+        // These three are not terminal and the port cannot report them —
+        // it matches rows against `is_terminal` — so reaching here means
+        // the two definitions have diverged. Fail closed: serving the
+        // manifest would be acting on a disagreement about what terminal
+        // means.
+        QuarantineStatus::None | QuarantineStatus::Quarantined | QuarantineStatus::Released => {
+            tracing::error!(
+                repo_key = %repo.key,
+                constituent = %constituent.content_hash,
+                constituent_status = %constituent.status,
+                "OCI manifest: the deliverability resolution reported a non-terminal \
+                 constituent; refusing to serve the manifest rather than act on a \
+                 disagreement about what terminal means"
+            );
+            OciError::Internal.into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -840,9 +1063,12 @@ async fn try_upstream_manifest_pull_by_digest(
     // consumes `mapping`. Threaded into `VerifiedIngestRequest` so
     // `ingest_inner` can gate the publish-anchored quarantine resolution.
     let blob_trust_publish_time = mapping.trust_upstream_publish_time;
-    // Captured for the LEADER-side membership-edge registration (#46
-    // Item 4) below — the only path that (briefly) holds the manifest
-    // bytes after the stream-to-CAS retirement of the bytes-broadcast.
+    // Captured for the LEADER-side post-commit side effects below (the
+    // eager child-ingest enqueue and the blob warm) — this is the only
+    // path that (briefly) holds the manifest bytes after the
+    // stream-to-CAS retirement of the bytes-broadcast. The membership
+    // edges that used to be registered here no longer need a context:
+    // they are derived from the bytes and committed by the ingest.
     let blob_ctx = ctx.clone();
     // Captured for the LEADER-side prefetch warming (#51) below —
     // mirrors `blob_ctx` above; the digest path needs its own
@@ -888,15 +1114,50 @@ async fn try_upstream_manifest_pull_by_digest(
                         .to_string(),
                 ))
             })?;
-            let file = tokio::fs::File::open(&cache_handle.path)
-                .await
-                .map_err(|e| {
-                    AppError::from(DomainError::Validation(format!(
-                        "failed to open cached manifest body at {}: {e}",
+            // Read the cached body ONCE, into memory, BEFORE the ingest, and
+            // let every consumer of these bytes share that copy — the ingest
+            // stream, the membership-claim derivation, the eager child-ingest
+            // enqueue and the blob warm. Bounded work, not an unbounded
+            // buffer: the upstream adapter already refused anything over its
+            // `manifest_cache_max_bytes` cap when it wrote this tempfile, and
+            // the body has to be parsed on this path regardless.
+            //
+            // The read moved AHEAD of the ingest because the membership edges
+            // this manifest claims are derivable from nothing but these bytes
+            // and the digest the ingest is keyed on, and a
+            // `content_references` row is the claim that keeps the claimed
+            // bytes alive under the storage GC. Derived afterwards they were
+            // inserted beside the manifest's transition rather than inside
+            // it — a window in which the manifest is live and its blobs carry
+            // no claim, which no reconcile sweep repairs for a tree edge.
+            // `oci_index_child_ingest` reads its body up front for the same
+            // reason.
+            let manifest_bytes = match tokio::fs::read(&cache_handle.path).await {
+                Ok(b) => Bytes::from(b),
+                Err(e) => {
+                    hort_app::project::remove_cached_body(cache_handle).await;
+                    return Err(AppError::from(DomainError::Validation(format!(
+                        "failed to read cached manifest body at {}: {e}",
                         cache_handle.path.display()
-                    )))
-                })?;
-            let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(file);
+                    ))));
+                }
+            };
+            // The tempfile's lifecycle ends here: nothing downstream reaches
+            // for the path again, so dropping it now also stops an ingest
+            // failure from leaving it behind.
+            hort_app::project::remove_cached_body(cache_handle).await;
+            let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
+                Box::new(std::io::Cursor::new(manifest_bytes.clone()));
+            // Derived before the mint so the claims ride the manifest's own
+            // transition. `blob_upstream_digest` is the digest the ingest
+            // verifies against and mints under, so it is the right identity
+            // for the derivation's diagnostics.
+            let claims = crate::manifests_write::pull_membership_claims(
+                blob_repo_id,
+                &blob_upstream_digest,
+                &media_type,
+                &manifest_bytes,
+            );
             let request = VerifiedIngestRequest::ProtocolNative {
                 repository_id: blob_repo_id,
                 coords: oci_manifest_coords(name, &blob_upstream_digest),
@@ -916,25 +1177,23 @@ async fn try_upstream_manifest_pull_by_digest(
                 trust_upstream_publish_time: blob_trust_publish_time,
             };
             let outcome = blob_ingest
-                .ingest_verified(request, async_read, &OciFormatHandler)
+                .ingest_verified(request, &claims, async_read, &OciFormatHandler)
                 .await?;
 
-            // Register-only content_references membership edges (#46
-            // Item 4 — the pull-through re-fix). Read the manifest body
-            // back from the still-live tempfile (best-effort; a read
-            // failure here is non-fatal — the manifest is already in
-            // CAS) and write the SAME edges the hosted PUT path writes,
-            // without fetching the referenced children/blobs.
+            // The membership edges committed with the manifest above. What
+            // stays here are the two consumers of the same bytes that are
+            // NOT claims on bytes, and so stay post-commit and best-effort:
             //
             // The children of an index ARE fetched, but by the worker,
             // off this request: one durable `oci-index-child-ingest` row
-            // per declared child, enqueued in the same breath as the
-            // membership edges that enumerate them. Each child's
+            // per declared child. Each child's
             // quarantine window therefore starts at index ingest rather
             // than at the first client GET for it, so the index's window
             // and its children's run concurrently. No window is
             // shortened — the child's anchor still comes from
-            // `first_seen_for_checksum` (ADR 0054).
+            // `first_seen_for_checksum` (ADR 0054). These are `jobs` rows:
+            // a lost one leaves its child on the lazy pull path, which is
+            // where it was before the kind existed.
             //
             // Also warm this manifest's own config + layer blobs (#51):
             // a digest-ref pull IS the client naming a specific child
@@ -943,46 +1202,20 @@ async fn try_upstream_manifest_pull_by_digest(
             // `prefetch_policy.enabled` only (design doc §4/§5). An
             // OCI index has no config/layers, so `warm_manifest_blobs`
             // is a safe no-op for the index-by-digest case.
-            match tokio::fs::read(&cache_handle.path).await {
-                Ok(manifest_bytes) => {
-                    crate::manifests_write::register_membership_edges_from_pull(
-                        &blob_ctx,
-                        blob_repo_id,
-                        outcome.artifact.id,
-                        &media_type,
-                        &manifest_bytes,
-                    )
-                    .await;
-                    blob_ctx
-                        .oci_index_child_enqueue_use_case
-                        .enqueue_declared_children(blob_repo_id, name, &manifest_bytes)
-                        .await;
-                    if blob_repo.prefetch_policy.enabled {
-                        crate::prefetch::warm_manifest_blobs(
-                            &blob_ctx,
-                            &blob_repo,
-                            name,
-                            reference,
-                            "child_digest",
-                            &Bytes::from(manifest_bytes),
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        %blob_repo_id,
-                        artifact_id = %outcome.artifact.id,
-                        error = %e,
-                        "OCI pull-through: failed to re-read manifest tempfile for \
-                         membership-edge registration / prefetch; skipping both \
-                         (non-fatal, manifest is in CAS)"
-                    );
-                }
+            blob_ctx
+                .oci_index_child_enqueue_use_case
+                .enqueue_declared_children(blob_repo_id, name, &manifest_bytes)
+                .await;
+            if blob_repo.prefetch_policy.enabled {
+                crate::prefetch::warm_manifest_blobs(
+                    &blob_ctx,
+                    &blob_repo,
+                    name,
+                    reference,
+                    "child_digest",
+                    &manifest_bytes,
+                );
             }
-
-            // Tempfile is in CAS now — drop it (the lifecycle
-            // `manifest_body_bytes` used to own).
-            hort_app::project::remove_cached_body(cache_handle).await;
             Ok(outcome.artifact.sha256_checksum)
         })
         .await;
@@ -1019,10 +1252,11 @@ async fn try_upstream_manifest_pull_by_digest(
 /// coalesce via `finalise_manifest_pull`.
 ///
 /// The prefetch-on-tag-move trigger fires LEADER-SIDE inside the closure
-/// (it is the only path that holds the manifest bytes — read once from
-/// the just-ingested tempfile before cleanup — and it is gated on the
-/// leader's successful ingest). Coalesced followers do not re-plan the
-/// same prefetch.
+/// (it is the only path that holds the manifest bytes — read once from the
+/// cached tempfile BEFORE the ingest, because the membership claims derived
+/// from the same copy have to ride the ingest's transition — and it is
+/// gated on the leader's successful ingest). Coalesced followers do not
+/// re-plan the same prefetch.
 async fn try_upstream_manifest_pull_by_tag(
     ctx: &Arc<AppContext>,
     repo: &Repository,
@@ -1186,15 +1420,38 @@ async fn try_upstream_manifest_pull_by_tag(
                         .to_string(),
                 ))
             })?;
-            let file = tokio::fs::File::open(&cache_handle.path)
-                .await
-                .map_err(|e| {
-                    AppError::from(DomainError::Validation(format!(
-                        "failed to open cached manifest body at {}: {e}",
+            // Read the cached body ONCE, into memory, BEFORE the ingest —
+            // see the digest-ref leg for the reasoning in full. In short:
+            // the membership edges this manifest claims are derivable from
+            // these bytes plus the digest the ingest is keyed on, and a
+            // `content_references` row is the claim that keeps the claimed
+            // bytes alive under the storage GC, so the manifest's own
+            // transaction is the only place to record one. The ingest, the
+            // claim derivation, the eager child-ingest enqueue and the
+            // prefetch trigger all share this one copy; the upstream
+            // adapter's `manifest_cache_max_bytes` cap is what bounds it.
+            let manifest_bytes = match tokio::fs::read(&cache_handle.path).await {
+                Ok(b) => Bytes::from(b),
+                Err(e) => {
+                    hort_app::project::remove_cached_body(cache_handle).await;
+                    return Err(AppError::from(DomainError::Validation(format!(
+                        "failed to read cached manifest body at {}: {e}",
                         cache_handle.path.display()
-                    )))
-                })?;
-            let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(file);
+                    ))));
+                }
+            };
+            // The tempfile's lifecycle ends here: nothing downstream reaches
+            // for the path again, so dropping it now also stops an ingest
+            // failure from leaving it behind.
+            hort_app::project::remove_cached_body(cache_handle).await;
+            let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
+                Box::new(std::io::Cursor::new(manifest_bytes.clone()));
+            let claims = crate::manifests_write::pull_membership_claims(
+                meta_repo_id,
+                &upstream_digest,
+                &media_type,
+                &manifest_bytes,
+            );
             let request = VerifiedIngestRequest::ProtocolNative {
                 repository_id: meta_repo_id,
                 coords: oci_manifest_coords(&meta_name, &upstream_digest),
@@ -1214,7 +1471,7 @@ async fn try_upstream_manifest_pull_by_tag(
                 trust_upstream_publish_time: meta_trust_publish_time,
             };
             let ingest_outcome = meta_ingest
-                .ingest_verified(request, async_read, &OciFormatHandler)
+                .ingest_verified(request, &claims, async_read, &OciFormatHandler)
                 .await?;
             let actual_hash = ingest_outcome.artifact.sha256_checksum.clone();
 
@@ -1255,69 +1512,35 @@ async fn try_upstream_manifest_pull_by_tag(
                 "OCI upstream manifest pull-through succeeded"
             );
 
-            // LEADER-SIDE re-read of the manifest tempfile. The
-            // bytes-broadcast retirement (ADR 0026) means this is the only
-            // path that (briefly) holds the manifest bytes; read them once
-            // BEFORE the cleanup below and reuse for all three consumers:
-            // - Register-only content_references membership edges (#46
-            //   Item 4 — the pull-through re-fix), UNCONDITIONALLY (not
-            //   gated on prefetch, unlike the trigger below) — mirrors the
-            //   hosted PUT path's edges, without fetching children/blobs.
-            // - The eager index-child ingest enqueue, likewise
-            //   unconditional: an index's children are the declared
-            //   membership of the artifact a client just requested, not
-            //   speculation, so it carries no policy gate (the blob warm
-            //   beside it keeps its own — the asymmetry is deliberate).
+            // The membership edges committed with the manifest above. The
+            // two remaining consumers of the body stay post-commit and
+            // best-effort, because neither is a claim on bytes:
+            // - The eager index-child ingest enqueue, unconditional: an
+            //   index's children are the declared membership of the
+            //   artifact a client just requested, not speculation, so it
+            //   carries no policy gate (the prefetch trigger beside it
+            //   keeps its own — the asymmetry is deliberate). A tag pull of
+            //   a multi-arch image resolves to an index too, so the same
+            //   enqueue rides here; see the digest arm for why.
             // - The prefetch-on-tag-move trigger (only when prefetch is
             //   enabled and the tag moved — `fire_prefetch_trigger_oci`
             //   gates internally).
-            // All three are best-effort and non-fatal — a tempfile read
-            // failure here never affects the live response; the manifest is
-            // already in CAS.
-            match tokio::fs::read(&cache_handle.path).await {
-                Ok(manifest_bytes) => {
-                    crate::manifests_write::register_membership_edges_from_pull(
-                        &meta_ctx,
-                        meta_repo_id,
-                        ingest_outcome.artifact.id,
-                        &media_type,
-                        &manifest_bytes,
-                    )
-                    .await;
-                    // A tag pull of a multi-arch image resolves to an
-                    // index too, so the same eager child-ingest enqueue
-                    // rides here. See the digest arm for why.
-                    meta_ctx
-                        .oci_index_child_enqueue_use_case
-                        .enqueue_declared_children(meta_repo_id, &meta_name, &manifest_bytes)
-                        .await;
-                    if meta_repo.prefetch_policy.enabled {
-                        crate::prefetch::fire_prefetch_trigger_oci(
-                            &meta_ctx,
-                            &meta_repo,
-                            &meta_name,
-                            &meta_tag,
-                            &actual_hash,
-                            meta_prior_held_digest.as_ref(),
-                            &Bytes::from(manifest_bytes),
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        repo_key = %meta_repo_key,
-                        tag = %meta_tag,
-                        error = %e,
-                        "OCI pull-through: failed to re-read manifest tempfile for \
-                         membership-edge registration / prefetch; skipping both \
-                         (non-fatal, manifest is in CAS)"
-                    );
-                }
+            // Both read the one in-memory copy taken before the ingest.
+            meta_ctx
+                .oci_index_child_enqueue_use_case
+                .enqueue_declared_children(meta_repo_id, &meta_name, &manifest_bytes)
+                .await;
+            if meta_repo.prefetch_policy.enabled {
+                crate::prefetch::fire_prefetch_trigger_oci(
+                    &meta_ctx,
+                    &meta_repo,
+                    &meta_name,
+                    &meta_tag,
+                    &actual_hash,
+                    meta_prior_held_digest.as_ref(),
+                    &manifest_bytes,
+                );
             }
-
-            // Tempfile is in CAS now — drop it (the lifecycle
-            // `manifest_body_bytes` used to own).
-            hort_app::project::remove_cached_body(cache_handle).await;
             Ok(actual_hash)
         })
         .await;
@@ -1513,10 +1736,10 @@ async fn follower_media_type_for_hash(ctx: &Arc<AppContext>, content_hash: &Cont
 /// `register_existing_cas_blob` rather than failing closed. Coords are
 /// reconstructed deterministically from `(name, content_hash)` —
 /// `oci_manifest_coords` is exactly what the leader's closure used, and
-/// [`register_follower_membership_edges`] then gives that row the same
-/// `content_references` membership edges the ingesting leg writes, so a
-/// row minted here is never structurally weaker than one minted by the
-/// leg that fetched the bytes.
+/// the claims derived by [`follower_manifest_bytes`] ride that row's own
+/// transition, so a row minted here carries the same `content_references`
+/// membership edges the ingesting leg's does and is never structurally
+/// weaker than it.
 ///
 /// The follower's content_type is resolved via
 /// [`follower_media_type_for_hash`] — the leader's cross-repo row carries
@@ -1546,6 +1769,24 @@ async fn finalise_manifest_pull(
         },
         Ok(None) => {
             let media_type = follower_media_type_for_hash(ctx, &content_hash).await;
+            // Read the manifest out of CAS BEFORE the row that will claim
+            // its constituents exists, and derive that row's membership
+            // claims from it — see [`follower_manifest_bytes`]. An absent
+            // or over-ceiling read yields no claims and no enqueue; the
+            // register below then fails its own `storage.exists` gate if
+            // the bytes genuinely are not there.
+            let manifest_bytes = follower_manifest_bytes(ctx, repo, reference, &content_hash).await;
+            let claims = manifest_bytes
+                .as_deref()
+                .map(|body| {
+                    crate::manifests_write::pull_membership_claims(
+                        repo.id,
+                        &content_hash,
+                        &media_type,
+                        body,
+                    )
+                })
+                .unwrap_or_default();
             match ctx
                 .ingest_use_case
                 .register_existing_cas_blob(
@@ -1573,21 +1814,32 @@ async fn finalise_manifest_pull(
                         // `None`/immediately-downloadable with no gate at
                         // all.
                         seed_import_quarantine_anchor: None,
+                        // The follower's manifest claims its config / layer
+                        // / index-member bytes exactly as the ingesting
+                        // leg's row does, and they ride this row's own
+                        // transition.
+                        claimed_edges: claims,
                     },
                     &OciFormatHandler,
                 )
                 .await
             {
                 Ok(outcome) => {
-                    register_follower_membership_edges(
-                        ctx,
-                        repo,
-                        name,
-                        reference,
-                        outcome.artifact.id,
-                        &media_type,
-                    )
-                    .await;
+                    // The eager child-ingest enqueue stays post-commit and
+                    // best-effort: `jobs` rows, not claims on bytes. A
+                    // follower's repository needs its index's children as
+                    // much as the leader's does — more so, because the
+                    // leader's enqueue targeted the LEADER's repository and
+                    // the dedupe key is per-repository (the quarantine
+                    // anchor is per row, ADR 0054). `name` is the
+                    // follower's own client-facing requested name, so each
+                    // child resolves through the mapping a client pull
+                    // against THIS repository would use.
+                    if let Some(body) = manifest_bytes.as_deref() {
+                        ctx.oci_index_child_enqueue_use_case
+                            .enqueue_declared_children(repo.id, name, body)
+                            .await;
+                    }
                     UpstreamManifestPullOutcome::Ingested {
                         hash: outcome.artifact.sha256_checksum.clone(),
                         artifact: Box::new(outcome.artifact),
@@ -1618,9 +1870,8 @@ async fn finalise_manifest_pull(
     }
 }
 
-/// Register the `content_references` membership edges for a manifest row
-/// that a **coalesced follower** just minted from an already-CAS-resident
-/// hash, re-deriving them from the CAS bytes.
+/// The CAS bytes of the manifest a **coalesced follower** is about to mint
+/// its own per-repo row for, read bounded and ahead of that mint.
 ///
 /// # The invariant this closes
 ///
@@ -1635,65 +1886,59 @@ async fn finalise_manifest_pull(
 /// The pull-through's fetch closure runs at most once per coalescing
 /// window, and that window is keyed by content hash alone — it is
 /// cross-repository by design, so the closure (and with it the leader's
-/// edge registration) runs against the LEADER's repository. Every other
-/// caller in the window is a follower, and a follower whose target
-/// repository differs from the leader's has no row to inherit: it mints
-/// its own via `register_existing_cas_blob`. Without this call that row
-/// is structurally incomplete — the artifact is served 200 and its
-/// membership edges never exist. Registration is idempotent (upsert on
-/// the `content_references` PK), so re-deriving here can only converge
-/// on what the ingesting leg would have written for identical bytes.
+/// claim set) runs against the LEADER's repository. Every other caller in
+/// the window is a follower, and a follower whose target repository
+/// differs from the leader's has no row to inherit: it mints its own via
+/// `register_existing_cas_blob`. Without these claims that row is
+/// structurally incomplete — the artifact is served 200 and its membership
+/// edges never exist. Re-deriving from CAS can only converge on what the
+/// ingesting leg wrote for identical bytes, and the upsert PK makes the
+/// convergence idempotent.
 ///
-/// **Non-fatal**, exactly like the ingesting leg's own registration: the
-/// row is already committed and the manifest is already serveable by the
-/// time this runs, so a CAS re-read or parse failure is logged and
-/// skipped rather than failing the pull.
+/// # Why the read is here and not after the mint
 ///
-/// # The eager child-ingest enqueue rides here too
+/// It used to run after `register_existing_cas_blob` returned, keyed on
+/// the artifact id that call produced, and insert the edges beside the
+/// committed row. That is a window in which the follower's manifest is
+/// live and servable while the blobs it references carry one fewer claim
+/// against the storage GC — and no sweep repairs a tree edge, because the
+/// refcount reconcile derives `primary_content` / `metadata_blob` from the
+/// artifact row and nothing relational records what a manifest
+/// references. A claim has to travel INTO the minting transaction, so the
+/// read has to precede it, so it is keyed on the content hash instead of
+/// an id — which is all it ever needed: the bytes are CAS-resident and
+/// upstream-verified (ADR 0006) by the leg that fetched them.
 ///
-/// A follower's repository needs its index's children as much as the
-/// leader's does — more so, because the leader's enqueue targeted the
-/// LEADER's repository and the dedupe key is per-repository (the
-/// quarantine anchor is per row, ADR 0054). The enqueue therefore fires
-/// from every leg that mints an index row, and `name` is the follower's
-/// own client-facing requested name so each child resolves through the
-/// mapping a client pull against THIS repository would use.
-async fn register_follower_membership_edges(
+/// `None` on a read failure, and the caller then mints with no membership
+/// claims and skips the child enqueue. That is the same warn-and-continue
+/// posture the derivation itself takes, for the same reason: the bytes
+/// match their digest and the manifest is legitimately servable, so a
+/// failure to re-derive its projection must not refuse the pull. What is
+/// no longer warn-and-continue is the edge *write* — that rides the
+/// transition now and a failure takes the whole register with it.
+async fn follower_manifest_bytes(
     ctx: &Arc<AppContext>,
     repo: &Repository,
-    name: &str,
     reference: &str,
-    manifest_artifact_id: Uuid,
-    media_type: &str,
-) {
+    content_hash: &ContentHash,
+) -> Option<Vec<u8>> {
     match ctx
         .artifact_use_case
-        .read_content_for_projection(manifest_artifact_id, MANIFEST_PROJECTION_READ_CAP_BYTES)
+        .read_content_for_projection(content_hash, MANIFEST_PROJECTION_READ_CAP_BYTES)
         .await
     {
-        Ok(manifest_bytes) => {
-            crate::manifests_write::register_membership_edges_from_pull(
-                ctx,
-                repo.id,
-                manifest_artifact_id,
-                media_type,
-                &manifest_bytes,
-            )
-            .await;
-            ctx.oci_index_child_enqueue_use_case
-                .enqueue_declared_children(repo.id, name, &manifest_bytes)
-                .await;
-        }
+        Ok(bytes) => Some(bytes),
         Err(e) => {
             tracing::warn!(
                 repo_key = %repo.key,
                 reference = %reference,
-                artifact_id = %manifest_artifact_id,
+                hash = %content_hash,
                 error = %e,
-                "OCI pull-through: CAS re-read for the coalesced follower's membership-edge \
-                 registration failed; edges not registered (non-fatal, the row is committed \
-                 and serveable)"
+                "OCI pull-through: CAS read for the coalesced follower's membership-edge \
+                 derivation failed; the row is minted without membership edges and no \
+                 child-ingest rows are enqueued"
             );
+            None
         }
     }
 }
@@ -1729,6 +1974,13 @@ fn upstream_pull_failure_response(
     reference: &str,
 ) -> Response {
     match outcome {
+        // `CurationBlocked` keeps the 404 even though a locally-held
+        // `Rejected` manifest answers `403 DENIED` + its axis. The
+        // asymmetry is deliberate and the two callers differ: a rule
+        // blocking a pull-through fetch refuses a manifest this registry
+        // never admitted, so there is no verdict of its own to report,
+        // and a cryptic 403 mid-`docker pull` is the worse answer for
+        // that client.
         UpstreamManifestPullOutcome::NotConfigured
         | UpstreamManifestPullOutcome::UpstreamNotFound
         | UpstreamManifestPullOutcome::CurationBlocked => OciError::ManifestUnknown {
@@ -1790,8 +2042,10 @@ mod tests {
     use uuid::Uuid;
 
     use hort_app::use_cases::test_support::{
-        sample_artifact, sample_repository, MockArtifactMetadataRepository, MockArtifactRepository,
-        MockRefRegistryPort, MockRepositoryRepository, MockStoragePort,
+        persisted_artifact_rejected, sample_artifact, sample_repository,
+        MockArtifactMetadataRepository, MockArtifactRepository, MockEventStore,
+        MockPolicyProjectionRepository, MockRefRegistryPort, MockRepositoryRepository,
+        MockStoragePort,
     };
     use hort_domain::entities::artifact::{ArtifactMetadata, QuarantineStatus};
     use hort_domain::entities::mutable_ref::MutableRef;
@@ -1819,6 +2073,25 @@ mod tests {
         storage: Arc<MockStoragePort>,
         refs: Arc<MockRefRegistryPort>,
         metadata: Arc<MockArtifactMetadataRepository>,
+        /// Policy projections, for a test whose subject is the
+        /// *advertised* observation window: the harness's global seed
+        /// carries `quarantine_duration_secs = 0`, so a repo-scoped seed
+        /// through `test_authz::quarantining_policy_with_window` is what
+        /// puts a real window on the wire.
+        policy_projections: Arc<MockPolicyProjectionRepository>,
+        /// The constituent-deliverability reader behind
+        /// `AppContext::manifest_deliverability_use_case`. It serves from
+        /// the same seeded `artifacts` rows, so the ordinary way to
+        /// drive it is `seed_constituent`; the handle is here for the
+        /// fail-closed arm, which arms the read to error.
+        constituent_status: Arc<hort_app::use_cases::test_support::MockConstituentStatusReader>,
+        /// The artifact's own event stream — where a `Rejected` row's
+        /// rejection axis actually lives. `MockArtifactRepository` clears
+        /// `Artifact::rejection_reason` on read exactly as Postgres's one
+        /// `row -> Artifact` mapper does, so an axis test seeds an
+        /// `ArtifactRejected` here and the use-case hydration recovers
+        /// it; setting the field on a fixture entity proves nothing.
+        events: Arc<MockEventStore>,
     }
 
     fn harness() -> Harness {
@@ -1831,6 +2104,9 @@ mod tests {
             storage: mocks.storage,
             refs: mocks.refs,
             metadata: mocks.artifact_metadata,
+            policy_projections: mocks.policy_projections,
+            constituent_status: mocks.constituent_status,
+            events: mocks.events,
         }
     }
 
@@ -2421,6 +2697,7 @@ mod tests {
 
     #[test]
     fn quarantined_manifest_returns_503_with_retry_after() {
+        const WINDOW_SECS: i64 = 48 * 3600;
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
@@ -2441,6 +2718,18 @@ mod tests {
                 None,
                 QuarantineStatus::Quarantined,
             );
+            // The window this test asserts has to be seeded. The harness's
+            // permissive GLOBAL policy carries
+            // `quarantine_duration_secs = 0`, which resolves the computed
+            // deadline onto the row's anchor and clamps `Retry-After` to
+            // the useless `1`. A repo-scoped policy shadows the global for
+            // this repository only (`resolve_active_policy_for_repo`'s
+            // `repo_scoped.or(global)` precedence).
+            h.policy_projections
+                .insert(crate::test_authz::quarantining_policy_with_window(
+                    repo_id,
+                    WINDOW_SECS,
+                ));
             // Anonymous read of a held manifest. Route through an
             // RBAC-ENABLED context (not the admit-everything mock default)
             // so the anonymous caller genuinely lacks `Write` — otherwise
@@ -2474,16 +2763,18 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let retry_after = retry_after.expect("Retry-After header missing");
         let secs: i64 = retry_after.parse().unwrap();
-        // Issue #76: the harness wires no active scan policy, so
+        // The header reports the window the matched policy configures:
         // `ArtifactUseCase::hydrate_quarantine_deadline` resolves
-        // `anchor + DefaultPolicy::quarantine_duration_secs()` (24h) —
-        // a real, multi-hour observation window, not the pre-#76 bare-
-        // anchor clamp-to-1s. Allow a little slack for clock drift /
-        // test execution time between seeding and the response.
-        let default_secs = hort_domain::policy::DefaultPolicy::quarantine_duration_secs();
+        // `anchor + resolved-policy-duration`. The bound is what makes the
+        // assertion worth having — the two plausible wrong answers both
+        // sit outside it: the bare-anchor clamp-to-1s (what a
+        // `quarantine_duration_secs = 0` policy produces, and what this
+        // path answered before a real window was resolved) and the
+        // deadline-unknown 3600 fallback. Allow a little slack for clock
+        // drift / test execution time between seeding and the response.
         assert!(
-            (default_secs - 5..=default_secs).contains(&secs),
-            "Retry-After out of expected range: {secs} (expected close to {default_secs})"
+            (WINDOW_SECS - 5..=WINDOW_SECS).contains(&secs),
+            "Retry-After out of expected range: {secs} (expected close to {WINDOW_SECS})"
         );
         // Assert body shape so a regression to TOOMANYREQUESTS /
         // mis-aligned status+code pair would be caught.
@@ -2508,44 +2799,6 @@ mod tests {
     // use case and the header is exactly what the unit tests in
     // `quarantine.rs` cannot see.
 
-    /// Seed a repo-scoped `provenance_mode: Required` policy. Repo-scoped
-    /// shadows the harness's permissive global seed
-    /// (`resolve_active_policy_for_repo` precedence), so the global stays
-    /// in place for every other test in this file.
-    fn seed_required_policy(
-        projections: &hort_app::use_cases::test_support::MockPolicyProjectionRepository,
-        repo_id: Uuid,
-        quarantine_duration_secs: i64,
-    ) {
-        use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-            SeverityThreshold,
-        };
-        use hort_domain::events::PolicyScope;
-        let now = Utc::now();
-        projections.insert(ScanPolicyProjection {
-            policy_id: Uuid::new_v4(),
-            name: "required-provenance".to_string(),
-            scope: PolicyScope::Repository(repo_id),
-            severity_threshold: SeverityThreshold::Critical,
-            quarantine_duration_secs,
-            require_approval: false,
-            provenance_mode: ProvenanceMode::Required,
-            provenance_backends: vec!["cosign".to_string()],
-            provenance_identities: Vec::new(),
-            max_artifact_age_secs: None,
-            license_policy: serde_json::Value::Null,
-            archived: false,
-            scan_backends: vec!["trivy".to_string()],
-            rescan_interval_hours: 24,
-            negligible_action: NegligibleAction::Ignore,
-            enforcement: ScanEnforcement::Reject,
-            stream_version: 0,
-            created_at: now,
-            updated_at: now,
-        });
-    }
-
     /// Drive an anonymous read of an unsigned `Required` manifest whose
     /// anchor is `anchor_age_secs` old under a `window_secs` window, and
     /// return `(status, Retry-After)` for the requested verb.
@@ -2565,7 +2818,7 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             mocks.repositories.insert(repo);
-            seed_required_policy(&mocks.policy_projections, repo_id, window_secs);
+            seed_required_provenance_policy(&mocks.policy_projections, repo_id, window_secs);
             seed_manifest(
                 &mocks.artifacts,
                 &mocks.storage,
@@ -2662,7 +2915,9 @@ mod tests {
 
     // RBAC-enabled ctx builders + the capability-token principal shape
     // are shared with the blob suite via `crate::test_authz`.
-    use crate::test_authz::{pull_scoped_cap_principal, user_grant_ctx, write_grant_ctx};
+    use crate::test_authz::{
+        pull_scoped_cap_principal, seed_required_provenance_policy, user_grant_ctx, write_grant_ctx,
+    };
 
     /// A `CallerPrincipal` carrying exactly `claim`.
     fn principal_with_claim(claim: &str) -> CallerPrincipal {
@@ -2980,24 +3235,39 @@ mod tests {
         }
     }
 
-    /// Rejected stays terminal for the capability shape too: a
-    /// write-granted pull-scoped cap principal's GET of a `Rejected`
-    /// manifest is still hidden as 404 (`MANIFEST_UNKNOWN`).
-    #[test]
-    fn rejected_manifest_pull_scoped_cap_write_grant_still_hidden_as_404() {
-        use hort_domain::entities::rbac::Permission;
+    /// Seed a `Rejected` manifest and `GET` it, returning
+    /// `(status, body)`.
+    ///
+    /// `axis` seeds the artifact's **stream** with an `ArtifactRejected`
+    /// carrying that reason; `None` seeds an empty stream, which is the
+    /// ADR 0039 D6 illegal state. The fixture entity's
+    /// `rejection_reason` is never set — `MockArtifactRepository` clears
+    /// it on read exactly as `hort-adapters-postgres`'s one
+    /// `row -> Artifact` mapper does, so only `ArtifactUseCase`'s
+    /// hydration can put it back.
+    ///
+    /// `ctx_for` builds the context from the harness: the three callers
+    /// below are the RBAC-disabled default, a write-granted claims
+    /// principal, and a write-granted pull-scoped capability principal.
+    /// Each wraps its result in `with_provenance_hold_hydration` so the
+    /// axis is recovered for a production reason rather than left unset
+    /// for a harness one.
+    fn rejected_manifest_response(
+        axis: Option<RejectionReason>,
+        ctx_for: impl FnOnce(&Harness) -> Arc<AppContext>,
+        principal: Option<CallerPrincipal>,
+    ) -> (StatusCode, Vec<u8>) {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
             hex::encode(sha2::Sha256::digest(&content))
         };
-        let uid = Uuid::from_u128(0xCA11);
-        let status = run(async {
+        run(async move {
             let h = harness();
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            seed_manifest(
+            let (artifact_id, _) = seed_manifest(
                 &h.artifacts,
                 &h.storage,
                 &h.metadata,
@@ -3007,100 +3277,12 @@ mod tests {
                 None,
                 QuarantineStatus::Rejected,
             );
-            let ctx = user_grant_ctx(
-                &h.ctx,
-                h.repositories.clone(),
-                uid,
-                &[Permission::Read, Permission::Write],
+            h.events.set_stream(
+                &hort_domain::events::StreamId::artifact(artifact_id),
+                axis.map(|reason| vec![persisted_artifact_rejected(artifact_id, reason, 1)])
+                    .unwrap_or_default(),
             );
-            let principal = pull_scoped_cap_principal(uid);
-            serve(
-                ctx,
-                "myrepo",
-                "library/nginx",
-                &format!("sha256:{hex}"),
-                &HeaderMap::new(),
-                /* head = */ false,
-                Some(&principal),
-            )
-            .await
-            .status()
-        });
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "the hold exemption covers Quarantined only — Rejected stays hidden \
-             regardless of grants or cap shape"
-        );
-    }
-
-    #[test]
-    fn rejected_manifest_is_hidden_as_404() {
-        let content = br#"{"schemaVersion":2}"#.to_vec();
-        let hex = {
-            use sha2::Digest;
-            hex::encode(sha2::Sha256::digest(&content))
-        };
-        let (status, body) = run(async {
-            let h = harness();
-            let repo = oci_repo("myrepo");
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            seed_manifest(
-                &h.artifacts,
-                &h.storage,
-                &h.metadata,
-                repo_id,
-                &hex,
-                &content,
-                None,
-                QuarantineStatus::Rejected,
-            );
-            let router = manifest_router(h.ctx);
-            let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{hex}");
-            let resp = router
-                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let status = resp.status();
-            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            (status, body)
-        });
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
-    }
-
-    /// Security scope guard, RBAC-enabled mirror of the test above: the
-    /// hold-read exemption is `Quarantined`-only, so even a WRITE-authorized
-    /// caller's GET of a `Rejected` manifest stays hidden as 404
-    /// (`MANIFEST_UNKNOWN`) — a Write grant never resurrects a rejected
-    /// manifest. Pins the property under the same `write_grant_ctx` harness
-    /// the Quarantined suite uses, not just the RBAC-disabled ctx.
-    #[test]
-    fn rejected_manifest_write_authorized_get_still_hidden_as_404() {
-        let content = br#"{"schemaVersion":2}"#.to_vec();
-        let hex = {
-            use sha2::Digest;
-            hex::encode(sha2::Sha256::digest(&content))
-        };
-        let (status, body) = run(async {
-            let h = harness();
-            let repo = oci_repo("myrepo");
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            seed_manifest(
-                &h.artifacts,
-                &h.storage,
-                &h.metadata,
-                repo_id,
-                &hex,
-                &content,
-                None,
-                QuarantineStatus::Rejected,
-            );
-            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
-            let principal = principal_with_claim("ci-pusher");
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&ctx_for(&h));
             let resp = serve(
                 ctx,
                 "myrepo",
@@ -3108,21 +3290,813 @@ mod tests {
                 &format!("sha256:{hex}"),
                 &HeaderMap::new(),
                 /* head = */ false,
-                Some(&principal),
+                principal.as_ref(),
+            )
+            .await;
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        })
+    }
+
+    /// Rewritten from the concealment pin
+    /// (`rejected_manifest_pull_scoped_cap_write_grant_still_hidden_as_404`).
+    ///
+    /// Both halves of that pin now have to be stated, because only one of
+    /// them moved. **Resolvability is unchanged**: the ADR 0039 §10
+    /// hold-read exemption covers `Quarantined` and stops there, so a
+    /// write-granted pull-scoped capability principal gets no manifest
+    /// body out of a `Rejected` row — no grant and no cap shape
+    /// resurrects a rejected manifest. **Diagnosability is what changes**:
+    /// a caller holding granted `Write` certainly passes the read gate,
+    /// so the reason is owed to them exactly as to any other admitted
+    /// reader (ADR 0055's 2026-10-12 clarification). Hence `403 DENIED` +
+    /// axis rather than the old `404 MANIFEST_UNKNOWN`, and still not
+    /// `200`.
+    #[test]
+    fn rejected_manifest_pull_scoped_cap_write_grant_is_403_with_the_axis_never_the_body() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCA11);
+        let (status, body) = rejected_manifest_response(
+            Some(RejectionReason::Curator {
+                curator_id: Uuid::from_u128(0xC0FFEE),
+            }),
+            |h| {
+                user_grant_ctx(
+                    &h.ctx,
+                    h.repositories.clone(),
+                    uid,
+                    &[Permission::Read, Permission::Write],
+                )
+            },
+            Some(pull_scoped_cap_principal(uid)),
+        );
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a Rejected manifest is never served, whatever the grants or cap shape — \
+             but the caller is told why rather than told it does not exist"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "curator");
+        // The curator's identity is not published: the axis says a human
+        // decided, not which human.
+        let text = String::from_utf8(body).unwrap();
+        assert!(
+            !text.contains(&Uuid::from_u128(0xC0FFEE).to_string()),
+            "the curator uuid must never reach the wire: {text}"
+        );
+    }
+
+    /// Rewritten from the concealment pin
+    /// (`rejected_manifest_is_hidden_as_404`, which asserted the `404
+    /// MANIFEST_UNKNOWN` envelope byte-identical to "no such tag").
+    ///
+    /// What it pins now: an anonymous caller on a repository the read
+    /// gate admits — the case ADR 0055's clarification turns on, since a
+    /// public repository has no grant to hold — is told `403 DENIED` with
+    /// the axis and the reference. The reason reveals strictly less than
+    /// the manifest itself would have.
+    #[test]
+    fn rejected_manifest_is_403_denied_naming_the_axis_to_an_anonymous_reader() {
+        let (status, body) = rejected_manifest_response(
+            Some(RejectionReason::Provenance),
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(parsed["errors"][0]["message"], "artifact is rejected");
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "provenance");
+        assert!(
+            parsed["errors"][0]["detail"]["subject"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:"),
+            "the subject echoes the client's own reference: {parsed}"
+        );
+    }
+
+    /// **Every** `RejectionReason` variant reaches the manifest refusal
+    /// as its own `wire_kind()` token, iterated off
+    /// [`RejectionReason::ALL_KIND_SAMPLES`] rather than a hand-written
+    /// list, and no body carries a uuid or a CVE identifier. The uuid
+    /// half is only meaningful because the corpus includes the two
+    /// payload-carrying variants (`Curator`, `CurationRetroactive`): a
+    /// body built from the payload rather than the discriminator would
+    /// leak there and nowhere else.
+    #[test]
+    fn every_rejection_reason_variant_reaches_the_manifest_refusal_as_its_wire_kind() {
+        assert_eq!(
+            RejectionReason::ALL_KIND_SAMPLES.len(),
+            7,
+            "the corpus is the vocabulary; a drop to zero would make this loop vacuous"
+        );
+        let uuid_shaped = regex::Regex::new(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        )
+        .unwrap();
+        for sample in RejectionReason::ALL_KIND_SAMPLES {
+            let (status, body) = rejected_manifest_response(
+                Some(sample.clone()),
+                |h| h.ctx.clone(),
+                /* anonymous */ None,
+            );
+            assert_eq!(status, StatusCode::FORBIDDEN, "{sample:?}");
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                parsed["errors"][0]["detail"]["axis"],
+                sample.wire_kind(),
+                "axis for {sample:?} must be its wire_kind()"
+            );
+            let text = String::from_utf8(body).unwrap();
+            assert!(
+                !uuid_shaped.is_match(&text),
+                "refusal body for {sample:?} carries a uuid: {text}"
+            );
+            assert!(
+                !text.contains("CVE-"),
+                "refusal body for {sample:?} carries a CVE identifier: {text}"
+            );
+        }
+    }
+
+    /// ADR 0039 D6's illegal state on the manifest route: the projection
+    /// says `Rejected` and the stream carries no `ArtifactRejected`. The
+    /// caller is refused and told which reference, with no axis field and
+    /// no invented `unknown` token; the operator is told at `error`
+    /// level, because the status has no record behind it.
+    #[test]
+    fn rejected_manifest_with_no_axis_on_the_stream_is_403_with_no_axis_field() {
+        let (status, body) =
+            rejected_manifest_response(None, |h| h.ctx.clone(), /* anonymous */ None);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert!(
+            parsed["errors"][0]["detail"]["subject"].is_string(),
+            "the subject is owed regardless: {parsed}"
+        );
+        assert!(
+            parsed["errors"][0]["detail"].get("axis").is_none(),
+            "an unrecoverable axis emits no axis field: {parsed}"
+        );
+    }
+
+    /// The counterpart that makes the posture change worth anything: a
+    /// manifest that genuinely is not here still answers `404
+    /// MANIFEST_UNKNOWN`. Only asserting both proves the two cases are
+    /// now distinguishable, which is the defect — before this they were
+    /// byte-identical.
+    #[test]
+    fn a_genuinely_absent_manifest_still_answers_404_and_is_distinguishable() {
+        let (rejected_status, _) = rejected_manifest_response(
+            Some(RejectionReason::Scanner),
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        let (absent_status, absent_body) = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("myrepo"));
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            let resp = serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{}", "11".repeat(32)),
+                &HeaderMap::new(),
+                /* head = */ false,
+                /* anonymous */ None,
             )
             .await;
             let status = resp.status();
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             (status, body)
         });
+        assert_eq!(absent_status, StatusCode::NOT_FOUND);
+        let parsed: serde_json::Value = serde_json::from_slice(&absent_body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
+        assert_ne!(
+            absent_status, rejected_status,
+            "a withheld manifest and an absent manifest must no longer share one answer"
+        );
+    }
+
+    /// Rewritten from the concealment pin
+    /// (`rejected_manifest_write_authorized_get_still_hidden_as_404`),
+    /// the RBAC-enabled claims-principal mirror of the capability case
+    /// above. Same two halves, and the same split: the ADR 0039 §10
+    /// hold-read exemption is `Quarantined`-only, so a `Write` grant
+    /// still buys no manifest body out of a `Rejected` row —
+    /// resolvability does not move. What the write-granted caller gains
+    /// is the diagnosis, owed to them because they certainly pass the
+    /// read gate, which is the only predicate the reason keys on.
+    #[test]
+    fn rejected_manifest_write_authorized_get_is_403_with_the_axis_never_the_body() {
+        let (status, body) = rejected_manifest_response(
+            Some(RejectionReason::ScanPolicyRetroactive),
+            |h| write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher"),
+            Some(principal_with_claim("ci-pusher")),
+        );
         assert_eq!(
             status,
-            StatusCode::NOT_FOUND,
-            "a write-authorized GET of a Rejected manifest must stay hidden — \
+            StatusCode::FORBIDDEN,
+            "a write-authorized GET of a Rejected manifest must still never serve it — \
              the hold-read exemption covers Quarantined only"
         );
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(
+            parsed["errors"][0]["detail"]["axis"], "scan_policy_retroactive",
+            "a write-granted caller is told the axis too: {parsed}"
+        );
+    }
+
+    // ---------------- Constituent deliverability (ADR 0062) ----------------
+    //
+    // A manifest is deliverable only while every artifact in its closure
+    // is. The arms below are the per-constituent mirror of the
+    // per-manifest matrix above: a terminal constituent answers in the
+    // envelope that constituent's own state would answer in, a hold and
+    // an absence change nothing, and `GET` and `HEAD` agree on every one
+    // of them — which is asserted rather than assumed, because the two
+    // resolve the closure through the same walk and a divergence there
+    // would make `HEAD`-before-`GET` clients see a manifest `GET` then
+    // refuses.
+
+    /// Fixed constituent digests. Distinct leading nibbles so a failure
+    /// message says which constituent the refusal named without
+    /// decoding anything.
+    const CONFIG_HEX: &str = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
+    const LAYER_HEX: &str = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a";
+
+    /// The parts of a served response these arms assert on. Kept as raw
+    /// bytes rather than parsed JSON because a `HEAD` body is empty by
+    /// construction and a `200` body is the manifest itself.
+    struct Served {
+        status: StatusCode,
+        retry_after: Option<String>,
+        body: Vec<u8>,
+    }
+
+    impl Served {
+        fn json(&self) -> serde_json::Value {
+            serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
+        }
+    }
+
+    fn image_manifest_body(config_hex: &str, layer_hexes: &[&str]) -> Vec<u8> {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": DEFAULT_MEDIA_TYPE,
+            "config": { "digest": format!("sha256:{config_hex}"), "size": 2 },
+            "layers": layer_hexes
+                .iter()
+                .map(|h| serde_json::json!({ "digest": format!("sha256:{h}"), "size": 2 }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn image_index_body(child_hexes: &[&str]) -> Vec<u8> {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": child_hexes
+                .iter()
+                .map(|h| serde_json::json!({ "digest": format!("sha256:{h}"), "size": 2 }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    /// Seed a `Released` manifest carrying `manifest_body`, run `seed`
+    /// for whatever constituents the arm needs, then serve the manifest
+    /// once as `GET` and once as `HEAD` and return both.
+    ///
+    /// Both methods run against the SAME seeded harness, which is what
+    /// makes their agreement an assertion about the handler rather than
+    /// about two independently-built fixtures.
+    fn serve_both_methods(
+        manifest_body: Vec<u8>,
+        seed: impl FnOnce(&Harness, Uuid),
+        ctx_for: impl FnOnce(&Harness) -> Arc<AppContext>,
+        principal: Option<CallerPrincipal>,
+    ) -> (Served, Served) {
+        run(async move {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let hex = sha256_hex(&manifest_body);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                &manifest_body,
+                None,
+                QuarantineStatus::Released,
+            );
+            seed(&h, repo_id);
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&ctx_for(&h));
+            let mut out = Vec::new();
+            for head in [false, true] {
+                let resp = serve(
+                    ctx.clone(),
+                    "myrepo",
+                    "library/nginx",
+                    &format!("sha256:{hex}"),
+                    &HeaderMap::new(),
+                    head,
+                    principal.as_ref(),
+                )
+                .await;
+                let status = resp.status();
+                let retry_after = resp
+                    .headers()
+                    .get("Retry-After")
+                    .map(|v| v.to_str().unwrap().to_string());
+                let body = to_bytes(resp.into_body(), 64 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec();
+                out.push(Served {
+                    status,
+                    retry_after,
+                    body,
+                });
+            }
+            let head = out.pop().expect("the HEAD response");
+            let get = out.pop().expect("the GET response");
+            (get, head)
+        })
+    }
+
+    /// Give `hex` a catalog row in `repo` carrying `status`, and
+    /// optionally an `ArtifactRejected` on its stream so the axis is
+    /// recoverable the way production recovers it.
+    ///
+    /// Deliberately seeds **no** CAS content: a blob's bytes are never
+    /// read by the closure walk, so a fixture that stored them would
+    /// hide a dependency on them.
+    fn seed_constituent(
+        h: &Harness,
+        repo_id: Uuid,
+        hex: &str,
+        status: QuarantineStatus,
+        axis: Option<RejectionReason>,
+    ) {
+        let hash: ContentHash = hex.parse().unwrap();
+        let mut a = sample_artifact(QuarantineStatus::None);
+        a.repository_id = repo_id;
+        a.path = format!("blobs/sha256:{hex}");
+        a.sha256_checksum = hash;
+        a.quarantine_status = status;
+        if matches!(status, QuarantineStatus::Quarantined) {
+            a.quarantine_window_start = Some(Utc::now());
+        }
+        let id = a.id;
+        h.artifacts.insert(a);
+        if let Some(reason) = axis {
+            h.events.set_stream(
+                &hort_domain::events::StreamId::artifact(id),
+                vec![persisted_artifact_rejected(id, reason, 1)],
+            );
+        }
+    }
+
+    /// Every arm asserts this: the two methods agree on the status, on
+    /// the `Retry-After` header, and — when the manifest is refused — on
+    /// the refusal body byte for byte.
+    ///
+    /// The `200` arm is the one asymmetry, and it is the handler's own:
+    /// `HEAD` short-circuits the stream while keeping the header set
+    /// identical. A refusal built by an `OciError` carries its body on
+    /// both methods here because `serve` is called directly; the HTTP
+    /// layer above strips a `HEAD` body, so asserting equality is the
+    /// strictest statement this level can make.
+    fn assert_get_and_head_agree(get: &Served, head: &Served, label: &str) {
+        assert_eq!(
+            get.status, head.status,
+            "GET and HEAD must agree on the status for {label}"
+        );
+        assert_eq!(
+            get.retry_after, head.retry_after,
+            "GET and HEAD must agree on Retry-After for {label}"
+        );
+        if get.status == StatusCode::OK {
+            assert!(
+                head.body.is_empty(),
+                "a served manifest's HEAD carries headers only, for {label}"
+            );
+        } else {
+            assert_eq!(
+                get.body, head.body,
+                "a refusal must be the same answer on GET and HEAD for {label}"
+            );
+        }
+    }
+
+    /// A terminally rejected **layer** withholds the manifest, and the
+    /// refusal names the layer and the axis it was condemned on.
+    ///
+    /// The digest is the point. It is what identified the cause in the
+    /// incident behind this rule — identical across repeated pulls of
+    /// one manifest, different across manifests — and a concealed answer
+    /// would delete that signal for everyone who cannot read hort's
+    /// logs. Note the subject is the **layer's** digest, not the
+    /// requested reference: that is how a client tells "this manifest is
+    /// rejected" apart from "something it needs is".
+    #[test]
+    fn a_rejected_layer_withholds_the_manifest_and_names_it_with_its_axis() {
+        let (get, head) = serve_both_methods(
+            image_manifest_body(CONFIG_HEX, &[LAYER_HEX]),
+            |h, repo| {
+                seed_constituent(h, repo, CONFIG_HEX, QuarantineStatus::Released, None);
+                seed_constituent(
+                    h,
+                    repo,
+                    LAYER_HEX,
+                    QuarantineStatus::Rejected,
+                    Some(RejectionReason::Scanner),
+                );
+            },
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        assert_get_and_head_agree(&get, &head, "a rejected layer");
+        assert_eq!(get.status, StatusCode::FORBIDDEN);
+        let parsed = get.json();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(
+            parsed["errors"][0]["detail"]["subject"],
+            format!("sha256:{LAYER_HEX}"),
+            "the refusal names the offending constituent, not the reference: {parsed}"
+        );
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "scanner");
+    }
+
+    /// The **config** blob, which is the shape the production population
+    /// has: one rejected `{}` config row shared by a whole repository's
+    /// signature inventory, with the payload layers innocent.
+    #[test]
+    fn a_rejected_config_blob_withholds_the_manifest_and_names_the_config() {
+        let (get, head) = serve_both_methods(
+            image_manifest_body(CONFIG_HEX, &[LAYER_HEX]),
+            |h, repo| {
+                seed_constituent(
+                    h,
+                    repo,
+                    CONFIG_HEX,
+                    QuarantineStatus::Rejected,
+                    Some(RejectionReason::Curator {
+                        curator_id: Uuid::from_u128(0xC0FFEE),
+                    }),
+                );
+                seed_constituent(h, repo, LAYER_HEX, QuarantineStatus::Released, None);
+            },
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        assert_get_and_head_agree(&get, &head, "a rejected config blob");
+        assert_eq!(get.status, StatusCode::FORBIDDEN);
+        let parsed = get.json();
+        assert_eq!(
+            parsed["errors"][0]["detail"]["subject"],
+            format!("sha256:{CONFIG_HEX}")
+        );
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "curator");
+        // The curator's identity stays off the wire, exactly as on the
+        // manifest's own refusal: the axis says a human decided, not
+        // which human.
+        let text = String::from_utf8(get.body).unwrap();
+        assert!(
+            !text.contains(&Uuid::from_u128(0xC0FFEE).to_string()),
+            "the curator uuid must never reach the wire: {text}"
+        );
+    }
+
+    /// A `ScanIndeterminate` constituent is terminal too, and answers in
+    /// that state's own envelope: `503` with **no** `Retry-After`,
+    /// because the hold has no self-resolving deadline — its exit is an
+    /// admin action or a successful rescan, not elapsed time.
+    #[test]
+    fn a_scan_indeterminate_layer_withholds_the_manifest_with_no_retry_after() {
+        let (get, head) = serve_both_methods(
+            image_manifest_body(CONFIG_HEX, &[LAYER_HEX]),
+            |h, repo| {
+                seed_constituent(h, repo, CONFIG_HEX, QuarantineStatus::Released, None);
+                seed_constituent(
+                    h,
+                    repo,
+                    LAYER_HEX,
+                    QuarantineStatus::ScanIndeterminate,
+                    None,
+                );
+            },
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        assert_get_and_head_agree(&get, &head, "a scan-indeterminate layer");
+        assert_eq!(get.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            get.retry_after, None,
+            "a terminal hold has no self-resolving deadline to advertise"
+        );
+        let parsed = get.json();
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        assert_eq!(
+            parsed["errors"][0]["message"],
+            "artifact scan result is indeterminate"
+        );
+    }
+
+    /// A **held** constituent changes nothing: "not yet" is not "never",
+    /// the client's own blob fetch already answers it with the deadline,
+    /// and propagating it here would change the answer for every fresh
+    /// push — a manifest PUT lands seconds after its blobs are
+    /// quarantined on ingest.
+    #[test]
+    fn a_quarantined_layer_leaves_the_manifest_served() {
+        let body = image_manifest_body(CONFIG_HEX, &[LAYER_HEX]);
+        let expected = body.clone();
+        let (get, head) = serve_both_methods(
+            body,
+            |h, repo| {
+                seed_constituent(h, repo, CONFIG_HEX, QuarantineStatus::Released, None);
+                seed_constituent(h, repo, LAYER_HEX, QuarantineStatus::Quarantined, None);
+            },
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        assert_get_and_head_agree(&get, &head, "a quarantined layer");
+        assert_eq!(get.status, StatusCode::OK);
+        assert_eq!(get.body, expected, "the manifest body is served unchanged");
+    }
+
+    /// **The arm that must never break.** A pull-through manifest whose
+    /// constituents are not ingested still answers `200`: those
+    /// references are registered by digest with no existence check,
+    /// deliberately, and the client's own blob `GET` is what pulls them
+    /// through. Treating absence as a hold inverts every cold
+    /// pull-through in the registry.
+    #[test]
+    fn constituents_that_are_not_ingested_leave_the_manifest_served() {
+        let body = image_manifest_body(CONFIG_HEX, &[LAYER_HEX]);
+        let expected = body.clone();
+        let (get, head) = serve_both_methods(
+            body,
+            // No catalog rows and no CAS objects for either constituent.
+            |_h, _repo| {},
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        assert_get_and_head_agree(&get, &head, "constituents that are not ingested");
+        assert_eq!(
+            get.status,
+            StatusCode::OK,
+            "a cold pull-through manifest must still resolve"
+        );
+        assert_eq!(get.body, expected);
+    }
+
+    /// Transitivity. An index whose child is itself fine but whose
+    /// child's **layer** is terminal must not answer `200` and then fail
+    /// one level down — that is the same contradiction the rule exists to
+    /// close, one level up.
+    #[test]
+    fn an_index_is_withheld_for_a_terminal_layer_of_one_of_its_children() {
+        let child_body = image_manifest_body(CONFIG_HEX, &[LAYER_HEX]);
+        let child_hex = sha256_hex(&child_body);
+        let index_body = image_index_body(&[&child_hex]);
+        let (get, head) = serve_both_methods(
+            index_body,
+            move |h, repo| {
+                // The child is a manifest in its own right: a catalog row
+                // AND the CAS bytes the walk reads its constituents from.
+                let child_hash: ContentHash = child_hex.parse().unwrap();
+                seed_constituent(h, repo, &child_hex, QuarantineStatus::Released, None);
+                h.storage.insert_content(child_hash, child_body.clone());
+                seed_constituent(h, repo, CONFIG_HEX, QuarantineStatus::Released, None);
+                seed_constituent(
+                    h,
+                    repo,
+                    LAYER_HEX,
+                    QuarantineStatus::Rejected,
+                    Some(RejectionReason::Provenance),
+                );
+            },
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        assert_get_and_head_agree(&get, &head, "an index over a child with a rejected layer");
+        assert_eq!(get.status, StatusCode::FORBIDDEN);
+        let parsed = get.json();
+        assert_eq!(
+            parsed["errors"][0]["detail"]["subject"],
+            format!("sha256:{LAYER_HEX}"),
+            "the refusal names the layer two hops down: {parsed}"
+        );
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "provenance");
+    }
+
+    /// An index whose children have not arrived yet — the cold
+    /// multi-arch pull — still resolves. The walk asks for each child's
+    /// bytes, gets absence, and absence is not a hold.
+    #[test]
+    fn an_index_whose_children_are_not_ingested_is_still_served() {
+        let child_hex = sha256_hex(b"a child that was never pulled");
+        let body = image_index_body(&[&child_hex]);
+        let expected = body.clone();
+        let (get, head) = serve_both_methods(
+            body,
+            |_h, _repo| {},
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        assert_get_and_head_agree(&get, &head, "an index whose children are not ingested");
+        assert_eq!(get.status, StatusCode::OK);
+        assert_eq!(get.body, expected);
+    }
+
+    /// A write-granted principal gets the same answer as everyone else.
+    /// ADR 0039 §10 / ADR 0055 let such a caller read a **held** manifest
+    /// so a subject can be signed; this unit does not extend that, and
+    /// the reason is not procedural: a terminal constituent will not
+    /// become deliverable by the pusher completing their workflow, so
+    /// there is no push-then-sign payoff to protect.
+    #[test]
+    fn a_write_granted_principal_gets_the_same_refusal() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCA11);
+        let (get, head) = serve_both_methods(
+            image_manifest_body(CONFIG_HEX, &[LAYER_HEX]),
+            |h, repo| {
+                seed_constituent(h, repo, CONFIG_HEX, QuarantineStatus::Released, None);
+                seed_constituent(
+                    h,
+                    repo,
+                    LAYER_HEX,
+                    QuarantineStatus::Rejected,
+                    Some(RejectionReason::Scanner),
+                );
+            },
+            |h| {
+                user_grant_ctx(
+                    &h.ctx,
+                    h.repositories.clone(),
+                    uid,
+                    &[Permission::Read, Permission::Write],
+                )
+            },
+            Some(pull_scoped_cap_principal(uid)),
+        );
+        assert_get_and_head_agree(&get, &head, "a write-granted principal");
+        assert_eq!(
+            get.status,
+            StatusCode::FORBIDDEN,
+            "no grant resurrects a manifest whose constituent is terminally held"
+        );
+        assert!(
+            get.body != image_manifest_body(CONFIG_HEX, &[LAYER_HEX]),
+            "the manifest body must never be served"
+        );
+    }
+
+    /// A resolution that cannot be answered refuses. Not knowing what a
+    /// document binds is not the same as knowing it is safe (ADR 0007),
+    /// and the alternative — serving on an unanswered question — is the
+    /// posture this rule replaced.
+    #[test]
+    fn a_deliverability_resolution_failure_refuses_rather_than_serves() {
+        let (get, head) = serve_both_methods(
+            image_manifest_body(CONFIG_HEX, &[LAYER_HEX]),
+            |h, _repo| {
+                // Two failures armed: the GET and the HEAD each consume
+                // one, so both methods meet the same broken catalog.
+                for _ in 0..2 {
+                    h.constituent_status
+                        .fail_next(DomainError::Invariant("catalog unavailable".into()));
+                }
+            },
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        assert_get_and_head_agree(&get, &head, "a failed resolution");
+        assert_eq!(get.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(get.json()["errors"][0]["code"], "INTERNAL");
+    }
+
+    /// The mandatory server-side line, asserted here because ADR 0062
+    /// accepts an opaque answer to the *client*: the operator's only way
+    /// to tell a withheld manifest from a broken registry is this line,
+    /// so it carries all three facts — which manifest, which
+    /// constituent, which verdict.
+    ///
+    /// Captured by `target` from the resolution's own module, which is
+    /// what makes this an assertion about the resolution rather than
+    /// about a line the handler could re-type beside it.
+    #[test]
+    fn the_refusal_logs_the_manifest_the_constituent_and_the_verdict() {
+        let body = image_manifest_body(CONFIG_HEX, &[LAYER_HEX]);
+        let manifest_hex = sha256_hex(&body);
+        let (_, events) = crate::test_tracing::capture_tracing(|| {
+            serve_both_methods(
+                body,
+                |h, repo| {
+                    seed_constituent(
+                        h,
+                        repo,
+                        LAYER_HEX,
+                        QuarantineStatus::Rejected,
+                        Some(RejectionReason::Scanner),
+                    );
+                },
+                |h| h.ctx.clone(),
+                /* anonymous */ None,
+            )
+        });
+        let lines = crate::test_tracing::events_at(
+            &events,
+            tracing::Level::WARN,
+            "hort_app::use_cases::manifest_deliverability",
+        );
+        // One per method: the GET and the HEAD each refuse, and each
+        // refusal is diagnosable on its own.
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected one refusal line per served method, got: {lines:?}"
+        );
+        for line in lines {
+            assert!(
+                line.fields.contains(&manifest_hex)
+                    && line.fields.contains(LAYER_HEX)
+                    && line.fields.contains("rejected"),
+                "the refusal line must name the manifest, the constituent and the verdict: \
+                 {line:?}"
+            );
+        }
+    }
+
+    /// The converse, and the reason the line above means anything: a
+    /// deliverable manifest is not an incident and logs no refusal, so
+    /// the assertion cannot be satisfied by logging unconditionally.
+    #[test]
+    fn a_deliverable_manifest_logs_no_refusal() {
+        let (_, events) = crate::test_tracing::capture_tracing(|| {
+            serve_both_methods(
+                image_manifest_body(CONFIG_HEX, &[LAYER_HEX]),
+                |h, repo| {
+                    seed_constituent(h, repo, CONFIG_HEX, QuarantineStatus::Released, None);
+                    seed_constituent(h, repo, LAYER_HEX, QuarantineStatus::Quarantined, None);
+                },
+                |h| h.ctx.clone(),
+                /* anonymous */ None,
+            )
+        });
+        assert!(
+            crate::test_tracing::events_at(
+                &events,
+                tracing::Level::WARN,
+                "hort_app::use_cases::manifest_deliverability",
+            )
+            .is_empty(),
+            "a deliverable manifest must log no refusal: {events:?}"
+        );
+    }
+
+    /// The manifest's own gate still runs first and still owns its own
+    /// arm: a `Rejected` manifest answers about **itself** (the subject
+    /// is the requested reference), not about a constituent, so the two
+    /// gates cannot be confused in a bug report.
+    #[test]
+    fn the_manifests_own_rejection_still_answers_about_itself() {
+        let (status, body) = rejected_manifest_response(
+            Some(RejectionReason::Scanner),
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            parsed["errors"][0]["detail"]["subject"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:"),
+            "the subject is the client's own reference: {parsed}"
+        );
     }
 
     // ---------------- ScanIndeterminate (issue #92) ----------------
@@ -3554,6 +4528,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         });
@@ -3769,8 +4744,8 @@ mod tests {
     }
 
     // ================================================================
-    // Two things ride alongside `register_membership_edges_from_pull` on
-    // the digest-ref pull-through, and the tests below separate them:
+    // Two things ride alongside the membership-claim derivation on the
+    // digest-ref pull-through, and the tests below separate them:
     //
     // - The blob warm (`crate::prefetch::warm_manifest_blobs`). A
     //   digest-ref pull IS the client naming a specific architecture, so
@@ -4514,6 +5489,553 @@ mod tests {
         );
         assert_eq!(config_rows[0].source_artifact_id, manifest_artifact_id);
         assert_eq!(layer_rows[0].source_artifact_id, manifest_artifact_id);
+    }
+
+    // =================================================================
+    // Atomicity acceptance for the pull-through legs. All three legs that
+    // mint a manifest row now carry their membership claims INTO that
+    // row's transition rather than inserting them beside it: the two
+    // leader legs (digest-ref and tag-ref) and the coalesced follower.
+    //
+    // Each injected-failure test is paired with a success pin. The pins
+    // matter as much as the failures: a rollback assertion passes equally
+    // well against a leg that claimed nothing at all, so the pin is what
+    // proves the claim set is non-empty and rides ONE lifecycle call.
+    // =================================================================
+
+    /// **Acceptance, digest-ref leader leg.** A failed `oci_index_member`
+    /// claim fails the pull: no index artifact, no event on its stream, no
+    /// row.
+    ///
+    /// This leg used to read the manifest body back from its tempfile
+    /// AFTER the ingest and insert the edges with a `warn!`-and-continue
+    /// arm per edge, so a failure left a live, servable index whose child
+    /// manifests carried one fewer claim against the storage GC — and no
+    /// sweep repairs a tree edge (the refcount reconcile derives
+    /// `primary_content` / `metadata_blob` from the artifact row, and
+    /// nothing relational records what a manifest references). A failed GET
+    /// is retriable; a committed index with no claim was not.
+    #[test]
+    fn pull_through_by_digest_with_failing_member_edge_fails_the_pull() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, member_rows, index_present, event_batches) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+            let batches_before = mocks.events.appended_batches().len();
+            mocks.content_references.fail_next_insert_for_kind(
+                "oci_index_member",
+                DomainError::Invariant("simulated oci_index_member insert failure".into()),
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            let child_hash: ContentHash = child_hex.parse().unwrap();
+            let member_rows = mocks
+                .content_references
+                .find_by_target(repo_id, &child_hash, Some("oci_index_member"))
+                .await
+                .unwrap()
+                .len();
+            let index_present = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            let event_batches = mocks.events.appended_batches().len() - batches_before;
+            (status, member_rows, index_present, event_batches)
+        });
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a failed claim on a child manifest's bytes must fail the pull, not serve 200 \
+             over an index that never recorded it"
+        );
+        assert_eq!(member_rows, 0, "no oci_index_member row landed");
+        assert!(
+            !index_present,
+            "no index artifact may survive the rolled-back pull"
+        );
+        assert_eq!(
+            event_batches, 0,
+            "no event may survive the rolled-back pull — not even ArtifactIngested"
+        );
+    }
+
+    /// The counter-assertion for the digest-ref leg: ONE lifecycle call
+    /// carries the index artifact AND its `oci_index_member` claim.
+    #[test]
+    fn pull_through_by_digest_commits_member_claims_with_the_index_transition() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, index_edges, carrying) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            let index = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .expect("pulled-through index must be committed as an artifact");
+            let index_edges: Vec<(String, String)> = mocks
+                .lifecycle
+                .ingest_edge_kinds()
+                .into_iter()
+                .filter(|(id, _, _)| *id == index.id)
+                .map(|(_, kind, target)| (kind, target))
+                .collect();
+            let carrying = mocks
+                .lifecycle
+                .ingest_edges()
+                .into_iter()
+                .filter(|(id, _)| *id == index.id)
+                .count();
+            (status, index_edges, carrying)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            index_edges,
+            vec![
+                ("primary_content".to_string(), hex.clone()),
+                ("oci_index_member".to_string(), child_hex.to_string()),
+            ],
+            "the index's claim on its own bytes and on its child's, in one call"
+        );
+        assert_eq!(
+            carrying, 1,
+            "one transition carries the index's whole edge set"
+        );
+    }
+
+    /// **Acceptance, tag-ref leader leg.** The same rollback for the other
+    /// leader leg. Separate test rather than a parameterisation because the
+    /// two legs are separate closures with separately-captured state — the
+    /// tag leg additionally resolves its digest from the upstream's
+    /// `Docker-Content-Digest` and writes a tag→digest ref — and a
+    /// conversion applied to one and missed on the other is exactly the
+    /// drift this audit keeps finding.
+    #[test]
+    fn pull_through_by_tag_with_failing_member_edge_fails_the_pull() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        let (status, member_rows, index_present, event_batches) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                "latest",
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(format!("sha256:{hex}")),
+                    last_modified: None,
+                },
+            );
+            let batches_before = mocks.events.appended_batches().len();
+            mocks.content_references.fail_next_insert_for_kind(
+                "oci_index_member",
+                DomainError::Invariant("simulated oci_index_member insert failure".into()),
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/latest");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            let child_hash: ContentHash = child_hex.parse().unwrap();
+            let member_rows = mocks
+                .content_references
+                .find_by_target(repo_id, &child_hash, Some("oci_index_member"))
+                .await
+                .unwrap()
+                .len();
+            let index_present = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            let event_batches = mocks.events.appended_batches().len() - batches_before;
+            (status, member_rows, index_present, event_batches)
+        });
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a failed claim on a child manifest's bytes must fail the tag pull too"
+        );
+        assert_eq!(member_rows, 0, "no oci_index_member row landed");
+        assert!(
+            !index_present,
+            "no index artifact may survive the rolled-back tag pull"
+        );
+        assert_eq!(
+            event_batches, 0,
+            "no event may survive the rolled-back tag pull"
+        );
+    }
+
+    /// The counter-assertion for the tag-ref leg.
+    #[test]
+    fn pull_through_by_tag_commits_member_claims_with_the_index_transition() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        let (status, index_edges, carrying) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                "latest",
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(format!("sha256:{hex}")),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/latest");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            let index = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .expect("pulled-through index must be committed as an artifact");
+            let index_edges: Vec<(String, String)> = mocks
+                .lifecycle
+                .ingest_edge_kinds()
+                .into_iter()
+                .filter(|(id, _, _)| *id == index.id)
+                .map(|(_, kind, target)| (kind, target))
+                .collect();
+            let carrying = mocks
+                .lifecycle
+                .ingest_edges()
+                .into_iter()
+                .filter(|(id, _)| *id == index.id)
+                .count();
+            (status, index_edges, carrying)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            index_edges,
+            vec![
+                ("primary_content".to_string(), hex.clone()),
+                ("oci_index_member".to_string(), child_hex.to_string()),
+            ],
+            "the index's claim on its own bytes and on its child's, in one call"
+        );
+        assert_eq!(
+            carrying, 1,
+            "one transition carries the index's whole edge set"
+        );
+    }
+
+    /// **Acceptance, coalesced follower.** A failed `oci_index_member`
+    /// claim fails the follower's own registration: no row in the
+    /// follower's repository, no event, no edge — and `Internal` rather
+    /// than `Ingested`.
+    ///
+    /// The follower is the leg with no row to inherit: `DedupKey` is
+    /// cross-repository by design, so a follower whose target repository
+    /// differs from the leader's mints its own row from the
+    /// already-CAS-resident bytes. It used to insert its membership edges
+    /// after that row committed, keyed on the id the register returned, with
+    /// a `warn!`-and-continue arm — a 200 over a row whose constituents
+    /// nothing was keeping alive. The read now precedes the mint (keyed on
+    /// the content hash, which is all it ever needed) and the claims ride
+    /// the transition.
+    #[test]
+    fn coalesced_follower_with_failing_member_edge_registers_nothing() {
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        let (variant, member_rows, follower_rows, event_batches) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let leader_repo = oci_repo("leader-mirror");
+            let follower_repo = oci_repo("follower-mirror");
+            assert_ne!(leader_repo.id, follower_repo.id);
+            mocks.repositories.insert(leader_repo.clone());
+            mocks.repositories.insert(follower_repo.clone());
+
+            // Only the LEADER's row exists, so `finalise_manifest_pull`
+            // takes its cross-repo follower branch for `follower_repo`.
+            seed_manifest(
+                &mocks.artifacts,
+                &mocks.storage,
+                &mocks.artifact_metadata,
+                leader_repo.id,
+                &hex,
+                &content,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::None,
+            );
+            let batches_before = mocks.events.appended_batches().len();
+            mocks.content_references.fail_next_insert_for_kind(
+                "oci_index_member",
+                DomainError::Invariant("simulated oci_index_member insert failure".into()),
+            );
+
+            let content_hash: ContentHash = hex.parse().unwrap();
+            let outcome = finalise_manifest_pull(
+                &ctx,
+                &follower_repo,
+                "dockerhub/library/nginx",
+                &format!("sha256:{hex}"),
+                content_hash.clone(),
+                /*write_tag=*/ false,
+            )
+            .await;
+
+            let child_hash: ContentHash = child_hex.parse().unwrap();
+            let member_rows = mocks
+                .content_references
+                .find_by_target(follower_repo.id, &child_hash, Some("oci_index_member"))
+                .await
+                .unwrap()
+                .len();
+            let follower_rows = mocks
+                .artifacts
+                .find_by_path(follower_repo.id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            let event_batches = mocks.events.appended_batches().len() - batches_before;
+            (
+                manifest_outcome_variant_name(&outcome),
+                member_rows,
+                follower_rows,
+                event_batches,
+            )
+        });
+        assert_eq!(
+            variant, "Internal",
+            "a failed claim on a child manifest's bytes must fail the follower's \
+             registration, not serve 200 over a row that never recorded it"
+        );
+        assert_eq!(member_rows, 0, "no oci_index_member row landed");
+        assert!(
+            !follower_rows,
+            "no follower artifact row may survive the rolled-back registration"
+        );
+        assert_eq!(
+            event_batches, 0,
+            "no event may survive the rolled-back registration"
+        );
+    }
+
+    /// The counter-assertion for the follower: ONE lifecycle call carries
+    /// the follower's own row AND its `oci_index_member` claim, with the
+    /// claim scoped to the FOLLOWER's repository (the leader's row is a
+    /// different unit of work with its own edges).
+    #[test]
+    fn coalesced_follower_commits_member_claims_with_its_own_transition() {
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let leader_repo = oci_repo("leader-mirror");
+            let follower_repo = oci_repo("follower-mirror");
+            assert_ne!(leader_repo.id, follower_repo.id);
+            mocks.repositories.insert(leader_repo.clone());
+            mocks.repositories.insert(follower_repo.clone());
+
+            seed_manifest(
+                &mocks.artifacts,
+                &mocks.storage,
+                &mocks.artifact_metadata,
+                leader_repo.id,
+                &hex,
+                &content,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::None,
+            );
+
+            let content_hash: ContentHash = hex.parse().unwrap();
+            let outcome = finalise_manifest_pull(
+                &ctx,
+                &follower_repo,
+                "dockerhub/library/nginx",
+                &format!("sha256:{hex}"),
+                content_hash,
+                /*write_tag=*/ false,
+            )
+            .await;
+            let follower_artifact = match outcome {
+                UpstreamManifestPullOutcome::Ingested { artifact, .. } => {
+                    assert_eq!(artifact.repository_id, follower_repo.id);
+                    artifact
+                }
+                other => panic!(
+                    "expected Ingested from cross-repo follower re-register; got {}",
+                    manifest_outcome_variant_name(&other)
+                ),
+            };
+
+            let follower_edges: Vec<(String, String)> = mocks
+                .lifecycle
+                .ingest_edge_kinds()
+                .into_iter()
+                .filter(|(id, _, _)| *id == follower_artifact.id)
+                .map(|(_, kind, target)| (kind, target))
+                .collect();
+            assert_eq!(
+                follower_edges,
+                vec![
+                    ("primary_content".to_string(), hex.clone()),
+                    ("oci_index_member".to_string(), child_hex.to_string()),
+                ],
+                "the follower's own row claims its bytes and its child's, in one call"
+            );
+            // `register_by_hash_inner` commits twice for this row — the
+            // genesis commit that mints it, then the quarantine gate's
+            // follow-on commit, which carries enqueues and no edges. Exactly
+            // ONE of the two carries edges, and it carries all of them: the
+            // row and its claims are a single atomic unit, not a mint
+            // followed by a top-up.
+            let edge_carrying: Vec<usize> = mocks
+                .lifecycle
+                .ingest_edges()
+                .into_iter()
+                .filter(|(id, edges)| *id == follower_artifact.id && !edges.is_empty())
+                .map(|(_, edges)| edges.len())
+                .collect();
+            assert_eq!(
+                edge_carrying,
+                vec![2],
+                "exactly one transition carries the follower row's whole edge set"
+            );
+        });
     }
 
     /// The membership edges of a digest-ref manifest pull must exist for

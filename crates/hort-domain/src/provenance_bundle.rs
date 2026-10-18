@@ -28,6 +28,15 @@
 //!   artifact's manifest digest (the re-tag guard — a signature over a
 //!   *different* digest must be rejected, ADR 0039 §2).
 //!
+//! # Well-formedness, separately from extraction
+//!
+//! [`is_well_formed_sigstore_bundle`] and [`simplesigning_subject_digest`]
+//! answer the *other* question about the same bytes: not "what signature
+//! material do they carry" but "are they the kind of thing they claim to
+//! be at all". The OCI manifest-push path asks it before granting a
+//! referrer the signature exemption; the keyed verifier asks the second one
+//! because the simplesigning digest it binds IS the payload's readability.
+//!
 //! A **keyless** bundle (cert chain present) yields `Ok(None)` — it is the
 //! Sigstore verifier's, never claimed here. Structurally-broken bundle JSON,
 //! or a bundle that is not a keyed DSSE envelope, likewise yields `Ok(None)` or
@@ -233,6 +242,118 @@ fn dsse_pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
     out.push(b' ');
     out.extend_from_slice(payload);
     out
+}
+
+// --- Well-formedness probes -------------------------------------------------
+
+/// A deliberately **loose** projection for [`is_well_formed_sigstore_bundle`]:
+/// presence of the two structural members, and nothing about what is inside
+/// them. Distinct from [`Bundle`] for the reason the probe exists — it must
+/// never be *stricter* than what a verifier can read, and [`DsseEnvelope`]'s
+/// required `payload` / `payloadType` fields would make a bundle whose
+/// envelope is shaped differently fail to deserialise here while the
+/// verifiers still read it.
+///
+/// [`VerificationMaterial`] is shared with the keyed extractor on purpose:
+/// "what counts as trust material" is one list, so the probe and the
+/// extractor cannot disagree about it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleShape {
+    #[serde(default)]
+    verification_material: Option<VerificationMaterial>,
+    /// The DSSE-envelope content member (an attestation / a keyed signature).
+    #[serde(default)]
+    dsse_envelope: Option<serde_json::Value>,
+    /// The bare-message-signature content member (`cosign sign` keyless over
+    /// a digest).
+    #[serde(default)]
+    message_signature: Option<serde_json::Value>,
+}
+
+/// Returns `true` iff `bundle_json` is **well-formed as a Sigstore v0.3
+/// bundle**: valid JSON carrying
+///
+/// 1. a `verificationMaterial` with at least one recognised trust-material
+///    form — `publicKey` (keyed), `certificate` or `x509CertificateChain`
+///    (keyless); and
+/// 2. a content member — `dsseEnvelope` or `messageSignature`.
+///
+/// **Well-formedness, never validity.** Whether a signature is *valid* needs
+/// the trust root and the subject's bytes and stays in the verifiers. This
+/// function answers one question: is this the kind of thing it claims to be?
+///
+/// # Why exactly these two conditions
+///
+/// Each is a **necessary** condition for *some* verifier to read the bytes at
+/// all, so failing either means no verifier can: the keyless path needs a leaf
+/// certificate out of the verification material and the keyed path needs the
+/// bare public key, and both need a content member (the keyless bundle check
+/// errors `SignatureMissing` without one, the keyed extractor needs the DSSE
+/// envelope). Nothing beyond them is checked, and that direction is
+/// load-bearing: a probe stricter than the verifiers' own parse would refuse
+/// material the system can in fact verify.
+///
+/// `mediaType` is deliberately **not** checked even though the spec pins it.
+/// The keyed extractor never reads it, so a keyed bundle carrying an
+/// unexpected or absent `mediaType` is still verifiable material, and
+/// refusing it here would refuse a push the keyed verifier would have
+/// honoured. Likewise untouched: the base64 payload's decodability, the
+/// in-toto subject, the transparency-log entry, and everything
+/// cryptographic — each is read by one path and not the other, so none of
+/// them is a statement about the carriage.
+pub fn is_well_formed_sigstore_bundle(bundle_json: &[u8]) -> bool {
+    let Ok(bundle) = serde_json::from_slice::<BundleShape>(bundle_json) else {
+        return false;
+    };
+    let Some(material) = &bundle.verification_material else {
+        return false;
+    };
+    let has_trust_material = material.public_key.is_some()
+        || material.certificate.is_some()
+        || material.x509_certificate_chain.is_some();
+    let has_content = bundle.dsse_envelope.is_some() || bundle.message_signature.is_some();
+    has_trust_material && has_content
+}
+
+/// The cosign `simplesigning` payload projection — only the one field the
+/// keyed binding needs.
+#[derive(Deserialize)]
+struct Simplesigning {
+    critical: Critical,
+}
+
+#[derive(Deserialize)]
+struct Critical {
+    image: SimplesigningImage,
+}
+
+#[derive(Deserialize)]
+struct SimplesigningImage {
+    #[serde(rename = "docker-manifest-digest")]
+    docker_manifest_digest: String,
+}
+
+/// Parse a cosign `simplesigning` payload → the
+/// `critical.image.docker-manifest-digest` it binds (`"sha256:<hex>"` as the
+/// payload spells it). `None` on malformed JSON or a missing field — which is
+/// exactly "these bytes are not a simplesigning payload".
+///
+/// Single-sourced here because two callers need the same answer for two
+/// different reasons, and they must not drift: the keyed verifier binds the
+/// digest this returns against the served artifact (a mismatch is the re-tag
+/// finding, ADR 0039 §2), and the OCI manifest-push path uses `is_some()` as
+/// the well-formedness door for a layer declared
+/// [`COSIGN_SIMPLESIGNING_MEDIA_TYPE`](crate::oci::COSIGN_SIMPLESIGNING_MEDIA_TYPE).
+/// Because the door's predicate IS the verifier's readability test, the door
+/// cannot refuse a payload the verifier could have read.
+///
+/// The digest string is **not** validated as a `sha256:<hex>` shape, and that
+/// is the same rule: a payload binding `"garbage"` is readable material whose
+/// binding fails, which is a *finding* the verifier must be allowed to make.
+pub fn simplesigning_subject_digest(payload: &[u8]) -> Option<String> {
+    let parsed: Simplesigning = serde_json::from_slice(payload).ok()?;
+    Some(parsed.critical.image.docker_manifest_digest)
 }
 
 #[cfg(test)]
@@ -443,6 +564,156 @@ mod tests {
         );
         let err = extract_keyed_dsse_signature(bundle.as_bytes()).unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    // --- is_well_formed_sigstore_bundle ------------------------------------
+    //
+    // The probe must never refuse material a verifier can read, so the
+    // counter-assertion for it is a REAL cosign bundle passing — and those
+    // fixtures live with the verifiers that read them
+    // (`hort-adapters-provenance-sigstore`'s keyless one,
+    // `hort-adapters-provenance-cosign-key`'s keyed one), each of which
+    // asserts it there rather than this crate reaching across into another
+    // crate's fixture tree. What follows is the synthetic corpus: one case
+    // per structural condition, in both directions.
+
+    #[test]
+    fn a_keyless_certificate_bundle_with_a_message_signature_is_well_formed() {
+        let bundle = serde_json::json!({
+            "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "verificationMaterial": { "certificate": { "rawBytes": "Zm9v" } },
+            "messageSignature": { "messageDigest": { "algorithm": "SHA2_256" } },
+        })
+        .to_string();
+        assert!(is_well_formed_sigstore_bundle(bundle.as_bytes()));
+    }
+
+    #[test]
+    fn an_older_x509_chain_bundle_is_well_formed() {
+        let bundle = serde_json::json!({
+            "verificationMaterial": {
+                "x509CertificateChain": { "certificates": [ { "rawBytes": "Zm9v" } ] }
+            },
+            "dsseEnvelope": { "payload": "e30=", "payloadType": "x", "signatures": [] },
+        })
+        .to_string();
+        assert!(is_well_formed_sigstore_bundle(bundle.as_bytes()));
+    }
+
+    /// The `mediaType` is NOT part of the probe: a keyed bundle whose media
+    /// type is absent or unexpected is still material the keyed verifier
+    /// reads and can verify, so refusing it would refuse a push the system
+    /// would otherwise have honoured.
+    #[test]
+    fn a_bundle_with_no_media_type_is_still_well_formed() {
+        let bundle = serde_json::json!({
+            "verificationMaterial": { "publicKey": { "hint": "abc" } },
+            "dsseEnvelope": { "payload": "e30=", "payloadType": "x", "signatures": [] },
+        })
+        .to_string();
+        assert!(is_well_formed_sigstore_bundle(bundle.as_bytes()));
+    }
+
+    #[test]
+    fn garbage_is_not_well_formed() {
+        assert!(!is_well_formed_sigstore_bundle(b"not json at all"));
+        assert!(!is_well_formed_sigstore_bundle(b""));
+    }
+
+    #[test]
+    fn json_without_verification_material_is_not_well_formed() {
+        let bundle = serde_json::json!({
+            "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "dsseEnvelope": { "payload": "e30=", "payloadType": "x", "signatures": [] },
+        })
+        .to_string();
+        assert!(!is_well_formed_sigstore_bundle(bundle.as_bytes()));
+    }
+
+    /// Verification material that carries none of the three recognised trust
+    /// forms is no trust anchor at all: the keyless path finds no leaf cert
+    /// and the keyed path finds no public key.
+    #[test]
+    fn verification_material_without_trust_material_is_not_well_formed() {
+        let bundle = serde_json::json!({
+            "verificationMaterial": { "tlogEntries": [] },
+            "dsseEnvelope": { "payload": "e30=", "payloadType": "x", "signatures": [] },
+        })
+        .to_string();
+        assert!(!is_well_formed_sigstore_bundle(bundle.as_bytes()));
+    }
+
+    #[test]
+    fn a_bundle_with_no_content_member_is_not_well_formed() {
+        let bundle = serde_json::json!({
+            "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "verificationMaterial": { "publicKey": { "hint": "abc" } },
+        })
+        .to_string();
+        assert!(!is_well_formed_sigstore_bundle(bundle.as_bytes()));
+    }
+
+    /// A simplesigning payload is not a bundle, and vice versa. The two
+    /// carriages are distinguished by their declared media type; the probes
+    /// must not quietly accept each other's shape.
+    #[test]
+    fn a_simplesigning_payload_is_not_a_well_formed_bundle() {
+        let payload = serde_json::json!({
+            "critical": { "image": { "docker-manifest-digest": "sha256:aa" } }
+        })
+        .to_string();
+        assert!(!is_well_formed_sigstore_bundle(payload.as_bytes()));
+    }
+
+    // --- simplesigning_subject_digest --------------------------------------
+
+    #[test]
+    fn simplesigning_payload_yields_its_bound_digest() {
+        let payload = serde_json::json!({
+            "critical": {
+                "identity": { "docker-reference": "example.com/app" },
+                "image": { "docker-manifest-digest": "sha256:abc" },
+                "type": "cosign container image signature"
+            },
+            "optional": null
+        })
+        .to_string();
+        assert_eq!(
+            simplesigning_subject_digest(payload.as_bytes()),
+            Some("sha256:abc".to_string())
+        );
+    }
+
+    /// The digest string is handed back unvalidated: a payload binding
+    /// nonsense is readable material whose binding fails, which is a finding
+    /// the verifier must be allowed to make.
+    #[test]
+    fn simplesigning_digest_is_returned_unvalidated() {
+        let payload = br#"{"critical":{"image":{"docker-manifest-digest":"garbage"}}}"#;
+        assert_eq!(
+            simplesigning_subject_digest(payload),
+            Some("garbage".to_string())
+        );
+    }
+
+    #[test]
+    fn non_simplesigning_payloads_yield_no_digest() {
+        assert_eq!(
+            simplesigning_subject_digest(b"not a simplesigning json"),
+            None
+        );
+        assert_eq!(simplesigning_subject_digest(br#"{"critical":{}}"#), None);
+        assert_eq!(
+            simplesigning_subject_digest(br#"{"critical":{"image":{}}}"#),
+            None
+        );
+        // A bundle is not a simplesigning payload either.
+        assert_eq!(
+            simplesigning_subject_digest(
+                br#"{"verificationMaterial":{"publicKey":{}},"dsseEnvelope":{}}"#
+            ),
+            None
+        );
     }
 
     #[test]

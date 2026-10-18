@@ -7,7 +7,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 use hort_domain::entities::api_token::{ApiToken, TokenKind};
-use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
+use hort_domain::entities::artifact::{Artifact, ArtifactMetadata};
 use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::oidc_issuer::{JwtAlg, OidcIssuer};
 use hort_domain::entities::rbac::Permission;
@@ -25,6 +25,8 @@ use hort_domain::events::{
 };
 use hort_domain::types::ContentHash;
 use std::str::FromStr;
+
+use crate::quarantine_status_sql::quarantine_status_from_sql;
 
 // ---------------------------------------------------------------------------
 // RepositoryRow
@@ -283,11 +285,18 @@ impl TryFrom<ArtifactRow> for Artifact {
     type Error = DomainError;
 
     fn try_from(row: ArtifactRow) -> Result<Self, Self::Error> {
-        let quarantine_status = row
-            .quarantine_status
-            .as_deref()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(QuarantineStatus::None);
+        // Fail closed: a stored status this adapter cannot classify is a
+        // data-integrity error, not a status. The substitution it
+        // replaced (`QuarantineStatus::None`) is the most permissive
+        // state in the system — `Artifact::is_downloadable` admits it
+        // and the default `ReleasedOnly` index mode serves it — so an
+        // unclassifiable row was advertised and served with no release
+        // authority behind it. Same reasoning, and the same error, as
+        // the corrupt-checksum arm immediately below.
+        let quarantine_status =
+            quarantine_status_from_sql(row.quarantine_status.as_deref(), || {
+                format!("artifact {}", row.id)
+            })?;
 
         let sha256_checksum: ContentHash = row.checksum_sha256.trim().parse().map_err(|_| {
             DomainError::Invariant(format!("corrupt SHA-256 checksum in artifact {}", row.id))
@@ -1121,6 +1130,8 @@ impl TryFrom<FallbackRotationRow> for FallbackRotation {
 mod tests {
     use super::*;
 
+    use hort_domain::entities::artifact::QuarantineStatus;
+
     fn base_row() -> RepositoryRow {
         RepositoryRow {
             id: Uuid::nil(),
@@ -1637,14 +1648,39 @@ mod tests {
         assert_eq!(artifact.quarantine_status, QuarantineStatus::Rejected);
     }
 
+    /// A stored status the domain cannot classify fails the whole row
+    /// mapping. This test replaces one that asserted
+    /// `'unscanned' -> QuarantineStatus::None` as correct: `None` is the
+    /// most permissive state in the system, so the old behaviour handed
+    /// every unclassifiable row to `Artifact::is_downloadable` as
+    /// downloadable and to the default `ReleasedOnly` index mode as
+    /// servable — with no release authority and no `ArtifactReleased` in
+    /// its stream.
+    ///
+    /// The cases below are the three spellings migration `003`'s CHECK
+    /// still accepts and no writer in this crate produces, plus the two
+    /// the column cannot hold at all: `none` (the `Display` spelling of
+    /// a state stored as SQL `NULL`) and an outright unknown value.
     #[test]
-    fn artifact_unknown_quarantine_defaults_to_none() {
-        let row = ArtifactRow {
-            quarantine_status: Some("unscanned".into()),
-            ..base_artifact_row()
-        };
-        let artifact = Artifact::try_from(row).unwrap();
-        assert_eq!(artifact.quarantine_status, QuarantineStatus::None);
+    fn an_unclassifiable_quarantine_status_fails_the_row() {
+        for raw in ["unscanned", "clean", "flagged", "none", "something-new"] {
+            let row = ArtifactRow {
+                quarantine_status: Some(raw.into()),
+                ..base_artifact_row()
+            };
+            let id = row.id;
+            let err = Artifact::try_from(row)
+                .expect_err("an unclassifiable status must not produce an artifact");
+            match err {
+                DomainError::Invariant(msg) => {
+                    assert!(
+                        msg.contains(raw) && msg.contains(&id.to_string()),
+                        "the error must name the value and the row; got {msg}"
+                    );
+                }
+                other => panic!("expected Invariant for {raw}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

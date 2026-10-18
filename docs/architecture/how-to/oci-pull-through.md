@@ -406,4 +406,4 @@ non-zero rate is recommended.
 - [ADR 0006](../../adr/0006-mandatory-upstream-verification.md) — upstream verification framework
 - [ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md) — quarantine release predicate
 - [`declare-gitops-config.md`](declare-gitops-config.md) — full operator surface for `Repository`, `UpstreamMapping`, and `ScanPolicy`
-- [`quarantine-patch-release.md`](quarantine-patch-release.md) — emergency `admin_release` flow for an unaged quarantined artifact
+- [`quarantine-patch-release.md`](quarantine-patch-release.md) — the manual release (curator waive) of an unaged quarantined artifact

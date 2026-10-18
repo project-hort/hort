@@ -6,9 +6,9 @@
 //! HTTP surface. It is the single point of truth for "compute the
 //! plan, then apply it" — the diff is in `hort-config`, the writes
 //! land via the managed-write methods on `RepositoryRepository`,
-//! `ClaimMappingRepository`, `PermissionGrantRepository`,
-//! `CurationRuleRepository`, and through `PolicyUseCase` for
-//! event-sourced kinds.
+//! `CurationRuleRepository`, through `AuthorityLifecyclePort` for the
+//! five authority kinds whose rows commit with their audit events,
+//! and through `PolicyUseCase` for event-sourced kinds.
 //!
 //! # Additive-claims RBAC model (ADR 0012)
 //!
@@ -20,19 +20,46 @@
 //! (`(sorted required_claims, repository_id, permission)` for `Claims`;
 //! `(user_id, repository_id, permission)` for `User`).
 //!
-//! `ClaimMappingRepository::save_managed` /
-//! `PermissionGrantRepository::save_managed` are **whole-partition
-//! reconcile primitives**: the apply
+//! `AuthorityLifecyclePort::commit_claim_mappings` /
+//! `commit_permission_grants` are **whole-partition reconcile
+//! primitives that carry their own audit trail**: the apply
 //! branch builds the *complete* desired gitops-managed set, diffs it
 //! against `list_managed_by_gitops` to emit one
 //! `ClaimMappingApplied`/`PermissionGrantApplied` per added-or-changed
 //! row and one `ClaimMappingRevoked`/`PermissionGrantRevoked` per
-//! removed row (audit-event-per-mutation invariant), then calls
-//! `save_managed(&complete_desired_set)` once — the adapter does the
-//! atomic delete-absent + upsert-present. Because `save_managed`
-//! reconciles the *entire* gitops partition, the ServiceAccount
-//! `User`-subject grants and the envelope-declared grants are unioned
-//! into one `save_managed(permission_grants)` call.
+//! removed row (audit-event-per-mutation invariant), then commits the
+//! complete set **and** those events in one transaction — the adapter
+//! does the atomic delete-absent + upsert-present and joins the audit
+//! append to the same transaction. Because the reconcile covers the
+//! *entire* gitops partition, the ServiceAccount `User`-subject grants
+//! and the envelope-declared grants are unioned into one
+//! `commit_permission_grants` call.
+//!
+//! # Why the audit append rides the row transaction
+//!
+//! The five security-relevant CRUD kinds — permission grants, claim
+//! mappings, OIDC issuers, gitops-managed upstream mappings,
+//! service-account aggregates — each used to write their row, commit
+//! it, and append the attesting event in a separate call. An append
+//! failure (or a process termination) after that commit left the row
+//! **active with nothing in the authorization stream attesting it**,
+//! and the retry could not repair it: the next apply derives its
+//! events from the prior *rows*, which already hold the change, so it
+//! emits nothing. All five now route through
+//! `AuthorityLifecyclePort`, whose adapter commits rows + events in
+//! one `PgUnitOfWork`. Consequence an operator will notice: an
+//! event-store failure during any of those five applies now leaves
+//! the rows **unchanged** — the apply fails closed instead of
+//! half-done.
+//!
+//! The five repository ports no longer carry the write method the port
+//! replaced, so a future apply branch cannot reintroduce the dual
+//! write — it is a compile error, not a review rule. The one write
+//! that stays outside the transaction is the backing `users` row for a
+//! declared `ServiceAccount`, and it has to: the FK from
+//! `service_accounts.backing_user_id` requires it to be durable first.
+//! See `apply_service_accounts` for why an orphan backing user confers
+//! nothing.
 //!
 //! # Topological apply
 //!
@@ -135,10 +162,13 @@ use hort_domain::events::{
 use hort_domain::policy::{evaluate_curation_retroactive, RetroactiveCurationOutcome};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
+use hort_domain::ports::authority_lifecycle::{
+    AuthorityLifecyclePort, OidcIssuerChange, ServiceAccountCommit, UpstreamMappingCommit,
+};
 use hort_domain::ports::claim_mapping_repository::ClaimMappingRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::federated_jwt_validator::FederatedJwtValidator;
 use hort_domain::ports::oidc_issuer_repository::OidcIssuerRepository;
 use hort_domain::ports::permission_grant_repository::PermissionGrantRepository;
@@ -159,6 +189,7 @@ use uuid::Uuid;
 use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
 use crate::gitops::event_sourced::{ApplyEventSourcedKind, ExclusionsApplier, ScanPolicyApplier};
+use crate::lint::LinterRule;
 use crate::metrics::{
     emit_gitops_event, emit_gitops_object, emit_policy_evaluation, emit_policy_violations,
     gitops_kind, policy_decision_point, GitopsObjectResult, PolicyEvaluationResult,
@@ -280,7 +311,6 @@ impl UpstreamHostAllowlist {
     }
 }
 use crate::gitops_apply_status::ApplyKindCounts;
-use crate::use_cases::read_expected_version;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use crate::use_cases::{
     append_any_with_conflict_retry, event_append_backoff, EVENT_APPEND_RETRY_ATTEMPTS,
@@ -289,6 +319,7 @@ use crate::use_cases::{
     AddExclusionCommand, CreatePolicyCommand, FieldChange, PolicyUseCase, RemoveExclusionCommand,
     UpdatePolicyCommand,
 };
+use crate::use_cases::{ArtifactAtVersion, OverCapStream};
 
 /// One per-object outcome counter rolled up after an apply.
 ///
@@ -330,19 +361,40 @@ pub struct ApplyReport {
 pub struct ApplyConfigUseCase {
     repositories: Arc<dyn RepositoryRepository>,
     /// Whole-partition reconcile port for
-    /// `claim_mappings` (ADR 0012).
-    /// `save_managed` is the atomic delete-absent + upsert-present
-    /// primitive; revoke/apply audit events are emitted by this use
-    /// case, not the adapter.
+    /// `claim_mappings` (ADR 0012). Read-side only in this use case —
+    /// the apply diff runs off `list_managed_by_gitops`; the write goes
+    /// through [`Self::authority`], which commits the reconcile and the
+    /// revoke/apply audit events this use case derived in one
+    /// transaction.
     claim_mappings: Arc<dyn ClaimMappingRepository>,
     /// Whole-partition reconcile port for
     /// `permission_grants` (ADR 0012;
     /// there is no `role_id` in the additive-claims model). A grant
     /// carries a sum-typed [`GrantSubject`] (`Claims` XOR `User`).
-    /// `save_managed` reconciles the **entire** gitops partition, so
-    /// envelope-declared grants and SA-owned `User`-subject
-    /// grants are unioned into a single call.
+    /// Read-side only in this use case — the apply diff runs off
+    /// `list_managed_by_gitops`; the write goes through
+    /// [`Self::authority`].
     permission_grants: Arc<dyn PermissionGrantRepository>,
+    /// Atomic authority-row-plus-audit-event writer for the three
+    /// security-relevant CRUD kinds — permission grants, claim mappings
+    /// and OIDC issuers. One call commits the desired rows **and** the
+    /// audit batches the prior-vs-desired diff produced; the whole
+    /// gitops-partition reconcile (grants / claim mappings) and the
+    /// per-row upsert/delete set (issuers) join that one transaction.
+    ///
+    /// This closes a dual-write the three branches shared: each wrote
+    /// its row, committed it, and appended the attesting event in a
+    /// separate call, so an append failure — or a process termination —
+    /// left the grant, mapping or issuer **active with nothing in the
+    /// authorization stream attesting it**, in a state the retry
+    /// cannot repair (the next apply diffs against the already-changed
+    /// rows and emits nothing).
+    ///
+    /// A **required** [`Self::new`] parameter, not an opt-in builder: a
+    /// composition point that cannot supply an atomic writer must fail
+    /// to build rather than inherit its way back onto the
+    /// commit-then-append path.
+    authority: Arc<dyn AuthorityLifecyclePort>,
     /// Standalone curation-rule rows plus
     /// the `repository_curation_rules` junction-edge writer.
     curation_rules: Arc<dyn CurationRuleRepository>,
@@ -547,12 +599,11 @@ impl RetentionApply {
     }
 }
 
-/// Compile-time gate for the
-/// authorization-event append helpers ([`ApplyConfigUseCase::
-/// append_authorization_events`] /
-/// [`ApplyConfigUseCase::append_grouped_authorization_events`]).
+/// Compile-time gate for the authorization-event batch builders
+/// ([`ApplyConfigUseCase::authorization_batches`] /
+/// [`ApplyConfigUseCase::grouped_authorization_batches`]).
 ///
-/// **Architectural intent.** The helpers persist `RoleDefined` /
+/// **Architectural intent.** The builders assemble `RoleDefined` /
 /// `GroupMappingAdded` / `PermissionGrantAdded` / etc. — a set of
 /// audit events whose only legitimate emitter is the gitops apply
 /// pipeline. Before this gate, any future contributor could call the
@@ -560,7 +611,7 @@ impl RetentionApply {
 /// invariant "authorization events come from gitops apply only" was
 /// convention, not compile-time enforced. The token plus the pub-crate
 /// constructor turns the invariant into a compile error: without a
-/// `&GitOpsApplyToken`, the helpers refuse to compile, and a
+/// `&GitOpsApplyToken`, the builders refuse to compile, and a
 /// `GitOpsApplyToken` cannot be constructed outside `hort-app` (the
 /// constructor is `pub(crate)`).
 ///
@@ -610,12 +661,124 @@ impl GitOpsApplyToken {
     }
 }
 
+/// How one [`PRE_WRITE_REJECT_ROWS`] row assembles the message it aborts
+/// with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowAbort {
+    /// `"; "`-join every finding of the row, so the operator sees all
+    /// offenders in one pass. The default for a new row: the validator
+    /// collects them all anyway and the offline `validate-config` prints
+    /// them all, so a reject that named one of five offenders would send
+    /// the operator round the loop five times.
+    EveryFinding,
+    /// Take the first finding only. Reserved for the rows whose inline
+    /// predecessor aborted on the first violation *within* the row
+    /// (`validate_provenance_config` / `reject_repo_storage_backend_mismatch`);
+    /// changing them would change the message an already-failing config
+    /// rejects with.
+    FirstFinding,
+    /// `"; "`-join the row's findings with duplicates collapsed. For a row
+    /// whose finding text identifies the *rule* and not the offending
+    /// object: the grant linter reports one finding per (grant, rule)
+    /// violation but renders no grant identity into the message, so ten
+    /// grants tripping one rule produce ten byte-identical sentences and
+    /// joining them verbatim is pure noise. Collapsed, the operator gets
+    /// one sentence per rule — the information the grant stage's own
+    /// aggregate message carried.
+    DistinctFindings,
+}
+
+/// Every reject row [`ApplyConfigUseCase::run_pre_write_validation`]
+/// consumes from the [`crate::lint::StaticConfigValidator`] report, in
+/// apply's row order, with the `error!` line and the message assembly each
+/// aborts with.
+///
+/// This is a value rather than a comment because the list is a claim about
+/// completeness — "every rejection the apply can reach is reachable before
+/// the first write" — and a comment cannot fail.
+/// `pre_write_validation_consumes_every_reject_row` matches exhaustively
+/// over [`LinterRule`] and asserts that every rejecting rule appears here,
+/// so a new lint row has to state where it is consumed instead of silently
+/// deferring its rejection to a write-capable stage. The two rows that are
+/// deliberately absent are the two that are not rejects collected from this
+/// table: `SaIssuerFk` (consumed by its own dedicated abort just above the
+/// walk, to keep its distinct `error!` + joined envelope) and
+/// `UnderConstrainedFederatedIdentities` (advisory only — it never aborts).
+const PRE_WRITE_REJECT_ROWS: &[(LinterRule, &str, RowAbort)] = &[
+    (
+        LinterRule::TrustUpstreamPublishTimeRequiresScanBackends,
+        "gitops apply: trust_upstream_publish_time × scan_backends:[] linter rejected combination(s)",
+        RowAbort::EveryFinding,
+    ),
+    (
+        LinterRule::PrefetchMaxAgeDaysNotImplemented,
+        "gitops apply: prefetchPolicy.maxAgeDays linter rejected envelope(s) (field accepted-but-inert)",
+        RowAbort::EveryFinding,
+    ),
+    (
+        LinterRule::PrefetchTriggerRequiresVersionDiscovery,
+        "gitops apply: prefetchPolicy.triggers linter rejected envelope(s) (trigger requires VersionDiscovery, format handler does not declare it)",
+        RowAbort::EveryFinding,
+    ),
+    (
+        LinterRule::ProvenanceConfig,
+        "gitops apply: provenanceMode linter rejected ScanPolicy envelope(s)",
+        RowAbort::FirstFinding,
+    ),
+    (
+        LinterRule::RepoStorageBackendMismatch,
+        "gitops apply: rejected — per-repository storage backend differs from the deployment's effective global backend; per-repository storage routing is unsupported in v2",
+        RowAbort::FirstFinding,
+    ),
+    (
+        LinterRule::ScanBackendCapability,
+        "gitops apply: scanBackends linter rejected ScanPolicy envelope(s) (backend cannot analyse a governed repository's format — scanner capability map)",
+        RowAbort::EveryFinding,
+    ),
+    // Row 8 sits before row 9 because that is where the validator collects
+    // it: the walk's "first row with an error finding" and the report's
+    // "first error in row order" have to name the same row, or the two
+    // halves of the no-drift guarantee answer differently for a bundle
+    // that trips both.
+    (
+        LinterRule::PermissionGrant,
+        "gitops apply: permission-grant linter rejected the desired set (secure-by-default — operator allowlist/downgrade is the only escape hatch)",
+        RowAbort::DistinctFindings,
+    ),
+    (
+        LinterRule::RetentionUnusedForNotImplemented,
+        "gitops apply: retention predicate linter rejected RetentionPolicy envelope(s) (UnusedFor has no last-download signal and silently decides on age)",
+        RowAbort::EveryFinding,
+    ),
+    (
+        LinterRule::ScanPolicyLicensePolicyNotImplemented,
+        "gitops apply: licensePolicy linter rejected ScanPolicy envelope(s) (the scan path evaluates the policy against an empty licence list, so it decides nothing)",
+        RowAbort::EveryFinding,
+    ),
+    (
+        LinterRule::ExclusionScopeNotImplemented,
+        "gitops apply: exclusion scope linter rejected Exclusion envelope(s) (the finding filter never reads the scope, so the waiver clears its CVE everywhere the policy governs)",
+        RowAbort::EveryFinding,
+    ),
+    (
+        LinterRule::VirtualMemberFormatNotEnforced,
+        "gitops apply: virtualMembers linter rejected ArtifactRepository envelope(s) (member format differs from the virtual's and no compatibility check is implemented)",
+        RowAbort::EveryFinding,
+    ),
+    (
+        LinterRule::ScanPolicyMaxArtifactAgeNotImplemented,
+        "gitops apply: maxArtifactAge linter rejected ScanPolicy envelope(s) (the age evaluator has no caller, so the cap is stored and never applied)",
+        RowAbort::EveryFinding,
+    ),
+];
+
 impl ApplyConfigUseCase {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repositories: Arc<dyn RepositoryRepository>,
         claim_mappings: Arc<dyn ClaimMappingRepository>,
         permission_grants: Arc<dyn PermissionGrantRepository>,
+        authority: Arc<dyn AuthorityLifecyclePort>,
         curation_rules: Arc<dyn CurationRuleRepository>,
         policy_projections: Arc<dyn PolicyProjectionRepository>,
         policies: Arc<PolicyUseCase>,
@@ -635,6 +798,7 @@ impl ApplyConfigUseCase {
             repositories,
             claim_mappings,
             permission_grants,
+            authority,
             curation_rules,
             policy_projections,
             policies,
@@ -918,14 +1082,25 @@ impl ApplyConfigUseCase {
     ///
     /// Runs every check that is **provably performed before the first DB
     /// write** (`apply`'s Stage-1 `save_managed`): snapshot/env validation,
-    /// the SA->issuer FK check, the `scanBackends` /
-    /// `trust_upstream_publish_time` / `prefetchPolicy.maxAgeDays` /
-    /// provenance / retention-predicate linters, and the per-repo
-    /// storage-backend check. Only the
+    /// the SA->issuer FK check, every reject row in
+    /// [`PRE_WRITE_REJECT_ROWS`], and the upstream-host allowlist gate.
+    /// Only the
     /// `build_snapshot` reads touch the database -- zero writes. (The
     /// `scanBackends` check validates against the compiled-in
     /// `crate::scanning::KNOWN_SCAN_BACKENDS` set, so it does no I/O and is
     /// immune to worker-registration timing -- see regression H20.)
+    ///
+    /// The completeness claim this pass carries is that **no rejection the
+    /// apply can reach is reachable only from a write-capable stage**: the
+    /// apply writes between its stages and ships no rollback, so a
+    /// late-stage reject leaves a partial apply -- a refused tightening
+    /// beside a committed loosening of the same bundle. Two tests hold the
+    /// claim: `pre_write_validation_consumes_every_reject_row` (no lint row
+    /// may be omitted from the table) and
+    /// `every_rejecting_apply_stage_is_rejected_pre_write` (per-stage
+    /// corpus). The stages keep their own checks as defence-in-depth, where
+    /// a reject is then a `DomainError::Invariant`-grade contract violation
+    /// rather than operator error.
     ///
     /// This is the seam `gitops_boot` uses (via [`Self::preflight_validate`])
     /// to PARK not-ready on a pre-write config error instead of
@@ -960,19 +1135,49 @@ impl ApplyConfigUseCase {
         }
 
         // The snapshot-free rows (rows 2,3,5,6,6b,
-        // 7,7b,9) are collected by the pure `StaticConfigValidator`, in
+        // 7,7b,7c,8,9) are collected by the pure `StaticConfigValidator`, in
         // apply's row order, with NO early return / metric / `tracing`.
         // This caller walks the report below and reproduces the historical
         // first-failing-row abort + per-rule metric emission byte-
         // identically — the no-drift guarantee shared with the offline
         // `hort-server validate-config` command. The env/DB rows (1 above,
         // 4 below) stay inline.
-        use crate::lint::{LinterRule, StaticConfigValidator};
+        //
+        // Row 8 (the permission-grant linter) is enabled here via
+        // `with_grant_lint_base`. It is the one row whose verdict the apply
+        // pipeline could also reach from its own grant stage, and that stage
+        // runs after the repository, policy and mapping writes — so a grant
+        // the linter refuses used to abort the apply with a loosened policy
+        // from the same bundle already committed. The row's rejection
+        // therefore belongs here, before the first write. What licenses
+        // running it this early is that the rules read only the grant's
+        // subject shape, permission and whether it is repo-scoped — never a
+        // resolved id value — so the validator's placeholder-id expansion
+        // produces the same verdict as the stage's port-built set
+        // (`static_validator_row8_and_apply_grant_linter_agree`).
+        //
+        // The base is `self.lint_config` (the composition-root config, secure
+        // default unless the root opted out), NOT the resolved one: the
+        // validator resolves the bundle's own `PermissionGrantLintConfig`
+        // partition on top of it through the shared pure resolver, exactly as
+        // the grant stage does, so a same-bundle allowlist-then-use still
+        // commits. The audited `resolve_effective_lint_config` wrapper stays
+        // on the write path — its `info!`/`warn!` must be emitted once per
+        // apply, and this pass runs twice per boot (preflight, then apply).
+        //
+        // No linter metric is emitted from here. Row 8's
+        // `hort_apply_config_linter_total` is the grant stage's own emission
+        // over the port-built desired set, which stays where it is; a
+        // metric-free validator is what keeps the offline
+        // `validate-config` path from inventing series (see
+        // `LinterRule::metric_rule`).
+        use crate::lint::StaticConfigValidator;
         let validator = StaticConfigValidator::new(
             self.provenance_capable_formats.clone(),
             self.version_discovery_capable_formats.clone(),
             self.effective_storage_backend,
-        );
+        )
+        .with_grant_lint_base(self.lint_config.clone());
         let report = validator.validate(desired);
 
         // Row 2 (SA→issuer cross-kind FK) precedes row 4: first-failing-
@@ -1070,65 +1275,19 @@ impl ApplyConfigUseCase {
             return Err(AppError::Domain(DomainError::Validation(joined)));
         }
 
-        // ----- Post-row-4 snapshot-free rejects (rows 5,6,6b,7,7b,7c,9),
-        //       collected by `StaticConfigValidator` above. -----
+        // ----- Post-row-4 snapshot-free rejects, collected by
+        //       `StaticConfigValidator` above. -----
         //
-        // Reproduce the historical first-failing-row abort byte-
-        // identically for rows 5/6/7/7b; rows 6b, 7c and 9 are newer but
-        // join the same row order and the same rows-5/6 shape. Walk the
-        // rule order [trust_pt, prefetch-max-age, prefetch-trigger,
-        // provenance, storage-backend, scan-backend-capability,
-        // retention-unused-for] and, on the FIRST rule with any error
-        // finding,
-        // emit that rule's metric (where it has one — rows 5/6/6b/7c/9
-        // only, via `LinterRule::metric_rule`) once per finding, log the
-        // same `error!`, and return that rule's
-        // `AppError::Domain(DomainError::Validation(_))`. Later rules are
+        // The rows, their `error!` lines and their message assembly are
+        // [`PRE_WRITE_REJECT_ROWS`] — a value, not a comment, so
+        // `pre_write_validation_consumes_every_reject_row` can assert the
+        // set is complete instead of a reader having to notice an omission.
+        // On the FIRST row with any error finding: emit that row's metric
+        // (where the rule has one — `LinterRule::metric_rule`) once per
+        // finding, log its `error!`, and return its
+        // `AppError::Domain(DomainError::Validation(_))`. Later rows are
         // NOT emitted/reported.
-        //
-        // - Rows 5 (trust_upstream_publish_time × scan_backends:[]),
-        //   6 (PrefetchPolicy.max_age_days), 6b
-        //   (PrefetchPolicy.triggers requiring VersionDiscovery), 7c
-        //   (scanBackends × repository-format capability) and 9
-        //   (RetentionPolicy predicate using `UnusedFor`)
-        //   `"; "`-join every finding of the row AND tick
-        //   `hort_apply_config_linter_total{rule, result=reject}` once per
-        //   finding (cardinality bounded by mappings / repositories).
-        // - Rows 7 (provenance-config) and 7b (per-repo
-        //   storage-backend mismatch) historically aborted on the FIRST
-        //   violation WITHIN the row (single-message reject, no metric);
-        //   the validator collects every finding for the offline CLI, but
-        //   this caller takes only the first to stay byte-identical.
-        for (rule, error_log) in [
-            (
-                LinterRule::TrustUpstreamPublishTimeRequiresScanBackends,
-                "gitops apply: trust_upstream_publish_time × scan_backends:[] linter rejected combination(s)",
-            ),
-            (
-                LinterRule::PrefetchMaxAgeDaysNotImplemented,
-                "gitops apply: prefetchPolicy.maxAgeDays linter rejected envelope(s) (field accepted-but-inert)",
-            ),
-            (
-                LinterRule::PrefetchTriggerRequiresVersionDiscovery,
-                "gitops apply: prefetchPolicy.triggers linter rejected envelope(s) (trigger requires VersionDiscovery, format handler does not declare it)",
-            ),
-            (
-                LinterRule::ProvenanceConfig,
-                "gitops apply: provenanceMode linter rejected ScanPolicy envelope(s)",
-            ),
-            (
-                LinterRule::RepoStorageBackendMismatch,
-                "gitops apply: rejected — per-repository storage backend differs from the deployment's effective global backend; per-repository storage routing is unsupported in v2",
-            ),
-            (
-                LinterRule::ScanBackendCapability,
-                "gitops apply: scanBackends linter rejected ScanPolicy envelope(s) (backend cannot analyse a governed repository's format — scanner capability map)",
-            ),
-            (
-                LinterRule::RetentionUnusedForNotImplemented,
-                "gitops apply: retention predicate linter rejected RetentionPolicy envelope(s) (UnusedFor has no last-download signal and silently decides on age)",
-            ),
-        ] {
+        for (rule, error_log, abort) in PRE_WRITE_REJECT_ROWS.iter().copied() {
             let messages: Vec<&str> = report
                 .errors
                 .iter()
@@ -1138,8 +1297,11 @@ impl ApplyConfigUseCase {
             if messages.is_empty() {
                 continue;
             }
-            // Per-rule metric (rows 5/6/6b/7c/9 — `metric_rule` is `None`
-            // for rows 7/7b). One increment per offending finding.
+            // Per-row metric, one increment per offending finding, for the
+            // rows that have one. Independent of the message assembly
+            // below: a row can reject every offender in its message and
+            // still carry no metric (row 8 — the grant stage owns that
+            // series).
             if let Some(metric_rule) = rule.metric_rule() {
                 tracing::error!(error_count = messages.len(), "{error_log}");
                 for _ in 0..messages.len() {
@@ -1148,18 +1310,22 @@ impl ApplyConfigUseCase {
                         crate::metrics::LinterResult::Reject,
                     );
                 }
-                return Err(AppError::Domain(DomainError::Validation(
-                    messages.join("; "),
-                )));
+            } else {
+                tracing::error!("{error_log}");
             }
-            // Rows 7 / 7b — first-violation-within-the-row abort
-            // (single-message reject, no linter metric), preserving the
-            // historical `validate_provenance_config` /
-            // `reject_repo_storage_backend_mismatch` shape exactly.
-            tracing::error!("{error_log}");
-            return Err(AppError::Domain(DomainError::Validation(
-                messages[0].to_string(),
-            )));
+            return Err(AppError::Domain(DomainError::Validation(match abort {
+                RowAbort::EveryFinding => messages.join("; "),
+                RowAbort::FirstFinding => messages[0].to_string(),
+                RowAbort::DistinctFindings => {
+                    let mut seen: HashSet<&str> = HashSet::new();
+                    messages
+                        .iter()
+                        .filter(|m| seen.insert(m))
+                        .copied()
+                        .collect::<Vec<&str>>()
+                        .join("; ")
+                }
+            })));
         }
 
         // No post-row-4 error: surface the provenance advisory warning(s)
@@ -1323,13 +1489,13 @@ impl ApplyConfigUseCase {
         // aggregate + the backing `users` row — its `User`-subject
         // grants are reconciled by the consolidated PermissionGrant
         // pass below.
-        self.apply_oidc_issuers(&plan.oidc_issuers, &mut report)
+        self.apply_oidc_issuers(&plan.oidc_issuers, &mut report, &token)
             .await?;
-        self.apply_service_accounts(&plan.service_accounts, &mut report)
+        self.apply_service_accounts(&plan.service_accounts, &mut report, &token)
             .await?;
 
         // ----- Consolidated PermissionGrant
-        // reconcile (runs LAST). `PermissionGrantRepository::save_managed`
+        // reconcile (runs LAST). `AuthorityLifecyclePort::commit_permission_grants`
         // reconciles the *entire* `managed_by = gitops` partition in one
         // atomic delete-absent + upsert-present, so the
         // envelope-declared grants AND the SA-owned
@@ -1348,6 +1514,13 @@ impl ApplyConfigUseCase {
         // Absent kind ⇒ the composition-root default
         // (`LintConfig::default()` unless the root opted out via
         // `with_lint_config`) — a missing kind is not a downgrade.
+        //
+        // The pre-write pass resolved the same thing for its row 8, through
+        // the same shared pure resolver, so the same-bundle
+        // allowlist-then-use pattern commits at both gates rather than
+        // being refused by the earlier one. This call keeps the audited
+        // `info!`/`warn!` side of the resolution, which belongs on the
+        // write path and must happen once per apply.
         let effective_lint_config = self.resolve_effective_lint_config(&desired);
         self.apply_permission_grants(
             &plan.permission_grants,
@@ -1730,6 +1903,20 @@ fn update_command_from_diff(
     }
 }
 
+/// Resolve a `ScanPolicy`'s operator-authored scope into the domain form.
+///
+/// Panics on a repository name absent from `repo_id_by_name`, and the
+/// rule that makes that an invariant rather than an operator-reachable
+/// crash is `push_scan_policy_scope_reference_errors` in
+/// `hort-config`'s `desired` module: it rejects a
+/// `scope: { repository: <name> }` naming a repository no envelope
+/// declares, with a `DanglingReference`, in `DesiredState::validate` —
+/// which both the boot preflight and `hort-server validate-config` run
+/// before the first write. The pipeline fills the map from the same
+/// `DesiredState` before dispatching policy applies, so every name that
+/// reaches here is in it. A softer fallback would mean that rule's
+/// guarantee is no longer load-bearing, and the two resolution paths
+/// would drift.
 fn resolve_scope(scope: &ScopeSpec, repo_id_by_name: &HashMap<String, Uuid>) -> PolicyScope {
     match scope {
         ScopeSpec::Global => PolicyScope::Global,
@@ -1751,12 +1938,12 @@ fn resolve_scope(scope: &ScopeSpec, repo_id_by_name: &HashMap<String, Uuid>) -> 
 /// domain form, mirroring [`resolve_scope`].
 ///
 /// Panics on a repository name absent from `repo_id_by_name`, for the
-/// same reason `resolve_scope` does: the cross-spec validator in
-/// `hort-config` has already proved every named repository is declared,
-/// and the apply pipeline fills the map from `DesiredState` before
-/// dispatching policy applies. A softer fallback here would mean the
-/// linter's guarantee is no longer load-bearing, and the two resolution
-/// paths would drift.
+/// same reason `resolve_scope` does — with
+/// `push_retention_policy_scope_reference_errors` as the rule that
+/// carries the guarantee here, and the apply pipeline filling the map
+/// from `DesiredState` before dispatching policy applies. A softer
+/// fallback here would mean that rule's guarantee is no longer
+/// load-bearing, and the two resolution paths would drift.
 fn resolve_retention_scope(
     scope: &hort_config::retention_policy::RetentionScopeSpec,
     repo_id_by_name: &HashMap<String, Uuid>,
@@ -1885,7 +2072,7 @@ mod tests {
 
     // --- mock ClaimMappingRepository ---------------------------------------
     //
-    // `save_managed(&[items])` is the whole-partition reconcile
+    // `reconcile_managed_rows(&[items])` is the whole-partition
     // primitive: in one call the adapter deletes every
     // gitops-managed row whose `(idp_group, claim)` identity is absent
     // from `items` and upserts every row that is present, keyed on that
@@ -1897,22 +2084,22 @@ mod tests {
     #[derive(Default)]
     pub(in crate::use_cases::apply_config_use_case) struct MockClaimMappingRepo {
         /// gitops-managed rows keyed by the `(idp_group, claim)` natural
-        /// identity — same key `save_managed` reconciles on.
+        /// identity — the same key the reconcile upserts on.
         pub(in crate::use_cases::apply_config_use_case) managed:
             Mutex<HashMap<(String, String), ClaimMapping>>,
-        /// Every `save_managed` invocation's complete slice (test
+        /// Every reconcile invocation's complete slice (test
         /// introspection: call count + last authoritative set).
-        save_managed_calls: Mutex<Vec<Vec<ClaimMapping>>>,
+        reconcile_calls: Mutex<Vec<Vec<ClaimMapping>>>,
     }
 
     impl MockClaimMappingRepo {
         pub(in crate::use_cases::apply_config_use_case) fn new() -> Self {
             Self::default()
         }
-        /// Number of `save_managed` invocations (the apply pipeline
-        /// calls it once per `apply_claim_mappings`, unconditionally).
-        pub(in crate::use_cases::apply_config_use_case) fn save_managed_call_count(&self) -> usize {
-            self.save_managed_calls.lock().unwrap().len()
+        /// Number of reconcile invocations (the apply pipeline commits
+        /// once per `apply_claim_mappings`, unconditionally).
+        pub(in crate::use_cases::apply_config_use_case) fn reconcile_call_count(&self) -> usize {
+            self.reconcile_calls.lock().unwrap().len()
         }
         /// Current managed-row count after the last reconcile.
         pub(in crate::use_cases::apply_config_use_case) fn managed_count(&self) -> usize {
@@ -1929,16 +2116,28 @@ mod tests {
             let v: Vec<ClaimMapping> = self.managed.lock().unwrap().values().cloned().collect();
             Box::pin(async move { Ok(v) })
         }
-        fn save_managed(&self, items: &[ClaimMapping]) -> BoxFuture<'_, DomainResult<()>> {
-            self.save_managed_calls.lock().unwrap().push(items.to_vec());
-            // Whole-partition reconcile: replace the entire managed set
-            // with `items` keyed on `(idp_group, claim)`.
+    }
+
+    impl MockClaimMappingRepo {
+        /// The whole-partition reconcile, as an **inherent** method:
+        /// replace the entire managed set with `items`, keyed on
+        /// `(idp_group, claim)`.
+        ///
+        /// [`ClaimMappingRepository`] carries no write method any more
+        /// — the write is
+        /// `AuthorityLifecyclePort::commit_claim_mappings`, which
+        /// commits the reconcile with its audit batch in one
+        /// transaction. [`MockAuthorityLifecycle`] writes through here,
+        /// exactly as the Postgres adapter writes through
+        /// `claim_mapping_repo::reconcile_managed_claim_mappings_in_tx`:
+        /// the body stays, the trait wrapper is what went away.
+        fn reconcile_managed_rows(&self, items: &[ClaimMapping]) {
+            self.reconcile_calls.lock().unwrap().push(items.to_vec());
             let mut managed = self.managed.lock().unwrap();
             *managed = items
                 .iter()
                 .map(|m| ((m.idp_group.clone(), m.claim.clone()), m.clone()))
                 .collect();
-            Box::pin(async { Ok(()) })
         }
     }
 
@@ -1947,7 +2146,7 @@ mod tests {
     // --- mock PermissionGrantRepository ------------------------------------
     //
     // There is no `RoleRepository`; grants persist on their own port.
-    // `save_managed(&[items])` is the whole-partition reconcile
+    // `reconcile_managed_rows(&[items])` is the whole-partition
     // primitive: delete every gitops-managed grant whose subject-
     // dependent identity (`grant_identity_key` — `(sorted required_claims,
     // repository_id, permission)` for `Claims`; `(user_id, repository_id,
@@ -1960,23 +2159,23 @@ mod tests {
     #[derive(Default)]
     pub(in crate::use_cases::apply_config_use_case) struct MockPermissionGrantRepo {
         /// gitops-managed grants keyed by the subject-dependent identity
-        /// (`GrantIdentityKey`) — the same key `save_managed` reconciles
+        /// (`GrantIdentityKey`) — the same key the reconcile upserts
         /// on. Keeps surrogate-id churn out of the test assertions.
         managed: Mutex<HashMap<GrantIdentityKey, PermissionGrant>>,
-        /// Every `save_managed` invocation's complete authoritative
-        /// slice (call count + last reconciled set introspection).
-        save_managed_calls: Mutex<Vec<Vec<PermissionGrant>>>,
+        /// Every reconcile invocation's complete authoritative slice
+        /// (call count + last reconciled set introspection).
+        reconcile_calls: Mutex<Vec<Vec<PermissionGrant>>>,
     }
 
     impl MockPermissionGrantRepo {
         pub(in crate::use_cases::apply_config_use_case) fn new() -> Self {
             Self::default()
         }
-        /// Number of `save_managed` invocations. `apply_permission_grants`
-        /// calls it exactly once per apply, unconditionally — the
+        /// Number of reconcile invocations. `apply_permission_grants`
+        /// commits exactly once per apply, unconditionally — the
         /// consolidated reconcile that covers envelope + SA-owned grants.
-        pub(in crate::use_cases::apply_config_use_case) fn save_managed_call_count(&self) -> usize {
-            self.save_managed_calls.lock().unwrap().len()
+        pub(in crate::use_cases::apply_config_use_case) fn reconcile_call_count(&self) -> usize {
+            self.reconcile_calls.lock().unwrap().len()
         }
         /// Current managed-grant count after the last reconcile.
         pub(in crate::use_cases::apply_config_use_case) fn managed_count(&self) -> usize {
@@ -1999,10 +2198,17 @@ mod tests {
             let v: Vec<PermissionGrant> = self.managed.lock().unwrap().values().cloned().collect();
             Box::pin(async move { Ok(v) })
         }
-        fn save_managed(&self, items: &[PermissionGrant]) -> BoxFuture<'_, DomainResult<()>> {
-            self.save_managed_calls.lock().unwrap().push(items.to_vec());
-            // Whole-partition reconcile keyed on the subject-dependent
-            // identity — replace the entire managed set.
+    }
+
+    impl MockPermissionGrantRepo {
+        /// The whole-partition reconcile, as an **inherent** method:
+        /// replace the entire managed set with `items`, keyed on the
+        /// subject-dependent identity. See
+        /// [`MockClaimMappingRepo::reconcile_managed_rows`] for why
+        /// this is not a trait method; the adapter's counterpart is
+        /// `permission_grant_repo::reconcile_managed_grants_in_tx`.
+        fn reconcile_managed_rows(&self, items: &[PermissionGrant]) {
+            self.reconcile_calls.lock().unwrap().push(items.to_vec());
             let mut managed = self.managed.lock().unwrap();
             *managed = items
                 .iter()
@@ -2013,7 +2219,189 @@ mod tests {
                     )
                 })
                 .collect();
-            Box::pin(async { Ok(()) })
+        }
+    }
+
+    // --- mock AuthorityLifecyclePort ---------------------------------------
+    //
+    // The five authority kinds no longer write their rows through the
+    // row ports and then append; they hand rows + audit batches to
+    // `AuthorityLifecyclePort` in one call — and the row ports no longer
+    // carry a write method at all, so the mistake is a compile error.
+    // This mock writes through the same row mocks and event-store mock
+    // the harness already holds (via their inherent `*_row` /
+    // `reconcile_managed_rows` methods), so every pre-existing assertion
+    // on `h.claim_mappings` / `h.grant_repo` / `h.oidc_issuers` /
+    // `h.upstream` / `h.service_accounts` / `h.events` keeps meaning
+    // what it meant.
+    //
+    // The transaction is modelled by **outcome**: an armed failure
+    // returns `Err` having written neither the rows nor the events —
+    // which is what the Postgres adapter's rollback leaves behind. The
+    // rollback itself is pinned against a real server in
+    // `hort-adapters-postgres/tests/authority_audit_atomicity.rs`; what
+    // these app-layer tests pin is that the apply branch has no path
+    // that writes a row outside this one call.
+
+    /// Which authority write a [`MockAuthorityLifecycle`] call or armed
+    /// failure refers to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(in crate::use_cases::apply_config_use_case) enum AuthoritySite {
+        PermissionGrants,
+        ClaimMappings,
+        OidcIssuers,
+        UpstreamMappings,
+        ServiceAccounts,
+    }
+
+    pub(in crate::use_cases::apply_config_use_case) struct MockAuthorityLifecycle {
+        claim_mappings: Arc<MockClaimMappingRepo>,
+        grants: Arc<MockPermissionGrantRepo>,
+        oidc_issuers: Arc<crate::use_cases::test_support::MockOidcIssuerRepository>,
+        upstream_mappings:
+            Arc<crate::use_cases::test_support::MockRepositoryUpstreamMappingRepository>,
+        service_accounts: Arc<crate::use_cases::test_support::MockServiceAccountRepository>,
+        events: Arc<MockPolicyEventStore>,
+        /// One-shot armed failures, keyed by site. Consumed on use.
+        next_error: Mutex<HashMap<AuthoritySite, DomainError>>,
+        /// `(site, batch_count)` per call, in call order — including
+        /// calls that then failed.
+        commits: Mutex<Vec<(AuthoritySite, usize)>>,
+    }
+
+    impl MockAuthorityLifecycle {
+        pub(in crate::use_cases::apply_config_use_case) fn new(
+            claim_mappings: Arc<MockClaimMappingRepo>,
+            grants: Arc<MockPermissionGrantRepo>,
+            oidc_issuers: Arc<crate::use_cases::test_support::MockOidcIssuerRepository>,
+            upstream_mappings: Arc<
+                crate::use_cases::test_support::MockRepositoryUpstreamMappingRepository,
+            >,
+            service_accounts: Arc<crate::use_cases::test_support::MockServiceAccountRepository>,
+            events: Arc<MockPolicyEventStore>,
+        ) -> Self {
+            Self {
+                claim_mappings,
+                grants,
+                oidc_issuers,
+                upstream_mappings,
+                service_accounts,
+                events,
+                next_error: Mutex::new(HashMap::new()),
+                commits: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Arm a one-shot failure for the next commit at `site`. The
+        /// commit records the attempt and then writes nothing — the
+        /// adapter's all-or-nothing outcome.
+        pub(in crate::use_cases::apply_config_use_case) fn fail_next(
+            &self,
+            site: AuthoritySite,
+            err: DomainError,
+        ) {
+            self.next_error.lock().unwrap().insert(site, err);
+        }
+
+        /// `(site, batch_count)` per commit call, in call order.
+        pub(in crate::use_cases::apply_config_use_case) fn commits(
+            &self,
+        ) -> Vec<(AuthoritySite, usize)> {
+            self.commits.lock().unwrap().clone()
+        }
+
+        /// Record the call and consume an armed failure. `Err` here is
+        /// the rolled-back outcome: no row write, no append.
+        fn enter(&self, site: AuthoritySite, batch_count: usize) -> DomainResult<()> {
+            self.commits.lock().unwrap().push((site, batch_count));
+            match self.next_error.lock().unwrap().remove(&site) {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        async fn append_all(&self, batches: Vec<AppendEvents>) -> DomainResult<()> {
+            for batch in batches {
+                self.events.append(batch).await?;
+            }
+            Ok(())
+        }
+    }
+
+    impl AuthorityLifecyclePort for MockAuthorityLifecycle {
+        fn commit_permission_grants<'a>(
+            &'a self,
+            desired: &'a [PermissionGrant],
+            batches: Vec<AppendEvents>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async move {
+                self.enter(AuthoritySite::PermissionGrants, batches.len())?;
+                self.grants.reconcile_managed_rows(desired);
+                self.append_all(batches).await
+            })
+        }
+
+        fn commit_claim_mappings<'a>(
+            &'a self,
+            desired: &'a [ClaimMapping],
+            batches: Vec<AppendEvents>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async move {
+                self.enter(AuthoritySite::ClaimMappings, batches.len())?;
+                self.claim_mappings.reconcile_managed_rows(desired);
+                self.append_all(batches).await
+            })
+        }
+
+        fn commit_oidc_issuers<'a>(
+            &'a self,
+            change: &'a OidcIssuerChange,
+            batches: Vec<AppendEvents>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async move {
+                self.enter(AuthoritySite::OidcIssuers, batches.len())?;
+                for issuer in &change.upserts {
+                    self.oidc_issuers.upsert_row(issuer);
+                }
+                for name in &change.deletes {
+                    self.oidc_issuers.delete_row(name);
+                }
+                self.append_all(batches).await
+            })
+        }
+
+        fn commit_upstream_mappings<'a>(
+            &'a self,
+            change: &'a UpstreamMappingCommit,
+            batches: Vec<AppendEvents>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async move {
+                self.enter(AuthoritySite::UpstreamMappings, batches.len())?;
+                for mapping in &change.upserts {
+                    self.upstream_mappings.write_managed_row(mapping)?;
+                }
+                for id in &change.deletes {
+                    self.upstream_mappings.delete_managed_row(*id);
+                }
+                self.append_all(batches).await
+            })
+        }
+
+        fn commit_service_accounts<'a>(
+            &'a self,
+            change: &'a ServiceAccountCommit,
+            batches: Vec<AppendEvents>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async move {
+                self.enter(AuthoritySite::ServiceAccounts, batches.len())?;
+                for sa in &change.upserts {
+                    self.service_accounts.upsert_row(sa);
+                }
+                for name in &change.deletes {
+                    self.service_accounts.delete_row(name);
+                }
+                self.append_all(batches).await
+            })
         }
     }
 
@@ -2395,7 +2783,11 @@ mod tests {
 
         // Retention stubs: apply-config mock; retention paths are
         // unreachable from policy-driven apply, panic on call.
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
             Box::pin(async { unimplemented!("retention path unused by apply-config tests") })
         }
 
@@ -2403,7 +2795,8 @@ mod tests {
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
             Box::pin(async { unimplemented!("retention path unused by apply-config tests") })
         }
     }
@@ -2574,6 +2967,15 @@ mod tests {
         }
     }
 
+    /// A `ScanPolicy` envelope that applies cleanly.
+    ///
+    /// `license_policy` is `Null` and `max_artifact_age` is `None` —
+    /// both inert defaults — and both must stay that way for every
+    /// fixture that is expected to apply: a declared `licensePolicy` is
+    /// an apply-time rejection because the scan path evaluates it
+    /// against an empty licence list, and a declared `maxArtifactAge` is
+    /// one because the age evaluator has no caller. A test that wants
+    /// either rejection sets the field itself.
     pub(in crate::use_cases::apply_config_use_case) fn scan_policy_env(
         name: &str,
     ) -> Envelope<ScanPolicySpec> {
@@ -2589,8 +2991,8 @@ mod tests {
                 provenance_mode: "verify_if_present".into(),
                 provenance_backends: vec!["cosign".to_string()],
                 provenance_identities: Vec::new(),
-                max_artifact_age: Some("90d".into()),
-                license_policy: serde_json::json!({"allowed": ["MIT"]}),
+                max_artifact_age: None,
+                license_policy: serde_json::Value::Null,
                 scan_backends: vec!["trivy".to_string()],
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
@@ -2656,6 +3058,10 @@ mod tests {
         #[allow(dead_code)]
         pub(in crate::use_cases::apply_config_use_case) users:
             Arc<crate::use_cases::test_support::MockUserRepository>,
+        /// The atomic authority writer the three authority branches
+        /// commit through. Tests arm a per-site failure on it to pin
+        /// the fail-closed outcome.
+        pub(in crate::use_cases::apply_config_use_case) authority: Arc<MockAuthorityLifecycle>,
     }
 
     /// Reconcile-mechanics harness. Pins a **permissive**
@@ -2710,10 +3116,21 @@ mod tests {
         let service_accounts =
             Arc::new(crate::use_cases::test_support::MockServiceAccountRepository::new());
         let users = Arc::new(crate::use_cases::test_support::MockUserRepository::new());
+        // Atomic authority writer — writes through the row mocks above
+        // so the pre-existing row assertions keep working.
+        let authority = Arc::new(MockAuthorityLifecycle::new(
+            claim_mappings.clone(),
+            grant_repo.clone(),
+            oidc_issuers.clone(),
+            upstream.clone(),
+            service_accounts.clone(),
+            events.clone(),
+        ));
         let uc = ApplyConfigUseCase::new(
             repos.clone(),
             claim_mappings.clone(),
             grant_repo.clone(),
+            authority.clone(),
             rule_repo.clone(),
             proj.clone(),
             policies,
@@ -2763,6 +3180,7 @@ mod tests {
             oidc_issuers,
             service_accounts,
             users,
+            authority,
         }
     }
 
@@ -2801,10 +3219,21 @@ mod tests {
         let service_accounts =
             Arc::new(crate::use_cases::test_support::MockServiceAccountRepository::new());
         let users = Arc::new(crate::use_cases::test_support::MockUserRepository::new());
+        // Atomic authority writer — writes through the row mocks above
+        // so the pre-existing row assertions keep working.
+        let authority = Arc::new(MockAuthorityLifecycle::new(
+            claim_mappings.clone(),
+            grant_repo.clone(),
+            oidc_issuers.clone(),
+            upstream.clone(),
+            service_accounts.clone(),
+            events.clone(),
+        ));
         let uc = ApplyConfigUseCase::new(
             repos.clone(),
             claim_mappings.clone(),
             grant_repo.clone(),
+            authority.clone(),
             rule_repo.clone(),
             proj.clone(),
             policies,
@@ -2842,6 +3271,7 @@ mod tests {
             oidc_issuers,
             service_accounts,
             users,
+            authority,
         }
     }
 
@@ -2849,7 +3279,7 @@ mod tests {
     // Apply-config linter wiring (ADR 0015).
     // These tests assert the linter runs INSIDE
     // `apply_permission_grants` BEFORE the whole-partition
-    // `save_managed` commit, with the secure-by-default reject
+    // commit, with the secure-by-default reject
     // posture, under ZERO operator config. They use
     // `build_harness_with_lint_config(LintConfig::default())` — NOT
     // the permissive `build_harness` — so the default
@@ -2864,7 +3294,7 @@ mod tests {
     /// operator config — proving the secure-by-default posture
     /// (blocking out of the box, not opt-in). No grant row and no
     /// `PermissionGrantApplied` event lands (strict-atomic abort before
-    /// `save_managed`).
+    /// the commit).
     #[tokio::test]
     async fn secure_by_default_wildcard_grant_fails_apply_with_zero_config() {
         let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
@@ -2894,9 +3324,9 @@ mod tests {
         // Strict-atomic: the reconcile commit never ran, so no
         // gitops-managed grant row was written.
         assert_eq!(
-            h.grant_repo.save_managed_call_count(),
+            h.grant_repo.reconcile_call_count(),
             0,
-            "linter reject must abort BEFORE the whole-partition save_managed"
+            "linter reject must abort BEFORE the whole-partition commit"
         );
         assert_eq!(h.grant_repo.managed_count(), 0);
     }
@@ -2924,7 +3354,7 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
-        assert_eq!(h.grant_repo.save_managed_call_count(), 0);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 0);
     }
 
     /// An unjustified direct-`User` **Admin** grant fails apply by
@@ -2954,26 +3384,24 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
-        assert_eq!(h.grant_repo.save_managed_call_count(), 0);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 0);
     }
 
     /// A `claim_mappings` row resolving to the reserved
     /// `service_account` token-kind discriminator fails the apply by
     /// default (claim-name-collision — no downgrade knob).
     ///
-    /// **Ordering caveat (recorded residual).** The linter is wired at
-    /// the Item-10 seam inside `apply_permission_grants`, which the
-    /// pipeline runs *after* `apply_claim_mappings`' whole-partition
-    /// `save_managed`. So for the collision rule the apply still
-    /// **fails** (the gitops apply returns `Err`, the operator's CI is
-    /// red, the bad mapping never goes live in an *accepted* state), but
-    /// the claim-mapping partition reconcile already ran before the abort.
-    /// The three grant rules ARE strict-atomic —
-    /// they reject before the grant `save_managed`. Making the
-    /// collision rule strict-atomic too would require running a
-    /// claim-mapping pre-check before `apply_claim_mappings`, which is
-    /// outside this item's seam (and `apply_claim_mappings` is out of
-    /// scope). Flagged to the orchestrator as a follow-on.
+    /// **Ordering, resolved.** The collision rule is one of the grant
+    /// linter's, and the linter used to run only inside
+    /// `apply_permission_grants` — which the pipeline reaches *after*
+    /// `apply_claim_mappings`' whole-partition commit. The apply
+    /// failed either way, but the claim-mapping partition had already been
+    /// reconciled when it did: a refused mapping left behind as a
+    /// committed reconcile of the partition it belongs to. The linter's
+    /// rejection is now consumed in the pre-write pass
+    /// (`PRE_WRITE_REJECT_ROWS`), so this rule is strict-atomic like the
+    /// three grant rules — asserted below on the claim-mapping partition
+    /// itself, not only on the grant one.
     #[tokio::test]
     async fn secure_by_default_reserved_claim_mapping_fails_apply() {
         let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
@@ -2988,10 +3416,17 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
-        // The whole apply failed (the load-bearing property). The
-        // grant partition was NOT written (linter aborts before the
-        // grant save_managed).
-        assert_eq!(h.grant_repo.save_managed_call_count(), 0);
+        // The whole apply failed (the load-bearing property), and nothing
+        // was written: neither the grant partition nor — the part that
+        // changed — the Stage-1 claim-mapping partition.
+        assert_eq!(h.grant_repo.reconcile_call_count(), 0);
+        assert_eq!(
+            h.claim_mappings.reconcile_call_count(),
+            0,
+            "the reject is now pre-write, so the Stage-1 claim-mapping \
+             reconcile must not have run"
+        );
+        assert_eq!(h.claim_mappings.managed_count(), 0);
     }
 
     /// An operator downgrade (explicit, audited gitops config) of the
@@ -3021,7 +3456,7 @@ mod tests {
                 .await
                 .expect("an explicit operator downgrade must let the apply commit");
         assert_eq!(report.created, 1);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
         assert_eq!(h.grant_repo.managed_count(), 1);
     }
 
@@ -3046,7 +3481,7 @@ mod tests {
                 .expect("a clean bundle must apply under the secure default");
         // repo + claim mapping + grant.
         assert_eq!(report.created, 3);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
     }
 
     // ===================================================================
@@ -3116,7 +3551,7 @@ mod tests {
         );
         // repo + grant created; the linter did NOT reject.
         assert_eq!(report.created, 2);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
         assert_eq!(h.grant_repo.managed_count(), 1);
     }
 
@@ -3146,7 +3581,7 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
-        assert_eq!(h.grant_repo.save_managed_call_count(), 0);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 0);
     }
 
     /// A bundle-supplied per-rule downgrade
@@ -3178,7 +3613,7 @@ mod tests {
                 .await
                 .expect("a bundle-declared downgrade must let the wildcard grant commit");
         assert_eq!(report.created, 1);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
     }
 
     /// `resolve_effective_lint_config`: absent kind → the
@@ -3462,9 +3897,9 @@ mod tests {
             .calls()
             .iter()
             .any(|c| matches!(c, MockCall::Save(_))));
-        // Whole-partition reconcile — one `save_managed`
+        // Whole-partition reconcile — one commit
         // call carrying the single declared mapping row.
-        assert_eq!(h.claim_mappings.save_managed_call_count(), 1);
+        assert_eq!(h.claim_mappings.reconcile_call_count(), 1);
         assert_eq!(h.claim_mappings.managed_count(), 1);
     }
 
@@ -3481,7 +3916,7 @@ mod tests {
             .iter()
             .filter(|c| matches!(c, MockCall::SaveManaged(_, _)))
             .count();
-        // The whole-partition `save_managed` reconcile primitive is
+        // The whole-partition reconcile primitive is
         // called unconditionally once per apply;
         // idempotence is observed via zero report churn + a stable
         // managed-row set, not a call-count delta.
@@ -3537,7 +3972,7 @@ mod tests {
     // ClaimMapping apply (ADR 0012 — there is no Role CRUD block and
     // no `roles` table). Every
     // test here asserts shipped `apply_claim_mappings` behaviour: a
-    // single whole-partition `save_managed` per apply,
+    // single whole-partition reconcile per apply,
     // `ClaimMappingApplied` on create OR digest change, silence on an
     // unchanged digest, `ClaimMappingRevoked` for a prior managed row
     // absent from desired, and "empty desired revokes all".
@@ -3562,7 +3997,7 @@ mod tests {
     // PermissionGrant apply (claims-subject; ADR 0012).
     // There is no `role`-keyed grant or per-row save API:
     // a grant carries a sum-typed `GrantSubject`, persistence is the
-    // whole-partition `save_managed` reconcile, and the
+    // whole-partition reconcile, and the
     // diff identity is `(sorted required_claims, repository_id,
     // permission)` for `Claims` / `(user_id, repository_id, permission)`
     // for `User`.
@@ -3580,6 +4015,119 @@ mod tests {
             .count()
     }
 
+    // -------------------------------------------------------------------
+    // Grant rows commit with their audit events (one transaction).
+    // -------------------------------------------------------------------
+
+    /// An audit-append failure during the grant apply leaves the
+    /// gitops partition **exactly as it was** — the apply fails closed
+    /// rather than half-done. This is the property the retry cannot
+    /// supply: a committed row with no event is invisible to the next
+    /// apply's prior-vs-desired diff, so no replacement event is ever
+    /// emitted.
+    #[tokio::test]
+    async fn permission_grant_commit_failure_leaves_the_partition_unchanged() {
+        let h = build_harness();
+        let mut seeded = DesiredState::default();
+        seeded
+            .permission_grants
+            .push(grant_env("dev-read", &["developer", "ops"], "read", None));
+        h.uc.apply(seeded, env_oidc()).await.unwrap();
+        assert_eq!(h.grant_repo.managed_count(), 1);
+        let before = h.grant_repo.managed_snapshot();
+        let applied_before = count_pg_applied(&authz_events(&h).await);
+        let saves_before = h.grant_repo.reconcile_call_count();
+
+        // A different desired set, with the commit armed to fail.
+        h.authority.fail_next(
+            AuthoritySite::PermissionGrants,
+            DomainError::Invariant("event store unavailable".into()),
+        );
+        let mut next = DesiredState::default();
+        next.permission_grants.push(grant_env(
+            "sec-curate",
+            &["security", "ops"],
+            "curate",
+            None,
+        ));
+        let err =
+            h.uc.apply(next, env_oidc())
+                .await
+                .expect_err("an audit-append failure must fail the apply");
+        assert!(
+            err.to_string().contains("event store unavailable"),
+            "the event-store failure must surface, got: {err}"
+        );
+
+        assert_eq!(
+            h.grant_repo.reconcile_call_count(),
+            saves_before,
+            "no second row write may have landed — rows and events commit together"
+        );
+        assert_eq!(
+            h.grant_repo.managed_snapshot(),
+            before,
+            "the gitops grant partition must be byte-identical to its pre-apply state"
+        );
+        assert_eq!(
+            count_pg_applied(&authz_events(&h).await),
+            applied_before,
+            "no audit event may have landed either"
+        );
+    }
+
+    /// A grant reconcile that routes events to several streams hands
+    /// the whole batch list to **one** commit call, which is what makes
+    /// the multi-stream append atomic. Before the port each stream was
+    /// its own `EventStore::append` transaction, so a list that failed
+    /// part-way left some repository streams audited and others not.
+    #[tokio::test]
+    async fn permission_grant_commit_takes_every_stream_in_one_call() {
+        let h = build_harness();
+        let mut desired = DesiredState::default();
+        desired.repositories.push(repo_env("npm-public", "hosted"));
+        // One repo-scoped grant (routes to the repository stream) and
+        // one wildcard grant (routes to the authorization stream).
+        desired.permission_grants.push(grant_env(
+            "dev-read-npm",
+            &["developer", "ops"],
+            "read",
+            Some("npm-public"),
+        ));
+        desired.permission_grants.push(grant_env(
+            "admin-everywhere",
+            &["platform", "admins"],
+            "admin",
+            None,
+        ));
+        h.uc.apply(desired, env_oidc()).await.unwrap();
+
+        let grant_commits: Vec<usize> = h
+            .authority
+            .commits()
+            .into_iter()
+            .filter(|(site, _)| *site == AuthoritySite::PermissionGrants)
+            .map(|(_, batches)| batches)
+            .collect();
+        assert_eq!(
+            grant_commits,
+            vec![2],
+            "exactly one commit call carrying both stream batches"
+        );
+
+        let repo_id = h.repos.find_by_key("npm-public").await.unwrap().id;
+        assert_eq!(
+            count_pg_applied(&repo_stream_events(&h.events, repo_id).await),
+            1,
+            "the repo-scoped grant is audited on its repository stream"
+        );
+        assert_eq!(
+            count_pg_applied(&authz_events(&h).await),
+            1,
+            "the wildcard grant is audited on the authorization stream"
+        );
+    }
+
     #[tokio::test]
     async fn create_permission_grant_resolves_claims_and_repository() {
         let h = build_harness();
@@ -3594,7 +4142,7 @@ mod tests {
         let report = h.uc.apply(desired, env_oidc()).await.unwrap();
         // Repo + Grant = 2 created (no `roles` table).
         assert_eq!(report.created, 2);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
         assert_eq!(h.grant_repo.managed_count(), 1);
         let g = &h.grant_repo.managed_snapshot()[0];
         assert_eq!(
@@ -3833,9 +4381,9 @@ mod tests {
 
         // Spot-check: every CRUD writer fired once via the
         // whole-partition reconcile primitive.
-        assert_eq!(h.claim_mappings.save_managed_call_count(), 1);
+        assert_eq!(h.claim_mappings.reconcile_call_count(), 1);
         assert_eq!(h.claim_mappings.managed_count(), 1);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
         assert_eq!(h.grant_repo.managed_count(), 1);
         assert_eq!(h.rule_repo.save_count(), 1);
         // PolicyUseCase fired twice (PolicyCreated + ExclusionAdded).
@@ -4239,6 +4787,7 @@ mod tests {
                 mtls_key_ref: None,
                 ca_bundle_ref: None,
                 pinned_cert_sha256: None,
+                allowed_realm_hosts: Vec::new(),
             },
         }
     }
@@ -4462,8 +5011,13 @@ mod tests {
     use hort_domain::ports::secret_port::{SecretRef, SecretSource};
 
     /// Helper — read every event on a given Repository(repo_id) stream
-    /// as a `Vec<DomainEvent>`.
-    async fn repo_stream_events(events: &MockPolicyEventStore, repo_id: Uuid) -> Vec<DE> {
+    /// as a `Vec<DomainEvent>`. `pub(in …)` so the per-branch test
+    /// modules (e.g. `upstream_mappings::tests`) can read a repo-scoped
+    /// stream without a second copy of this.
+    pub(in crate::use_cases::apply_config_use_case) async fn repo_stream_events(
+        events: &MockPolicyEventStore,
+        repo_id: Uuid,
+    ) -> Vec<DE> {
         events
             .read_stream(&StreamId::repository(repo_id), RF::Start, u64::MAX)
             .await
@@ -4505,6 +5059,7 @@ mod tests {
                 mtls_key_ref: None,
                 ca_bundle_ref: None,
                 pinned_cert_sha256: None,
+                allowed_realm_hosts: Vec::new(),
             },
         }
     }
@@ -5370,6 +5925,7 @@ mod tests {
             h.repos.clone(),
             h.claim_mappings.clone(),
             h.grant_repo.clone(),
+            h.authority.clone(),
             h.rule_repo.clone(),
             h.proj.clone(),
             Arc::new(PolicyUseCase::new(
@@ -5444,8 +6000,8 @@ mod tests {
                 provenance_mode: "verify_if_present".into(),
                 provenance_backends: vec!["cosign".to_string()],
                 provenance_identities: Vec::new(),
-                max_artifact_age: Some("90d".into()),
-                license_policy: serde_json::json!({"allowed": ["MIT"]}),
+                max_artifact_age: None,
+                license_policy: serde_json::Value::Null,
                 scan_backends: backends.into_iter().map(str::to_string).collect(),
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
@@ -5475,7 +6031,7 @@ mod tests {
             provenance_backends: vec!["cosign".to_string()],
             provenance_identities: Vec::new(),
             max_artifact_age_secs: Some(90 * 24 * 3600),
-            license_policy: serde_json::json!({"allowed": ["MIT"]}),
+            license_policy: serde_json::Value::Null,
             // The crucial bit — this row is archived. The previous
             // apply ran with the YAML absent, archived `p1`, and
             // left the row in `policy_projections`.
@@ -6259,6 +6815,451 @@ mod tests {
     }
 
     // ===================================================================
+    // Gitops apply linter rejecting the three further accepted-but-inert
+    // operator surfaces (rows 10, 11, 12 — ADR 0015):
+    //
+    //   - `ScanPolicy.licensePolicy` — the scan path evaluates it against
+    //     an empty licence list, so every rule in it matches nothing.
+    //   - `Exclusion.scope` — the finding filter never reads it, so a
+    //     waiver narrowed to one repository clears its CVE everywhere.
+    //   - a `virtualMembers` entry's format — nothing compares it with
+    //     the virtual's, so a member can own names for a format it does
+    //     not serve.
+    //
+    // Each pair below is the acceptance shape the item asks for: the
+    // field set fails the apply and ticks its rule's counter once; the
+    // field absent or at its inert default applies and ticks nothing.
+    // ===================================================================
+
+    /// A declared `licensePolicy` fails the apply, naming the policy, the
+    /// field and the missing enforcement, and ticks
+    /// `scan_policy_license_policy_not_implemented` once.
+    #[test]
+    fn apply_rejects_scan_policy_with_a_declared_license_policy() {
+        use crate::metrics::capture_metrics;
+        let mut captured_err: Option<AppError> = None;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let mut env = scan_policy_env("prod-with-licence-rules");
+                env.spec.license_policy = serde_json::json!({
+                    "denied_licenses": ["GPL-3.0"],
+                    "action": "Block",
+                });
+                let desired = DesiredState {
+                    scan_policies: vec![env],
+                    ..Default::default()
+                };
+                captured_err = Some(
+                    h.uc.apply(desired, env_oidc())
+                        .await
+                        .expect_err("apply must reject a declared licensePolicy"),
+                );
+            });
+        });
+        match captured_err.expect("apply must have errored") {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(
+                    msg.contains("prod-with-licence-rules"),
+                    "must name the offending policy, got: {msg}"
+                );
+                assert!(
+                    msg.contains("licensePolicy"),
+                    "must name the offending field, got: {msg}"
+                );
+                assert!(
+                    msg.contains("not implemented") && msg.contains("empty licence list"),
+                    "must say what is missing, got: {msg}"
+                );
+            }
+            other => panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}"),
+        }
+        assert_eq!(
+            counter_value_for(
+                &snap.into_vec(),
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "scan_policy_license_policy_not_implemented"),
+                    ("result", "reject"),
+                ],
+            ),
+            1,
+            "linter metric must tick once for the offending ScanPolicy",
+        );
+    }
+
+    /// Both inert forms still apply: `{}` (what every shipped example
+    /// tree writes) and `null` (the omitted field). The rule removes an
+    /// assurance; it must not change what a tree that never claimed it
+    /// does.
+    #[test]
+    fn apply_accepts_scan_policy_with_an_inert_license_policy() {
+        use crate::metrics::capture_metrics;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                for (what, value) in [
+                    ("an empty object", serde_json::json!({})),
+                    ("the omitted default", serde_json::Value::Null),
+                ] {
+                    let h = build_harness();
+                    let mut env = scan_policy_env("prod-inert-licence");
+                    env.spec.license_policy = value;
+                    h.uc.apply(
+                        DesiredState {
+                            scan_policies: vec![env],
+                            ..Default::default()
+                        },
+                        env_oidc(),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("apply must succeed for {what}: {e:?}"));
+                    assert!(
+                        !h.events.appended().is_empty(),
+                        "{what} must still create the policy — the accept side cannot \
+                         pass vacuously"
+                    );
+                }
+            });
+        });
+        assert_eq!(
+            counter_value_for(
+                &snap.into_vec(),
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "scan_policy_license_policy_not_implemented"),
+                    ("result", "reject"),
+                ],
+            ),
+            0,
+            "linter metric must NOT tick reject for an inert licensePolicy",
+        );
+    }
+
+    /// A repository-scoped `Exclusion` fails the apply and ticks
+    /// `exclusion_scope_not_implemented` once. The parent policy is
+    /// declared and the scoped repository is declared, so neither the
+    /// parent-reference rule nor a dangling reference is what refuses it.
+    #[test]
+    fn apply_rejects_exclusion_scoped_to_a_repository() {
+        use crate::metrics::capture_metrics;
+        let mut captured_err: Option<AppError> = None;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let mut ex = exclusion_env("cve-on-one-repo", "prod-default", "CVE-2026-0001");
+                ex.spec.scope = ScopeSpec::Repository(hort_config::scope::RepositoryScope {
+                    repository: "npm-internal".into(),
+                });
+                let desired = DesiredState {
+                    repositories: vec![repo_env("npm-internal", "hosted")],
+                    scan_policies: vec![scan_policy_env("prod-default")],
+                    exclusions: vec![ex],
+                    ..Default::default()
+                };
+                captured_err = Some(
+                    h.uc.apply(desired, env_oidc())
+                        .await
+                        .expect_err("apply must reject a repository-scoped exclusion"),
+                );
+            });
+        });
+        match captured_err.expect("apply must have errored") {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(
+                    msg.contains("cve-on-one-repo") && msg.contains("npm-internal"),
+                    "must name the exclusion and the repository it was scoped to, \
+                     got: {msg}"
+                );
+                assert!(
+                    msg.contains("not enforced") && msg.contains("never reads"),
+                    "must say the control is missing, got: {msg}"
+                );
+                assert!(
+                    msg.contains("scope: global"),
+                    "must name the one accepted form, got: {msg}"
+                );
+            }
+            other => panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}"),
+        }
+        assert_eq!(
+            counter_value_for(
+                &snap.into_vec(),
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "exclusion_scope_not_implemented"),
+                    ("result", "reject"),
+                ],
+            ),
+            1,
+            "linter metric must tick once for the offending Exclusion",
+        );
+    }
+
+    /// `scope: global` — the inert default, and the only form the schema
+    /// now accepts — applies and emits the `ExclusionAdded`.
+    #[test]
+    fn apply_accepts_exclusion_with_a_global_scope() {
+        use crate::metrics::capture_metrics;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let desired = DesiredState {
+                    scan_policies: vec![scan_policy_env("prod-default")],
+                    exclusions: vec![exclusion_env(
+                        "cve-everywhere",
+                        "prod-default",
+                        "CVE-2026-0002",
+                    )],
+                    ..Default::default()
+                };
+                h.uc.apply(desired, env_oidc())
+                    .await
+                    .expect("a global-scope exclusion must apply");
+                assert!(
+                    h.events.appended().iter().any(|b| b
+                        .events
+                        .iter()
+                        .any(|e| matches!(e.event, DomainEvent::ExclusionAdded(_)))),
+                    "the accept side must actually write the exclusion: {:?}",
+                    h.events.appended()
+                );
+            });
+        });
+        assert_eq!(
+            counter_value_for(
+                &snap.into_vec(),
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "exclusion_scope_not_implemented"),
+                    ("result", "reject"),
+                ],
+            ),
+            0,
+            "linter metric must NOT tick reject for a global scope",
+        );
+    }
+
+    /// A `virtualMembers` entry on another format fails the apply and
+    /// ticks `virtual_member_format_not_enforced` once. The member is
+    /// declared and non-virtual, so neither the dangling-member rule nor
+    /// the no-nested-virtuals rule is what refuses it.
+    #[test]
+    fn apply_rejects_virtual_member_on_another_format() {
+        use crate::metrics::capture_metrics;
+        let mut captured_err: Option<AppError> = None;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let mut virt = repo_env_with_format("all-npm", "virtual", "npm");
+                virt.spec.virtual_members = Some(vec!["py-lib".into()]);
+                let desired = DesiredState {
+                    repositories: vec![virt, repo_env_with_format("py-lib", "hosted", "pypi")],
+                    ..Default::default()
+                };
+                captured_err = Some(
+                    h.uc.apply(desired, env_oidc())
+                        .await
+                        .expect_err("apply must reject a cross-format virtual member"),
+                );
+            });
+        });
+        match captured_err.expect("apply must have errored") {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(
+                    msg.contains("all-npm") && msg.contains("py-lib"),
+                    "must name the virtual and the offending member, got: {msg}"
+                );
+                assert!(
+                    msg.contains("pypi") && msg.contains("npm"),
+                    "must name both formats, got: {msg}"
+                );
+                assert!(
+                    msg.contains("no format-compatibility check is implemented"),
+                    "must say the control is missing, got: {msg}"
+                );
+            }
+            other => panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}"),
+        }
+        assert_eq!(
+            counter_value_for(
+                &snap.into_vec(),
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "virtual_member_format_not_enforced"),
+                    ("result", "reject"),
+                ],
+            ),
+            1,
+            "linter metric must tick once for the offending member",
+        );
+    }
+
+    /// A format-homogeneous virtual — the inert default, and every
+    /// shipped example tree — applies unchanged.
+    #[test]
+    fn apply_accepts_virtual_member_on_the_same_format() {
+        use crate::metrics::capture_metrics;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let mut virt = repo_env_with_format("all-npm", "virtual", "npm");
+                virt.spec.virtual_members = Some(vec!["npm-internal".into()]);
+                let desired = DesiredState {
+                    repositories: vec![virt, repo_env_with_format("npm-internal", "hosted", "npm")],
+                    ..Default::default()
+                };
+                h.uc.apply(desired, env_oidc())
+                    .await
+                    .expect("a same-format virtual must apply");
+                assert!(
+                    !h.repos.calls().is_empty(),
+                    "the accept side must actually write the repositories"
+                );
+            });
+        });
+        assert_eq!(
+            counter_value_for(
+                &snap.into_vec(),
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "virtual_member_format_not_enforced"),
+                    ("result", "reject"),
+                ],
+            ),
+            0,
+            "linter metric must NOT tick reject for a same-format member",
+        );
+    }
+
+    /// A declared `maxArtifactAge` fails the apply, naming the policy,
+    /// the field and the missing enforcement, and ticks
+    /// `scan_policy_max_artifact_age_not_implemented` once.
+    #[test]
+    fn apply_rejects_scan_policy_with_a_declared_max_artifact_age() {
+        use crate::metrics::capture_metrics;
+        let mut captured_err: Option<AppError> = None;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let mut env = scan_policy_env("prod-with-age-cap");
+                env.spec.max_artifact_age = Some("90d".into());
+                let desired = DesiredState {
+                    scan_policies: vec![env],
+                    ..Default::default()
+                };
+                captured_err = Some(
+                    h.uc.apply(desired, env_oidc())
+                        .await
+                        .expect_err("apply must reject a declared maxArtifactAge"),
+                );
+            });
+        });
+        match captured_err.expect("apply must have errored") {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(
+                    msg.contains("prod-with-age-cap"),
+                    "must name the offending policy, got: {msg}"
+                );
+                assert!(
+                    msg.contains("maxArtifactAge"),
+                    "must name the offending field, got: {msg}"
+                );
+                assert!(
+                    msg.contains("not implemented") && msg.contains("never evaluated"),
+                    "must say what is missing, got: {msg}"
+                );
+            }
+            other => panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}"),
+        }
+        assert_eq!(
+            counter_value_for(
+                &snap.into_vec(),
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "scan_policy_max_artifact_age_not_implemented"),
+                    ("result", "reject"),
+                ],
+            ),
+            1,
+            "linter metric must tick once for the offending ScanPolicy",
+        );
+    }
+
+    /// The inert form — the absent field, which is what every shipped
+    /// example tree writes — still applies. Unlike row 10 there is no
+    /// accepted *value* to check beside it: `None` is the only inert
+    /// state `Option<String>` has.
+    #[test]
+    fn apply_accepts_scan_policy_without_a_max_artifact_age() {
+        use crate::metrics::capture_metrics;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let mut env = scan_policy_env("prod-no-age-cap");
+                env.spec.max_artifact_age = None;
+                h.uc.apply(
+                    DesiredState {
+                        scan_policies: vec![env],
+                        ..Default::default()
+                    },
+                    env_oidc(),
+                )
+                .await
+                .expect("an omitted maxArtifactAge must apply");
+                assert!(
+                    !h.events.appended().is_empty(),
+                    "the accept side must still create the policy — it cannot pass \
+                     vacuously"
+                );
+            });
+        });
+        assert_eq!(
+            counter_value_for(
+                &snap.into_vec(),
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "scan_policy_max_artifact_age_not_implemented"),
+                    ("result", "reject"),
+                ],
+            ),
+            0,
+            "linter metric must NOT tick reject for an omitted maxArtifactAge",
+        );
+    }
+
+    // ===================================================================
     // `StaticConfigValidator` extraction.
     // (a) No-drift parity: the apply pre-write pass's static subset
     //     and `StaticConfigValidator::validate` agree on the reject SET
@@ -6394,6 +7395,70 @@ mod tests {
                 expect_rule: LinterRule::RetentionUnusedForNotImplemented,
                 effective_backend: None,
             },
+            // Row 10 — a ScanPolicy declaring licence rules the scan
+            // path evaluates against no licences.
+            Case {
+                desired: DesiredState {
+                    scan_policies: vec![{
+                        let mut env = scan_policy_env("p-licence");
+                        env.spec.license_policy =
+                            serde_json::json!({ "denied_licenses": ["GPL-3.0"] });
+                        env
+                    }],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::ScanPolicyLicensePolicyNotImplemented,
+                effective_backend: None,
+            },
+            // Row 11 — an Exclusion scoped to a repository the finding
+            // filter never reads.
+            Case {
+                desired: DesiredState {
+                    repositories: vec![repo_env("npm-internal", "hosted")],
+                    scan_policies: vec![scan_policy_env("p-parent")],
+                    exclusions: vec![{
+                        let mut ex = exclusion_env("cve-scoped", "p-parent", "CVE-2026-0003");
+                        ex.spec.scope =
+                            ScopeSpec::Repository(hort_config::scope::RepositoryScope {
+                                repository: "npm-internal".into(),
+                            });
+                        ex
+                    }],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::ExclusionScopeNotImplemented,
+                effective_backend: None,
+            },
+            // Row 12 — a virtual member on another format.
+            Case {
+                desired: DesiredState {
+                    repositories: vec![
+                        {
+                            let mut virt = repo_env_with_format("all-npm", "virtual", "npm");
+                            virt.spec.virtual_members = Some(vec!["py-lib".into()]);
+                            virt
+                        },
+                        repo_env_with_format("py-lib", "hosted", "pypi"),
+                    ],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::VirtualMemberFormatNotEnforced,
+                effective_backend: None,
+            },
+            // Row 13 — a ScanPolicy declaring a staleness cap the age
+            // evaluator never applies.
+            Case {
+                desired: DesiredState {
+                    scan_policies: vec![{
+                        let mut env = scan_policy_env("p-stale-cap");
+                        env.spec.max_artifact_age = Some("90d".into());
+                        env
+                    }],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::ScanPolicyMaxArtifactAgeNotImplemented,
+                effective_backend: None,
+            },
         ];
 
         for case in cases {
@@ -6449,6 +7514,21 @@ mod tests {
     /// DB ids and synthesising SA-owned grants). The verdict is invariant
     /// to id VALUES, so the two must agree — proving the offline
     /// expansion replicates apply's grant set, no drift.
+    ///
+    /// This invariance is what licenses consuming row 8 in the pre-write
+    /// pass (`PRE_WRITE_REJECT_ROWS`), and consuming it there changes what
+    /// each arm of this test observes:
+    ///
+    /// - **reject cases** — apply now aborts in the pre-write pass, so the
+    ///   verdict it reports *is* the validator's. The grant stage's gate
+    ///   survives as defence-in-depth over the port-built set; it is no
+    ///   longer reachable through the public API for a bundle the
+    ///   placeholder expansion already refuses, which is the point of
+    ///   moving the rejection before the first write.
+    /// - **clean cases** — apply reaches the grant stage, which runs the
+    ///   linter over the port-built set and must also pass. This direction
+    ///   is unchanged and still non-trivial: it is what would catch a
+    ///   placeholder expansion that passed something the real set rejects.
     #[tokio::test]
     async fn static_validator_row8_and_apply_grant_linter_agree() {
         use crate::lint::{LinterRule, StaticConfigValidator};
@@ -6556,14 +7636,22 @@ mod tests {
             // --- real apply path (secure-default LintConfig) ---
             let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
             // The referenced repository is DECLARED as an envelope (above):
-            // apply's repository stage creates it through the mock BEFORE the
-            // grant stage, so the grant expansion's `find_by_key` resolves it.
-            // No pre-seed (a pre-seeded `managed_by=local` row would make
-            // apply reject the re-declaration before reaching the linter).
+            // on the clean cases apply's repository stage creates it through
+            // the mock BEFORE the grant stage, so the grant expansion's
+            // `find_by_key` resolves it. No pre-seed (a pre-seeded
+            // `managed_by=local` row would make apply reject the
+            // re-declaration before reaching the linter).
             let apply_result = h.uc.apply(case.desired.clone(), env_oidc()).await;
+            // The grant-lint reject now lands in the pre-write pass, which
+            // aborts with the row-8 finding verbatim; the grant stage's own
+            // aggregate message ("apply-config linter rejected N …") is only
+            // reachable if the placeholder-id expansion and the port-built
+            // set ever disagreed. Accept either — what this asserts is the
+            // verdict, not which of the two gates produced it.
             let apply_rejects = match &apply_result {
                 Err(AppError::Domain(DomainError::Validation(msg))) => {
-                    msg.contains("apply-config linter rejected")
+                    msg.contains("permission-grant linter rule")
+                        || msg.contains("apply-config linter rejected")
                 }
                 _ => false,
             };
@@ -6579,7 +7667,672 @@ mod tests {
                 "row-8 / apply parity broken for `{}`",
                 case.name
             );
+
+            // On the clean cases the grant stage DID run, over the
+            // port-built desired set, and passed: an `Ok` apply is the
+            // port-built linter's own verdict, not the validator's. That is
+            // the half of the parity the pre-write reject cannot shadow —
+            // a placeholder expansion that passed something the port-built
+            // set rejects would fail here.
+            if !case.expect_reject {
+                assert_eq!(
+                    h.grant_repo.reconcile_call_count(),
+                    1,
+                    "a clean bundle must reach the grant stage's own lint + \
+                     reconcile for `{}`",
+                    case.name
+                );
+            }
         }
+    }
+
+    // ===================================================================
+    // Pre-write rejection completeness.
+    //
+    // The apply writes between its stages and ships no rollback, so a
+    // rejection reachable only from a write-capable stage leaves a partial
+    // apply: the reachable bad state is a tightening refused while a
+    // loosening from the same bundle has already landed. The claim these
+    // tests hold is therefore "every rejection the apply can reach is
+    // reachable before the first write", in two complementary shapes — a
+    // structural one over the lint rows, and a per-stage corpus.
+    // ===================================================================
+
+    /// `PRE_WRITE_REJECT_ROWS` is COMPLETE: every [`LinterRule`] that can
+    /// produce an error finding is consumed by the pre-write pass.
+    ///
+    /// This is the enumeration turned into a checked claim. The table used
+    /// to be a comment listing the rows the pass consumed, and a comment
+    /// cannot fail — which is how the grant lint stayed off the list while
+    /// its rejection ran inside the last apply stage, behind the
+    /// repository, policy and mapping writes. The classification below is
+    /// wildcard-free, so a new `LinterRule` variant does not compile until
+    /// its author states where its verdict is surfaced; if the answer is
+    /// "a reject", the assertion then requires it to be in the table.
+    #[test]
+    fn pre_write_validation_consumes_every_reject_row() {
+        /// Where the pre-write pass surfaces a rule's verdict.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Consumption {
+            /// Walked from `PRE_WRITE_REJECT_ROWS`.
+            Table,
+            /// A dedicated pre-write abort outside the table, kept separate
+            /// because it has its own `error!` line and error envelope.
+            Dedicated,
+            /// Advisory: the rule emits warnings only and never aborts, so
+            /// there is no rejection to bring forward.
+            AdvisoryOnly,
+        }
+
+        // No `_` arm, on purpose: `LinterRule` is not `#[non_exhaustive]`,
+        // so a new variant fails to COMPILE here until it is consciously
+        // classified.
+        fn consumption(rule: LinterRule) -> Consumption {
+            match rule {
+                LinterRule::TrustUpstreamPublishTimeRequiresScanBackends
+                | LinterRule::PrefetchMaxAgeDaysNotImplemented
+                | LinterRule::PrefetchTriggerRequiresVersionDiscovery
+                | LinterRule::ProvenanceConfig
+                | LinterRule::RepoStorageBackendMismatch
+                | LinterRule::ScanBackendCapability
+                | LinterRule::PermissionGrant
+                | LinterRule::RetentionUnusedForNotImplemented
+                | LinterRule::ScanPolicyLicensePolicyNotImplemented
+                | LinterRule::ExclusionScopeNotImplemented
+                | LinterRule::VirtualMemberFormatNotEnforced
+                | LinterRule::ScanPolicyMaxArtifactAgeNotImplemented => Consumption::Table,
+                // Row 2 — its own abort immediately before row 4, so the
+                // cross-kind FK keeps its distinct log line and its
+                // `"; "`-joined envelope.
+                LinterRule::SaIssuerFk => Consumption::Dedicated,
+                // Row 3 — advisory warning only.
+                LinterRule::UnderConstrainedFederatedIdentities => Consumption::AdvisoryOnly,
+            }
+        }
+
+        /// Every `LinterRule` variant, once. The wildcard-free `match`
+        /// above is the compile-time guarantee that this list is complete;
+        /// the array is what lets the assertions iterate it.
+        const ALL_RULES: &[LinterRule] = &[
+            LinterRule::SaIssuerFk,
+            LinterRule::UnderConstrainedFederatedIdentities,
+            LinterRule::TrustUpstreamPublishTimeRequiresScanBackends,
+            LinterRule::PrefetchMaxAgeDaysNotImplemented,
+            LinterRule::PrefetchTriggerRequiresVersionDiscovery,
+            LinterRule::ProvenanceConfig,
+            LinterRule::RepoStorageBackendMismatch,
+            LinterRule::ScanBackendCapability,
+            LinterRule::PermissionGrant,
+            LinterRule::RetentionUnusedForNotImplemented,
+            LinterRule::ScanPolicyLicensePolicyNotImplemented,
+            LinterRule::ExclusionScopeNotImplemented,
+            LinterRule::VirtualMemberFormatNotEnforced,
+            LinterRule::ScanPolicyMaxArtifactAgeNotImplemented,
+        ];
+
+        let in_table: HashSet<LinterRule> =
+            PRE_WRITE_REJECT_ROWS.iter().map(|(r, _, _)| *r).collect();
+        assert_eq!(
+            in_table.len(),
+            PRE_WRITE_REJECT_ROWS.len(),
+            "PRE_WRITE_REJECT_ROWS lists a rule twice — the second entry is \
+             dead (the walk aborts on the first row with findings)"
+        );
+
+        for &rule in ALL_RULES {
+            let classified = consumption(rule);
+            assert_eq!(
+                in_table.contains(&rule),
+                classified == Consumption::Table,
+                "{rule:?} is classified {classified:?} but \
+                 PRE_WRITE_REJECT_ROWS membership says otherwise. A rejecting \
+                 lint row that is NOT consumed by the pre-write pass can only \
+                 reject from inside a write-capable apply stage, which leaves \
+                 a partial apply behind. Add it to the table (and give it an \
+                 `error!` line + a RowAbort), or classify it Dedicated / \
+                 AdvisoryOnly and say where its verdict is surfaced."
+            );
+        }
+
+        // Counter-assertion: the classification is not vacuously
+        // Table-for-everything, and the array did not lose a variant to a
+        // rename. Three buckets, with the counts the as-built pass has.
+        let table = ALL_RULES
+            .iter()
+            .filter(|r| consumption(**r) == Consumption::Table)
+            .count();
+        let dedicated = ALL_RULES
+            .iter()
+            .filter(|r| consumption(**r) == Consumption::Dedicated)
+            .count();
+        let advisory = ALL_RULES
+            .iter()
+            .filter(|r| consumption(**r) == Consumption::AdvisoryOnly)
+            .count();
+        assert_eq!(
+            (table, dedicated, advisory),
+            (12, 1, 1),
+            "the LinterRule bucket counts changed — a silent reclassification \
+             (or a variant missing from ALL_RULES) is exactly what this guard \
+             exists to catch"
+        );
+    }
+
+    /// For every apply stage that can refuse an operator config, the boot
+    /// preflight refuses the same bundle — so the refusal happens before
+    /// the first write and `gitops_boot` parks not-ready instead of
+    /// crashlooping on a half-applied tree.
+    ///
+    /// Each case names the stage whose check would refuse the bundle and
+    /// the pre-write row that now catches it first. The test has teeth in
+    /// the direction that matters: delete the pre-write row and the
+    /// matching case goes red, because the stage's own check still refuses
+    /// the bundle (the stages keep theirs as defence-in-depth) while the
+    /// preflight no longer does.
+    ///
+    /// Two cases in the corpus are worse than a late refusal and are
+    /// carried here for the same reason: neither `apply_scan_policies`
+    /// nor `apply_exclusions` *refuses* a scope naming an undeclared
+    /// repository, they panic on it, which is not a `GitopsBootError` and
+    /// so cannot park the pod at all. Deleting either pre-write rule
+    /// turns this test's `apply` call into that panic — which is the
+    /// standing proof that `ExclusionsApplier::resolve_scope`'s panic is
+    /// unreachable from operator config.
+    ///
+    /// # What the corpus is, and what it is not
+    ///
+    /// The cases are **hand-written, one per rejecting stage**, and the
+    /// coverage claim is therefore only as complete as this list. The
+    /// companion test above (`pre_write_validation_consumes_every_reject_row`)
+    /// IS derived — its wildcard-free `match` over `LinterRule` fails to
+    /// compile until a new variant is classified — but that covers the
+    /// linter rows, not the stages: a stage can refuse through a domain
+    /// constructor, a port lookup or a `FromStr` with no lint row behind
+    /// it, which is exactly what the two newest cases below
+    /// (`apply_curation_rules`, `apply_virtual_members`) do. Those two
+    /// were absent for as long as the list was the only inventory, and
+    /// while both were covered by a preflight mirror throughout, losing
+    /// either mirror would have left this purported stage-completeness
+    /// test green. A new rejection arm added to a represented stage has
+    /// the same exposure. There is one stage function per apply pass, so
+    /// the list is checkable by reading `apply`; it is not checked by the
+    /// compiler.
+    #[tokio::test]
+    async fn every_rejecting_apply_stage_is_rejected_pre_write() {
+        struct Case {
+            /// The stage whose check refuses this bundle, and the pre-write
+            /// row that makes the same verdict reachable earlier.
+            what: &'static str,
+            desired: DesiredState,
+        }
+
+        let mut undeclared_issuer_sa = DesiredState::default();
+        undeclared_issuer_sa
+            .service_accounts
+            .push(service_account_env_for_apply("ci", Some("missing-idp")));
+
+        let mut proxy_without_block = repo_env("npm-proxy", "proxy");
+        proxy_without_block.spec.proxy = None;
+
+        let mut bad_jwks_interval = oidc_issuer_env_for_apply("corp");
+        bad_jwks_interval.spec.jwks_refresh_interval = "every other tuesday".into();
+
+        let mut scoped_scan_policy_at_a_ghost = scan_policy_env("scoped-at-a-ghost");
+        scoped_scan_policy_at_a_ghost.spec.scope =
+            ScopeSpec::Repository(hort_config::scope::RepositoryScope {
+                repository: "not-declared".into(),
+            });
+
+        let mut exclusion_scoped_at_a_ghost =
+            exclusion_env("scoped-at-a-ghost", "p-parent", "CVE-2026-0004");
+        exclusion_scoped_at_a_ghost.spec.scope =
+            ScopeSpec::Repository(hort_config::scope::RepositoryScope {
+                repository: "not-declared".into(),
+            });
+
+        let mut half_mtls = upstream_mapping_env(
+            "m-half-mtls",
+            "oci-mirror",
+            "dockerhub/",
+            "https://registry-1.docker.io",
+        );
+        half_mtls.spec.mtls_cert_ref = Some(SecretRef {
+            source: SecretSource::EnvVar,
+            location: "CLIENT_CERT".into(),
+        });
+
+        // A `type: virtual` repo naming a member the bundle does not
+        // declare. `repo_env`'s `npm` format is serve-supported, so the
+        // only thing wrong with this bundle is the member reference.
+        let mut virtual_at_a_ghost_member = repo_env("npm-aggregate", "virtual");
+        virtual_at_a_ghost_member.spec.virtual_members = Some(vec!["not-declared".into()]);
+
+        let cases = vec![
+            // `apply_claim_mappings` (Stage 1) — the grant linter's
+            // claim-name-collision rule. Row 8: before this moved forward,
+            // the Stage-1 claim-mapping partition reconcile had already run
+            // when the linter refused.
+            Case {
+                what: "apply_permission_grants / claim-name-collision (row 8)",
+                desired: DesiredState {
+                    claim_mappings: vec![cm_env("svc", "sa-group", "service_account")],
+                    ..Default::default()
+                },
+            },
+            // `apply_permission_grants` (last) — the three grant rules.
+            Case {
+                what: "apply_permission_grants / single-claim-grant (row 8)",
+                desired: DesiredState {
+                    repositories: vec![repo_env("repo-x", "hosted")],
+                    permission_grants: vec![grant_env(
+                        "solo",
+                        &["team-alpha"],
+                        "read",
+                        Some("repo-x"),
+                    )],
+                    ..Default::default()
+                },
+            },
+            Case {
+                what: "apply_permission_grants / wildcard-repo-non-admin (row 8)",
+                desired: DesiredState {
+                    permission_grants: vec![grant_env(
+                        "everywhere",
+                        &["developer", "ops"],
+                        "write",
+                        None,
+                    )],
+                    ..Default::default()
+                },
+            },
+            Case {
+                what: "apply_permission_grants / direct-user-grant (row 8)",
+                desired: DesiredState {
+                    permission_grants: vec![user_grant_env("god", Uuid::new_v4(), "admin", None)],
+                    ..Default::default()
+                },
+            },
+            // `apply_upstream_mappings` (Stage 3) — the value-object
+            // constructor's TLS invariants, mirrored at per-spec validation.
+            Case {
+                what: "apply_upstream_mappings / RepositoryUpstreamMapping::new TLS pairing",
+                desired: DesiredState {
+                    repositories: vec![repo_env("oci-mirror", "proxy")],
+                    upstream_mappings: vec![half_mtls],
+                    ..Default::default()
+                },
+            },
+            // `apply_repository_rows` (Stage 2) — `build_repository_from_spec`
+            // refuses a proxy with no upstream URL; per-spec validation
+            // refuses the missing `proxy:` block that produces it.
+            Case {
+                what: "apply_repository_rows / proxy without an upstream URL",
+                desired: DesiredState {
+                    repositories: vec![proxy_without_block],
+                    ..Default::default()
+                },
+            },
+            // `apply_scan_policies` (Stage 2) — `resolve_scope`'s
+            // repository-name lookup. This stage does not refuse such a
+            // bundle, it PANICS on it, which no boot path can park on; the
+            // pre-write reference rule
+            // (`push_scan_policy_scope_reference_errors`) is what keeps the
+            // panic unreachable from operator config.
+            Case {
+                what: "apply_scan_policies / resolve_scope repository name",
+                desired: DesiredState {
+                    scan_policies: vec![scoped_scan_policy_at_a_ghost],
+                    ..Default::default()
+                },
+            },
+            // `apply_exclusions` (Stage 3) — `ExclusionsApplier::resolve_scope`.
+            // Same shape as the scan-policy case above and worse in reach:
+            // that resolver panics on a repository name absent from the
+            // id map, and `validate_exclusion_scope_not_implemented` keeps
+            // it unreachable by refusing EVERY repository scope — so this
+            // case covers both the undeclared name (panic) and a declared
+            // one (which would resolve, and then be refused by
+            // `PolicyUseCase::add_exclusion` from a write-capable stage).
+            Case {
+                what: "apply_exclusions / resolve_scope repository name",
+                desired: DesiredState {
+                    scan_policies: vec![scan_policy_env("p-parent")],
+                    exclusions: vec![exclusion_scoped_at_a_ghost],
+                    ..Default::default()
+                },
+            },
+            // `apply_retention_policies` (Stage 2) — the predicate resolve.
+            Case {
+                what: "apply_retention_policies / predicate resolve",
+                desired: DesiredState {
+                    retention_policies: vec![retention_policy_env_for_apply(
+                        "nonsense",
+                        serde_json::json!({ "NotAPredicate": 1 }),
+                    )],
+                    ..Default::default()
+                },
+            },
+            // `apply_oidc_issuers` — `humantime` parse of the refresh
+            // interval, guarded by the per-spec rule that parses it first.
+            Case {
+                what: "apply_oidc_issuers / jwksRefreshInterval parse",
+                desired: DesiredState {
+                    oidc_issuers: vec![bad_jwks_interval],
+                    ..Default::default()
+                },
+            },
+            // `apply_service_accounts` — the cross-kind issuer FK (row 2,
+            // the pass's dedicated abort).
+            Case {
+                what: "apply_service_accounts / issuer cross-kind FK (row 2)",
+                desired: undeclared_issuer_sa,
+            },
+            // `apply_curation_rules` (Stage 1) —
+            // `build_curation_rule_from_spec`'s
+            // `CurationRuleAction::from_str`, which refuses an action
+            // outside {block, warn, allow} while building the rule. The
+            // mirror is per-spec `validate_curation_rule`. Worth a case
+            // of its own because of WHERE the stage sits: Stage 1 runs
+            // after `apply_claim_mappings`, so a late refusal here
+            // leaves the claim-mapping partition already reconciled.
+            Case {
+                what: "apply_curation_rules / CurationRuleAction::from_str",
+                desired: DesiredState {
+                    curation_rules: vec![rule_env(
+                        "cr-bad-action",
+                        "quarantine",
+                        "left-pad",
+                        "operator rationale",
+                    )],
+                    ..Default::default()
+                },
+            },
+            // `apply_virtual_members` (Stage 3) — the declared-member
+            // key→id resolution (`repositories.find_by_key`), which
+            // fails `NotFound` for a member no envelope declares. The
+            // mirror is cross-document `DanglingVirtualMember`. Stage 3
+            // is after the repository, policy and mapping writes, so
+            // this is the partial-apply shape at its widest.
+            Case {
+                what: "apply_virtual_members / member key resolution",
+                desired: DesiredState {
+                    repositories: vec![virtual_at_a_ghost_member],
+                    ..Default::default()
+                },
+            },
+        ];
+
+        for case in cases {
+            // Secure-default lint config: the grant rows must reject with
+            // zero operator config, which is the posture they ship in.
+            let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
+            let Err(err) = h.uc.preflight_validate(&case.desired, &env_oidc()).await else {
+                panic!(
+                    "`{}` is refused by a write-capable apply stage, so the \
+                     pre-write pass must refuse it too — otherwise an apply \
+                     carrying it writes the earlier stages and only then fails, \
+                     leaving a partial apply with no rollback",
+                    case.what
+                )
+            };
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Validation(_))),
+                "`{}` must surface as a park-eligible Validation error \
+                 (`GitopsBootError::PreflightValidate`), got {err:?}",
+                case.what
+            );
+
+            // And the write path agrees, with nothing written: the pre-write
+            // pass runs first inside `apply`, so no stage is entered.
+            let h2 = build_harness_with_lint_config(crate::lint::LintConfig::default());
+            h2.uc
+                .apply(case.desired.clone(), env_oidc())
+                .await
+                .expect_err("apply must refuse the same bundle");
+            assert!(
+                h2.repos.calls().is_empty()
+                    && h2.claim_mappings.reconcile_call_count() == 0
+                    && h2.grant_repo.reconcile_call_count() == 0
+                    && h2.events.appended().is_empty(),
+                "`{}` must abort before the first write; repo calls {:?}, \
+                 claim-mapping reconciles {}, grant reconciles {}, events {}",
+                case.what,
+                h2.repos.calls(),
+                h2.claim_mappings.reconcile_call_count(),
+                h2.grant_repo.reconcile_call_count(),
+                h2.events.appended().len(),
+            );
+        }
+    }
+
+    /// The acceptance shape for the grant lint: a bundle carrying a grant
+    /// the linter refuses AND a loosening scan policy leaves the policy
+    /// projection unchanged.
+    ///
+    /// Before the grant lint's rejection moved into the pre-write pass, the
+    /// reachable bad state was exactly this: the loosened policy committed
+    /// in Stage 2, the tightening refused in the final stage, and the
+    /// operator's atomic-looking `apply` returning an error with the
+    /// loosening live.
+    #[tokio::test]
+    async fn row8_reject_beside_a_loosening_scan_policy_writes_nothing() {
+        // Loosened on all three axes an operator would notice.
+        let mut loosened = scan_policy_env("relaxed");
+        loosened.spec.enforcement = "record".into();
+        loosened.spec.require_approval = false;
+        loosened.spec.severity_threshold = "critical".into();
+
+        // Positive control: the loosening policy alone applies and lands,
+        // so the "nothing written" assertions below cannot pass vacuously.
+        let control = build_harness_with_lint_config(crate::lint::LintConfig::default());
+        control
+            .uc
+            .apply(
+                DesiredState {
+                    scan_policies: vec![loosened.clone()],
+                    ..Default::default()
+                },
+                env_oidc(),
+            )
+            .await
+            .expect("the loosening policy alone must apply cleanly");
+        assert!(
+            !control.events.appended().is_empty(),
+            "positive control: applying the loosening policy must append the \
+             ScanPolicy event that creates its projection"
+        );
+
+        // A tightening grant the linter refuses (wildcard-repo non-admin),
+        // in the same bundle as the loosening.
+        let desired = DesiredState {
+            scan_policies: vec![loosened],
+            permission_grants: vec![grant_env(
+                "ops-write-everywhere",
+                &["developer", "ops"],
+                "write",
+                None,
+            )],
+            ..Default::default()
+        };
+
+        let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
+        let err =
+            h.uc.apply(desired.clone(), env_oidc())
+                .await
+                .expect_err("the refused grant must fail the whole apply");
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => assert!(
+                msg.contains("wildcard-repo-non-admin"),
+                "the abort must name the rejecting grant rule, got: {msg}"
+            ),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert!(
+            h.events.appended().is_empty(),
+            "the loosening scan policy must NOT have been written — {} event \
+             batch(es) landed",
+            h.events.appended().len()
+        );
+        assert_eq!(h.grant_repo.reconcile_call_count(), 0);
+
+        // The boot preflight reaches the same verdict, so the pod parks.
+        h.uc.preflight_validate(&desired, &env_oidc())
+            .await
+            .expect_err("the boot preflight must refuse the same bundle");
+    }
+
+    /// A row that renders the rule and not the offending object collapses
+    /// its duplicate findings into one sentence per rule.
+    ///
+    /// Two grants trip `single-claim-grant`, so the grant linter reports two
+    /// findings whose messages are byte-identical (the message names the
+    /// rule; the offending grant's identity is deliberately not rendered —
+    /// claim names are operator topology). Joining them verbatim would hand
+    /// the operator the same sentence twice and say nothing more; the
+    /// `RowAbort::DistinctFindings` collapse is what keeps the abort as
+    /// informative as the grant stage's own aggregate message was.
+    #[tokio::test]
+    async fn row8_abort_collapses_duplicate_findings_of_the_same_rule() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("repo-x", "hosted"), repo_env("repo-y", "hosted")],
+            permission_grants: vec![
+                grant_env("solo-x", &["team-alpha"], "read", Some("repo-x")),
+                grant_env("solo-y", &["team-beta"], "read", Some("repo-y")),
+            ],
+            ..Default::default()
+        };
+        let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
+        let err =
+            h.uc.preflight_validate(&desired, &env_oidc())
+                .await
+                .expect_err("two single-claim grants must be refused");
+        let AppError::Domain(DomainError::Validation(msg)) = err else {
+            panic!("expected Validation, got {err:?}")
+        };
+        assert_eq!(
+            msg.matches("single-claim-grant").count(),
+            1,
+            "the rule must be named once, not once per offending grant: {msg}"
+        );
+
+        // Counter-assertion: a bundle tripping TWO DIFFERENT grant rules
+        // names both, so the collapse is a dedupe and not a truncation.
+        let two_rules = DesiredState {
+            permission_grants: vec![
+                grant_env("solo", &["team-alpha"], "read", None),
+                user_grant_env("god", Uuid::new_v4(), "admin", None),
+            ],
+            ..Default::default()
+        };
+        let h2 = build_harness_with_lint_config(crate::lint::LintConfig::default());
+        let err2 = h2
+            .uc
+            .preflight_validate(&two_rules, &env_oidc())
+            .await
+            .expect_err("both grants must be refused");
+        let AppError::Domain(DomainError::Validation(msg2)) = err2 else {
+            panic!("expected Validation, got {err2:?}")
+        };
+        for rule in [
+            "single-claim-grant",
+            "wildcard-repo-non-admin",
+            "direct-user-grant-without-justification",
+        ] {
+            assert!(
+                msg2.contains(rule),
+                "the abort must name every rejecting rule; `{rule}` missing from: {msg2}"
+            );
+        }
+    }
+    /// The grant lint's `hort_apply_config_linter_total` emission is
+    /// unchanged by the move: it is the grant stage's own, over the
+    /// port-built desired set, and the validator emits none.
+    ///
+    /// Two halves, and both are load-bearing. On a CLEAN apply the stage
+    /// still evaluates every (grant, rule) pair and still ticks the
+    /// counter — the pre-write pass running the same rules metric-free did
+    /// not move or duplicate that series. On a REFUSED apply the pass
+    /// aborts first, so no series is emitted at all: the rejection is
+    /// reported by the `Validation` error (and, at boot,
+    /// `hort_gitops_apply_total{result="validation_error"}`), not by a
+    /// per-rule counter. That is the deliberate trade of rejecting before
+    /// the first write rather than after it.
+    #[test]
+    fn row8_apply_path_metric_emission_is_unchanged() {
+        use crate::metrics::capture_metrics;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        // Clean: a multi-claim repo-scoped grant passes every rule.
+        let clean = capture_metrics(|| {
+            let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
+            runtime.block_on(async {
+                h.uc.apply(
+                    DesiredState {
+                        repositories: vec![repo_env("repo-x", "hosted")],
+                        permission_grants: vec![grant_env(
+                            "scoped",
+                            &["developer", "team-alpha"],
+                            "write",
+                            Some("repo-x"),
+                        )],
+                        ..Default::default()
+                    },
+                    env_oidc(),
+                )
+                .await
+                .expect("the clean bundle must apply");
+            });
+        });
+        let clean_entries = clean.into_vec();
+        assert_eq!(
+            counter_value_for(
+                &clean_entries,
+                "hort_apply_config_linter_total",
+                &[("rule", "single-claim-grant"), ("result", "pass")],
+            ),
+            1,
+            "the grant stage's per-(grant, rule) emission over the port-built \
+             set must be untouched by the pre-write pass"
+        );
+
+        // Refused: the pre-write pass aborts, so the grant stage — and its
+        // emission — is never reached.
+        let refused = capture_metrics(|| {
+            let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
+            runtime.block_on(async {
+                h.uc.apply(
+                    DesiredState {
+                        permission_grants: vec![grant_env(
+                            "everywhere",
+                            &["developer", "ops"],
+                            "write",
+                            None,
+                        )],
+                        ..Default::default()
+                    },
+                    env_oidc(),
+                )
+                .await
+                .expect_err("the refused bundle must fail the apply");
+            });
+        });
+        let refused_entries = refused.into_vec();
+        assert_eq!(
+            counter_value_for(
+                &refused_entries,
+                "hort_apply_config_linter_total",
+                &[("rule", "wildcard-repo-non-admin"), ("result", "reject")],
+            ),
+            0,
+            "a bundle refused before the first write emits no grant-linter \
+             series: the validator is metric-free by design (the offline \
+             `validate-config` path must invent no series) and the stage that \
+             owns the emission is never reached"
+        );
     }
 
     /// Apply-path metric byte-identity — rows 5 and 6 each tick
@@ -6756,8 +8509,8 @@ mod tests {
                     .map(str::to_string)
                     .collect(),
                 provenance_identities,
-                max_artifact_age: Some("90d".into()),
-                license_policy: serde_json::json!({"allowed": ["MIT"]}),
+                max_artifact_age: None,
+                license_policy: serde_json::Value::Null,
                 scan_backends: vec!["trivy".to_string()],
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
@@ -6789,8 +8542,8 @@ mod tests {
                     .map(str::to_string)
                     .collect(),
                 provenance_identities,
-                max_artifact_age: Some("90d".into()),
-                license_policy: serde_json::json!({"allowed": ["MIT"]}),
+                max_artifact_age: None,
+                license_policy: serde_json::Value::Null,
                 scan_backends: vec!["trivy".to_string()],
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
@@ -7241,8 +8994,8 @@ mod tests {
                 provenance_mode: "verify_if_present".into(),
                 provenance_backends: vec!["cosign".to_string()],
                 provenance_identities: Vec::new(),
-                max_artifact_age: Some("90d".into()),
-                license_policy: serde_json::json!({"allowed": ["MIT"]}),
+                max_artifact_age: None,
+                license_policy: serde_json::Value::Null,
                 scan_backends: backends.into_iter().map(str::to_string).collect(),
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),

@@ -23,7 +23,10 @@ use crate::metrics::{
     emit_policy_evaluation, emit_policy_violations, policy_decision_point, PolicyEvaluationResult,
 };
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
-use crate::use_cases::{read_expected_version, scan_history, CallerPrivileges};
+use crate::use_cases::{
+    read_unpaired_append_version, scan_history, ArtifactAtVersion, CallerPrivileges, OverCapStream,
+    UnpairedAppend,
+};
 
 /// Application use case for artifact promotion operations.
 ///
@@ -88,8 +91,18 @@ impl PromotionUseCase {
         let correlation_id = Uuid::new_v4();
         let stream_id = StreamId::artifact(artifact_id);
 
-        let artifact = self.artifacts.find_by_id(artifact_id).await?;
-        if !artifact.is_promotable() {
+        // The promotability gate is a decision derived from the loaded
+        // artifact, and the two repository lookups below sit between it
+        // and the append — so the version is paired with the load rather
+        // than read after them.
+        let paired = ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Refuse,
+        )
+        .await?;
+        if !paired.artifact().is_promotable() {
             // Caller-reachable state precondition (operator requests
             // promotion of a quarantined/rejected artifact) → InvalidState
             // (HTTP 409), NOT Invariant (HTTP 500). ADR 0025.
@@ -102,7 +115,7 @@ impl PromotionUseCase {
         self.repositories.find_by_id(source_repo_id).await?;
         self.repositories.find_by_id(target_repo_id).await?;
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, true).await?;
+        let expected_version = paired.expected_version();
 
         self.events
             .append(AppendEvents {
@@ -134,7 +147,11 @@ impl PromotionUseCase {
     /// Steps:
     /// 1. `privileges.require_write_access(target_repo_id)` — the
     ///    caller must have write access to the destination.
-    /// 2. Load the artifact and assert
+    /// 2. Pair the artifact load with its stream version and evidence
+    ///    ([`ArtifactAtVersion`](crate::use_cases::ArtifactAtVersion) —
+    ///    the promotion verdict is derived from both and committed behind
+    ///    an optimistic append, so the two may not be read separately),
+    ///    then assert
     ///    [`Artifact::is_promotable`](hort_domain::entities::artifact::Artifact::is_promotable)
     ///    (quarantine invariant 4 — must be `Released`).
     /// 3. Load the target repository (validates existence; the entity
@@ -145,8 +162,8 @@ impl PromotionUseCase {
     ///    wins over global) — same algorithm as `QuarantineUseCase`.
     /// 5. Load exclusions for the resolved policy (empty when no
     ///    policy resolved).
-    /// 6. Read the artifact's most recent `ScanCompleted` payload via
-    ///    [`scan_history::read_last_scan_completed`]. `None` is the
+    /// 6. Take the most recent `ScanCompleted` payload off the paired
+    ///    stream via [`scan_history::last_scan_completed`]. `None` is the
     ///    clean-baseline fast path; the evaluator handles it.
     /// 7. Call
     ///    [`evaluate_promotion`](hort_domain::policy::evaluate_promotion)
@@ -189,7 +206,20 @@ impl PromotionUseCase {
         let correlation_id = Uuid::new_v4();
         let actor_envelope = Actor::Api(actor);
 
-        let artifact = self.artifacts.find_by_id(artifact_id).await?;
+        // Pair the load with the stream version and the scan evidence:
+        // the promotion verdict below is derived from both, and the
+        // target-repo + policy + exclusion-set resolution between them is
+        // exactly the window in which a scan verdict can commit. Read the
+        // version after that and the promotion append would not conflict
+        // with it.
+        let paired = ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Tolerate,
+        )
+        .await?;
+        let artifact = paired.artifact();
         if !artifact.is_promotable() {
             tracing::info!(
                 artifact_id = %artifact_id,
@@ -218,12 +248,11 @@ impl PromotionUseCase {
             None => Vec::new(),
         };
 
-        let last_scan_summary = scan_history::read_last_scan_completed(&*self.events, artifact_id)
-            .await?
-            .map(|s| s.summary);
+        let last_scan_summary =
+            scan_history::last_scan_completed(paired.evidence()?).map(|s| s.summary);
 
         let outcome = evaluate_promotion(
-            &artifact,
+            artifact,
             &target_repo,
             policy.as_ref(),
             last_scan_summary.as_ref(),
@@ -236,9 +265,10 @@ impl PromotionUseCase {
             .map(|p| p.policy_id)
             .unwrap_or_else(Uuid::nil);
 
-        // Read the expected version once for the atomic append. The
-        // event-store enforces optimistic concurrency on the call.
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
+        // The version the pairing above fixed. Carrying it is what makes
+        // a scan verdict committed since then fail this append rather
+        // than be overwritten by a promotion decided without it.
+        let expected_version = paired.expected_version();
 
         match outcome {
             PromotionOutcome::Allow => {
@@ -258,7 +288,7 @@ impl PromotionUseCase {
 
                 self.lifecycle
                     .commit_transition(
-                        &artifact,
+                        artifact,
                         AppendEvents {
                             stream_id,
                             expected_version,
@@ -306,7 +336,7 @@ impl PromotionUseCase {
 
                 self.lifecycle
                     .commit_transition(
-                        &artifact,
+                        artifact,
                         AppendEvents {
                             stream_id,
                             expected_version,
@@ -468,7 +498,13 @@ impl PromotionUseCase {
         let stream_id = StreamId::artifact(artifact_id);
         let correlation_id = Uuid::new_v4();
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
+        let expected_version = read_unpaired_append_version(
+            &*self.events,
+            &stream_id,
+            false,
+            UnpairedAppend::CallerSuppliedPayload,
+        )
+        .await?;
 
         let mut events_to_append = vec![EventToAppend::new(DomainEvent::ApprovalDecided(
             ApprovalDecided {
@@ -541,7 +577,13 @@ impl PromotionUseCase {
         let stream_id = StreamId::artifact(artifact_id);
         let correlation_id = Uuid::new_v4();
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
+        let expected_version = read_unpaired_append_version(
+            &*self.events,
+            &stream_id,
+            false,
+            UnpairedAppend::CallerSuppliedPayload,
+        )
+        .await?;
 
         self.events
             .append(AppendEvents {
@@ -842,6 +884,52 @@ mod tests {
         let evs = &transitions[0].1.events;
         assert!(matches!(&evs[0].event, DomainEvent::PolicyEvaluated(_)));
         assert!(matches!(&evs[1].event, DomainEvent::ArtifactPromoted(_)));
+    }
+
+    /// An over-cap stream refuses the promotion. The verdict rests on the
+    /// latest `ScanCompleted`, which is read off the paired evidence; the
+    /// oldest prefix of a breached stream would hand back a superseded
+    /// scan while looking like the current one, so no decision is derived
+    /// from it.
+    #[tokio::test]
+    async fn evaluate_and_promote_refuses_a_stream_past_the_event_cap() {
+        let (uc, artifacts, repos, events, lifecycle, _policies) = make_use_case();
+        let artifact = sample_artifact(QuarantineStatus::None);
+        let target = sample_repository();
+        let artifact_id = artifact.id;
+        let target_id = target.id;
+        artifacts.insert(artifact);
+        repos.insert(target);
+
+        let stream_id = StreamId::artifact(artifact_id);
+        let over_cap: Vec<_> = (0..201)
+            .map(|i| dummy_persisted_with_event(&stream_id, i, dummy_scan_requested(artifact_id)))
+            .collect();
+        events.set_stream(&stream_id, over_cap);
+
+        let privs = write_privileges(vec![target_id]);
+        let err = uc
+            .evaluate_and_promote(artifact_id, Uuid::new_v4(), target_id, api_actor(), privs)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("200-event cap"),
+            "the refusal must name the cap it is enforcing; got {err}"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "no promotion is committed from a scan summary that may be superseded"
+        );
+    }
+
+    /// Filler for an over-cap stream: any event the promotion gate does
+    /// not read.
+    fn dummy_scan_requested(artifact_id: Uuid) -> DomainEvent {
+        DomainEvent::ScanRequested(hort_domain::events::ScanRequested {
+            artifact_id,
+            scanner: "trivy".into(),
+        })
     }
 
     // -- evaluate_and_promote: Warn path --------------------------------------

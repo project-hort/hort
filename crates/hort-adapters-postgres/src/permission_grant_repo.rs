@@ -129,13 +129,13 @@ pub(crate) fn subject_to_columns(subject: &GrantSubject) -> (Option<Vec<String>>
 }
 
 /// Owned column projection of a managed [`PermissionGrant`], built
-/// before the `save_managed` transaction opens so the future borrows
+/// before the reconcile transaction opens so the future borrows
 /// nothing from `items`. Named struct (not a 6-tuple) to keep the
 /// reconcile INSERT loop readable and to satisfy
 /// `clippy::type_complexity` — behaviour is identical to the prior
 /// tuple form. `required_claims` XOR `user_id` is non-NULL (mirrors the
 /// `subject_exclusive` CHECK; see [`subject_to_columns`]).
-struct PreparedGrant {
+pub(crate) struct PreparedGrant {
     id: Uuid,
     required_claims: Option<Vec<String>>,
     user_id: Option<Uuid>,
@@ -208,95 +208,99 @@ impl PermissionGrantRepository for PgPermissionGrantRepository {
             rows.iter().map(row_to_grant).collect()
         })
     }
+}
 
-    fn save_managed(&self, items: &[PermissionGrant]) -> BoxFuture<'_, DomainResult<()>> {
-        // Project to owned column tuples up front so the future owns no
-        // borrow of `items`. Every element must carry a digest — a
-        // managed grant without one violates the
-        // `managed_by_digest IS NOT NULL` shape the diff layer relies
-        // on; surface it before touching the DB.
-        let prepared: DomainResult<Vec<PreparedGrant>> = items
-            .iter()
-            .map(|g| {
-                let (required_claims, user_id) = subject_to_columns(&g.subject);
-                let digest = g.managed_by_digest.ok_or_else(|| {
-                    DomainError::Invariant(format!(
-                        "save_managed requires managed_by_digest on grant {}",
-                        g.id
-                    ))
-                })?;
-                Ok(PreparedGrant {
-                    id: g.id,
-                    required_claims,
-                    user_id,
-                    permission: g.permission.to_string(),
-                    repository_id: g.repository_id,
-                    digest: digest.to_vec(),
-                })
+// ---------------------------------------------------------------------------
+// In-transaction reconcile — shared with the authority lifecycle adapter
+// ---------------------------------------------------------------------------
+
+/// Project a managed grant set to its owned column tuples, rejecting any
+/// element missing a digest **before** a transaction is opened.
+///
+/// A managed grant without a digest violates the
+/// `managed_by_digest IS NOT NULL` shape the apply diff relies on, so it
+/// is surfaced before the DB is touched.
+pub(crate) fn prepare_managed_grants(
+    items: &[PermissionGrant],
+) -> DomainResult<Vec<PreparedGrant>> {
+    items
+        .iter()
+        .map(|g| {
+            let (required_claims, user_id) = subject_to_columns(&g.subject);
+            let digest = g.managed_by_digest.ok_or_else(|| {
+                DomainError::Invariant(format!(
+                    "a managed grant requires managed_by_digest, grant {} has none",
+                    g.id
+                ))
+            })?;
+            Ok(PreparedGrant {
+                id: g.id,
+                required_claims,
+                user_id,
+                permission: g.permission.to_string(),
+                repository_id: g.repository_id,
+                digest: digest.to_vec(),
             })
-            .collect();
-        Box::pin(async move {
-            let prepared = prepared?;
-            tracing::info!(
-                entity = "permission_grant",
-                count = prepared.len(),
-                "save_managed full reconcile (gitops apply)"
-            );
-
-            // `save_managed` reconciles the ENTIRE `managed_by = 'gitops'`
-            // partition to `items` in a single transaction.
-            // Delete-absent + upsert-present over a content-keyed
-            // partition is realised as delete-all-gitops + insert-present:
-            // every row absent from `items` is removed (revoke), every
-            // row present is (re)written (the surrogate PK is not the
-            // gitops identity — the diff keys off the subject-dependent
-            // tuple, never the PK — so a rewrite is not churn).
-            // `managed_by = 'local'` rows are never in scope. The DELETE
-            // + INSERTs share one tx so a failure rolls the partition back
-            // to its prior state unchanged; there is no window where the
-            // partition is partially applied.
-            let mut tx = self.pool.begin().await.map_err(|e| {
-                tracing::warn!(error = %e, "begin tx for permission_grants save_managed");
-                map_sqlx_error(&e, "PermissionGrant", "save_managed:begin")
-            })?;
-
-            sqlx::query("DELETE FROM permission_grants WHERE managed_by = 'gitops'")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "delete gitops-managed grants");
-                    map_sqlx_error(&e, "PermissionGrant", "save_managed:delete")
-                })?;
-
-            for g in &prepared {
-                sqlx::query(
-                    r#"INSERT INTO permission_grants
-                           (id, required_claims, user_id, permission,
-                            repository_id, managed_by, managed_by_digest)
-                       VALUES ($1, $2, $3, $4::permission_type,
-                               $5, 'gitops', $6)"#,
-                )
-                .bind(g.id)
-                .bind(&g.required_claims)
-                .bind(g.user_id)
-                .bind(&g.permission)
-                .bind(g.repository_id)
-                .bind(&g.digest)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    tracing::warn!(grant_id = %g.id, error = %e, "insert gitops grant");
-                    map_sqlx_error(&e, "PermissionGrant", &g.id.to_string())
-                })?;
-            }
-
-            tx.commit().await.map_err(|e| {
-                tracing::warn!(error = %e, "commit permission_grants save_managed");
-                map_sqlx_error(&e, "PermissionGrant", "save_managed:commit")
-            })?;
-            Ok(())
         })
+        .collect()
+}
+
+/// Reconcile the ENTIRE `managed_by = 'gitops'` partition to `prepared`
+/// on the caller's open transaction.
+///
+/// Delete-absent + upsert-present over a content-keyed partition is
+/// realised as delete-all-gitops + insert-present: every row absent from
+/// `prepared` is removed (revoke), every row present is (re)written (the
+/// surrogate PK is not the gitops identity — the diff keys off the
+/// subject-dependent tuple, never the PK — so a rewrite is not churn).
+/// `managed_by = 'local'` rows are never in scope.
+///
+/// The DELETE + INSERTs are one statement group, so there is no window
+/// in which the partition is partially applied. The caller owns the
+/// transaction boundary, which is what lets the audit append join the
+/// same transaction
+/// (`crate::authority_lifecycle::PgAuthorityLifecycle`); a failure on
+/// either side rolls the partition back to its prior state unchanged.
+pub(crate) async fn reconcile_managed_grants_in_tx(
+    conn: &mut sqlx::PgConnection,
+    prepared: &[PreparedGrant],
+) -> DomainResult<()> {
+    tracing::info!(
+        entity = "permission_grant",
+        count = prepared.len(),
+        "managed-partition full reconcile (gitops apply)"
+    );
+
+    sqlx::query("DELETE FROM permission_grants WHERE managed_by = 'gitops'")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "delete gitops-managed grants");
+            map_sqlx_error(&e, "PermissionGrant", "reconcile_managed:delete")
+        })?;
+
+    for g in prepared {
+        sqlx::query(
+            r#"INSERT INTO permission_grants
+                   (id, required_claims, user_id, permission,
+                    repository_id, managed_by, managed_by_digest)
+               VALUES ($1, $2, $3, $4::permission_type,
+                       $5, 'gitops', $6)"#,
+        )
+        .bind(g.id)
+        .bind(&g.required_claims)
+        .bind(g.user_id)
+        .bind(&g.permission)
+        .bind(g.repository_id)
+        .bind(&g.digest)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::warn!(grant_id = %g.id, error = %e, "insert gitops grant");
+            map_sqlx_error(&e, "PermissionGrant", &g.id.to_string())
+        })?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -314,10 +318,9 @@ mod tests {
     // honour that same single-flight contract. `#[serial(hort_pg_db)]`
     // is one shared key across *every* DB-backed test in this crate;
     // it keeps them from running concurrently with each other (other
-    // crates stay parallel). Without it, `save_managed`'s global
-    // gitops-partition reconcile (and other global-scope reads) race
-    // sibling tests under `cargo test --lib`.
-    use serial_test::serial;
+    // crates stay parallel). Without it, the global gitops-partition
+    // reconcile (and other global-scope reads) race sibling tests under
+    // `cargo test --lib`.
 
     // -- Permission parsing ------------------------------------------------
 
@@ -513,228 +516,5 @@ mod tests {
         let pool = PgPool::connect_lazy("postgres://localhost/nonexistent")
             .expect("connect_lazy validates only the URL, not connectivity");
         let _ = PgPermissionGrantRepository::new(pool);
-    }
-
-    // -- DB-backed integration tests (skipped when DATABASE_URL unset) ------
-
-    use std::env;
-
-    async fn maybe_pool() -> Option<PgPool> {
-        let url = env::var("DATABASE_URL").ok()?;
-        let pool = crate::test_support::isolated_db_from(&url).await?;
-        crate::test_support::migrate_or_panic(&pool).await;
-        Some(pool)
-    }
-
-    fn managed_claims_grant(id: Uuid, repo: Option<Uuid>) -> PermissionGrant {
-        PermissionGrant {
-            id,
-            subject: GrantSubject::Claims(vec!["developer".into(), "team-alpha".into()]),
-            repository_id: repo,
-            permission: Permission::Write,
-            managed_by: ManagedBy::GitOps,
-            managed_by_digest: Some([0x11; 32]),
-            created_at: Utc::now(),
-        }
-    }
-
-    // `save_managed` is the authoritative-set reconcile primitive
-    // (delete-absent + upsert-present over the gitops partition, one
-    // transaction). The DB-backed tests below pin the full-reconcile
-    // semantic. They are deferred-execution: no `DATABASE_URL` here →
-    // `maybe_pool` returns `None` and they early-return.
-
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn save_managed_round_trips_claims_and_is_idempotent() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        let repo = PgPermissionGrantRepository::new(pool.clone());
-        let grant = managed_claims_grant(Uuid::new_v4(), None);
-        repo.save_managed(std::slice::from_ref(&grant))
-            .await
-            .expect("save_managed");
-        // Idempotent re-application of the same complete set — upsert
-        // on the subject-dependent key, no churn.
-        repo.save_managed(std::slice::from_ref(&grant))
-            .await
-            .expect("save_managed again (idempotent)");
-
-        let listed = repo.list_all().await.expect("list_all");
-        let found = listed
-            .iter()
-            .find(|g| g.subject == grant.subject && g.permission == Permission::Write)
-            .expect("claims grant present");
-        assert_eq!(
-            found.subject,
-            GrantSubject::Claims(vec!["developer".into(), "team-alpha".into()])
-        );
-
-        let managed = repo
-            .list_managed_by_gitops()
-            .await
-            .expect("list_managed_by_gitops");
-        assert_eq!(
-            managed
-                .iter()
-                .filter(|g| g.subject == grant.subject)
-                .count(),
-            1,
-            "idempotent re-apply must not duplicate the managed row"
-        );
-    }
-
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn save_managed_full_reconcile_deletes_absent_managed_rows() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        let repo = PgPermissionGrantRepository::new(pool.clone());
-
-        // First apply: two distinct claims grants.
-        let g_a = PermissionGrant {
-            id: Uuid::new_v4(),
-            subject: GrantSubject::Claims(vec!["alpha".into()]),
-            repository_id: None,
-            permission: Permission::Read,
-            managed_by: ManagedBy::GitOps,
-            managed_by_digest: Some([0x01; 32]),
-            created_at: Utc::now(),
-        };
-        let g_b = PermissionGrant {
-            id: Uuid::new_v4(),
-            subject: GrantSubject::Claims(vec!["beta".into()]),
-            repository_id: None,
-            permission: Permission::Read,
-            managed_by: ManagedBy::GitOps,
-            managed_by_digest: Some([0x02; 32]),
-            created_at: Utc::now(),
-        };
-        repo.save_managed(&[g_a.clone(), g_b.clone()])
-            .await
-            .expect("first apply");
-
-        // Second apply: only g_a — g_b must be revoked (delete-absent).
-        repo.save_managed(std::slice::from_ref(&g_a))
-            .await
-            .expect("reconcile to {g_a}");
-
-        let managed = repo
-            .list_managed_by_gitops()
-            .await
-            .expect("list_managed_by_gitops");
-        assert!(
-            managed.iter().any(|g| g.subject == g_a.subject),
-            "g_a survives the reconcile"
-        );
-        assert!(
-            !managed.iter().any(|g| g.subject == g_b.subject),
-            "g_b absent from the new set must be deleted (save_managed IS the revoke primitive)"
-        );
-    }
-
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn save_managed_empty_set_revokes_all_gitops_grants() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        let repo = PgPermissionGrantRepository::new(pool.clone());
-        let grant = managed_claims_grant(Uuid::new_v4(), None);
-        repo.save_managed(std::slice::from_ref(&grant))
-            .await
-            .expect("seed one grant");
-
-        // An explicitly-emptied gitops config revokes everything.
-        repo.save_managed(&[]).await.expect("reconcile to empty");
-
-        let managed = repo
-            .list_managed_by_gitops()
-            .await
-            .expect("list_managed_by_gitops");
-        assert!(
-            !managed.iter().any(|g| g.subject == grant.subject),
-            "empty authoritative set revokes all gitops-managed grants"
-        );
-    }
-
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn save_managed_does_not_touch_local_rows() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        // A non-gitops (Local/admin-created) row must survive a gitops
-        // reconcile — the partition boundary is `managed_by = gitops`.
-        let local_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO permission_grants \
-               (id, required_claims, permission, managed_by) \
-             VALUES ($1, ARRAY['local-only'], 'read'::permission_type, 'local')",
-        )
-        .bind(local_id)
-        .execute(&pool)
-        .await
-        .expect("insert local grant");
-
-        let repo = PgPermissionGrantRepository::new(pool.clone());
-        // Reconcile gitops partition to empty.
-        repo.save_managed(&[])
-            .await
-            .expect("reconcile gitops empty");
-
-        let all = repo.list_all().await.expect("list_all");
-        assert!(
-            all.iter().any(|g| matches!(
-                &g.subject,
-                GrantSubject::Claims(c) if c == &vec!["local-only".to_string()]
-            )),
-            "Local row must survive a gitops-partition reconcile"
-        );
-    }
-
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn save_managed_round_trips_user_subject() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        // A User-subject grant needs a real users row (FK).
-        let uid = Uuid::new_v4();
-        let uname = format!("sa-{}", uid.simple());
-        sqlx::query(
-            "INSERT INTO users (id, username, email, auth_provider, is_service_account) \
-             VALUES ($1, $2, $3, 'local', true)",
-        )
-        .bind(uid)
-        .bind(&uname)
-        .bind(format!("{uname}@example.test"))
-        .execute(&pool)
-        .await
-        .expect("insert backing user");
-
-        let repo = PgPermissionGrantRepository::new(pool.clone());
-        let grant = PermissionGrant {
-            id: Uuid::new_v4(),
-            subject: GrantSubject::User(uid),
-            repository_id: None,
-            permission: Permission::Read,
-            managed_by: ManagedBy::GitOps,
-            managed_by_digest: Some([0x22; 32]),
-            created_at: Utc::now(),
-        };
-        repo.save_managed(std::slice::from_ref(&grant))
-            .await
-            .expect("save_managed");
-
-        let listed = repo.list_all().await.expect("list_all");
-        let found = listed
-            .iter()
-            .find(|g| g.subject == GrantSubject::User(uid))
-            .expect("user grant present");
-        assert_eq!(found.permission, Permission::Read);
-        assert!(found.repository_id.is_none());
     }
 }

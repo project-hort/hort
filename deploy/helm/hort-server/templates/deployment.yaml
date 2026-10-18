@@ -214,8 +214,13 @@ spec:
                      float64 number coercion, so there is no scientific-notation
                      path; the binary parses the suffix. Keep it a quoted string;
                      do NOT convert to a bare integer. An empty value leaves the
-                     env var unset (binary default, 300 MiB); an explicit "0"
-                     is the refuse-all-publishes kill-switch. */}}
+                     env var unset (binary default, 300 MiB). A size applies to
+                     npm, PyPI and Maven; cargo keeps its own fixed 200 MiB
+                     ceiling and the OCI push path takes no ceiling from it. An
+                     explicit "0" is the refuse-all-publishes kill-switch and
+                     closes every publish surface — all four hosted formats plus
+                     OCI push — with 503 and no Retry-After, leaving reads and
+                     deletions working. */}}
               value: {{ .Values.http.publishBodyMaxSize | quote }}
             {{- end }}
             # ----- Upstream proxy storage backstops -----

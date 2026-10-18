@@ -70,15 +70,37 @@ pub struct ScanPolicySpec {
     pub provenance_identities: Vec<SignerIdentitySpec>,
     /// Optional humantime duration. `None` when omitted from the
     /// YAML — the evaluator treats this as "no age cap".
+    ///
+    /// **`None` is the only value apply accepts.** Any declared
+    /// duration is rejected by
+    /// [`validate_scan_policy_max_artifact_age_not_implemented`](crate::desired::validate_scan_policy_max_artifact_age_not_implemented):
+    /// the cap is projected, event-sourced and persisted while the age
+    /// evaluator (`hort_domain::policy::evaluate_age_gates`) has no
+    /// caller on any scan, release or retention path, so no artifact is
+    /// ever flagged for age (ADR 0015). The field stays in the schema
+    /// for the enforcement iteration that wires that evaluator in; the
+    /// rejection is deleted then. The humantime format check below
+    /// stays either way, so a malformed duration remains a per-envelope
+    /// error rather than being shadowed by the rejection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_artifact_age: Option<String>,
     /// Operator-supplied JSON object describing license rules. Passed
     /// through to the evaluator without inspection — the schema is
     /// owned by the policy evaluator, not by this layer. Optional;
     /// when omitted, defaults to `Value::Null`, which the evaluator's
-    /// `has_license_policy` short-circuits as "no policy declared". The
+    /// [`has_license_policy`](hort_domain::policy::has_license_policy)
+    /// short-circuits as "no policy declared". The
     /// asymmetry with `max_artifact_age` was a wire-schema bug — both
     /// fields are functionally opt-in and should be omittable.
+    ///
+    /// **`Value::Null` and `{}` are the only values apply accepts.**
+    /// Anything richer is rejected by
+    /// [`validate_scan_policy_license_policy_not_implemented`](crate::desired::validate_scan_policy_license_policy_not_implemented):
+    /// the scan path evaluates the policy against an empty licence list,
+    /// so every rule in it matches nothing (ADR 0015). The field stays
+    /// in the schema — and stays opaque — for the enforcement iteration
+    /// that surfaces licences through a port; the rejection is deleted
+    /// in the same commit as that work.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub license_policy: serde_json::Value,
     /// Names of the scanner backends invoked per scan. Each entry must
@@ -181,7 +203,7 @@ pub fn parse_scan_policy(
     _path: &Path,
     bytes: &[u8],
 ) -> Result<Envelope<ScanPolicySpec>, ParseError> {
-    let env: Envelope<ScanPolicySpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<ScanPolicySpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::ScanPolicy {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),

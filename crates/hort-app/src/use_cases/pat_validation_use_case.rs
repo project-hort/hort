@@ -2685,10 +2685,21 @@ mod tests {
             ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::events::PersistedEvent>>> {
                 Box::pin(async { unreachable!() })
             }
-            fn delete_stream(&self, _s: DStreamId) -> BoxFuture<'_, DomainResult<()>> {
+            fn delete_stream(
+                &self,
+                _s: DStreamId,
+                _authority: hort_domain::ports::event_store::SealAuthority,
+            ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>>
+            {
                 Box::pin(async { unreachable!() })
             }
-            fn archive_stream(&self, _s: DStreamId, _t: &str) -> BoxFuture<'_, DomainResult<()>> {
+            fn archive_stream(
+                &self,
+                _s: DStreamId,
+                _t: &str,
+                _authority: hort_domain::ports::event_store::SealAuthority,
+            ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>>
+            {
                 Box::pin(async { unreachable!() })
             }
         }

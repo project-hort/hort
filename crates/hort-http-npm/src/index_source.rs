@@ -483,17 +483,20 @@ impl IndexSource for ProxyNpmSource {
             }
         };
 
-        // Per-version status hydration — used by
-        // `NonServableStatusFilter` + `IndexModeFilter`. A status-query
-        // failure degrades to "no status known".
+        // Per-version status hydration — the input
+        // `NonServableStatusFilter` + `IndexModeFilter` decide on.
+        //
+        // Propagated, never degraded. "No status known" is not a
+        // weaker version of the truth here, it is a different claim:
+        // under `IncludePending` the filters drop only versions hort
+        // KNOWS are non-servable, so an empty status map re-advertises
+        // every quarantined, rejected and scan-indeterminate version
+        // of this package. A read that cannot say what hort holds
+        // cannot be answered safely, so the serve fails instead.
         let pkg_status = ctx
             .artifact_use_case
             .package_version_status(repo.id, package_name)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "npm proxy source: package_version_status failed; degrading to no status");
-                Vec::new()
-            });
+            .await?;
 
         // Fire the prefetch trigger on every successful fetch
         // (fresh-cache-hit, upstream success, and stale-while-error

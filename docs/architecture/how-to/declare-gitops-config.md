@@ -168,6 +168,17 @@ members is rejected — keep the gitops surface self-contained, or keep the
 virtual itself `Local`. A member that is itself `type: virtual` is rejected
 (no nested virtuals in v1).
 
+**Every member must declare the virtual's own `format`.** A member on
+another format is an apply-time rejection
+(`virtual_member_format_not_enforced`): there is no
+format-compatibility model — neither apply nor serve-time member
+resolution compared the two — so such a member is resolved for the
+virtual's format regardless, and a non-proxy one additionally **owns**
+the names it holds there (the pinning rule below), suppressing the
+virtual's other members for every one of them while serving nothing the
+client can install. A cross-format aggregate is one virtual per format,
+not one virtual over several.
+
 > **⚠️ Member order is load-bearing — and repo type is the ownership
 > signal.** `virtualMembers` is an **ordered priority list** (index 0 =
 > highest priority). Two security-critical rules follow, both designed to
@@ -579,11 +590,19 @@ spec:
   provenanceMode: verify_if_present   # optional; off | verify_if_present | required
   negligibleAction: ignore      # optional; ignore | warn | block — informational (unmaintained/unsound) advisory handling; default ignore
   enforcement: reject           # optional; reject | record — what a blocking verdict DOES; default reject
-  maxArtifactAge: 90d           # optional humantime
-  licensePolicy:                # optional JSON; defaults to no license policy when omitted
-    allowed: [Apache-2.0, MIT]
-    denied: [GPL-3.0]
+  # maxArtifactAge: omit it — declaring any cap is an apply-time rejection (not evaluated)
+  licensePolicy: {}             # optional; `{}` or omitted are the only accepted values
 ```
+
+**`scope: { repository: … }` names a repository; it never carries an id.**
+The name is an `ArtifactRepository.metadata.name`, resolved to a UUID by
+the apply pipeline through the same map the `RetentionPolicy` scope
+resolves through — so the same two consequences hold: the repository must
+be declared in the same `$HORT_CONFIG_DIR` (one declared in the *same*
+apply is fine, resolution happens after the repository rows are written),
+and a name that resolves to nothing is a pre-write rejection naming the
+offending value, not a half-applied bundle. A repository UUID is read as
+a name, matches nothing and is rejected.
 
 **What apply emits:**
 - First apply: one `PolicyCreated` event; one row inserted into
@@ -603,6 +622,71 @@ spec:
 
 **Idempotency:** reapply with no YAML change emits zero events and
 no projection writes. The `unchanged` counter ticks instead.
+
+#### `licensePolicy` — apply rejects any declared licence rule
+
+**Licence enforcement is not implemented, and declaring it is now an
+apply-time rejection** (`scan_policy_license_policy_not_implemented`).
+No port surfaces an artifact's licences, so the scan path evaluates the
+policy against an **empty** licence list: a well-formed
+`{denied_licenses: [GPL-3.0], action: Block}` compares its denied set
+against zero licences, produces zero violations, and leaves the scan
+clean whatever the artifact is licensed under. The only thing such a
+value can still produce is a non-blocking `license-policy-shape`
+advisory against a malformed one.
+
+The two accepted values are `{}` and omitting the field — both are the
+evaluator's own "no policy declared" short-circuit, so a tree that never
+claimed licence enforcement applies exactly as before. A different
+*value* does not help; the rejection is about the missing control, not
+the shape:
+
+```text
+ScanPolicy `block-gpl` is invalid: `licensePolicy` enforcement is not implemented
+(the scan path evaluates the policy against an empty licence list, so every rule
+in it matches nothing and the scan stays clean whatever the artifact is licensed
+under). Remove the field — or write `licensePolicy: {}` — to apply; a different
+value does not change this. (scan policy: `block-gpl`)
+```
+
+A projection stored before this rule shipped keeps its value — nothing
+rewrites those rows — and keeps deciding nothing. `hort-server
+validate-config` catches the declaration offline.
+
+#### `maxArtifactAge` — apply rejects any declared staleness cap
+
+**Age enforcement is not implemented, and declaring a cap is an
+apply-time rejection** (`scan_policy_max_artifact_age_not_implemented`).
+The duration is parsed, converted to `max_artifact_age_secs`, diffed
+field-by-field, event-sourced onto the policy stream, persisted and
+written into the config snapshot — and read by nothing that decides. The
+evaluator exists (`hort_domain::policy::evaluate_age_gates`, which would
+raise a `Medium` `max-artifact-age` violation) and has **no production
+caller**: no scan-result evaluation, no release decision and no retention
+pass ever asks the question, so no artifact is ever flagged for age.
+
+Unlike `licensePolicy` there is no accepted *value*: the field is an
+optional duration whose absence the evaluator reads as "no cap", so
+omitting it is the only inert state, and `0s` is refused exactly like
+`90d` — the rejection is about the missing consumer, not the number:
+
+```text
+ScanPolicy `stale-cap` is invalid: `maxArtifactAge` enforcement is not implemented:
+the cap is stored on the policy and never evaluated (the age evaluator has no
+caller on any scan, release or retention path), so no artifact is ever flagged for
+age however old it is. Remove the field to apply; a different duration does not
+change this. (scan policy: `stale-cap`, declared cap: `90d`)
+```
+
+The humantime format check stays beside the row, so a malformed duration
+is still a row-0 error naming the parse failure. There is no equivalent
+control to reach for instead — the nearest *enforced* age mechanism is a
+`RetentionPolicy` with an `AgeExceeds` predicate, which **deletes** the
+artifact rather than raising a policy violation against it, so it is a
+different decision and not a substitute. A projection stored before this
+rule shipped keeps its `max_artifact_age_secs` and keeps deciding
+nothing. `hort-server validate-config` catches the declaration
+offline.
 
 #### `scanBackends` — apply rejects a backend that cannot analyse the format
 
@@ -652,9 +736,10 @@ validate-config` catches both shapes offline.
 
 #### `enforcement: reject | record` — what a blocking verdict *does*
 
-`severityThreshold`, `licensePolicy` and `negligibleAction` decide
-**which** findings are enforcement-worthy. `enforcement` decides what
-the resulting verdict is allowed to **do**:
+`severityThreshold` and `negligibleAction` decide **which** findings are
+enforcement-worthy. (`licensePolicy` does not: it decides nothing, which
+is why declaring it is an apply-time rejection — see above.)
+`enforcement` decides what the resulting verdict is allowed to **do**:
 
 | Value | The scan | The findings | The verdict | The artifact |
 |---|---|---|---|---|
@@ -762,14 +847,48 @@ spec:
   expiresAt: "2026-12-31T23:59:59Z"   # optional RFC3339
 ```
 
+**`scope: global` is the only accepted value.** A
+`scope: { repository: <name> }` is an apply-time rejection
+(`exclusion_scope_not_implemented`), and so is the same shape issued
+through `POST /api/v1/admin/policies/:id/exclusions`. The reason is not
+the reference but the field: the finding filter never reads an
+exclusion's scope — the artifact coordinates it matches against carry no
+repository identity — so an exclusion narrowed to one repository
+suppresses its CVE for **every** repository the parent policy governs.
+The operator's edit looks like a narrowing and acts like a widening,
+which is why it fails closed rather than warning:
+
+```text
+Exclusion `cve-on-one-repo` is invalid: `spec.scope` names repository `npm-internal`,
+but a repository-scoped exclusion is not enforced: … Write `scope: global` if clearing
+this CVE everywhere the policy governs is what was meant, or drop the exclusion until
+per-repository scoping is implemented.
+```
+
+To waive a CVE for one repository only, scope the **parent
+`ScanPolicy`** to that repository and hang the exclusion off it — the
+policy scope *is* enforced.
+
+A row stored before this rule shipped keeps its scope; nothing rewrites
+it, and it keeps acting globally. Removing it is not refused anywhere —
+only writing one is. Drop its envelope from the tree and the apply
+removes it as usual; so does
+`DELETE /api/v1/admin/policies/:id/exclusions/:cve`. The removal is the
+direction that *withdraws* an assurance nothing honoured, so there is
+nothing to fail closed about. What it does do is re-reject findings in
+every repository the parent policy governs rather than only the one the
+scope named, and the server logs exactly that — the policy id, the CVE,
+the stored repository id and the rationale — as it removes the row.
+
 **What apply emits:**
 - First apply: one `ExclusionAdded` event on the parent policy's
   stream; one row inserted into `exclusion_projections`. Counters:
   `hort_gitops_events_emitted_total{kind=exclusion,event_type=ExclusionAdded}`.
-- Field edit (scope, reason, expiry): one `ExclusionRemoved` +
+- Field edit (reason, expiry): one `ExclusionRemoved` +
   one `ExclusionAdded` on the same stream — the events crate has
   no `ExclusionUpdated`, and remove-and-add is the canonical update
-  form.
+  form. (The scope is not among the editable fields: only `global` is
+  accepted, so there is nothing to change it to.)
 - YAML removed: one `ExclusionRemoved` event with
   `reason = "removed by gitops apply"`; the projection row is
   deleted.
@@ -920,6 +1039,89 @@ The knob exists for registry-of-registries layouts (it obsoletes
 URL-rewriting sidecars): when one registry mounts another's content
 under a path prefix, the prefix belongs in declarative config, not in
 a proxy rewrite layer.
+
+### `kind: UpstreamMapping` — `spec.allowedRealmHosts`
+
+`spec.allowedRealmHosts: [String]` (default empty) names the hosts that
+may be given this mapping's credential as the `WWW-Authenticate` realm
+of a `bearer_challenge` exchange. **The mapping's own origin is always
+allowed and is never listed.**
+
+```yaml
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: dockerhub-authenticated
+spec:
+  repository: dockerhub-proxy
+  pathPrefix: ""
+  upstreamUrl: https://registry-1.docker.io
+  auth:
+    type: bearer_challenge
+  secretRef:                      # the credential this list guards
+    source: file
+    location: /run/secrets/dockerhub-pat
+  allowedRealmHosts:
+    - auth.docker.io              # Docker Hub's token service
+```
+
+**Why the operator has to answer this.** The realm arrives verbatim in
+the upstream's `WWW-Authenticate` response header, so it is
+upstream-controlled data — and the realm exchange is the one request
+that carries the credential, as
+`Authorization: Basic base64("oauth2:<secret>")`. hort already refuses a
+non-`https` realm and a realm resolving to a non-routable host, but
+those bound *where* the credential may travel, not *to whom*: a
+compromised or hijacked upstream can answer `401` naming any https,
+routable host it likes. Binding the realm silently to the mapping's own
+origin is not available as the fix, because off-origin realms are
+normal — `auth.docker.io` for `registry-1.docker.io`, and a GitLab
+container registry's `/jwt/auth` on its own host. So the allowance is
+the operator's to state.
+
+**It applies only to a credentialed exchange.** The list is consulted
+if and only if the mapping also carries a `secretRef`. An exchange with
+no credential has nothing a nominated realm could receive, so it keeps
+exactly its previous behaviour (the `https` and routability gates
+alone). That is why every anonymous pull-through proxy — including the
+`bearer_challenge` Docker Hub mappings shipped in this repository, whose
+realm is off-origin — needs no entry and is unaffected.
+
+**What breaks on upgrade, and for whom.** A mapping that is **both**
+credentialed **and** has an off-origin realm stops working until that
+realm's host is listed: the fetch fails with
+`hort_upstream_fetch_total{result="parse_error"}` and a server log line
+naming the mapping and the refused realm host. **Authenticated Docker
+Hub is the canonical case** — `registry-1.docker.io` with a PAT, whose
+realm is `auth.docker.io`. The remedy is the one line above:
+`allowedRealmHosts: [auth.docker.io]`. Nothing else changes: an
+anonymous mapping, and a credentialed mapping whose realm is on its own
+origin (most self-hosted registries — Harbor's `/service/token`, Zot, a
+registry serving `/token` itself), are untouched.
+
+**Validation.** Entries are bare hostnames: ASCII letters, digits, `.`
+and `-`, no empty label, no leading or trailing `.` or `-`. A scheme, a
+port, a path or an empty string is rejected at apply-config parse time
+with the accepted form in the message — those shapes could never match
+the host hort compares against, so accepting them would hand you a
+control you wrote and did not get. The field is also rejected on a
+mapping whose `auth.type` is not `bearer_challenge`, because no realm
+exists in those flows for it to govern
+([ADR 0015](../../adr/0015-apply-time-linter-inert-fields-and-naming.md)).
+It is **accepted** on a `bearer_challenge` mapping with no `secretRef`:
+its consumer comes into being the moment you add one, so the allowance
+may be declared first. The schema CHECK constraints
+`chk_repository_upstream_mappings_allowed_realm_hosts` and
+`chk_repository_upstream_mappings_realm_hosts_auth` mirror both rules.
+`hort-server validate-config` catches all of them offline.
+
+**The allowance is for a host, not for whatever that host redirects
+to.** A credentialed exchange at a listed realm runs on a client whose
+redirect policy refuses any hop that leaves the realm's own origin, so a
+listed realm answering `302` to somewhere else cannot carry the
+credential onward.
+
+---
 
 ### `kind: UpstreamMapping` — `spec.trustUpstreamPublishTime`
 
@@ -1663,10 +1865,16 @@ the rule are walked and re-evaluated.
 
 **Asymmetric semantics — this is not optional.** Rule **deletion**
 or **weakening** (Block → Warn → Allow) does NOT auto-unblock
-artifacts that were retroactively rejected. Rejection is sticky;
-admin explicit release via `POST /quarantine/:artifact_id/release`
-is the only way to un-reject (architect-skill quarantine invariant
-3, mirroring scan-driven rejection). The smoke at
+artifacts that were retroactively rejected. Nothing *automatic* reverses
+a rejection: the rule change applies to what is evaluated after it, and
+the already-rejected artifacts stay rejected until a human decides
+otherwise. What a human may do is the curator's manual release, which as
+of ADR 0007's 2026-10-11 amendment reaches a `curation_retroactive`
+rejection — the curator owns that axis, so an authority that may block
+may unblock — with attribution and a justification on the event. A
+corruption tombstone is never reachable that way (architect-skill
+quarantine invariant
+3). The smoke at
 `scripts/host-tests/test-gitops-policies.sh` phase 6c asserts
 this explicitly — a Block→Allow rewrite must produce zero
 `curation_retroactive` metric ticks AND leave previously-rejected

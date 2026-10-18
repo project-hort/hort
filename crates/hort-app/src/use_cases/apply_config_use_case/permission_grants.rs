@@ -3,11 +3,12 @@ use super::*;
 impl ApplyConfigUseCase {
     /// Consolidated PermissionGrant reconcile (ADR 0012).
     ///
-    /// `PermissionGrantRepository::save_managed` reconciles the **entire**
-    /// `managed_by = gitops` partition (atomic delete-absent +
+    /// [`AuthorityLifecyclePort::commit_permission_grants`] reconciles
+    /// the **entire** `managed_by = gitops` partition (delete-absent +
     /// upsert-present, keyed on the subject-dependent identity —
     /// `(sorted required_claims, repository_id, permission)` for
-    /// `Claims`; `(user_id, repository_id, permission)` for `User`).
+    /// `Claims`; `(user_id, repository_id, permission)` for `User`)
+    /// **and** appends the audit batches, in one transaction.
     /// The `PermissionGrant` envelopes are the single authority source
     /// — a `ServiceAccount` envelope materialises no grants (identity +
     /// federation binding only; SA authority is declared as explicit
@@ -27,12 +28,16 @@ impl ApplyConfigUseCase {
     ///    `StreamCategory::Authorization` for a global grant
     ///    (audit-event-per-mutation invariant — there is no `role_id`;
     ///    the subject is the `GrantSubjectRecord` payload);
-    /// 3. `save_managed(&complete_set)` once.
+    /// 3. commit the complete set + every per-stream batch once.
     ///
-    /// Diff-then-emit failure-mode contract preserved:
-    /// a `save_managed` failure aborts the apply before any audit event
-    /// lands; an append failure after a successful save surfaces the
-    /// apply error and the next apply re-runs the (now no-op) diff.
+    /// **Failure mode (changed).** A failure on either side leaves the
+    /// partition **unchanged** — the apply aborts fail-closed instead
+    /// of half-done, and the multi-stream batch list commits as one
+    /// unit (no "some repository streams audited, others not"). Before
+    /// the port, an append failure after a committed row write left
+    /// the grant live with nothing attesting it, and the retry
+    /// could not repair that: the next apply diffs against the
+    /// already-changed rows and emits nothing.
     pub(super) async fn apply_permission_grants(
         &self,
         plan: &KindPlan<PermissionGrantSpec, Uuid>,
@@ -49,7 +54,7 @@ impl ApplyConfigUseCase {
         token: &GitOpsApplyToken,
     ) -> AppResult<()> {
         // Prior gitops-managed grant set, keyed by subject-dependent
-        // identity (the same key `save_managed` upserts on). The
+        // identity (the same key the reconcile upserts on). The
         // surrogate id + digest carry through so re-applies are stable
         // and the audit `grant_id` matches the existing row.
         let prior = self.permission_grants.list_managed_by_gitops().await?;
@@ -156,12 +161,24 @@ impl ApplyConfigUseCase {
         // additive-claims' deliberate loss of *server-enforced*
         // "every grant has both legs". It runs over the fully-built
         // desired set AND the desired `claim_mappings`,
-        // BEFORE the whole-partition `save_managed` commit and BEFORE
-        // any audit event is constructed — a `Reject` aborts the
-        // apply strict-atomic so no row and no `PermissionGrantApplied`
-        // / `ClaimMappingApplied` event lands. The metric
+        // BEFORE the whole-partition commit and BEFORE any audit event
+        // is constructed. The metric
         // (`hort_apply_config_linter_total{rule,result}`) is emitted
-        // per (grant|row, rule) evaluation inside the linter.
+        // per (grant|row, rule) evaluation inside the linter, and this is
+        // its only emission site: the port-built desired set is the real
+        // one, so it is the one the series describes.
+        //
+        // The REJECTION, however, is not this stage's to raise first. This
+        // stage runs after the repository, policy and mapping writes, and
+        // the apply ships no rollback — so a grant refused here used to
+        // leave a loosening from the same bundle committed. The pre-write
+        // pass therefore rejects on the same rules (its row 8), over an
+        // expansion with placeholder ids whose verdict is provably the same
+        // because no rule reads an id value. What survives here is the
+        // gate over the real set: reaching a `Reject` at this point would
+        // mean the two expansions disagreed, which is a contract violation
+        // rather than operator error — and the strict-atomic abort below
+        // still holds the line if it ever happens.
         let desired_claim_mappings: Vec<ClaimMapping> = desired
             .claim_mappings
             .iter()
@@ -269,26 +286,33 @@ impl ApplyConfigUseCase {
             report.deleted += 1;
         }
 
-        let total_pg_events: usize = authz_events_by_stream.values().map(Vec::len).sum();
+        // Whole-partition delete-absent + upsert-present (covers
+        // envelope grants AND SA-owned grants) AND every per-stream
+        // audit batch, in one transaction.
+        let batches = Self::grouped_authorization_batches(
+            authz_events_by_stream,
+            Kind::PermissionGrant,
+            token,
+        );
+        let total_pg_events: usize = batches.iter().map(|b| b.events.len()).sum();
+        let streams = batches.len();
+        self.authority
+            .commit_permission_grants(&desired_set, batches)
+            .await?;
+
+        // Emitted AFTER the commit returned `Ok`, because that is the
+        // first point at which "committed" is true. The same line used
+        // to run before the row write and the append, so an apply that
+        // died in between left an operator-visible claim that the audit
+        // events had landed when none had.
         if total_pg_events > 0 {
             tracing::info!(
                 kind = "permission_grant",
                 events = total_pg_events,
-                streams = authz_events_by_stream.len(),
+                streams,
                 "permission_grant audit events committed"
             );
         }
-
-        // Whole-partition atomic delete-absent + upsert-present (covers
-        // envelope grants AND SA-owned grants in one transaction).
-        self.permission_grants.save_managed(&desired_set).await?;
-
-        self.append_grouped_authorization_events(
-            authz_events_by_stream,
-            Kind::PermissionGrant,
-            token,
-        )
-        .await?;
         Ok(())
     }
 

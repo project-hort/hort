@@ -13,11 +13,13 @@
 //!
 //! ## Enumeration scope
 //!
-//! All live artifacts whose status is retention-eligible: SQL `NULL`,
-//! `none`, the legacy non-terminal scan spellings (`unscanned`, `clean`,
-//! `flagged`), and `released`. The protected states `quarantined`,
-//! `rejected`, and `scan_indeterminate` and all soft-deleted rows are
-//! excluded SQL-side. The result is keyset-paginated by `artifact.id`.
+//! All live artifacts whose status is retention-eligible: SQL `NULL`
+//! (the stored spelling of
+//! [`QuarantineStatus::None`](crate::entities::artifact::QuarantineStatus::None))
+//! and `released`.
+//! The protected states `quarantined`, `rejected`, and
+//! `scan_indeterminate` and all soft-deleted rows are excluded
+//! SQL-side. The result is keyset-paginated by `artifact.id`.
 //! Per-policy-scope SQL
 //! pre-filtering is **deliberately not** done here: the evaluator
 //! does scope matching via the pure

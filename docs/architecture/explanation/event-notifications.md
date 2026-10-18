@@ -36,8 +36,11 @@ The `NotificationDispatcher`
 broadcast channel once per process and owns one tokio task per active
 subscription. It reconciles the task set every 30 seconds and on
 `subscription_changes` LISTEN/NOTIFY events, spawning tasks for newly
-active subscriptions and cancelling tasks whose rows vanished or were
-disabled.
+active subscriptions, cancelling tasks whose rows vanished or were
+disabled or whose owner no longer resolves to a delivery authority, and
+re-publishing into every task that survives the pass both a freshly
+synthesised owner principal and the listed row's own delivery-shaping
+fields (its target and its filter).
 
 **Delivery is driven by the event store, not by that channel**
 ([ADR 0061](../../adr/0061-store-driven-notification-delivery.md)). Each
@@ -171,14 +174,111 @@ authority each time, all delegating to the single
   bound; live grants are the floor, so revoking a role cuts off
   delivery without touching the subscription.
 
+### Which repository an event belongs to is resolved, not read off the payload
+
+The read gate and the delivery filter both have to answer "which
+repositories does this event disclose?", and for most of the artifact
+lifecycle the payload does not say. `ArtifactIngested`,
+`ChecksumMismatch`, `ArtifactDeleted` and `ArtifactDownloaded` carry a
+`repository_id`; `ArtifactQuarantined`, `ScanRequested`,
+`ScanCompleted`, `ArtifactBecameVulnerable`, `ArtifactReleased`,
+`ArtifactRejected`, `ScanIndeterminate`, `ChecksumVerified`, the
+provenance verdicts, `ArtifactReEvaluated`, `PolicyEvaluated`,
+`ApprovalDecided`, `ArtifactExpired`, `ArtifactPurged` and
+`ArtifactCorrupted` name the **artifact**, because the artifact
+aggregate already owns exactly one repository. The payload is not
+extended to add one: already-stored events would not gain the field, so
+the gate would only work for events written after the change, and a
+field appended to an event type alters the canonical bytes of every
+event written before it (the chain verifier's `ChainBreak::HashMismatch`
+— see [ADR 0002](../../adr/0002-event-sourcing.md)).
+
+So the resolution happens on the read side, for stored and future events
+alike, through one primitive both call sites use
+(`hort_app::use_cases::event_visibility`):
+
+1. `EventTypeKind::disclosed_repositories` classifies the payload —
+   exhaustively, with no wildcard arm — into *global* (no repository
+   association exists), a set of one or two repository references
+   (carried directly, or named indirectly through the artifact /
+   artifact-group aggregate), or *unattributable*.
+2. `EventVisibilityUseCase::index` resolves every indirect reference on
+   the page in a **single** round trip (`EventRepositoryResolver`). The
+   read handler does this for the page it just read; the dispatcher does
+   it for each catch-up page. Neither resolves per event — that would
+   put a database round trip on each event of the read hot path.
+3. Each call site then applies its own gate to the same answer: the read
+   handler requires `Permission::Read` on **every** disclosed
+   repository, the filter additionally intersects with the stored
+   `RepositoryScope`.
+
+Three properties of that design are load-bearing:
+
+- **The conjunction.** The promotion chain (`PromotionRequested`,
+  `ApprovalRequested`, `ArtifactPromoted`, `PromotionRejected`)
+  discloses a source *and* a target, and the delivered payload carries
+  both repository identities — so `Read` on one of them is not authority
+  to receive it.
+- **Resolution is by identity, never filtered on liveness.** Purge
+  retires an artifact's projection row (`artifacts.deleted_at`) instead
+  of removing it, and `ArtifactPurged` / `ArtifactExpired` are precisely
+  the events a repository's own readers still need. A liveness filter in
+  the resolver would hide a repository's retention history from the
+  people entitled to it.
+- **Unresolvable means admin-only, not invisible.**
+  `CasIntegrityMismatch` is keyed on a CAS content hash that any number
+  of repositories' artifacts may point at (its stream `entity_id` is
+  derived from the hash, not from an artifact id), and an aggregate
+  whose repository was deleted has no row left to resolve. Both fail
+  closed onto live `Permission::Admin`: there is no repository to check,
+  and an audit fact that no one can read is its own failure mode.
+
+The symmetry is why both halves ship together. The same absent
+`repository_id` that let a grantless account read every repository's
+scanner names and release justifications **also** made a correctly
+restricted `RepositoryScope::Some([repo])` subscriber lose that
+repository's entire lifecycle feed: an allow-list cannot match an event
+that names no repository. A change that only closed the disclosure
+would have traded one silent failure for the other.
+
 Each subscription also carries `snapshot_claims` — the creator's
 resolved claim set captured at create/update time as the delivery
 authority floor. The dispatcher synthesises the owner principal from
-that snapshot at task spawn, with one critical exception: any `"admin"`
-string in the snapshot is stripped and re-derived from the owner's live
-`is_admin` bit (`dispatcher.rs`, `synthesise_principal`), so a snapshot
-elevated by a then-admin actor cannot retroactively unlock privileged
-categories for an owner whose admin was revoked.
+that snapshot on every reconcile pass — for a task already running as
+much as for one being spawned — with one critical exception: any
+`"admin"` string in the snapshot is stripped and re-derived from the
+owner's live `is_admin` bit (`dispatcher.rs`, `synthesise_principal`),
+so a snapshot elevated by a then-admin actor cannot retroactively unlock
+privileged categories for an owner whose admin was revoked. The
+re-synthesised principal is published into the running task, which reads
+it per event, so revoking the bit takes effect within one reconcile
+interval; a principal that stops resolving at all — owner row gone,
+deactivated, or unreadable — cancels the task instead.
+
+The row's **target and filter** travel the same path, for the same
+reason: an input to a per-event decision may not be older than the
+cadence the rest of that decision runs on. The reconcile pass publishes
+them from the row it just listed into the running task
+(`dispatcher.rs`, `DeliveryShape`), which loads them per event alongside
+the principal and the evaluator — so a `PATCH
+/api/v1/subscriptions/:id` that rotates a webhook URL away from a
+compromised receiver, or narrows a filter to drop a category or an event
+type, takes effect for the next delivered event within one reconcile
+interval, with no restart and no cancel-and-respawn. What is published
+is those two fields and not the whole row: a task owns its own progress,
+and `last_delivered_position` on a freshly read row is behind the task's
+in-memory cursor by up to the 5-minute progress debounce, so a task that
+re-seeded from a republished row would re-deliver that window on every
+reconcile tick. **A filter change applies from the cursor forward** —
+narrowing takes effect for everything the task has not yet walked, while
+a *widened* filter does not retroactively deliver events the task
+already passed under the narrower one, because those positions are below
+its mark and no read starts below the mark
+([ADR 0061](../../adr/0061-store-driven-notification-delivery.md)). The
+delivery walk does not re-validate the target: the create / update path
+validates a webhook target — plaintext rule, URL grammar and the SSRF /
+DNS guard — before it is persisted, so a row that reached the database
+was admitted.
 
 Repository-capped API tokens cannot escape their cap through the
 durable side-effect either: a capped token must name an explicit
@@ -382,10 +482,11 @@ on, and it has two limits that are not corner cases:
   filtering breaks it the same way and less visibly, because it is
   applied **per event, not per stream** — both the dispatcher
   (`crates/hort-app/src/use_cases/subscription_filter.rs`) and the pull
-  surface drop an individual event whose `repository_id` you lack `Read`
-  on, or whose type is an authorization-model mutation or a privileged
-  audit fact you are not admin for, while passing its stream-mates that
-  carry no repository association at all. So contiguity is a detector
+  surface drop an individual event whose disclosed repositories you lack
+  `Read` on, or whose type is an authorization-model mutation or a
+  privileged audit fact you are not admin for, while passing its
+  stream-mates that have no repository association at all. So contiguity
+  is a detector
   only when nothing between you and the log is removing events: no
   `event_types` filter, and a principal that can read everything in the
   categories you take. Where that does not hold, use the trailing-window

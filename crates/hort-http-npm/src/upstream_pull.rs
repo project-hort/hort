@@ -51,7 +51,9 @@ use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::ApiActor;
-use hort_domain::ports::format_handler::FormatHandler;
+use hort_domain::ports::format_handler::{
+    require_https_metadata_url, FormatHandler, MetadataUrlSubject,
+};
 use hort_domain::types::checksum::UpstreamPublishedChecksum;
 use hort_domain::types::ArtifactCoords;
 use hort_formats::npm::projection::NpmVersionEntry;
@@ -340,9 +342,9 @@ pub(crate) async fn try_upstream_tarball_pull(
     };
 
     // 4. Recover the absolute tarball URL from the projection's verbatim
-    //    `dist.tarball` (`entry.tarball`). Apply the SAME `https://` guard
-    //    `extract_upstream_tarball_url` enforced (no downgrade target is
-    //    ever promoted to a fetch URL).
+    //    `dist.tarball` (`entry.tarball`). The scheme rule is the shared
+    //    `require_https_metadata_url` (no downgrade target is ever
+    //    promoted to a fetch URL).
     let tarball_url = match tarball_url_from_entry(entry, version) {
         Ok(u) => u,
         Err(e) => {
@@ -480,7 +482,14 @@ pub(crate) async fn try_upstream_tarball_pull(
                 trust_upstream_publish_time: blob_trust_publish_time,
             };
             let outcome = blob_ingest
-                .ingest_verified(request, reader, &blob_handler)
+                .ingest_verified(
+                    request,
+                    // A tarball claims only its own content; the
+                    // primary-content edge is derived inside the ingest.
+                    &[],
+                    reader,
+                    &blob_handler,
+                )
                 .await?;
             Ok(outcome.artifact.sha256_checksum)
         })
@@ -494,6 +503,29 @@ pub(crate) async fn try_upstream_tarball_pull(
         // follower: ...")` and route to `IngestFailed` per the design's
         // leader-only-discrimination contract.
         Err(AppError::Domain(DomainError::Conflict(msg))) => {
+            // Part of the refusal, not cleanup after it: the bytes just
+            // disproved the `dist.integrity` this packument declared, so
+            // the packument has stopped being a cache entry. Drop every
+            // evictable copy of it (projection cache row + pull-dedup
+            // window record — see `evict_packument`) so the next reader
+            // resolves this package from upstream instead of inheriting
+            // the disproved document. A reader who then gets the same
+            // document from a still-lying upstream fails again, which is
+            // correct; failing against OUR stale copy is a different
+            // thing, and the only one we can stop.
+            //
+            // The drop is per-PACKAGE because a packument is one
+            // document: a single refuted `dist.integrity` disproves the
+            // document that carried it, and there is no way to keep
+            // believing its other versions while disbelieving that one.
+            crate::packument::evict_packument(
+                ctx.ephemeral_evictable.as_ref(),
+                ctx.pull_dedup.as_ref(),
+                repo.id,
+                mapping.id,
+                pkg,
+            )
+            .await;
             // The mismatch warn carries `algorithm`, `format`, `repository_id`
             // so an operator can correlate it with the corresponding
             // `ChecksumMismatch` event on the repository stream. NEVER
@@ -592,6 +624,10 @@ pub(crate) async fn try_upstream_tarball_pull(
                         // `ingest_verified`, which only ever gated the
                         // leader's own (possibly different) repo's row.
                         seed_import_quarantine_anchor: None,
+                        // A pulled-through FILE / blob claims only its own
+                        // content; the mint derives that edge itself. Only a
+                        // manifest-shaped follower has foreign bytes to claim.
+                        claimed_edges: Vec::new(),
                     },
                     &NpmFormatHandler,
                 )
@@ -652,9 +688,11 @@ fn checksum_from_entry(
 }
 
 /// Recover the genuine upstream tarball URL from a projection
-/// [`NpmVersionEntry`]'s verbatim `dist.tarball` (`entry.tarball`),
-/// applying the SAME `https://` guard `extract_upstream_tarball_url`
-/// enforced (no downgrade target is ever promoted to a fetch URL).
+/// [`NpmVersionEntry`]'s verbatim `dist.tarball` (`entry.tarball`). The
+/// scheme rule is [`require_https_metadata_url`] — the one definition of
+/// "a metadata-supplied download URL must be `https://`" — so no
+/// downgrade target is ever promoted to a fetch URL, and this path
+/// refuses exactly what the prefetch worker's npm arm refuses.
 ///
 /// `entry.tarball` is the genuine upstream URL captured by the
 /// projector before any serve-time rewrite (ADR 0026 §9.1 invariant
@@ -666,11 +704,7 @@ fn tarball_url_from_entry(entry: &NpmVersionEntry, version: &str) -> DomainResul
             "upstream npm version {version} is missing dist.tarball"
         ))
     })?;
-    if !tarball.starts_with("https://") {
-        return Err(DomainError::Validation(format!(
-            "upstream npm returned non-https tarball URL: {tarball}"
-        )));
-    }
+    require_https_metadata_url(tarball, MetadataUrlSubject::NpmTarballUrl)?;
     Ok(tarball.to_string())
 }
 
@@ -685,8 +719,8 @@ fn tarball_url_from_entry(entry: &NpmVersionEntry, version: &str) -> DomainResul
 /// Strips a `?` or `#` suffix first (npm registries don't use them
 /// today, but the rule must survive a future change), then returns the
 /// segment after the final `/`. If the URL has no `/`, the entire
-/// string is returned (defensive — `extract_upstream_tarball_url`
-/// already enforces `https://` so this branch is unreachable in
+/// string is returned (defensive — `tarball_url_from_entry` has already
+/// enforced the `https://` scheme, so this branch is unreachable in
 /// practice). Returns a `Cow` so the common case (URL contains `/`)
 /// avoids an allocation; the trim case allocates once.
 fn tarball_basename(url: &str) -> std::borrow::Cow<'_, str> {
@@ -856,6 +890,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         });
@@ -921,6 +956,47 @@ mod tests {
     // longer owns the cache/mirror-key encoding (it resolves the
     // packument through `crate::packument::fetch_raw_with_cache`). The
     // encoding contract is pinned by that module's tests.
+
+    // ---- tarball_url_from_entry pinning -------------------------------------
+
+    /// The genuine absolute upstream URL passes; a plaintext downgrade
+    /// target and an absent `dist.tarball` are both refused as
+    /// `Validation`, which the caller maps to `TarballUrlInvalid` → 502.
+    /// Mirrors `hort-http-pypi`'s `url_from_entry_https_passes_non_https_rejected`.
+    #[test]
+    fn tarball_url_from_entry_https_passes_non_https_rejected() {
+        let ok = NpmVersionEntry {
+            version: "1.0.0".into(),
+            name_as_published: None,
+            tarball: Some("https://registry.npmjs.org/x/-/x-1.0.0.tgz".into()),
+            integrity: None,
+            shasum: None,
+            published_at: None,
+            manifest: serde_json::Map::new(),
+        };
+        assert_eq!(
+            tarball_url_from_entry(&ok, "1.0.0").unwrap(),
+            "https://registry.npmjs.org/x/-/x-1.0.0.tgz"
+        );
+
+        let http = NpmVersionEntry {
+            tarball: Some("http://insecure/x/-/x-1.0.0.tgz".into()),
+            ..ok.clone()
+        };
+        assert!(matches!(
+            tarball_url_from_entry(&http, "1.0.0"),
+            Err(DomainError::Validation(_))
+        ));
+
+        let missing = NpmVersionEntry {
+            tarball: None,
+            ..ok.clone()
+        };
+        assert!(matches!(
+            tarball_url_from_entry(&missing, "1.0.0"),
+            Err(DomainError::Validation(_))
+        ));
+    }
 
     // ---- tarball_basename pinning -------------------------------------------
 
@@ -1186,6 +1262,125 @@ mod tests {
         assert_eq!(
             verified_count, 0,
             "ChecksumVerified must NOT fire on the mismatch path"
+        );
+    }
+
+    // ---- The refuted document is not the answer ----------------------------
+
+    /// Fixture for the two eviction tests: a Proxy repo whose upstream
+    /// serves a packument advertising the SHA-512 of bytes it does not
+    /// serve. Returns the mapping id (the projection-cache key's
+    /// invalidation axis) and the lying packument's package name.
+    ///
+    /// Shared so both tests stand on the SAME refusal — one reads the
+    /// cache afterwards, the other counts upstream calls, and a
+    /// divergence between the two fixtures would let one of them pass
+    /// for the wrong reason.
+    fn seed_refuted_packument(mocks: &MockPorts, repo: &Repository) -> Uuid {
+        let mapping_id = seed_mapping(mocks, repo.id);
+        let lying_sri = sri_sha512(b"lying-bytes");
+        let url = "https://registry.npmjs.org/express/-/express-4.18.2.tgz";
+        let body = packument_json("4.18.2", &lying_sri, url);
+        mocks.upstream_proxy.insert_metadata("", "/express", body);
+        mocks
+            .upstream_proxy
+            .insert_artifact("", url, b"actual-bytes".to_vec());
+        mapping_id
+    }
+
+    /// A refused pull leaves NO evictable copy of the packument that
+    /// declared the refuted `dist.integrity` — asserted by driving the
+    /// pull and then READING the cache, not by observing that an
+    /// eviction call was made.
+    ///
+    /// Both evictable rows are checked, because either one left behind
+    /// keeps the disproved document answerable: the projection cache row
+    /// (`npm_packument_proj:{mapping}:{name}`) and the pull-dedup
+    /// window's terminal `SucceededMetadata` record, which
+    /// `fetch_raw_with_cache` would otherwise write straight back into
+    /// the cache row.
+    #[tokio::test]
+    async fn refused_pull_leaves_no_evictable_copy_of_the_refuted_packument() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = npm_proxy_repo("npm-mirror");
+        mocks.repositories.insert(repo.clone());
+        let mapping_id = seed_refuted_packument(&mocks, &repo);
+
+        let proj_key = format!("npm_packument_proj:{mapping_id}:express");
+        let dedup_key = DedupKey::metadata("npm", repo.id, "/express");
+
+        let err = try_upstream_tarball_pull(&ctx, &repo, "express", "4.18.2", "express-4.18.2.tgz")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UpstreamPullError::ChecksumMismatch),
+            "expected ChecksumMismatch, got {err:?}"
+        );
+
+        assert!(
+            ctx.ephemeral_evictable
+                .get(&proj_key)
+                .await
+                .expect("cache read must succeed")
+                .is_none(),
+            "the packument whose dist.integrity the bytes refuted must be gone from the \
+             projection cache ({proj_key}); it is not a cache entry once its claim is disproved"
+        );
+        assert!(
+            ctx.ephemeral_evictable
+                .get(dedup_key.serialised_for_test())
+                .await
+                .expect("cache read must succeed")
+                .is_none(),
+            "the pull-dedup window's terminal record for the refuted packument must be gone \
+             too — it is served to every later caller for leader_lock_ttl with no upstream \
+             call, which would re-populate the projection cache with the same disproved bytes"
+        );
+    }
+
+    /// The eviction's PURPOSE, not just its side effect: a second pull
+    /// after the refusal goes back to the upstream for the packument.
+    /// Asserted on the upstream mock's `fetch_metadata` count — a reader
+    /// served from any surviving copy would leave it at 1.
+    ///
+    /// The second pull failing again is correct and deliberately not
+    /// pinned to a variant: the blob leg's own negative cache
+    /// (`ttl_checksum_mismatch`, 60 s) can short-circuit it as a
+    /// follower, which changes the error's shape but only AFTER the
+    /// metadata leg has already run. What this test pins is that the
+    /// metadata leg ran.
+    #[tokio::test]
+    async fn second_pull_after_a_refusal_refetches_the_packument() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = npm_proxy_repo("npm-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_refuted_packument(&mocks, &repo);
+
+        let first =
+            try_upstream_tarball_pull(&ctx, &repo, "express", "4.18.2", "express-4.18.2.tgz")
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(first, UpstreamPullError::ChecksumMismatch),
+            "expected ChecksumMismatch, got {first:?}"
+        );
+        assert_eq!(
+            mocks.upstream_proxy.metadata_calls(),
+            1,
+            "the first pull fetches the packument once"
+        );
+
+        let second =
+            try_upstream_tarball_pull(&ctx, &repo, "express", "4.18.2", "express-4.18.2.tgz").await;
+        assert!(
+            second.is_err(),
+            "a still-lying upstream must still be refused, got {second:?}"
+        );
+        assert_eq!(
+            mocks.upstream_proxy.metadata_calls(),
+            2,
+            "the second pull must RE-FETCH the packument from upstream — a surviving \
+             projection-cache row or pull-dedup record would have answered it for free"
         );
     }
 

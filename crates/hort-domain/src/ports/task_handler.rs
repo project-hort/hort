@@ -63,6 +63,15 @@ pub enum TaskOutcome {
     /// [`REASON_MAX_BYTES`]). `retry` signals whether the dispatcher should
     /// schedule a re-run; transient I/O errors set `retry = true`, invariant
     /// violations set `retry = false`.
+    ///
+    /// `retry = true` is a request, not a guarantee: the dispatcher
+    /// honours it while the `jobs` row has attempt budget left and
+    /// fails the row terminally once that budget is spent, so a
+    /// handler that keeps returning the same transient failure ends as
+    /// a persistent, operator-visible `failed` row rather than being
+    /// re-driven indefinitely. A handler therefore does not need its
+    /// own attempt counting, and `reason` should be written to be the
+    /// text an operator reads off that row.
     Failed { reason: String, retry: bool },
 }
 

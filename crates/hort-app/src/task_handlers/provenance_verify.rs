@@ -97,7 +97,10 @@ impl TaskHandler for ProvenanceVerifyHandler {
                     // `no_attestation` case. Closed taxonomy:
                     // `verified` / `rejected:<reason>` /
                     // `no_attestation` / `held_pending_signature` /
-                    // `skipped:<why>`.
+                    // `held_pending_subject` / `held_indeterminate` /
+                    // `allowed_indeterminate` /
+                    // `cleared:signature_material` / `skipped:<why>` /
+                    // `requeued:<why>` (see `result_summary_label`).
                     let result = result_summary_label(&outcome);
                     // A single `debug!` on the silent path is the most that
                     // is allowed — NO per-`no_attestation` `info!` (firehose
@@ -115,9 +118,21 @@ impl TaskHandler for ProvenanceVerifyHandler {
                             "provenance: no attestation (allowed)",
                         );
                     }
-                    Ok(TaskOutcome::Completed {
-                        result_summary: json!({ "result": result }),
-                    })
+                    // The per-artifact forensic trail of candidates the
+                    // verifier(s) could not read and therefore did not
+                    // consider. Present only when something was actually
+                    // skipped: the key's absence is the ordinary case, and
+                    // adding `"unreadable_skipped": 0` to every row would
+                    // bury the rows that matter. The aggregate rate lives
+                    // on `hort_provenance_unreadable_skipped_total`; this
+                    // is the per-artifact half, the only durable record of
+                    // WHICH artifact had garbage attached.
+                    let skipped = unreadable_skipped(&outcome);
+                    let mut result_summary = json!({ "result": result });
+                    if skipped > 0 {
+                        result_summary["unreadable_skipped"] = json!(skipped);
+                    }
+                    Ok(TaskOutcome::Completed { result_summary })
                 }
                 Err(err) => Ok(TaskOutcome::fail(
                     format!("provenance-verify failed: {err}"),
@@ -131,8 +146,9 @@ impl TaskHandler for ProvenanceVerifyHandler {
 /// Map a [`ProvenanceRunOutcome`] to the compact `result_summary` label
 /// written on the job row. The closed
 /// taxonomy is `verified` / `rejected:<reason>` / `no_attestation` /
-/// `held_pending_signature` / `held_pending_subject` / `skipped:<why>` /
-/// `requeued:<why>`;
+/// `held_pending_signature` / `held_pending_subject` /
+/// `held_indeterminate` / `allowed_indeterminate` /
+/// `cleared:signature_material` / `skipped:<why>` / `requeued:<why>`;
 /// `<reason>` reuses the metrics-catalog wire string so the
 /// `result_summary` trail and the `hort_provenance_reject_total{reason}`
 /// series agree. Pure — testable without the use case.
@@ -147,6 +163,9 @@ fn result_summary_label(outcome: &ProvenanceRunOutcome) -> String {
         ProvenanceRunOutcome::SkippedOff => "skipped:off".to_string(),
         ProvenanceRunOutcome::SkippedNoVerifier => "skipped:no_verifier".to_string(),
         ProvenanceRunOutcome::SkippedAlreadyCleared => "skipped:already_cleared".to_string(),
+        ProvenanceRunOutcome::ClearedAsSignatureMaterial { .. } => {
+            "cleared:signature_material".to_string()
+        }
         ProvenanceRunOutcome::RequeuedNoAnchor => "requeued:no_anchor".to_string(),
         ProvenanceRunOutcome::Applied { verdict, .. } => match verdict {
             ProvenanceVerdictSummary::Verified => "verified".to_string(),
@@ -159,7 +178,37 @@ fn result_summary_label(outcome: &ProvenanceRunOutcome) -> String {
             ProvenanceVerdictSummary::NoAttestation => "no_attestation".to_string(),
             ProvenanceVerdictSummary::HeldPendingSignature => "held_pending_signature".to_string(),
             ProvenanceVerdictSummary::HeldPendingSubject => "held_pending_subject".to_string(),
+            ProvenanceVerdictSummary::HeldIndeterminate => "held_indeterminate".to_string(),
+            ProvenanceVerdictSummary::AllowedIndeterminate => "allowed_indeterminate".to_string(),
         },
+    }
+}
+
+/// How many attestation candidates the verifier(s) skipped as unreadable
+/// on this run — the companion half of [`result_summary_label`], written
+/// onto the same `result_summary` object.
+///
+/// Zero for every outcome reached **before** the verifiers ran
+/// (`SkippedOff` / `SkippedNoVerifier` / `SkippedAlreadyCleared`): no
+/// candidate was examined, so none was skipped. `RequeuedNoAnchor` also
+/// answers zero, and for a different reason — the fold did run, but `run`
+/// intercepts that outcome and returns a retryable `Failed`, so no
+/// `result_summary` is written at all; the count was already reported by
+/// the orchestration layer's log line and counter. Wildcard-free, so a
+/// future outcome has to say whether it can carry a skip.
+/// Pure — testable without the use case.
+fn unreadable_skipped(outcome: &ProvenanceRunOutcome) -> u32 {
+    match outcome {
+        ProvenanceRunOutcome::Applied {
+            unreadable_skipped, ..
+        }
+        | ProvenanceRunOutcome::ClearedAsSignatureMaterial { unreadable_skipped } => {
+            *unreadable_skipped
+        }
+        ProvenanceRunOutcome::SkippedOff
+        | ProvenanceRunOutcome::SkippedNoVerifier
+        | ProvenanceRunOutcome::SkippedAlreadyCleared
+        | ProvenanceRunOutcome::RequeuedNoAnchor => 0,
     }
 }
 
@@ -535,10 +584,77 @@ mod tests {
     #[test]
     fn held_pending_signature_maps_to_result_summary_label() {
         let outcome = ProvenanceRunOutcome::Applied {
+            unreadable_skipped: 0,
             event_appended: false,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         };
         assert_eq!(result_summary_label(&outcome), "held_pending_signature");
+    }
+
+    /// The could-not-check hold maps to its own `held_indeterminate`
+    /// label, separable from both signature holds: the operator action is
+    /// on *our* side (fix the trust root, or let the fetch retry), so a
+    /// `result_summary` that said `held_pending_signature` would send
+    /// somebody to look at their signer. Pure-mapper assertion; the
+    /// emission on the real hold path is covered by the orchestration
+    /// use-case tests.
+    #[test]
+    fn held_indeterminate_maps_to_result_summary_label() {
+        let outcome = ProvenanceRunOutcome::Applied {
+            unreadable_skipped: 0,
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::HeldIndeterminate,
+        };
+        assert_eq!(result_summary_label(&outcome), "held_indeterminate");
+    }
+
+    /// The **non-held** could-not-check verdict gets its own
+    /// `result_summary` label too. `no_attestation` here would be the one
+    /// reading an operator must not be given: it names the artifact's
+    /// state ("allowed unsigned") when the truth is about ours (a
+    /// misprovisioned trust root, an unreachable upstream), and it is the
+    /// per-artifact trail — the durable half — that somebody reads when
+    /// they go looking for which artifact was affected.
+    #[test]
+    fn allowed_indeterminate_maps_to_result_summary_label() {
+        let outcome = ProvenanceRunOutcome::Applied {
+            unreadable_skipped: 0,
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::AllowedIndeterminate,
+        };
+        assert_eq!(result_summary_label(&outcome), "allowed_indeterminate");
+        // Separable from both neighbours, which is the whole reason it
+        // exists.
+        assert_ne!(
+            result_summary_label(&outcome),
+            result_summary_label(&ProvenanceRunOutcome::Applied {
+                unreadable_skipped: 0,
+                event_appended: false,
+                verdict: ProvenanceVerdictSummary::NoAttestation,
+            }),
+        );
+        assert_ne!(
+            result_summary_label(&outcome),
+            result_summary_label(&ProvenanceRunOutcome::Applied {
+                unreadable_skipped: 0,
+                event_appended: false,
+                verdict: ProvenanceVerdictSummary::HeldIndeterminate,
+            }),
+        );
+    }
+
+    /// A digest-mismatch rejection reaches the `result_summary` with its
+    /// own reason string rather than hiding inside `bundle_malformed` —
+    /// the audit trail an operator reads to tell a re-tag attack from a
+    /// corrupt upload.
+    #[test]
+    fn digest_mismatch_maps_to_result_summary_label() {
+        let outcome = ProvenanceRunOutcome::Applied {
+            unreadable_skipped: 0,
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::DigestMismatch),
+        };
+        assert_eq!(result_summary_label(&outcome), "rejected:digest_mismatch");
     }
 
     /// The issue #90 bounded-requeue outcome maps to the distinct
@@ -566,6 +682,74 @@ mod tests {
             result_summary_label(&ProvenanceRunOutcome::SkippedAlreadyCleared),
             "skipped:already_cleared"
         );
+    }
+
+    /// The job's `result_summary` names how many candidates were skipped
+    /// as unreadable — the only durable per-artifact record of WHICH
+    /// artifact had garbage attached. Driven end-to-end: the stub verifier
+    /// answers `Verified` while carrying a skip, exactly the headline
+    /// shape, so the key has to survive a verdict that is not itself
+    /// about the skipped material.
+    #[tokio::test]
+    async fn unreadable_skips_are_named_in_the_result_summary() {
+        let (handler, artifact_id) = build_handler(
+            ProvenanceMode::VerifyIfPresent,
+            ProvenanceVerdict::verified(sample_signer(), None).with_unreadable_skipped(2),
+            true,
+        );
+        let summary = run_summary(&handler, artifact_id).await;
+        assert_eq!(
+            summary,
+            serde_json::json!({ "result": "verified", "unreadable_skipped": 2 }),
+        );
+    }
+
+    /// Nothing skipped → the key is absent, not `0`. The ordinary row
+    /// stays exactly as it was, so the rows that carry the key are the
+    /// ones worth reading.
+    #[tokio::test]
+    async fn an_ordinary_verdict_carries_no_unreadable_skipped_key() {
+        let (handler, artifact_id) = build_handler(
+            ProvenanceMode::VerifyIfPresent,
+            ProvenanceVerdict::verified(sample_signer(), None),
+            true,
+        );
+        let summary = run_summary(&handler, artifact_id).await;
+        assert_eq!(summary, serde_json::json!({ "result": "verified" }));
+    }
+
+    /// The extractor answers for every outcome, and zero for the three
+    /// that are reached before any verifier ran plus the requeue (whose
+    /// row is never written). Pure-mapper assertion, mirroring
+    /// `result_summary_label`'s own tests.
+    #[test]
+    fn unreadable_skipped_reads_every_outcome() {
+        assert_eq!(
+            unreadable_skipped(&ProvenanceRunOutcome::Applied {
+                event_appended: true,
+                verdict: ProvenanceVerdictSummary::Verified,
+                unreadable_skipped: 4,
+            }),
+            4
+        );
+        assert_eq!(
+            unreadable_skipped(&ProvenanceRunOutcome::ClearedAsSignatureMaterial {
+                unreadable_skipped: 1,
+            }),
+            1
+        );
+        for before_dispatch in [
+            ProvenanceRunOutcome::SkippedOff,
+            ProvenanceRunOutcome::SkippedNoVerifier,
+            ProvenanceRunOutcome::SkippedAlreadyCleared,
+            ProvenanceRunOutcome::RequeuedNoAnchor,
+        ] {
+            assert_eq!(
+                unreadable_skipped(&before_dispatch),
+                0,
+                "{before_dispatch:?}"
+            );
+        }
     }
 
     /// Under `Off` the handler records `skipped:off` (defensive — the ingest

@@ -31,10 +31,11 @@ const OIDC_ISSUER_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.
 /// non-URI / non-email workload identities (mirrors `sigstore`'s policy).
 const OTHERNAME_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.57264.1.7");
 
-/// Why observed-identity extraction failed — both arms fold to the
-/// adapter's `BundleMalformed` reject reason (a cert that verified
-/// cryptographically but carries no readable identity is a malformed
-/// attestation for our purposes, not an untrusted one).
+/// Why observed-identity extraction failed — both arms make the candidate
+/// **unreadable** to this verifier, so it is skipped rather than judged. A
+/// cert carrying no readable `{issuer, san}` leaves no identity decision to
+/// make: that is a statement about our ability to read the material, not a
+/// finding about the artifact, and only a finding may condemn one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IdentityExtractError {
     /// No OIDC-issuer extension (`1.3.6.1.4.1.57264.1.1`) on the cert.
@@ -47,8 +48,9 @@ pub(crate) enum IdentityExtractError {
 ///
 /// Returns the first usable SAN (URI, then RFC822 email, then a Sigstore
 /// "other name"), and the OIDC-issuer extension value. Both must be
-/// present; a cert missing either is an [`IdentityExtractError`] which the
-/// caller maps to `BundleMalformed`.
+/// present; a cert missing either is an [`IdentityExtractError`], on which
+/// the caller skips the candidate (counting the skip) instead of producing
+/// a verdict from it.
 pub(crate) fn observed_identity(
     cert: &Certificate,
 ) -> Result<SignerIdentity, IdentityExtractError> {

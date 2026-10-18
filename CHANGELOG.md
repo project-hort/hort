@@ -7,946 +7,161 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.14.1] - 2026-10-02
+## [0.15.0] - 2026-10-18
 
 ### Added
 
-- **A job row abandoned in `running` is recovered** (#306). A worker that died
-  holding a claim used to leave its row on `status = 'running'` forever: both
-  claim statements select `status = 'pending'` only, their `locked_until IS
-  NULL OR locked_until < now()` clause re-claims a *pending* row whose
-  not-before has passed and never looks at a `running` one, and nothing
-  anywhere requeued or reaped. For four kinds that was not clutter but a lost
-  capability — `jobs_scan_unique` is `(artifact_id) WHERE kind = 'scan' AND
-  status IN ('pending','running')`, so the artifact became permanently
-  unscannable *and* unrescannable, silently; `provenance-verify`, `prefetch`
-  and `prefetch-dependencies` have the same shape via
-  `find_active_provenance_for_artifact`, `jobs_prefetch_unique` and
-  `jobs_prefetch_dependencies_unique`.
-
-  Two halves. **Lease renewal**: `JobsRepository::renew_lease` plus a renewal
-  task the dispatcher holds across `TaskHandler::run`, ticking three times per
-  lease. `TaskDispatcher::dispatch_one` is the single point every registered
-  kind runs through and `claim_pending_by_kinds` is the only claim statement
-  with a production caller, so one call site covers the whole kind vocabulary
-  and every kind added later. **The sweep**: `requeue_abandoned`, run inline on
-  the dispatcher's poll loop every 60 s on every replica (no leader election —
-  the picking CTE is `FOR UPDATE SKIP LOCKED`), returning `running` rows whose
-  lease lapsed more than one further lease ago to `pending`. Migration `028`
-  adds the partial index `jobs_abandoned_lease_idx ON (locked_until) WHERE
-  status = 'running'` so the sweep does not seq-scan the highest-churn table
-  in the schema.
-
-  Renewal is what makes the discriminator derivable rather than guessed:
-  before it, `locked_until < now()` meant both "the worker died" and "the task
-  is slower than its 15-minute lease", and no per-kind grace multiple is
-  correct for a kind with no upper bound on runtime. A live worker renews
-  three times a lease however long its task runs, so a lapsed lease already
-  means three consecutive renewals failed to land; the extra full lease of
-  grace is the margin for a renewal that is alive but late (a lost database
-  race, a paused container, a rolling upgrade whose older replicas do not
-  renew at all).
-
-  The sweep is also where the retry budget is spent, because it is the only
-  code that runs for a row whose handler never returned — the scan
-  orchestrator's `attempts >= max_attempts` branch and the dispatcher's
-  `TaskOutcome::Failed` arms both require the handler to come back. A row at
-  the attempt cap is failed terminally instead of re-driven; for `kind='scan'`
-  that hands the artifact to the existing stranded-scan recovery, whose
-  predicate is a newest scan job in `failed`. Rows are never deleted: a late
-  completion from the original worker is an unconditional `UPDATE … WHERE id`
-  and must still find a row. `attempts` is left alone by the sweep — the next
-  claim charges it, exactly as for a `reschedule`d row.
-
-  Which kinds are requeued is a decision per kind, not a default:
-  `REQUEUE_ON_LEASE_EXPIRY_KINDS` / `NO_REQUEUE_ON_LEASE_EXPIRY_KINDS` in
-  `hort-domain`, exhaustive over `EVENT_TASK_KINDS` under a guard test, each
-  carrying its reason. The seven excluded kinds are excluded because a
-  concurrent second execution of them is absorbed by nothing —
-  `eventstore-archive` most sharply, whose unbounded `StreamSealed` append is
-  safe only while at most one `seal_and_remove` is in flight cluster-wide and
-  one of the three layers delivering that is a *per-process* semaphore — and
-  the exclusion is free because none of them appears in an in-flight
-  uniqueness predicate, so their next scheduled tick is the recovery. A renewal that
-  reports the row is no longer this worker's is a **fencing token**, not just a
-  log line: the dispatcher discards that handler's outcome rather than writing
-  over the row's current holder, because the damaging write is not the lost
-  result but a `reschedule` returning a row a live worker is mid-way through to
-  `pending`. New metrics `hort_admin_tasks_lease_requeued_total{kind, result}`
-  (worker health) and `hort_admin_tasks_lease_renew_failed_total{kind, result}`
-  (the fence — one `lost` is one execution whose result was discarded).
-
-- **`public.jobs` gets a general horizon, and the newest state row per kind
-  survives it** (#297). New `jobs-row-retention-sweep` task kind (migration
-  `027`, default-enabled daily CronJob at 03:30 UTC,
-  `scheduledTasks.jobsRowRetentionSweep`) deleting terminal
-  (`status IN ('completed', 'failed')`) `jobs` rows older than a configurable
-  horizon (default 7 days) for every kind the two existing kind-specific
-  sweeps do not reach — `kind NOT LIKE 'prefetch%' AND kind NOT IN ('scan',
-  'oci-index-child-ingest')`. Nineteen of the twenty-five allow-listed kinds
-  had no horizon at all; the highest-churn of them, `staging-sweep`, adds
-  ~288 terminal rows a day at its five-minute cadence, and a production count
-  found ~83,000 unreclaimed terminal rows.
-
-  The sweep retains, per kind, **two** rows: the newest `completed` row and
-  the newest terminal row. Retaining only the newest terminal row is not
-  enough — both `last_completed_at_by_kind` (the boot-time
-  `hort_staging_sweep_overdue` and `hort_event_chain_verify_overdue` gauges)
-  and `last_result_summary_by_kind` (the `prefetch-tick` rotation cursor)
-  filter `status = 'completed'`, so a kind whose newest terminal row is a
-  failure would lose the `completed` row underneath it and report as having
-  never run. The kind exclusions keep exactly one horizon in force per kind:
-  a second sweep over the same rows would silently win whenever its horizon
-  were the shorter of the two. Non-terminal rows — including a row abandoned
-  in `running` by a crashed worker — are never deleted: an expired claim lease
-  does not distinguish a dead worker from a task slower than its lease, so
-  recovering those is a requeue rather than a retention concern.
-
-- **A denial records which leg denied it** (#239). `RbacEvaluator` gains
-  `authorize_explained`, returning `AuthzDecision` — `Allowed`,
-  `DeniedGrants`, `DeniedCap`, `DeniedBoth` — beside the unchanged `authorize`
-  predicate, which now delegates to it. Both legs of the cap-intersection AND
-  were already evaluated unconditionally, so which one failed was computed and
-  thrown away on every deny.
-
-  Two structurally different faults used to produce one indistinguishable
-  signal: an identity with no grant, and an identity that holds the permission
-  presenting a token whose cap excludes the repository. They have disjoint
-  remediations — declare a `PermissionGrant` versus widen or re-mint the token
-  — so a configuration correct in gitops could stay unreachable with nothing
-  saying why. The deny log now names the measured leg (`denial_reason`) and its
-  hint states which surface is at fault *and* which is exonerated, in place of
-  the "check both the token's scopes and the grant table" checklist it could
-  only offer while the evaluator returned a bare `bool`. A CLI session is told
-  to re-login with `--admin` only when the cap is genuinely what denied; an
-  identity holding no admin authority is no longer sent on a mint that would
-  be refused.
-
-  New counter `hort_authz_denials_total{permission, reason}` with
-  `reason ∈ {grants, cap, both}`, deny-only and with no `repository` label.
-  `hort_authz_decisions_total` is unchanged and remains the complete decision
-  count: the composite curate-or-admin gate evaluates two permissions and
-  denies on the pair, so it emits no `reason` rather than an invented
-  `unknown` one, and reports both decisions on its log line instead.
-
-  The caller-visible contract is untouched — a cap reject and a missing grant
-  still return the same status, since distinguishing them would disclose that
-  an identity's grants are broader than the presented token's cap.
-
-- **`hort-cli admin retention preview` / `apply` — the surface a cleanup
-  actually happens on** (#289). `preview` runs the dry run, waits for it, and
-  renders it for a person: rows and distinct stored contents named as the
-  different quantities they are, the measured bytes that would be freed — or the
-  words `NOT MEASURED` and the server's reason, never a number the server did
-  not measure — a capped sample so the selection can be checked, and partial
-  coverage stated in the header rather than a footnote. Repositories are named
-  by the key an operator writes in a policy, not by UUID.
-
-  `apply` re-runs the preview immediately before executing and shows the
-  difference to the one it was pointed at, per figure and per group. When
-  anything moved, it asks twice: once to confirm the difference was read, once
-  to execute. Declining either exits without sending the execution. `--yes`
-  skips the questions and still prints the difference. Both commands work with a
-  fresh admin CLI session and need no new authority — a preview requires no
-  destructive claim at all, an execution still does. `--output json` carries the
-  same information, including the omission status and the coverage flag.
-
-  Both commands state plainly that expiry marks artifact records and does not
-  itself delete stored bytes; the separate purge reclaims a blob once its last
-  reference is gone.
-
-- **A retention policy can be previewed before it takes anything** (#283).
-  `retention-evaluate` gains a dry-run mode that draws the same candidates
-  through the same reader and the same predicates, appends no `ArtifactExpired`,
-  advances no projection field, and writes its finding into its own job's
-  `result_summary`. It is the same code path with one branch, not a second
-  evaluator, so the preview cannot drift from the action it predicts. The mode
-  defaults to execute, so a deployment that sends no mode behaves exactly as
-  before.
-
-  The report gives rows per policy and repository, distinct content hashes —
-  rows are not bytes — a capped sample so the selection can be checked rather
-  than a total believed, and the bytes that would actually be freed. That figure
-  is **simulated, never estimated**: a blob falls only when its reference count
-  reaches zero across the whole candidate set, so the simulation reproduces the
-  purge's edge set term by term, including the OCI membership edges, and
-  excludes any target a surviving artifact still references. Where the candidate
-  set exceeds the simulation's bounds, or a size lookup fails, the figure is
-  reported as **omitted** with a reason — against 142 GB, a plausible wrong
-  number is worse than none.
-
-  Preview and execution are independent jobs at **both** idempotency layers: the
-  server-derived per-day key carries the mode, and the ephemeral
-  `Idempotency-Key` cache now records what its entry was issued for, so the same
-  header sent for a preview and an execution no longer returns the preview's
-  job. `hort-cli`'s window-derived key carries the mode too — it is the normal
-  path, and without it the shipped CronJob and an operator's preview would
-  collide by construction. A preview needs no destructive claim; an execution
-  still does, checked both at the HTTP boundary and inside the use case.
+- **`hort-cli admin retention preview` / `apply`** — a retention policy can be
+  dry-run before it takes anything. The preview draws the same candidates
+  through the same predicates, appends no `ArtifactExpired`, and reports the
+  rows and the bytes a real run would free (#283, #289).
+- **`jobs-row-retention-sweep`** — a daily task kind (migration `027`,
+  `scheduledTasks.jobsRowRetentionSweep`, 03:30 UTC) that reclaims terminal
+  `jobs` rows and keeps the newest state row per kind (#297).
+- **A job row abandoned in `running` is recovered** instead of sitting there
+  forever (#306).
+- **A denial records which leg denied it** — `RbacEvaluator::authorize_explained`
+  returns `Allowed` / `DeniedGrants` / `DeniedCap` / `DeniedBoth` beside the
+  unchanged predicate (#239).
+- **CAS read verification is a binding contract**, enforced structurally
+  rather than hand-written per adapter (#341).
 
 ### Changed
 
-- **Retention policies using `HasFixAvailable` now expire matching artifacts**
-  (#323). The scan findings projection now preserves advisory fix versions, so
-  policies that previously did nothing can take effect without an operator
-  change. Findings recorded before this change read as "no fix" until their
-  artifact is rescanned; the scheduled rescan closes that gap over time.
-
-- **`UnusedFor` is refused at gitops apply while no usage signal exists**
-  (#299). A `RetentionPolicy` whose predicate uses `UnusedFor` — at the root
-  of `spec.predicate` or nested anywhere inside a `Composite` — is now
-  rejected by the apply-config linter and by the offline `hort-server
-  validate-config` gate, with an error naming the policy, the reason, and
-  `AgeExceeds` as the alternative.
-
-  The predicate was not inert, which would have been the milder ADR 0015
-  fault; it was mislabelled. No port supplies a last-download anchor, so the
-  retention evaluator is handed `last_downloaded_at: None` on every artifact
-  and its `None` arm measures the interval from the creation time —
-  `UnusedFor(N)` decided exactly what `AgeExceeds(N)` decides. An operator
-  writing `UnusedFor(90d)` was making a decision about usage and silently
-  getting one about age, which on a hosted repository inverts the intent: a
-  year-old artifact pulled daily is the last thing "unused" should reach and
-  the first thing "old" does.
-
-  New `hort_apply_config_linter_total` rule key
-  `retention_unused_for_not_implemented`, one increment per offending
-  envelope. The `UnusedFor` variant, `ExpirationReason::UnusedTtl` and the
-  evaluator arm are unchanged — the rejection is the operator surface only,
-  and it is retired in the same change that gives the evaluator a real
-  last-download anchor.
-
-- **The retention dry-run's byte accounting probes storage concurrently**
-  (#293). The `freed_bytes` simulation issued one `StoragePort::size_of` per
-  reclaimable target, one at a time. On a filesystem CAS that is a `stat`
-  (5.5 µs, measured); on an object store it is an HTTP `HEAD`, so a preview at
-  the 128 000-target ceiling cost 128 000 serialised round trips — over half an
-  hour against a store answering in 15 ms, which is why the instances that most
-  need the figure were the ones reading `freed_bytes: omitted`. The probes now
-  fan out 64 at a time: 48.9× measured against an object store in the
-  latency-dominated regime a real S3 sits in, 4.3× against a filesystem CAS.
-
-  The width is a measured constant rather than a round one. The adapter's HTTP
-  client imposes no ceiling of its own — `object_store`'s `ClientOptions`
-  leaves `pool_max_idle_per_host` at `reqwest`'s `usize::MAX`, holds idle
-  connections for 90 s, and pins `http1_only`, so one in-flight probe is one
-  socket and a wider fan-out buys sockets rather than backpressure. The width
-  is therefore sized to what the shipped worker's guaranteed CPU share can keep
-  fed, with the measurement recorded beside the constant.
-
-  **Visible only on a failing preview:** when more than one thing goes wrong,
-  the reason is now ranked rather than raced — concurrently, "the first error"
-  is a property of the scheduler. A failed probe outranks an overflowing total,
-  because a sum missing an addend cannot be claimed to have overflowed. The
-  outcome is unchanged: `omitted` with a reason, never a partial sum dressed as
-  `exact`. `MAX_SIMULATION_TARGETS` is unchanged.
-
-- **A `RetentionPolicy` scope names repositories, and a declared retention
-  policy now actually applies** (#282). The `repos` scope carried repository
-  **UUIDs** at the gitops surface — a form that contradicts every other
-  reference in that tree and stops meaning anything the moment an instance is
-  rebuilt against a fresh database, so the one scope a first cleanup needs could
-  not be authored at all. It now carries `metadata.name` values, mirroring
-  `ScanPolicy`: the apply resolves each name to an id exactly once, through the
-  same map and under the same ordering guarantee, and a name that is not
-  declared in the same desired state is rejected before anything is written,
-  with the offending value named. The UUID form is gone rather than kept
-  alongside — a tree still writing ids fails the declared-repository rule.
-
-  The half that made all of this moot is also closed: the retention apply slot
-  was never wired into the composition root, so every `RetentionPolicy` envelope
-  was parsed, validated, logged as skipped, and dropped. It is now wired, and
-  the slot is a required argument rather than an opt-in builder — the failure
-  was omission by inheritance, so omission is now a compile error. A composition
-  that genuinely has no projection still says so explicitly and still warns on
-  every envelope it skips.
-
-  **Operator action:** write `scope: { Repos: [<metadata.name>, …] }`. Nothing
-  in a shipped configuration changes, because no retention policy could take
-  effect before this.
+- **One authority owns the manual release: the curator.** The admin route
+  `POST /api/v1/admin/quarantine/<id>/release` and `hort-cli admin quarantine
+  release` are **gone**; the curator's waive covers the transition, including
+  the stuck-scanner case (#345).
+- **A `RetentionPolicy`'s `repos` scope names repositories by name, not by
+  UUID.** Policies written with UUIDs must be rewritten (#282).
+- **A check that could not be carried out holds the artifact instead of
+  rejecting it.** `ProvenanceOutcome::Indeterminate` separates an unusable
+  trust root, unreadable attestation material and a verifier error from a
+  real disproof (#350).
+- **The worker refuses to start on a trust root it cannot build a verifier
+  from**, and a re-tagged signature reports `DigestMismatch` rather than
+  `BundleMalformed` (#350).
+- **The gitops YAML parser is `serde-saphyr`** — pure Rust, replacing a
+  binding to the unmaintained `unsafe-libyaml` (RUSTSEC-2024-0449) (#347).
+- **A ZIP entry whose name cannot be decoded is no longer read under an
+  invented one**: the metadata reader skips and counts it, the scan extractor
+  refuses the archive (#278).
+- **A failing job becomes terminal at the attempt cap**, and its five attempts
+  now span 96 minutes instead of seven and a half (#341).
+- **`HORT_RETENTION_STREAM_MODE=archive` is refused at startup** while no
+  cold-storage writer exists; `delete` is the way forward (#333).
+- **`UnusedFor` is refused at gitops apply** while no usage signal exists;
+  `AgeExceeds` is the alternative (#299).
+- **Retention policies using `HasFixAvailable` now expire matching
+  artifacts.** Findings recorded before this change read as "no fix" until
+  their artifact is rescanned (#323).
 
 ### Fixed
 
-- **The storage-GC purge locked the artifact, but the blob is what it
-  destroys** (#320). `purge_gc` took `SELECT checksum_sha256 FROM artifacts
-  WHERE id = $1 FOR UPDATE` — a lock on one artifact row — and then deleted a
-  **CAS blob**, which by construction may belong to any number of artifacts;
-  deduplication is the whole point. So the refcount-zero observation and the
-  `StoragePort::delete` that acted on it were two unrelated moments, and the
-  worklist's `refs_remaining` is a *snapshot* the delete can act on sweeps
-  later. A concurrent ingest that deduplicated onto the same hash
-  (`exists(hash)` true, nothing written) and recorded its reference in between
-  left its new artifact pointing at bytes that no longer existed.
+- **Retention works at all.** `KeepLastN` matched nothing, the candidate query
+  could not enumerate a single artifact, the evaluation restarted its keyset
+  cursor on every run, and a completed purge left the artifact unreadable
+  instead of reclaiming its space (#284, #286, #287, #322).
+- **`KeepLastN(n)` could leave n artifacts and no downloadable one** — a
+  quarantined or rejected sibling counted toward the keep set (#292).
+- **A retention preview no longer takes the destructive single-flight key**,
+  so previewing first stopped making the confirmation lie (#291).
+- **The preview's byte figure is no longer bounded by a guess**, and the query
+  behind it lost a 38x performance cliff (#290, #293).
+- **`NOTHING CHANGED SINCE THE PREVIEW YOU NAMED` compares the artifacts, not
+  the totals** (#326).
+- **The `retention-purge` start gate no longer opens after a sweep that did
+  not converge** (#321).
+- **The storage-GC purge locks the blob it destroys**, not one artifact row
+  (#320).
+- **A retention expiry can no longer push an artifact stream past the
+  200-event cap**, which made every capped reader decide on the oldest 200
+  events (#324).
+- **An artifact whose findings the policy did not block is released.** A
+  non-empty finding list set `rejected` terminally whatever the policy verdict
+  beside it said (#344).
+- **A stored quarantine status the domain cannot parse no longer decodes to
+  the most permissive one** (#334).
+- **A gitops bundle is no longer half-applied when a late check refuses it**,
+  and a `ScanPolicy` scoped to an undeclared repository is rejected instead of
+  crashlooping the pod (#334).
+- **A lifecycle decision can no longer be committed over a newer verdict**
+  (#334).
+- **The CAS scrub classifies a real hash mismatch as a mismatch** instead of a
+  read error (#341).
+- **The publish kill switch (`HORT_PUBLISH_BODY_MAX_SIZE=0`) refuses the
+  publish itself**, and reaches every hosted format (#341).
+- **A compensating delete removes only the job row it inserted** (#349).
+- **An exclusion is removed by its identity, not by its CVE** — a policy may
+  hold several exclusions for one CVE (#349).
+- **A failed OCI manifest `DELETE` no longer strands a live manifest without
+  its keepalive edges** (#301).
+- **A soft delete releases the content reference**, so the bytes have a
+  release path (#295).
+- **Notification subscribers receive the artifact lifecycle.** Delivery read a
+  channel the atomic append path never fed, and an exhausted failure budget
+  during catch-up did not stop the task (#296).
+- **A pull-through response that triggers a quarantine reports the policy's
+  own window**, not a flat 3600 s `Retry-After` (#240).
+- **`hort-server validate-config` runs the rules it claimed to run** (#304).
+- **Terminal `scan` and `prefetch` job rows are reclaimed on the non-k8s
+  deploy**, and the prefetch rotation cursor survives its sweep (#308).
 
-  Closed with a **hash-scoped Postgres advisory lock**
-  (`hort-adapters-postgres/src/blob_lock.rs`) that both sides take. The sweep
-  takes it with `try` and re-reads the cross-`kind` count under it immediately
-  before deleting, holding it across the storage call (the guard *is* the open
-  transaction, which is how the lock spans the commit boundary the reference
-  bookkeeping ended at). Every production `content_references` write —
-  `PgContentReferenceRepo::insert`, which every ingest / OCI / provenance /
-  wheel-metadata / curation path funnels through, and
-  `PgRefcountReconcile`'s repair upsert — takes the same lock in the same
-  transaction as its write, so a re-reference is either committed before the
-  re-count or blocked until the lease ends.
+### Security
 
-  **Skip when in doubt**, reusing the retry the sweep already had: contention
-  defers (nothing deleted, no terminal event, the durable worklist row stands,
-  the next run asks again) and surfaces as `blobs_deferred` in the
-  `retention-purge` summary plus `hort_retention_purged_total{result="deferred"}`
-  — which is what distinguishes *nothing to reclaim* from *reclamation being
-  skipped every run*. A count that is no longer zero is a **keep**, not a
-  deferral: the blob stays, the worklist row is corrected under the lock, the
-  purge finishes, and the `ArtifactPurged` states the count that actually held
-  instead of the stale zero.
-
-  Also capped the sweep's first run, which was unbounded because the pending
-  set's size is only known once it is fully loaded: `list_pending_purge` is now
-  keyset-paged and the walk stops at `MAX_BATCHES_PER_TICK * BATCH_SIZE`
-  (64 × 1000), retention-evaluate's shape and numbers. No cursor is persisted —
-  unlike retention-evaluate's candidates, this sweep *consumes* its work set.
-
-  Enforced by `crates/hort-app/tests/blob_reclaim_lock.rs` (DB-free source
-  scan: every production `INSERT INTO content_references` is preceded by the
-  lock helper in its own function, the advisory-lock SQL is spelled in exactly
-  one file, and the sweep never takes the waiting form), alongside DB-backed
-  proofs that the ingest write and the reconcile repair each block on the very
-  lease the sweep holds.
-
-- **The non-k8s deploy never reclaimed terminal `scan` job rows** (#308).
-  `scan-row-retention-sweep` was the only default-on chart CronJob with no
-  systemd counterpart in `hort_timers`, so on an Ansible-deployed instance
-  every artifact scan — ingest plus every periodic rescan — left a terminal
-  `jobs` row forever. Added the timer (daily 03:00, matching the chart), and
-  added `crates/hort-config/tests/deploy_schedule_parity.rs`, a DB-free source
-  scan that holds the chart's `cronjob-*.yaml` set against
-  `hort_timers_tasks` in both directions, so the next task that ships on one
-  flavour and not the other fails a test instead of standing for years. The
-  one legitimate asymmetry (`noop`, a heartbeat for the k8s svc-token chain
-  the native deploy does not have) is named in the test with its reason, and
-  the test fails if that reason goes stale in either direction.
-
-- **The prefetch rotation cursor sat in a sweep with no keep-newest clause**
-  (#308). `delete_terminal_prefetch_rows_older_than` matched `kind LIKE
-  'prefetch%'`, which also caught `prefetch-tick` — whose keyset rotation
-  cursor lives in the `result_summary` of its newest `completed` row and is
-  read back by `PrefetchTickHandler::read_cursor`. An instance whose
-  `prefetch-tick` schedule was off (it is default-disabled) or failing for
-  longer than the 7-day horizon lost the cursor and restarted the rotation
-  from the beginning, so on a large instance the tail packages came up rarely
-  or never. The kind is now carved out of the cascade predicate and swept by
-  `jobs-row-retention-sweep`, which retains the newest `completed` row per
-  kind. `prefetch-tick` is a scheduled tick, not cascade work; it matched the
-  cascade only by name prefix.
-
-- **Ten places documented a way to set a retention horizon that does not
-  exist** (#308). The two row-retention CLI subcommands, four chart CronJob
-  templates, five `scheduledTasks` blocks in `values.yaml`, three
-  `values.schema.json` descriptions and several handler docs pointed operators
-  at `hort-cli admin task invoke <kind>`. `hort-http-admin-tasks::router()`
-  enumerates its invoke routes one by one and none of
-  `quarantine-release-sweep`, `prefetch-tick`, `wheel-metadata-backfill` or the
-  three row-retention sweeps is among them, so those requests answer 404;
-  the `enqueue-*` subcommands behind the CronJobs and timers take no horizon
-  argument and write `params` unconditionally empty. Every such comment now
-  says what is true: the handler's 7-day `DEFAULT_HORIZON` is the horizon in
-  force on every supported path. No route, flag or chart value was added —
-  `horizon_seconds` and the 365-day cap stay as they are, now documented as
-  what they are. The cap's stated justification was also invented: it claimed
-  a wide horizon "falls off the `updated_at` index", and no migration creates
-  an index on `jobs.updated_at`.
-
-- **`NOTHING CHANGED SINCE THE PREVIEW YOU NAMED` compared totals, not the
-  artifacts** (#326). `render::diff` had nothing else to compare with:
-  `PreviewGroup` carried `rows` and `distinct_contents` and no statement of
-  *which* rows, so the CLI could not detect an identity change even in
-  principle. Between the baseline preview and the apply, artifact A could stop
-  matching and an equally sized B start — same row count, same distinct
-  contents, same byte total, same coverage — and the comparison reported that
-  nothing had changed, **skipped the acknowledgement confirmation**, and the
-  apply expired B instead of A. The sample could not close the gap either: it
-  is capped server-side and may be empty. Among artifacts of the same kind,
-  equal totals are not a rare coincidence, and the confirmation is the last
-  place a human sees what disappears.
-
-  The preview now carries the proposal's identity. `retention-evaluate`'s
-  `build_preview` digests the `(policy_id, artifact_id)` pairs it matched —
-  the proposal's own unit, since one artifact matched by two policies is two
-  expiries — in ascending pair order, framed one pair per line and
-  domain-separated from every other digest in the system, and emits it as
-  `preview.proposal_digest` plus one per `(policy, repository)` group so a
-  reader can say *which* group moved. It is fixed-width whatever the
-  proposal's size, it is computed inside the walk the preview already
-  performs, and it is not a content hash: it digests identifiers, never
-  artifact bytes. A `scheme` tag rides with each value, so a baseline written
-  before a server upgrade and a fresh preview written after it report "not
-  comparable" instead of a false "the proposal changed".
-
-  The comparison decides on that identity, and fails closed: `NOTHING
-  CHANGED` is now earned only by matching identities, and every other
-  outcome — different rows, no identity reported, two schemes — demands the
-  acknowledgement and says which of the three it found. `delta.changed` in
-  the JSON keeps that reading (`true` whenever sameness was not *established*),
-  so a script gating an unattended apply on `changed == false` stops rather
-  than proceeding blind; `delta.proposal.comparison` distinguishes the cases.
-
-  **Partial coverage qualifies a difference, never a match.** Equal digests
-  mean the same proposed rows however much of the candidate set each run
-  examined. Differing digests over a `partial` run are another matter: the
-  sweep persists its keyset position, so an execution between the two
-  previews moves the window under them, and reporting that as "the proposal
-  changed" would be a warning that fires when nothing moved — trained away,
-  then missed on the run where something did. The output says it compared two
-  windows and that the difference may be the window rather than the world;
-  `delta.proposal.window_limited` carries the same fact for a script.
-
-- **The retention expiry could push an artifact stream past the 200-event cap,
-  and every capped reader then decided on the oldest 200 events** (#324).
-  `STREAM_EVENT_CAP` is an enforced bound, not an estimate: it is what makes a
-  single capped `ReadFrom::Start` read of an artifact stream equal to reading
-  the whole stream, which is what `read_expected_version` relies on when it
-  reads `cap + 1` events and refuses a stream longer than that. One writer sat
-  outside that bound. `RetentionUseCase::append_expired` appends at
-  `ExpectedVersion::Any`, the adapter treats `Any` as no version check at all,
-  and the method took the stream length as `_stream_len` and discarded it — so
-  the daily expiry sweep was the only writer able to grow an artifact stream
-  without limit.
-
-  Past the cap, every full-stream reader silently answered a question about the
-  oldest 200 events instead of the stream. **The release authorization is the
-  one that matters**: it resolves `ScanSucceeded` from the *latest*
-  `ScanCompleted` plus the absence of an `ArtifactRejected` *later than it*, and
-  both halves are wrong over a truncated prefix — a stale clean scan reads as
-  current and the rejection that superseded it lies outside the read, so the
-  timer sweep releases an artifact the scanner condemned. The same truncation
-  reached the retention evaluation itself (an existing `ArtifactExpired` past
-  position 199 is invisible, and since the append was unchecked another was
-  added every pass), scan history, the provenance clearance, the provenance
-  cascade's idempotency check *and* its derived append version, the
-  misrejection-repair conjuncts, and the event-store retention terminal proof —
-  which decides whether to **delete** a stream.
-
-  Both sides are now closed. The expiry append refuses when the length it was
-  already handed leaves no room under the cap. Every full-artifact-stream read
-  goes through one helper, `read_artifact_stream`, which reads `cap + 1` events
-  so that a read returning at most `cap` has provably reached the tail, and
-  refuses one that has not rather than return a prefix; the six duplicated
-  `STREAM_READ_LIMIT`/`READ_LIMIT`/`TERMINAL_PROOF_READ_LIMIT` constants that
-  each carried their own copy of the number are gone with it. Raising the cap
-  was explicitly not the fix — a larger number only moves the point at which
-  the same silent truncation happens. A candidate whose stream cannot be read
-  completely is skipped by the release sweep at `error!` level and stays
-  quarantined (fail-closed), rather than failing the whole sweep tick and
-  stalling every other candidate's release.
-
-- **The `retention-purge` start-gate opened after a sweep that did not
-  converge** (#321). `RefcountReconcileUseCase::sweep_drift` keeps sweeping
-  past a repository it cannot scan or a repair it cannot apply, counts each
-  failure in `ReconcileSummary::errors`, and returns `Ok` either way — by
-  design, so one bad repository does not block the rest from converging. The
-  worker's boot sweep read that `Ok` as convergence and opened the gate,
-  logging `errors=1` and `converged — RetentionPurgeHandler gate OPEN` on the
-  same line. The error count was logged and never read.
-
-  The gate exists to keep the destructive storage-GC walk off an unconverged
-  `content_references` refcount projection, and a partially-failed sweep is
-  exactly an unconverged one: an artifact whose `primary_content` edge is
-  missing (repair failed) or was never looked at (scan failed) contributes
-  nothing to its hash's cross-`kind` count, so purging a retired sibling that
-  shares the hash drives the count to zero and deletes the live artifact's
-  bytes.
-
-  The convergence verdict is now `ReconcileSummary::converged()`
-  (`errors == 0`), read by the worker composition root; a partial failure
-  takes the same fail-safe posture the whole-sweep failure already had — gate
-  CLOSED, purge refuses and retries, boot does not abort — with a log line
-  that no longer claims the convergence that did not happen. `hort-server`'s
-  pre-traffic sweep keeps its own behaviour (it hosts no purge handler) and
-  now reports `converged` alongside the counts.
-
-  Because the gate is decided once per boot and holds for the life of the pod,
-  a closed gate is now discoverable **while it persists**, not only at the
-  instant it is decided: the worker's 60-second heartbeat tick restates it as
-  a `warn!` carrying the worker id, the reason and the remediation, and sets
-  the new `hort_refcount_reconcile_gate_closed` gauge (0/1, refreshed per
-  tick). The log line is the primary signal deliberately — the worker
-  `/metrics` listener is off by default, so a gauge alone can be unreadable in
-  a real deployment. Every refused purge also continues to land its refusal in
-  `jobs.last_error`, served by the always-on admin task API.
-
-- **The retention evaluation restarted at the beginning of the keyset every
-  run** (#322). `RetentionEvaluateHandler` walks at most
-  `MAX_BATCHES_PER_TICK * BATCH_SIZE` = 64 x 1000 = 64,000 artifacts per run,
-  and re-initialised its keyset cursor to `None` on every invocation. Since
-  `RetentionCandidateReader::list_candidates` is paginated by `artifacts.id`
-  (`a.id > $3 ORDER BY a.id`) and excludes nothing it has already looked at,
-  every daily run re-walked the same leading 64,000 ids and stopped. The doc
-  comment claimed "subsequent daily ticks drain the rest", which holds only if
-  the candidate set shrinks — that needs the leading artifacts to expire *and*
-  be purged, and purge is disabled by default. On a registry with more than
-  64,000 eligible artifacts the tail was therefore never evaluated, with no
-  error signal: the run reported success with `partial` coverage. This broke
-  **logical** retirement (artifacts being marked expired and leaving service),
-  independently of physical byte reclamation.
-
-  The run now persists where it stopped and resumes there. The position rides
-  the run's own `result_summary.cursor` and is read back by the next run's
-  fresh `jobs` row through `JobsRepository::last_result_summary_by_kind` — the
-  `prefetch-tick` rotation's mechanism, applied to a single-dimension keyset
-  walk. No new table, no column on `artifacts`, no operator knob, and the
-  jobs-row retention sweep already retains the newest `completed` row of every
-  kind precisely because readers of this shape exist. A short or empty page
-  means the walk reached the highest candidate id, so the pass is over and the
-  cursor goes back to `null`: the next run starts from the beginning. Full
-  coverage costs `ceil(candidates / 64,000)` runs, and a candidate set that
-  fits inside one run behaves exactly as before — one page, pass complete,
-  cursor `null`.
-
-  Two properties are now stated rather than left to be rediscovered.
-  **Coverage comes from the wrap, not from the ordering**: `artifacts.id` is a
-  v4 UUID, so the walk traverses UUID space rather than time and a newly
-  eligible artifact lands behind the saved cursor about half the time; the
-  bound on when it is seen is two passes, delivered by the wrap. **A dry run
-  leaves the rotation where it found it**: a preview takes no per-UTC-day
-  single-flight claim (ADR 0028) and so may run any number of times a day, and
-  it reads the cursor — which is what makes it a preview of the window the
-  next execution will act on — and writes back exactly the value it read.
-  Advancing on a preview would let previews walk the rotation past the one
-  execution a day allows; writing `null` would reset it.
-
-  `coverage` now answers for the run rather than for the enumeration:
-  `complete` only when the run both started at the beginning and reached the
-  end, so a run that resumed mid-pass and drained to the tail reports
-  `partial` — the artifacts behind its start point are not in its figures. The
-  CLI's `PARTIAL` header says what becomes of them instead of leaving "still
-  unexamined" to read as a permanent blind spot.
-
-- **`hort-server validate-config` ran no row-0 rule, and said the opposite**
-  (#304). The offline gate parsed the tree and then went straight to the
-  `StaticConfigValidator` rows: `DesiredState::validate()` — the per-envelope
-  domain rules and the cross-document rules (duplicate `(kind, name)`,
-  dangling references, singleton conflicts, virtual-member resolution) — was
-  never called, and outside `validate_against` it was called nowhere in the
-  binary. A tree with a `PermissionGrant` pointing at an undeclared
-  repository, two envelopes sharing a `(kind, name)`, a `RetentionPolicy`
-  scoped to a repository nothing declares, or a structurally invalid
-  `spec.predicate` such as `{AgeExceeds: 0}` validated clean, exit 0, and then
-  parked the pod not-ready at boot. Three places in the command claimed
-  otherwise — the step-3 comment, the failure branch's "parse / cross-validate
-  error(s)", and an honesty footer naming only rows 1 and 4 as missing — so an
-  operator reading it concluded the coverage was there.
-
-  The command now calls `DesiredState::validate()` between parse and the lint
-  rows. That is the apply path's own row 0 (`validate_against` delegates to it
-  before adding its snapshot/env rules), so this is a shared source rather
-  than a second implementation, and the two verdicts cannot drift. The
-  rejection is headed by a message saying the *gate* got stricter rather than
-  the tree — these errors were already failing that operator's apply,
-  invisibly. Every gitops tree this repository ships already passes row 0 and
-  is now guarded against regressing (`gitops_trees_validate` covers all four,
-  including `deploy/compose/s3/config`, which the three `hort-config` per-tree
-  guards do not reach).
-
-  The footer now names every apply pre-write check the command still skips,
-  and why each is absent — a distinction the old wording flattened. Only two
-  are blocked on the running deployment: the managed-by ownership rule and the
-  `HORT_UPSTREAM_ALLOWLIST_HOSTS` gate (enforced over the create+update slice
-  of the `UpstreamMapping` diff). The `HORT_AUTH_PROVIDER=disabled` ×
-  `ClaimMapping` rule needs only that env var, and the `scanBackends`
-  backend-**name** check (row 4) needs nothing at all; both are merely not
-  wired here yet. Two standing claims were wrong and are corrected in the same
-  change: there is no immutable-field-change check anywhere in the gitops
-  apply path, and row 4 has validated against the compiled-in
-  `KNOWN_SCAN_BACKENDS` rather than the live worker registry since regression
-  H20.
-
-- **A failed OCI manifest `DELETE` stranded a live manifest without its
-  keepalive edges** (#301). The digest-`DELETE` handler swept the manifest's
-  `content_references` rows *before* the lifecycle delete, non-transactionally
-  and warn-on-fail, then called `ArtifactUseCase::delete`. A failure in the
-  second step returned 500 and left a live, servable manifest whose
-  `oci_config` / `oci_layer` / `oci_index_member` keepalive edges were
-  permanently gone — `PgRefcountReconcile` re-creates only the single-target
-  `primary_content` / `metadata_blob` kinds, so nothing repairs them. The
-  manifest's config and layer blobs became GC-collectable while every read path
-  still considered the manifest healthy, and at the next purge the bytes
-  vanished underneath it. The two calls are now in the other order: the
-  lifecycle delete commits first, so a failed delete returns 500 with every
-  edge intact, and the sweep runs on the committed-transition side where a
-  projection-write failure can only leave a tombstoned source whose edges
-  stand until the purge clears them — the same eventual-consistency posture
-  every other `content_references` write already has.
-
-  The eager sweep was *not* dropped in favour of the transactional one in
-  `purge_artifact_refs`, despite the two now deleting the same rows. The purge
-  is only ever offered an artifact whose `quarantine_status` is outside the
-  GC-protected set (`quarantined`, `rejected`, `scan_indeterminate`), and
-  nothing stops a caller deleting a quarantined manifest — so for those
-  statuses the purge never runs and the DELETE-time sweep is the *only* sweep.
-  Promptness is load-bearing too: three live readers of the edge set (the OCI
-  referrers projection, `IngestUseCase`'s referenced-tree-descendant
-  quarantine anchor, and the release sweep's parent-gated-blob skip, whose own
-  liveness argument names this sweep) must stop seeing a tombstoned source
-  immediately rather than at the next purge interval.
-
-- **A Postgres that was set but unreachable turned the DB-gated suite into
-  silent passes** (#302). `test_support::isolated_db_from` returned `None` on
-  every failure — URL parse, maintenance connection, `CREATE DATABASE`, pool
-  connect — which is the same value its 60 call sites use for "no
-  `DATABASE_URL`, no database, skip". The caller could not tell the two apart,
-  early-returned, and libtest reported `ok`. Not an uncertain result, a false
-  one: the state in which a green gate is most valuable — the server has a
-  problem — was the state in which the gate inverted, and the `ignored` count
-  was not even a lower bound on what had been skipped. Measured against a
-  closed port, `cargo test --workspace --tests --no-fail-fast` reported 12,350
-  passed / 1 failed / 7 ignored, the single failure being the one test in the
-  workspace that hand-rolled `.expect()` on its own maintenance connection; a
-  dead server also cost ten minutes of `acquire_timeout` stalls on the way to
-  that green.
-
-  The `DATABASE_URL` read stays where it is — unset still skips, and an unset
-  workspace run is still green, because that is how the pre-push gate runs.
-  What changed is everything after it: once a URL is in hand the operator has
-  declared a database, so `isolated_db_from`, the new shared
-  `test_support::connect_or_panic`, and `shared_migrated_pool` panic with a
-  message naming the stage that failed and the credential-free target. The
-  same command against an unreachable target now reports 489 failures across
-  42 targets.
-
-  The swallow was not confined to the isolation helpers: five hand-rolled
-  `admin_pool()` fixtures (`hort-server`'s four `migrate_*` targets and
-  `hort-worker`'s `schema_compat_boot`) carried their own
-  `PgPool::connect(&url).await.ok()` and never touched `test_support` at all —
-  35 further tests a helper-only fix would have left silent. They now route
-  through `connect_or_panic`. A new DB-free source guard,
-  `crates/hort-app/tests/db_gate_not_silent.rs`, rejects any
-  `PgPool`/`PgConnection` connect whose error is discarded with `.ok()`, and
-  pins the isolation harness to a single `?`-shaped skip: the `DATABASE_URL`
-  read.
-
-- **The response that triggers a quarantine reported a flat 3600 s
-  `Retry-After`** (#240). A pull-through `GET` that ingested and quarantined
-  an artifact answered `503 UNAVAILABLE` with `retry_after_seconds: 3600`
-  whatever the policy's window, while a later read of the same row reported a
-  correctly computed remaining time (observed against a 48-hour policy: 3600
-  on the triggering response, 143914 on a later one). The computation was
-  never wrong; `quarantine_deadline` is transient and non-persisted — the
-  schema stores only the immutable anchor `quarantine_window_start` and the
-  deadline is derived live, so the Postgres row mapper yields `None` — and
-  nothing on the ingest path filled it in, so the consuming handler's
-  deadline-unknown constant fired on the one response where Hort had just
-  computed the window in order to create it. Wrong in the load-generating
-  direction: a client honouring it returns after an hour on a 48-hour window
-  and is refused again, roughly 47 times.
-
-  Both halves of the ingest path now hydrate, at the use-case layer, so every
-  format's quarantine response inherits the fix with no change of its own.
-  `ArtifactUseCase::find_in_repo_by_hash` — the post-coalesce recovery read
-  the OCI blob and manifest, Cargo, npm, PyPI and Maven pull-through tails all
-  take, since the leg that fetched from upstream discards its own ingest
-  outcome — hydrates through the same `hydrate_quarantine_deadline` a later
-  read goes through. The two `IngestUseCase` mint paths stamp the pair from
-  the anchor and duration already in hand (no extra policy resolution), which
-  covers the cross-repo coalesced-follower row that has no later read to
-  hydrate it. The shared arithmetic lives in one place
-  (`use_cases::quarantine_hold`) so the two layers cannot report different
-  remaining windows for one artifact.
-
-  The deadline is measured from the **derived** anchor, never from `now`:
-  ADR 0054's anchor may legitimately predate the ingest (in the observed case
-  `library/hello-world` inherited an eight-hour-old anchor through the
-  `first_seen` age source, which is why the correct later value was 143914 and
-  not 172800), so reporting the policy duration would be wrong in the other
-  direction — and wrong invisibly, since it looks right on any freshly-seen
-  artifact. No change to the window, the release predicate, the past-deadline
-  clamp, or the `Retry-After` suppression for a hold with no self-resolving
-  deadline.
-
-- **Notification subscribers never received the artifact lifecycle** (#296).
-  Push delivery ran off an in-process `tokio::sync::broadcast` channel fed by
-  `EventStorePublisher` after `EventStore::append`. But every event that must
-  land atomically with a projection write goes through
-  `PgEventStore::append_in_tx` instead — reached via `ArtifactLifecyclePort`,
-  `RefLifecyclePort`, `ArtifactGroupLifecyclePort`, the artifact delete and
-  the purge sweep — which sits *below* the publisher and therefore below the
-  `send`. That is the whole subscribable artifact lifecycle: `ArtifactIngested`,
-  `ChecksumVerified`, `ArtifactQuarantined`, `ScanRequested`, `ScanCompleted`,
-  `ArtifactBecameVulnerable`, `ArtifactReleased`, `ArtifactRejected`,
-  `ScanIndeterminate`, `ProvenanceVerified`, `ProvenanceRejected`,
-  `ArtifactReEvaluated`, `PromotionRequested`, `PolicyEvaluated`,
-  `ApprovalRequested`, `ApprovalDecided`, `ArtifactPromoted`,
-  `PromotionRejected`, `ArtifactDeleted`, `ArtifactPurged` and
-  `ArtifactCorrupted`, plus `RefMoved` / `RefRetired`
-  and every `ArtifactGroup*` kind. Exactly two artifact-stream kinds reached the
-  channel — `ArtifactExpired` and `CasIntegrityMismatch`, both appended through
-  the publisher. The same channel is per-process and the dispatcher
-  has no leader election, so at `replicaCount > 1` a replica also never saw any
-  other replica's appends. This was not new with #286's atomicity work —
-  `ArtifactDeleted` had behaved this way since the delete path existed (#281);
-  #286 only made it visible on a second event.
-
-  Catch-up did not save it. The read is `global_position > last_delivered_position`,
-  so as soon as one *delivered* event checkpointed a higher position, every
-  never-delivered event below it was below the mark and never revisited —
-  permanent loss, from that moment rather than from the next restart. (The
-  documentation claiming that marker was "operator visibility, not a delivery
-  cursor" was simply false.)
-
-  Delivery is now driven by reads of the event store
-  ([ADR 0061](docs/adr/0061-store-driven-notification-delivery.md)): every event
-  is delivered by `catch_up` — already the filter, dispatch and progress path —
-  which runs on every 5-second `STORE_POLL_INTERVAL` tick and not only at
-  startup and on `Lagged`. The broadcast becomes a **wake-up**: its
-  `global_position` is discarded, and only its *category* is used, as the
-  predicate deciding whether this subscription has anything to read at all.
-  Delivering the payload directly is the tempting shortcut and is the same bug
-  one layer up — the delivered position would advance the cursor over every
-  transactional append below it, so a subscriber getting a publisher-path event
-  at position 100 would skip the appends at 51..99. Only reads advance the
-  cursor, which is what keeps the walk contiguous.
-
-  **A pass reads the filter's categories as one ordered stream**, via a new
-  `EventStore::read_categories`. The task holds one cursor over one
-  `global_position`-ordered page rather than one cursor per category, which is
-  what makes the single persisted `last_delivered_position` scalar correct
-  instead of approximately correct — a per-category walk over one scalar loses
-  events across a restart, because the scalar is seeded into every category at
-  spawn and an advance driven by one category becomes the floor for all of
-  them. The port ships a default that merges per-category reads (right for the
-  ~20 in-memory implementations); Postgres overrides it with a `UNION ALL` of
-  per-category keyset arms that the planner serves with a `Merge Append`. The
-  shape is the deliverable: the obvious `stream_category = ANY($1)` spelling
-  measures 160 641 buffers and 33.9 ms — 160 001 rows scanned and discarded to
-  return nothing — against 9 buffers and 0.011 ms for what ships, on a seeded
-  200 000-event table under both custom and generic plans. A source-scan guard
-  pins it.
-
-  **A failed delivery is no longer checkpointed past.** Previously the failed
-  event's own position was written to `last_delivered_position` and reads
-  resume strictly above it: one transport attempt, ever, and a 30-second
-  receiver outage silently swallowed every event that arrived in it. The pass
-  now stops at the failed event, leaves the cursor below it, persists the
-  position *before* it, and retries on every subsequent tick — until it
-  succeeds or the existing 100-failures-in-1h budget disables the subscription
-  visibly. That is what makes "at-least-once" a statement about deliveries
-  rather than about attempts, and the budget is what bounds the head-of-line
-  block the in-order retry creates.
-
-  No transaction gained, lost or reordered a statement, and
-  `hort-adapters-postgres` still holds no broadcast sender — asserted both
-  behaviourally (`event_delivery_visibility.rs`) and as a source-scan guard on
-  the crate (`no_broadcast_in_adapter.rs`), since a sender reached through a
-  setter would leave the behavioural test green. The stated guarantee moves
-  from "best-effort, may drop" to **at-least-once for every event visible to a
-  category read when the cursor passes it, duplicates possible**: a duplicate
-  is the receiver's to drop (`X-Hort-Delivery-Id` + stable `global_position`),
-  a gap is nobody's to recover.
-
-  Three residuals are deliberate and named in the ADR.
-  `events.global_position` is a `nextval` default evaluated at INSERT while a
-  row becomes visible at COMMIT, so a later-committing transaction can hold a
-  lower position and a bare high-water-mark cursor steps over it — pinned
-  against a live database, and it bounds `GET /api/v1/events`'s `next_after`
-  checkpoint at least as much as the dispatcher, so closing it is a change to
-  the position model. It is *widened* here, measurably rather than slightly:
-  the old live loop delivered whatever it received regardless of position, so
-  publisher-path events were immune by accident, and the window is the whole
-  transaction tail including lock waits (every transactional port appends first
-  and writes projections after), not one commit latency. Second: the event
-  store is swept on age, not on delivery, so a subscription paused across a
-  retention sweep can miss events that were deleted — bounded by both sweeps
-  being `enabled: false` by default and the floor defaulting to 1 080 days.
-  Third: N replicas still deliver N times.
-
-  A failed *read* is fail-closed the same way (the cursor does not move), which
-  means a deterministic read failure — one row a replica cannot decode, as a
-  mid-rollout version skew produces — stalls a subscription indefinitely rather
-  than skipping. `hort_notify_store_read_errors_total` is the alertable signal;
-  before it, the only signal was a `warn!` per tick.
-
-- **Failure-budget exhaustion during catch-up did not stop the task** (#296).
-  `catch_up` returned `()`, so its early exit on an exhausted budget ended only
-  the pass: `run` carried on into the live loop and kept delivering to a
-  subscription it had just transitioned to `Disabled`. Contradicted both the
-  module documentation and the inline comment asserting the opposite. `catch_up`
-  now reports the exit to its caller — load-bearing now that the pass runs on
-  every poll tick.
-
-- **A soft delete never released the content reference, so the bytes had no
-  release path at all** (#295). `ArtifactUseCase::delete` is an event-sourced
-  soft delete: the adapter appends `ArtifactDeleted` and sets
-  `artifacts.deleted_at` in one transaction, and its doc comment stated that
-  the CAS blob is left to refcount-gated GC "because another artifact may
-  reference the same bytes". The intent was right and the mechanism never
-  fired. The `content_references` source edge stood after the delete, so the
-  refcount never fell, so the refcount-gated collector never saw the blob — no
-  predicate reached those bytes, no policy selected them, and no configuration
-  changed it.
-
-  `ArtifactDeleted` is now a **byte-release work item** in its own right:
-  `purge_gc::list_pending_purge` enumerates every artifact stream carrying an
-  `ArtifactExpired` *or* an `ArtifactDeleted` with no following
-  `ArtifactPurged`, and the existing storage-GC sweep releases the source
-  edges, deletes the blob at cross-kind refcount zero, and appends the
-  terminal event — unchanged, crash-safe, and still the only destructive path.
-  The carrier is the event the delete already writes rather than a synthesised
-  `ArtifactExpired` (which would have to invent a `policy_id`, a `policy_name`
-  and an expiry reason for a decision no policy made) or a new work-item event
-  (which would duplicate, on the same stream at the same instant, a fact
-  `ArtifactDeleted` already records). It is also already durable in the same
-  transaction as `deleted_at`, so the work item cannot come apart from the
-  retirement that authorises it — no new transaction code was needed to get
-  the atomicity.
-
-  A delete does not inherit the `KeepLastN` tag exemption. That flag is
-  vacuously true for an artifact carrying no expiry decision at all, so a
-  tagged delete would otherwise have been skipped forever by a rule for a
-  policy that never ran, its bytes held by a mutable ref pointing at a row no
-  read path resolves. Invariant 1 is untouched: a quarantined, rejected or
-  scan-indeterminate artifact keeps its bytes as evidence even when a caller
-  deletes it — and unlike the retention path, which pre-filters those
-  statuses, the delete verb is deliberately orthogonal to the quarantine axis,
-  so the sweep's status filter is what holds there.
-
-  Byte release is asynchronous, bounded by the `retention-purge` sweep
-  interval (default `0 4 * * *`); the sweep summary gains
-  `user_deletes_visited` so a deployment with no retention policy configured
-  can still attribute the destructive work it does. On first run after
-  upgrading, the sweep collects the bytes of artifacts deleted before this
-  change — which is the point.
-
-- **`KeepLastN(n)` could leave n artifacts and no downloadable one** (#292).
-  The retention candidate reader ranked siblings over every live row of the
-  `(repository, name)` group, while the candidate page itself excluded the
-  GC-protected statuses. A quarantined, rejected or scan-indeterminate sibling
-  could therefore never expire *and* still held a rank slot — the two halves of
-  one query disagreeing about what a sibling is.
-
-  That does not merely narrow the keep window, it can empty it. `KeepLastN(3)`
-  over five siblings whose three newest went into quarantine together — one
-  scan hit on a fresh build burst does exactly that — gave ranks 1–3 to the
-  quarantined rows and expired both released siblings at ranks 4 and 5. What
-  survived was three artifacts, none downloadable and none collectable, for an
-  operator who had asked to keep the last three.
-
-  The rank now counts **usable** siblings: `ranked` carries the identical
-  predicate the page does, bound from the same protected-status set, so
-  `KeepLastN(n)` means n artifacts a client can actually fetch. The accepted
-  counter-cost is that a group holds n plus its protected siblings rather than
-  n rows — a population `KeepLastN` could not have collected in any case.
-  Releasing a protected sibling re-enters it in the rank and can push an older
-  released sibling out of the window; that is the rule working, since release
-  is what makes an artifact usable. A soft-deleted sibling still occupies no
-  slot, and the tag exemption is unchanged.
-
-- **A retention preview took the destructive single-flight key, so previewing
-  first is what made the confirmation lie** (#291). `retention-evaluate` is a
-  destructive *kind*, and the server derived its durable per-UTC-day
-  idempotency key for every invocation of one — including a dry run. The second
-  preview of a UTC day was therefore not a sweep at all: the server answered
-  `200 OK` with the first one's job.
-
-  That fires on the intended workflow, every time. `hort-cli admin retention
-  apply --from-preview A` re-measures immediately before executing so it can
-  show what moved since the proposal; that fresh preview was deduplicated back
-  to A, so the delta was A against A and always empty. The execution *was*
-  fresh, and expired what it found. The operator read "nothing changed since
-  you looked" and then authorised a sweep computed from different data.
-
-  The key is a single-flight claim on destroying something, so it is now
-  derived per **invocation** rather than per kind, from the same domain answer
-  that decides whether the caller needs the `task:destructive` claim — one
-  decision, two consumers, and a test that fails if they ever come apart. A dry
-  run takes no key and is repeatable; an execution keeps the key it has always
-  had, mode segment and all, so a second execution in one UTC day is still
-  deduplicated by design. Audit routing is unchanged: a dry run's `TaskInvoked`
-  still lands on the never-deleted destructive-kind stream.
-
-- **The preview's byte figure was bounded by a guess, on the wrong axis, and
-  the query behind it had a 38× performance cliff** (#290). The simulation
-  refused to compute a size above 10 000 candidate artifacts or 10 000 target
-  blobs — round numbers, not measured ones — so a preview over a repository of
-  any real size reported the figure as omitted, and said only that a bound had
-  been exceeded.
-
-  Measured, the cost sits on the **target** side: about 7 µs of walk per target
-  against about 2 µs per candidate artifact. The bounds now reflect that — a
-  100 000-artifact backstop above the sweep's own structural maximum, and a
-  128 000-target operational ceiling — and both carry the measurement in their
-  doc comments. The omission now names the bound it hit, its value and the
-  observed count, so a narrower scope is a decision an operator can make rather
-  than guess at.
-
-  The measurement also turned up a latency cliff that would have surfaced only
-  in production: the survivor probe filtered with `NOT (… = ANY($1::uuid[]))`,
-  and PostgreSQL folds bound parameters into constants only while it is building
-  custom plans. From the sixth execution on a pooled connection — the steady
-  state for a worker that holds connections for days — the plan goes generic and
-  the array becomes a linear scan per row, measured at 64.2 s against 1.7 s for
-  identical input. The probe is now an anti-join against the candidate set,
-  producing a verified-identical result, with a structural guard pinning the
-  shape because only cost distinguishes the two forms.
-
-
-- **`KeepLastN` never matched anything** (#287). The evaluator was handed no
-  sibling ranking, and its fail-safe — correctly — refuses to expire an artifact
-  whose position among its siblings is unknown, so a count-based retention policy
-  was inert however it was written. The rank and the sibling total are now
-  resolved in the candidate query itself, by a window function over
-  `(repository, name)` computed across the **whole** sibling group rather than
-  the current keyset page: a rank that shifted with the page boundary would have
-  expired the wrong versions. Which N survive is now a documented part of the
-  contract — newest first by creation time, ties broken by artifact id — so two
-  artifacts created in the same instant cannot swap places between runs. Retired
-  rows occupy no rank slot.
-
-  **An artifact a tag points at does not expire under `KeepLastN`, however low
-  its rank** — otherwise the first count-based policy would delete the image a
-  pinned deployment is running. The exemption resolves per repository, because
-  content hashes are shared across repositories by construction and a global
-  lookup would protect the wrong artifacts in both directions; it covers both
-  mutable-pointer forms, the content-hash target an OCI tag resolves to and the
-  version target an npm dist-tag resolves to; and it is re-checked immediately
-  before the purge deletes, because evaluation and purge are separate scheduled
-  sweeps and a tag set in between would otherwise find the artifact already
-  expired and unasked. A skipped artifact is reported in the sweep summary
-  rather than disappearing from the work set.
-
-- **A completed purge left the artifact broken instead of reclaiming space**
-  (#286). The purge deleted an artifact's content references, deleted the blob
-  once nothing else referenced it, and recorded `ArtifactPurged` — but never
-  retired the row. With the blob gone the artifact kept answering `HEAD` with
-  200 from a row whose bytes no longer existed, `GET` failed on the storage
-  read, and re-pushing the same content could not heal it: the ingest dedup
-  keys on path and checksum and returns before writing. Purge now retires the
-  projection in the same transaction that writes the terminal events, whether
-  or not the blob survived for another referent, and the refcount reconcile no
-  longer recreates references for retired rows. The retirement is idempotent in
-  the state rather than in the writer, so an artifact a person deleted between
-  its expiry and the purge still completes and keeps its original deletion
-  timestamp. Completion is now per artifact rather than per hash — a failure on
-  one of several hashes no longer records the artifact as purged while part of
-  its content survives — which needs durable state, so a new table records each
-  target and its post-delete refcount in the same transaction that removes the
-  edges. Without it a retry could not rediscover an OCI manifest's child
-  targets at all.
-
-- **Retention could never have enumerated a single artifact** (#284). Three
-  faults in one query, all of which had to fall before any retention policy
-  could do anything at all. The candidate reader selected
-  `repositories.format` without casting the PostgreSQL enum to text, so
-  decoding failed on the first row of every non-empty page — the sweep
-  returned a retryable error and expired nothing. Its status filter was
-  written as `quarantine_status NOT IN (…)`, which is *unknown* rather than
-  *true* for the SQL `NULL` that an artifact without a quarantine status is
-  stored as, so a quarter of a typical inventory was invisible to every
-  policy. And it had no `deleted_at` predicate, so it offered soft-deleted
-  rows as candidates. None of this was reachable before: the sweep
-  short-circuits when no retention policy exists, and the only test over the
-  reader enumerated an empty table. The eligible and GC-protected status sets
-  now come from one definition shared by the candidate reader, the
-  pending-purge reader, the refcount reconcile and the purge-path mapper,
-  which is what kept them from drifting apart again.
+- **`zip` 8.6.0 -> 9.0.3**, resolving RUSTSEC-2026-0367, -0368 and -0369
+  against the archive reader. hort calls neither affected extraction API, so
+  it was not exposed (#278).
+- **An OCI manifest is served only while every artifact in its closure is.**
+  The read path consulted the manifest's own status and never its
+  constituents. The rule applies to the whole existing inventory from the
+  first request after upgrade — no migration, no backfill, no repair
+  instrument — and because signature manifests share constituents, a few
+  terminally rejected blobs withdraw a large population at once. New
+  signatures and image pulls are unaffected (#342).
+- **A finding condemns only an artifact that carries the named component**
+  (#351).
+- **Material a provenance verifier could not read no longer condemns an
+  artifact**: a caller holding only write access could attach unreadable
+  bundle bytes to someone else's validly signed image (#350).
+- **Artifact-lifecycle events no longer bypass repository visibility** on
+  `GET /api/v1/events` and in subscription delivery (#338).
+- **The PyPI simple index escapes upstream text** instead of interpolating it
+  into the page (#338).
+- **`hort-server admin --output=file:<path>` refuses a path whose permissions
+  or type it did not set** (#338).
+- **A failed OCI blob-upload `PATCH` can no longer grow the staging file past
+  the upload cap** (#338).
+- **An upstream credential is bound to its mapping's own origin** — an
+  absolute URL read out of upstream metadata could otherwise carry it
+  elsewhere (#343).
+- **The anti-replay seen-set remembers a federated JWT for as long as that JWT
+  can be presented** (#349).
+- **A repeated key in a `ServiceAccount`'s `claims` map no longer applies
+  silently** (#347).
+- **A one-hour break-glass credential can no longer compose into a 30-day
+  standing full-admin one** (#334).
+- **An authority change commits with its audit event** on every write path,
+  and the old commit-then-append shape no longer compiles (#341).
+- **Content-reference edges commit in the transaction that makes the claiming
+  artifact live** — on ingest, on both pull-through legs and on the OCI
+  manifest `PUT` — so the storage GC cannot delete bytes a live artifact
+  claims (#335).
+- **Garbage collection no longer deletes quarantined evidence's bytes through
+  a released sibling**, no longer decides from a page row read before the
+  deleting began, and an event-stream seal now carries the version its own
+  proof was read at (#335).
+- **A running subscription delivers against its live row and its owner's live
+  admin authority**, not the state it was spawned with (#339, #341).
+- **The chart's unrestricted-egress Job exception selects only this release's
+  Jobs** — the previous `podSelector` matched any pod that set one label
+  (#341).
+- **A published hort image or chart is gated on the checks meant to secure
+  it**; the publish workflows consumed none of each other's verdicts (#339).
+- **Refused at gitops apply instead of accepted and ignored**:
+  `ScanPolicy.maxArtifactAge`, `ScanPolicy.licensePolicy`, an `Exclusion`
+  scoped to a repository, and a `virtualMembers` entry of another format
+  (#334).
 
 ## [0.14.0] - 2026-09-20
 
@@ -1049,9 +264,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same registry used to contradict each other. Asking for a held version's
   tarball returned `503` with a `Retry-After` — the truth. Asking the catalog
   what versions exist left it out of `versions{}` and out of `dist-tags`, so
-  anyone checking concluded the version was missing upstream. In production
-  that cost two days: a pinned `package-lock.json` install failed, and every
-  human who then read the packument drew the wrong conclusion.
+  anyone checking concluded the version was missing upstream — a pinned
+  `package-lock.json` install then fails, and the packument hands every human
+  who reads it the wrong answer.
 
   The packument now carries an additional top-level `hort` block naming each
   withheld version, why it is withheld, and — for a version inside its
@@ -1637,10 +852,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `quarantined` and therefore stays at the head of the next tick's
   selection. Once a whole batch of the oldest candidates was permanently
   unreleasable, **no artifact anywhere in the deployment was ever
-  released again**, with nothing in the logs that looked like a failure
-  (a live deployment hit this at 1482 quarantined artifacts against a
-  batch of 1000, of which 964 of the oldest 1000 were parent-gated
-  blobs). Candidacy now rotates: a new nullable
+  released again**, with nothing in the logs that looked like a failure.
+  Candidacy now rotates: a new nullable
   `artifacts.release_attempt_at` column records when the sweep last
   *attempted* a row (scheduling metadata only — it records that a
   decision was attempted, never what it was, and is deliberately not
@@ -1685,10 +898,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `result_summary` gains a third count, `held_parent_gated`, carrying
   the parent-gated share of what used to be reported under
   `skipped_provenance_pending`; the log line's tick-complete and
-  stall-warn fields gain the same field. On the production deployment
-  that motivated this split, ~964 of 1000 candidates in a stalled batch
-  are the structural kind — the split is what makes that stall warning
-  readable rather than alarming. (#209)
+  stall-warn fields gain the same field. A stall made of the
+  structural kind is not the same event as one made of the actionable
+  kind, and only the split makes that warning readable rather than
+  alarming. (#209)
 
 ## [0.12.0] - 2026-08-27
 
