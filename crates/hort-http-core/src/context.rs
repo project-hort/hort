@@ -26,6 +26,7 @@ use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUse
 use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
 use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
+use hort_app::use_cases::list_deliverability::ListDeliverabilityUseCase;
 use hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeUseCase;
@@ -421,6 +422,24 @@ pub struct AppContext {
     /// and `HEAD` cannot drift, and a second format that ever serves an
     /// immutable multi-part document resolves it the same way.
     pub manifest_deliverability_use_case: Arc<ManifestDeliverabilityUseCase>,
+    /// "Which of the manifests this document is about to name would the
+    /// pull refuse?" — ADR 0062's **omission** half, for the OCI
+    /// surfaces hort builds out of manifest digests (the referrers
+    /// index, `tags/list`).
+    ///
+    /// The sibling above answers the same question about **one**
+    /// manifest and resolves its closure from the bytes its caller is
+    /// already holding. This one answers it about a **set**, and
+    /// resolves the closure from the membership projection, because a
+    /// list surface holds no bytes and the same derivation there would
+    /// be N round trips. The split is the decision, not an
+    /// inconsistency — see the use case's module doc.
+    ///
+    /// The format crate holds the **use case**, not the census port
+    /// behind it (ADR 0008): `ctx.content_references` is `pub(crate)`,
+    /// and the walk is not a projection read a format crate could
+    /// assemble from it in one statement anyway.
+    pub list_deliverability_use_case: Arc<ListDeliverabilityUseCase>,
     /// Curator decision authority over quarantined
     /// / non-terminal artifacts. The inbound HTTP adapter
     /// (`handlers/admin/curation/`) calls
@@ -975,6 +994,8 @@ pub struct AppContextParts {
     pub event_visibility_use_case: Arc<EventVisibilityUseCase>,
     /// See [`AppContext::manifest_deliverability_use_case`].
     pub manifest_deliverability_use_case: Arc<ManifestDeliverabilityUseCase>,
+    /// See [`AppContext::list_deliverability_use_case`].
+    pub list_deliverability_use_case: Arc<ListDeliverabilityUseCase>,
 
     /// See [`AppContext::curation_use_case`].
     pub curation_use_case: Arc<CurationUseCase>,
@@ -1105,6 +1126,7 @@ impl AppContext {
             subscription_use_case: parts.subscription_use_case,
             event_visibility_use_case: parts.event_visibility_use_case,
             manifest_deliverability_use_case: parts.manifest_deliverability_use_case,
+            list_deliverability_use_case: parts.list_deliverability_use_case,
             curation_use_case: parts.curation_use_case,
             provenance_misrejection_repair_use_case: parts.provenance_misrejection_repair_use_case,
             policy_use_case: parts.policy_use_case,

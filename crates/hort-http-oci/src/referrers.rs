@@ -20,9 +20,50 @@
 //!    Tombstoned source rows (NotFound) are skipped silently — the
 //!    referrers index is eventual; the artifact-DELETE path's
 //!    `delete_by_source` call eventually clears them.
-//! 6. Return an OCI image-index document
+//! 6. Drop every row whose referrer manifest this registry would
+//!    refuse to serve — see the next section.
+//! 7. Return an OCI image-index document
 //!    (`application/vnd.oci.image.index.v1+json`) with one descriptor
 //!    per surviving row.
+//!
+//! # This document names nothing it will not serve (ADR 0062)
+//!
+//! The referrers index is a document **hort builds**, so the
+//! enforcement shape for it is omission: a referrer manifest carrying a
+//! terminal status — or binding anything that does, a shared config or
+//! layer blob being the population that matters — is simply not listed.
+//! Before this, the index advertised such a manifest and the client's
+//! subsequent pull refused it, which spends a round trip and an
+//! operator's diagnosis on an answer the registry already had.
+//!
+//! The question has two halves and they are answered in two places for
+//! one reason — cost:
+//!
+//! - the **own-status** half is free. Step 5 already hydrates every row
+//!   through `find_visible_by_id` to recover `sha256` + `size`, and that
+//!   load carries `quarantine_status`, so the test is one match on data
+//!   in hand.
+//! - the **closure** half is the census,
+//!   `ListDeliverabilityUseCase::non_deliverable_in`, asked **once**
+//!   for every row that survived the first half. One statement per
+//!   request, never one per row.
+//!
+//! A row whose referrer is merely **quarantined** stays listed: a hold
+//! is "not yet", and the per-leaf `503` is that answer. A row whose
+//! referrer is not ingested at all stays listed too — absence is the
+//! ordinary state of a cold pull-through, not a verdict.
+//!
+//! **The omission does not move the diagnosis.** Asked for the same
+//! manifest directly, `GET /v2/<name>/manifests/<digest>` still answers
+//! `403 DENIED` naming the subject and its rejection axis (ADR 0055):
+//! the list omits, the direct ask explains. A client that can no longer
+//! see the descriptor can still ask about the digest and be told why.
+//!
+//! A census **failure** refuses the whole request (`500`), the same
+//! posture this handler already takes when a row's artifact lookup
+//! fails transiently: not knowing what the index would refuse is not
+//! the same as knowing it would refuse nothing (ADR 0007), and a
+//! partial list silently misrepresents "what references this digest".
 //!
 //! # Empty results return 200, NOT 404
 //!
@@ -45,6 +86,7 @@
 //! - `error` — any other infrastructure failure (repo-lookup transient
 //!   error, content-reference port error).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -54,6 +96,7 @@ use axum::response::{IntoResponse, Response};
 
 use hort_app::error::AppError;
 use hort_app::use_cases::repository_access::AccessLevel;
+use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::error::DomainError;
 use hort_domain::ports::content_reference_index::ContentReference;
@@ -82,7 +125,8 @@ const DEFAULT_DESCRIPTOR_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.
 /// 404 is reserved for an unknown repository.
 ///
 /// `#[tracing::instrument]` covers the multi-step fan-out (one
-/// `find_by_target` query plus N `find_by_id` lookups). `err` is
+/// `find_by_target` query, N `find_by_id` lookups, and one batched
+/// deliverability census over the survivors). `err` is
 /// deliberately omitted: the handler returns 200 + `manifests: []` for
 /// the common "unknown subject" case and 4xx envelopes for client
 /// errors — none of those should log at ERROR. Operator-level
@@ -240,7 +284,12 @@ pub async fn serve(
     //    errors (transient DB) abort the whole request as 500 because
     //    a partial response would silently misrepresent "what
     //    references this digest".
-    let mut manifests: Vec<serde_json::Value> = Vec::new();
+    //
+    //    The same hydration answers the own-status half of ADR 0062:
+    //    the load carries `quarantine_status`, so a terminally rejected
+    //    referrer is dropped here for the cost of one match — no query,
+    //    no read. Its closure is asked about once, below.
+    let mut candidates: Vec<(&ContentReference, Artifact)> = Vec::new();
     for row in filtered {
         // Visibility-aware row hydration (ADR 0008). Repo visibility was
         // already proved at step 1; routing through `find_visible_by_id`
@@ -269,6 +318,80 @@ pub async fn serve(
                 return OciError::Internal.into_response();
             }
         };
+
+        // A terminal verdict means never, so the descriptor is not
+        // minted. A hold (`Quarantined`) means "not yet" and stays
+        // listed — the per-leaf `503` is that answer, and ADR 0062
+        // decision 3 leaves the per-child model standing for holds.
+        if artifact.quarantine_status.is_terminal() {
+            tracing::debug!(
+                source_artifact_id = %artifact.id,
+                referrer = %artifact.sha256_checksum,
+                status = %artifact.quarantine_status,
+                "referrers index omitting a referrer whose own status is terminal"
+            );
+            continue;
+        }
+
+        candidates.push((row, artifact));
+    }
+
+    // 6. The closure half, batched: one census for the whole surviving
+    //    set. The candidates' own statuses are already known
+    //    non-terminal, so what this adds is "does any of this
+    //    referrer's own closure carry a terminal status" — a shared
+    //    config or layer blob being the population the rule is about.
+    //
+    //    Asked once with every surviving hash rather than once per row:
+    //    the census is a single statement over the membership
+    //    projection, and a per-row fan-out would put one round trip on
+    //    every descriptor of every referrers request.
+    let withheld: HashSet<ContentHash> = if candidates.is_empty() {
+        // Nothing to ask about. Not merely an optimisation: the port
+        // contract is that an empty candidate set never reaches the
+        // database.
+        HashSet::new()
+    } else {
+        let hashes: Vec<ContentHash> = candidates
+            .iter()
+            .map(|(_row, artifact)| artifact.sha256_checksum.clone())
+            .collect();
+        match ctx
+            .list_deliverability_use_case
+            .non_deliverable_in(repo.id, &hashes)
+            .await
+        {
+            Ok(set) => set,
+            Err(e) => {
+                tracing::error!(
+                    repo_key = %repo.key,
+                    candidate_count = hashes.len(),
+                    error = %e,
+                    "referrers deliverability census failed; refusing to serve an index that \
+                     may name what the pull would refuse"
+                );
+                emit_metric(&repo_label(&ctx, Some(&repo.key)), "error");
+                return OciError::Internal.into_response();
+            }
+        }
+    };
+
+    // 7. Mint one descriptor per surviving row.
+    let mut manifests: Vec<serde_json::Value> = Vec::new();
+    for (row, artifact) in candidates {
+        if withheld.contains(&artifact.sha256_checksum) {
+            // The mandatory server-side line for an omission the client
+            // cannot see: the hidden-descriptor cost ADR 0062 accepts is
+            // paid by the client, and an operator must still be able to
+            // tell a withheld referrer from one that was never pushed.
+            // The census names the count, this names the referrer.
+            tracing::debug!(
+                source_artifact_id = %artifact.id,
+                referrer = %artifact.sha256_checksum,
+                "referrers index omitting a referrer whose closure carries a terminal status"
+            );
+            continue;
+        }
 
         let media_type = row
             .metadata
@@ -299,8 +422,12 @@ pub async fn serve(
         manifests.push(descriptor);
     }
 
-    // 6. Build the OCI image-index envelope. Empty `manifests` is the
-    //    spec-mandated shape for "no referrers" — NOT 404.
+    // 8. Build the OCI image-index envelope. Empty `manifests` is the
+    //    spec-mandated shape for "no referrers" — NOT 404, and that
+    //    holds just as much when the list is empty because every
+    //    candidate was omitted as when nothing referenced the subject.
+    //    A 404 in the first case would make the omission itself an
+    //    enumeration oracle.
     let body = serde_json::json!({
         "schemaVersion": 2,
         "mediaType": IMAGE_INDEX_MEDIA_TYPE,
@@ -389,11 +516,13 @@ mod tests {
     use uuid::Uuid;
 
     use hort_app::use_cases::test_support::{
-        sample_artifact, sample_repository, MockArtifactRepository, MockContentReferenceIndex,
-        MockRepositoryRepository,
+        persisted_artifact_rejected, sample_artifact, sample_repository, MockArtifactRepository,
+        MockContentReferenceIndex, MockEventStore, MockListDeliverabilityCensus,
+        MockRepositoryRepository, MockStoragePort,
     };
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
+    use hort_domain::events::{RejectionReason, StreamId};
     use hort_domain::ports::content_reference_index::ContentReference;
 
     use hort_http_core::test_support::build_mock_ctx;
@@ -405,6 +534,23 @@ mod tests {
         artifacts: Arc<MockArtifactRepository>,
         repositories: Arc<MockRepositoryRepository>,
         content_references: Arc<MockContentReferenceIndex>,
+        /// CAS, for the paired assertions that drive the **manifest**
+        /// route beside this one: the direct ask derives its closure
+        /// from the manifest's own bytes (ADR 0062's refusal shape),
+        /// while this surface derives it from the membership projection
+        /// (its omission shape). A test that asserts both halves has to
+        /// seed both inputs, and that asymmetry is the decision rather
+        /// than a fixture accident.
+        storage: Arc<MockStoragePort>,
+        /// Artifact streams, for seeding the `ArtifactRejected` the
+        /// rejection **axis** is derived from. Nothing on this surface
+        /// reads it — a referrers descriptor carries no verdict — but
+        /// the direct ask does, and the pairing is the point.
+        events: Arc<MockEventStore>,
+        /// The list-surface census the closure half runs through.
+        /// Handles for its two assertions: the batching count, and the
+        /// candidate set the one call carried.
+        list_deliverability: Arc<MockListDeliverabilityCensus>,
     }
 
     fn harness() -> Harness {
@@ -415,6 +561,9 @@ mod tests {
             artifacts: mocks.artifacts,
             repositories: mocks.repositories,
             content_references: mocks.content_references,
+            storage: mocks.storage,
+            events: mocks.events,
+            list_deliverability: mocks.list_deliverability,
         }
     }
 
@@ -710,6 +859,467 @@ mod tests {
             format!("sha256:{}", "11".repeat(32))
         );
         assert_eq!(manifests[0]["artifactType"], "application/vnd.spdx+json");
+    }
+
+    // ------- 3b. ADR 0062 — the index omits what the pull would refuse -------
+
+    /// Re-stamp a seeded artifact's quarantine status.
+    ///
+    /// A mutator rather than a `status` parameter on
+    /// [`seed_referrer`]: that helper already carries seven arguments,
+    /// and the referrers fixture's shape (one artifact plus one
+    /// `oci_subject` row) is what the six existing callers want
+    /// unchanged.
+    fn set_status(artifacts: &MockArtifactRepository, id: Uuid, status: QuarantineStatus) {
+        let mut artifact = artifacts.get(id).expect("the artifact was just seeded");
+        artifact.quarantine_status = status;
+        artifacts.insert(artifact);
+    }
+
+    /// Seed `rejected_by` as the artifact's `ArtifactRejected`, which is
+    /// where the rejection **axis** is derived from — the `artifacts`
+    /// projection carries no such column, so a fixture that set
+    /// `Artifact::rejection_reason` directly would prove a behaviour
+    /// production cannot show (`MockArtifactRepository` clears the field
+    /// on read, exactly as the one Postgres row mapper does).
+    fn seed_rejection_axis(h: &Harness, artifact_id: Uuid, rejected_by: RejectionReason) {
+        h.events.set_stream(
+            &StreamId::artifact(artifact_id),
+            vec![persisted_artifact_rejected(artifact_id, rejected_by, 1)],
+        );
+    }
+
+    /// Give `hex` a catalog row in `repo` carrying `status` — a
+    /// constituent of some referrer manifest, reached through the
+    /// membership projection rather than through a descriptor.
+    ///
+    /// Deliberately seeds **no** CAS content: the census reads no bytes
+    /// at all, so a fixture that stored them would hide a dependency on
+    /// them.
+    fn seed_constituent(
+        h: &Harness,
+        repo_id: Uuid,
+        hex: &str,
+        status: QuarantineStatus,
+        axis: Option<RejectionReason>,
+    ) -> ContentHash {
+        let hash: ContentHash = hex.parse().expect("valid sha256 hex");
+        let mut a = sample_artifact(QuarantineStatus::None);
+        a.repository_id = repo_id;
+        a.path = format!("blobs/sha256:{hex}");
+        a.sha256_checksum = hash.clone();
+        a.quarantine_status = status;
+        if matches!(status, QuarantineStatus::Quarantined) {
+            a.quarantine_window_start = Some(Utc::now());
+        }
+        let id = a.id;
+        h.artifacts.insert(a);
+        if let Some(reason) = axis {
+            seed_rejection_axis(h, id, reason);
+        }
+        hash
+    }
+
+    /// Record a membership edge from `source` onto `target` — the
+    /// projection row the census descends.
+    async fn seed_closure_edge(
+        h: &Harness,
+        repo_id: Uuid,
+        source: Uuid,
+        kind: &str,
+        target: &ContentHash,
+    ) {
+        h.content_references
+            .insert(ContentReference {
+                source_artifact_id: source,
+                target_content_hash: target.clone(),
+                kind: kind.to_string(),
+                metadata: serde_json::Value::Object(serde_json::Map::new()),
+                repository_id: repo_id,
+                recorded_at: Utc::now(),
+            })
+            .await
+            .expect("seed membership edge");
+    }
+
+    /// Serve the referrers index for the shared subject and return the
+    /// parsed `manifests` array.
+    async fn referrers_manifests(ctx: Arc<AppContext>) -> Vec<serde_json::Value> {
+        let resp = serve(
+            ctx,
+            "myrepo",
+            "library/nginx",
+            &format!("sha256:{SUBJECT_HEX}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an index with every candidate omitted is still a 200 with an empty array — a \
+             404 would make the omission an enumeration oracle"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .expect("the index body is small")
+            .to_vec();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("the index body is JSON");
+        parsed["manifests"]
+            .as_array()
+            .expect("the envelope carries a manifests array")
+            .clone()
+    }
+
+    /// Ask the **manifest** route for `hex` directly and return
+    /// `(status, parsed body)`.
+    ///
+    /// The pairing is the assertion: ADR 0055 keeps the diagnosis on the
+    /// direct request, so what the list omits the direct ask must still
+    /// explain. Asserted in the same test as the omission precisely so
+    /// the two cannot drift apart later — a change that concealed the
+    /// direct verdict would leave the omission with nothing behind it,
+    /// and a change that stopped omitting would leave the direct verdict
+    /// contradicting the list.
+    async fn direct_manifest_ask(
+        ctx: Arc<AppContext>,
+        hex: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = crate::manifests::serve(
+            ctx,
+            "myrepo",
+            "library/nginx",
+            &format!("sha256:{hex}"),
+            &HeaderMap::new(),
+            /* head = */ false,
+            /* anonymous */ None,
+        )
+        .await;
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .expect("the refusal body is small")
+            .to_vec();
+        let parsed: serde_json::Value = serde_json::from_slice(&body)
+            .unwrap_or_else(|e| panic!("expected a JSON envelope, got {e}"));
+        (status, parsed)
+    }
+
+    /// A referrer whose **own** status is terminal is not listed — and
+    /// asked for by digest, it still answers `403 DENIED` with its axis.
+    ///
+    /// Both halves in one test on purpose: the list omits and the direct
+    /// ask explains, and that split is what keeps ADR 0055 intact while
+    /// ADR 0062's omission rule holds.
+    #[test]
+    fn a_terminal_referrer_is_omitted_and_403_with_the_axis_when_named() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let (id, hash) = seed_referrer(
+                &h.artifacts,
+                &h.content_references,
+                repo_id,
+                0xab,
+                512,
+                Some("application/vnd.example.signature"),
+                None,
+            )
+            .await;
+            set_status(&h.artifacts, id, QuarantineStatus::Rejected);
+            seed_rejection_axis(&h, id, RejectionReason::Scanner);
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+
+            assert!(
+                referrers_manifests(ctx.clone()).await.is_empty(),
+                "a terminally rejected referrer must not be advertised"
+            );
+
+            let (status, parsed) = direct_manifest_ask(ctx, hash.as_ref()).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "the direct ask keeps its verdict: {parsed}"
+            );
+            assert_eq!(parsed["errors"][0]["code"], "DENIED");
+            assert_eq!(
+                parsed["errors"][0]["detail"]["axis"], "scanner",
+                "the omission must not take the axis with it: {parsed}"
+            );
+        });
+    }
+
+    /// The case a cheap own-status-only filter misses, and therefore the
+    /// one that proves the closure half works: the referrer's own row is
+    /// clean and the config blob it binds is terminal.
+    ///
+    /// This is the production population behind the rule — one rejected
+    /// config row shared by a whole repository's signature inventory,
+    /// with the referrer manifests themselves innocent.
+    #[test]
+    fn a_referrer_over_a_terminal_constituent_is_omitted_and_the_direct_ask_names_the_constituent()
+    {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let (id, hash) = seed_referrer(
+                &h.artifacts,
+                &h.content_references,
+                repo_id,
+                0xcd,
+                512,
+                Some("application/vnd.example.signature"),
+                None,
+            )
+            .await;
+            // Its own status is fine.
+            set_status(&h.artifacts, id, QuarantineStatus::Released);
+            let config_hex = "aa".repeat(32);
+            let config = seed_constituent(
+                &h,
+                repo_id,
+                &config_hex,
+                QuarantineStatus::Rejected,
+                Some(RejectionReason::Scanner),
+            );
+            seed_closure_edge(&h, repo_id, id, "oci_config", &config).await;
+            // The direct ask derives the same closure from the bytes, so
+            // the manifest's CAS body has to name the config blob.
+            h.storage.insert_content(
+                hash.clone(),
+                serde_json::json!({
+                    "schemaVersion": 2,
+                    "config": { "digest": format!("sha256:{config_hex}"), "size": 2 },
+                    "layers": [],
+                })
+                .to_string()
+                .into_bytes(),
+            );
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+
+            assert!(
+                referrers_manifests(ctx.clone()).await.is_empty(),
+                "a referrer whose config blob is terminal must not be advertised"
+            );
+
+            let (status, parsed) = direct_manifest_ask(ctx, hash.as_ref()).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "the direct ask keeps its verdict: {parsed}"
+            );
+            assert_eq!(
+                parsed["errors"][0]["detail"]["subject"],
+                format!("sha256:{config_hex}"),
+                "the direct refusal names the offending constituent, not the reference: \
+                 {parsed}"
+            );
+            assert_eq!(parsed["errors"][0]["detail"]["axis"], "scanner");
+        });
+    }
+
+    /// A constituent that is merely **not ingested** leaves the referrer
+    /// listed. Absence is the ordinary state of a cold pull-through, not
+    /// a verdict, and the inversion that treats it as terminal empties
+    /// the index for every proxied repository.
+    #[test]
+    fn a_referrer_whose_constituent_is_not_ingested_stays_listed() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let (id, _hash) = seed_referrer(
+                &h.artifacts,
+                &h.content_references,
+                repo_id,
+                0x1a,
+                512,
+                None,
+                None,
+            )
+            .await;
+            // An edge onto a hash with no catalog row — exactly what a
+            // pull-through registers by digest before the blob arrives.
+            let absent: ContentHash = "bb".repeat(32).parse().expect("valid sha256 hex");
+            seed_closure_edge(&h, repo_id, id, "oci_layer", &absent).await;
+
+            let manifests = referrers_manifests(h.ctx.clone()).await;
+            assert_eq!(
+                manifests.len(),
+                1,
+                "a not-yet-ingested constituent is not a verdict: {manifests:?}"
+            );
+        });
+    }
+
+    /// A `Quarantined` referrer stays listed, and so does one over a
+    /// `Quarantined` constituent. A hold means "not yet" — the per-leaf
+    /// `503` is that answer, and ADR 0062 decision 3 leaves the
+    /// per-child model standing for holds.
+    #[test]
+    fn a_held_referrer_and_a_held_constituent_both_stay_listed() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+
+            let (held_id, _) = seed_referrer(
+                &h.artifacts,
+                &h.content_references,
+                repo_id,
+                0x2a,
+                512,
+                None,
+                None,
+            )
+            .await;
+            set_status(&h.artifacts, held_id, QuarantineStatus::Quarantined);
+
+            let (over_held_id, _) = seed_referrer(
+                &h.artifacts,
+                &h.content_references,
+                repo_id,
+                0x2b,
+                512,
+                None,
+                None,
+            )
+            .await;
+            let held_layer = seed_constituent(
+                &h,
+                repo_id,
+                &"cc".repeat(32),
+                QuarantineStatus::Quarantined,
+                None,
+            );
+            seed_closure_edge(&h, repo_id, over_held_id, "oci_layer", &held_layer).await;
+
+            let manifests = referrers_manifests(h.ctx.clone()).await;
+            assert_eq!(
+                manifests.len(),
+                2,
+                "neither a held referrer nor a held constituent withdraws a descriptor: \
+                 {manifests:?}"
+            );
+        });
+    }
+
+    /// The closure half costs **one** census call for the whole page,
+    /// not one per descriptor — and the own-status half costs none at
+    /// all, so a referrer this handler has already dropped is never
+    /// asked about.
+    #[test]
+    fn the_census_is_asked_once_for_the_surviving_rows_only() {
+        let (calls, asked) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let mut survivors = Vec::new();
+            for seed in [0x3a_u8, 0x3b, 0x3c] {
+                let (_id, hash) = seed_referrer(
+                    &h.artifacts,
+                    &h.content_references,
+                    repo_id,
+                    seed,
+                    512,
+                    None,
+                    None,
+                )
+                .await;
+                survivors.push(hash);
+            }
+            // A fourth row the own-status half drops for free.
+            let (dropped_id, dropped_hash) = seed_referrer(
+                &h.artifacts,
+                &h.content_references,
+                repo_id,
+                0x3d,
+                512,
+                None,
+                None,
+            )
+            .await;
+            set_status(&h.artifacts, dropped_id, QuarantineStatus::Rejected);
+
+            let manifests = referrers_manifests(h.ctx.clone()).await;
+            assert_eq!(manifests.len(), 3, "only the rejected row is dropped");
+
+            let asked = h.list_deliverability.last_candidates();
+            assert!(
+                !asked.contains(&dropped_hash),
+                "a referrer already dropped on its own status must not be asked about"
+            );
+            (h.list_deliverability.calls(), asked)
+        });
+        assert_eq!(
+            calls, 1,
+            "one census for the whole page — a per-row fan-out would put a round trip on \
+             every descriptor"
+        );
+        assert_eq!(
+            asked.len(),
+            3,
+            "the ask carries exactly the surviving rows: {asked:?}"
+        );
+    }
+
+    /// A census failure refuses the whole request. Not knowing what the
+    /// index would refuse is not the same as knowing it would refuse
+    /// nothing (ADR 0007), and a partial list silently misrepresents
+    /// "what references this digest".
+    #[test]
+    fn a_census_failure_refuses_the_index_and_increments_the_error_metric() {
+        let (snapshot, status) = capture(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                seed_referrer(
+                    &h.artifacts,
+                    &h.content_references,
+                    repo_id,
+                    0x4a,
+                    512,
+                    None,
+                    None,
+                )
+                .await;
+                h.list_deliverability
+                    .fail_next(DomainError::Invariant("census exploded".into()));
+                let resp = serve(
+                    h.ctx.clone(),
+                    "myrepo",
+                    "library/nginx",
+                    &format!("sha256:{SUBJECT_HEX}"),
+                    None,
+                    None,
+                )
+                .await;
+                resp.status()
+            })
+        });
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let entries: Vec<MetricEntry> = snapshot.into_vec();
+        let counter = find_counter(
+            &entries,
+            "hort_content_reference_queries_total",
+            &[
+                ("format", "oci"),
+                ("repository", "myrepo"),
+                ("result", "error"),
+            ],
+        )
+        .expect("the error-result counter fires");
+        assert_eq!(*counter, DebugValue::Counter(1));
     }
 
     // -------------- 4. Repo missing (anonymous, Disabled) → 404 + not_found metric --------------

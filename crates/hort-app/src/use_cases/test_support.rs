@@ -66,6 +66,7 @@ use hort_domain::ports::jobs_repository::{
 use hort_domain::ports::kubernetes_secret_writer::{
     KubernetesSecretWriter, ManagedSecret, ManagedSecretSpec,
 };
+use hort_domain::ports::list_deliverability::{ListDeliverabilityCensus, CLOSURE_EDGE_KINDS};
 use hort_domain::ports::oidc_issuer_repository::OidcIssuerRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::ref_lifecycle::{RefCommitOutcome, RefLifecyclePort};
@@ -384,6 +385,25 @@ impl MockArtifactRepository {
     /// [`MockConstituentStatusReader`] serves from here so a test cannot
     /// prove a manifest withheld by a row no read path can see.
     pub fn live_status_in_repo(&self, repo: Uuid, hash: &ContentHash) -> Option<QuarantineStatus> {
+        self.live_row_in_repo(repo, hash)
+            .map(|(_id, status)| status)
+    }
+
+    /// The same live, repository-scoped row as
+    /// [`Self::live_status_in_repo`], but carrying its **id** as well.
+    ///
+    /// [`MockListDeliverabilityCensus`] needs the id because the
+    /// membership projection keys its edges on `source_artifact_id`, so
+    /// descending from a content hash means resolving the hash to a row
+    /// first — the same two-step the Postgres census does with
+    /// `artifacts.checksum_sha256 → artifacts.id`. Returning the pair
+    /// keeps the retirement and repository filters in **one** place
+    /// rather than letting a second helper drift.
+    pub fn live_row_in_repo(
+        &self,
+        repo: Uuid,
+        hash: &ContentHash,
+    ) -> Option<(Uuid, QuarantineStatus)> {
         self.artifacts
             .lock()
             .unwrap()
@@ -391,7 +411,7 @@ impl MockArtifactRepository {
             .find(|a| {
                 a.repository_id == repo && a.sha256_checksum == *hash && a.deleted_at.is_none()
             })
-            .map(|a| a.quarantine_status)
+            .map(|a| (a.id, a.quarantine_status))
     }
 
     /// Seed a synthetic `(name, version, status)`
@@ -5227,6 +5247,124 @@ impl ConstituentStatusReader for MockConstituentStatusReader {
     }
 }
 
+/// [`ListDeliverabilityCensus`] over the harness's own seeded artifact
+/// rows and membership edges.
+///
+/// Deliberately **not** a seedable answer map, for the same reason
+/// [`MockConstituentStatusReader`] is not: a test that seeds an entry's
+/// closure has already told the census what it needs, so the harness
+/// cannot drift into a state where the artifact store, the edge
+/// projection and the gate disagree. A candidate with no seeded row is
+/// absent from the answer — which is what makes the "absence is not a
+/// verdict" arm testable without a knob.
+///
+/// The four decisions it mirrors from the Postgres statement, because a
+/// double that answered them differently would let a handler test stand
+/// on behaviour production does not have:
+///
+/// - **where the closure comes from** — the `content_references` edges
+///   the harness holds, restricted to
+///   [`CLOSURE_EDGE_KINDS`], descended transitively;
+/// - **repository scope** and **retirement** — served through
+///   [`MockArtifactRepository::live_row_in_repo`], on the descent and on
+///   the verdict alike;
+/// - **which statuses are terminal** — filtered through
+///   `QuarantineStatus::is_terminal`, never a written-out list;
+/// - **termination** — a `seen` set, the in-memory equal of the
+///   statement's `UNION` distinctness, so a cyclic edge set answers
+///   instead of spinning.
+pub struct MockListDeliverabilityCensus {
+    artifacts: Arc<MockArtifactRepository>,
+    content_references: Arc<MockContentReferenceIndex>,
+    /// FIFO of injected errors. Each call pops the front and returns it
+    /// verbatim, so a test can drive a consumer's fail-closed arm.
+    errors: Mutex<std::collections::VecDeque<DomainError>>,
+    calls: AtomicUsize,
+    last_candidates: Mutex<Vec<ContentHash>>,
+}
+
+impl MockListDeliverabilityCensus {
+    #[must_use]
+    pub fn new(
+        artifacts: Arc<MockArtifactRepository>,
+        content_references: Arc<MockContentReferenceIndex>,
+    ) -> Self {
+        Self {
+            artifacts,
+            content_references,
+            errors: Mutex::new(std::collections::VecDeque::new()),
+            calls: AtomicUsize::new(0),
+            last_candidates: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Arm the next census call to fail with `err`. Queued, so a test
+    /// can arm several consecutive failures.
+    pub fn fail_next(&self, err: DomainError) {
+        self.errors.lock().unwrap().push_back(err);
+    }
+
+    /// How many times the census was asked — the handle for the
+    /// "one call for the batch, not one per entry" assertion.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    /// The candidate set the most recent call carried, in the caller's
+    /// own order. The handle for asserting **which** entries a surface
+    /// asked about — e.g. that a `tags/list` page left its
+    /// version-targeted refs out of the ask entirely.
+    pub fn last_candidates(&self) -> Vec<ContentHash> {
+        self.last_candidates.lock().unwrap().clone()
+    }
+}
+
+impl ListDeliverabilityCensus for MockListDeliverabilityCensus {
+    fn non_deliverable_in<'a>(
+        &'a self,
+        repository_id: Uuid,
+        candidates: &'a [ContentHash],
+    ) -> BoxFut<'a, DomainResult<std::collections::HashSet<ContentHash>>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        *self.last_candidates.lock().unwrap() = candidates.to_vec();
+        if let Some(err) = self.errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
+        let mut withheld: std::collections::HashSet<ContentHash> = std::collections::HashSet::new();
+        for candidate in candidates {
+            // Breadth-first over the candidate's own hash plus its
+            // membership closure, stopping at hashes already visited —
+            // the statement's `UNION` distinctness.
+            let mut seen: std::collections::HashSet<ContentHash> =
+                std::collections::HashSet::from([candidate.clone()]);
+            let mut frontier: Vec<ContentHash> = vec![candidate.clone()];
+            while let Some(member) = frontier.pop() {
+                let Some((source_id, status)) =
+                    self.artifacts.live_row_in_repo(repository_id, &member)
+                else {
+                    // Absent — not local yet, or retired. Neither a
+                    // verdict nor a node with edges to descend.
+                    continue;
+                };
+                if status.is_terminal() {
+                    withheld.insert(candidate.clone());
+                    break;
+                }
+                for target in self.content_references.closure_targets_of(
+                    repository_id,
+                    source_id,
+                    &CLOSURE_EDGE_KINDS,
+                ) {
+                    if seen.insert(target.clone()) {
+                        frontier.push(target);
+                    }
+                }
+            }
+        }
+        Box::pin(async move { Ok(withheld) })
+    }
+}
+
 impl ArtifactGroupRepository for MockArtifactGroupRepository {
     fn find_by_coords(
         &self,
@@ -5664,6 +5802,44 @@ impl MockContentReferenceIndex {
     /// `find_by_target` round-trip.
     pub fn entry_count(&self) -> usize {
         self.entries.lock().unwrap().len()
+    }
+
+    /// Every target `source` points at under one of `kinds`, inside
+    /// `repo` — the harness's own view of one descent step in the
+    /// membership projection.
+    ///
+    /// Not a port method, and deliberately so: no production caller
+    /// reads "all targets of a source across several kinds" through the
+    /// `ContentReferenceIndex` trait, because the one consumer that
+    /// needs that walk does it inside a single SQL statement
+    /// (`hort_adapters_postgres::list_deliverability`). Adding a trait
+    /// method for it would put a port on the interface that nothing
+    /// implements for a reason. [`MockListDeliverabilityCensus`] uses
+    /// this to mirror that statement's descent in memory.
+    ///
+    /// Ordering is `recorded_at` then target hash, so a test that seeds
+    /// several edges gets a stable walk.
+    pub fn closure_targets_of(&self, repo: Uuid, source: Uuid, kinds: &[&str]) -> Vec<ContentHash> {
+        let mut rows: Vec<ContentReference> = self
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| {
+                e.repository_id == repo
+                    && e.source_artifact_id == source
+                    && kinds.contains(&e.kind.as_str())
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.recorded_at.cmp(&b.recorded_at).then_with(|| {
+                a.target_content_hash
+                    .as_ref()
+                    .cmp(b.target_content_hash.as_ref())
+            })
+        });
+        rows.into_iter().map(|e| e.target_content_hash).collect()
     }
 
     /// Upsert `edges` as **one all-or-nothing** write: on the first failure

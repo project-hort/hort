@@ -65,6 +65,7 @@ use hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase;
 // Wired into the mock `AppContext` so the `hort-http-discovery` handler
 // tests can drive `POST /api/v1/repositories/:repo_key/prefetch` through
 // the shared harness.
+use hort_app::use_cases::list_deliverability::ListDeliverabilityUseCase;
 use hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase;
 use hort_app::use_cases::oci_index_child_enqueue::OciIndexChildEnqueueUseCase;
 use hort_app::use_cases::self_service_prefetch_use_case::SelfServicePrefetchUseCase;
@@ -75,10 +76,11 @@ use hort_app::use_cases::test_support::{
     MockArtifactLifecycle, MockArtifactMetadataRepository, MockArtifactRepository,
     MockClaimMappingRepository, MockConstituentStatusReader, MockContentReferenceIndex,
     MockCurationRuleRepository, MockEventRepositoryResolver, MockEventStore, MockJobsRepository,
-    MockPermissionGrantRepository, MockPolicyProjectionRepository, MockRefLifecyclePort,
-    MockRefRegistryPort, MockRepoSecurityScoreRepository, MockRepositoryRepository,
-    MockRepositoryUpstreamMappingRepository, MockStatefulUploadStagingPort, MockStoragePort,
-    MockUpstreamMetadataPort, MockUpstreamProxy, MockUpstreamResolver, MockUserRepository,
+    MockListDeliverabilityCensus, MockPermissionGrantRepository, MockPolicyProjectionRepository,
+    MockRefLifecyclePort, MockRefRegistryPort, MockRepoSecurityScoreRepository,
+    MockRepositoryRepository, MockRepositoryUpstreamMappingRepository,
+    MockStatefulUploadStagingPort, MockStoragePort, MockUpstreamMetadataPort, MockUpstreamProxy,
+    MockUpstreamResolver, MockUserRepository,
 };
 use hort_app::use_cases::user_use_case::UserUseCase;
 // PEP 658 `.metadata` read-path use case.
@@ -695,6 +697,16 @@ pub struct MockPorts {
     /// test arms the read to error via
     /// [`MockConstituentStatusReader::fail_next`].
     pub constituent_status: Arc<MockConstituentStatusReader>,
+    /// The list-surface census wired into
+    /// [`AppContext::list_deliverability_use_case`]. Serves from
+    /// [`Self::artifacts`] and [`Self::content_references`], so the
+    /// ordinary way to drive it is to seed an entry's membership edges
+    /// and its constituents' statuses. This handle is for the
+    /// fail-closed arm ([`MockListDeliverabilityCensus::fail_next`]) and
+    /// for the batching assertions
+    /// ([`MockListDeliverabilityCensus::calls`] /
+    /// [`MockListDeliverabilityCensus::last_candidates`]).
+    pub list_deliverability: Arc<MockListDeliverabilityCensus>,
     pub repositories: Arc<MockRepositoryRepository>,
     pub storage: Arc<MockStoragePort>,
     pub events: Arc<MockEventStore>,
@@ -1478,6 +1490,21 @@ pub fn build_mock_ctx_with_label_flag(
         constituent_status.clone(),
     ));
 
+    // The list-surface census, over the SAME seeded
+    // `MockArtifactRepository` / `MockContentReferenceIndex`: a test
+    // that seeds a referrer's config-blob edge and that blob's status
+    // has already told the census everything it needs, and the harness
+    // cannot drift into a state where the projection and the gate
+    // disagree. A candidate with no seeded row is absent, which is how
+    // the "absence is not a verdict" arm — a cold pull-through tag —
+    // is reachable from a test.
+    let list_deliverability = Arc::new(MockListDeliverabilityCensus::new(
+        artifacts.clone(),
+        content_references.clone(),
+    ));
+    let list_deliverability_use_case =
+        Arc::new(ListDeliverabilityUseCase::new(list_deliverability.clone()));
+
     // `CurationUseCase` wired
     // with the same ports the production composition root threads
     // (events, artifacts, lifecycle, policy projections). The three
@@ -1629,6 +1656,8 @@ pub fn build_mock_ctx_with_label_flag(
         // See field doc.
         manifest_deliverability_use_case,
         // See field doc.
+        list_deliverability_use_case,
+        // See field doc.
         curation_use_case,
         provenance_misrejection_repair_use_case,
         // See field doc.
@@ -1759,6 +1788,7 @@ pub fn build_mock_ctx_with_label_flag(
     let mocks = MockPorts {
         artifacts,
         constituent_status,
+        list_deliverability,
         repositories,
         storage,
         events,
@@ -1902,6 +1932,12 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         subscription_use_case: base.subscription_use_case.clone(),
         event_visibility_use_case: base.event_visibility_use_case.clone(),
         manifest_deliverability_use_case: base.manifest_deliverability_use_case.clone(),
+        // Carry forward. The census is read-only
+        // and does not consume `RepositoryAccessUseCase` — the list
+        // handlers resolve the repository themselves before they ask —
+        // so no `with_*` helper rebuild is needed when the access
+        // policy flips.
+        list_deliverability_use_case: base.list_deliverability_use_case.clone(),
         // Carry forward the same
         // `Arc<CurationUseCase>`. The curation surface is admin-only
         // (gated by `CurateOrAdminPrincipal`) and does NOT consume

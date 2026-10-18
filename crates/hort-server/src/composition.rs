@@ -73,6 +73,7 @@ use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 // with the I/O-bearing orchestration (the pure
 // planner stays untouched).
 use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
+use hort_app::use_cases::list_deliverability::ListDeliverabilityUseCase;
 use hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase;
 use hort_app::use_cases::promotion_use_case::PromotionUseCase;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
@@ -2819,6 +2820,17 @@ pub async fn build_app_context(
         ),
     ));
 
+    // ADR 0062's **omission** half for the OCI surfaces hort builds out
+    // of manifest digests (the referrers index, `tags/list`): "which of
+    // these would the pull refuse?". Same question as the resolution
+    // above, different authority — a list holds no bytes to derive a
+    // closure from, so the closure comes from the `content_references`
+    // membership projection in one recursive statement. The split is
+    // the decision; see the use case's module doc before unifying them.
+    let list_deliverability_use_case = Arc::new(ListDeliverabilityUseCase::new(Arc::new(
+        hort_adapters_postgres::list_deliverability::PgListDeliverabilityCensus::new(db.clone()),
+    )));
+
     // Boot-time unsafe-config gauges for the two webhook-safety
     // operator opt-ins — see `emit_webhook_unsafe_config_gauges`.
     emit_webhook_unsafe_config_gauges(&notify_config);
@@ -3089,6 +3101,7 @@ pub async fn build_app_context(
         // The OCI manifest read paths' constituent gate; `hort-http-oci`
         // calls it from `serve` for GET and HEAD alike.
         manifest_deliverability_use_case,
+        list_deliverability_use_case,
         // Curator decision authority over quarantined /
         // non-terminal artifacts; HTTP decision handlers mount under
         // `/api/v1/admin/curation/...`.
