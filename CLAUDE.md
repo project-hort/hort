@@ -3,9 +3,9 @@
 Auto-generated from all feature plans. Last updated: 011
 
 ## Active Technologies
-- Rust 1.94+ (backend) + git2, axum
-- Rust 1.94+ + axum, sqlx, tokio, reqwest
-- Rust 1.94+ + axum, serde, serde_json
+- Rust 1.97+ (backend) + git2, axum
+- Rust 1.97+ + axum, sqlx, tokio, reqwest
+- Rust 1.97+ + axum, serde, serde_json
 - Planned, post-v1 (not wired into the build today — see
   `hort-formats/README.md`): wasmtime 21.0+, wasmtime-wasi, wit-bindgen,
   filesystem for WASM binaries. Format handlers are currently compiled-in
@@ -115,10 +115,10 @@ release gate.
 
 ## Code Style
 
-Rust 1.94+ with the following project configuration:
+Rust 1.97+ with the following project configuration:
 
 - **Line width:** 100 characters (see `rustfmt.toml`)
-- **MSRV:** 1.94.0 (see `.clippy.toml`)
+- **MSRV:** 1.97.0 (see `.clippy.toml`)
 - **`unsafe` is forbidden workspace-wide** via `[workspace.lints.rust] unsafe_code = "forbid"` in the root `Cargo.toml`. This cannot be overridden with `#[allow]` — it is a compile error. All dependencies that need `unsafe` handle it within their own crates; no application code in this workspace has a legitimate need for it. If a future edge case requires revisiting this, the change must be made in `Cargo.toml` and reviewed as a policy change.
 - **Clippy lints** are configured in `[workspace.lints.clippy]` in the root `Cargo.toml`. Every crate inherits these via `[lints] workspace = true`. Do not override workspace lints in individual crates without justification.
 - **SonarCloud quality gate** runs on every PR and enforces >= 85% coverage on new code and <= 1% duplication on new code. PRs that fail the gate will be blocked.
