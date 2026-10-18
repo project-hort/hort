@@ -449,8 +449,14 @@ export COSIGN_DOCKER_MEDIA_TYPES=1
 export COSIGN_EXPERIMENTAL=1
 SIGN_OUT=""
 SIGN_RC=0
+# `--tlog-upload=false` for the same reason as the sibling multilayer
+# scenario: the keyed verifier consults no transparency log, so the upload
+# only couples this compose run to a public service. This subject's digest is
+# fresh per run, so it does not collide today — the flag keeps it that way
+# rather than waiting for a run that reuses one.
 SIGN_OUT="$(cosign sign --yes \
     --key "$COSIGN_KEY" \
+    --tlog-upload=false \
     --registry-referrers-mode=oci-1-1 \
     --registry-username="$PUSH_USER" \
     --registry-password="$PUSH_SECRET" \
