@@ -24,11 +24,10 @@
 //! # Why the statement spells out no status
 //!
 //! The terminal vocabulary is bound, not written: the array comes from
-//! [`terminal_statuses_by_refusal_precedence`], which filters
-//! `QuarantineStatus::ALL` through `QuarantineStatus::is_terminal` and
-//! encodes each survivor through
-//! [`quarantine_status_to_sql`](crate::quarantine_status_sql) — the one
-//! author of this column's stored vocabulary. A literal
+//! [`terminal_status_binding`], which filters `QuarantineStatus::ALL`
+//! through `QuarantineStatus::is_terminal` and encodes each survivor
+//! through `quarantine_status_to_sql` — the one author of this column's
+//! stored vocabulary, and the one derivation of this array. A literal
 //! `IN ('rejected','scan_indeterminate')` here would be a second
 //! definition of `is_terminal`, and a sixth `QuarantineStatus` variant
 //! would leave it narrower than the predicate with nothing failing. The
@@ -57,12 +56,10 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::constituent_status::{
-    terminal_statuses_by_refusal_precedence, ConstituentStatusReader, TerminalConstituent,
-};
+use hort_domain::ports::constituent_status::{ConstituentStatusReader, TerminalConstituent};
 use hort_domain::types::ContentHash;
 
-use crate::quarantine_status_sql::{quarantine_status_from_sql, quarantine_status_to_sql};
+use crate::quarantine_status_sql::{quarantine_status_from_sql, terminal_status_binding};
 use crate::{map_sqlx_error, BoxFuture};
 
 /// The one statement. Hoisted to a `const` so the DB-free guard can read
@@ -105,18 +102,15 @@ impl PgConstituentStatusReader {
     /// against the domain predicate directly rather than inferring it
     /// from the statement text. Nothing in production calls it except
     /// the one query below.
+    ///
+    /// The derivation itself lives in
+    /// [`crate::quarantine_status_sql`] — beside the encoder it uses —
+    /// because a second query now binds the same array (the list
+    /// surfaces' census), and the crate holds one derivation of it
+    /// rather than one per consumer.
     #[must_use]
     pub fn terminal_status_binding() -> Vec<String> {
-        terminal_statuses_by_refusal_precedence()
-            .into_iter()
-            // `None` is the one status the column stores as SQL NULL, and
-            // it is not terminal, so `filter_map` drops nothing a
-            // terminal set contains. Expressed as a flatten rather than
-            // an `expect` because an encoder that returned `None` for a
-            // terminal status would be a mapping bug, not a reason to
-            // panic a read path.
-            .filter_map(quarantine_status_to_sql)
-            .collect()
+        terminal_status_binding()
     }
 }
 
@@ -179,6 +173,8 @@ mod tests {
 
     use hort_domain::entities::artifact::QuarantineStatus;
     use serial_test::serial;
+
+    use crate::quarantine_status_sql::quarantine_status_to_sql;
 
     async fn maybe_pool() -> Option<PgPool> {
         let url = std::env::var("DATABASE_URL").ok()?;

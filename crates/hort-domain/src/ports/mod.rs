@@ -44,6 +44,13 @@ pub mod format_handler;
 pub mod identity_provider;
 pub mod jobs_repository;
 pub mod kubernetes_secret_writer;
+// The list-surface counterpart of `constituent_status`: same question
+// ("would this registry refuse this?"), asked about a set of manifests a
+// hort-built document is about to name, with the closure resolved from
+// the membership projection rather than from bytes the caller does not
+// hold. ADR 0062's omission shape for the OCI referrers index and
+// `tags/list`.
+pub mod list_deliverability;
 pub mod metadata_mirror_store;
 pub mod oidc_issuer_repository;
 pub mod patch_candidate_repository;

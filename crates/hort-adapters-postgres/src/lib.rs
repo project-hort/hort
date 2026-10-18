@@ -73,6 +73,14 @@ pub mod event_chain_reader;
 pub mod event_repository_resolver;
 pub mod event_store;
 pub mod jobs_repository;
+// The list-surface census behind ADR 0062's omission shape: one
+// recursive statement over the `content_references` membership
+// projection that turns a set of candidate manifest hashes into the
+// subset the referrers index and `tags/list` must omit. The
+// by-the-bytes sibling is `constituent_status`; the two answer the same
+// question from different sources on purpose, because their callers
+// differ in whether they already hold the bytes.
+pub mod list_deliverability;
 pub mod mappers;
 pub(crate) mod merged_category_read;
 pub mod metrics;

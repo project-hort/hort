@@ -15,7 +15,11 @@
   On the OCI paths the manifest write path refuses a terminal reference; the
   read path's constituent half is this issue's enforcement unit and **had not
   landed when this ADR was accepted** — stated so the record is not read as
-  describing shipped behaviour. The per-format enforcement map belongs to the
+  describing shipped behaviour. It has since landed for the manifest route
+  (`hort_app::use_cases::manifest_deliverability`, closure from the bytes) and
+  for the two OCI list surfaces (`hort_app::use_cases::list_deliverability`
+  behind the referrers index and `tags/list`, closure from the membership
+  projection — decision 2b). The per-format enforcement map belongs to the
   architect skill (ADR 0024, `.claude/commands/hort-architect.md`), which a
   reviewer re-reads; one in an ADR is stale at the next rename.
 - **Relates:** [0007](0007-fail-closed-quarantine-release-predicate.md) (the
@@ -90,6 +94,45 @@ tier is neither servable nor non-servable but unknown, it is the ordinary
 state of a cold pull-through, and which modes advertise it is `IndexMode`'s
 question under ADR 0015's naming discipline — untouched here.
 
+### 2b. Where the answer is *read from* follows the document's input cost
+
+Deciding that an entry is non-servable requires resolving what it binds —
+its closure — and the source of that resolution is not one choice for the
+whole system. It follows from what the document's reader is already
+holding, and the two answers are deliberate rather than an inconsistency
+to tidy away:
+
+- **The reader already holds the bytes.** A manifest `GET` has the
+  document in hand before it can serve it, so deriving the closure from
+  those bytes costs nothing, and consulting the `content_references`
+  membership projection instead would buy a second source of truth for
+  free. ADR 0039 settles which one wins when they can disagree: edges
+  *nominate*, the bytes decide.
+- **The reader holds no bytes.** A list surface — the OCI referrers
+  index, `tags/list` — names N manifests it has not read. The same
+  derivation there is N round trips and one CAS-read tree per entry, and
+  a list has no acceptable fail-closed answer when a per-entry budget
+  blows: refusing one manifest is proportionate, refusing a whole
+  `tags/list` is not. So a list resolves the closure from the membership
+  projection, in one statement, with zero CAS reads.
+
+**The projection's weakness, dated.** A manifest row minted before the
+2026-10-07 amendment to ADR 0043 — the one that moved the OCI membership
+edges into the claiming artifact's own transaction — can carry incomplete
+edges, and the `oci-membership-edge-backfill` task exists to repair
+exactly those. An incomplete edge set makes a list surface
+**under**-report: the entry stays listed and the subsequent pull refuses
+it, which is the behaviour that preceded the rule — so no regression, and
+it fails **open** rather than hiding something the registry would have
+served. The converse cannot happen, because an edge is written only from
+a complete resolution of what a document declares, so the projection
+cannot nominate a constituent a document does not bind.
+
+This is why a surface's enforcement shape (decision 2) and its closure
+authority are two separate questions. A future surface answers the first
+from whether hort builds the document and the second from whether its
+reader already holds the bytes; neither answer implies the other.
+
 ### 3. The line runs between a verdict and a wait, and it is one line for every format
 
 - A **terminal** verdict — `Rejected` or `ScanIndeterminate`, the class
@@ -163,6 +206,12 @@ decides a different question (the never-ingested tier), and is not extended.
 - Issue #342; backlog item 296 — this record's commission and its scope.
 - `crates/hort-app/src/use_cases/index_filters.rs` — the
   construct-the-document shape and its per-entry truth table.
+- `crates/hort-app/src/use_cases/manifest_deliverability.rs` and
+  `crates/hort-app/src/use_cases/list_deliverability.rs` — decision 2b's two
+  closure authorities, each carrying its own cost argument; the Postgres
+  census statement in
+  `crates/hort-adapters-postgres/src/list_deliverability.rs` carries the dated
+  legacy-edge weakness at the query.
 - `docs/glossary.md`, "Terminal (quarantine status)" — decision 3's
   vocabulary, already in place and unchanged here.
 - [ADR 0043](0043-oci-image-index-support.md) — the narrowed argument, with

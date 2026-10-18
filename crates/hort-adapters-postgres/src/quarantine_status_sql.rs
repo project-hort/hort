@@ -54,6 +54,7 @@
 
 use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::error::{DomainError, DomainResult};
+use hort_domain::ports::constituent_status::terminal_statuses_by_refusal_precedence;
 
 /// The [`Display`](std::fmt::Display) spelling of
 /// [`QuarantineStatus::None`]. Named so the decoder can refuse it
@@ -78,6 +79,37 @@ pub(crate) fn quarantine_status_to_sql(status: QuarantineStatus) -> Option<Strin
         QuarantineStatus::None => None,
         other => Some(other.to_string()),
     }
+}
+
+/// The terminal statuses in their **stored** spelling, strongest first —
+/// the array a query binds when it has to ask "is this row's lifecycle
+/// concluded against delivery?".
+///
+/// This is the one derivation of that array in the crate, and every
+/// query that needs it binds this rather than deriving it again. Two
+/// derivations would not be two definitions of `is_terminal` — both
+/// filter through the predicate — but they would be two places to get
+/// the *encoding* wrong, and this module is where the column's stored
+/// vocabulary has its single author. A spelled-out
+/// `IN ('rejected','scan_indeterminate')` in SQL is the thing neither
+/// may become: that is a second definition of the predicate, and a sixth
+/// `QuarantineStatus` variant leaves it narrower with nothing failing.
+///
+/// The **order** is load-bearing for a caller that ranks verdicts: it is
+/// [`terminal_statuses_by_refusal_precedence`]'s, so a query can turn the
+/// array's ordinality into an `ORDER BY` key without SQL knowing which
+/// verdict is stronger. A caller that only tests membership may ignore
+/// it.
+pub(crate) fn terminal_status_binding() -> Vec<String> {
+    terminal_statuses_by_refusal_precedence()
+        .into_iter()
+        // `None` is the one status the column stores as SQL NULL, and it
+        // is not terminal, so `filter_map` drops nothing a terminal set
+        // contains. Expressed as a flatten rather than an `expect`
+        // because an encoder that returned `None` for a terminal status
+        // would be a mapping bug, not a reason to panic a read path.
+        .filter_map(quarantine_status_to_sql)
+        .collect()
 }
 
 /// Decode a stored `artifacts.quarantine_status` into the domain state,

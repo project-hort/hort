@@ -69,6 +69,13 @@ pub mod index_serve;
 // `VersionOrdering` implementations.
 pub mod index_serve_filter;
 pub mod ingest_use_case;
+// ADR 0062's **omission** shape for the OCI surfaces hort builds out of
+// manifest digests (the referrers index, `tags/list`): which of the
+// entries a document is about to name would the pull refuse? The closure
+// comes from the membership projection here, because a list holds no
+// bytes to derive it from — see the module doc, and `manifest_
+// deliverability` for the same question answered from the bytes.
+pub mod list_deliverability;
 // `POST /api/v1/artifacts/:id/rescan` use case.
 // Lives in `hort-app` (not `hort-http-admin-security`) per the layered
 // architecture: use cases hold the RBAC / conflict-detection /
