@@ -58,8 +58,8 @@ use super::BoxFuture;
 /// The adapter owns the verifier↔emitter signature contract: it MUST
 /// sign exactly the bytes the read adapter verifies
 /// (`serde_json::to_vec(&SignedBody)` over the shared `SignedBody`
-/// fields) so a checkpoint this port emits round-trips to
-/// `AnchorVerdict::Ok` through the existing read adapter. A divergence
+/// fields) so a checkpoint this port emits round-trips to a clean
+/// `AnchorFindings` through the existing read adapter. A divergence
 /// makes every emitted checkpoint read as a signature failure ⇒ a
 /// permanent `missing_checkpoint` verdict.
 ///

@@ -6,7 +6,7 @@
 //! [`PgEventStore::append_in_tx`] so neither side can land without the
 //! other.
 //!
-//! # Three load-bearing rules (see port docstring)
+//! # Four load-bearing rules (see port docstring)
 //!
 //! 1. **The adapter never mutates `DomainEvent` payloads.** The caller
 //!    hands us an [`AppendEvents`]; we either append it verbatim or
@@ -32,6 +32,16 @@
 //!    `DomainError::Conflict`. Member-add for the losing call does
 //!    NOT land; the caller chose a privileged operation and needs to
 //!    know it didn't stick.
+//!
+//! 4. **A transaction that wrote commits its event batch or nothing
+//!    at all.** `commit_member_added` has one branch — the same-role
+//!    member re-add — that commits WITHOUT appending the batch. That
+//!    branch is gated on [`ProjectionWrites::Clean`]: it is reachable
+//!    only while no step of the transaction has written a row, so the
+//!    commit it performs releases locks and changes no state. A
+//!    committed projection change whose batch was dropped is a state
+//!    transition the event log never mentions, and no reader can
+//!    recover it — see [`ProjectionWrites`].
 //!
 
 use std::sync::Arc;
@@ -62,6 +72,33 @@ impl PgArtifactGroupLifecycle {
     }
 }
 
+/// Whether any step of a `commit_member_added` transaction has already
+/// written a projection row.
+///
+/// The same-role member re-add branch commits its transaction **without**
+/// appending the caller's event batch. That is sound only while the
+/// transaction is [`ProjectionWrites::Clean`] — then the commit releases
+/// the lock the member `INSERT` attempt took and changes nothing else.
+/// Committing it [`ProjectionWrites::Dirty`] would leave a durable
+/// projection change with no event behind it, which the event-sourced
+/// lifecycle (ADR 0002) forbids and which nothing downstream can detect:
+/// the log simply never mentions the transition, so a reader cannot tell
+/// the change from one that never happened.
+///
+/// Every step that writes records itself here and the branch consumes
+/// the value. A step added later between a write and that branch has to
+/// decide what this value should be in order to compile past it, which
+/// is the point of threading a value rather than re-reading the intent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProjectionWrites {
+    /// No step has written a row — a commit here is a true no-op and
+    /// has no state transition for an event to explain.
+    Clean,
+    /// At least one row written — this transaction must append its
+    /// batch or roll back entirely.
+    Dirty,
+}
+
 impl ArtifactGroupLifecyclePort for PgArtifactGroupLifecycle {
     fn commit_member_added(
         &self,
@@ -70,6 +107,9 @@ impl ArtifactGroupLifecyclePort for PgArtifactGroupLifecycle {
     ) -> BoxFuture<'_, DomainResult<GroupCommitOutcome>> {
         Box::pin(async move {
             let mut uow = self.event_store.begin_unit_of_work().await?;
+            // Consumed by the same-role re-add branch in step 3, which
+            // may only commit without the batch while this is `Clean`.
+            let mut writes = ProjectionWrites::Clean;
 
             // -----------------------------------------------------------
             // Step 1 — group row: insert-or-observe-the-winner.
@@ -99,7 +139,12 @@ impl ArtifactGroupLifecyclePort for PgArtifactGroupLifecycle {
                 })?;
 
                 match inserted {
-                    Some(id) => id,
+                    Some(id) => {
+                        // The group row landed; the transaction is no
+                        // longer a candidate for the no-batch commit.
+                        writes = ProjectionWrites::Dirty;
+                        id
+                    }
                     None => {
                         // Concurrent writer won the race. Look up their
                         // id so the use case's retry has something to
@@ -172,6 +217,10 @@ impl ArtifactGroupLifecyclePort for PgArtifactGroupLifecycle {
                         "primary_role already assigned on group {target_group_id} (race lost)"
                     )));
                 }
+                // The group's primary role is now written. Whatever
+                // commits this transaction from here on carries the
+                // batch that explains the assignment, or rolls back.
+                writes = ProjectionWrites::Dirty;
             }
 
             // -----------------------------------------------------------
@@ -198,12 +247,13 @@ impl ArtifactGroupLifecyclePort for PgArtifactGroupLifecycle {
             })?
             .rows_affected();
 
+            // The branch below is reached only when this INSERT wrote
+            // nothing, so the member row is not a write to record.
             if inserted_rows == 0 {
                 // Existing row. Inspect `role` to decide idempotent
-                // vs conflict. If same role → no event, commit the
-                // transaction (to release the member-row lock), and
-                // return Committed. If different role → roll back
-                // and surface Conflict.
+                // re-add vs conflict. A different role rolls the whole
+                // transaction back; the same role is a no-op ONLY if
+                // nothing else in this transaction has written.
                 let existing_role: String = sqlx::query_scalar(
                     r#"SELECT role FROM artifact_group_members
                        WHERE group_id = $1 AND artifact_id = $2"#,
@@ -217,27 +267,43 @@ impl ArtifactGroupLifecyclePort for PgArtifactGroupLifecycle {
                         "artifact_group_members lookup after ON CONFLICT failed: {e}"
                     ))
                 })?;
-                if existing_role == change.member.role {
+                if existing_role != change.member.role {
+                    drop(uow);
+                    return Err(DomainError::Conflict(format!(
+                        "artifact {artifact_id} already belongs to group {group_id} with role `{existing}`, cannot re-add with role `{requested}`",
+                        artifact_id = change.member.artifact_id,
+                        group_id = target_group_id,
+                        existing = existing_role,
+                        requested = change.member.role,
+                    )));
+                }
+                if writes == ProjectionWrites::Clean {
                     tracing::debug!(
                         group_id = %target_group_id,
                         artifact_id = %change.member.artifact_id,
                         role = %existing_role,
                         "idempotent same-role re-add; no event emitted"
                     );
-                    // Commit releases the row lock from the INSERT
-                    // attempt; nothing else was written, so the txn
-                    // is semantically a no-op.
+                    // `writes` is `Clean`: no step of this transaction
+                    // wrote a row, so the commit only releases the lock
+                    // the member INSERT attempt took. Nothing changed,
+                    // so there is no transition for an event to carry.
                     uow.commit().await?;
                     return Ok(GroupCommitOutcome::Committed);
                 }
-                drop(uow);
-                return Err(DomainError::Conflict(format!(
-                    "artifact {artifact_id} already belongs to group {group_id} with role `{existing}`, cannot re-add with role `{requested}`",
-                    artifact_id = change.member.artifact_id,
-                    group_id = target_group_id,
-                    existing = existing_role,
-                    requested = change.member.role,
-                )));
+                // The member row was already there, but an earlier step
+                // of THIS transaction wrote — the group row, or the
+                // primary-role slot this call just claimed. That write
+                // is a state transition, so fall through to the append:
+                // committing it here would leave a durable change the
+                // event log never mentions.
+                tracing::debug!(
+                    group_id = %target_group_id,
+                    artifact_id = %change.member.artifact_id,
+                    role = %existing_role,
+                    "same-role re-add over a transaction that already wrote; \
+                     appending the batch so the write carries its events"
+                );
             }
 
             // -----------------------------------------------------------
@@ -871,6 +937,282 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(member_rows, 1);
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// `(primary_role, total events on the group's stream)` — the pair
+    /// the write-carries-its-event invariant requires to move together.
+    async fn group_primary_and_event_count(
+        pool: &PgPool,
+        group_id: Uuid,
+        stream_id: &str,
+    ) -> (String, i64) {
+        let primary: String =
+            sqlx::query_scalar("SELECT primary_role FROM artifact_groups WHERE id = $1")
+                .bind(group_id)
+                .fetch_one(pool)
+                .await
+                .expect("group row present");
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE stream_id = $1")
+            .bind(stream_id)
+            .fetch_one(pool)
+            .await
+            .expect("event count");
+        (primary, events)
+    }
+
+    /// Seed a group row with an EMPTY primary slot and return its id.
+    async fn seed_group_without_primary(
+        pool: &PgPool,
+        repo: Uuid,
+        coords: &ArtifactCoords,
+    ) -> Uuid {
+        let group_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO artifact_groups (id, repository_id, coords_json, primary_role)
+               VALUES ($1, $2, $3, '')"#,
+        )
+        .bind(group_id)
+        .bind(repo)
+        .bind(coords_to_canonical_json(coords).unwrap())
+        .execute(pool)
+        .await
+        .expect("seed group row with an empty primary slot");
+        group_id
+    }
+
+    /// A member-add batch that ALSO carries the primary-role claim.
+    fn build_primary_claim_batch(group_id: Uuid, role: &str, artifact_id: Uuid) -> AppendEvents {
+        AppendEvents {
+            stream_id: StreamId::artifact_group(group_id),
+            expected_version: ExpectedVersion::Any,
+            events: vec![
+                EventToAppend::new(DomainEvent::ArtifactGroupMemberAdded(
+                    ArtifactGroupMemberAdded {
+                        group_id,
+                        role: role.into(),
+                        artifact_id,
+                    },
+                )),
+                EventToAppend::new(DomainEvent::ArtifactGroupPrimaryRoleAssigned(
+                    hort_domain::events::ArtifactGroupPrimaryRoleAssigned {
+                        group_id,
+                        primary_role: role.into(),
+                    },
+                )),
+            ],
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: Actor::Api(ApiActor {
+                user_id: Uuid::new_v4(),
+            }),
+        }
+    }
+
+    fn member_commit(
+        role: &str,
+        artifact_id: Uuid,
+        primary_role_assigned: Option<&str>,
+    ) -> GroupMemberCommit {
+        GroupMemberCommit {
+            new_group: None,
+            member: ArtifactGroupMember {
+                role: role.into(),
+                artifact_id,
+                added_at: Utc::now(),
+            },
+            primary_role_assigned: primary_role_assigned.map(str::to_string),
+        }
+    }
+
+    /// The write-carries-its-event keystone: a same-role re-add that
+    /// ALSO claims a previously-unset `primary_role`. The member INSERT
+    /// conflicts and writes nothing, but the primary-role UPDATE in the
+    /// same transaction DID write — so the transaction is not a no-op
+    /// and may not commit without the batch that explains the claim.
+    ///
+    /// Asserts the projection and the stream move TOGETHER: before the
+    /// gate, this committed `primary_role = 'jar'` with the event count
+    /// unchanged — a durable role change the event log never mentions.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn primary_role_claim_over_same_role_re_add_carries_its_events() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let event_store = Arc::new(PgEventStore::new(pool.clone()).await.unwrap());
+        let adapter = PgArtifactGroupLifecycle::new(event_store.clone());
+
+        let coords = maven_coords("com.example:write-carries-event", "1.0.0");
+        let group_id = seed_group_without_primary(&pool, repo, &coords).await;
+        let artifact = seed_artifact(&pool, repo, "write-carries-event.jar").await;
+        let stream_id = format!("artifact_group-{group_id}");
+
+        // Arrange: the artifact is already a member under role "jar",
+        // committed WITHOUT claiming the primary slot — so the group
+        // still carries `primary_role = ''`.
+        adapter
+            .commit_member_added(
+                member_commit("jar", artifact, None),
+                build_append_batch(group_id, "jar", artifact),
+            )
+            .await
+            .expect("the plain member add commits");
+
+        let (primary_before, events_before) =
+            group_primary_and_event_count(&pool, group_id, &stream_id).await;
+        assert_eq!(primary_before, "", "arranged state: primary slot empty");
+        assert_eq!(events_before, 1, "arranged state: one MemberAdded landed");
+
+        // Act: same artifact, same role — the member INSERT writes
+        // nothing — but this call also claims the empty primary slot,
+        // which does.
+        let outcome = adapter
+            .commit_member_added(
+                member_commit("jar", artifact, Some("jar")),
+                build_primary_claim_batch(group_id, "jar", artifact),
+            )
+            .await
+            .expect("the primary-role claim commits");
+        assert!(matches!(outcome, GroupCommitOutcome::Committed));
+
+        let (primary_after, events_after) =
+            group_primary_and_event_count(&pool, group_id, &stream_id).await;
+        assert_eq!(primary_after, "jar", "the primary slot was claimed");
+        assert_eq!(
+            events_after,
+            events_before + 2,
+            "the batch explaining the claim must have landed alongside it"
+        );
+        let assigned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE stream_id = $1 AND event_type = 'ArtifactGroupPrimaryRoleAssigned'",
+        )
+        .bind(&stream_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(assigned, 1, "exactly one PrimaryRoleAssigned event");
+
+        // The re-add stayed idempotent on the projection side.
+        let member_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifact_group_members WHERE group_id = $1")
+                .bind(group_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(member_rows, 1, "the duplicate member row was absorbed");
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// The genuine no-op the gate must leave alone: a same-role re-add
+    /// with NO primary claim writes nothing, so it still commits, still
+    /// emits no event, and still returns `Committed`.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn same_role_re_add_without_a_primary_claim_emits_no_event() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let event_store = Arc::new(PgEventStore::new(pool.clone()).await.unwrap());
+        let adapter = PgArtifactGroupLifecycle::new(event_store.clone());
+
+        let coords = maven_coords("com.example:true-noop", "1.0.0");
+        let group_id = seed_group_without_primary(&pool, repo, &coords).await;
+        let artifact = seed_artifact(&pool, repo, "true-noop.jar").await;
+        let stream_id = format!("artifact_group-{group_id}");
+
+        adapter
+            .commit_member_added(
+                member_commit("jar", artifact, None),
+                build_append_batch(group_id, "jar", artifact),
+            )
+            .await
+            .expect("the first add commits");
+        let (primary_before, events_before) =
+            group_primary_and_event_count(&pool, group_id, &stream_id).await;
+
+        let outcome = adapter
+            .commit_member_added(
+                member_commit("jar", artifact, None),
+                build_append_batch(group_id, "jar", artifact),
+            )
+            .await
+            .expect("the same-role re-add still commits");
+        assert!(matches!(outcome, GroupCommitOutcome::Committed));
+
+        let (primary_after, events_after) =
+            group_primary_and_event_count(&pool, group_id, &stream_id).await;
+        assert_eq!(primary_after, primary_before, "nothing was written");
+        assert_eq!(
+            events_after, events_before,
+            "a transaction that wrote nothing emits nothing"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// A DIFFERENT-role re-add still rolls the WHOLE transaction back —
+    /// including the `primary_role` the same call just claimed. The gate
+    /// added for the same-role case must not leak that write into a
+    /// commit: projection and stream both stay exactly where they were.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn different_role_re_add_rolls_back_the_primary_claim_too() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let event_store = Arc::new(PgEventStore::new(pool.clone()).await.unwrap());
+        let adapter = PgArtifactGroupLifecycle::new(event_store.clone());
+
+        let coords = maven_coords("com.example:role-mismatch", "1.0.0");
+        let group_id = seed_group_without_primary(&pool, repo, &coords).await;
+        let artifact = seed_artifact(&pool, repo, "role-mismatch.pom").await;
+        let stream_id = format!("artifact_group-{group_id}");
+
+        adapter
+            .commit_member_added(
+                member_commit("pom", artifact, None),
+                build_append_batch(group_id, "pom", artifact),
+            )
+            .await
+            .expect("the pom add commits");
+        let (primary_before, events_before) =
+            group_primary_and_event_count(&pool, group_id, &stream_id).await;
+
+        let err = adapter
+            .commit_member_added(
+                member_commit("jar", artifact, Some("jar")),
+                build_primary_claim_batch(group_id, "jar", artifact),
+            )
+            .await
+            .expect_err("re-adding the same artifact under another role is a Conflict");
+        assert!(
+            matches!(err, DomainError::Conflict(_)),
+            "expected Conflict, got: {err}"
+        );
+
+        let (primary_after, events_after) =
+            group_primary_and_event_count(&pool, group_id, &stream_id).await;
+        assert_eq!(
+            primary_after, primary_before,
+            "the rolled-back transaction must not leave the primary claim behind"
+        );
+        assert_eq!(events_after, events_before, "no event from a rollback");
+        let stored_role: String = sqlx::query_scalar(
+            "SELECT role FROM artifact_group_members WHERE group_id = $1 AND artifact_id = $2",
+        )
+        .bind(group_id)
+        .bind(artifact)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_role, "pom", "the existing member row is untouched");
 
         cleanup_repo(&pool, repo).await;
     }

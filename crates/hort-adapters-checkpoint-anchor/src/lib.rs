@@ -50,7 +50,7 @@
 //! round-trip is proven end-to-end by
 //! `emitted_checkpoint_round_trips_through_the_reader` (an emitted
 //! object is fed back through [`ObjectStoreCheckpointAnchor::read_all`]
-//! and the pure verify core, asserting `AnchorVerdict::Ok`).
+//! and the pure verify core, asserting a clean `AnchorFindings`).
 //!
 //! **Signed-body field set (precise — a real nuance).**
 //! `SignedBody` is the **shipped contract pin**: it covers
@@ -62,7 +62,7 @@
 //! [`CheckpointWire`] doc). Governance forbids reshaping the shipped
 //! `SignedBody`. The emitter therefore signs **exactly the shipped
 //! `SignedBody`** (so every emitted checkpoint round-trips to
-//! `AnchorVerdict::Ok` against the real verifier) and writes
+//! a clean `AnchorFindings` against the real verifier) and writes
 //! `max_global_position` / `backfill_baseline` into the JSON object as
 //! **unsigned advisory fields** alongside the signed body — precisely
 //! the forward-compatible extension the reader's [`CheckpointWire`]
@@ -889,15 +889,15 @@ mod tests {
     // Write path — checkpoint EMISSION (ADR 0002). The centerpiece is the
     // LOAD-BEARING round-trip: a checkpoint this emitter produces is accepted
     // by the read adapter (`read_all`) + the pure verify core
-    // (`verify_against_checkpoint`) → `AnchorVerdict::Ok` against a matching
-    // live-head set; a tampered body or a wrong signing key is rejected
+    // (`verify_against_checkpoint`) → a clean `AnchorFindings` against a
+    // matching live-head set; a tampered body or a wrong signing key is rejected
     // (dropped → not `Ok`). This proves the signature contract
     // end-to-end against the real verifier (the reader is the pin).
     // =======================================================================
 
     use ed25519_dalek::pkcs8::EncodePrivateKey;
     use hort_domain::events::{
-        build_checkpoint, verify_against_checkpoint, AnchorVerdict, BackfillBaseline, Checkpoint,
+        build_checkpoint, verify_against_checkpoint, AnchorFindings, BackfillBaseline, Checkpoint,
         MissingReason, StreamHead,
     };
 
@@ -1005,20 +1005,21 @@ mod tests {
         );
 
         // Feed it through the pure verify core against a MATCHING live
-        // head set → AnchorVerdict::Ok. This is the end-to-end
-        // signature-contract proof against the real verifier.
+        // head set → a clean `AnchorFindings` (no break, no coverage
+        // gap). This is the end-to-end signature-contract proof against
+        // the real verifier.
         let live = vec![
             ("admin-a".to_string(), 1u64, EventHash([0xaa; 32])),
             ("admin-b".to_string(), 3u64, EventHash([0xbb; 32])),
         ];
-        let verdict = verify_against_checkpoint(
+        let findings = verify_against_checkpoint(
             &live,
             &[],
             &cps,
             Utc.timestamp_opt(1_700_000_001, 0).unwrap(),
             std::time::Duration::from_secs(3600),
         );
-        assert_eq!(verdict, AnchorVerdict::Ok);
+        assert_eq!(findings, AnchorFindings::default());
 
         // The v1 SignedBody signs the flat sorted witness list directly;
         // the reader verifies that signed list — there is no Merkle root
@@ -1098,8 +1099,8 @@ mod tests {
     async fn wrong_signing_key_checkpoint_is_rejected_by_reader() {
         // Emitter signs with key A; reader verifies with an unrelated
         // key B's public PEM → the reader drops it (treated as absent),
-        // never a passing checkpoint. The anchor verdict is then
-        // MissingCheckpoint (NoCheckpoint), NOT Ok.
+        // never a passing checkpoint. The anchor findings then carry
+        // the NoCheckpoint coverage gap, NOT a clean result.
         let (priv_a, _pub_a) = signing_keypair_pems();
         let (_priv_b, pub_b) = signing_keypair_pems();
         let store = Arc::new(InMemory::new());
@@ -1120,7 +1121,7 @@ mod tests {
         let reader = ObjectStoreCheckpointAnchor::new(store, &pub_b).unwrap();
         let cps = reader.read_all().await.unwrap();
         assert!(cps.is_empty(), "wrong-key checkpoint must read as absent");
-        let verdict = verify_against_checkpoint(
+        let findings = verify_against_checkpoint(
             &[],
             &[],
             &cps,
@@ -1128,8 +1129,11 @@ mod tests {
             std::time::Duration::from_secs(3600),
         );
         assert_eq!(
-            verdict,
-            AnchorVerdict::MissingCheckpoint(MissingReason::NoCheckpoint)
+            findings,
+            AnchorFindings {
+                breaks: vec![],
+                coverage_gaps: vec![MissingReason::NoCheckpoint],
+            }
         );
     }
 

@@ -14,7 +14,7 @@
 //! distinguishes "really position 0" from "field not yet written".
 //!
 //! Scope note: the checkpoint/anchor types
-//! ([`Checkpoint`], [`AnchorVerdict`], [`verify_against_checkpoint`],
+//! ([`Checkpoint`], [`AnchorFindings`], [`verify_against_checkpoint`],
 //! [`ChainReport`], [`roll_up`]) are the pure verify core that the
 //! `verify-event-chain` subcommand composes. They are
 //! *defined and unit-tested here* because they are pure `hort-domain`
@@ -23,6 +23,8 @@
 //! `eventstore-checkpoint` task, the CLI subcommand, and the
 //! `hort_event_chain_verify_total` metric live in the outer layers and
 //! are NOT built here.
+
+use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
@@ -573,60 +575,200 @@ pub enum MissingReason {
 /// checkpoint, which is a coverage gap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnchorBreak {
-    /// A live stream head does not match the head the newest
-    /// checkpoint anchored (rollback / whole-stream truncation).
+    /// A live stream's `(final_position, head)` contradicts what a
+    /// signature-verified checkpoint anchored for that stream
+    /// (rollback / tail rewrite / whole-stream truncation). Every
+    /// checkpoint's statement counts, not only the newest one's — see
+    /// [`contradicts_anchored_head`] for the relation and for the one
+    /// half of it this pure core cannot decide.
     HeadMismatch,
     /// A live stream is absent and there is no `StreamSealed` for it.
     UnsealedAbsentStream,
     /// A `StreamSealed` head was never anchored by a checkpoint.
     SealUnanchored,
+    /// Two or more signature-verified checkpoints carry the same
+    /// `checkpoint_seq` — a fork in the anchor record.
+    ///
+    /// The sequence is single-valued by construction: the emitter
+    /// derives its seq as `max(existing) + 1` (`next_checkpoint_seq`)
+    /// from the same store it is about to write to. So a repeated seq
+    /// means either two emitters ran against one store, or a signed
+    /// checkpoint was fabricated — and in both cases one of the two
+    /// attests a cut the other contradicts. Deduplicating the seqs
+    /// made the fork disappear *and* left the `checkpoint_seq`
+    /// contiguity count reading as satisfied.
+    DuplicateCheckpointSeq,
 }
 
-/// Result of the anchor cross-check.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AnchorVerdict {
-    /// Live heads + seals are all consistent with the newest anchored
-    /// checkpoint.
-    Ok,
-    /// Cannot fully attest external anchoring (a coverage gap).
-    MissingCheckpoint(MissingReason),
-    /// A detected anchor-level integrity violation.
-    Broken(AnchorBreak),
+/// Everything the anchor cross-check found, on its two independent
+/// axes, before any ranking.
+///
+/// The cross-check answers two separate questions — "is there a real
+/// anchor-level violation?" and "is the anchor attestation complete?"
+/// — and a single-verdict return cannot carry both. It used to try:
+/// the coverage checks returned early, so a head mismatch under a
+/// stale or gapped anchor set was never computed, and [`roll_up`]'s
+/// `Broken`-dominates-`MissingCheckpoint` promise had nothing to rank
+/// in exactly the case it names. Both axes are therefore reported
+/// here and ranked once, in [`roll_up`] — the only ranking site.
+///
+/// Each `Vec` is a **set in detection order**: [`AnchorBreak`] and
+/// [`MissingReason`] carry no per-detection detail, so recording one
+/// kind twice would be noise rather than information. Empty on both
+/// axes is the clean result, i.e. `AnchorFindings::default()`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnchorFindings {
+    /// Anchor-level integrity violations. Non-empty ⇒
+    /// [`ChainReport::Broken`].
+    pub breaks: Vec<AnchorBreak>,
+    /// Coverage gaps in the anchor attestation. Non-empty with no
+    /// break ⇒ [`ChainReport::MissingCheckpoint`].
+    pub coverage_gaps: Vec<MissingReason>,
 }
 
-/// Cross-check live stream heads + sealed records against the newest
-/// anchored checkpoint.
+/// Push `value` unless it is already present — the backing store for
+/// both [`AnchorFindings`] axes, each of which is a set in detection
+/// order.
+fn record_once<T: PartialEq>(into: &mut Vec<T>, value: T) {
+    if !into.contains(&value) {
+        into.push(value);
+    }
+}
+
+impl AnchorFindings {
+    /// Record one anchor-level violation kind.
+    fn record_break(&mut self, value: AnchorBreak) {
+        record_once(&mut self.breaks, value);
+    }
+
+    /// Record one coverage-gap reason.
+    fn record_gap(&mut self, value: MissingReason) {
+        record_once(&mut self.coverage_gaps, value);
+    }
+}
+
+/// The checkpoint the coverage checks read, selected by a **total**
+/// order over the set's own content: highest `checkpoint_seq`, and
+/// among equal seqs the *earliest* `created_at`.
+///
+/// `max_by_key(|c| c.checkpoint_seq)` returns the last of several
+/// equal maxima, so its answer was a function of the order the adapter
+/// happened to hand the set over in — and
+/// `CheckpointAnchorPort::read_all` promises no order at all. A seq
+/// tie is itself a reported violation
+/// ([`AnchorBreak::DuplicateCheckpointSeq`]); resolving it towards the
+/// earliest `created_at` resolves it fail-closed, because a forked
+/// sequence cannot vouch for the freshness the later timestamp claims.
+///
+/// Two checkpoints equal on *both* keys leave which one is returned
+/// order-dependent, which is harmless: every use of the result reads
+/// only `checkpoint_seq` and `created_at`, so the verdict is not.
+fn newest_checkpoint(checkpoints: &[Checkpoint]) -> Option<&Checkpoint> {
+    checkpoints.iter().max_by(|a, b| {
+        a.checkpoint_seq
+            .cmp(&b.checkpoint_seq)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    })
+}
+
+/// Does a live stream's `(position, head)` contradict what a
+/// signature-verified checkpoint anchored for it?
+///
+/// The chain is append-only, so a head a checkpoint anchored must be
+/// **reachable** from the live head: the live stream is at least as
+/// long as the anchored statement, and the anchored head is either the
+/// live head itself (nothing appended since the cut) or an ancestor of
+/// it. The relation against an older anchor is therefore *not*
+/// equality — a head legitimately advances between checkpoints.
+///
+/// Two halves of reachability are decidable from the final head alone,
+/// which is all this pure core is given:
+///
+/// * `anchored_position > live_position` — the stream is *shorter*
+///   than a checkpoint attested, so rows were removed from its tail.
+/// * `(anchored_position == live_position) != (anchored_head == live_head)`
+///   — `stream_position` is bound into the hash (field 5 of
+///   [`canonical_event_bytes`]), so one head hash cannot sit at two
+///   positions and two distinct heads cannot sit at one. Equal
+///   positions with different heads is a tail rewrite; different
+///   positions with the same head is a SHA-256 collision.
+///
+/// What is **not** decidable here: when `anchored_position <
+/// live_position` and the heads differ, confirming that the anchored
+/// head really is the live chain's hash *at that position* needs the
+/// live chain's hash at `anchored_position`, and `live_heads` carries
+/// only each stream's final head. So a wholesale rewrite followed by
+/// further appends still passes this predicate, while a wholesale
+/// rewrite of a stream that has not grown since the cut does not.
+/// Closing the residual is a read this function does not have, not a
+/// weaker relation.
+fn contradicts_anchored_head(
+    live_position: u64,
+    live_head: &EventHash,
+    anchored_position: u64,
+    anchored_head: &EventHash,
+) -> bool {
+    anchored_position > live_position
+        || (anchored_position == live_position) != (anchored_head == live_head)
+}
+
+/// Cross-check live stream heads + sealed records against **every**
+/// signature-verified anchored checkpoint.
 ///
 /// `live_heads`: every present stream's `(stream_id,
 /// final_stream_position, head_hash)`. `sealed`: the `StreamSealed`
 /// records read from the audit-meta stream. `checkpoints`: all
 /// checkpoints read from the anchor store. `now` / `cadence`: for the
 /// staleness check.
+///
+/// Returns both axes of [`AnchorFindings`]; the ranking is
+/// [`roll_up`]'s. A coverage gap (stale, gapped) no longer short-
+/// circuits the integrity checks: the gap is real and is reported, and
+/// so is any violation found under it. The one exception is "no
+/// checkpoint at all", where there is no anchored statement for a live
+/// head to contradict and nothing to compute.
+///
+/// Pure: no I/O, and no panic on any caller input (an absurd `cadence`
+/// is saturated rather than unwrapped).
 pub fn verify_against_checkpoint(
     live_heads: &[(String, u64, EventHash)],
     sealed: &[SealedStreamRecord],
     checkpoints: &[Checkpoint],
     now: chrono::DateTime<chrono::Utc>,
     cadence: std::time::Duration,
-) -> AnchorVerdict {
-    // (a) no checkpoint at all.
-    let Some(newest) = checkpoints.iter().max_by_key(|c| c.checkpoint_seq) else {
-        return AnchorVerdict::MissingCheckpoint(MissingReason::NoCheckpoint);
+) -> AnchorFindings {
+    let mut findings = AnchorFindings::default();
+
+    // (a) no checkpoint at all. The only coverage gap that also ends
+    //     the function: with nothing anchored there is no statement a
+    //     live head could contradict.
+    let Some(newest) = newest_checkpoint(checkpoints) else {
+        findings.record_gap(MissingReason::NoCheckpoint);
+        return findings;
     };
 
-    // (b) checkpoint_seq gap: the present seqs must be a contiguous
-    //     1..=max run (a missing intermediate seq = suppressed anchor).
     let mut seqs: Vec<u64> = checkpoints.iter().map(|c| c.checkpoint_seq).collect();
     seqs.sort_unstable();
-    seqs.dedup();
-    let expected_count = newest.checkpoint_seq;
-    // Sequences are 1-based and contiguous; the count of distinct seqs
-    // must equal the max seq, and the min must be 1.
-    if seqs.first().copied() != Some(1) || (seqs.len() as u64) != expected_count {
-        return AnchorVerdict::MissingCheckpoint(MissingReason::SequenceGap);
+
+    // (b) a repeated `checkpoint_seq` is a fork in the anchor record
+    //     (see `AnchorBreak::DuplicateCheckpointSeq`) — detected
+    //     *before* the dedup the contiguity count below needs, which
+    //     is what used to make it vanish.
+    if seqs.windows(2).any(|w| w[0] == w[1]) {
+        findings.record_break(AnchorBreak::DuplicateCheckpointSeq);
     }
 
-    // (c) staleness: newest older than 2 × cadence.
+    // (c) checkpoint_seq gap: the *distinct* seqs present must be a
+    //     contiguous 1..=max run (a missing intermediate seq =
+    //     suppressed anchor). Sequences are 1-based and contiguous, so
+    //     the count of distinct seqs must equal the max seq and the
+    //     min must be 1.
+    seqs.dedup();
+    if seqs.first().copied() != Some(1) || (seqs.len() as u64) != newest.checkpoint_seq {
+        findings.record_gap(MissingReason::SequenceGap);
+    }
+
+    // (d) staleness: newest older than 2 × cadence.
     let max_age = match chrono::Duration::from_std(cadence.saturating_mul(2)) {
         Ok(d) => d,
         // An absurd cadence overflows chrono::Duration; treat the
@@ -635,48 +777,73 @@ pub fn verify_against_checkpoint(
         Err(_) => chrono::Duration::MAX,
     };
     if now.signed_duration_since(newest.created_at) > max_age {
-        return AnchorVerdict::MissingCheckpoint(MissingReason::Stale);
+        findings.record_gap(MissingReason::Stale);
     }
 
-    // Integrity checks against the newest checkpoint.
-    // Every live head must match the anchored head for that stream, OR
-    // be a stream that did not exist when the checkpoint was cut
-    // (newer than the cut — not anchored yet, not a violation).
-    for (sid, _pos, head) in live_heads {
-        if let Some((_, _, anchored)) = newest.stream_heads.iter().find(|(s, _, _)| s == sid) {
-            if anchored != head {
-                return AnchorVerdict::Broken(AnchorBreak::HeadMismatch);
+    // The two cross-checks below each visit EVERY anchored statement
+    // in the store, so both sides are indexed first. A linear scan per
+    // statement would be quadratic in the stream count *and* linear in
+    // the checkpoint count on top of that; with the index each
+    // statement costs one lookup, which is the floor for a check whose
+    // premise is that every statement is read.
+    let mut live_by_id: HashMap<&str, (u64, &EventHash)> = HashMap::with_capacity(live_heads.len());
+    for (sid, pos, head) in live_heads {
+        // First occurrence wins, which is what the linear `find` this
+        // replaced did. `live_heads` carries one entry per stream by
+        // contract, so a repeat is a caller error rather than a case
+        // with a better answer.
+        live_by_id.entry(sid.as_str()).or_insert((*pos, head));
+    }
+    let sealed_ids: HashSet<&str> = sealed.iter().map(|r| r.sealed_stream_id.as_str()).collect();
+    let anchored_seals: HashSet<(&str, &EventHash)> = checkpoints
+        .iter()
+        .flat_map(|c| c.sealed_streams.iter())
+        .map(|s| (s.sealed_stream_id.as_str(), &s.final_event_hash))
+        .collect();
+
+    // Integrity checks against EVERY checkpoint's head statement, not
+    // only the newest one's. An older checkpoint was fetched and
+    // signature-verified too, so what it says about a stream head is
+    // evidence of the same standing; judging a run only against the
+    // newest cut means a wholesale rewrite is laundered by simply
+    // waiting for the next scheduled checkpoint.
+    //
+    // For each anchored stream, exactly one of two things must hold:
+    // it is still live with a head reachable from the anchored one
+    // (`contradicts_anchored_head`), or it is absent and a
+    // `StreamSealed` record justifies the absence. An anchored stream
+    // that is now absent with no seal is a whole-stream truncation.
+    //
+    // A live stream NO checkpoint anchored is not visited at all —
+    // that is a stream created after every cut, which is not a
+    // violation.
+    for cp in checkpoints {
+        for (sid, anchored_pos, anchored_head) in &cp.stream_heads {
+            match live_by_id.get(sid.as_str()) {
+                Some((live_pos, live_head)) => {
+                    if contradicts_anchored_head(*live_pos, live_head, *anchored_pos, anchored_head)
+                    {
+                        findings.record_break(AnchorBreak::HeadMismatch);
+                    }
+                }
+                None => {
+                    if !sealed_ids.contains(sid.as_str()) {
+                        findings.record_break(AnchorBreak::UnsealedAbsentStream);
+                    }
+                }
             }
-        }
-    }
-
-    // Every stream the checkpoint anchored must either still be live
-    // with a matching head (checked above) or have a `StreamSealed`
-    // record. An anchored stream that is now absent with no seal is a
-    // whole-stream truncation.
-    for (sid, _, _) in &newest.stream_heads {
-        let live = live_heads.iter().any(|(s, _, _)| s == sid);
-        let is_sealed = sealed.iter().any(|r| &r.sealed_stream_id == sid);
-        if !live && !is_sealed {
-            return AnchorVerdict::Broken(AnchorBreak::UnsealedAbsentStream);
         }
     }
 
     // Every `StreamSealed` must have its head anchored by some
     // checkpoint (so the seal is provably expected).
     for rec in sealed {
-        let anchored = checkpoints.iter().any(|c| {
-            c.sealed_streams.iter().any(|s| {
-                s.sealed_stream_id == rec.sealed_stream_id
-                    && s.final_event_hash == rec.final_event_hash
-            })
-        });
-        if !anchored {
-            return AnchorVerdict::Broken(AnchorBreak::SealUnanchored);
+        if !anchored_seals.contains(&(rec.sealed_stream_id.as_str(), &rec.final_event_hash)) {
+            findings.record_break(AnchorBreak::SealUnanchored);
         }
     }
 
-    AnchorVerdict::Ok
+    findings
 }
 
 // ---------------------------------------------------------------------------
@@ -696,19 +863,26 @@ pub enum ChainReport {
     MissingCheckpoint,
 }
 
-/// Roll the per-stream verdicts + the anchor verdict into the single
+/// Roll the per-stream verdicts + the anchor findings into the single
 /// top-level report. `Broken` dominates
 /// `MissingCheckpoint` dominates `Ok` — a real violation is never
 /// masked by a coverage gap.
-pub fn roll_up(stream_verdicts: &[StreamVerdict], anchor: &AnchorVerdict) -> ChainReport {
+///
+/// **This is the only ranking site**, and the dominance it states is
+/// now reachable in the case it names: [`verify_against_checkpoint`]
+/// reports both axes of [`AnchorFindings`] instead of returning the
+/// first coverage gap it finds, so an anchor set that is stale or
+/// gapped *and* contradicted by a live head arrives here carrying both
+/// facts and ranks as `Broken`.
+pub fn roll_up(stream_verdicts: &[StreamVerdict], anchor: &AnchorFindings) -> ChainReport {
     let any_broken = stream_verdicts
         .iter()
         .any(|v| matches!(v, StreamVerdict::Broken { .. }))
-        || matches!(anchor, AnchorVerdict::Broken(_));
+        || !anchor.breaks.is_empty();
     if any_broken {
         return ChainReport::Broken;
     }
-    if matches!(anchor, AnchorVerdict::MissingCheckpoint(_)) {
+    if !anchor.coverage_gaps.is_empty() {
         return ChainReport::MissingCheckpoint;
     }
     ChainReport::Ok
@@ -1277,18 +1451,42 @@ mod tests {
         }
     }
 
+    /// One hour — the production default cadence, and the one every
+    /// anchor test below that does not test staleness itself wants.
+    const HOURLY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// The cross-check at the hourly cadence with `now` taken at call
+    /// time. Factored out because fourteen anchor tests want exactly
+    /// this shape and only the staleness/cadence tests want another.
+    fn anchor_check(
+        live: &[(String, u64, EventHash)],
+        sealed: &[SealedStreamRecord],
+        cps: &[Checkpoint],
+    ) -> AnchorFindings {
+        verify_against_checkpoint(live, sealed, cps, Utc::now(), HOURLY)
+    }
+
+    /// Expected findings carrying only the coverage axis.
+    fn gap(reason: MissingReason) -> AnchorFindings {
+        AnchorFindings {
+            breaks: vec![],
+            coverage_gaps: vec![reason],
+        }
+    }
+
+    /// Expected findings carrying only the violation axis.
+    fn broke(b: AnchorBreak) -> AnchorFindings {
+        AnchorFindings {
+            breaks: vec![b],
+            coverage_gaps: vec![],
+        }
+    }
+
     #[test]
     fn anchor_no_checkpoint() {
-        let v = verify_against_checkpoint(
-            &[],
-            &[],
-            &[],
-            Utc::now(),
-            std::time::Duration::from_secs(3600),
-        );
         assert_eq!(
-            v,
-            AnchorVerdict::MissingCheckpoint(MissingReason::NoCheckpoint)
+            anchor_check(&[], &[], &[]),
+            gap(MissingReason::NoCheckpoint)
         );
     }
 
@@ -1296,16 +1494,12 @@ mod tests {
     fn anchor_sequence_gap() {
         // seqs {1, 3} with max 3 -> count 2 != 3 -> gap.
         let cps = vec![cp(1, 10, vec![]), cp(3, 5, vec![])];
-        let v = verify_against_checkpoint(
-            &[],
-            &[],
-            &cps,
-            Utc::now(),
-            std::time::Duration::from_secs(3600),
-        );
+        // Asserting the WHOLE findings is the point: an honest coverage
+        // gap with nothing contradicted stays a coverage gap and never
+        // acquires a break (acceptance: no reclassification).
         assert_eq!(
-            v,
-            AnchorVerdict::MissingCheckpoint(MissingReason::SequenceGap)
+            anchor_check(&[], &[], &cps),
+            gap(MissingReason::SequenceGap)
         );
     }
 
@@ -1313,16 +1507,9 @@ mod tests {
     fn anchor_sequence_not_starting_at_one() {
         // single checkpoint with seq 2 -> min != 1 -> gap.
         let cps = vec![cp(2, 5, vec![])];
-        let v = verify_against_checkpoint(
-            &[],
-            &[],
-            &cps,
-            Utc::now(),
-            std::time::Duration::from_secs(3600),
-        );
         assert_eq!(
-            v,
-            AnchorVerdict::MissingCheckpoint(MissingReason::SequenceGap)
+            anchor_check(&[], &[], &cps),
+            gap(MissingReason::SequenceGap)
         );
     }
 
@@ -1330,14 +1517,7 @@ mod tests {
     fn anchor_stale() {
         // newest is 3h old, cadence 1h -> older than 2× -> Stale.
         let cps = vec![cp(1, 3 * 3600, vec![])];
-        let v = verify_against_checkpoint(
-            &[],
-            &[],
-            &cps,
-            Utc::now(),
-            std::time::Duration::from_secs(3600),
-        );
-        assert_eq!(v, AnchorVerdict::MissingCheckpoint(MissingReason::Stale));
+        assert_eq!(anchor_check(&[], &[], &cps), gap(MissingReason::Stale));
     }
 
     #[test]
@@ -1350,7 +1530,35 @@ mod tests {
             Utc::now(),
             std::time::Duration::from_secs(u64::MAX),
         );
-        assert_eq!(v, AnchorVerdict::Ok);
+        assert_eq!(v, AnchorFindings::default());
+    }
+
+    /// Acceptance: no panic on any caller input. Every numeric input at
+    /// its extreme simultaneously — `u64::MAX` stream positions, a
+    /// `u64::MAX`-second cadence, and a `now`/`created_at` pair at the
+    /// opposite ends of the representable range. The cadence overflows
+    /// `chrono::Duration` (saturated to `MAX`, so never stale) and the
+    /// positions are compared, not arithmetic'd.
+    #[test]
+    fn anchor_extreme_inputs_do_not_panic() {
+        let sid = "admin-extreme".to_string();
+        let head = EventHash([0xee; 32]);
+        let cps = vec![Checkpoint {
+            chain_format_version: "hort-evchain/v1".into(),
+            checkpoint_seq: 1,
+            created_at: chrono::DateTime::<Utc>::MIN_UTC,
+            stream_heads: vec![(sid.clone(), u64::MAX, head)],
+            sealed_streams: vec![],
+        }];
+        let live = vec![(sid, u64::MAX, head)];
+        let v = verify_against_checkpoint(
+            &live,
+            &[],
+            &cps,
+            chrono::DateTime::<Utc>::MAX_UTC,
+            std::time::Duration::from_secs(u64::MAX),
+        );
+        assert_eq!(v, AnchorFindings::default());
     }
 
     #[test]
@@ -1358,14 +1566,10 @@ mod tests {
         let sid = "admin-a".to_string();
         let cps = vec![cp(1, 5, vec![(sid.clone(), 0, EventHash([1u8; 32]))])];
         let live = vec![(sid, 0, EventHash([2u8; 32]))];
-        let v = verify_against_checkpoint(
-            &live,
-            &[],
-            &cps,
-            Utc::now(),
-            std::time::Duration::from_secs(3600),
+        assert_eq!(
+            anchor_check(&live, &[], &cps),
+            broke(AnchorBreak::HeadMismatch)
         );
-        assert_eq!(v, AnchorVerdict::Broken(AnchorBreak::HeadMismatch));
     }
 
     #[test]
@@ -1373,14 +1577,10 @@ mod tests {
         let sid = "admin-a".to_string();
         let cps = vec![cp(1, 5, vec![(sid, 0, EventHash([1u8; 32]))])];
         // No live head, no seal -> whole-stream truncation.
-        let v = verify_against_checkpoint(
-            &[],
-            &[],
-            &cps,
-            Utc::now(),
-            std::time::Duration::from_secs(3600),
+        assert_eq!(
+            anchor_check(&[], &[], &cps),
+            broke(AnchorBreak::UnsealedAbsentStream)
         );
-        assert_eq!(v, AnchorVerdict::Broken(AnchorBreak::UnsealedAbsentStream));
     }
 
     #[test]
@@ -1394,14 +1594,10 @@ mod tests {
             sealed_stream_id: "admin-gone".into(),
             final_event_hash: EventHash([9u8; 32]),
         }];
-        let v = verify_against_checkpoint(
-            &live,
-            &sealed,
-            &cps,
-            Utc::now(),
-            std::time::Duration::from_secs(3600),
+        assert_eq!(
+            anchor_check(&live, &sealed, &cps),
+            broke(AnchorBreak::SealUnanchored)
         );
-        assert_eq!(v, AnchorVerdict::Broken(AnchorBreak::SealUnanchored));
     }
 
     #[test]
@@ -1419,14 +1615,34 @@ mod tests {
             sealed_stream_id: gone_sid,
             final_event_hash: gone_head,
         }];
-        let v = verify_against_checkpoint(
-            &live,
-            &sealed,
-            &[checkpoint],
-            Utc::now(),
-            std::time::Duration::from_secs(3600),
+        assert_eq!(
+            anchor_check(&live, &sealed, &[checkpoint]),
+            AnchorFindings::default()
         );
-        assert_eq!(v, AnchorVerdict::Ok);
+    }
+
+    /// An anchored stream that is absent **and** sealed is justified,
+    /// which is the shape the real emitter writes: the checkpoint that
+    /// covers a `StreamSealed` also anchors the sealed stream's head,
+    /// so the absent-stream arm must consult the seal set before
+    /// calling a removal a truncation.
+    #[test]
+    fn anchor_absent_anchored_stream_with_a_seal_is_not_reported() {
+        let gone_sid = "admin-gone".to_string();
+        let gone_head = EventHash([9u8; 32]);
+        let mut checkpoint = cp(1, 5, vec![(gone_sid.clone(), 2, gone_head)]);
+        checkpoint.sealed_streams = vec![SealedStreamRecord {
+            sealed_stream_id: gone_sid.clone(),
+            final_event_hash: gone_head,
+        }];
+        let sealed = vec![SealedStreamRecord {
+            sealed_stream_id: gone_sid,
+            final_event_hash: gone_head,
+        }];
+        assert_eq!(
+            anchor_check(&[], &sealed, &[checkpoint]),
+            AnchorFindings::default()
+        );
     }
 
     #[test]
@@ -1443,14 +1659,292 @@ mod tests {
             (anchored_sid, 2, EventHash([1u8; 32])),
             ("admin-new".to_string(), 0, EventHash([7u8; 32])),
         ];
-        let v = verify_against_checkpoint(
-            &live,
-            &[],
-            &cps,
-            Utc::now(),
-            std::time::Duration::from_secs(3600),
+        assert_eq!(anchor_check(&live, &[], &cps), AnchorFindings::default());
+    }
+
+    // ---- both axes survive: a coverage gap no longer hides a break ------
+
+    /// A gapped anchor set **and** a head mismatch: both facts are
+    /// reported and `roll_up` ranks the violation above the coverage
+    /// gap. Before the correction the sequence-gap check returned first
+    /// and the head comparison — with both operands already in hand —
+    /// never ran, so the one case `roll_up`'s dominance comment names
+    /// was the one case that could not reach it.
+    #[test]
+    fn anchor_sequence_gap_plus_head_mismatch_reports_both_and_rolls_up_broken() {
+        let sid = "admin-a".to_string();
+        let cps = vec![
+            cp(1, 10, vec![]),
+            cp(3, 5, vec![(sid.clone(), 4, EventHash([1u8; 32]))]),
+        ];
+        let live = vec![(sid, 4, EventHash([2u8; 32]))];
+        let findings = anchor_check(&live, &[], &cps);
+        assert_eq!(
+            findings,
+            AnchorFindings {
+                breaks: vec![AnchorBreak::HeadMismatch],
+                coverage_gaps: vec![MissingReason::SequenceGap],
+            }
         );
-        assert_eq!(v, AnchorVerdict::Ok);
+        assert_eq!(roll_up(&[], &findings), ChainReport::Broken);
+    }
+
+    /// The same, for the other coverage reason: a stale anchor set that
+    /// is also contradicted by a live head is `Broken`, not
+    /// `MissingCheckpoint`.
+    #[test]
+    fn anchor_stale_plus_head_mismatch_reports_both_and_rolls_up_broken() {
+        let sid = "admin-a".to_string();
+        let cps = vec![cp(
+            1,
+            3 * 3600,
+            vec![(sid.clone(), 4, EventHash([1u8; 32]))],
+        )];
+        let live = vec![(sid, 4, EventHash([2u8; 32]))];
+        let findings = anchor_check(&live, &[], &cps);
+        assert_eq!(
+            findings,
+            AnchorFindings {
+                breaks: vec![AnchorBreak::HeadMismatch],
+                coverage_gaps: vec![MissingReason::Stale],
+            }
+        );
+        assert_eq!(roll_up(&[], &findings), ChainReport::Broken);
+    }
+
+    // ---- a repeated checkpoint_seq is a fork, not a duplicate ----------
+
+    /// Two signed checkpoints at one `checkpoint_seq` are reported even
+    /// when they agree with each other and with the live head: the
+    /// sequence is single-valued by construction, so a repeat is a fork
+    /// in the anchor record whatever the two bodies happen to say.
+    /// `dedup()` turned it into a thing that did not happen.
+    #[test]
+    fn anchor_duplicate_checkpoint_seq_is_reported_even_when_the_two_agree() {
+        let sid = "admin-a".to_string();
+        let head = EventHash([1u8; 32]);
+        let heads = vec![(sid.clone(), 4, head)];
+        let cps = vec![cp(1, 20, heads.clone()), cp(1, 10, heads)];
+        let live = vec![(sid, 4, head)];
+        assert_eq!(
+            anchor_check(&live, &[], &cps),
+            broke(AnchorBreak::DuplicateCheckpointSeq)
+        );
+    }
+
+    /// The fork and the head statement it contradicts are both
+    /// reported, in detection order. `max_by_key`'s arbitrary pick used
+    /// to drop one of the two bodies on the floor, so the head the
+    /// loser attested was never compared with anything.
+    #[test]
+    fn anchor_duplicate_checkpoint_seq_reports_the_fork_and_the_contradicted_head() {
+        let sid = "admin-a".to_string();
+        let live_head = EventHash([1u8; 32]);
+        let cps = vec![
+            cp(1, 30, vec![]),
+            cp(2, 20, vec![(sid.clone(), 4, live_head)]),
+            cp(2, 10, vec![(sid.clone(), 4, EventHash([2u8; 32]))]),
+        ];
+        let live = vec![(sid, 4, live_head)];
+        assert_eq!(
+            anchor_check(&live, &[], &cps),
+            AnchorFindings {
+                breaks: vec![
+                    AnchorBreak::DuplicateCheckpointSeq,
+                    AnchorBreak::HeadMismatch,
+                ],
+                coverage_gaps: vec![],
+            }
+        );
+    }
+
+    /// A repeated seq does not make the contiguity count read as a
+    /// hole: `{1, 1, 2}` is a fork with no missing anchor, so only the
+    /// violation is reported. (The dedup the count needs happens after
+    /// the fork is detected, which is the whole fix.)
+    #[test]
+    fn anchor_duplicate_seq_is_not_also_reported_as_a_sequence_gap() {
+        let cps = vec![cp(1, 30, vec![]), cp(1, 20, vec![]), cp(2, 10, vec![])];
+        assert_eq!(
+            anchor_check(&[], &[], &cps),
+            broke(AnchorBreak::DuplicateCheckpointSeq)
+        );
+    }
+
+    /// The newest-checkpoint selection is a function of the set's
+    /// content, not of the order the adapter happened to return it in
+    /// (`CheckpointAnchorPort::read_all` promises none).
+    /// `max_by_key` returned the *last* of several equal maxima, so
+    /// with a forked seq the staleness answer flipped with the input
+    /// order. The tie resolves towards the earliest `created_at` —
+    /// fail-closed, because a forked sequence cannot vouch for the
+    /// freshness the later timestamp claims.
+    #[test]
+    fn anchor_findings_do_not_depend_on_the_order_the_checkpoints_arrive_in() {
+        let fresh = cp(2, 10, vec![]);
+        let old = cp(2, 3 * 3600, vec![]);
+        let base = cp(1, 4 * 3600, vec![]);
+        let expected = AnchorFindings {
+            breaks: vec![AnchorBreak::DuplicateCheckpointSeq],
+            coverage_gaps: vec![MissingReason::Stale],
+        };
+        for order in [
+            vec![base.clone(), fresh.clone(), old.clone()],
+            vec![base.clone(), old.clone(), fresh.clone()],
+            vec![fresh.clone(), old.clone(), base.clone()],
+            vec![old.clone(), fresh.clone(), base.clone()],
+        ] {
+            assert_eq!(
+                anchor_check(&[], &[], &order),
+                expected,
+                "the verdict must not depend on checkpoint order"
+            );
+        }
+    }
+
+    // ---- every checkpoint's head statement is evidence -----------------
+
+    /// Acceptance: a live head contradicting a **non-newest**
+    /// signature-verified checkpoint is reported. The older checkpoint
+    /// anchors the contradicting head at the same position the live
+    /// stream is at; the newest checkpoint agrees with the live head.
+    ///
+    /// This is the laundering the old code allowed: rewrite a quiescent
+    /// stream, wait for the next scheduled checkpoint, and the run is
+    /// judged against that one — the older checkpoint that contradicts
+    /// it was fetched and signature-verified, then set aside.
+    #[test]
+    fn anchor_head_contradicting_an_older_checkpoint_is_reported() {
+        let sid = "admin-a".to_string();
+        let live_head = EventHash([2u8; 32]);
+        let cps = vec![
+            // Older: the stream was at position 4 with a DIFFERENT head.
+            cp(1, 7200, vec![(sid.clone(), 4, EventHash([1u8; 32]))]),
+            // Newest: cut after the rewrite, so it agrees with the live
+            // head and on its own reports nothing.
+            cp(2, 60, vec![(sid.clone(), 4, live_head)]),
+        ];
+        let live = vec![(sid, 4, live_head)];
+        assert_eq!(
+            anchor_check(&live, &[], &cps),
+            broke(AnchorBreak::HeadMismatch)
+        );
+    }
+
+    /// A stream shorter than an older checkpoint attested: rows were
+    /// removed from its tail. Decidable from the final head alone, and
+    /// the reason the anchored `final_stream_position` is compared at
+    /// all — it used to be read into `_pos` and dropped.
+    #[test]
+    fn anchor_live_stream_shorter_than_an_anchored_statement_is_reported() {
+        let sid = "admin-a".to_string();
+        let live_head = EventHash([2u8; 32]);
+        let cps = vec![
+            cp(1, 7200, vec![(sid.clone(), 9, EventHash([1u8; 32]))]),
+            cp(2, 60, vec![(sid.clone(), 4, live_head)]),
+        ];
+        let live = vec![(sid, 4, live_head)];
+        assert_eq!(
+            anchor_check(&live, &[], &cps),
+            broke(AnchorBreak::HeadMismatch)
+        );
+    }
+
+    /// One head hash at two different positions is a SHA-256 collision
+    /// — `stream_position` is bound into the hash — so an older
+    /// checkpoint anchoring the *current* head at a *lower* position is
+    /// a contradiction too.
+    #[test]
+    fn anchor_same_head_at_a_lower_anchored_position_is_reported() {
+        let sid = "admin-a".to_string();
+        let head = EventHash([3u8; 32]);
+        let cps = vec![cp(1, 60, vec![(sid.clone(), 3, head)])];
+        let live = vec![(sid, 9, head)];
+        assert_eq!(
+            anchor_check(&live, &[], &cps),
+            broke(AnchorBreak::HeadMismatch)
+        );
+    }
+
+    /// Acceptance, and the false-positive guard that makes the test
+    /// above mean something: a head that legitimately **advanced**
+    /// between two checkpoints and again since the newest is not
+    /// reported. The relation against an older anchor is reachability,
+    /// never equality — the chain is append-only, so a prior anchored
+    /// head is an ancestor of the current one, not the same hash.
+    #[test]
+    fn anchor_head_that_advanced_between_checkpoints_is_not_reported() {
+        let sid = "admin-a".to_string();
+        let cps = vec![
+            cp(1, 7200, vec![(sid.clone(), 3, EventHash([1u8; 32]))]),
+            cp(2, 3600, vec![(sid.clone(), 7, EventHash([2u8; 32]))]),
+        ];
+        let live = vec![(sid, 9, EventHash([3u8; 32]))];
+        assert_eq!(anchor_check(&live, &[], &cps), AnchorFindings::default());
+    }
+
+    /// A stream anchored only by an **older** checkpoint, now absent
+    /// with no `StreamSealed`: the newest checkpoint was cut after the
+    /// removal and never mentions it, so scanning only the newest
+    /// anchored set made a whole-stream truncation invisible.
+    #[test]
+    fn anchor_absent_stream_anchored_only_by_an_older_checkpoint_is_reported() {
+        let live_sid = "admin-a".to_string();
+        let gone_sid = "admin-gone".to_string();
+        let live_head = EventHash([1u8; 32]);
+        let cps = vec![
+            cp(
+                1,
+                7200,
+                vec![
+                    (live_sid.clone(), 0, live_head),
+                    (gone_sid, 0, EventHash([8u8; 32])),
+                ],
+            ),
+            cp(2, 60, vec![(live_sid.clone(), 0, live_head)]),
+        ];
+        let live = vec![(live_sid, 0, live_head)];
+        assert_eq!(
+            anchor_check(&live, &[], &cps),
+            broke(AnchorBreak::UnsealedAbsentStream)
+        );
+    }
+
+    /// Each axis is a set in detection order: two streams contradicting
+    /// their anchored heads record one `HeadMismatch`, not two.
+    /// `AnchorBreak` carries no per-stream detail, so a repeat would be
+    /// noise rather than information.
+    #[test]
+    fn anchor_repeated_break_kind_is_recorded_once() {
+        let a = "admin-a".to_string();
+        let b = "admin-b".to_string();
+        let cps = vec![cp(
+            1,
+            60,
+            vec![
+                (a.clone(), 0, EventHash([1u8; 32])),
+                (b.clone(), 0, EventHash([1u8; 32])),
+            ],
+        )];
+        let live = vec![(a, 0, EventHash([2u8; 32])), (b, 0, EventHash([3u8; 32]))];
+        assert_eq!(
+            anchor_check(&live, &[], &cps),
+            broke(AnchorBreak::HeadMismatch)
+        );
+    }
+
+    /// A repeated `stream_id` in `live_heads` is a caller error with no
+    /// better answer available, so the documented resolution — the
+    /// first occurrence, exactly what the linear `find` this replaced
+    /// returned — is pinned here rather than left to the index's
+    /// insertion order. Part of "no panic on any caller input".
+    #[test]
+    fn anchor_repeated_live_stream_id_resolves_to_the_first_occurrence() {
+        let sid = "admin-a".to_string();
+        let anchored = EventHash([1u8; 32]);
+        let cps = vec![cp(1, 60, vec![(sid.clone(), 4, anchored)])];
+        let live = vec![(sid.clone(), 4, anchored), (sid, 4, EventHash([2u8; 32]))];
+        assert_eq!(anchor_check(&live, &[], &cps), AnchorFindings::default());
     }
 
     // ---- roll_up: every arm + dominance --------------------------------
@@ -1461,7 +1955,7 @@ mod tests {
             head: genesis_hash(),
             position: 0,
         }];
-        assert_eq!(roll_up(&v, &AnchorVerdict::Ok), ChainReport::Ok);
+        assert_eq!(roll_up(&v, &AnchorFindings::default()), ChainReport::Ok);
     }
 
     #[test]
@@ -1471,10 +1965,7 @@ mod tests {
             position: 0,
         }];
         assert_eq!(
-            roll_up(
-                &v,
-                &AnchorVerdict::MissingCheckpoint(MissingReason::NoCheckpoint)
-            ),
+            roll_up(&v, &gap(MissingReason::NoCheckpoint)),
             ChainReport::MissingCheckpoint
         );
     }
@@ -1485,10 +1976,7 @@ mod tests {
             at_position: 0,
             reason: ChainBreak::HashMismatch,
         }];
-        assert_eq!(
-            roll_up(&v, &AnchorVerdict::MissingCheckpoint(MissingReason::Stale)),
-            ChainReport::Broken
-        );
+        assert_eq!(roll_up(&v, &gap(MissingReason::Stale)), ChainReport::Broken);
     }
 
     #[test]
@@ -1498,9 +1986,33 @@ mod tests {
             position: 0,
         }];
         assert_eq!(
-            roll_up(&v, &AnchorVerdict::Broken(AnchorBreak::HeadMismatch)),
+            roll_up(&v, &broke(AnchorBreak::HeadMismatch)),
             ChainReport::Broken
         );
+    }
+
+    /// The new break kind reaches the top-level report through the same
+    /// ranking as every other one, so the subcommand maps it to exit 2
+    /// and `result="broken"` — ADR 0057's existing catalogue, with no
+    /// fourth `ChainReport` variant and no fourth metric series.
+    #[test]
+    fn roll_up_broken_from_duplicate_checkpoint_seq() {
+        assert_eq!(
+            roll_up(&[], &broke(AnchorBreak::DuplicateCheckpointSeq)),
+            ChainReport::Broken
+        );
+    }
+
+    /// A violation on one axis and a coverage gap on the other, in one
+    /// `AnchorFindings` — the shape the cross-check now produces and
+    /// the shape the dominance exists to rank.
+    #[test]
+    fn roll_up_anchor_break_dominates_a_coverage_gap_in_the_same_findings() {
+        let findings = AnchorFindings {
+            breaks: vec![AnchorBreak::HeadMismatch],
+            coverage_gaps: vec![MissingReason::Stale],
+        };
+        assert_eq!(roll_up(&[], &findings), ChainReport::Broken);
     }
 
     #[test]
@@ -1508,7 +2020,7 @@ mod tests {
         let v = vec![StreamVerdict::SealedGap {
             final_event_hash: genesis_hash(),
         }];
-        assert_eq!(roll_up(&v, &AnchorVerdict::Ok), ChainReport::Ok);
+        assert_eq!(roll_up(&v, &AnchorFindings::default()), ChainReport::Ok);
     }
 
     // ---- Determinism: full-64-variant canonical round-trip ----

@@ -703,7 +703,9 @@ async fn verify(
         .await
         .map_err(|e| anyhow::anyhow!("reading StreamSealed records: {e}"))?;
 
-    let anchor_verdict = verify_against_checkpoint(
+    // Both axes of the anchor cross-check (violations and coverage
+    // gaps); `roll_up` is the single site that ranks them.
+    let anchor_findings = verify_against_checkpoint(
         &live_heads,
         &sealed,
         &checkpoints,
@@ -711,7 +713,7 @@ async fn verify(
         cadence,
     );
 
-    let report = roll_up(&stream_verdicts, &anchor_verdict);
+    let report = roll_up(&stream_verdicts, &anchor_findings);
     Ok(VerifySummary {
         report,
         streams_verified: stream_ids.len(),
@@ -1805,6 +1807,122 @@ mod tests {
             "a sealed-then-removed anchored stream must be justified by the \
              real StreamSealed record read through the port; pre-amendment \
              `sealed = Vec::new()` would mis-report UnsealedAbsentStream → Broken"
+        );
+    }
+
+    /// **Acceptance: the forked-anchor verdict is reachable from the
+    /// subcommand with ADR 0057's exit code.** Two signature-verified
+    /// checkpoints carrying one `checkpoint_seq` — the shape the old
+    /// `dedup()` erased — over an intact chain whose live head both of
+    /// them agree with. Nothing else is wrong: the sequence has no
+    /// hole, the anchor is fresh, the per-stream chain verifies. The
+    /// only finding is the fork, and it must reach `result="broken"` +
+    /// exit `2`, the existing catalogue, with no fourth
+    /// `ChainReport` variant and no fourth metric series.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn forked_checkpoint_sequence_is_broken_at_exit_two() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let sid = seed_stream(&pool, 2).await;
+        let (head, final_pos, _) = stream_head(&pool, &sid).await;
+        // Two checkpoints at seq 1. Both attest the real live head, so
+        // the fork is the whole finding.
+        let anchor = FixedAnchor(vec![
+            Checkpoint {
+                chain_format_version: "hort-evchain/v1".into(),
+                checkpoint_seq: 1,
+                created_at: chrono::Utc::now() - chrono::Duration::seconds(120),
+                stream_heads: vec![(sid.clone(), final_pos, head)],
+                sealed_streams: Vec::new(),
+            },
+            Checkpoint {
+                chain_format_version: "hort-evchain/v1".into(),
+                checkpoint_seq: 1,
+                created_at: chrono::Utc::now(),
+                stream_heads: vec![(sid.clone(), final_pos, head)],
+                sealed_streams: Vec::new(),
+            },
+        ]);
+
+        let summary = verify(
+            &PgEventChainReader::new(pool.clone()),
+            &args_for(&sid, None),
+            &anchor,
+            TEST_CADENCE,
+            ANCHOR_EXPECTED,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            summary.report,
+            ChainReport::Broken,
+            "two signed checkpoints at one checkpoint_seq is a fork in the \
+             anchor record, not a duplicate to collapse"
+        );
+        assert_eq!(
+            result_label(summary.report, summary.anchor_expected),
+            "broken"
+        );
+        assert_eq!(
+            format!("{:?}", report_to_exit_code(summary.report, true)),
+            format!("{:?}", ExitCode::from(2))
+        );
+        // The per-stream chain is intact — the finding is purely on the
+        // anchor axis.
+        assert!(summary.first_broken_stream.is_none());
+    }
+
+    /// **Acceptance: a coverage gap no longer masks a violation at the
+    /// exit code.** A stale anchor set (3 h old against the 1 h
+    /// cadence) that *also* contradicts the live head. Both facts are
+    /// real; the run must exit `2` (a detected violation), not `3` (a
+    /// coverage gap). Before the correction the staleness check
+    /// returned before the head comparison ran, so this scenario
+    /// reported `missing_checkpoint` — an operator reading exit `3`
+    /// would have gone looking for a stopped checkpoint emitter while
+    /// the rewritten stream sat underneath it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn stale_anchor_with_a_head_mismatch_exits_two_not_three() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let sid = seed_stream(&pool, 2).await;
+        let (_head, final_pos, _) = stream_head(&pool, &sid).await;
+        let anchor = FixedAnchor(vec![Checkpoint {
+            chain_format_version: "hort-evchain/v1".into(),
+            checkpoint_seq: 1,
+            created_at: chrono::Utc::now() - chrono::Duration::seconds(3 * 3600),
+            // A head the live stream does not have, at the position it
+            // is actually at.
+            stream_heads: vec![(sid.clone(), final_pos, EventHash([0x7a; 32]))],
+            sealed_streams: Vec::new(),
+        }]);
+
+        let summary = verify(
+            &PgEventChainReader::new(pool.clone()),
+            &args_for(&sid, None),
+            &anchor,
+            TEST_CADENCE,
+            ANCHOR_EXPECTED,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            summary.report,
+            ChainReport::Broken,
+            "a real violation must not be masked by the coverage gap it \
+             happens to coincide with"
+        );
+        assert_eq!(
+            result_label(summary.report, summary.anchor_expected),
+            "broken"
+        );
+        assert_eq!(
+            format!("{:?}", report_to_exit_code(summary.report, true)),
+            format!("{:?}", ExitCode::from(2))
         );
     }
 }

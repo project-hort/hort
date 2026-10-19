@@ -2447,7 +2447,7 @@ mod tests {
     // end-to-end.
     // -----------------------------------------------------------------
     use hort_domain::events::{
-        verify_against_checkpoint, AnchorBreak, AnchorVerdict, Checkpoint, SealedStreamRecord,
+        verify_against_checkpoint, AnchorBreak, AnchorFindings, Checkpoint, SealedStreamRecord,
     };
 
     /// Build the `StreamSealed` tombstone exactly as `seal_and_remove`
@@ -2509,8 +2509,8 @@ mod tests {
         };
 
         // (1) Absent stream WITH a matching anchored tombstone -> the
-        //     anchor cross-check is `Ok` (a defined SealedGap, NOT a
-        //     Broken truncation).
+        //     anchor cross-check finds nothing on either axis (a
+        //     defined SealedGap, NOT a Broken truncation).
         assert_eq!(
             verify_against_checkpoint(
                 &[], // sealed stream is absent (deleted)
@@ -2519,9 +2519,9 @@ mod tests {
                 now,
                 std::time::Duration::from_secs(3600),
             ),
-            AnchorVerdict::Ok,
+            AnchorFindings::default(),
             "a deleted stream WITH a matching anchored StreamSealed must \
-             be a SealedGap (Ok), not Broken"
+             be a SealedGap (clean findings), not Broken"
         );
 
         // (2) Same absent stream WITHOUT the tombstone -> Broken
@@ -2536,7 +2536,10 @@ mod tests {
                 now,
                 std::time::Duration::from_secs(3600),
             ),
-            AnchorVerdict::Broken(AnchorBreak::UnsealedAbsentStream),
+            AnchorFindings {
+                breaks: vec![AnchorBreak::UnsealedAbsentStream],
+                coverage_gaps: vec![],
+            },
             "an absent stream with NO StreamSealed must be Broken"
         );
 
@@ -2555,7 +2558,10 @@ mod tests {
                 now,
                 std::time::Duration::from_secs(3600),
             ),
-            AnchorVerdict::Broken(AnchorBreak::SealUnanchored),
+            AnchorFindings {
+                breaks: vec![AnchorBreak::SealUnanchored],
+                coverage_gaps: vec![],
+            },
             "a StreamSealed whose head was never anchored must be Broken"
         );
     }

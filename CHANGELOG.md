@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The event-chain verifier judges a run against every anchored checkpoint,
+  not only the newest.** `hort-server verify-event-chain` can now exit `2`
+  where it previously exited `0` or `3` (#352).
+
 ## [0.15.0] - 2026-10-18
 
 ### Added

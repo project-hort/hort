@@ -45,8 +45,13 @@ use super::BoxFuture;
 ///
 /// Returns the verified checkpoints in no particular order; the pure
 /// core [`verify_against_checkpoint`](crate::events::verify_against_checkpoint)
-/// selects the newest by `checkpoint_seq` and checks the sequence is
-/// gap-free, so the adapter need not sort. An **empty `Vec`** is a
+/// reads **every** checkpoint in the set — each one's head statement is
+/// evidence of the same standing, since each was signature-verified
+/// here — and derives the newest by a total order over
+/// `(checkpoint_seq, created_at)`, so the adapter need not sort and no
+/// ordering it happens to produce can change a verdict. The sequence
+/// itself is checked both ways: a hole in the distinct seqs is a
+/// coverage gap, a repeated seq is a violation. An **empty `Vec`** is a
 /// valid, expected result (no emitter deployed yet, or the cron never
 /// ran) — the core maps it to
 /// [`MissingReason::NoCheckpoint`](crate::events::MissingReason::NoCheckpoint).
