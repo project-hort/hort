@@ -9,7 +9,7 @@
 //! read/write split keeps consumers that only lookup independent of the
 //! transactional-write path.
 //!
-//! # Three load-bearing rules — do not deviate
+//! # Four load-bearing rules — do not deviate
 //!
 //! 1. **The adapter MUST NEVER mutate or re-serialise `DomainEvent`
 //!    payloads.** The caller builds an [`AppendEvents`] and the adapter
@@ -36,6 +36,15 @@
 //!    [`crate::error::DomainError::Conflict`]. Member-add for the losing
 //!    call does NOT land. The caller has to re-fetch and make a
 //!    different decision (retry with `is_primary = false`).
+//! 4. **A transaction that wrote commits its event batch or nothing at
+//!    all.** The one branch that commits without appending — the
+//!    same-role member re-add of step 4 below — is reachable only while
+//!    no earlier step of the same transaction has written a row. When an
+//!    earlier step did write (the group row, or the `primary_role` slot
+//!    this call claimed), the duplicate member row does not make the
+//!    transaction a no-op and the batch is appended. Committing a
+//!    projection change whose batch was dropped is a state transition
+//!    the event log never mentions, and no reader can recover it.
 
 use uuid::Uuid;
 
@@ -139,9 +148,13 @@ pub trait ArtifactGroupLifecyclePort: Send + Sync {
     /// 4. `INSERT INTO artifact_group_members ... ON CONFLICT
     ///    (group_id, artifact_id) DO NOTHING`. On 0-row conflict,
     ///    inspect the existing row's role:
-    ///    - same role → idempotent no-op, do NOT append events, return
-    ///      `Ok(Committed)`.
     ///    - different role → roll back and return `Conflict`.
+    ///    - same role AND no earlier step wrote (steps 2 and 3 both
+    ///      no-ops) → idempotent no-op, do NOT append events, return
+    ///      `Ok(Committed)`.
+    ///    - same role but an earlier step DID write → append `batch`
+    ///      and commit (rule 4 above): the write that happened carries
+    ///      its events.
     /// 5. Otherwise append `batch` verbatim via the event store's
     ///    in-transaction helper, commit, and return `Ok(Committed)`.
     ///
