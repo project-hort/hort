@@ -36,7 +36,9 @@ use hort_domain::ports::advisory::AdvisoryPort;
 use hort_domain::ports::format_handler::{
     FormatHandler, PayloadSbom, PayloadSbomExtraction, SbomResolution,
 };
-use hort_domain::ports::jobs_repository::{JobStatus, JobsRepository, ScanJob, TriggerSource};
+use hort_domain::ports::jobs_repository::{
+    JobStatus, JobsRepository, ResultWriteOutcome, ScanJob, TriggerSource,
+};
 use hort_domain::ports::scanner::{
     EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort,
 };
@@ -65,6 +67,11 @@ struct MockJobsRepository {
     /// Stub claim — tests call run_scan / record_outcome directly with
     /// hand-built `ScanJob` values, so claim_scan_jobs is rarely used.
     claim_response: Mutex<Vec<ScanJob>>,
+    /// The fence every result write arrived with, and what they
+    /// answer. The orchestrator has to hand the row's own `attempts`
+    /// to each of the three — a write carrying any other number is a
+    /// write no execution can own. See [`ResultWriteLog`].
+    write_log: ResultWriteLog,
 }
 
 impl MockJobsRepository {
@@ -103,33 +110,39 @@ impl JobsRepository for MockJobsRepository {
     fn mark_completed<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         _result_summary: serde_json::Value,
-    ) -> BoxFuture<'a, DomainResult<()>> {
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
         self.completed.lock().unwrap().push(job_id);
-        Box::pin(async { Ok(()) })
+        let outcome = self.write_log.record(attempt);
+        Box::pin(async move { Ok(outcome) })
     }
     fn reschedule<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         backoff: Duration,
         last_error: &'a str,
-    ) -> BoxFuture<'a, DomainResult<()>> {
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
         self.rescheduled
             .lock()
             .unwrap()
             .push((job_id, backoff, last_error.to_string()));
-        Box::pin(async { Ok(()) })
+        let outcome = self.write_log.record(attempt);
+        Box::pin(async move { Ok(outcome) })
     }
     fn mark_failed<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         last_error: &'a str,
-    ) -> BoxFuture<'a, DomainResult<()>> {
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
         self.failed
             .lock()
             .unwrap()
             .push((job_id, last_error.to_string()));
-        Box::pin(async { Ok(()) })
+        let outcome = self.write_log.record(attempt);
+        Box::pin(async move { Ok(outcome) })
     }
     fn enqueue_scan<'a>(
         &'a self,
@@ -1805,6 +1818,74 @@ async fn record_outcome_completed_identical_findings_emits_no_artifact_became_vu
     assert!(
         !became_vulnerable,
         "identical findings vs prior must not emit ArtifactBecameVulnerable"
+    );
+}
+
+/// Every `record_outcome` arm writes under the row's own `attempts`
+/// — the identity the adapter's result-write fence compares against.
+///
+/// A write carrying any other number is a write no execution owns, and
+/// the fence refuses it. The arms reach three different methods and
+/// the orchestrator closes the row out itself (the dispatcher's own
+/// write comes after), so each arm is checked rather than one standing
+/// in for the others.
+#[tokio::test]
+async fn record_outcome_writes_under_the_rows_own_attempt() {
+    let cases: Vec<(&str, u32, ScanRunOutcome)> = vec![
+        ("mark_completed", 1, ScanRunOutcome::SkippedNoBackends),
+        ("reschedule", 2, ScanRunOutcome::Failed("transient".into())),
+        (
+            "mark_failed",
+            5, // == default max_attempts → terminal.
+            ScanRunOutcome::Failed("dead".into()),
+        ),
+    ];
+    for (write, attempts, outcome) in cases {
+        let (uc, jobs, _events, _storage, artifacts, repositories, _policy) =
+            make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
+        let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+        let job = sample_scan_job(artifact_id, attempts);
+
+        uc.record_outcome(&job, outcome)
+            .await
+            .expect("record_outcome");
+
+        assert_eq!(
+            jobs.write_log.attempts(),
+            vec![attempts],
+            "{write} must write under the row's own attempt",
+        );
+    }
+}
+
+/// A refused result write is not an error.
+///
+/// If the orchestrator propagated it, `ScanTaskHandler` would return a
+/// retryable failure, the dispatcher would answer with a `reschedule`,
+/// and a row that already belongs to a sibling would be written to a
+/// second time — turning one discarded result into the `pending`
+/// clobber the fence exists to prevent. The refusal is logged and the
+/// arm completes.
+#[tokio::test]
+async fn a_refused_result_write_does_not_become_a_retryable_failure() {
+    let (uc, jobs, _events, _storage, _artifacts, _repositories, _policy) =
+        make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
+    jobs.write_log
+        .refuse(ResultWriteOutcome::Superseded { current_attempt: 9 });
+    let job = sample_scan_job(Uuid::new_v4(), 2);
+
+    uc.record_outcome(&job, ScanRunOutcome::Failed("transient".into()))
+        .await
+        .expect("a refused write is an outcome, not an error");
+
+    assert_eq!(
+        jobs.write_log.attempts(),
+        vec![2],
+        "the write is attempted exactly once and not retried under another identity"
+    );
+    assert!(
+        jobs.failed_calls().is_empty(),
+        "and it is not answered with a different write"
     );
 }
 

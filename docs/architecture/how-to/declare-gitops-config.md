@@ -1407,6 +1407,14 @@ Apply-time validation rules:
 - `fallbackRotation.validity` ≥ 2 × `rotationInterval`. The
   factor-of-2 is the safety margin for consumer-side Secret
   reload latency.
+- `fallbackRotation.targetSecret` is **unique across
+  ServiceAccounts**. A target's identity is `(namespace, name)`, so
+  the same Secret name in two namespaces is fine. Two
+  ServiceAccounts on one target is a **hard reject** — the
+  reconciler's ownership barrier refuses one of them on every tick,
+  so its declared rotation never happens, and without the barrier
+  the two would overwrite each other's credential and leave
+  consumers holding the wrong identity.
 - `fallbackRotation.targetSecret.namespace` is **not** validated
   against `worker.rotation.targetNamespaces` at apply time — the
   chart's allow-list is a runtime concern. Mismatches surface as

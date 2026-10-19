@@ -62,6 +62,7 @@ use crate::metrics::{
     emit_scan_terminal, observe_scan_duration, SbomExtractionResult, SbomResolutionResult,
     ScanFailureResult, ScanJobsResult, ScanTerminalResult,
 };
+use crate::result_write_fence::surface_result_write;
 // `record_outcome`'s `Failed` branch waits out the workspace's one
 // retry curve. The four-step shape used to be defined here and the task
 // dispatcher carried its own, differently-shaped copy behind the same
@@ -83,6 +84,12 @@ use crate::use_cases::quarantine_use_case::QuarantineUseCase;
 fn is_report_too_large_error(err: &DomainError) -> bool {
     matches!(err, DomainError::Invariant(msg) if msg.contains(SCAN_REPORT_TOO_LARGE_MARKER))
 }
+
+/// The `jobs.kind` of every row this orchestrator closes out. Only
+/// used as the label on a refused-write log line — the orchestrator is
+/// reached through `ScanTaskHandler`, which the dispatcher registers
+/// under this same literal.
+const KIND: &str = "scan";
 
 /// Default cap on the number of attempts before a job is moved to the
 /// terminal `failed` status. Mirrors `HORT_SCANNER_MAX_ATTEMPTS`.
@@ -778,9 +785,11 @@ impl ScanOrchestrationUseCase {
                 // (`{scanner, finding_count}`) is built by ScanTaskHandler and
                 // persisted by the dispatcher's own (second, authoritative,
                 // idempotent) mark_completed call, so pass Null here.
-                self.jobs
-                    .mark_completed(job.id, serde_json::Value::Null)
+                let outcome = self
+                    .jobs
+                    .mark_completed(job.id, job.attempts, serde_json::Value::Null)
                     .await?;
+                surface_result_write(outcome, "mark_completed", job.id, KIND, job.attempts);
                 emit_scan_jobs(ScanJobsResult::Completed);
                 // Operator-waiver clean outcome.
                 emit_scan_terminal(ScanTerminalResult::Completed);
@@ -834,9 +843,11 @@ impl ScanOrchestrationUseCase {
                 // (`{scanner, finding_count}`) is built by ScanTaskHandler and
                 // persisted by the dispatcher's own (second, authoritative,
                 // idempotent) mark_completed call, so pass Null here.
-                self.jobs
-                    .mark_completed(job.id, serde_json::Value::Null)
+                let outcome = self
+                    .jobs
+                    .mark_completed(job.id, job.attempts, serde_json::Value::Null)
                     .await?;
+                surface_result_write(outcome, "mark_completed", job.id, KIND, job.attempts);
                 emit_scan_jobs(ScanJobsResult::Completed);
                 emit_scan_terminal(terminal);
                 Ok(())
@@ -876,7 +887,8 @@ impl ScanOrchestrationUseCase {
                         job.attempts,
                     )
                     .await?;
-                self.jobs.mark_failed(job.id, &reason).await?;
+                let outcome = self.jobs.mark_failed(job.id, job.attempts, &reason).await?;
+                surface_result_write(outcome, "mark_failed", job.id, KIND, job.attempts);
                 emit_scan_jobs(ScanJobsResult::Failed);
                 emit_scan_terminal(ScanTerminalResult::Indeterminate);
                 Ok(())
@@ -937,7 +949,8 @@ impl ScanOrchestrationUseCase {
                              (not scan_indeterminate); will be re-picked by the rescan sweep \
                              once the scanner recovers",
                         );
-                        self.jobs.mark_failed(job.id, &err).await?;
+                        let outcome = self.jobs.mark_failed(job.id, job.attempts, &err).await?;
+                        surface_result_write(outcome, "mark_failed", job.id, KIND, job.attempts);
                         emit_scan_jobs(ScanJobsResult::Failed);
                     } else {
                         // FAIL-CLOSED (ADR 0007): transition the
@@ -962,7 +975,8 @@ impl ScanOrchestrationUseCase {
                                 job.attempts,
                             )
                             .await?;
-                        self.jobs.mark_failed(job.id, &err).await?;
+                        let outcome = self.jobs.mark_failed(job.id, job.attempts, &err).await?;
+                        surface_result_write(outcome, "mark_failed", job.id, KIND, job.attempts);
                         emit_scan_jobs(ScanJobsResult::Failed);
                         // Artifact-terminal: indeterminate.
                         emit_scan_terminal(ScanTerminalResult::Indeterminate);
@@ -976,7 +990,11 @@ impl ScanOrchestrationUseCase {
                         backoff_secs = backoff.as_secs(),
                         "scan failure classified as transient (scanner-execution) — rescheduling",
                     );
-                    self.jobs.reschedule(job.id, backoff, &err).await?;
+                    let outcome = self
+                        .jobs
+                        .reschedule(job.id, job.attempts, backoff, &err)
+                        .await?;
+                    surface_result_write(outcome, "reschedule", job.id, KIND, job.attempts);
                     emit_scan_jobs(ScanJobsResult::Retried);
                 }
                 Ok(())

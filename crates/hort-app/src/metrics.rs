@@ -3832,10 +3832,16 @@ pub enum RotationResult {
     /// `read_managed` returned `Some(s)` and `s.last_rotated` was
     /// within `rotation_interval` of now — fresh, no work needed.
     SkippedFresh,
-    /// `read_managed` returned `Some(s)` and
-    /// `s.managed_by != Some("hort-worker")` — the Secret was created
-    /// out-of-band. Operator must `kubectl delete secret <name>` to
-    /// hand management over.
+    /// `read_managed` returned `Some(s)` and the Secret is not this
+    /// ServiceAccount's to rotate: `s.managed_by != Some("hort-worker")`
+    /// (created out-of-band), `s.service_account` naming a different
+    /// ServiceAccount (two SAs on one target Secret), or
+    /// `s.service_account` absent beside our own `managed_by` (ownership
+    /// cannot be established). One result for the three rules, told
+    /// apart by the `collision_reason` field on the handler's warn line
+    /// rather than by a label — the taxonomy stays at 6. Resolution is
+    /// `kubectl delete secret <name>` for the first and third, and
+    /// giving each ServiceAccount its own `targetSecret` for the second.
     Collision,
     /// `sa.fallback_rotation.target_secret_namespace` is not in the
     /// worker's authorized `rotation_namespaces` set. Defence-in-depth

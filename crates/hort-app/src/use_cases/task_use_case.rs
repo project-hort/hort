@@ -557,7 +557,7 @@ mod tests {
     use hort_domain::ports::event_store::{
         AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
     };
-    use hort_domain::ports::jobs_repository::{JobsRepository, ScanJob};
+    use hort_domain::ports::jobs_repository::{JobsRepository, ResultWriteOutcome, ScanJob};
     use hort_domain::ports::BoxFuture;
     use hort_domain::types::ContentHash;
 
@@ -584,23 +584,26 @@ mod tests {
         fn mark_completed<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _result_summary: serde_json::Value,
-        ) -> BoxFuture<'a, DomainResult<()>> {
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
             panic!("PanicJobsRepository::mark_completed must not be called");
         }
         fn reschedule<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _backoff: Duration,
             _last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
             panic!("PanicJobsRepository::reschedule must not be called");
         }
         fn mark_failed<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
             panic!("PanicJobsRepository::mark_failed must not be called");
         }
         fn enqueue_scan<'a>(
@@ -773,24 +776,27 @@ mod tests {
         fn mark_completed<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _result_summary: serde_json::Value,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn reschedule<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _backoff: Duration,
             _last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn mark_failed<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn enqueue_scan<'a>(
             &'a self,

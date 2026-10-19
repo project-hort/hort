@@ -202,7 +202,7 @@ pub(crate) async fn emit_queue_depth(jobs: &dyn JobsRepository) {
 mod tests {
     use super::*;
     use hort_domain::error::{DomainError, DomainResult};
-    use hort_domain::ports::jobs_repository::ScanJob;
+    use hort_domain::ports::jobs_repository::{ResultWriteOutcome, ScanJob};
     use hort_domain::ports::BoxFuture;
     use hort_domain::types::ContentHash;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -231,24 +231,27 @@ mod tests {
         fn mark_completed<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _result_summary: serde_json::Value,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn reschedule<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _backoff: Duration,
             _last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn mark_failed<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn enqueue_scan<'a>(
             &'a self,

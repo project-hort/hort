@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The event-chain verifier judges a run against every anchored checkpoint,
   not only the newest.** `hort-server verify-event-chain` can now exit `2`
   where it previously exited `0` or `3` (#352).
+- **Three audit fixes on the gitops and job paths:** a service account can no
+  longer rotate over a Secret another one owns, and apply rejects two
+  `ServiceAccount` envelopes sharing one `fallbackRotation.targetSecret`; a
+  gitops apply drops every exclusion row it was told to drop, not only one per
+  CVE and package pattern; and a worker whose job the abandoned-lease sweep
+  handed on can no longer overwrite the worker now running it (#355).
 
 ## [0.15.0] - 2026-10-18
 

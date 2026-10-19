@@ -61,7 +61,8 @@ use hort_domain::ports::event_store::{
 use hort_domain::ports::format_handler::{FormatHandler, GroupMembership, MetadataStrategy};
 use hort_domain::ports::identity_provider::{IdentityProvider, IdpClaims, OidcValidationError};
 use hort_domain::ports::jobs_repository::{
-    CompensatingDelete, JobRow, JobsRepository, ListJobsFilter, ListJobsPage, ScanJob,
+    CompensatingDelete, JobRow, JobsRepository, ListJobsFilter, ListJobsPage, ResultWriteOutcome,
+    ScanJob,
 };
 use hort_domain::ports::kubernetes_secret_writer::{
     KubernetesSecretWriter, ManagedSecret, ManagedSecretSpec,
@@ -7200,6 +7201,11 @@ pub struct MockJobsRepository {
     reschedule_calls: Mutex<Vec<(Uuid, String)>>,
     /// Recorded calls to `mark_failed`.
     mark_failed_calls: Mutex<Vec<(Uuid, String)>>,
+    /// The fence every result write arrived with, and what they
+    /// answer. Public because a test asserts on it directly, the same
+    /// way the two mocks in `hort-app`'s own test modules do. See
+    /// [`ResultWriteLog`].
+    pub write_log: ResultWriteLog,
     /// Seed map returned by
     /// `find_active_scan_for_artifact`. `(artifact_id) -> existing job_id`.
     /// Empty by default (the manual-rescan use case sees "no in-flight
@@ -7298,6 +7304,7 @@ impl Default for MockJobsRepository {
             enqueue_error: Mutex::new(None),
             claim_batches: Mutex::new(Vec::new()),
             mark_completed_calls: Mutex::new(Vec::new()),
+            write_log: ResultWriteLog::default(),
             reschedule_calls: Mutex::new(Vec::new()),
             mark_failed_calls: Mutex::new(Vec::new()),
             active_scans: Mutex::new(HashMap::new()),
@@ -7563,6 +7570,51 @@ impl MockJobsRepository {
     }
 }
 
+/// What a mock's three result writes recorded, and what they answer.
+///
+/// Shared by every `JobsRepository` mock that needs the fence to be
+/// observable: the attempt each write arrived with, and an answer the
+/// test can turn into a refusal. A mock that always answered
+/// [`ResultWriteOutcome::Applied`] would make the refusal path
+/// untestable at the application layer, and one that recorded only the
+/// job id would let a write carrying an attempt no execution owns pass
+/// unnoticed.
+pub struct ResultWriteLog {
+    attempts: Mutex<Vec<u32>>,
+    outcome: Mutex<ResultWriteOutcome>,
+}
+
+impl Default for ResultWriteLog {
+    /// A row nothing has superseded — what a mock's single execution
+    /// is, unless a test says otherwise.
+    fn default() -> Self {
+        Self {
+            attempts: Mutex::new(Vec::new()),
+            outcome: Mutex::new(ResultWriteOutcome::Applied),
+        }
+    }
+}
+
+impl ResultWriteLog {
+    /// Record the fence a write arrived with, and answer it.
+    pub fn record(&self, attempt: u32) -> ResultWriteOutcome {
+        self.attempts.lock().unwrap().push(attempt);
+        *self.outcome.lock().unwrap()
+    }
+
+    /// Every attempt a result write arrived with, in call order across
+    /// all three writes.
+    pub fn attempts(&self) -> Vec<u32> {
+        self.attempts.lock().unwrap().clone()
+    }
+
+    /// Make every result write answer `outcome` — what a row a sibling
+    /// has re-claimed (or a row that no longer exists) does.
+    pub fn refuse(&self, outcome: ResultWriteOutcome) {
+        *self.outcome.lock().unwrap() = outcome;
+    }
+}
+
 impl JobsRepository for MockJobsRepository {
     fn claim_scan_jobs<'a>(
         &'a self,
@@ -7576,35 +7628,41 @@ impl JobsRepository for MockJobsRepository {
     fn mark_completed<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         _result_summary: serde_json::Value,
-    ) -> BoxFuture<'a, DomainResult<()>> {
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
         self.mark_completed_calls.lock().unwrap().push(job_id);
-        Box::pin(async { Ok(()) })
+        let outcome = self.write_log.record(attempt);
+        Box::pin(async move { Ok(outcome) })
     }
 
     fn reschedule<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         _backoff: std::time::Duration,
         last_error: &'a str,
-    ) -> BoxFuture<'a, DomainResult<()>> {
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
         self.reschedule_calls
             .lock()
             .unwrap()
             .push((job_id, last_error.to_string()));
-        Box::pin(async { Ok(()) })
+        let outcome = self.write_log.record(attempt);
+        Box::pin(async move { Ok(outcome) })
     }
 
     fn mark_failed<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         last_error: &'a str,
-    ) -> BoxFuture<'a, DomainResult<()>> {
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
         self.mark_failed_calls
             .lock()
             .unwrap()
             .push((job_id, last_error.to_string()));
-        Box::pin(async { Ok(()) })
+        let outcome = self.write_log.record(attempt);
+        Box::pin(async move { Ok(outcome) })
     }
 
     fn last_result_summary_by_kind<'a>(

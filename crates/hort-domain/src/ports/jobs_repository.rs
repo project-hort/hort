@@ -78,6 +78,73 @@ pub enum CompensatingDelete {
     NoLongerPending,
 }
 
+/// What a fenced result write — [`JobsRepository::mark_completed`],
+/// [`JobsRepository::reschedule`] or [`JobsRepository::mark_failed`] —
+/// did to the row.
+///
+/// # What identifies the execution a result belongs to
+///
+/// A `jobs` row can be executed more than once. The abandoned-lease
+/// sweep ([`JobsRepository::requeue_abandoned`]) returns a row whose
+/// holder stopped renewing its lease to `pending`, a sibling claims it,
+/// and the original worker — paused, not dead — may still return a
+/// result afterwards. So a result write has to say *which* execution
+/// produced it, and the identity cannot be the lease holder: the sweep
+/// sets `locked_by` to NULL and the sibling's claim overwrites it, and a
+/// worker id is in any case reused across every row that replica runs.
+///
+/// The identity is the row's `attempts`, as the claim that started the
+/// execution returned it ([`JobRow::attempts`] / [`ScanJob::attempts`]).
+/// It is a per-row execution sequence number: both claim statements set
+/// `attempts = attempts + 1` and they are its only writers — the sweep
+/// leaves it alone deliberately, a result write never touches the
+/// column it is fenced on, and the column is `integer NOT NULL DEFAULT
+/// 0` with no reset path. So the value is monotonic per row, every
+/// claim gets its own, and a superseded execution's number can never
+/// come round again.
+///
+/// That is what makes the two cases a lease holder cannot tell apart
+/// distinguishable:
+///
+/// - the sweep requeued the row and **nobody claimed it since** (or it
+///   went terminal at the attempt cap): `attempts` has not moved, so an
+///   honest late result still lands and saves a pointless re-run — the
+///   behaviour the sweep's never-delete rule exists to protect;
+/// - the sweep requeued the row and **a sibling claimed it**:
+///   `attempts` has moved on, so the late result is refused instead of
+///   written over an execution that is still in flight.
+///
+/// The variants name what the statement saw. [`Self::Superseded`] is
+/// not an error — the execution did its work; the result is simply no
+/// longer the row's — so the caller surfaces it and stops. Retrying it
+/// is always wrong: the fence refuses the retry for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultWriteOutcome {
+    /// The row was still on the writing execution's attempt, and the
+    /// result was written.
+    Applied,
+    /// The row has moved on to a later execution and nothing was
+    /// written. `current_attempt` is the `attempts` the row carries now;
+    /// it is higher than the attempt the writer supplied.
+    ///
+    /// The refused write would have put `completed` / `failed` /
+    /// `pending` over an execution that is still in flight. `pending` is
+    /// the worst of the three: it invites a third concurrent execution
+    /// and charges an attempt to the wrong run.
+    Superseded { current_attempt: u32 },
+    /// No row with that id exists any more, so there was nothing to
+    /// fence and nothing to write.
+    ///
+    /// Distinguished from [`Self::Superseded`] because the two call for
+    /// different operator reactions and conflating them would describe a
+    /// clobber that never happened. It needs a row that reached a
+    /// terminal status — the sweep's at-the-cap arm — and then aged past
+    /// a retention horizon (`delete_terminal_*_rows_older_than` are the
+    /// only deletes, and they never touch a non-terminal row) while the
+    /// original execution was still running.
+    RowGone,
+}
+
 /// Lifecycle status of a row in the `jobs` table.
 ///
 /// Mirrors the SQL CHECK constraint
@@ -363,7 +430,10 @@ pub enum RequeueOutcome {
     /// `running` → `failed`. `attempts` had already reached the cap, so
     /// requeueing again would loop forever behind a task that kills its
     /// worker every time. The row is retained (not deleted) so a late
-    /// completion from the original worker still lands somewhere.
+    /// completion from the original worker still lands: a `failed` row
+    /// is not claimable, so nothing can move `attempts` past the
+    /// execution that is still out there, and the result-write fence
+    /// admits it ([`ResultWriteOutcome`]).
     RetriesExhausted,
 }
 
@@ -512,6 +582,14 @@ pub const NO_REQUEUE_ON_LEASE_EXPIRY_KINDS: &[&str] = &[
 /// `FOR UPDATE SKIP LOCKED` claim query; mocks
 /// simulate the same semantics with their own data structure.
 ///
+/// The three close-out writes are **fenced on the execution that
+/// produced the result**: each takes the `attempt` the claim handed the
+/// caller and returns a [`ResultWriteOutcome`] saying whether the row
+/// was still on it. That type carries the whole rationale — read it
+/// before changing any of the three. A row can be executed twice (the
+/// abandoned-lease sweep hands a stalled row on), and an unfenced
+/// result write from the loser lands on the winner's row.
+///
 /// `enqueue_scan` is exposed so the ingest path can insert a
 /// `kind='scan'` row inside the same Postgres transaction as
 /// `ArtifactIngested` + `ScanRequested`. The scan
@@ -537,32 +615,53 @@ pub trait JobsRepository: Send + Sync {
     /// Mark `job_id` as `completed` and persist `result_summary` — the
     /// handler's `TaskOutcome::Completed { result_summary }` (H15/H17).
     /// A `Value::Null` summary is stored as SQL NULL (the "no summary"
-    /// sentinel). Idempotent — a row already in `completed` state takes
-    /// the update without error.
+    /// sentinel).
+    ///
+    /// `attempt` is the fence: the row's `attempts` as the claim that
+    /// started this execution returned it. See [`ResultWriteOutcome`]
+    /// for why that value identifies an execution and the lease holder
+    /// does not.
+    ///
+    /// Idempotent within one execution — the scan path writes
+    /// `completed` from the orchestrator and then again from the
+    /// dispatcher, both carrying the same `attempt`, and the second
+    /// write takes it without error. It is NOT idempotent across
+    /// executions, and that is the point.
     fn mark_completed<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         result_summary: serde_json::Value,
-    ) -> BoxFuture<'a, DomainResult<()>>;
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>>;
 
-    /// Reschedule a transient failure. Status stays `pending`,
-    /// `locked_by` and `locked_until` are cleared and reset to
+    /// Reschedule a transient failure. Status returns to `pending`,
+    /// `locked_by` is cleared, `locked_until` is reset to
     /// `now() + backoff`, and `last_error` records the failure
     /// message for operator visibility.
+    ///
+    /// `attempt` is the fence — see [`ResultWriteOutcome`]. This is the
+    /// write the fence matters most for: a `pending` status written over
+    /// a row a live worker is mid-way through invites a *third*
+    /// concurrent execution, where a stale `completed` or `failed` only
+    /// mislabels the row.
     fn reschedule<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         backoff: Duration,
         last_error: &'a str,
-    ) -> BoxFuture<'a, DomainResult<()>>;
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>>;
 
     /// Permanently fail a job — `status='failed'`, `last_error=err`.
     /// Terminal: no further claim attempts.
+    ///
+    /// `attempt` is the fence — see [`ResultWriteOutcome`].
     fn mark_failed<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         last_error: &'a str,
-    ) -> BoxFuture<'a, DomainResult<()>>;
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>>;
 
     /// Insert a fresh `kind='scan'` row for an artifact. The partial
     /// unique on `(artifact_id) WHERE kind='scan' AND artifact_id IS
@@ -667,6 +766,15 @@ pub trait JobsRepository: Send + Sync {
     /// three consecutive renewals failed to land, which a live worker
     /// with a working database connection does not do.
     ///
+    /// As a fence this one is an **early-out, not the authority**: it
+    /// only fires if a renewal happened to run between the handover and
+    /// the outcome write, which a worker that was paused and then
+    /// returned immediately never gives it. The authority is the
+    /// result write's own predicate ([`ResultWriteOutcome`]), which is
+    /// evaluated by the database at the moment of the write. Removing
+    /// the renewal would still cost the sweep its discriminator, so both
+    /// stay.
+    ///
     /// **Default implementation:** returns `Ok(true)`. A mock has no
     /// lease to extend, and the honest answer for "is the fixture's row
     /// still mine" is yes — the additive-default pattern of
@@ -703,10 +811,13 @@ pub trait JobsRepository: Send + Sync {
     /// passes in here.
     ///
     /// The row is never deleted. It may be genuinely running, and its
-    /// completion has to land somewhere: `mark_completed` /
-    /// `mark_failed` are unconditional on `id`, so a late write from the
-    /// original worker still updates the surviving row instead of
-    /// silently updating nothing.
+    /// completion has to land somewhere — and it does, because the
+    /// sweep leaves `attempts` alone: the requeued row still carries the
+    /// number the original execution claimed under, so that execution's
+    /// late [`Self::mark_completed`] passes the result-write fence and
+    /// lands. What the fence refuses is the same write *after a sibling
+    /// has claimed the row*, which moves `attempts` on. See
+    /// [`ResultWriteOutcome`].
     ///
     /// `attempts` is left alone. The claim increments it, so a requeued
     /// row is counted on its next claim exactly like a `reschedule`d
@@ -1410,24 +1521,27 @@ mod tests {
         fn mark_completed<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _result_summary: serde_json::Value,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn reschedule<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _backoff: Duration,
             _last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn mark_failed<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn enqueue_scan<'a>(
             &'a self,
@@ -1454,15 +1568,23 @@ mod tests {
             .await
             .expect("claim_scan_jobs")
             .is_empty());
-        repo.mark_completed(Uuid::nil(), serde_json::json!({}))
-            .await
-            .expect("mark_completed");
-        repo.reschedule(Uuid::nil(), Duration::from_secs(1), "e")
-            .await
-            .expect("reschedule");
-        repo.mark_failed(Uuid::nil(), "e")
-            .await
-            .expect("mark_failed");
+        for outcome in [
+            repo.mark_completed(Uuid::nil(), 1, serde_json::json!({}))
+                .await
+                .expect("mark_completed"),
+            repo.reschedule(Uuid::nil(), 1, Duration::from_secs(1), "e")
+                .await
+                .expect("reschedule"),
+            repo.mark_failed(Uuid::nil(), 1, "e")
+                .await
+                .expect("mark_failed"),
+        ] {
+            assert_eq!(
+                outcome,
+                ResultWriteOutcome::Applied,
+                "a fixture's row cannot be superseded — it has no claim to lose"
+            );
+        }
         let hash: ContentHash = format!("{:064x}", 1).parse().expect("64-hex sha");
         assert_eq!(
             repo.enqueue_scan(Uuid::nil(), Uuid::nil(), &hash, "oci", 0, "manual")
@@ -1543,24 +1665,27 @@ mod tests {
             fn mark_completed<'a>(
                 &'a self,
                 _job_id: Uuid,
+                _attempt: u32,
                 _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
+            ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+                Box::pin(async { Ok(ResultWriteOutcome::Applied) })
             }
             fn reschedule<'a>(
                 &'a self,
                 _job_id: Uuid,
+                _attempt: u32,
                 _backoff: Duration,
                 _last_error: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
+            ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+                Box::pin(async { Ok(ResultWriteOutcome::Applied) })
             }
             fn mark_failed<'a>(
                 &'a self,
                 _job_id: Uuid,
+                _attempt: u32,
                 _last_error: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
+            ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+                Box::pin(async { Ok(ResultWriteOutcome::Applied) })
             }
             fn enqueue_scan<'a>(
                 &'a self,
@@ -1652,6 +1777,34 @@ mod tests {
         assert_eq!(copied, rolled);
         assert_ne!(rolled, stale);
         assert_eq!(format!("{stale:?}"), "NoLongerPending");
+    }
+
+    /// `ResultWriteOutcome` derives `Copy + PartialEq + Eq + Debug` so a
+    /// caller can match on it without moving it and still log it, and
+    /// `Superseded` carries the row's current attempt so the refusal log
+    /// names both identities rather than only the writer's.
+    #[test]
+    fn result_write_outcome_copy_and_eq() {
+        let applied = ResultWriteOutcome::Applied;
+        let superseded = ResultWriteOutcome::Superseded { current_attempt: 3 };
+        let gone = ResultWriteOutcome::RowGone;
+        // `Copy`: `applied` is still usable after being read by value.
+        let copied = applied;
+        assert_eq!(copied, applied);
+        assert_ne!(applied, superseded);
+        assert_ne!(superseded, gone);
+        // A refusal by a later execution is a different fact from a
+        // refusal by a vanished row, and from a refusal at a different
+        // attempt — conflating any two would misreport what happened.
+        assert_ne!(
+            superseded,
+            ResultWriteOutcome::Superseded { current_attempt: 4 }
+        );
+        assert_eq!(format!("{gone:?}"), "RowGone");
+        assert_eq!(
+            format!("{superseded:?}"),
+            "Superseded { current_attempt: 3 }"
+        );
     }
 
     /// `JobsRepository::delete_job` default impl returns `Err(Invariant)`.
