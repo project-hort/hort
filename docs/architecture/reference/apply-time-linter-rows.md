@@ -53,6 +53,7 @@ treats as a hard block.
 | 11 | `ExclusionScopeNotImplemented` / `exclusion_scope_not_implemented` | `Exclusion.scope` | any `{ repository: <name> }` |
 | 12 | `VirtualMemberFormatNotEnforced` / `virtual_member_format_not_enforced` | `ArtifactRepository.virtualMembers[]` | a member whose `format` differs from the virtual's |
 | 13 | `ScanPolicyMaxArtifactAgeNotImplemented` / `scan_policy_max_artifact_age_not_implemented` | `ScanPolicy.maxArtifactAge` | any value — the inert state is the absent field |
+| 14 | `SaRotationTargetConflict` / — | `ServiceAccount.fallbackRotation.targetSecret` | two `ServiceAccount` envelopes declaring the same `(namespace, name)` target — the reconciler's ownership barrier refuses one of them on every tick, so its declared rotation never happens |
 
 Rows 0, 1 and 4 are not in this table because they are not lint rows:
 row 0 is `DesiredState::validate` (per-envelope + cross-document), row 1
@@ -66,8 +67,8 @@ for which of them the offline gate runs.
 Apply aborts on the **first** row with an error finding, so a row
 inserted ahead of an existing one changes which message an
 already-failing config is rejected with. New rows are therefore appended
-at the end — rows 9 through 13 all carry that note in their
-`LinterRule` doc comment, and rows 10–13 were appended in that order for
+at the end — rows 9 through 14 all carry that note in their
+`LinterRule` doc comment, and rows 10–14 were appended in that order for
 exactly this reason.
 
 ### Retirement triggers
@@ -86,7 +87,9 @@ trigger in the `validate_*` doc comment:
 | 13 — `maxArtifactAge` | a consumer feeds `ScanPolicyProjection.max_artifact_age_secs` and the artifact's ingest instant through `hort_domain::policy::evaluate_age_gates` and folds the resulting violation into the accumulator. The evaluator already exists and is not deleted by this row — the row withdraws the operator surface until something calls it |
 
 The other rows are not on this list: they reject a configuration that is
-wrong, and no future work makes them obsolete.
+wrong, and no future work makes them obsolete. Row 14 is one of them —
+two ServiceAccounts cannot share a rotation target under any
+implementation, because the owner of a Secret is a single value.
 
 ## Table 2 — surfaces with no named row, and where they are checked
 
@@ -134,7 +137,11 @@ four of them agree:
 
 1. `hort-config::desired` — the pure `validate_*` function, with the
    inert default and (for a missing-control row) the retirement trigger
-   in its doc comment.
+   in its doc comment. A row whose verdict spans *envelopes* rather than
+   reading one spec — rows 2 and 14 — lives in
+   `hort-app::lint::static_validate` instead, beside the other
+   cross-envelope validators, and returns rendered message strings
+   directly.
 2. `LinterRule` in `hort-app::lint::static_validate` — a new variant,
    appended; its `metric_rule` arm; a metric `rule`-label `const` if it
    emits one; and the call in `validate`, appended after the last row.

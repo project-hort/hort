@@ -1288,10 +1288,20 @@ emission per ServiceAccount per reconciler tick):
   appended.
 - `skipped_fresh` — existing Secret's `project-hort.de/last-rotated`
   annotation is within `rotation_interval` of now; no work needed.
-- `collision` — existing Secret's `project-hort.de/managed-by` label is NOT
-  `"hort-worker"` (operator-created, ArgoCD-managed, etc.). The
-  reconciler refuses to overwrite; operator must `kubectl delete
-  secret` to hand off management.
+- `collision` — the target Secret is not this ServiceAccount's to
+  rotate, so the reconciler refuses to overwrite it. One counter for
+  three rules, told apart by the `collision_reason` field on the warn
+  line (not a metric label — the series stays at six results):
+  `not_hort_managed` (the `project-hort.de/managed-by` label is NOT
+  `"hort-worker"` — operator-created, ArgoCD-managed, etc.; operator
+  must `kubectl delete secret` to hand off management),
+  `owned_by_another_service_account` (the
+  `project-hort.de/service-account` label names a different SA — two
+  `ServiceAccount` envelopes point at one Secret; gitops apply rejects
+  that configuration, so this is a bundle applied before the gate
+  shipped) and `owner_unestablished` (the managed-by label is ours and
+  the owner label is absent, so ownership cannot be established —
+  delete the Secret).
 - `namespace_not_authorized` — the SA's
   `fallbackRotation.targetSecret.namespace` is not in the worker's
   `HORT_ROTATION_TARGET_NAMESPACES` set. Defence-in-depth against an SA
@@ -3890,7 +3900,7 @@ deployment the only registered kind is `"scan"`.
 | `hort_admin_tasks_starved_total` | counter | `kind`, `reason` | — | `reason ∈ {unregistered, not_claimed, oldest_row_stalled}` — one increment per audit at which the kind's eligible backlog has gone unserved for > 600 s |
 | `hort_admin_tasks_claim_unmappable_total` | counter | (none) | — | emitted by the Postgres jobs adapter: one increment per claimed row that failed `JobRow` projection and was resolved terminally instead of being stranded in `running` |
 | `hort_admin_tasks_lease_requeued_total` | counter | `kind`, `result` | — | `result ∈ {requeued, retries_exhausted}` — one increment per row the abandoned-lease sweep resolved (a row left in `running` by a worker that stopped renewing its claim) |
-| `hort_admin_tasks_lease_renew_failed_total` | counter | `kind`, `result` | — | `result ∈ {lost, error}` — `lost` fires when the row is no longer this worker's; the dispatcher then **discards** that handler's outcome rather than writing over the row's current holder, so one `lost` is one run whose result was thrown away. `error` is a transient database failure on the renewal statement and has no such consequence |
+| `hort_admin_tasks_lease_renew_failed_total` | counter | `kind`, `result` | — | `result ∈ {lost, error}` — `lost` fires when the row is no longer this worker's; the dispatcher then **discards** that handler's outcome rather than writing over the row's current holder. `error` is a transient database failure on the renewal statement and has no such consequence. `lost` is a **lower bound** on discarded results, not a count of them: it only fires if a renewal happened to run between the handover and the outcome write, which a worker that was paused and then returned immediately never gives it. The authority is the result write's own `(id, attempts)` fence in the jobs adapter, and a result it refuses is a WARN naming the job id and both attempts, with no counter of its own |
 
 **Starvation semantics** (issue #131). A `provenance-verify` backlog once
 grew to ~1450 rows over 33 minutes while the same dispatcher claimed and
@@ -3995,6 +4005,11 @@ with the per-kind reason.
 
 - `result="completed"` — handler returned
   `TaskOutcome::Completed`; `mark_completed` was called on the jobs row.
+  "Called", not "landed": the write is fenced on the execution that
+  produced it, so a row handed to another worker mid-run refuses it
+  (WARN, see `hort_admin_tasks_lease_renew_failed_total` above). The
+  counter reports the handler's verdict, which is also what the
+  sibling's own run will report when it finishes.
 - `result="failed_retry"` — handler returned
   `TaskOutcome::Failed { retry: true }` (or an `Err`, which the
   dispatcher records as one) on a row that still had attempt budget

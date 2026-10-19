@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
 use hort_domain::ports::jobs_repository::{
-    JobsRepository, RequeueOutcome, REQUEUE_ON_LEASE_EXPIRY_KINDS,
+    JobsRepository, RequeueOutcome, ResultWriteOutcome, REQUEUE_ON_LEASE_EXPIRY_KINDS,
 };
 use hort_domain::types::ContentHash;
 
@@ -313,10 +313,16 @@ async fn at_the_attempt_cap_the_sweep_fails_the_row_instead_of_requeueing_foreve
     }
 
     // The failed row is retained, so a late completion from the original
-    // worker still lands on it rather than on nothing.
-    repo.mark_completed(at_cap, serde_json::json!({"late": true}))
-        .await
-        .expect("a late completion must still find its row");
+    // worker still lands on it rather than on nothing. The sweep left
+    // `attempts` at 5, and a `failed` row is not claimable, so nothing
+    // can have moved the row past the execution that is still out
+    // there — the result-write fence admits it.
+    assert_eq!(
+        repo.mark_completed(at_cap, 5, serde_json::json!({"late": true}))
+            .await
+            .expect("a late completion must still find its row"),
+        ResultWriteOutcome::Applied,
+    );
     let (status, _, _, _) = read_row(&pool, at_cap).await;
     assert_eq!(status, "completed");
 
@@ -601,7 +607,7 @@ async fn renewal_refuses_a_row_that_is_no_longer_running() {
     };
     let repo = PgJobsRepository::new(pool.clone());
     let (job_id, _) = seed_abandoned_scan(&pool, 0, 60).await;
-    repo.mark_completed(job_id, serde_json::Value::Null)
+    repo.mark_completed(job_id, 0, serde_json::Value::Null)
         .await
         .expect("mark_completed");
 

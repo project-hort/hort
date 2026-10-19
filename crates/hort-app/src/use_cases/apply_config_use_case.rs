@@ -770,6 +770,11 @@ const PRE_WRITE_REJECT_ROWS: &[(LinterRule, &str, RowAbort)] = &[
         "gitops apply: maxArtifactAge linter rejected ScanPolicy envelope(s) (the age evaluator has no caller, so the cap is stored and never applied)",
         RowAbort::EveryFinding,
     ),
+    (
+        LinterRule::SaRotationTargetConflict,
+        "gitops apply: rotation-target linter rejected ServiceAccount envelope(s) (two ServiceAccounts declare one fallbackRotation.targetSecret, so the reconciler's ownership barrier makes one of them collide every tick)",
+        RowAbort::EveryFinding,
+    ),
 ];
 
 impl ApplyConfigUseCase {
@@ -7459,6 +7464,28 @@ mod tests {
                 expect_rule: LinterRule::ScanPolicyMaxArtifactAgeNotImplemented,
                 effective_backend: None,
             },
+            // Row 14 — two ServiceAccounts pointed at one rotation
+            // target. No `federatedIdentities`, so row 2 stays silent and
+            // row 14 is the first error.
+            Case {
+                desired: DesiredState {
+                    service_accounts: vec![
+                        service_account_env_with_rotation_target(
+                            "ci-a",
+                            "ci-system",
+                            "shared-secret",
+                        ),
+                        service_account_env_with_rotation_target(
+                            "ci-b",
+                            "ci-system",
+                            "shared-secret",
+                        ),
+                    ],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::SaRotationTargetConflict,
+                effective_backend: None,
+            },
         ];
 
         for case in cases {
@@ -7740,7 +7767,8 @@ mod tests {
                 | LinterRule::ScanPolicyLicensePolicyNotImplemented
                 | LinterRule::ExclusionScopeNotImplemented
                 | LinterRule::VirtualMemberFormatNotEnforced
-                | LinterRule::ScanPolicyMaxArtifactAgeNotImplemented => Consumption::Table,
+                | LinterRule::ScanPolicyMaxArtifactAgeNotImplemented
+                | LinterRule::SaRotationTargetConflict => Consumption::Table,
                 // Row 2 — its own abort immediately before row 4, so the
                 // cross-kind FK keeps its distinct log line and its
                 // `"; "`-joined envelope.
@@ -7768,6 +7796,7 @@ mod tests {
             LinterRule::ExclusionScopeNotImplemented,
             LinterRule::VirtualMemberFormatNotEnforced,
             LinterRule::ScanPolicyMaxArtifactAgeNotImplemented,
+            LinterRule::SaRotationTargetConflict,
         ];
 
         let in_table: HashSet<LinterRule> =
@@ -7811,7 +7840,7 @@ mod tests {
             .count();
         assert_eq!(
             (table, dedicated, advisory),
-            (12, 1, 1),
+            (13, 1, 1),
             "the LinterRule bucket counts changed — a silent reclassification \
              (or a variant missing from ALL_RULES) is exactly what this guard \
              exists to catch"
@@ -9053,6 +9082,36 @@ mod tests {
             spec: ServiceAccountSpec {
                 federated_identities,
                 fallback_rotation: None,
+            },
+        }
+    }
+
+    /// A `fallbackRotation`-only `ServiceAccount` envelope pointed at a
+    /// given target Secret. No `federatedIdentities`, so row 2's
+    /// cross-kind FK stays silent and a row-14 corpus case reaches the
+    /// validator as its first error.
+    pub(in crate::use_cases::apply_config_use_case) fn service_account_env_with_rotation_target(
+        sa_name: &str,
+        namespace: &str,
+        secret_name: &str,
+    ) -> Envelope<ServiceAccountSpec> {
+        Envelope {
+            api_version: ApiVersion::V1,
+            kind: Kind::ServiceAccount,
+            metadata: Metadata {
+                name: sa_name.into(),
+            },
+            spec: ServiceAccountSpec {
+                federated_identities: vec![],
+                fallback_rotation: Some(hort_config::service_account::FallbackRotationSpec {
+                    target_secret: hort_config::service_account::TargetSecretSpec {
+                        name: secret_name.into(),
+                        namespace: namespace.into(),
+                        format: "dockerconfigjson".into(),
+                    },
+                    rotation_interval: "6h".into(),
+                    validity: "24h".into(),
+                }),
             },
         }
     }

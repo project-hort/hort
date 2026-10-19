@@ -23,8 +23,10 @@ instead of creating a dedicated bootstrap SA.
 
 Required verbs (from the writer adapter):
 - `get`, `list`: the `read_managed` path inspects existing Secrets
-  to enforce the `project-hort.de/managed-by` collision-detection rule and
-  to read the `project-hort.de/last-rotated` freshness label.
+  to enforce the ownership rules (`project-hort.de/managed-by` names the
+  writer, `project-hort.de/service-account` the owning ServiceAccount; a
+  mismatch or an absent owner is a collision) and to read the
+  `project-hort.de/last-rotated` freshness label.
 - `create`: the very first reconcile on a new Secret name.
 - `update`: SSA ownership-transfer edge cases on some k8s versions.
 - `patch`: the steady-state SSA path (`Patch::Apply`) requires

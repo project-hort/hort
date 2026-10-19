@@ -20,9 +20,14 @@
 //!    - If `target_secret_namespace` is NOT in the worker's authorized
 //!      `rotation_namespaces` set → warn + metric, skip.
 //!    - Read the existing Secret via `KubernetesSecretWriter::read_managed`.
-//!    - If the existing Secret's `managed_by != Some("hort-worker")` →
-//!      warn + metric, skip (collision; operator must delete the
-//!      Secret to hand off management).
+//!    - If the existing Secret is not *this* SA's to rotate → warn +
+//!      metric, skip (collision). Three shapes, all fail-closed:
+//!      `managed_by != Some("hort-worker")` (another controller owns
+//!      it), `service_account` naming a different SA (two SAs pointed
+//!      at one target Secret), or `service_account` absent while
+//!      `managed_by` is ours (ownership cannot be established). The
+//!      operator deletes the Secret, or splits the shared target, to
+//!      resolve.
 //!    - If the existing Secret is fresh (`last_rotated` within
 //!      `rotation_interval` of now) → debug + metric, skip.
 //!    - Otherwise (missing or stale): mint a fresh PAT, upsert the
@@ -80,6 +85,13 @@ const KIND: &str = "service-account-rotation";
 /// whose `project-hort.de/managed-by` projection matches this string. Any other
 /// value is a collision (out-of-band creator) and the reconciler
 /// refuses to overwrite.
+///
+/// This names the **writer**, not the owner: it is byte-identical on
+/// every Secret this deployment writes, so it cannot tell two
+/// ServiceAccounts pointed at the same target Secret apart. The owner is
+/// the `project-hort.de/service-account` label
+/// ([`ManagedSecret::service_account`]), and [`decide`] keys the
+/// ownership half of the barrier on that.
 const MANAGED_BY: &str = "hort-worker";
 
 /// Token `name` written into `api_tokens.name` and the request
@@ -266,19 +278,20 @@ impl TaskHandler for ServiceAccountRotationHandler {
                     }
                 };
 
-                let decision = decide(existing.as_ref(), rotation.rotation_interval, now);
+                let decision = decide(existing.as_ref(), &sa.name, rotation.rotation_interval, now);
 
                 match decision {
-                    Decision::Collision {
-                        existing_managed_by,
-                    } => {
+                    Decision::Collision(collision) => {
                         tracing::warn!(
                             service_account = %sa.name,
                             namespace = %ns,
                             name = %name,
-                            existing_managed_by = ?existing_managed_by,
+                            existing_managed_by = ?collision.existing_managed_by,
+                            existing_service_account = ?collision.existing_service_account,
+                            collision_reason = collision.reason.as_str(),
                             reason = "collision",
-                            "service account rotation: existing Secret not managed by hort-worker; skipping",
+                            "service account rotation: refusing to overwrite the target Secret — {}; skipping",
+                            collision.reason.detail(),
                         );
                         emit_rotation_result(RotationResult::Collision);
                         counts.collision += 1;
@@ -517,43 +530,145 @@ impl ServiceAccountRotationHandler {
 /// testable from the rest of the orchestration.
 #[derive(Debug, Clone, PartialEq)]
 enum Decision {
-    /// Existing Secret is managed by someone else — refuse to
-    /// overwrite. `existing_managed_by` carries whatever string the
-    /// `project-hort.de/managed-by` label actually has (or `None` if absent).
-    Collision { existing_managed_by: Option<String> },
-    /// Existing Secret is managed by `hort-worker` AND `last_rotated`
-    /// is within `rotation_interval` of `now`. `age_secs` is `now -
-    /// last_rotated` in seconds (for the lag gauge).
+    /// The existing Secret is not this ServiceAccount's to rotate —
+    /// refuse to overwrite. The payload carries which rule fired and the
+    /// two ownership labels as read, so the operator log names whose
+    /// Secret it is without a second `kubectl`.
+    Collision(Collision),
+    /// Existing Secret is owned by the SA being rotated AND
+    /// `last_rotated` is within `rotation_interval` of `now`. `age_secs`
+    /// is `now - last_rotated` in seconds (for the lag gauge).
     SkipFresh { age_secs: f64 },
     /// Missing or stale — proceed to mint + upsert.
     Rotate,
 }
 
-/// Pure freshness + collision decision. Driven by the
-/// `project-hort.de/managed-by` and `project-hort.de/last-rotated` projections off the
-/// existing Secret (or the absence of the Secret entirely).
+/// The refusal [`Decision::Collision`] carries: the rule that fired plus
+/// the ownership labels exactly as they were read off the existing
+/// Secret.
+///
+/// Both labels are carried whichever rule fired, rather than hung off
+/// the reason, because the operator-facing question is the same in all
+/// three cases — "who holds this Secret?" — and a reason-shaped payload
+/// would make the warn line's field set vary with the branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Collision {
+    /// Which of the ownership rules refused.
+    reason: CollisionReason,
+    /// `project-hort.de/managed-by` as read (`None` when the label is absent).
+    existing_managed_by: Option<String>,
+    /// `project-hort.de/service-account` as read (`None` when the label is
+    /// absent).
+    existing_service_account: Option<String>,
+}
+
+/// Why the rotation barrier refused to overwrite an existing Secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollisionReason {
+    /// `project-hort.de/managed-by` is absent or names a manager that is not
+    /// this reconciler — an out-of-band creator (kubectl, Sealed
+    /// Secrets, another controller).
+    NotHortManaged,
+    /// `project-hort.de/managed-by` is ours but `project-hort.de/service-account`
+    /// names a **different** ServiceAccount: two ServiceAccounts are
+    /// configured with the same `targetSecret`.
+    OwnedByAnotherServiceAccount,
+    /// `project-hort.de/managed-by` is ours and `project-hort.de/service-account`
+    /// is absent, so no owner can be established.
+    OwnerUnestablished,
+}
+
+impl CollisionReason {
+    /// Stable key for the structured `collision_reason` log field.
+    /// Operator log / SIEM pipelines key on it, so these strings are
+    /// part of the handler's observable surface.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotHortManaged => "not_hort_managed",
+            Self::OwnedByAnotherServiceAccount => "owned_by_another_service_account",
+            Self::OwnerUnestablished => "owner_unestablished",
+        }
+    }
+
+    /// Operator-facing sentence: what the barrier saw, and the fix.
+    const fn detail(self) -> &'static str {
+        match self {
+            Self::NotHortManaged => {
+                "the existing Secret is not labelled as managed by this reconciler — \
+                 another controller or an operator owns it; delete the Secret to hand \
+                 management over"
+            }
+            Self::OwnedByAnotherServiceAccount => {
+                "the existing Secret is managed by this reconciler but owned by a \
+                 different ServiceAccount — two ServiceAccounts share one rotation \
+                 target and would overwrite each other's credential every tick; give \
+                 each ServiceAccount its own targetSecret"
+            }
+            Self::OwnerUnestablished => {
+                "the existing Secret carries this reconciler's managed-by label but \
+                 names no owning ServiceAccount, so ownership cannot be established; \
+                 delete the Secret to let the reconciler take ownership"
+            }
+        }
+    }
+}
+
+/// Pure ownership + freshness decision. Driven by the
+/// `project-hort.de/managed-by`, `project-hort.de/service-account` and
+/// `project-hort.de/last-rotated` projections off the existing Secret (or the
+/// absence of the Secret entirely).
+///
+/// `owner` is the `metadata.name` of the ServiceAccount whose rotation is
+/// being decided — the value the reconciler writes into
+/// `project-hort.de/service-account` ([`ManagedSecretSpec::service_account_name`])
+/// when it takes a target Secret.
 ///
 /// Decision matrix:
 ///
-/// | `existing` | `managed_by` | `last_rotated` age | Decision |
-/// |---|---|---|---|
-/// | `None` | — | — | `Rotate` |
-/// | `Some` | `!= Some("hort-worker")` | — | `Collision` |
-/// | `Some` | `Some("hort-worker")` | `None` (absent / parse failure) | `Rotate` |
-/// | `Some` | `Some("hort-worker")` | `< rotation_interval` | `SkipFresh` |
-/// | `Some` | `Some("hort-worker")` | `>= rotation_interval` | `Rotate` |
+/// | `existing` | `managed_by` | `service_account` | `last_rotated` age | Decision |
+/// |---|---|---|---|---|
+/// | `None` | — | — | — | `Rotate` |
+/// | `Some` | `!= Some("hort-worker")` | — | — | `Collision(NotHortManaged)` |
+/// | `Some` | `Some("hort-worker")` | `Some(other)` | — | `Collision(OwnedByAnotherServiceAccount)` |
+/// | `Some` | `Some("hort-worker")` | `None` | — | `Collision(OwnerUnestablished)` |
+/// | `Some` | `Some("hort-worker")` | `Some(owner)` | `None` (absent / parse failure) | `Rotate` |
+/// | `Some` | `Some("hort-worker")` | `Some(owner)` | `< rotation_interval` | `SkipFresh` |
+/// | `Some` | `Some("hort-worker")` | `Some(owner)` | `>= rotation_interval` | `Rotate` |
 fn decide(
     existing: Option<&ManagedSecret>,
+    owner: &str,
     rotation_interval: std::time::Duration,
     now: chrono::DateTime<Utc>,
 ) -> Decision {
     let Some(secret) = existing else {
         return Decision::Rotate;
     };
-    if secret.managed_by.as_deref() != Some(MANAGED_BY) {
-        return Decision::Collision {
+    let collision = |reason| {
+        Decision::Collision(Collision {
+            reason,
             existing_managed_by: secret.managed_by.clone(),
-        };
+            existing_service_account: secret.service_account.clone(),
+        })
+    };
+    if secret.managed_by.as_deref() != Some(MANAGED_BY) {
+        return collision(CollisionReason::NotHortManaged);
+    }
+    // `MANAGED_BY` names the writer, not the owner, so it is identical on
+    // every Secret this deployment writes: on its own it answers "may
+    // hort overwrite this?" and never "may *this* ServiceAccount
+    // overwrite this?". The owner is `project-hort.de/service-account`, and it
+    // has to be *established* rather than assumed —
+    // `ManagedSecretSpec::service_account_name` is non-optional, so every
+    // Secret this reconciler writes carries it, and its absence beside
+    // our own managed-by label means a Secret this reconciler did not
+    // write (an older version of it, or a hand-made Secret wearing the
+    // label). Overwriting on an unestablished claim is the exact
+    // credential-crossing this barrier exists to prevent, so all three
+    // non-owning shapes fail closed.
+    match secret.service_account.as_deref() {
+        Some(existing_owner) if existing_owner == owner => {}
+        Some(_) => return collision(CollisionReason::OwnedByAnotherServiceAccount),
+        None => return collision(CollisionReason::OwnerUnestablished),
     }
     let Some(last_rotated) = secret.last_rotated else {
         return Decision::Rotate;
@@ -787,13 +902,15 @@ mod tests {
     fn decide_no_existing_secret_returns_rotate() {
         let now = pinned_now();
         assert_eq!(
-            decide(None, StdDuration::from_secs(60), now),
+            decide(None, "ci-pusher", StdDuration::from_secs(60), now),
             Decision::Rotate
         );
     }
 
     #[test]
     fn decide_foreign_managed_by_returns_collision() {
+        // The owning-SA label matches, so this collision can only be the
+        // `managed-by` rule — the pre-existing barrier, unchanged.
         let now = pinned_now();
         let existing = ManagedSecret {
             managed_by: Some("argocd".into()),
@@ -801,11 +918,11 @@ mod tests {
             last_rotated: Some(now - ChronoDuration::seconds(10)),
             token_id: Some(Uuid::nil()),
         };
-        match decide(Some(&existing), StdDuration::from_secs(60), now) {
-            Decision::Collision {
-                existing_managed_by,
-            } => {
-                assert_eq!(existing_managed_by, Some("argocd".to_string()));
+        match decide(Some(&existing), "ci", StdDuration::from_secs(60), now) {
+            Decision::Collision(c) => {
+                assert_eq!(c.reason, CollisionReason::NotHortManaged);
+                assert_eq!(c.existing_managed_by, Some("argocd".to_string()));
+                assert_eq!(c.existing_service_account, Some("ci".to_string()));
             }
             other => panic!("expected Collision, got {other:?}"),
         }
@@ -820,12 +937,142 @@ mod tests {
             last_rotated: None,
             token_id: None,
         };
-        assert!(matches!(
-            decide(Some(&existing), StdDuration::from_secs(60), now),
-            Decision::Collision {
-                existing_managed_by: None
+        match decide(Some(&existing), "ci", StdDuration::from_secs(60), now) {
+            Decision::Collision(c) => {
+                assert_eq!(c.reason, CollisionReason::NotHortManaged);
+                assert_eq!(c.existing_managed_by, None);
+                assert_eq!(c.existing_service_account, None);
             }
-        ));
+            other => panic!("expected Collision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_owning_service_account_proceeds_to_freshness_logic() {
+        // Case 1 — the Secret names the SA being rotated, so the
+        // ownership half of the barrier is silent and the freshness
+        // arithmetic decides. Both outcomes, over the same owner, so the
+        // test shows the owner match is not itself a decision.
+        let now = pinned_now();
+        let fresh = ManagedSecret {
+            managed_by: Some(MANAGED_BY.into()),
+            service_account: Some("ci".into()),
+            last_rotated: Some(now - ChronoDuration::seconds(30)),
+            token_id: Some(Uuid::nil()),
+        };
+        match decide(Some(&fresh), "ci", StdDuration::from_secs(60), now) {
+            Decision::SkipFresh { age_secs } => assert!((age_secs - 30.0).abs() < 1e-6),
+            other => panic!("expected SkipFresh for the owning SA, got {other:?}"),
+        }
+
+        let stale = ManagedSecret {
+            last_rotated: Some(now - ChronoDuration::seconds(120)),
+            ..fresh
+        };
+        assert_eq!(
+            decide(Some(&stale), "ci", StdDuration::from_secs(60), now),
+            Decision::Rotate,
+            "a stale Secret owned by the SA being rotated must still rotate"
+        );
+    }
+
+    #[test]
+    fn decide_other_service_account_returns_collision() {
+        // Case 2 — the defect's case. `managed_by` is ours on BOTH
+        // Secrets (it names the writer), so only the owner label
+        // separates them. A stale `last_rotated` makes the point: without
+        // the ownership rule this input rotates.
+        let now = pinned_now();
+        let existing = ManagedSecret {
+            managed_by: Some(MANAGED_BY.into()),
+            service_account: Some("ci-other".into()),
+            last_rotated: Some(now - ChronoDuration::seconds(120)),
+            token_id: Some(Uuid::nil()),
+        };
+        match decide(Some(&existing), "ci", StdDuration::from_secs(60), now) {
+            Decision::Collision(c) => {
+                assert_eq!(c.reason, CollisionReason::OwnedByAnotherServiceAccount);
+                assert_eq!(c.existing_managed_by, Some(MANAGED_BY.to_string()));
+                assert_eq!(c.existing_service_account, Some("ci-other".to_string()));
+            }
+            other => panic!("expected Collision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_absent_owner_label_with_our_managed_by_returns_collision() {
+        // Case 3 — fail closed. The writer sets the owner label on every
+        // upsert (`ManagedSecretSpec::service_account_name` is
+        // non-optional), so its absence beside our own managed-by label
+        // is a Secret this reconciler did not write. A stale
+        // `last_rotated` again: the freshness logic would rotate.
+        let now = pinned_now();
+        let existing = ManagedSecret {
+            managed_by: Some(MANAGED_BY.into()),
+            service_account: None,
+            last_rotated: Some(now - ChronoDuration::seconds(120)),
+            token_id: Some(Uuid::nil()),
+        };
+        match decide(Some(&existing), "ci", StdDuration::from_secs(60), now) {
+            Decision::Collision(c) => {
+                assert_eq!(c.reason, CollisionReason::OwnerUnestablished);
+                assert_eq!(c.existing_managed_by, Some(MANAGED_BY.to_string()));
+                assert_eq!(c.existing_service_account, None);
+            }
+            other => panic!("expected Collision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_owner_match_is_exact_not_prefix() {
+        // `ci` must not adopt `ci-pusher`'s Secret (or the reverse) —
+        // the comparison is equality, and a k8s label value is a flat
+        // string with no hierarchy to inherit through.
+        let now = pinned_now();
+        let existing = ManagedSecret {
+            managed_by: Some(MANAGED_BY.into()),
+            service_account: Some("ci-pusher".into()),
+            last_rotated: Some(now - ChronoDuration::seconds(120)),
+            token_id: Some(Uuid::nil()),
+        };
+        for owner in ["ci", "ci-pusher-2", "CI-PUSHER"] {
+            match decide(Some(&existing), owner, StdDuration::from_secs(60), now) {
+                Decision::Collision(c) => {
+                    assert_eq!(c.reason, CollisionReason::OwnedByAnotherServiceAccount);
+                }
+                other => panic!("expected Collision for owner `{owner}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn collision_reason_strings_are_distinct_and_populated() {
+        // The `collision_reason` key is part of the handler's observable
+        // log surface and `detail()` is what the operator reads, so both
+        // are pinned per variant rather than left to the branch that
+        // happens to be exercised elsewhere.
+        let all = [
+            CollisionReason::NotHortManaged,
+            CollisionReason::OwnedByAnotherServiceAccount,
+            CollisionReason::OwnerUnestablished,
+        ];
+        assert_eq!(
+            all.map(CollisionReason::as_str),
+            [
+                "not_hort_managed",
+                "owned_by_another_service_account",
+                "owner_unestablished",
+            ]
+        );
+        let details = all.map(CollisionReason::detail);
+        for (reason, detail) in all.iter().zip(details.iter()) {
+            assert!(!detail.is_empty(), "{reason:?} has no operator detail");
+        }
+        assert_eq!(
+            details.iter().collect::<HashSet<_>>().len(),
+            all.len(),
+            "each collision reason needs its own operator-facing sentence"
+        );
     }
 
     #[test]
@@ -838,7 +1085,7 @@ mod tests {
             last_rotated: Some(last),
             token_id: Some(Uuid::nil()),
         };
-        match decide(Some(&existing), StdDuration::from_secs(60), now) {
+        match decide(Some(&existing), "ci", StdDuration::from_secs(60), now) {
             Decision::SkipFresh { age_secs } => {
                 assert!((age_secs - 30.0).abs() < 1e-6);
             }
@@ -857,7 +1104,7 @@ mod tests {
             token_id: Some(Uuid::nil()),
         };
         assert_eq!(
-            decide(Some(&existing), StdDuration::from_secs(60), now),
+            decide(Some(&existing), "ci", StdDuration::from_secs(60), now),
             Decision::Rotate
         );
     }
@@ -873,7 +1120,7 @@ mod tests {
             token_id: None,
         };
         assert_eq!(
-            decide(Some(&existing), StdDuration::from_secs(60), now),
+            decide(Some(&existing), "ci", StdDuration::from_secs(60), now),
             Decision::Rotate
         );
     }
@@ -890,7 +1137,7 @@ mod tests {
             last_rotated: Some(last),
             token_id: Some(Uuid::nil()),
         };
-        match decide(Some(&existing), StdDuration::from_secs(60), now) {
+        match decide(Some(&existing), "ci", StdDuration::from_secs(60), now) {
             Decision::SkipFresh { age_secs } => assert_eq!(age_secs, 0.0),
             other => panic!("expected SkipFresh with clamped age=0, got {other:?}"),
         }
@@ -910,7 +1157,7 @@ mod tests {
             token_id: Some(Uuid::nil()),
         };
         assert_eq!(
-            decide(Some(&existing), StdDuration::from_secs(60), now),
+            decide(Some(&existing), "ci", StdDuration::from_secs(60), now),
             Decision::Rotate
         );
     }
@@ -1022,6 +1269,82 @@ mod tests {
         assert_eq!(tokens.inserted().len(), 0);
         // No events.
         assert!(events.appended_batches().is_empty());
+    }
+
+    // =====================================================================
+    // Collision gate — the target Secret belongs to another SA
+    // =====================================================================
+
+    #[tokio::test]
+    async fn run_skips_sa_whose_target_secret_belongs_to_another_sa() {
+        // Two ServiceAccounts configured with the SAME targetSecret —
+        // the configuration the apply gate now rejects, as it exists on
+        // an installation that applied before the gate shipped. Both see
+        // `managed_by = "hort-worker"` (the shared mock projects it, as
+        // the real writer does on every Secret it writes), so only the
+        // owner label separates them.
+        //
+        // The Secret is seeded fresh and owned by `ci-a`, which makes the
+        // assertion order-independent: `ci-a` skips on freshness, `ci-b`
+        // must collide rather than take the Secret over.
+        let writer = Arc::new(MockKubernetesSecretWriter::new());
+        let shared_name = "shared-secret";
+
+        let mut sa_a = sample_sa("ci-a");
+        if let Some(r) = sa_a.fallback_rotation.as_mut() {
+            r.target_secret_name = shared_name.into();
+        }
+        let mut sa_b = sample_sa("ci-b");
+        if let Some(r) = sa_b.fallback_rotation.as_mut() {
+            r.target_secret_name = shared_name.into();
+        }
+
+        let seeded_token_id = Uuid::new_v4();
+        writer.seed_existing(
+            "ci-system",
+            shared_name,
+            crate::use_cases::test_support::MockSecretState {
+                namespace: "ci-system".into(),
+                name: shared_name.into(),
+                format: SecretFormat::Dockerconfigjson,
+                token_id: seeded_token_id,
+                service_account_name: "ci-a".into(),
+                last_rotated: Utc::now(),
+                registry_host: registry_host(),
+            },
+        );
+
+        let sa_repo = Arc::new(MockServiceAccountRepository::new());
+        sa_repo.insert(sa_a);
+        sa_repo.insert(sa_b);
+
+        let (handler, _, tokens, events) =
+            make_handler(sa_repo, writer.clone(), ns_set(&["ci-system"]));
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["total"], 2);
+                assert_eq!(result_summary["collision"], 1, "ci-b must collide");
+                assert_eq!(result_summary["skipped_fresh"], 1, "ci-a is fresh");
+                assert_eq!(result_summary["rotated"], 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        // The crossing never happens: no write, no mint, no audit event,
+        // and the Secret still belongs to `ci-a` with its original token.
+        assert_eq!(writer.upsert_call_count(), 0);
+        assert_eq!(tokens.inserted().len(), 0);
+        assert!(events.appended_batches().is_empty());
+        let snapshot = writer.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].service_account_name, "ci-a");
+        assert_eq!(snapshot[0].token_id, seeded_token_id);
     }
 
     // =====================================================================
