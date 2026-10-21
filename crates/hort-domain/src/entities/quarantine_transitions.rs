@@ -261,7 +261,8 @@ pub fn classify(event: QuarantineEvent, state: QuarantineStatus) -> Cell {
             ScanIndeterminate => Allowed(&[ScanIndeterminate, Rejected]),
         },
         // Source-state guard only; the two stream-derived conjuncts
-        // (no `ArtifactRejected`, a `ProvenanceVerified`) are the
+        // (no `ArtifactRejected`, and provenance evidence that the
+        // rejection was never entitled to be terminal) are the
         // method's `required_triggers`, enforced in its body. Targets
         // `Quarantined` alone — never `Released`: the repair returns the
         // artifact to the hold and lets the ordinary release sweep make
@@ -502,9 +503,13 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
             "TerminalRejectionRecord::Absent — no ArtifactRejected anywhere on the \
              stream (ADR 0039's 2026-09-12 amendment, D6's illegal state); a Present \
              record is a genuine terminal rejection and is refused",
-            "ProvenanceClearance::Cleared — a ProvenanceVerified IS on the stream, so \
-             the stream contradicts the rejection the status records; Pending / \
-             NotRequired are refused",
+            "ProvenanceRejectionEvidence::{Contradicted, NeverTerminal} — the stream's \
+             provenance evidence establishes that this terminalisation was never valid: \
+             either a ProvenanceVerified contradicts the rejection, or the only \
+             provenance verdict on the stream is a ProvenanceRejected{Unsigned}, which \
+             is a statement about a point in time and may never be terminal (ADR 0039 \
+             D1). A positive disproof, and a stream with no provenance verdict at all, \
+             are refused",
         ],
     },
 ];

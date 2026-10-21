@@ -162,17 +162,31 @@ Before [ADR 0039](../../adr/0039-keyed-provenance-verification.md)'s
 signature had not yet reached hort when the verify ran was driven
 **terminal**: `quarantine_status = 'rejected'`, `rejection_reason` left
 NULL, and — because the provenance axis did not write one — **no
-`ArtifactRejected` event on its stream**. With cosign the signer must
+`ArtifactRejected` event on its stream**. That rejection recorded
+`reason = Unsigned`, which is a statement about *a point in time*, not
+about the artifact: ADR 0039 **D1** holds that such a verdict may never
+be terminal. Two shapes of artifact were left stranded by it.
+
+**The signature arrived moments later.** With cosign the signer must
 resolve the subject manifest before it can attach a signature to it, so
 the verdict running first is the *normal* ordering: the signature landed
 a moment later and a `ProvenanceVerified` was appended to the very same
-stream.
+stream. The artifact is condemned by a verdict its own stream
+contradicts.
 
-The artifact is therefore condemned by a verdict its own stream
-contradicts. The amendment stopped this happening (a missing signature
-now **holds** indefinitely instead of rejecting), but it did not move the
-artifacts already in that state — and **none of the ordinary exits
-reaches them**:
+**The signature can never arrive.** A descriptor that is itself *part of*
+a signature receives no signature of its own, ever — the
+`application/vnd.oci.empty.v1+json` config every cosign signature
+carries (the two-byte `{}`) is the canonical case. No contradicting
+event will ever appear on its stream, so the rejection is invalid on its
+own terms rather than by contradiction. This shape is the more damaging
+one in practice: the manifest mint refuses any signature manifest that
+binds a terminally-rejected descriptor, so a single stranded `{}` blob
+stops **every** signing pipeline pushing to that repository.
+
+The amendment stopped both happening (a missing signature now **holds**
+indefinitely instead of rejecting), but it did not move the artifacts
+already in that state — and **none of the ordinary exits reaches them**:
 
 - `POST /api/v1/admin/curation/quarantine/:id/reevaluate` answers
   `{"outcome":"still_rejected"}` and writes nothing. Its eligibility
@@ -240,12 +254,24 @@ It repairs an artifact only when **all three** hold:
    `ArtifactCorrupted` (the CAS integrity tombstone reaches `rejected`
    without writing an `ArtifactRejected`, so it needs naming separately);
    and
-3. a `ProvenanceVerified` **is** on its stream — without this, an
-   artifact that really was never signed would be released.
+3. its provenance evidence shows the rejection was **never entitled to
+   be terminal** — either of:
+   - a `ProvenanceVerified` **is** on its stream (the rejection is
+     contradicted outright); or
+   - the only provenance verdict on its stream is a `ProvenanceRejected`
+     whose reason is `Unsigned` — the verdict ADR 0039 D1 forbids from
+     ever being terminal, and the shape for which no contradiction can
+     ever arrive.
+
+   A **positive disproof** on the stream (a signature present and wrong,
+   any reason other than `Unsigned`) is terminal by design and refuses
+   here, including when an `Unsigned` rejection precedes it. So does a
+   stream carrying no provenance verdict at all: nothing there
+   establishes that the artifact was rejected on the provenance axis.
 
 So it leaves alone: an artifact rejected by a *positive disproof*
-(present-but-invalid signature — it carries both `ProvenanceRejected` and
-`ArtifactRejected`), a scan-rejected artifact, a curator- or
+(present-but-invalid signature — whether or not it carries the
+`ArtifactRejected` companion), a scan-rejected artifact, a curator- or
 admin-blocked one, an artifact tombstoned because its stored bytes do not
 match their content hash, a never-signed artifact still held
 `quarantined`, and anything already released.
@@ -257,10 +283,27 @@ observation-window anchor — restored, not restarted — and an
 `ArtifactReEvaluated` + `ArtifactQuarantined` pair is appended to its
 stream (the repair is recorded as events; the status is only the
 projection). The ordinary release sweep picks it up on its next tick and
-applies the live scan, curation and provenance gates. Because the
-`ProvenanceVerified` that made it repairable is the same event the
-release gate reads, the provenance conjunct clears and the artifact
-releases normally.
+applies the live scan, curation and provenance gates. **The repair never
+releases anything itself** — it hands the decision back to the sweep, and
+what the sweep then does depends on which arm matched:
+
+- **Contradicted by a `ProvenanceVerified`:** that is the same event the
+  release gate reads, so the provenance conjunct clears and the artifact
+  releases normally on the next tick.
+- **An `Unsigned` rejection with no verification:** the artifact
+  **holds** at `quarantined`. On a `provenanceMode: required` repository
+  the provenance gate reads `pending`, which denies release, and nothing
+  re-rejects it — that is ADR 0039 D1's prescribed treatment of an
+  unsigned artifact, and the hold is the correct resting state rather
+  than a failed repair. It leaves the hold the way D1 intends: its own
+  signature arriving and verifying, or — for a signature's own
+  constituents, which can never carry one — the parent manifest's
+  provenance-clearance cascade, which the terminal `rejected` status was
+  precisely what blocked.
+
+  **This is what unblocks the signing pipeline.** The descriptor no
+  longer being terminally rejected is all the manifest mint needs; it
+  refuses a *terminal* reference, not a held one.
 
 OCI tags pointing at a repaired manifest need no separate action: a tag
 resolves through the manifest, so it becomes servable when the manifest
