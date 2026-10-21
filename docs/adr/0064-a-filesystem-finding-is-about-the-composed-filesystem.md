@@ -439,10 +439,11 @@ reader of this decision knows what moved with it.
   its constituents are younger** — pre-existing, belongs to
   [0054](0054-content-level-age-evidence-anchors-quarantine.md), neither
   introduced nor worsened here (see *Consequences*).
-- **How large the composite actually is.** Measurement 3 below — cold
-  pull-through timing, whole-image size and entry counts, scan time, scratch
-  disk, worker concurrency — is open and needs a real image; the fixtures that
-  settled measurement 1 were synthetic and small.
+- **How large the composite actually is.** Measurement 3 below is now partly
+  taken against a real image (2026-10-21): acquisition dominates and is paid
+  once, the composed scan is the smaller half. Scratch-disk high-water and
+  worker concurrency stay open — they need the worker's metrics listener —
+  and no bounded *worst* case has been run.
 
 ## Alternatives considered
 
@@ -484,9 +485,43 @@ population it is pointed at.
    gzip failed the whole run rather than returning a short inventory.
 2. How many currently-rejected artifacts are layers condemned for a package
    their composition removes — the size of the false positive D2 retires.
-3. Cold proxy manifest-to-blob timing, missing-blob frequency, whole-image size
-   and entry counts, scan time, scratch disk and worker concurrency under
-   bounded worst cases.
+3. ~~Cold proxy manifest-to-blob timing, missing-blob frequency, whole-image
+   size and entry counts, scan time, scratch disk and worker concurrency under
+   bounded worst cases.~~ **Partly measured 2026-10-21 on the first real image
+   this unit has seen; two sub-measures remain open and one is deliberately
+   not attempted.**
+
+   A cold pull-through of `library/registry:2.8.3` — a 12-entry index whose
+   amd64 child carries 5 layers and a config — acquired **all six** absent
+   constituents (`fetched: 6`, `0 already present`, 10,121,684 bytes, which is
+   the exact sum of the five layer sizes plus the config). Missing-blob
+   frequency on a cold proxy manifest is therefore **total**, as the
+   acquisition module's own reasoning predicts: a pull-through manifest
+   nominates a complete composition not one constituent of which is present.
+
+   | | |
+   |---|---|
+   | ingest → terminal event | 20.776 s |
+   | — of which acquisition (upstream egress + scheduling) | 15.491 s |
+   | — of which the composed scan | **5.268 s** |
+   | layer sizes | 3,418,409 / 295,684 / 6,403,784 / 370 / 213 bytes |
+   | config | 3,224 bytes |
+
+   **Acquisition dominates, and it is paid once**: the bytes land in CAS and
+   the manifest's existing `oci_config` / `oci_layer` edges already claim them,
+   so the next attempt's survey finds them present. The scan itself is the
+   smaller half even on an image whose largest layer is 6 MB.
+
+   **Still open:** worker scratch-disk high-water mark and worker concurrency.
+   Neither has a log substitute, and both need the worker's metrics listener,
+   which is bound to `HORT_WORKER_METRICS_BIND` and off by default. Reported
+   missing rather than estimated.
+
+   **Not attempted:** the bounded *worst* case. This is one small real image,
+   so it settles the shape and the order of magnitude — acquisition-dominated,
+   paid once, scan time well under the fetch — and says nothing about a
+   hundred-layer multi-gigabyte image. The timings are one run on one
+   deployment and are indicative, not a budget.
 4. Blob-first-then-manifest, a layer shared across two compositions with
    different OS contexts, unsupported compression and media types, and a
    successful secondary backend alongside an incomplete composite.
