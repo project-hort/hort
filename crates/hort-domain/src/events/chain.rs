@@ -13,6 +13,19 @@
 //! offline by recomputing every hash. The genesis sentinel
 //! distinguishes "really position 0" from "field not yet written".
 //!
+//! **The attested object is the row.** Every field the hash binds is a
+//! column, taken in the form the row holds it — including the payload,
+//! which is the `event_data` value itself rather than a re-serialization
+//! of a typed [`DomainEvent`](super::DomainEvent) decoded from it. The
+//! two are not the same statement, and the difference is the whole
+//! integrity claim above: a re-derivation covers only what today's types
+//! can express, so a payload key matching no struct field would be
+//! dropped before the recomputation and the mutation would verify `Ok`,
+//! while a field added later with a bare `#[serde(default)]` would be
+//! *added* to the recomputation and report a mismatch on rows nobody
+//! touched. Hashing the stored bytes closes both. Key order is the one
+//! difference normalised away, because `jsonb` does not preserve it.
+//!
 //! Scope note: the checkpoint/anchor types
 //! ([`Checkpoint`], [`AnchorFindings`], [`verify_against_checkpoint`],
 //! [`ChainReport`], [`roll_up`]) are the pure verify core that the
@@ -28,7 +41,12 @@ use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
-use super::{DomainEvent, PersistedEvent};
+/// Golden canonical-byte vectors — frozen stored envelopes plus the
+/// `event_hash` computed over them, read from checked-in text. A
+/// submodule of `chain` so the measurement can read the real
+/// [`canonical_payload_bytes`] instead of a second opinion about it.
+#[cfg(test)]
+mod chain_vectors;
 
 // ---------------------------------------------------------------------------
 // Domain separation constants (frozen)
@@ -101,8 +119,8 @@ pub struct ActorCanonical<'a> {
 ///
 /// `stored_at` and `global_position` are deliberately absent — they
 /// are store-assigned/sequence-assigned and excluded from the hash by
-/// design. The typed `event` is what the
-/// payload is canonicalized from, never the stored JSONB text.
+/// design. Every other field is a column, carried in the exact form the
+/// row holds it: the hash is a function of the row and of nothing else.
 #[derive(Debug, Clone, Copy)]
 pub struct ChainInput<'a> {
     /// Predecessor `event_hash` (genesis sentinel for position 0).
@@ -120,9 +138,13 @@ pub struct ChainInput<'a> {
     pub event_type: &'a str,
     /// The `event_version` column (today always 1).
     pub event_version: u32,
-    /// The typed event — the payload is canonicalized from this, not
-    /// the stored JSONB.
-    pub event: &'a DomainEvent,
+    /// The `event_data` payload envelope — on the append path the very
+    /// value being written to the column, on the verify path the value
+    /// read back out of it. Canonicalized (object keys sorted) and
+    /// length-prefixed into field 8; never re-derived from a typed
+    /// event. [`stored_payload_envelope`](super::stored_payload_envelope)
+    /// is its single producer.
+    pub payload: &'a serde_json::Value,
     /// Correlation id (16 raw bytes).
     pub correlation_id: uuid::Uuid,
     /// Causation id (tag byte + optional 16 raw bytes).
@@ -152,86 +174,59 @@ fn put_opt<F: FnOnce(&mut Vec<u8>)>(buf: &mut Vec<u8>, present: bool, emit: F) {
     }
 }
 
-/// Canonical payload bytes: `serde_json::to_vec` of the
-/// typed `DomainEvent`, wrapped in the `{"type":…,"data":…}` envelope
-/// `serialize_event_data` uses, with object keys recursively sorted so
-/// the few `serde_json::Value` payload fields are deterministic. The
-/// hash input is a function of the *typed event*, recomputable offline
-/// by deserializing the stored JSONB back to `DomainEvent`.
+/// Canonical payload bytes: the stored `{"type":…,"data":…}` envelope
+/// with object keys recursively sorted, serialized.
 ///
-/// Infallible: it serializes an already-`validate()`d typed event;
-/// `serde_json` cannot fail on `DomainEvent` (no maps with non-string
-/// keys, no custom `Serialize` that errors). The append path therefore
-/// gains no new fallible step.
-fn canonical_payload_bytes(event: &DomainEvent) -> Vec<u8> {
-    // Mirror `mappers::serialize_event_data`'s reshape so the canonical
-    // form is a deterministic function of the typed event and matches
-    // what the verifier reconstructs from the row.
-    let raw = serde_json::to_value(event).expect("DomainEvent is always serializable");
-    // The stored envelope's `type` is `event_type()`; the serde
-    // externally-tagged key to strip is `serde_variant_key()`. They
-    // differ only for the `RetentionPolicyChanged` wrapper
-    // (identity for every other variant). Passing both keeps this a
-    // faithful mirror of `serialize_event_data`.
-    let envelope = reshape_to_envelope(event.event_type(), event.serde_variant_key(), raw);
-    let canonical = canonicalize_json(envelope);
+/// The hash input is a function of the **stored payload** — on the
+/// append path the exact value bound to the `event_data` column, on the
+/// verify path the exact value read back from it. Nothing is
+/// re-serialized through `DomainEvent`, so the attested object is the
+/// row: a payload key that matches no struct field is covered, and a row
+/// written before a field existed re-derives the bytes it was stored
+/// with rather than today's wider shape.
+///
+/// Key order is the one difference normalised away, because `jsonb` does
+/// not preserve it; everything else the column holds reaches the hash
+/// verbatim.
+///
+/// Infallible: a `serde_json::Value` is always serializable, so the
+/// append path gains no new fallible step.
+fn canonical_payload_bytes(payload: &serde_json::Value) -> Vec<u8> {
+    let canonical = canonicalize_json(payload);
     serde_json::to_vec(&canonical).expect("canonical JSON value is always serializable")
 }
 
-/// Reshape serde's externally-tagged enum form `{"VariantName":{fields}}`
-/// into the stored `{"type":…,"data":…}` envelope `serialize_event_data`
-/// writes. Factored out (taking the raw `Value`) so both the
-/// object-with-key path and the conservative non-object / missing-key
-/// fallback are directly unit-testable — `hort-domain` is the 100%
-/// coverage tier and the fallback must be exercised, not just asserted
-/// unreachable.
-fn reshape_to_envelope(
-    event_type: &str,
-    serde_key: &str,
-    raw: serde_json::Value,
-) -> serde_json::Value {
-    let payload = match raw {
-        serde_json::Value::Object(mut map) => {
-            // Missing-key arm: mirrors `serialize_event_data`'s
-            // `unwrap_or(Null)` — both fall back to `Null` when the
-            // externally-tagged key is absent. The key removed is the
-            // serde variant key (== `event_type` for every variant
-            // except the `RetentionPolicyChanged` wrapper, which has
-            // its own wrapper key) — NOT `event_type`, which is
-            // the discriminated stored-`type` string.
-            map.remove(serde_key).unwrap_or(serde_json::Value::Null)
-        }
-        // Non-object arm: mirrors `serialize_event_data`'s `other => other`
-        // pass-through. A non-object raw value would mean serde's
-        // externally-tagged enum representation changed unexpectedly.
-        // Passing it through unchanged keeps `reshape_to_envelope` a
-        // faithful mirror of `serialize_event_data` for all inputs —
-        // not only object inputs — so the tamper-evidence verifier
-        // and the append-side serializer always agree.
-        other => other,
-    };
-    serde_json::json!({ "type": event_type, "data": payload })
-}
-
 /// Recursively rewrite every object so its keys are emitted in
-/// lexicographic order (`serde_json::Map` with the default feature
-/// preserves insertion order, so we rebuild it sorted). Arrays keep
-/// element order (semantically significant); scalars pass through.
-fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+/// lexicographic order. Arrays keep element order (semantically
+/// significant); scalars pass through.
+///
+/// With the features this workspace resolves, `serde_json::Map` is a
+/// `BTreeMap` and already serialises sorted, so this is currently the
+/// identity on key order — and it stays here precisely because that is a
+/// *feature's* behaviour rather than a guarantee. Enabling
+/// `preserve_order` swaps the backing map for an `IndexMap`, at which
+/// point key order becomes insertion order and the canonical form of
+/// every payload would move; it is the same hazard class as
+/// `float_roundtrip` (see
+/// `hort-domain/tests/float_roundtrip_is_pinned.rs`), and this function
+/// is what makes the derivation immune to it rather than dependent on
+/// it. `jsonb` does not preserve key order anyway, so sorting is also
+/// the only honest reading of "the bytes the row holds".
+fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
-            let mut entries: Vec<(String, serde_json::Value)> = map.into_iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
             let mut out = serde_json::Map::new();
             for (k, v) in entries {
-                out.insert(k, canonicalize_json(v));
+                out.insert(k.clone(), canonicalize_json(v));
             }
             serde_json::Value::Object(out)
         }
         serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(canonicalize_json).collect())
+            serde_json::Value::Array(arr.iter().map(canonicalize_json).collect())
         }
-        scalar => scalar,
+        scalar => scalar.clone(),
     }
 }
 
@@ -257,7 +252,7 @@ pub fn canonical_event_bytes(input: &ChainInput<'_>) -> Vec<u8> {
     // 7: event_version (u32 BE).
     buf.extend_from_slice(&input.event_version.to_be_bytes());
     // 8: payload (len-prefixed canonical bytes).
-    let payload = canonical_payload_bytes(input.event);
+    let payload = canonical_payload_bytes(input.payload);
     put_lp(&mut buf, &payload);
     // 9: correlation_id (16 raw bytes).
     buf.extend_from_slice(input.correlation_id.as_bytes());
@@ -323,7 +318,7 @@ pub fn compute_event_hash(input: &ChainInput<'_>) -> EventHash {
 /// being checked against the recomputation.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamRow<'a> {
-    /// The recompute inputs (typed event + envelope columns).
+    /// The recompute inputs (the stored payload + the envelope columns).
     pub input: ChainInput<'a>,
     /// `prev_event_hash` as stored in the row.
     pub stored_prev: EventHash,
@@ -347,11 +342,22 @@ impl<'a> StreamRows<'a> {
 }
 
 /// One stored event row, **owned**, carrying everything the pure
-/// verifier core needs: the deserialized [`PersistedEvent`] (typed
-/// event plus envelope columns), the four persisted actor columns in
-/// their exact stored string form (the canonical hash must bind the
-/// bytes as stored, never a re-serialization of the typed
-/// [`super::Actor`]), and the two stored chain hashes.
+/// verifier core needs — and nothing else: the `event_data` payload
+/// verbatim, the envelope columns the hash binds, the four persisted
+/// actor columns in their exact stored string form, and the two stored
+/// chain hashes.
+///
+/// **No typed event.** Verification recomputes the hash from the stored
+/// payload, so it never needs to know whether today's `DomainEvent` can
+/// still decode that payload. That matters for the control's
+/// availability, not just its tidiness: while this row carried a
+/// deserialized `PersistedEvent`, a payload the current types could no
+/// longer read — a field later made required, a renamed variant — failed
+/// the read with an operational error *before* the verifier reached the
+/// hash, so the one tool that could prove the row was intact refused to
+/// run on it. The columns it used to supply through the typed event
+/// (`event_type`, the positions, `event_version`, correlation/causation)
+/// are columns the reader already selects.
 ///
 /// Owned because it crosses the [`EventChainReaderPort`] boundary from
 /// the adapter (the borrowing [`StreamRow`]/[`ChainInput`] cannot). The
@@ -365,13 +371,26 @@ impl<'a> StreamRows<'a> {
 /// [`EventChainReaderPort`]: crate::ports::event_chain_reader::EventChainReaderPort
 #[derive(Debug, Clone)]
 pub struct ChainRow {
-    /// The deserialized event + envelope (`event_id`, positions,
-    /// `event_version`, correlation/causation, typed `event`).
-    pub persisted: PersistedEvent,
+    /// The `event_data` JSONB column, verbatim — the object the hash
+    /// attests.
+    pub event_data: serde_json::Value,
+    /// `event_id` column.
+    pub event_id: uuid::Uuid,
     /// `stream_id` text column, exactly as persisted.
     pub stream_id: String,
     /// `stream_category` text column.
     pub stream_category: String,
+    /// `stream_position` column (0-based, per stream).
+    pub stream_position: u64,
+    /// `event_type` text column — the stored discriminator, not a
+    /// re-derivation of it from a decoded event.
+    pub event_type: String,
+    /// `event_version` column.
+    pub event_version: u32,
+    /// `correlation_id` column.
+    pub correlation_id: uuid::Uuid,
+    /// `causation_id` column.
+    pub causation_id: Option<uuid::Uuid>,
     /// `actor_type` text column.
     pub actor_type: String,
     /// `actor_id` column (`Some` only for `actor_type = "api"`).
@@ -393,15 +412,15 @@ impl ChainRow {
         StreamRow {
             input: ChainInput {
                 prev_event_hash: self.stored_prev,
-                event_id: self.persisted.event_id,
+                event_id: self.event_id,
                 stream_id: &self.stream_id,
                 stream_category: &self.stream_category,
-                stream_position: self.persisted.stream_position,
-                event_type: self.persisted.event.event_type(),
-                event_version: self.persisted.event_version,
-                event: &self.persisted.event,
-                correlation_id: self.persisted.correlation_id,
-                causation_id: self.persisted.causation_id,
+                stream_position: self.stream_position,
+                event_type: &self.event_type,
+                event_version: self.event_version,
+                payload: &self.event_data,
+                correlation_id: self.correlation_id,
+                causation_id: self.causation_id,
                 actor: ActorCanonical {
                     actor_type: &self.actor_type,
                     actor_id: self.actor_id,
@@ -927,10 +946,17 @@ mod tests {
         })
     }
 
+    /// The stored payload envelope for [`sample_event`] — the value the
+    /// `event_data` column holds, produced by the single producer the
+    /// append path uses.
+    fn sample_payload(n: u32) -> serde_json::Value {
+        crate::events::stored_payload_envelope(&sample_event(n))
+    }
+
     fn input<'a>(
         prev: EventHash,
         position: u64,
-        event: &'a DomainEvent,
+        payload: &'a serde_json::Value,
         stream_id: &'a str,
     ) -> ChainInput<'a> {
         ChainInput {
@@ -939,9 +965,15 @@ mod tests {
             stream_id,
             stream_category: "artifact",
             stream_position: position,
-            event_type: event.event_type(),
+            // The stored `event_type` column and the envelope's `type`
+            // key are written from the same `event_type()` on the append
+            // path, so reading it back off the envelope here keeps the
+            // helper to one input.
+            event_type: payload["type"]
+                .as_str()
+                .expect("a stored envelope carries a `type` string"),
             event_version: 1,
-            event,
+            payload,
             correlation_id: Uuid::from_u128(0xC0FFEE),
             causation_id: None,
             actor: ActorCanonical {
@@ -954,16 +986,16 @@ mod tests {
     }
 
     /// Build a valid chained stream of `n` events; returns the owned
-    /// events + the row views (rows borrow the events).
-    fn valid_stream(n: u64) -> (Vec<DomainEvent>, String) {
-        let events: Vec<DomainEvent> = (0..n).map(|i| sample_event(i as u32)).collect();
-        (events, "artifact-deadbeef".to_string())
+    /// stored payloads + the stream id (the row views borrow both).
+    fn valid_stream(n: u64) -> (Vec<serde_json::Value>, String) {
+        let payloads: Vec<serde_json::Value> = (0..n).map(|i| sample_payload(i as u32)).collect();
+        (payloads, "artifact-deadbeef".to_string())
     }
 
-    fn build_rows<'a>(events: &'a [DomainEvent], stream_id: &'a str) -> Vec<StreamRow<'a>> {
+    fn build_rows<'a>(payloads: &'a [serde_json::Value], stream_id: &'a str) -> Vec<StreamRow<'a>> {
         let mut rows = Vec::new();
         let mut prev = genesis_hash();
-        for (i, e) in events.iter().enumerate() {
+        for (i, e) in payloads.iter().enumerate() {
             let inp = input(prev, i as u64, e, stream_id);
             let h = compute_event_hash(&inp);
             rows.push(StreamRow {
@@ -1007,7 +1039,7 @@ mod tests {
 
     #[test]
     fn canonical_bytes_are_deterministic_and_domain_separated() {
-        let e = sample_event(1);
+        let e = sample_payload(1);
         let i = input(genesis_hash(), 0, &e, "artifact-x");
         let a = canonical_event_bytes(&i);
         let b = canonical_event_bytes(&i);
@@ -1019,7 +1051,7 @@ mod tests {
 
     #[test]
     fn changing_any_bound_field_changes_the_hash() {
-        let e = sample_event(1);
+        let e = sample_payload(1);
         let base = compute_event_hash(&input(genesis_hash(), 0, &e, "artifact-x"));
 
         // Different position.
@@ -1038,31 +1070,62 @@ mod tests {
             compute_event_hash(&input(EventHash([9u8; 32]), 0, &e, "artifact-x"))
         );
         // Different payload.
-        let e2 = sample_event(2);
+        let e2 = sample_payload(2);
         assert_ne!(
             base,
             compute_event_hash(&input(genesis_hash(), 0, &e2, "artifact-x"))
         );
     }
 
+    /// Key order is the one difference the canonicalisation removes —
+    /// which it must, because `jsonb` does not preserve insertion order,
+    /// so the order the writer happened to emit is not a property of the
+    /// row.
     #[test]
     fn payload_canonicalization_sorts_object_keys_recursively() {
-        // PolicyUpdated carries serde_json::Value fields; build two
-        // logically-equal values whose key insertion order differs and
-        // assert the canonical bytes match.
-        use crate::events::{PolicyField, PolicyUpdated};
-        let mk = |v: serde_json::Value| {
-            DomainEvent::PolicyUpdated(PolicyUpdated {
-                policy_id: Uuid::nil(),
-                field: PolicyField::Name,
-                previous_value: v.clone(),
-                new_value: v,
-            })
-        };
-        // Object key order must not affect the canonical payload.
-        let a = mk(serde_json::json!({"b": 1, "a": {"d": 4, "c": 3}}));
-        let b = mk(serde_json::json!({"a": {"c": 3, "d": 4}, "b": 1}));
+        // Two logically-equal stored envelopes whose key insertion order
+        // differs at every level, including inside the payload's own
+        // `serde_json::Value` fields.
+        let a = serde_json::json!({
+            "type": "PolicyUpdated",
+            "data": {"new_value": {"b": 1, "a": {"d": 4, "c": 3}}, "field": "Name"}
+        });
+        let b = serde_json::json!({
+            "data": {"field": "Name", "new_value": {"a": {"c": 3, "d": 4}, "b": 1}},
+            "type": "PolicyUpdated"
+        });
         assert_eq!(canonical_payload_bytes(&a), canonical_payload_bytes(&b));
+        // And it is only key order: a different *value* still moves the
+        // bytes, so the sort is not flattening the payload.
+        let c = serde_json::json!({
+            "type": "PolicyUpdated",
+            "data": {"new_value": {"b": 2, "a": {"d": 4, "c": 3}}, "field": "Name"}
+        });
+        assert_ne!(canonical_payload_bytes(&a), canonical_payload_bytes(&c));
+    }
+
+    /// A stored payload key that matches no `DomainEvent` field reaches
+    /// the hash. This is the property the re-derivation could not have:
+    /// decoding the payload into a typed event dropped such a key, so
+    /// the recomputation reproduced the untampered bytes and an added
+    /// key verified `Ok`.
+    #[test]
+    fn a_payload_key_matching_no_struct_field_changes_the_hash() {
+        let clean = sample_payload(1);
+        let mut injected = clean.clone();
+        injected["data"]["injected_key_matching_no_struct_field"] = serde_json::json!("tampered");
+        assert_ne!(
+            canonical_payload_bytes(&clean),
+            canonical_payload_bytes(&injected),
+            "an added payload key must be covered by the hash"
+        );
+        // The same statement at the hash level, through the production
+        // entry point rather than the payload helper.
+        let sid = "artifact-x";
+        assert_ne!(
+            compute_event_hash(&input(genesis_hash(), 0, &clean, sid)),
+            compute_event_hash(&input(genesis_hash(), 0, &injected, sid))
+        );
     }
 
     #[test]
@@ -1074,7 +1137,7 @@ mod tests {
             "z": [ {"b": 1, "a": 2}, {"d": 4, "c": 3} ],
             "a": "scalar"
         });
-        let c = canonicalize_json(v);
+        let c = canonicalize_json(&v);
         // Serialized form has keys in sorted order at every level and
         // array element order preserved.
         assert_eq!(
@@ -1083,133 +1146,40 @@ mod tests {
         );
     }
 
+    /// Array element order is semantically significant and must survive
+    /// the canonicalisation untouched — unlike object key order.
+    /// `PermissionGrantApplied`'s `subject` (Claims) carries a
+    /// `Vec<String>`, so this exercises the Array arm through a real
+    /// event's stored envelope.
     #[test]
-    fn reshape_to_envelope_object_with_key() {
-        // Pre-B6 variant: serde_key == event_type.
-        let raw = serde_json::json!({ "ArtifactIngested": {"x": 1} });
-        assert_eq!(
-            reshape_to_envelope("ArtifactIngested", "ArtifactIngested", raw),
-            serde_json::json!({ "type": "ArtifactIngested", "data": {"x": 1} })
-        );
-    }
-
-    /// The `RetentionPolicyChanged` wrapper is the one
-    /// variant where the stored `type` (discriminated) differs from
-    /// the serde key. `reshape_to_envelope` must strip the serde key
-    /// but stamp the discriminated `type` — exactly what
-    /// `serialize_event_data` does.
-    #[test]
-    fn reshape_to_envelope_b6_wrapper_strips_serde_key_keeps_discriminated_type() {
-        let raw = serde_json::json!({ "RetentionPolicyChanged": {"Created": {"id": "x"}} });
-        assert_eq!(
-            reshape_to_envelope("RetentionPolicyCreated", "RetentionPolicyChanged", raw),
-            serde_json::json!({
-                "type": "RetentionPolicyCreated",
-                "data": {"Created": {"id": "x"}}
-            })
-        );
-    }
-
-    #[test]
-    fn reshape_to_envelope_object_missing_key_falls_back_to_null() {
-        // Object that does not contain the serde key -> Null data.
-        let raw = serde_json::json!({ "SomethingElse": {"x": 1} });
-        assert_eq!(
-            reshape_to_envelope("ArtifactIngested", "ArtifactIngested", raw),
-            serde_json::json!({ "type": "ArtifactIngested", "data": serde_json::Value::Null })
-        );
-    }
-
-    #[test]
-    fn reshape_to_envelope_non_object_passes_through_unchanged() {
-        // A non-object raw value (serde enum repr changed) -> the value
-        // is passed through as the payload, mirroring `serialize_event_data`'s
-        // `other => other` arm. Previously this asserted `Null`; the correct
-        // behavior is pass-through so the verifier and serializer agree.
-        let raw = serde_json::Value::String("unexpected".into());
-        assert_eq!(
-            reshape_to_envelope("ArtifactIngested", "ArtifactIngested", raw.clone()),
-            serde_json::json!({ "type": "ArtifactIngested", "data": "unexpected" })
-        );
-
-        // Also exercise a non-object array input to confirm the arm is
-        // truly a pass-through for any non-Object variant.
-        let arr = serde_json::Value::Array(vec![serde_json::Value::Bool(true)]);
-        assert_eq!(
-            reshape_to_envelope("ArtifactIngested", "ArtifactIngested", arr.clone()),
-            serde_json::json!({ "type": "ArtifactIngested", "data": arr })
-        );
-    }
-
-    /// Parity test: `reshape_to_envelope`'s non-object arm must produce
-    /// the same payload as `serialize_event_data`'s `other => other` arm.
-    ///
-    /// `serialize_event_data` (mappers.rs ~439-444):
-    /// ```text
-    /// let payload = match data {
-    ///     serde_json::Value::Object(mut map) => { map.remove(event_type).unwrap_or(Null) }
-    ///     other => other,   // <-- non-object arm: pass through unchanged
-    /// };
-    /// ```
-    /// This test constructs the same non-object value, runs both code
-    /// paths in-line, and asserts they produce identical output — pinning
-    /// the parity so a future regression in either arm fails CI.
-    #[test]
-    fn reshape_to_envelope_non_object_parity_with_serialize_event_data() {
-        for non_object in [
-            serde_json::Value::String("str-value".into()),
-            serde_json::Value::Number(serde_json::Number::from(42)),
-            serde_json::Value::Bool(false),
-            serde_json::Value::Array(vec![serde_json::json!(1), serde_json::json!(2)]),
-            serde_json::Value::Null,
-        ] {
-            let event_type = "ArtifactIngested";
-
-            // serialize_event_data non-object arm: `other => other`
-            let serializer_payload = match non_object.clone() {
-                serde_json::Value::Object(mut map) => {
-                    map.remove(event_type).unwrap_or(serde_json::Value::Null)
-                }
-                other => other,
-            };
-
-            // reshape_to_envelope result (pre-B6: serde_key == event_type)
-            let envelope = reshape_to_envelope(event_type, event_type, non_object);
-            let reshaper_payload = envelope
-                .get("data")
-                .expect("reshape_to_envelope always produces 'data' field")
-                .clone();
-
-            assert_eq!(
-                reshaper_payload, serializer_payload,
-                "non-object parity failed for input type {reshaper_payload:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn payload_with_array_field_canonicalizes_stably() {
-        // PermissionGrantApplied's `subject` (Claims) carries a
-        // Vec<String> -> a JSON array in the payload, exercising the
-        // Array arm through the real path.
+    fn payload_with_array_field_keeps_element_order() {
         use crate::entities::rbac::Permission;
         use crate::events::{GrantSubjectRecord, PermissionGrantApplied};
-        let e = DomainEvent::PermissionGrantApplied(PermissionGrantApplied {
-            grant_id: Uuid::nil(),
-            subject: GrantSubjectRecord::Claims {
-                required: vec!["developer".into(), "team-alpha".into()],
-            },
-            permission: Permission::Read,
-            repository_id: None,
-        });
-        assert_eq!(canonical_payload_bytes(&e), canonical_payload_bytes(&e));
+        let mk = |required: Vec<String>| {
+            crate::events::stored_payload_envelope(&DomainEvent::PermissionGrantApplied(
+                PermissionGrantApplied {
+                    grant_id: Uuid::nil(),
+                    subject: GrantSubjectRecord::Claims { required },
+                    permission: Permission::Read,
+                    repository_id: None,
+                },
+            ))
+        };
+        let a = mk(vec!["developer".into(), "team-alpha".into()]);
+        let reversed = mk(vec!["team-alpha".into(), "developer".into()]);
+        assert_eq!(canonical_payload_bytes(&a), canonical_payload_bytes(&a));
+        assert_ne!(
+            canonical_payload_bytes(&a),
+            canonical_payload_bytes(&reversed),
+            "array order is part of the payload and must reach the hash"
+        );
     }
 
     #[test]
     fn canonical_encoding_covers_some_optional_and_gitops_actor() {
         // Exercise the Some-branches of causation_id and the gitops
         // actor (actor_id None, source_file + spec_digest Some).
-        let e = sample_event(3);
+        let e = sample_payload(3);
         let digest = [0xab_u8; 32];
         let i = ChainInput {
             prev_event_hash: genesis_hash(),
@@ -1217,9 +1187,9 @@ mod tests {
             stream_id: "artifact-z",
             stream_category: "artifact",
             stream_position: 0,
-            event_type: e.event_type(),
+            event_type: "ArtifactIngested",
             event_version: 2,
-            event: &e,
+            payload: &e,
             correlation_id: Uuid::from_u128(1),
             causation_id: Some(Uuid::from_u128(2)),
             actor: ActorCanonical {
@@ -1272,37 +1242,24 @@ mod tests {
 
     // ---- ChainRow::as_stream_row ---------------------------------------
 
+    /// A `ChainRow` built from stored columns maps into a view that
+    /// verifies. A wrong field mapping in `as_stream_row` would shift the
+    /// canonical bytes and break verification, so `Ok` exercises the
+    /// mapping end-to-end rather than field-copy equality.
     #[test]
     fn chain_row_as_stream_row_round_trips_into_a_verifiable_view() {
-        use crate::events::{Actor, ApiActor, PersistedEvent, StreamId};
         let user_id = Uuid::from_u128(0xA9);
-        let persisted = PersistedEvent {
-            event_id: Uuid::from_u128(0xE0),
-            stream_id: StreamId::artifact(Uuid::from_u128(1)),
-            stream_position: 0,
-            global_position: 0,
-            event: sample_event(1),
-            correlation_id: Uuid::from_u128(0xC0FFEE),
-            causation_id: None,
-            actor: Actor::Api(ApiActor { user_id }),
-            event_version: 1,
-            stored_at: Utc::now(),
-        };
-        // Compute the genuine hash for these inputs, store it, then check
-        // that the mapped view verifies as a valid single-row chain. A
-        // wrong field mapping in `as_stream_row` would shift the canonical
-        // bytes and break verification — so `Ok` exercises the mapping
-        // end-to-end, not just field-copy equality.
+        let event_data = sample_payload(1);
         let probe = ChainInput {
             prev_event_hash: genesis_hash(),
-            event_id: persisted.event_id,
+            event_id: Uuid::from_u128(0xE0),
             stream_id: "artifact-x",
             stream_category: "artifact",
             stream_position: 0,
-            event_type: persisted.event.event_type(),
+            event_type: "ArtifactIngested",
             event_version: 1,
-            event: &persisted.event,
-            correlation_id: persisted.correlation_id,
+            payload: &event_data,
+            correlation_id: Uuid::from_u128(0xC0FFEE),
             causation_id: None,
             actor: ActorCanonical {
                 actor_type: "api",
@@ -1313,9 +1270,15 @@ mod tests {
         };
         let stored_hash = compute_event_hash(&probe);
         let row = ChainRow {
-            persisted,
+            event_data: event_data.clone(),
+            event_id: Uuid::from_u128(0xE0),
             stream_id: "artifact-x".to_string(),
             stream_category: "artifact".to_string(),
+            stream_position: 0,
+            event_type: "ArtifactIngested".to_string(),
+            event_version: 1,
+            correlation_id: Uuid::from_u128(0xC0FFEE),
+            causation_id: None,
             actor_type: "api".to_string(),
             actor_id: Some(user_id),
             actor_source_file: None,
@@ -1324,9 +1287,11 @@ mod tests {
             stored_hash,
         };
         let view = row.as_stream_row();
-        assert_eq!(view.input.event_id, row.persisted.event_id);
+        assert_eq!(view.input.event_id, Uuid::from_u128(0xE0));
         assert_eq!(view.input.stream_id, "artifact-x");
         assert_eq!(view.input.stream_position, 0);
+        assert_eq!(view.input.event_type, "ArtifactIngested");
+        assert_eq!(view.input.payload, &event_data);
         assert_eq!(view.input.actor.actor_type, "api");
         assert_eq!(view.input.actor.actor_id, Some(user_id));
         assert_eq!(view.stored_prev, genesis_hash());
@@ -1336,6 +1301,20 @@ mod tests {
             StreamVerdict::Ok {
                 head: stored_hash,
                 position: 0
+            }
+        );
+
+        // The mapping is not vacuous: a mutated payload in the same row
+        // breaks the recomputation. `event_data` is the only field the
+        // row carries that the typed-event version did not expose
+        // directly, so this is the assertion the decoupling added.
+        let mut tampered = row.clone();
+        tampered.event_data["data"]["name"] = serde_json::json!("rewritten");
+        assert_eq!(
+            verify_stream_chain(&StreamRows::new(&[tampered.as_stream_row()])),
+            StreamVerdict::Broken {
+                at_position: 0,
+                reason: ChainBreak::HashMismatch
             }
         );
     }
@@ -1348,8 +1327,8 @@ mod tests {
         let mut rows = build_rows(&events, &sid);
         // Swap the typed event at position 1 for a different one while
         // leaving the stored hash untouched — a field mutation.
-        let tampered = sample_event(99);
-        rows[1].input.event = &tampered;
+        let tampered = sample_payload(99);
+        rows[1].input.payload = &tampered;
         assert_eq!(
             verify_stream_chain(&StreamRows::new(&rows)),
             StreamVerdict::Broken {
@@ -2023,112 +2002,82 @@ mod tests {
         assert_eq!(roll_up(&v, &AnchorFindings::default()), ChainReport::Ok);
     }
 
-    // ---- Determinism: full-64-variant canonical round-trip ----
+    // ---- Determinism: the stored envelope round-trips ----
 
-    /// Canonical-bytes determinism binding test.
+    /// Every `DomainEvent` variant's stored envelope is a fixed point of
+    /// store-then-rehydrate: decoding the envelope back to a typed event
+    /// and re-producing it yields the same canonical bytes.
     ///
-    /// Requirement: `canonical_payload_bytes(deserialize(serialize(e))) ==
-    /// canonical_payload_bytes(e)` for every `DomainEvent` variant — the
-    /// round-trip property test mandated by the spec's "determinism
-    /// requirement" paragraph.
+    /// **What this is, after the chain started hashing the stored
+    /// payload.** It is no longer the chain's premise — verification
+    /// recomputes from the column and never re-serialises a typed event,
+    /// so a round-trip failure can no longer make an untouched row read
+    /// as tampered. What it still pins is the *write* path's
+    /// determinism: the same fact, stored and rehydrated, stores
+    /// identically. That is what makes two appends of one fact
+    /// comparable, and what a replay or a re-emit depends on. A failure
+    /// here is a genuine payload-identity bug (a `serde(default)` /
+    /// `skip_serializing_if` / untagged field that does not survive its
+    /// own decode) — do NOT paper over it.
     ///
-    /// The serialize→deserialize path mirrors exactly what the production
-    /// verifier does:
-    ///   - `serialize_event_data` (`mappers.rs:434-451`): serde-serialize
-    ///     the typed event into the stored `{"type":…,"data":…}` envelope.
-    ///   - `deserialize_event_data` (`mappers.rs:452-464`): reconstruct the
-    ///     typed `DomainEvent` from the stored envelope.
-    ///
-    /// The test is in `hort-domain/chain.rs` (the 100%-coverage pure-domain
-    /// tier) because `canonical_payload_bytes` is a private function here
-    /// and the serialize/deserialize round-trip is purely serde — it needs
-    /// no DB, no adapter dependency. The full canonical-variant vector is
-    /// provided by the `pub(crate) fn all_test_variants()` accessor added
-    /// to `domain_event::tests` (a minimal additive `#[cfg(test)]`
-    /// accessor — no production-signature change).
-    ///
-    /// If any variant fails, the test panics loudly identifying the variant
-    /// name and the hex diff of the two byte slices. A failure here is a
-    /// a genuine tamper-evidence bug (a `serde(default)`/`skip_serializing_if`/untagged
-    /// field that breaks payload identity) — do NOT paper over it.
+    /// The producer under test is the real one,
+    /// [`stored_payload_envelope`](super::stored_payload_envelope), which
+    /// `hort-adapters-postgres::mappers::serialize_event_data` delegates
+    /// to — not an inline copy of it. The decode mirrors
+    /// `mappers::deserialize_event_data`: re-tag `data` with the serde
+    /// variant key the stored `type` maps to, then deserialize. (The
+    /// decode cannot be shared, since it lives in the adapter and this is
+    /// `hort-domain`; it is three lines and the two keys it uses —
+    /// `serde_variant_key()` and `serde_key_for_event_type()` — are
+    /// `hort-domain`'s own.)
     #[test]
-    fn canonical_payload_bytes_round_trip_all_variants() {
-        // Import the canonical variant vector from domain_event::tests.
-        // `super` = `events` module (chain is a submodule of events).
-        // Access via the full crate path; `domain_event` is a private
-        // submodule of `events` but is reachable from within the same crate.
+    fn stored_envelope_is_a_fixed_point_of_store_then_rehydrate() {
         use crate::events::domain_event::tests::all_test_variants;
+        use crate::events::stored_payload_envelope;
         let variants = all_test_variants();
 
-        // The round-trip replicates `serialize_event_data` +
-        // `deserialize_event_data` from `hort-adapters-postgres/src/mappers.rs`
-        // without importing the adapter crate. The logic is identical: serde
-        // serializes the enum as `{"VariantName": {fields}}`, we reshape to
-        // `{"type": event_type, "data": {fields}}`, then deserialize back.
         let mut exercised: usize = 0;
         for original in &variants {
             let event_type = original.event_type();
-            // The serde externally-tagged key (== event_type
-            // for every variant except the `RetentionPolicyChanged`
-            // wrapper, which has its own wrapper key). The persistence path uses
-            // `serde_variant_key()` for the serialize `map.remove` and
-            // `serde_key_for_event_type()` for the deserialize re-tag;
-            // this mirror must do the same or the wrapper round-trip
-            // (correctly) regresses.
-            let serde_key = original.serde_variant_key();
+            let envelope = stored_payload_envelope(original);
 
-            // --- serialize (mirrors serialize_event_data) ---
-            let serde_value =
-                serde_json::to_value(original).expect("DomainEvent must be serializable");
-            let payload = match serde_value {
-                serde_json::Value::Object(mut map) => {
-                    map.remove(serde_key).unwrap_or(serde_json::Value::Null)
-                }
-                other => other,
-            };
-            let envelope = serde_json::json!({ "type": event_type, "data": payload });
-
-            // --- deserialize (mirrors deserialize_event_data) ---
+            // --- decode (mirrors deserialize_event_data) ---
             let data = envelope
                 .get("data")
-                .expect("envelope always has 'data' field");
+                .expect("the stored envelope always has a 'data' field");
             let deser_key = DomainEvent::serde_key_for_event_type(event_type);
-            let serde_enum = serde_json::json!({ deser_key: data });
-            let deserialized =
-                serde_json::from_value::<DomainEvent>(serde_enum).unwrap_or_else(|e| {
-                    panic!(
-                        "variant {event_type}: deserialize failed after serialize round-trip: {e}"
-                    )
-                });
+            let rehydrated =
+                serde_json::from_value::<DomainEvent>(serde_json::json!({ deser_key: data }))
+                    .unwrap_or_else(|e| {
+                        panic!("variant {event_type}: the stored envelope does not decode: {e}")
+                    });
 
-            // --- compare canonical payload bytes ---
-            let original_bytes = canonical_payload_bytes(original);
-            let roundtrip_bytes = canonical_payload_bytes(&deserialized);
-            if original_bytes != roundtrip_bytes {
+            let stored_bytes = canonical_payload_bytes(&envelope);
+            let rehydrated_bytes = canonical_payload_bytes(&stored_payload_envelope(&rehydrated));
+            if stored_bytes != rehydrated_bytes {
                 panic!(
-                    "canonical round-trip FAILED for variant `{event_type}`:\n  \
-                     original  ({} bytes): {}\n  \
-                     roundtrip ({} bytes): {}",
-                    original_bytes.len(),
-                    hex::encode(&original_bytes),
-                    roundtrip_bytes.len(),
-                    hex::encode(&roundtrip_bytes),
+                    "stored-envelope round trip FAILED for variant `{event_type}`:\n  \
+                     stored     ({} bytes): {}\n  \
+                     rehydrated ({} bytes): {}",
+                    stored_bytes.len(),
+                    hex::encode(&stored_bytes),
+                    rehydrated_bytes.len(),
+                    hex::encode(&rehydrated_bytes),
                 );
             }
 
             exercised += 1;
         }
 
-        // Explicitly assert the count so a future silent truncation of the
-        // variant vector is caught here rather than appearing as a green
-        // test. The count is the number of constructed `DomainEvent`
-        // instances in `domain_event::tests::all_test_variants()` — it
-        // shifts whenever a `DomainEvent` variant (or an
-        // inner-discrimination instance like the four
-        // `RetentionPolicyChanged` ones) is added or removed.
-        // The round-trip itself (the determinism property) must
-        // still pass for every one of them; only this anti-silent-
-        // truncation tripwire is rebased.
+        // Explicitly assert the count so a future silent truncation of
+        // the variant vector is caught here rather than appearing as a
+        // green test. The count is the number of constructed
+        // `DomainEvent` instances in
+        // `domain_event::tests::all_test_variants()` — it shifts whenever
+        // a `DomainEvent` variant (or an inner-discrimination instance
+        // like the four `RetentionPolicyChanged` ones) is added or
+        // removed. The round trip itself must still pass for every one of
+        // them; only this anti-silent-truncation tripwire is rebased.
         assert_eq!(
             exercised, 71,
             "expected all 71 DomainEvent test instances to be exercised, got {exercised}"

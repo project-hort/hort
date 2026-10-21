@@ -31,6 +31,7 @@ mod policy_events;
 mod ref_events;
 mod retention_events;
 mod service_account_events;
+mod stored_envelope;
 mod subscription_events;
 mod validation;
 
@@ -53,6 +54,7 @@ pub use policy_events::*;
 pub use ref_events::*;
 pub use retention_events::*;
 pub use service_account_events::*;
+pub use stored_envelope::*;
 pub use subscription_events::*;
 
 // ---------------------------------------------------------------------------

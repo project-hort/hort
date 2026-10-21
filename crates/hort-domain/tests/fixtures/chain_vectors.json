@@ -1,0 +1,2666 @@
+[
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000000000",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000000",
+      "event_id": "e0000000-0000-0000-0000-000000000000",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000000",
+      "stream_position": 0
+    },
+    "event_hash": "ab40e70d5ae8e5c9b9aa38fa7ba3b045ac6db13c4b0cb13a6519727ef67fbe04",
+    "event_type": "ArtifactIngested",
+    "name": "ArtifactIngested",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "metadata": null,
+        "metadata_blob": null,
+        "name": "pkg",
+        "repository_id": "00000000-0000-0000-0000-000000000000",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 1,
+        "source": "Direct",
+        "upstream_published_at": null,
+        "version": "1.0"
+      },
+      "type": "ArtifactIngested"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000002710",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000002710",
+      "event_id": "e0000000-0000-0000-0000-000000002710",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000002710",
+      "stream_position": 0
+    },
+    "event_hash": "6e3699f33140c6c764aba58af3c26ffd1c050206ef6f79990cbac18fecf5ace5",
+    "event_type": "ArtifactIngested",
+    "name": "ArtifactIngested@pre-metadata",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "metadata_blob": null,
+        "name": "pkg",
+        "repository_id": "00000000-0000-0000-0000-000000000000",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 1,
+        "source": "Direct",
+        "upstream_published_at": null,
+        "version": "1.0"
+      },
+      "type": "ArtifactIngested"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": "ca000000-0000-0000-0000-000000002711",
+      "correlation_id": "c0000000-0000-0000-0000-000000002711",
+      "event_id": "e0000000-0000-0000-0000-000000002711",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000002711",
+      "stream_position": 0
+    },
+    "event_hash": "28bfed122d158efb801595ee29cb099c1468f01be5f975b96adf56b5eac1f2e9",
+    "event_type": "ArtifactIngested",
+    "name": "ArtifactIngested@pre-metadata-blob",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "metadata": null,
+        "name": "pkg",
+        "repository_id": "00000000-0000-0000-0000-000000000000",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 1,
+        "source": "Direct",
+        "upstream_published_at": null,
+        "version": "1.0"
+      },
+      "type": "ArtifactIngested"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000002712",
+      "event_id": "e0000000-0000-0000-0000-000000002712",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000002712",
+      "stream_position": 0
+    },
+    "event_hash": "db6d64b5af1bc3c0c9a2e97f30b89a739815320ed685574840918587ec2dcb64",
+    "event_type": "ArtifactIngested",
+    "name": "ArtifactIngested@pre-upstream-published-at",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "metadata": null,
+        "metadata_blob": null,
+        "name": "pkg",
+        "repository_id": "00000000-0000-0000-0000-000000000000",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 1,
+        "source": "Direct",
+        "version": "1.0"
+      },
+      "type": "ArtifactIngested"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": "ca000000-0000-0000-0000-000000000001",
+      "correlation_id": "c0000000-0000-0000-0000-000000000001",
+      "event_id": "e0000000-0000-0000-0000-000000000001",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000001",
+      "stream_position": 0
+    },
+    "event_hash": "c84b8772a9b0b32440544720e2bbd6a10c956c9777edabd7bdaa7be3bad0b992",
+    "event_type": "ChecksumVerified",
+    "name": "ChecksumVerified",
+    "stored_envelope": {
+      "data": {
+        "algorithm": "sha256",
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "computed_value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "upstream_value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "type": "ChecksumVerified"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000002",
+      "event_id": "e0000000-0000-0000-0000-000000000002",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000002",
+      "stream_position": 0
+    },
+    "event_hash": "8c06c31afe8b87c166642e225b95f9386113f873d6039b5d62e95453d9ce84d3",
+    "event_type": "ChecksumMismatch",
+    "name": "ChecksumMismatch",
+    "stored_envelope": {
+      "data": {
+        "algorithm": "sha256",
+        "computed_value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "coords": {
+          "format": "Pypi",
+          "metadata": null,
+          "name": "pkg",
+          "name_as_published": "pkg",
+          "path": "pkg/1.0/pkg-1.0.tar.gz",
+          "version": "1.0"
+        },
+        "format": "pypi",
+        "repository_id": "00000000-0000-0000-0000-000000000000",
+        "upstream_value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "type": "ChecksumMismatch"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": "ca000000-0000-0000-0000-000000000003",
+      "correlation_id": "c0000000-0000-0000-0000-000000000003",
+      "event_id": "e0000000-0000-0000-0000-000000000003",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000003",
+      "stream_position": 0
+    },
+    "event_hash": "93dc201bb97743fbad82475e04fe9856249bb50cd2c80d157f1f13af0871e18c",
+    "event_type": "ArtifactQuarantined",
+    "name": "ArtifactQuarantined",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "quarantine_window_start": "2026-10-20T18:39:48.150169613Z"
+      },
+      "type": "ArtifactQuarantined"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/ScanRequested.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000004",
+      "event_id": "e0000000-0000-0000-0000-000000000004",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000004",
+      "stream_position": 0
+    },
+    "event_hash": "5258d6145b2454e691b5640454089c7dc957d2de9c19fa2008c10087c00bd078",
+    "event_type": "ScanRequested",
+    "name": "ScanRequested",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "scanner": "trivy"
+      },
+      "type": "ScanRequested"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000000005",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": "ca000000-0000-0000-0000-000000000005",
+      "correlation_id": "c0000000-0000-0000-0000-000000000005",
+      "event_id": "e0000000-0000-0000-0000-000000000005",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000005",
+      "stream_position": 0
+    },
+    "event_hash": "1efe37b8b502424fabcd25736098d9d9ef1dc6e773932932856c093b39b4b712",
+    "event_type": "ScanCompleted",
+    "name": "ScanCompleted",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "finding_count": 0,
+        "findings_blob": null,
+        "scanner": "trivy",
+        "severity_summary": {
+          "critical": 0,
+          "high": 0,
+          "low": 0,
+          "medium": 0,
+          "negligible": 0
+        }
+      },
+      "type": "ScanCompleted"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000002742",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000002742",
+      "event_id": "e0000000-0000-0000-0000-000000002742",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000002742",
+      "stream_position": 0
+    },
+    "event_hash": "c4a16c1c18b5cee682df7d5e6e8ad3d612c61cecf5055e6f17bad56ee850128b",
+    "event_type": "ScanCompleted",
+    "name": "ScanCompleted@pre-findings-blob",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "finding_count": 0,
+        "scanner": "trivy",
+        "severity_summary": {
+          "critical": 0,
+          "high": 0,
+          "low": 0,
+          "medium": 0,
+          "negligible": 0
+        }
+      },
+      "type": "ScanCompleted"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": "ca000000-0000-0000-0000-000000002743",
+      "correlation_id": "c0000000-0000-0000-0000-000000002743",
+      "event_id": "e0000000-0000-0000-0000-000000002743",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000002743",
+      "stream_position": 0
+    },
+    "event_hash": "17fd4bccabf07103df04e371290df043daf087f5a8cc7d7e7c1cf2f5f1cc7aef",
+    "event_type": "ScanCompleted",
+    "name": "ScanCompleted@assessment-not-applicable",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "assessment": "not_applicable",
+        "finding_count": 0,
+        "findings_blob": null,
+        "scanner": "trivy",
+        "severity_summary": {
+          "critical": 0,
+          "high": 0,
+          "low": 0,
+          "medium": 0,
+          "negligible": 0
+        }
+      },
+      "type": "ScanCompleted"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000006",
+      "event_id": "e0000000-0000-0000-0000-000000000006",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000006",
+      "stream_position": 0
+    },
+    "event_hash": "a6eb09660d3352a47dab575304e7ca8c48ef2c07a02d41239262c54c3fed940f",
+    "event_type": "ArtifactBecameVulnerable",
+    "name": "ArtifactBecameVulnerable",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "new_findings": [
+          {
+            "aliases": [],
+            "component_relation": "not_established",
+            "cvss_score": 7.199999809265137,
+            "fixed_versions": [
+              "4.17.21"
+            ],
+            "informational_class": null,
+            "purl": "pkg:npm/lodash@4.17.20",
+            "references": [],
+            "severity": "High",
+            "severity_basis": "assessed",
+            "source_scanner": "trivy",
+            "title": "Command Injection in lodash",
+            "vulnerability_id": "CVE-2021-23337"
+          }
+        ],
+        "previously_clean_at": "2026-10-20T18:39:48.150177117Z"
+      },
+      "type": "ArtifactBecameVulnerable"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-00000000274c",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000274c",
+      "event_id": "e0000000-0000-0000-0000-00000000274c",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000274c",
+      "stream_position": 0
+    },
+    "event_hash": "ffcf3786f4a37ff060840b58e04f2479f29b4c357dfffa5695b379937fa34c9a",
+    "event_type": "ArtifactBecameVulnerable",
+    "name": "ArtifactBecameVulnerable@pre-aliases",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "new_findings": [
+          {
+            "component_relation": "not_established",
+            "cvss_score": 7.199999809265137,
+            "fixed_versions": [
+              "4.17.21"
+            ],
+            "informational_class": null,
+            "purl": "pkg:npm/lodash@4.17.20",
+            "references": [],
+            "severity": "High",
+            "severity_basis": "assessed",
+            "source_scanner": "trivy",
+            "title": "Command Injection in lodash",
+            "vulnerability_id": "CVE-2021-23337"
+          }
+        ],
+        "previously_clean_at": "2026-10-20T18:39:48.150177117Z"
+      },
+      "type": "ArtifactBecameVulnerable"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": "ca000000-0000-0000-0000-00000000274d",
+      "correlation_id": "c0000000-0000-0000-0000-00000000274d",
+      "event_id": "e0000000-0000-0000-0000-00000000274d",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000274d",
+      "stream_position": 0
+    },
+    "event_hash": "df1b5651f679f2e9fe318157d08221c92b06392e49e5f79ec1fca24f07464b5f",
+    "event_type": "ArtifactBecameVulnerable",
+    "name": "ArtifactBecameVulnerable@pre-informational-class",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "new_findings": [
+          {
+            "aliases": [],
+            "component_relation": "not_established",
+            "cvss_score": 7.199999809265137,
+            "fixed_versions": [
+              "4.17.21"
+            ],
+            "purl": "pkg:npm/lodash@4.17.20",
+            "references": [],
+            "severity": "High",
+            "severity_basis": "assessed",
+            "source_scanner": "trivy",
+            "title": "Command Injection in lodash",
+            "vulnerability_id": "CVE-2021-23337"
+          }
+        ],
+        "previously_clean_at": "2026-10-20T18:39:48.150177117Z"
+      },
+      "type": "ArtifactBecameVulnerable"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000274e",
+      "event_id": "e0000000-0000-0000-0000-00000000274e",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000274e",
+      "stream_position": 0
+    },
+    "event_hash": "d7338773fd65faf0daae1c0e386359a23e156035c2d2b341e65a414cb05de459",
+    "event_type": "ArtifactBecameVulnerable",
+    "name": "ArtifactBecameVulnerable@pre-severity-basis",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "new_findings": [
+          {
+            "aliases": [],
+            "component_relation": "not_established",
+            "cvss_score": 7.199999809265137,
+            "fixed_versions": [
+              "4.17.21"
+            ],
+            "informational_class": null,
+            "purl": "pkg:npm/lodash@4.17.20",
+            "references": [],
+            "severity": "High",
+            "source_scanner": "trivy",
+            "title": "Command Injection in lodash",
+            "vulnerability_id": "CVE-2021-23337"
+          }
+        ],
+        "previously_clean_at": "2026-10-20T18:39:48.150177117Z"
+      },
+      "type": "ArtifactBecameVulnerable"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": "ca000000-0000-0000-0000-00000000274f",
+      "correlation_id": "c0000000-0000-0000-0000-00000000274f",
+      "event_id": "e0000000-0000-0000-0000-00000000274f",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000274f",
+      "stream_position": 0
+    },
+    "event_hash": "8f3e3a88e6c962767e4afa91a8c19813d40098f754b875bb18e0ee09a6f25bf2",
+    "event_type": "ArtifactBecameVulnerable",
+    "name": "ArtifactBecameVulnerable@pre-component-relation",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "new_findings": [
+          {
+            "aliases": [],
+            "cvss_score": 7.199999809265137,
+            "fixed_versions": [
+              "4.17.21"
+            ],
+            "informational_class": null,
+            "purl": "pkg:npm/lodash@4.17.20",
+            "references": [],
+            "severity": "High",
+            "severity_basis": "assessed",
+            "source_scanner": "trivy",
+            "title": "Command Injection in lodash",
+            "vulnerability_id": "CVE-2021-23337"
+          }
+        ],
+        "previously_clean_at": "2026-10-20T18:39:48.150177117Z"
+      },
+      "type": "ArtifactBecameVulnerable"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": "ca000000-0000-0000-0000-000000000007",
+      "correlation_id": "c0000000-0000-0000-0000-000000000007",
+      "event_id": "e0000000-0000-0000-0000-000000000007",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000007",
+      "stream_position": 0
+    },
+    "event_hash": "da6bbd932c3b1c87d2acc5af3e01545fa092bec7a5b97c417b0232d4c805997e",
+    "event_type": "ArtifactReleased",
+    "name": "ArtifactReleased",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "justification": null,
+        "released_by": "Timer",
+        "released_by_user_id": null
+      },
+      "type": "ArtifactReleased"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000008",
+      "event_id": "e0000000-0000-0000-0000-000000000008",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000008",
+      "stream_position": 0
+    },
+    "event_hash": "1bf37e654eb08384c10bd041825b2905f152df046bc9f44ccda10d583ab104b1",
+    "event_type": "ArtifactRejected",
+    "name": "ArtifactRejected",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "reason": "CVE-2024-0001",
+        "rejected_by": "Scanner"
+      },
+      "type": "ArtifactRejected"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/ScanIndeterminate.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": "ca000000-0000-0000-0000-000000000009",
+      "correlation_id": "c0000000-0000-0000-0000-000000000009",
+      "event_id": "e0000000-0000-0000-0000-000000000009",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000009",
+      "stream_position": 0
+    },
+    "event_hash": "f6a2ac86e696b09f7f1cccfcba7f1cdce7add69c3bae0150d8900ee92e6596a0",
+    "event_type": "ScanIndeterminate",
+    "name": "ScanIndeterminate",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "attempts": 5,
+        "reason": "all scan backends failed",
+        "scanner": "trivy,osv"
+      },
+      "type": "ScanIndeterminate"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-00000000000a",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000000a",
+      "event_id": "e0000000-0000-0000-0000-00000000000a",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000000a",
+      "stream_position": 0
+    },
+    "event_hash": "4c3139e01c649abb6abd3ab4acc077051e0290e5050dcb3a75c8d499b646c416",
+    "event_type": "ProvenanceVerified",
+    "name": "ProvenanceVerified",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "backend": "cosign",
+        "cascaded_from": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "content_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "predicate_type": "https://slsa.dev/provenance/v1",
+        "signer": {
+          "issuer": "https://token.actions.githubusercontent.com",
+          "san": "https://github.com/acme/repo/.github/workflows/release.yml@refs/heads/main"
+        }
+      },
+      "type": "ProvenanceVerified"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000002774",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000002774",
+      "event_id": "e0000000-0000-0000-0000-000000002774",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000002774",
+      "stream_position": 0
+    },
+    "event_hash": "e4888498bd4647ff74943fda6d56ba330db1d655d78ea6879433b00db3475666",
+    "event_type": "ProvenanceVerified",
+    "name": "ProvenanceVerified@pre-cascaded-from",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "backend": "cosign",
+        "content_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "predicate_type": "https://slsa.dev/provenance/v1",
+        "signer": {
+          "issuer": "https://token.actions.githubusercontent.com",
+          "san": "https://github.com/acme/repo/.github/workflows/release.yml@refs/heads/main"
+        }
+      },
+      "type": "ProvenanceVerified"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": "ca000000-0000-0000-0000-00000000000b",
+      "correlation_id": "c0000000-0000-0000-0000-00000000000b",
+      "event_id": "e0000000-0000-0000-0000-00000000000b",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000000b",
+      "stream_position": 0
+    },
+    "event_hash": "c60dd133dd59f3a135519e795b0ec1c8ec960c722e0f350a91ca05c2d507b4ce",
+    "event_type": "ProvenanceRejected",
+    "name": "ProvenanceRejected",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "backend": "cosign",
+        "content_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "reason": "UntrustedIdentity"
+      },
+      "type": "ProvenanceRejected"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000000c",
+      "event_id": "e0000000-0000-0000-0000-00000000000c",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000000c",
+      "stream_position": 0
+    },
+    "event_hash": "97ab7ec83b3bb5207cf3201c1711e19c42d72fbbfb1f54056124278183f5c79d",
+    "event_type": "ArtifactReEvaluated",
+    "name": "ArtifactReEvaluated",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "new_status": "Released",
+        "policy_id": "00000000-0000-0000-0000-000000000000",
+        "previous_status": "Rejected",
+        "trigger": {
+          "ExclusionAdded": {
+            "exclusion_id": "00000000-0000-0000-0000-000000000000"
+          }
+        }
+      },
+      "type": "ArtifactReEvaluated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000002788",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000002788",
+      "event_id": "e0000000-0000-0000-0000-000000002788",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000002788",
+      "stream_position": 0
+    },
+    "event_hash": "7f12f3328028b53e8975d529e03d99ec78049000be2827287fcb4e2c488d94c7",
+    "event_type": "ArtifactReEvaluated",
+    "name": "ArtifactReEvaluated@legacy-trigger-exclusion-id",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "new_status": "Released",
+        "policy_id": "00000000-0000-0000-0000-000000000000",
+        "previous_status": "Rejected",
+        "trigger_exclusion_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ArtifactReEvaluated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": "ca000000-0000-0000-0000-00000000000d",
+      "correlation_id": "c0000000-0000-0000-0000-00000000000d",
+      "event_id": "e0000000-0000-0000-0000-00000000000d",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000000d",
+      "stream_position": 0
+    },
+    "event_hash": "643dd843879e1ed72be848ca7bd19f8f07b4a9c499e7947e708eaa22d0d04a4f",
+    "event_type": "PromotionRequested",
+    "name": "PromotionRequested",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "source_repository_id": "00000000-0000-0000-0000-000000000000",
+        "target_repository_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "PromotionRequested"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/PolicyEvaluated.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000000e",
+      "event_id": "e0000000-0000-0000-0000-00000000000e",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000000e",
+      "stream_position": 0
+    },
+    "event_hash": "508415dbafd815a8322ff15d51573fc20e7ae649f7ff1537ce166071a93525e5",
+    "event_type": "PolicyEvaluated",
+    "name": "PolicyEvaluated",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "policy_id": "00000000-0000-0000-0000-000000000000",
+        "result": "Pass",
+        "violations": []
+      },
+      "type": "PolicyEvaluated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-00000000000f",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": "ca000000-0000-0000-0000-00000000000f",
+      "correlation_id": "c0000000-0000-0000-0000-00000000000f",
+      "event_id": "e0000000-0000-0000-0000-00000000000f",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000000f",
+      "stream_position": 0
+    },
+    "event_hash": "e49f7c6f26a605f2a62332c72f3ee08207b65592d68487e3f4eef19e91f62b24",
+    "event_type": "ApprovalRequested",
+    "name": "ApprovalRequested",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "source_repository_id": "00000000-0000-0000-0000-000000000000",
+        "target_repository_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ApprovalRequested"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000010",
+      "event_id": "e0000000-0000-0000-0000-000000000010",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000010",
+      "stream_position": 0
+    },
+    "event_hash": "4888b8d186e6677e2467fff9df8921c239a57849c67cd697c3d13894c68486a3",
+    "event_type": "ApprovalDecided",
+    "name": "ApprovalDecided",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "decision": "Approved",
+        "notes": null
+      },
+      "type": "ApprovalDecided"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": "ca000000-0000-0000-0000-000000000011",
+      "correlation_id": "c0000000-0000-0000-0000-000000000011",
+      "event_id": "e0000000-0000-0000-0000-000000000011",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000011",
+      "stream_position": 0
+    },
+    "event_hash": "8bdd1908d8dfee97c7e6e2f26772c7832f8bf03ae70896bc4a0f239c73f4003d",
+    "event_type": "ArtifactPromoted",
+    "name": "ArtifactPromoted",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "source_repository_id": "00000000-0000-0000-0000-000000000000",
+        "target_repository_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ArtifactPromoted"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000012",
+      "event_id": "e0000000-0000-0000-0000-000000000012",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000012",
+      "stream_position": 0
+    },
+    "event_hash": "784475f7b5e95a0227cb05b4f8f09e781e8d07ed73404bc27ce445d6157378b4",
+    "event_type": "PromotionRejected",
+    "name": "PromotionRejected",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "reason": "policy",
+        "source_repository_id": "00000000-0000-0000-0000-000000000000",
+        "target_repository_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "PromotionRejected"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/ArtifactExpired.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": "ca000000-0000-0000-0000-000000000013",
+      "correlation_id": "c0000000-0000-0000-0000-000000000013",
+      "event_id": "e0000000-0000-0000-0000-000000000013",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000013",
+      "stream_position": 0
+    },
+    "event_hash": "66ffe68063549c3d7c722fc389398a9ff1dfd3e9a93837a2b7892d2e9c90b38d",
+    "event_type": "ArtifactExpired",
+    "name": "ArtifactExpired",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "eligible_at": "2026-10-20T18:39:48.150183387Z",
+        "policy_id": "00000000-0000-0000-0000-000000000000",
+        "policy_name": "90-day-age",
+        "reason": {
+          "AgeExceeded": {
+            "published_at": "2026-10-20T18:39:48.150183237Z",
+            "ttl_secs": 86400
+          }
+        }
+      },
+      "type": "ArtifactExpired"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000000014",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000014",
+      "event_id": "e0000000-0000-0000-0000-000000000014",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000014",
+      "stream_position": 0
+    },
+    "event_hash": "886fb7c6ac2211b9366eaac40543a30bd6b6e301260f6a76c6595114d02049a1",
+    "event_type": "ArtifactPurged",
+    "name": "ArtifactPurged",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "content_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "purged_at": "2026-10-20T18:39:48.150184858Z",
+        "refs_remaining": 0
+      },
+      "type": "ArtifactPurged"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": "ca000000-0000-0000-0000-000000000015",
+      "correlation_id": "c0000000-0000-0000-0000-000000000015",
+      "event_id": "e0000000-0000-0000-0000-000000000015",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000015",
+      "stream_position": 0
+    },
+    "event_hash": "c7c177017481eecf4b5ecd665b3d4fd0a2eddb9d4d54b8ad50979a3468b3573d",
+    "event_type": "ArtifactDeleted",
+    "name": "ArtifactDeleted",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "content_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "path": "pkg/1.0/pkg-1.0.tar.gz",
+        "repository_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ArtifactDeleted"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000016",
+      "event_id": "e0000000-0000-0000-0000-000000000016",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000016",
+      "stream_position": 0
+    },
+    "event_hash": "2b2c432e8d7b65a1196c7ad049ae714f42d561e460f0bef835c0a7cb32c97c9b",
+    "event_type": "ArtifactDownloaded",
+    "name": "ArtifactDownloaded",
+    "stored_envelope": {
+      "data": {
+        "actor": "Anonymous",
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "content_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "occurred_at": "2026-10-20T18:39:48.150187789Z",
+        "repository_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ArtifactDownloaded"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": "ca000000-0000-0000-0000-000000000017",
+      "correlation_id": "c0000000-0000-0000-0000-000000000017",
+      "event_id": "e0000000-0000-0000-0000-000000000017",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000017",
+      "stream_position": 0
+    },
+    "event_hash": "8042d6dcc472cf31a11000bb20d40d0993a594eefd622c591f81a7f4dac99a1f",
+    "event_type": "PolicyCreated",
+    "name": "PolicyCreated",
+    "stored_envelope": {
+      "data": {
+        "config_snapshot": {},
+        "name": "default",
+        "policy_id": "00000000-0000-0000-0000-000000000000",
+        "scope": "Global"
+      },
+      "type": "PolicyCreated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/PolicyUpdated.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000018",
+      "event_id": "e0000000-0000-0000-0000-000000000018",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000018",
+      "stream_position": 0
+    },
+    "event_hash": "3593062c6e7e6ae83e5202e2656985869d3d569e058176336fb333ddb7d03022",
+    "event_type": "PolicyUpdated",
+    "name": "PolicyUpdated",
+    "stored_envelope": {
+      "data": {
+        "field": "Name",
+        "new_value": "new",
+        "policy_id": "00000000-0000-0000-0000-000000000000",
+        "previous_value": "old"
+      },
+      "type": "PolicyUpdated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000000019",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": "ca000000-0000-0000-0000-000000000019",
+      "correlation_id": "c0000000-0000-0000-0000-000000000019",
+      "event_id": "e0000000-0000-0000-0000-000000000019",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000019",
+      "stream_position": 0
+    },
+    "event_hash": "22be06de7b23ed7ee36a1e13fb1dc6c0f0b576b1b125bf899d4b90f3d77f3429",
+    "event_type": "ExclusionAdded",
+    "name": "ExclusionAdded",
+    "stored_envelope": {
+      "data": {
+        "cve_id": "CVE-2024-0001",
+        "exclusion_id": "00000000-0000-0000-0000-000000000000",
+        "expires_at": null,
+        "package_pattern": null,
+        "policy_id": "00000000-0000-0000-0000-000000000000",
+        "reason": "false positive",
+        "scope": "Global"
+      },
+      "type": "ExclusionAdded"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000001a",
+      "event_id": "e0000000-0000-0000-0000-00000000001a",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000001a",
+      "stream_position": 0
+    },
+    "event_hash": "c535a1f2ea9d05e0517844b959f7ac151d1846b9078f8fa1219e7dd2703aea82",
+    "event_type": "ExclusionRemoved",
+    "name": "ExclusionRemoved",
+    "stored_envelope": {
+      "data": {
+        "exclusion_id": "00000000-0000-0000-0000-000000000000",
+        "policy_id": "00000000-0000-0000-0000-000000000000",
+        "reason": "revoked"
+      },
+      "type": "ExclusionRemoved"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": "ca000000-0000-0000-0000-00000000001b",
+      "correlation_id": "c0000000-0000-0000-0000-00000000001b",
+      "event_id": "e0000000-0000-0000-0000-00000000001b",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000001b",
+      "stream_position": 0
+    },
+    "event_hash": "4d6a23a9e54c011768b74a76ccc71878a96c443cfa73c97c10cccc61ac819d66",
+    "event_type": "PolicyArchived",
+    "name": "PolicyArchived",
+    "stored_envelope": {
+      "data": {
+        "policy_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "PolicyArchived"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000001c",
+      "event_id": "e0000000-0000-0000-0000-00000000001c",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000001c",
+      "stream_position": 0
+    },
+    "event_hash": "bcd66d9649921dd3bf86b5426876a6b3ff4eafc428667f7edf0672f799856032",
+    "event_type": "PolicyReactivated",
+    "name": "PolicyReactivated",
+    "stored_envelope": {
+      "data": {
+        "policy_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "PolicyReactivated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/CasIntegrityMismatch.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": "ca000000-0000-0000-0000-00000000001d",
+      "correlation_id": "c0000000-0000-0000-0000-00000000001d",
+      "event_id": "e0000000-0000-0000-0000-00000000001d",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000001d",
+      "stream_position": 0
+    },
+    "event_hash": "78a85f33e60603354cc36728e7d5ecaea178d1ff93ac9c4bc960462b7703861a",
+    "event_type": "CasIntegrityMismatch",
+    "name": "CasIntegrityMismatch",
+    "stored_envelope": {
+      "data": {
+        "backend": "filesystem",
+        "content_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "observed_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "type": "CasIntegrityMismatch"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-00000000001e",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000001e",
+      "event_id": "e0000000-0000-0000-0000-00000000001e",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000001e",
+      "stream_position": 0
+    },
+    "event_hash": "e524f1c13cbb1b6fab7ce9cbeee9434a25b941708d0d260d0f13dc093c4c4a6a",
+    "event_type": "ArtifactCorrupted",
+    "name": "ArtifactCorrupted",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "computed_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "detected_at": "2026-10-20T18:39:48.150210161Z",
+        "expected_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "type": "ArtifactCorrupted"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": "ca000000-0000-0000-0000-00000000001f",
+      "correlation_id": "c0000000-0000-0000-0000-00000000001f",
+      "event_id": "e0000000-0000-0000-0000-00000000001f",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000001f",
+      "stream_position": 0
+    },
+    "event_hash": "280f50a950f20e6160ad300e26a4f742a531fb0363f27f1569861c976d60a6dc",
+    "event_type": "RefMoved",
+    "name": "RefMoved",
+    "stored_envelope": {
+      "data": {
+        "from": null,
+        "namespace": "library/nginx",
+        "ref_id": "00000000-0000-0000-0000-000000000000",
+        "ref_name": "latest",
+        "repository_id": "00000000-0000-0000-0000-000000000000",
+        "to": {
+          "ContentHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "type": "RefMoved"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000020",
+      "event_id": "e0000000-0000-0000-0000-000000000020",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000020",
+      "stream_position": 0
+    },
+    "event_hash": "a603069c5a5e3692559f583eedab6175383da042a35402ef3a08b42ffcdec2ff",
+    "event_type": "RefRetired",
+    "name": "RefRetired",
+    "stored_envelope": {
+      "data": {
+        "last_target": {
+          "ContentHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "namespace": "library/nginx",
+        "ref_id": "00000000-0000-0000-0000-000000000000",
+        "ref_name": "latest",
+        "repository_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "RefRetired"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": "ca000000-0000-0000-0000-000000000021",
+      "correlation_id": "c0000000-0000-0000-0000-000000000021",
+      "event_id": "e0000000-0000-0000-0000-000000000021",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000021",
+      "stream_position": 0
+    },
+    "event_hash": "d96ee7a317708dd9addff4f2b74d9bdedec8c73889d53173e3031ef6cdd1f307",
+    "event_type": "ArtifactGroupInitiated",
+    "name": "ArtifactGroupInitiated",
+    "stored_envelope": {
+      "data": {
+        "coords": {
+          "format": "Maven",
+          "metadata": null,
+          "name": "my-pkg",
+          "name_as_published": "my-pkg",
+          "path": "",
+          "version": "1.0.0"
+        },
+        "group_id": "00000000-0000-0000-0000-000000000000",
+        "primary_role": "pom",
+        "repository_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ArtifactGroupInitiated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/ArtifactGroupMemberAdded.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000022",
+      "event_id": "e0000000-0000-0000-0000-000000000022",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000022",
+      "stream_position": 0
+    },
+    "event_hash": "b43448d27510eab7112a70002204b606c11faf84000f128054e6759d2640eed5",
+    "event_type": "ArtifactGroupMemberAdded",
+    "name": "ArtifactGroupMemberAdded",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "group_id": "00000000-0000-0000-0000-000000000000",
+        "role": "jar"
+      },
+      "type": "ArtifactGroupMemberAdded"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000000023",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": "ca000000-0000-0000-0000-000000000023",
+      "correlation_id": "c0000000-0000-0000-0000-000000000023",
+      "event_id": "e0000000-0000-0000-0000-000000000023",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000023",
+      "stream_position": 0
+    },
+    "event_hash": "71141cc87d9ef078f1bdadb4784101e053be16eef0d8bf6d034dea6ce53708ca",
+    "event_type": "ArtifactGroupMemberRemoved",
+    "name": "ArtifactGroupMemberRemoved",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "group_id": "00000000-0000-0000-0000-000000000000",
+        "reason": "admin"
+      },
+      "type": "ArtifactGroupMemberRemoved"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000024",
+      "event_id": "e0000000-0000-0000-0000-000000000024",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000024",
+      "stream_position": 0
+    },
+    "event_hash": "15b5e47e337bf3d41daa73cbe65721355a8f62b489fd42782566d9d71a004fb7",
+    "event_type": "ArtifactGroupPrimaryRoleAssigned",
+    "name": "ArtifactGroupPrimaryRoleAssigned",
+    "stored_envelope": {
+      "data": {
+        "group_id": "00000000-0000-0000-0000-000000000000",
+        "primary_role": "pom"
+      },
+      "type": "ArtifactGroupPrimaryRoleAssigned"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": "ca000000-0000-0000-0000-000000000025",
+      "correlation_id": "c0000000-0000-0000-0000-000000000025",
+      "event_id": "e0000000-0000-0000-0000-000000000025",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000025",
+      "stream_position": 0
+    },
+    "event_hash": "4b4b61b1a792329896c13610530a53a07811e2b288065c28f4341eefc13d0632",
+    "event_type": "CurationApplied",
+    "name": "CurationApplied",
+    "stored_envelope": {
+      "data": {
+        "action": "Block",
+        "coords": {
+          "format": "Pypi",
+          "metadata": null,
+          "name": "xz-utils",
+          "name_as_published": "xz-utils",
+          "path": "",
+          "version": "1.0.0"
+        },
+        "reason": "supply-chain risk",
+        "repository_id": "00000000-0000-0000-0000-000000000000",
+        "rule_id": "00000000-0000-0000-0000-000000000000",
+        "rule_name": "block-xz",
+        "trigger": "Retroactive"
+      },
+      "type": "CurationApplied"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000026",
+      "event_id": "e0000000-0000-0000-0000-000000000026",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000026",
+      "stream_position": 0
+    },
+    "event_hash": "8c2786e1350644c665279051f598d727f3d3ec22713de67b7dd80413c4bd70f8",
+    "event_type": "AuthenticationAttempted",
+    "name": "AuthenticationAttempted",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150215330Z",
+        "client_ip": "203.0.113.42",
+        "external_id_if_decoded": "alice",
+        "result": "local_invalid_credentials"
+      },
+      "type": "AuthenticationAttempted"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/OidcKeyRotated.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": "ca000000-0000-0000-0000-000000000027",
+      "correlation_id": "c0000000-0000-0000-0000-000000000027",
+      "event_id": "e0000000-0000-0000-0000-000000000027",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000027",
+      "stream_position": 0
+    },
+    "event_hash": "960876d4a84ad36719ffb5aef18bdd9fd50de6717d928e7166e37dbe2286e824",
+    "event_type": "OidcKeyRotated",
+    "name": "OidcKeyRotated",
+    "stored_envelope": {
+      "data": {
+        "fetched_at": "2026-10-20T18:39:48.150215602Z",
+        "kid_added": "kid-new",
+        "kid_evicted": "kid-old"
+      },
+      "type": "OidcKeyRotated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000000028",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000028",
+      "event_id": "e0000000-0000-0000-0000-000000000028",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000028",
+      "stream_position": 0
+    },
+    "event_hash": "f7cca16f0e330d1a0d0946c3436ec17be497d396c54def28f55173a43f4d394a",
+    "event_type": "AdminStatusChanged",
+    "name": "AdminStatusChanged",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150217892Z",
+        "external_id": "realm-users:abc-123",
+        "granted": true,
+        "user_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "AdminStatusChanged"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": "ca000000-0000-0000-0000-000000000029",
+      "correlation_id": "c0000000-0000-0000-0000-000000000029",
+      "event_id": "e0000000-0000-0000-0000-000000000029",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000029",
+      "stream_position": 0
+    },
+    "event_hash": "f06f28da90977e54370a75c8273b9e2bed8c279fd5779195b34352ad282581b9",
+    "event_type": "ClaimMappingApplied",
+    "name": "ClaimMappingApplied",
+    "stored_envelope": {
+      "data": {
+        "claim": "admin",
+        "idp_group": "ops-team",
+        "mapping_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ClaimMappingApplied"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000002a",
+      "event_id": "e0000000-0000-0000-0000-00000000002a",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000002a",
+      "stream_position": 0
+    },
+    "event_hash": "89a91c71284156dc2eb70fb70c09ded6f71ffe049d7276bd3c32621c5976e5b8",
+    "event_type": "ClaimMappingRevoked",
+    "name": "ClaimMappingRevoked",
+    "stored_envelope": {
+      "data": {
+        "claim": "admin",
+        "idp_group": "ops-team",
+        "mapping_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ClaimMappingRevoked"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": "ca000000-0000-0000-0000-00000000002b",
+      "correlation_id": "c0000000-0000-0000-0000-00000000002b",
+      "event_id": "e0000000-0000-0000-0000-00000000002b",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000002b",
+      "stream_position": 0
+    },
+    "event_hash": "4243db53a42cb1bd437b4af86025bbdd750860ba16e6c32cba33a699e0cb3e7b",
+    "event_type": "PermissionGrantApplied",
+    "name": "PermissionGrantApplied",
+    "stored_envelope": {
+      "data": {
+        "grant_id": "00000000-0000-0000-0000-000000000000",
+        "permission": "Read",
+        "repository_id": null,
+        "subject": {
+          "kind": "claims",
+          "required": [
+            "developer"
+          ]
+        }
+      },
+      "type": "PermissionGrantApplied"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/PermissionGrantRevoked.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000002c",
+      "event_id": "e0000000-0000-0000-0000-00000000002c",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000002c",
+      "stream_position": 0
+    },
+    "event_hash": "f161d260eaff65590b8331cde4f639e55668028f6b4aec54fe515967513f0dda",
+    "event_type": "PermissionGrantRevoked",
+    "name": "PermissionGrantRevoked",
+    "stored_envelope": {
+      "data": {
+        "grant_id": "00000000-0000-0000-0000-000000000000",
+        "permission": "Read",
+        "repository_id": "00000000-0000-0000-0000-000000000000",
+        "subject": {
+          "kind": "user",
+          "user_id": "00000000-0000-0000-0000-000000000000"
+        }
+      },
+      "type": "PermissionGrantRevoked"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-00000000002d",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": "ca000000-0000-0000-0000-00000000002d",
+      "correlation_id": "c0000000-0000-0000-0000-00000000002d",
+      "event_id": "e0000000-0000-0000-0000-00000000002d",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000002d",
+      "stream_position": 0
+    },
+    "event_hash": "6b5916e987aae484899685fa4203a505c1713e5d13efc2a688d517182586964b",
+    "event_type": "RepositoryUpstreamMappingChanged",
+    "name": "RepositoryUpstreamMappingChanged",
+    "stored_envelope": {
+      "data": {
+        "change": "Updated",
+        "mapping_id": "00000000-0000-0000-0000-000000000000",
+        "new_secret_ref": "env_var:NEW_TOKEN",
+        "new_url": "https://registry-1.docker.io",
+        "previous_secret_ref": "env_var:OLD_TOKEN",
+        "previous_url": "https://registry-1.docker.io",
+        "repository_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "RepositoryUpstreamMappingChanged"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000002e",
+      "event_id": "e0000000-0000-0000-0000-00000000002e",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000002e",
+      "stream_position": 0
+    },
+    "event_hash": "979785ea30008f9b554249f35ad22a96dc4410d2d7b2ad6830e43b55d9a9edeb",
+    "event_type": "ApiTokenIssued",
+    "name": "ApiTokenIssued",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150219279Z",
+        "declared_permissions": [
+          "Read"
+        ],
+        "expires_at": null,
+        "kind": "Pat",
+        "minted_by_admin_id": null,
+        "repository_ids": null,
+        "token_id": "00000000-0000-0000-0000-000000000000",
+        "user_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ApiTokenIssued"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-0000000028dc",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-0000000028dc",
+      "event_id": "e0000000-0000-0000-0000-0000000028dc",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-0000000028dc",
+      "stream_position": 0
+    },
+    "event_hash": "23a43cf8e126389f37bf96b79f222fba72f3d449c721ad17311c47cd9699cde8",
+    "event_type": "ApiTokenIssued",
+    "name": "ApiTokenIssued@federated-issuance",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150219279Z",
+        "declared_permissions": [
+          "Read"
+        ],
+        "expires_at": null,
+        "kind": "Pat",
+        "minted_by_admin_id": null,
+        "repository_ids": null,
+        "source_issuer": "gh-actions",
+        "source_jti": "jti-0001",
+        "source_sub": "repo:acme/repo:ref:refs/heads/main",
+        "token_id": "00000000-0000-0000-0000-000000000000",
+        "user_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ApiTokenIssued"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": "ca000000-0000-0000-0000-00000000002f",
+      "correlation_id": "c0000000-0000-0000-0000-00000000002f",
+      "event_id": "e0000000-0000-0000-0000-00000000002f",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000002f",
+      "stream_position": 0
+    },
+    "event_hash": "02e7959a8947e341816911c474c4d8d4c27d9c8472a7cb608da8c626abf88d29",
+    "event_type": "ApiTokenRevoked",
+    "name": "ApiTokenRevoked",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150219437Z",
+        "reason": "OperatorRequest",
+        "revoked_by_admin_id": null,
+        "token_id": "00000000-0000-0000-0000-000000000000",
+        "user_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ApiTokenRevoked"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000030",
+      "event_id": "e0000000-0000-0000-0000-000000000030",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000030",
+      "stream_position": 0
+    },
+    "event_hash": "c7b875defe32040b75efeb61db4a239ded52e1e2a0cc71d8387f968b19af2472",
+    "event_type": "ApiTokenIssuanceDenied",
+    "name": "ApiTokenIssuanceDenied",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150219644Z",
+        "denial_reason": "AdminTokenDisallowed",
+        "requested_kind": "Pat",
+        "requested_permissions": [
+          "Admin"
+        ],
+        "requested_repository_ids": null,
+        "target_user_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ApiTokenIssuanceDenied"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/ApiTokenUsed.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": "ca000000-0000-0000-0000-000000000031",
+      "correlation_id": "c0000000-0000-0000-0000-000000000031",
+      "event_id": "e0000000-0000-0000-0000-000000000031",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000031",
+      "stream_position": 0
+    },
+    "event_hash": "3992d4739a781dae5934297c644c4372b396e41fb8e18ad839f1dac8c41cc21a",
+    "event_type": "ApiTokenUsed",
+    "name": "ApiTokenUsed",
+    "stored_envelope": {
+      "data": {
+        "kind": "Pat",
+        "occurred_at": "2026-10-20T18:39:48.150219785Z",
+        "token_id": "00000000-0000-0000-0000-000000000000",
+        "user_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ApiTokenUsed"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000000032",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000032",
+      "event_id": "e0000000-0000-0000-0000-000000000032",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000032",
+      "stream_position": 0
+    },
+    "event_hash": "09040e1d2b8beb55624e75c8045c19307afc6cf552e66c6aba79071c0e3bae91",
+    "event_type": "TaskInvoked",
+    "name": "TaskInvoked",
+    "stored_envelope": {
+      "data": {
+        "duplicate_of": null,
+        "kind": "noop",
+        "params_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "task_job_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "TaskInvoked"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000002904",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000002904",
+      "event_id": "e0000000-0000-0000-0000-000000002904",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000002904",
+      "stream_position": 0
+    },
+    "event_hash": "80835ff5b77172a02338964f39fdd178e73a648fbe3b763bbbc81a5788183661",
+    "event_type": "TaskInvoked",
+    "name": "TaskInvoked@pre-duplicate-of",
+    "stored_envelope": {
+      "data": {
+        "kind": "noop",
+        "params_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+        "task_job_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "TaskInvoked"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": "ca000000-0000-0000-0000-000000000033",
+      "correlation_id": "c0000000-0000-0000-0000-000000000033",
+      "event_id": "e0000000-0000-0000-0000-000000000033",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000033",
+      "stream_position": 0
+    },
+    "event_hash": "bf470adfe5eb5cb6c89b90b603078afeafa97b2bb8b60f2aafa0859501180ab9",
+    "event_type": "TaskFailed",
+    "name": "TaskFailed",
+    "stored_envelope": {
+      "data": {
+        "final_attempt": false,
+        "kind": "noop",
+        "reason": "db connection lost",
+        "task_job_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "TaskFailed"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000034",
+      "event_id": "e0000000-0000-0000-0000-000000000034",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000034",
+      "stream_position": 0
+    },
+    "event_hash": "05e411a9046b8cd575dc4e71a6d9e63d5d7993c3d04d7659cecdd43b03f32a5d",
+    "event_type": "OidcIssuerCreated",
+    "name": "OidcIssuerCreated",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150233352Z",
+        "issuer_id": "00000000-0000-0000-0000-000000000000",
+        "name": "github-actions"
+      },
+      "type": "OidcIssuerCreated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": "ca000000-0000-0000-0000-000000000035",
+      "correlation_id": "c0000000-0000-0000-0000-000000000035",
+      "event_id": "e0000000-0000-0000-0000-000000000035",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000035",
+      "stream_position": 0
+    },
+    "event_hash": "ccdaba741e442c27d7b8113a1b35a8ac820e7d50a96d6607e4995d367ca6188c",
+    "event_type": "OidcIssuerUpdated",
+    "name": "OidcIssuerUpdated",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150233587Z",
+        "issuer_id": "00000000-0000-0000-0000-000000000000",
+        "name": "github-actions"
+      },
+      "type": "OidcIssuerUpdated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/OidcIssuerDeleted.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000036",
+      "event_id": "e0000000-0000-0000-0000-000000000036",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000036",
+      "stream_position": 0
+    },
+    "event_hash": "d7ed380ed9a3f611d6b63a944e66cbb0117092ecb732eef819964b0a64efb02a",
+    "event_type": "OidcIssuerDeleted",
+    "name": "OidcIssuerDeleted",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150233898Z",
+        "issuer_id": "00000000-0000-0000-0000-000000000000",
+        "name": "github-actions"
+      },
+      "type": "OidcIssuerDeleted"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000000037",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": "ca000000-0000-0000-0000-000000000037",
+      "correlation_id": "c0000000-0000-0000-0000-000000000037",
+      "event_id": "e0000000-0000-0000-0000-000000000037",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000037",
+      "stream_position": 0
+    },
+    "event_hash": "86816c3709f81a16e97c572b7c3d7b8b96113797e48a766933f51c5fa064cb42",
+    "event_type": "ServiceAccountCreated",
+    "name": "ServiceAccountCreated",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150234118Z",
+        "backing_user_id": "00000000-0000-0000-0000-000000000000",
+        "service_account_id": "00000000-0000-0000-0000-000000000000",
+        "service_account_name": "ci-pypi-pusher"
+      },
+      "type": "ServiceAccountCreated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000038",
+      "event_id": "e0000000-0000-0000-0000-000000000038",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000038",
+      "stream_position": 0
+    },
+    "event_hash": "360c594bf236648f62d502575576420b011693c993d44fa8c125165f574768c8",
+    "event_type": "ServiceAccountUpdated",
+    "name": "ServiceAccountUpdated",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150234328Z",
+        "service_account_id": "00000000-0000-0000-0000-000000000000",
+        "service_account_name": "ci-pypi-pusher"
+      },
+      "type": "ServiceAccountUpdated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": "ca000000-0000-0000-0000-000000000039",
+      "correlation_id": "c0000000-0000-0000-0000-000000000039",
+      "event_id": "e0000000-0000-0000-0000-000000000039",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000039",
+      "stream_position": 0
+    },
+    "event_hash": "ea1d5bf09343ac960adb671c2117eb4e248d621b7001847fd16c967800eac1f1",
+    "event_type": "ServiceAccountDeleted",
+    "name": "ServiceAccountDeleted",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150234530Z",
+        "backing_user_id": "00000000-0000-0000-0000-000000000000",
+        "service_account_id": "00000000-0000-0000-0000-000000000000",
+        "service_account_name": "ci-pypi-pusher"
+      },
+      "type": "ServiceAccountDeleted"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000003a",
+      "event_id": "e0000000-0000-0000-0000-00000000003a",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000003a",
+      "stream_position": 0
+    },
+    "event_hash": "a061bf06ff6afa314657608ef1bc2c6698d35eb0d71794bb03c3fb5972ca3f37",
+    "event_type": "ServiceAccountTokenRotated",
+    "name": "ServiceAccountTokenRotated",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150234868Z",
+        "format": "dockerconfigjson",
+        "service_account_id": "00000000-0000-0000-0000-000000000000",
+        "service_account_name": "ci-pypi-pusher",
+        "target_secret_name": "ci-hort-token",
+        "target_secret_namespace": "ci-system",
+        "token_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "ServiceAccountTokenRotated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/SubscriptionCreated.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": "ca000000-0000-0000-0000-00000000003b",
+      "correlation_id": "c0000000-0000-0000-0000-00000000003b",
+      "event_id": "e0000000-0000-0000-0000-00000000003b",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000003b",
+      "stream_position": 0
+    },
+    "event_hash": "fe747feafe0598aa019c60890be62743cd31c510e01d1044c92cc24bbb9e0590",
+    "event_type": "SubscriptionCreated",
+    "name": "SubscriptionCreated",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150235268Z",
+        "filter_summary": {
+          "categories": [
+            "artifact"
+          ],
+          "event_type_count": 1,
+          "predicate_hash": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "repository_scope_kind": "OwnedByActor"
+        },
+        "owner_user_id": "00000000-0000-0000-0000-000000000000",
+        "snapshot_claims_count": 0,
+        "subscription_id": "00000000-0000-0000-0000-000000000000",
+        "target_kind": "Webhook"
+      },
+      "type": "SubscriptionCreated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-00000000003c",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000003c",
+      "event_id": "e0000000-0000-0000-0000-00000000003c",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000003c",
+      "stream_position": 0
+    },
+    "event_hash": "415432557cf7b6002399b85cec5c8565fed74a6269dc30335655bbb081d45625",
+    "event_type": "SubscriptionCreationDenied",
+    "name": "SubscriptionCreationDenied",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150235545Z",
+        "attempted_filter_summary": {
+          "categories": [
+            "artifact"
+          ],
+          "event_type_count": 1,
+          "predicate_hash": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "repository_scope_kind": "Some"
+        },
+        "denial_reason": "PlaintextWebhookDisallowed",
+        "requested_target_kind": "NatsJetStream",
+        "requesting_user_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "SubscriptionCreationDenied"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": "ca000000-0000-0000-0000-00000000003d",
+      "correlation_id": "c0000000-0000-0000-0000-00000000003d",
+      "event_id": "e0000000-0000-0000-0000-00000000003d",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000003d",
+      "stream_position": 0
+    },
+    "event_hash": "5a616579944830794939a14617ee9640020eb842d799512700b8cbfa90fb66cc",
+    "event_type": "SubscriptionUpdated",
+    "name": "SubscriptionUpdated",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150235939Z",
+        "changed_fields": [
+          "name"
+        ],
+        "owner_user_id": "00000000-0000-0000-0000-000000000000",
+        "snapshot_claims_count": 0,
+        "subscription_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "SubscriptionUpdated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-00000000003e",
+      "event_id": "e0000000-0000-0000-0000-00000000003e",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000003e",
+      "stream_position": 0
+    },
+    "event_hash": "d37390a8681e0a4d92466f57d94892d1ce93c74c27ed4bbc91a28eff24ef638e",
+    "event_type": "SubscriptionPaused",
+    "name": "SubscriptionPaused",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150236070Z",
+        "owner_user_id": "00000000-0000-0000-0000-000000000000",
+        "subscription_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "SubscriptionPaused"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": "ca000000-0000-0000-0000-00000000003f",
+      "correlation_id": "c0000000-0000-0000-0000-00000000003f",
+      "event_id": "e0000000-0000-0000-0000-00000000003f",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-00000000003f",
+      "stream_position": 0
+    },
+    "event_hash": "2dbbb3cc4b1e302c6a1bf7dc152ea21412391c7e1b848e0099d2cf22b87b17ca",
+    "event_type": "SubscriptionResumed",
+    "name": "SubscriptionResumed",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150236203Z",
+        "owner_user_id": "00000000-0000-0000-0000-000000000000",
+        "subscription_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "SubscriptionResumed"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/SubscriptionDeleted.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000040",
+      "event_id": "e0000000-0000-0000-0000-000000000040",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000040",
+      "stream_position": 0
+    },
+    "event_hash": "3007800686da240f2983653e52055c3e09118dd31907af90a7ac2910397779ac",
+    "event_type": "SubscriptionDeleted",
+    "name": "SubscriptionDeleted",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150236337Z",
+        "owner_user_id": "00000000-0000-0000-0000-000000000000",
+        "subscription_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "SubscriptionDeleted"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000000041",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": "ca000000-0000-0000-0000-000000000041",
+      "correlation_id": "c0000000-0000-0000-0000-000000000041",
+      "event_id": "e0000000-0000-0000-0000-000000000041",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000041",
+      "stream_position": 0
+    },
+    "event_hash": "c03c77df474879e7f48d01125f0bc1e5101c140ed05658c426e78584a3cf2378",
+    "event_type": "SubscriptionDisabled",
+    "name": "SubscriptionDisabled",
+    "stored_envelope": {
+      "data": {
+        "at": "2026-10-20T18:39:48.150236473Z",
+        "owner_user_id": "00000000-0000-0000-0000-000000000000",
+        "reason": "OperatorDisabled",
+        "subscription_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "type": "SubscriptionDisabled"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000042",
+      "event_id": "e0000000-0000-0000-0000-000000000042",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000042",
+      "stream_position": 0
+    },
+    "event_hash": "878f2313533ff241211bd889c445f517c7505cf1c1bacce44af15d26884f5531",
+    "event_type": "StreamSealed",
+    "name": "StreamSealed",
+    "stored_envelope": {
+      "data": {
+        "actor_id": null,
+        "event_count": 4,
+        "final_event_hash": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "final_stream_position": 3,
+        "retention_policy_id": "00000000-0000-0000-0000-000000000000",
+        "sealed_stream_category": "authorization",
+        "sealed_stream_id": "authorization-00000000-0000-0000-0000-000000000000"
+      },
+      "type": "StreamSealed"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "timer",
+      "causation_id": "ca000000-0000-0000-0000-000000000043",
+      "correlation_id": "c0000000-0000-0000-0000-000000000043",
+      "event_id": "e0000000-0000-0000-0000-000000000043",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000043",
+      "stream_position": 0
+    },
+    "event_hash": "fab5a13d64ea9598de864a8cc2eaea60eee75746a8eb17c561adc99a9ea93be6",
+    "event_type": "RetentionPolicyCreated",
+    "name": "RetentionPolicyCreated",
+    "stored_envelope": {
+      "data": {
+        "Created": {
+          "created_at": "2026-10-20T18:39:48.150236863Z",
+          "id": "00000000-0000-0000-0000-000000000000",
+          "name": "retain-proxied-30d",
+          "predicate": {
+            "AgeExceeds": 2592000
+          },
+          "scope": "AllRepos"
+        }
+      },
+      "type": "RetentionPolicyCreated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "retention_scheduler",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000044",
+      "event_id": "e0000000-0000-0000-0000-000000000044",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000044",
+      "stream_position": 0
+    },
+    "event_hash": "cb5b48d04c8530c6607bd7bc4944c18c71a84bceee4bd9a4bdaaf369fe38f7d6",
+    "event_type": "RetentionPolicyUpdated",
+    "name": "RetentionPolicyUpdated",
+    "stored_envelope": {
+      "data": {
+        "Updated": {
+          "id": "00000000-0000-0000-0000-000000000000",
+          "predicate": {
+            "AgeExceeds": 5184000
+          },
+          "scope": "AllRepos",
+          "updated_at": "2026-10-20T18:39:48.150237011Z"
+        }
+      },
+      "type": "RetentionPolicyUpdated"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": "gitops/RetentionPolicyArchived.yaml",
+      "actor_spec_digest": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "actor_type": "gitops",
+      "causation_id": "ca000000-0000-0000-0000-000000000045",
+      "correlation_id": "c0000000-0000-0000-0000-000000000045",
+      "event_id": "e0000000-0000-0000-0000-000000000045",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000045",
+      "stream_position": 0
+    },
+    "event_hash": "aa202745c8fbf67d92691e9a8ff97b323333b7c50115442c312bcda8b6ed7de7",
+    "event_type": "RetentionPolicyArchived",
+    "name": "RetentionPolicyArchived",
+    "stored_envelope": {
+      "data": {
+        "Archived": {
+          "archived_at": "2026-10-20T18:39:48.150237147Z",
+          "by": "00000000-0000-0000-0000-000000000000",
+          "id": "00000000-0000-0000-0000-000000000000"
+        }
+      },
+      "type": "RetentionPolicyArchived"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": "a1000000-0000-0000-0000-000000000046",
+      "actor_source_file": null,
+      "actor_spec_digest": null,
+      "actor_type": "api",
+      "causation_id": null,
+      "correlation_id": "c0000000-0000-0000-0000-000000000046",
+      "event_id": "e0000000-0000-0000-0000-000000000046",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000000046",
+      "stream_position": 0
+    },
+    "event_hash": "caaa544128f1abc3b6b618806615d446e7af1ac6c825dd52afac1cb8a6526d43",
+    "event_type": "RetentionPolicyEvaluated",
+    "name": "RetentionPolicyEvaluated",
+    "stored_envelope": {
+      "data": {
+        "Evaluated": {
+          "evaluated_at": "2026-10-20T18:39:48.150237268Z",
+          "expired_count": 3,
+          "id": "00000000-0000-0000-0000-000000000000",
+          "matched_count": 7
+        }
+      },
+      "type": "RetentionPolicyEvaluated"
+    }
+  }
+]
