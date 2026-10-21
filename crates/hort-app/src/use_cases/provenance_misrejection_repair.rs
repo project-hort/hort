@@ -74,19 +74,38 @@
 //!    `ArtifactRejected`-only test would let one of those
 //!    verified-then-corrupted artifacts through and hand corrupt bytes
 //!    back to the release sweep.
-//! 3. a `ProvenanceVerified` on the stream — resolved via
-//!    [`read_path_provenance_clearance`], the single-source release-gate
-//!    helper. Called with `ProvenanceMode::Required` **literally**, not
-//!    with the repository's currently-active mode: the question is "does
-//!    this artifact's stream contradict its rejection?", which is a fact
-//!    about the stream. An operator loosening the policy afterwards must
-//!    not change whether the artifact was wrongly condemned — and under
-//!    any other mode the helper answers `NotRequired` without reading the
-//!    stream at all, which would prove nothing.
+//! 3. provenance evidence on the stream that this terminalisation was
+//!    never valid — resolved by [`provenance_rejection_evidence`] into
+//!    the domain's [`ProvenanceRejectionEvidence`]. **A disjunction of
+//!    two proofs**, because a provenance rejection can be entitled to no
+//!    terminal state for either of two reasons:
+//!
+//!    - a `ProvenanceVerified` is on the stream, which contradicts the
+//!      rejection outright. Resolved via [`provenance_clearance_from`],
+//!      the single-source release-gate helper, with
+//!      `ProvenanceMode::Required` passed **literally**, not with the
+//!      repository's currently-active mode: the question is "does this
+//!      artifact's stream contradict its rejection?", which is a fact
+//!      about the stream. An operator loosening the policy afterwards
+//!      must not change whether the artifact was wrongly condemned — and
+//!      under any other mode the helper answers `NotRequired` without
+//!      reading the stream at all, which would prove nothing.
+//!    - the stream's only provenance verdict is a
+//!      `ProvenanceRejected{Unsigned}`. That verdict is a statement about
+//!      a point in time and ADR 0039 D1 forbids it from ever being
+//!      terminal, so it needs no contradiction — it is invalid on its own
+//!      terms. This is the arm that reaches a descriptor which can never
+//!      carry a signature of its own, and for which the first arm's proof
+//!      can therefore never arrive.
+//!
+//!    Both refusals are load-bearing: a **positive disproof** on the
+//!    stream (a signature present and wrong) is terminal by D1/D4, and a
+//!    stream with no provenance verdict at all establishes nothing about
+//!    why the artifact is `Rejected`. See [`ProvenanceRejectionEvidence`].
 //!
 //! Conjunct 2 is evaluated first because it is the cheap, highly
 //! selective one: almost every `Rejected` artifact has a terminal event,
-//! so the clearance read is reached only by the few that do not.
+//! so the evidence scan is reached only by the few that do not.
 //!
 //! # Exit
 //!
@@ -95,9 +114,22 @@
 //! The original observation-window anchor rides the emitted
 //! `ArtifactQuarantined`, so the artifact lands back in front of the
 //! ordinary release sweep with an already-elapsed window, and the sweep
-//! applies the live scan / curation / provenance gates. For this
-//! population `read_path_provenance_clearance` already answers `Cleared`
-//! (conjunct 3 is exactly its input), so the next sweep tick releases it.
+//! applies the live scan / curation / provenance gates. **What happens
+//! next differs per arm, and both outcomes are the sweep's to decide:**
+//!
+//! - a contradicted rejection already resolves `Cleared` at the
+//!   provenance leg (the first arm's proof is exactly that helper's
+//!   input), so the next sweep tick releases it;
+//! - a never-terminal one resolves `Pending`, which denies the timer arm
+//!   of `Artifact::release` — so the sweep **holds** it indefinitely,
+//!   neither releasing nor re-rejecting, which is precisely D1's
+//!   prescribed treatment of an unsigned artifact. It can still leave the
+//!   hold the way D1 intends: its own verify, or the parent's
+//!   provenance-clearance cascade, which
+//!   `Artifact::cascade_provenance_clearance` refuses from `Rejected` and
+//!   admits from `Quarantined`. For a signature's own constituents that
+//!   cascade is the only exit there is, and the illegal terminal state was
+//!   what blocked it.
 
 use std::sync::Arc;
 
@@ -105,16 +137,18 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{
-    ProvenanceClearance, QuarantineStatus, TerminalRejectionRecord,
+    ProvenanceClearance, ProvenanceRejectionEvidence, QuarantineStatus, TerminalRejectionRecord,
 };
 use hort_domain::entities::scan_policy::ProvenanceMode;
 use hort_domain::events::{
-    Actor, ApiActor, ArtifactReEvaluated, DomainEvent, ReEvaluationTrigger, NO_POLICY,
+    Actor, ApiActor, ArtifactReEvaluated, DomainEvent, PersistedEvent, ReEvaluationTrigger,
+    NO_POLICY,
 };
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::curation_queue_repository::{CurationQueueFilter, CurationQueueRepository};
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend};
+use hort_domain::ports::provenance::ProvenanceRejectReason;
 
 use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
@@ -186,6 +220,56 @@ pub struct RepairReport {
     /// `CurationUseCase::block`: successful repairs are not rolled back
     /// (events are immutable).
     pub failed: Vec<(Uuid, String)>,
+}
+
+/// Resolve conjunct 3 over a stream the caller already holds: does this
+/// artifact's provenance evidence establish that its `Rejected` status
+/// records a verdict that was never entitled to be terminal?
+///
+/// The two accepting arms are the module docs' disjunction. The order is
+/// load-bearing in both directions:
+///
+/// - **The contradiction is tested first**, through
+///   [`provenance_clearance_from`] so this path cannot drift from the
+///   release gate's own reading of `Cleared`. A stream carrying both a
+///   verification and a disproof therefore classifies `Contradicted`,
+///   exactly as the release gate classifies it `Cleared` — and is refused
+///   at conjunct 2 regardless, because a disproof writes the
+///   `ArtifactRejected` companion.
+/// - **A positive disproof then wins over an `Unsigned`.** The scan
+///   returns on the first non-`Unsigned` reason rather than accumulating,
+///   which is what makes "`Unsigned` and nothing else" the condition:
+///   an `Unsigned` followed by a later disproof is a disproven artifact,
+///   not a misrejected one.
+///
+/// Binding the reason rather than enumerating it is deliberate here, and
+/// is the fail-closed direction: [`ProvenanceRejectReason`]'s own
+/// contract is that every variant is a positive disproof, with
+/// `Unsigned` the single exception ADR 0039 D1 carved out of it. A future
+/// variant is therefore a disproof by construction, and classifying it
+/// as one refuses the repair.
+fn provenance_rejection_evidence(stream: &[PersistedEvent]) -> ProvenanceRejectionEvidence {
+    if provenance_clearance_from(stream, ProvenanceMode::Required) == ProvenanceClearance::Cleared {
+        return ProvenanceRejectionEvidence::Contradicted;
+    }
+
+    // No verification on the stream, so the rejection's own reason is the
+    // only thing left that can disprove its terminality.
+    let mut unsigned_seen = false;
+    for persisted in stream {
+        if let DomainEvent::ProvenanceRejected(rejected) = &persisted.event {
+            match rejected.reason {
+                ProvenanceRejectReason::Unsigned => unsigned_seen = true,
+                disproof => return ProvenanceRejectionEvidence::Disproved(disproof),
+            }
+        }
+    }
+
+    if unsigned_seen {
+        ProvenanceRejectionEvidence::NeverTerminal
+    } else {
+        ProvenanceRejectionEvidence::NoVerdict
+    }
 }
 
 /// See the module docs.
@@ -326,10 +410,11 @@ impl ProvenanceMisrejectionRepairUseCase {
             return Ok(false);
         }
 
-        // Conjunct 3 — see the module docs on why `Required` is passed
-        // literally rather than resolved from the repository's policy.
-        let provenance = provenance_clearance_from(persisted, ProvenanceMode::Required);
-        if provenance != ProvenanceClearance::Cleared {
+        // Conjunct 3 — a disjunction of two proofs. See the module docs
+        // for both arms, and on why `Required` is passed literally
+        // rather than resolved from the repository's policy.
+        let provenance = provenance_rejection_evidence(persisted);
+        if !provenance.disproves_terminality() {
             return Ok(false);
         }
 
@@ -391,9 +476,10 @@ impl ProvenanceMisrejectionRepairUseCase {
             artifact_id = %artifact_id,
             actor_id = %actor.user_id,
             correlation_id = %correlation_id,
+            evidence = ?provenance,
             "repaired a provenance misrejection: Rejected with no ArtifactRejected on the \
-             stream, contradicted by a ProvenanceVerified — returned to Quarantined for the \
-             ordinary release sweep"
+             stream, and provenance evidence that the rejection was never entitled to be \
+             terminal — returned to Quarantined for the ordinary release sweep"
         );
         Ok(true)
     }

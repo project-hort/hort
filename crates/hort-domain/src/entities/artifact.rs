@@ -14,7 +14,9 @@ use crate::events::{
     ScanIndeterminate,
 };
 use crate::policy::ScanOutcome;
-use crate::ports::provenance::{ProvenanceOutcome, ProvenanceVerdict, SignerIdentity};
+use crate::ports::provenance::{
+    ProvenanceOutcome, ProvenanceRejectReason, ProvenanceVerdict, SignerIdentity,
+};
 use crate::types::ContentHash;
 
 // ---------------------------------------------------------------------------
@@ -763,6 +765,105 @@ pub fn has_terminal_rejection_event<'a>(events: impl IntoIterator<Item = &'a Dom
     events
         .into_iter()
         .any(|e| matches!(e, DomainEvent::ArtifactRejected(_)))
+}
+
+// ---------------------------------------------------------------------------
+// ProvenanceRejectionEvidence (ADR 0039's 2026-09-12 amendment, D1)
+// ---------------------------------------------------------------------------
+
+/// What an artifact's event stream says about whether its **provenance**
+/// rejection was entitled to be terminal at all — the third conjunct of
+/// [`Artifact::repair_provenance_misrejection`].
+///
+/// D1 splits the provenance verdicts in two. A **positive disproof** — a
+/// signature that is *present* and wrong — is a statement about the
+/// artifact, equally true at every later moment, and may be terminal. A
+/// `ProvenanceRejected{Unsigned}` is a statement about *a point in time*
+/// ("no signature had reached Hort when this verify ran"), which the very
+/// next second can falsify, and may **never** be terminal.
+///
+/// So a terminalisation is structurally invalid on this axis for either
+/// of two reasons, and the repair takes both: the stream *contradicts*
+/// the verdict ([`Contradicted`](Self::Contradicted)), or the verdict was
+/// never entitled to terminalise anything
+/// ([`NeverTerminal`](Self::NeverTerminal)). The other two variants are
+/// the refusals, kept apart because they refuse for different reasons and
+/// a reader who sees only one of them learns the wrong rule.
+///
+/// Resolved by the application layer from a stream read (the domain stays
+/// pure) and threaded in as a verified fact, mirroring
+/// [`TerminalRejectionRecord`] beside it and the [`ProvenanceClearance`]
+/// parameter on [`Artifact::release`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvenanceRejectionEvidence {
+    /// A [`DomainEvent::ProvenanceVerified`] is on the stream: the
+    /// artifact's own stream contradicts the rejection its status
+    /// records. The measured shape of the defect — the signature landed
+    /// ~5.1 s after the verify ran and was written to the same stream.
+    ///
+    /// Resolved from [`ProvenanceClearance::Cleared`] under
+    /// `ProvenanceMode::Required`, so it is the same predicate the
+    /// release gate reads, and it is tested **first**: a stream carrying
+    /// both a verification and a disproof classifies here, exactly as the
+    /// release gate's `Cleared` does, and is refused one conjunct earlier
+    /// anyway (a disproof writes the `ArtifactRejected` companion, so its
+    /// [`TerminalRejectionRecord`] is `Present`).
+    Contradicted,
+    /// The stream's **only** provenance verdict is a
+    /// [`DomainEvent::ProvenanceRejected`] whose reason is
+    /// [`ProvenanceRejectReason::Unsigned`] — the one verdict D1 forbids
+    /// from ever being terminal.
+    ///
+    /// There is nothing to contradict here, and nothing needs to be: the
+    /// rejection is invalid on its own terms. This arm is what reaches a
+    /// descriptor that can never carry a signature of its own — a cosign
+    /// signature's `application/vnd.oci.empty.v1+json` config, whose
+    /// bytes are the two-byte `{}` — for which
+    /// [`Contradicted`](Self::Contradicted)'s proof can never arrive.
+    ///
+    /// **"Only"** is load-bearing: an `Unsigned` followed by a later
+    /// disproof is not this population, and resolves to
+    /// [`Disproved`](Self::Disproved) instead.
+    ///
+    /// The population is closed. `Unsigned` has no producer left (see
+    /// [`ProvenanceRejectReason::Unsigned`]), so this arm can only ever
+    /// name streams written before that producer was removed.
+    NeverTerminal,
+    /// The stream carries a positive disproof — a signature that is
+    /// present and wrong. D1 permits exactly this to be terminal, so the
+    /// repair refuses it and carries the reason for the audit message.
+    ///
+    /// Reachable, not theoretical: a disproof written **before** the D6
+    /// companion existed carries its `ProvenanceRejected` alone, so its
+    /// [`TerminalRejectionRecord`] is `Absent` and conjunct 2 lets it
+    /// through to here. This arm is the only thing standing between a
+    /// historical forged-signature rejection and the release sweep.
+    Disproved(ProvenanceRejectReason),
+    /// No provenance verdict on the stream at all, and no verification
+    /// either — the shape the release gate reads as
+    /// [`ProvenanceClearance::Pending`].
+    ///
+    /// Refused, and for a different reason than
+    /// [`NeverTerminal`](Self::NeverTerminal): there is no verdict here
+    /// to classify as never-terminal, so nothing establishes that this
+    /// artifact's `Rejected` status came from the provenance axis at all.
+    /// Repairing on that would be repairing an unexplained rejection.
+    NoVerdict,
+}
+
+impl ProvenanceRejectionEvidence {
+    /// Does this evidence establish that the terminalisation was
+    /// structurally invalid — i.e. is it one of the two proofs the repair
+    /// accepts?
+    ///
+    /// The match is wildcard-free so a future variant must be classified
+    /// here before it compiles, rather than defaulting to either answer.
+    pub fn disproves_terminality(self) -> bool {
+        match self {
+            Self::Contradicted | Self::NeverTerminal => true,
+            Self::Disproved(_) | Self::NoVerdict => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1907,9 +2008,20 @@ impl Artifact {
     /// Hort when the verify ran was driven terminal — status `Rejected`,
     /// `rejection_reason = None`, and **no `ArtifactRejected` on the
     /// stream** (the provenance axis did not append one; see
-    /// [`Self::complete_provenance`]). The signature then landed and a
-    /// `ProvenanceVerified` was written to the same stream. The artifact
-    /// is therefore condemned by a verdict its own stream contradicts.
+    /// [`Self::complete_provenance`]). That verdict was never entitled to
+    /// terminalise anything (D1), and it stranded two populations:
+    ///
+    /// - the one where the signature **then landed**, writing a
+    ///   `ProvenanceVerified` to the same stream, so the artifact is
+    ///   condemned by a verdict its own stream contradicts; and
+    /// - the one where it never can — a descriptor that is itself part of
+    ///   a signature (the `application/vnd.oci.empty.v1+json` config,
+    ///   whose bytes are the two-byte `{}`) receives no signature of its
+    ///   own, ever, so no contradiction will arrive to be read. Here the
+    ///   rejection's own reason is the proof: `Unsigned` and nothing
+    ///   else on the stream.
+    ///
+    /// Both are reached, and only those two — see conjunct 3.
     ///
     /// [`Self::re_evaluate`] cannot help: its eligibility guard admits
     /// only a *scan-clearable* rejection, and it must keep refusing this
@@ -1931,19 +2043,58 @@ impl Artifact {
     ///    that companion existed carries an `ArtifactCorrupted` alone (see
     ///    [`TerminalRejectionRecord::CorruptionTombstone`] for why that
     ///    second shape still needs naming rather than being assumed away).
-    /// 3. `provenance == `[`ProvenanceClearance::Cleared`] — a
-    ///    `ProvenanceVerified` IS on the stream. **Without this an
-    ///    artifact that really was never signed would be released.**
-    ///    `NotRequired` is refused alongside `Pending`: it means "the
-    ///    stream was never consulted", which proves nothing about the
-    ///    evidence this repair depends on.
+    /// 3. `provenance.disproves_terminality()` — the provenance evidence
+    ///    on the stream establishes that this terminalisation was
+    ///    structurally invalid. **A disjunction of two proofs**
+    ///    (see [`ProvenanceRejectionEvidence`]), because a rejection can
+    ///    be entitled to no terminal state for either of two reasons:
+    ///    - [`Contradicted`](ProvenanceRejectionEvidence::Contradicted) —
+    ///      a `ProvenanceVerified` IS on the stream, so the stream
+    ///      contradicts the verdict outright; or
+    ///    - [`NeverTerminal`](ProvenanceRejectionEvidence::NeverTerminal)
+    ///      — the stream's only provenance verdict is a
+    ///      `ProvenanceRejected{Unsigned}`, a statement about a point in
+    ///      time, which ADR 0039 D1 forbids from ever being terminal.
+    ///
+    ///    **Without this conjunct a genuine provenance disproof would be
+    ///    in range** — a signature that is present and wrong is a
+    ///    statement about the artifact and D1 permits it to be terminal,
+    ///    and a disproof written before the D6 companion existed reaches
+    ///    conjunct 2 as `Absent`. Both refusals
+    ///    ([`Disproved`](ProvenanceRejectionEvidence::Disproved),
+    ///    [`NoVerdict`](ProvenanceRejectionEvidence::NoVerdict)) are
+    ///    load-bearing for that reason.
     ///
     /// Together the three are the machine-checkable statement of *"this
-    /// artifact was condemned by a verdict its own stream later
-    /// contradicts"*. Conjuncts 2 and 3 are stream facts, so the
-    /// application layer resolves them and passes them in as verified
+    /// artifact's status records a terminal provenance verdict that was
+    /// never entitled to be one"*. Conjuncts 2 and 3 are stream facts, so
+    /// the application layer resolves them and passes them in as verified
     /// facts — the same shape as [`ProvenanceClearance`] on
     /// [`Self::release`], keeping the domain pure.
+    ///
+    /// # Why the second arm does not release an unsigned artifact
+    ///
+    /// The first arm's safety is self-evident: the stream itself
+    /// contradicts the verdict. The second arm's rests on conjuncts 1
+    /// and 2 — a terminal status with no terminal event behind it, which
+    /// is D6's illegal state — **plus the hold that follows**, and not on
+    /// any evidence that the artifact was signed. It has none.
+    ///
+    /// That is sufficient because of the next paragraph's exit:
+    /// `Rejected -> Quarantined`, never `Released`. The artifact lands
+    /// back in front of the ordinary release sweep carrying its original
+    /// anchor, and the sweep applies the **live** gates. An artifact that
+    /// really was never signed resolves `Pending` at the provenance leg
+    /// of a `provenanceMode: required` repository's release gate, and
+    /// `Pending` denies the timer arm of [`Self::release`] — so the sweep
+    /// **holds** it: it neither releases nor re-rejects. That is exactly
+    /// D1's prescribed behaviour for an unsigned artifact, and it is the
+    /// sweep's job rather than this repair's. (Restoring the hold is also
+    /// what makes the provenance-clearance cascade reachable again:
+    /// [`Self::cascade_provenance_clearance`] refuses a `Rejected`
+    /// artifact, so for a constituent whose clearance can only ever come
+    /// from its parent, the illegal terminal state was the thing
+    /// blocking its one real exit.)
     ///
     /// # Why `Quarantined` and not `Released`
     ///
@@ -1967,7 +2118,7 @@ impl Artifact {
     pub fn repair_provenance_misrejection(
         &mut self,
         terminal_record: TerminalRejectionRecord,
-        provenance: ProvenanceClearance,
+        provenance: ProvenanceRejectionEvidence,
         now: DateTime<Utc>,
     ) -> DomainResult<ArtifactQuarantined> {
         if quarantine_transitions::allowed_targets(
@@ -2005,14 +2156,30 @@ impl Artifact {
             TerminalRejectionRecord::Absent => {}
         }
 
-        if provenance != ProvenanceClearance::Cleared {
-            return Err(DomainError::Invariant(format!(
-                "refusing to repair artifact {}: provenance clearance is {provenance:?}, \
-                 not Cleared — without a ProvenanceVerified on the stream there is nothing \
-                 contradicting the rejection, and an artifact that really was never signed \
-                 must stay held",
-                self.id
-            )));
+        match provenance {
+            // The two proofs — see `ProvenanceRejectionEvidence`.
+            ProvenanceRejectionEvidence::Contradicted
+            | ProvenanceRejectionEvidence::NeverTerminal => {}
+            ProvenanceRejectionEvidence::Disproved(reason) => {
+                return Err(DomainError::Invariant(format!(
+                    "refusing to repair artifact {}: its stream carries a positive \
+                     provenance disproof ({reason:?}) — a signature that is present and \
+                     wrong is a statement about the artifact, so that verdict is \
+                     entitled to be terminal (ADR 0039 D1/D4) and is not the illegal \
+                     state this repairs",
+                    self.id
+                )));
+            }
+            ProvenanceRejectionEvidence::NoVerdict => {
+                return Err(DomainError::Invariant(format!(
+                    "refusing to repair artifact {}: its stream carries no provenance \
+                     verdict at all and no ProvenanceVerified, so nothing establishes \
+                     that this rejection came from the provenance axis or that it was \
+                     never entitled to be terminal — an unexplained rejection stays as \
+                     it is",
+                    self.id
+                )));
+            }
         }
 
         self.quarantine_status = QuarantineStatus::Quarantined;
@@ -2229,10 +2396,11 @@ pub fn is_scan_clearable(reason: Option<&RejectionReason>) -> bool {
 /// A `Rejected` artifact with no recorded reason is the illegal state ADR
 /// 0039's 2026-09-12 amendment (D6) names — a terminal status with nothing
 /// on the stream to audit it by — not an open door. Its corrective exit is
-/// [`Artifact::repair_provenance_misrejection`], which proves the stream
-/// contradicts the rejection before undoing it; a release that guessed
-/// from an absent reason would override whatever axis actually condemned
-/// the artifact.
+/// [`Artifact::repair_provenance_misrejection`], which proves the
+/// terminalisation was structurally invalid before undoing it — and
+/// returns the artifact to the hold rather than releasing it; a release
+/// that guessed from an absent reason would override whatever axis
+/// actually condemned the artifact.
 pub fn is_curator_overridable(reason: Option<&RejectionReason>) -> bool {
     match reason {
         Some(RejectionReason::Scanner)
@@ -5996,7 +6164,7 @@ mod tests {
         let event = a
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Absent,
-                ProvenanceClearance::Cleared,
+                ProvenanceRejectionEvidence::Contradicted,
                 now,
             )
             .expect("the three-conjunct state is exactly what this repairs");
@@ -6021,7 +6189,7 @@ mod tests {
         let event = a
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Absent,
-                ProvenanceClearance::Cleared,
+                ProvenanceRejectionEvidence::Contradicted,
                 now,
             )
             .expect("an absent anchor is not a reason to refuse the repair");
@@ -6044,7 +6212,7 @@ mod tests {
         let err = a
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Present,
-                ProvenanceClearance::Cleared,
+                ProvenanceRejectionEvidence::Contradicted,
                 Utc::now(),
             )
             .expect_err("a real terminal rejection is not repairable");
@@ -6067,7 +6235,7 @@ mod tests {
         let err = a
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::CorruptionTombstone,
-                ProvenanceClearance::Cleared,
+                ProvenanceRejectionEvidence::Contradicted,
                 Utc::now(),
             )
             .expect_err("corrupt bytes are a genuine terminal condemnation");
@@ -6089,7 +6257,7 @@ mod tests {
         let err = a
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Present,
-                ProvenanceClearance::Cleared,
+                ProvenanceRejectionEvidence::Contradicted,
                 Utc::now(),
             )
             .expect_err("a scan rejection is a real verdict");
@@ -6097,31 +6265,136 @@ mod tests {
         assert_eq!(a, before);
     }
 
-    /// **The third conjunct's negative.** A `Rejected` artifact with no
-    /// terminal event but also no `ProvenanceVerified` — nothing on its
-    /// stream contradicts the rejection. Repairing it would release an
-    /// artifact that really was never signed.
+    /// **The third conjunct's second arm.** A `Rejected` artifact whose
+    /// only provenance verdict is a `ProvenanceRejected{Unsigned}` is
+    /// repaired on the strength of that reason alone — no
+    /// `ProvenanceVerified` is involved, and for this population none can
+    /// ever arrive. D1 forbids the verdict from being terminal, so the
+    /// status is an illegal state whatever else the stream says.
     #[test]
-    fn repair_refuses_without_a_provenance_verified_on_the_stream() {
-        for clearance in [
-            ProvenanceClearance::Pending,
-            ProvenanceClearance::NotRequired,
-        ] {
+    fn repair_returns_a_never_terminal_rejection_to_the_hold() {
+        let mut a = stranded_artifact();
+        let anchor = a.quarantine_window_start.expect("fixture sets the anchor");
+
+        let event = a
+            .repair_provenance_misrejection(
+                TerminalRejectionRecord::Absent,
+                ProvenanceRejectionEvidence::NeverTerminal,
+                Utc::now(),
+            )
+            .expect("a verdict that may never be terminal is repairable on its own terms");
+
+        assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+        assert_eq!(a.rejection_reason, None);
+        // Restored, not restarted — identical to the contradicted arm:
+        // the sweep must see an already-elapsed window either way.
+        assert_eq!(event.quarantine_window_start, anchor);
+    }
+
+    /// **The counter-assertion the whole decision rests on.** The second
+    /// arm keys on the `reason`, never on a `ProvenanceRejected` merely
+    /// being present: every other reason is a positive disproof — a
+    /// signature that is present and wrong — and D1/D4 permit exactly
+    /// those to be terminal.
+    ///
+    /// Without this the narrowing is gone and the arm becomes a
+    /// pass-through that walks a genuinely forged signature back into the
+    /// release path. It is reachable, not theoretical: a disproof written
+    /// before the D6 companion existed carries its `ProvenanceRejected`
+    /// alone, so conjunct 2 classifies it `Absent` and lets it reach
+    /// here.
+    #[test]
+    fn repair_refuses_every_positive_disproof_and_keys_on_the_reason() {
+        // Every variant of the vocabulary EXCEPT `Unsigned` — listed
+        // exhaustively (not filtered from a helper) so a new reject
+        // reason has to be classified here by hand.
+        let disproofs = [
+            ProvenanceRejectReason::UntrustedIdentity,
+            ProvenanceRejectReason::RekorNotFound,
+            ProvenanceRejectReason::CertChainInvalid,
+            ProvenanceRejectReason::BundleMalformed,
+            ProvenanceRejectReason::DigestMismatch,
+        ];
+        for reason in disproofs {
             let mut a = stranded_artifact();
             let before = a.clone();
             let err = a
                 .repair_provenance_misrejection(
                     TerminalRejectionRecord::Absent,
-                    clearance,
+                    ProvenanceRejectionEvidence::Disproved(reason),
                     Utc::now(),
                 )
-                .expect_err("no contradicting evidence, no repair");
+                .expect_err("a positive disproof is entitled to be terminal");
             assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
             assert!(
-                err.to_string().contains("Cleared"),
-                "message must name the missing conjunct, got: {err}"
+                err.to_string().contains("positive"),
+                "message must name what it is refusing, got: {err}"
             );
-            assert_eq!(a, before, "clearance {clearance:?} must not mutate");
+            assert!(
+                err.to_string().contains(&format!("{reason:?}")),
+                "message must name the disproof it read, got: {err}"
+            );
+            assert_eq!(a, before, "reason {reason:?} must not mutate");
+        }
+
+        // And the discriminating half: the SAME shape with `Unsigned`
+        // resolved instead is repaired. Asserted here rather than in a
+        // separate test so the two cannot drift apart — the arm's whole
+        // content is the difference between these two calls.
+        let mut a = stranded_artifact();
+        a.repair_provenance_misrejection(
+            TerminalRejectionRecord::Absent,
+            ProvenanceRejectionEvidence::NeverTerminal,
+            Utc::now(),
+        )
+        .expect("the Unsigned reason is the one D1 forbids from being terminal");
+        assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+    }
+
+    /// **The third conjunct's other negative.** A `Rejected` artifact
+    /// with no terminal event, no `ProvenanceVerified` and no provenance
+    /// verdict at all: nothing establishes that the rejection came from
+    /// the provenance axis, let alone that it was never entitled to be
+    /// terminal. Refused — and refused with a different message than the
+    /// disproof arm, because the two refuse for different reasons.
+    #[test]
+    fn repair_refuses_a_stream_with_no_provenance_verdict_at_all() {
+        let mut a = stranded_artifact();
+        let before = a.clone();
+        let err = a
+            .repair_provenance_misrejection(
+                TerminalRejectionRecord::Absent,
+                ProvenanceRejectionEvidence::NoVerdict,
+                Utc::now(),
+            )
+            .expect_err("no evidence, no repair");
+        assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("no provenance verdict at all"),
+            "message must name the missing evidence, got: {err}"
+        );
+        assert_eq!(a, before, "a refused repair must not mutate the artifact");
+    }
+
+    /// The accepting/refusing split is exactly the two proofs, over every
+    /// variant — the predicate the application layer branches on.
+    #[test]
+    fn provenance_rejection_evidence_disproves_terminality_for_the_two_proofs_only() {
+        assert!(ProvenanceRejectionEvidence::Contradicted.disproves_terminality());
+        assert!(ProvenanceRejectionEvidence::NeverTerminal.disproves_terminality());
+        assert!(!ProvenanceRejectionEvidence::NoVerdict.disproves_terminality());
+        for reason in [
+            ProvenanceRejectReason::Unsigned,
+            ProvenanceRejectReason::UntrustedIdentity,
+            ProvenanceRejectReason::RekorNotFound,
+            ProvenanceRejectReason::CertChainInvalid,
+            ProvenanceRejectReason::BundleMalformed,
+            ProvenanceRejectReason::DigestMismatch,
+        ] {
+            assert!(
+                !ProvenanceRejectionEvidence::Disproved(reason).disproves_terminality(),
+                "Disproved({reason:?}) must never read as a proof"
+            );
         }
     }
 
@@ -6145,7 +6418,7 @@ mod tests {
             let err = a
                 .repair_provenance_misrejection(
                     TerminalRejectionRecord::Absent,
-                    ProvenanceClearance::Cleared,
+                    ProvenanceRejectionEvidence::Contradicted,
                     Utc::now(),
                 )
                 .unwrap_err();
@@ -6168,7 +6441,7 @@ mod tests {
         let mut a = stranded_artifact();
         a.repair_provenance_misrejection(
             TerminalRejectionRecord::Absent,
-            ProvenanceClearance::Cleared,
+            ProvenanceRejectionEvidence::Contradicted,
             Utc::now(),
         )
         .expect("repair succeeds");

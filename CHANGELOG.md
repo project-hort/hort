@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The provenance-misrejection repair reaches a rejection no signature can
+  ever contradict.** `POST /api/v1/admin/quarantine/provenance-misrejections/repair`
+  now also returns an artifact whose only provenance verdict is an unsigned
+  rejection to the hold, which unblocks signature pushes that a stranded
+  `application/vnd.oci.empty.v1+json` descriptor was refusing; a repaired
+  artifact that nothing has verified holds rather than releasing, and a
+  present-but-invalid signature stays rejected (#359).
 - **The discovery versions endpoint admits a service-account caller.** A CI
   job holding the `read` grant can classify a withheld version through
   `GET /api/v1/repositories/{repo_key}/discovery/versions/{package}` instead
