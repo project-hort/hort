@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gitops apply drops every exclusion row it was told to drop, not only one per
   CVE and package pattern; and a worker whose job the abandoned-lease sweep
   handed on can no longer overwrite the worker now running it (#355).
+- **hort no longer accepts an outbound TLS certificate path through the
+  distrusted emSign intermediates** (RUSTSEC-2026-0381, -0382, -0383) (#356).
 
 ## [0.15.0] - 2026-10-18
 
