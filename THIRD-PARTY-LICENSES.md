@@ -184,7 +184,7 @@ the result instead.
 | fnv | 1.0.7 | MIT | https://github.com/servo/rust-fnv |
 | stable_deref_trait | 1.2.1 | MIT | https://github.com/storyyeller/stable_deref_trait |
 | stringprep | 0.1.5 | MIT | https://github.com/sfackler/rust-stringprep |
-| arc-swap | 1.9.2 | MIT | https://github.com/vorner/arc-swap |
+| arc-swap | 1.9.3 | MIT | https://github.com/vorner/arc-swap |
 | bytes-utils | 0.1.4 | MIT | https://github.com/vorner/bytes-utils |
 | h2 | 0.4.16 | MIT | https://github.com/hyperium/h2 |
 | http | 1.5.0 | MIT | https://github.com/hyperium/http |
@@ -478,7 +478,7 @@ the result instead.
 | spin | 0.10.1 | MIT | https://github.com/mvdnes/spin-rs.git |
 | spin | 0.9.9 | MIT | https://github.com/mvdnes/spin-rs.git |
 | tracing-core | 0.1.36 | MIT | https://github.com/tokio-rs/tracing |
-| zip | 9.0.3 | MIT | https://github.com/zip-rs/zip2 |
+| zip | 9.0.5 | MIT | https://github.com/zip-rs/zip2 |
 | typenum | 1.20.0 | MIT | https://github.com/paholg/typenum |
 | endian-type | 0.1.2 | MIT | https://github.com/Lolirofle/endian-type.git |
 | base64 | 0.21.7 | MIT | https://github.com/marshallpierce/rust-base64 |
@@ -9006,7 +9006,7 @@ SOFTWARE.
 
 ```
 
-### arc-swap 1.9.2 — MIT
+### arc-swap 1.9.3 — MIT
 
 Repository: https://github.com/vorner/arc-swap
 
@@ -17858,7 +17858,7 @@ SOFTWARE.
 
 ```
 
-### zip 9.0.3 — MIT
+### zip 9.0.5 — MIT
 
 Repository: https://github.com/zip-rs/zip2
 
