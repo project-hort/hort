@@ -50,7 +50,7 @@ the result instead.
 | curve25519-dalek | 4.1.3 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek |
 | sha1_smol | 1.0.1 | BSD-3-Clause | https://github.com/mitsuhiko/sha1-smol |
 | encoding_rs | 0.8.35 | BSD-3-Clause | https://github.com/hsivonen/encoding_rs |
-| webpki-roots | 1.0.7 | CDLA-Permissive-2.0 | https://github.com/rustls/webpki-roots |
+| webpki-roots | 1.0.10 | CDLA-Permissive-2.0 | https://github.com/rustls/webpki-roots |
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
 | untrusted | 0.7.1 | ISC | https://github.com/briansmith/untrusted |
@@ -70,7 +70,7 @@ the result instead.
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
 | simple_asn1 | 0.6.4 | ISC | https://github.com/acw/simple_asn1 |
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
-| rustls-webpki | 0.103.15 | ISC | https://github.com/rustls/webpki |
+| rustls-webpki | 0.103.16 | ISC | https://github.com/rustls/webpki |
 | aws-lc-rs | 1.18.2 | ISC | https://github.com/aws/aws-lc-rs |
 | aws-lc-sys | 0.46.0 | ISC | https://github.com/aws/aws-lc-rs |
 | dotenvy | 0.15.7 | MIT | https://github.com/allan2/dotenvy |
@@ -4687,7 +4687,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
-### webpki-roots 1.0.7 — CDLA-Permissive-2.0
+### webpki-roots 1.0.10 — CDLA-Permissive-2.0
 
 Repository: https://github.com/rustls/webpki-roots
 
@@ -5339,7 +5339,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 ```
 
-### rustls-webpki 0.103.15 — ISC
+### rustls-webpki 0.103.16 — ISC
 
 Repository: https://github.com/rustls/webpki
 
