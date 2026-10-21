@@ -17,20 +17,19 @@
 //!
 //! # Security posture
 //!
-//! - `GET .../discovery/versions/:package_name` requires an authenticated
-//!   principal carrying `TokenKind::CliSession`. PATs and service-account
-//!   tokens are rejected with `403 Forbidden`.
-//! - `POST .../prefetch` accepts `TokenKind::CliSession` **or**
-//!   `TokenKind::ServiceAccount` — a service-account caller is admitted
-//!   only if its resolved grants include `Permission::Read ∧
-//!   Permission::Prefetch` on the target repository (the same
-//!   `RbacEvaluator` path every other permission check uses). PATs are
-//!   still rejected. This is a deliberate divergence from the discovery
-//!   endpoint above: the CI prefetch caller is specified as a
-//!   read+prefetch-only, non-admin ServiceAccount bearer
-//!   (`docs/ci/hort-quarantine-integration.md`) — the prior blanket
-//!   CliSession-only gate on this endpoint was implementation drift from
-//!   that spec (issue #80).
+//! - Both routes accept `TokenKind::CliSession` **or**
+//!   `TokenKind::ServiceAccount`, and reject PATs with `403 Forbidden`.
+//!   They are the read and the write half of one CI job — the caller
+//!   `docs/ci/hort-quarantine-integration.md` specifies is a
+//!   read+prefetch-only, non-admin ServiceAccount bearer that prefetches
+//!   through the POST and classifies the result through the GET — so a
+//!   gate that admitted one and refused the other would refuse that job
+//!   half its own specification.
+//! - The token kind alone grants NO authority. A service-account caller is
+//!   admitted only if its resolved grants include `Permission::Read` on
+//!   the target repository for the GET, and `Permission::Read ∧
+//!   Permission::Prefetch` for the POST (the same `RbacEvaluator` path
+//!   every other permission check uses — no SA-specific logic).
 //!
 //! Both gates live inside the use case (per the architect-doc *"Emission
 //! by layer"* rule — business metrics emit at `hort-app`, not the inbound

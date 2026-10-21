@@ -26,13 +26,13 @@
 //! for unauthenticated callers and enforce visibility themselves via the
 //! use-case layer. `GET /repositories` has no token-kind restriction. The
 //! other three routes additionally apply a token-kind gate inside their use
-//! cases — NOT identical between them (issue #80): discovery-versions
-//! requires `TokenKind::CliSession` alone (PATs rejected); prefetch (both
-//! the POST that mints a job id and the GET that reads its outcome) accepts
-//! `CliSession` **or** a `ServiceAccount` token whose resolved grants
-//! include `Permission::Read ∧ Permission::Prefetch` on the target
-//! repository (see `hort_app::use_cases::self_service_prefetch_use_case`'s
-//! module docs and `docs/ci/hort-quarantine-integration.md` for why). The
+//! cases, and all three admit the same two kinds — `CliSession` or
+//! `ServiceAccount`, PATs rejected. What differs is the RBAC gate behind
+//! it: discovery-versions requires `Permission::Read` on the target
+//! repository; prefetch (both the POST that mints a job id and the GET that
+//! reads its outcome) requires `Permission::Read ∧ Permission::Prefetch`
+//! (see `hort_app::use_cases::self_service_prefetch_use_case`'s module docs
+//! and `docs/ci/hort-quarantine-integration.md` for why). The
 //! job-outcome GET applies the EXACT same token-kind + RBAC gate as the
 //! POST that minted the id — symmetry is load-bearing (ADR 0013's
 //! token-kind contract).

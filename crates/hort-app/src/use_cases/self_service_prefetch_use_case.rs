@@ -170,9 +170,11 @@ const OCI_UNSUPPORTED_MESSAGE: &str =
 // accepted here alongside CliSession; the RBAC gate immediately below (Gate 2)
 // is what actually authorizes it (Permission::Read ∧ Permission::Prefetch on
 // the resolved repository) — no separate SA-specific logic. PATs remain
-// rejected; the discovery/list-versions endpoint is untouched (see
-// `discovery_use_case.rs`, which still requires CliSession alone — the design
-// doc speaks only to prefetch).
+// rejected. The discovery/list-versions endpoint carries the same pair for
+// the same reason (`discovery_use_case.rs`): the two routes are the read and
+// the write half of one CI job, so they admit one identity, and widening
+// either one to PATs is a question about ADR 0013's token-kind hierarchy that
+// has to be answered for both at once.
 const TOKEN_KIND_DENIED_MESSAGE: &str =
     "this endpoint requires a CLI session or service-account token";
 

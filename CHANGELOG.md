@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The discovery versions endpoint admits a service-account caller.** A CI
+  job holding the `read` grant can classify a withheld version through
+  `GET /api/v1/repositories/{repo_key}/discovery/versions/{package}` instead
+  of being refused for its token kind; personal access tokens stay refused
+  (#358).
 - **An OCI push no longer fails against a rejected blob or manifest.** The
   pre-upload `HEAD` a pusher issues reports existence to a caller with granted
   Write; the content `GET` stays refused for everyone (#357).
