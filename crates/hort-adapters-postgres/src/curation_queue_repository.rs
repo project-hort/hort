@@ -83,6 +83,30 @@
 //! stream_position)`; LATERAL is one indexed lookup per artifact row
 //! and is bounded by `filter.limit`.
 //!
+//! ## `finding_count` / `max_severity` answer about the LAST scan
+//!
+//! `scan_findings` is per-scan history: every run writes its rows under a
+//! fresh `scan_id` and nothing removes the previous run's, so a reader
+//! that only filters on `artifact_id` summarises every scan the artifact
+//! ever had and its numbers grow with the rescan count. The findings
+//! LATERAL therefore carries `sf.detected_at = a.last_scan_at`, which
+//! selects exactly one scan's rows: every row of one scan shares the one
+//! `detected_at` the run was committed with.
+//!
+//! **The anchor is `artifacts.last_scan_at`, not anything inside
+//! `scan_findings`.** `PgArtifactLifecycle::commit_scan_result_with_score`
+//! writes `artifacts.last_scan_at` and inserts the per-finding rows in the
+//! SAME transaction, from the same `DateTime<Utc>` the rows' `detected_at`
+//! is bound from — so the anchor and the rows it selects can only ever
+//! agree. The newest `scan_id` *present in the table* would not work: a
+//! scan that found nothing writes no row at all, so a table-internal
+//! anchor hands back the previous, dirty run for an artifact that has
+//! since come clean. `last_scan_at` advances on that clean run, matches no
+//! row, and the artifact reads as clean — which is the point.
+//!
+//! A `last_scan_at` of NULL (never scanned) matches nothing, and
+//! `COALESCE(f.finding_count, 0)` renders that as a clean row.
+//!
 //! See `docs/architecture/how-to/curator-workflow.md` for operator guidance.
 
 use chrono::{DateTime, Utc};
@@ -138,7 +162,8 @@ impl PgCurationQueueRepository {
 ///   (tuple variants).
 /// - `f.finding_count` and `f.max_severity_rank` are the same
 ///   scan_findings projection as `patch_candidate_repo` — values 0–4
-///   inline mapping.
+///   inline mapping — scoped to the artifact's last scan by
+///   `sf.detected_at = a.last_scan_at` (see the module docs).
 /// - `LEFT JOIN` for findings + LATERAL so a row with no findings and no
 ///   rejection event still surfaces (e.g. `scan_indeterminate` rows).
 /// - `$1` = optional repository_id, `$2` = optional status text,
@@ -207,6 +232,11 @@ const QUEUE_SQL: &str = r#"
                             END)::int2 AS max_severity_rank
                     FROM scan_findings sf
                     WHERE sf.artifact_id = a.id
+                      -- The last scan's rows and nothing else. See the
+                      -- module docs: `artifacts.last_scan_at` is written in
+                      -- the same transaction as these rows, from the same
+                      -- value their `detected_at` carries.
+                      AND sf.detected_at = a.last_scan_at
                 ) f ON true
                 LEFT JOIN LATERAL (
                     -- Single-source extraction: pull the latest

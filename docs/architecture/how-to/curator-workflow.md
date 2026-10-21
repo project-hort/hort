@@ -170,6 +170,14 @@ hort-cli curation queue --status quarantined --repo npm-proxy
 # with --exclude-finding.
 ```
 
+`finding_count` and `max_severity` describe the artifact's **last** scan,
+which is the same scan the release verdict is derived from. A finding an
+earlier scan reported and a later one did not is not counted here — the
+row is in the queue because of what is true now, not because of what was
+ever true. Both read `0` / empty for an artifact that has never been
+scanned, which is a different situation: `scan_status` is what tells the
+two apart.
+
 **Issue the waive:**
 
 ```sh

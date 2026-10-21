@@ -4464,6 +4464,148 @@ mod tests {
         }
     }
 
+    /// Every per-finding row a scan commits carries `detected_at` equal
+    /// to the `last_scan_at` that SAME commit writes — on the
+    /// non-rejecting path.
+    ///
+    /// The two values land in one Postgres transaction
+    /// (`PgArtifactLifecycle::commit_scan_result_with_score` writes
+    /// `artifacts.last_scan_at` and inserts the rows), and three SQL
+    /// readers select an artifact's last scan by comparing the two
+    /// columns: the curation queue's finding summary, the patch-candidate
+    /// listing it orders by, and the retention evaluator's findings read.
+    /// That equality is minted HERE — one `now` feeds both
+    /// `build_scan_findings_rows`' `detected_at` and the lifecycle call's
+    /// `last_scan_at`. Split it into two clocks and those readers stop
+    /// matching any row at all: every artifact would read as clean,
+    /// including a rejected one.
+    #[tokio::test]
+    async fn scan_rows_carry_the_last_scan_at_they_commit_with_non_rejecting() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        // `high` under the default Critical threshold: findings are
+        // recorded, no rejection — the `handle_non_rejecting_verdict`
+        // commit site.
+        let severity = SeveritySummary {
+            critical: 0,
+            high: 2,
+            medium: 1,
+            low: 0,
+            negligible: 0,
+        };
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings_from_summary(&severity),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let commits = lifecycle.scan_result_commits();
+        assert_eq!(commits.len(), 1, "one scan, one commit");
+        let (last_scan_at, rows) = &commits[0];
+        assert_eq!(rows.len(), 3, "three findings, three projection rows");
+        for row in rows {
+            assert_eq!(
+                row.detected_at, *last_scan_at,
+                "a row whose detected_at differs from the commit's                  last_scan_at is unreachable by every last-scan-scoped read"
+            );
+        }
+        // And one scan is one `scan_id` across its rows.
+        let scan_ids: std::collections::BTreeSet<_> = rows.iter().map(|r| r.scan_id).collect();
+        assert_eq!(scan_ids.len(), 1);
+    }
+
+    /// The rejecting path's commit site makes the same pairing. Two
+    /// separate call sites pass the timestamp
+    /// (`handle_reject_verdict` and `handle_non_rejecting_verdict`), so
+    /// one test per site: a regression in either one silently empties the
+    /// last-scan reads for the artifacts that reached it.
+    #[tokio::test]
+    async fn scan_rows_carry_the_last_scan_at_they_commit_with_rejecting() {
+        let (uc, artifacts, _events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::High,
+        ));
+
+        let severity = SeveritySummary {
+            critical: 1,
+            high: 1,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        };
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings_from_summary(&severity),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Rejected,
+            "fixture must actually take the rejecting branch"
+        );
+        let commits = lifecycle.scan_result_commits();
+        assert_eq!(commits.len(), 1);
+        let (last_scan_at, rows) = &commits[0];
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row.detected_at, *last_scan_at);
+        }
+    }
+
+    /// A clean scan commits no projection row and still advances
+    /// `last_scan_at`.
+    ///
+    /// This is the half of the pairing that makes the SQL anchor
+    /// answerable: the anchor cannot live inside `scan_findings`, because
+    /// a scan that found nothing leaves nothing there to anchor on. The
+    /// timestamp advancing on an empty batch is what lets a reader tell
+    /// "this artifact came clean" from "this artifact has not been
+    /// rescanned".
+    #[tokio::test]
+    async fn a_clean_scan_advances_last_scan_at_with_no_rows() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let commits = lifecycle.scan_result_commits();
+        assert_eq!(commits.len(), 1);
+        let (_last_scan_at, rows) = &commits[0];
+        assert!(rows.is_empty(), "a clean scan writes no per-finding row");
+        assert_eq!(
+            lifecycle.last_scan_at_writes().len(),
+            1,
+            "and still advances the anchor"
+        );
+    }
+
     /// Repo-scoped policy wins over a global policy with conflicting
     /// thresholds. Repo-scoped sets High → reject; global sets Low.
     /// We expect the High threshold to apply (repo-scoped wins).

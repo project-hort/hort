@@ -84,11 +84,15 @@ pub struct PatchCandidate {
     pub vulnerable_artifact_id: Uuid,
     /// `artifacts.version` of the earlier released row.
     pub vulnerable_version: Option<String>,
-    /// `COUNT(*)` over `scan_findings` for the released row. The
-    /// LATERAL filter `finding_count > 0` guarantees this is >= 1
-    /// when the row surfaces.
+    /// `COUNT(*)` over the released row's **last** scan's `scan_findings`
+    /// rows. `scan_findings` is per-scan history, so this is deliberately
+    /// not the count over every scan that row ever had. The LATERAL filter
+    /// `finding_count > 0` guarantees this is >= 1 when the row surfaces —
+    /// which also means a predecessor whose findings a later scan
+    /// retracted is no longer offered as a patch target.
     pub vulnerable_finding_count: u32,
-    /// Highest severity in the released row's `scan_findings`. `None`
+    /// Highest severity in the released row's **last** scan — not the
+    /// highest it has ever carried. The listing orders by this. `None`
     /// is the type-level possibility for "no findings"; in practice
     /// the LATERAL filter prevents that.
     pub vulnerable_max_severity: Option<SeverityThreshold>,

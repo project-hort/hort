@@ -2741,6 +2741,16 @@ pub struct MockArtifactLifecycle {
     /// tests can assert the `last_scan_at` write
     /// landed.
     last_scan_at_writes: Mutex<Vec<(Uuid, DateTime<Utc>)>>,
+    /// `Vec<(last_scan_at, scan_findings_rows)>` — the same calls as
+    /// `last_scan_at_writes`, with the per-finding rows beside the
+    /// timestamp instead of in a separate snapshot.
+    ///
+    /// The two are one fact rather than two: the Postgres adapter writes
+    /// `artifacts.last_scan_at` and inserts these rows inside a single
+    /// transaction, and three SQL readers select an artifact's last scan
+    /// by comparing `scan_findings.detected_at` against that column. A
+    /// test that has to see the two together reads this.
+    scan_result_commits: Mutex<Vec<(DateTime<Utc>, Vec<ScanFindingsRow>)>>,
     /// Every `(artifact_id, sbom_components)` pair
     /// passed through `commit_scan_result_with_score`'s new SBOM arg.
     /// `None` (no SBOM extracted) records as `(artifact_id, None)`;
@@ -2806,6 +2816,7 @@ impl MockArtifactLifecycle {
             event_store: Mutex::new(None),
             scan_findings: Mutex::new(None),
             last_scan_at_writes: Mutex::new(Vec::new()),
+            scan_result_commits: Mutex::new(Vec::new()),
             score_deltas: Mutex::new(Vec::new()),
             sbom_replace_calls: Mutex::new(Vec::new()),
             ingest_enqueues: Mutex::new(Vec::new()),
@@ -2896,6 +2907,16 @@ impl MockArtifactLifecycle {
     /// asserting the denorm write happened use this snapshot.
     pub fn last_scan_at_writes(&self) -> Vec<(Uuid, DateTime<Utc>)> {
         self.last_scan_at_writes.lock().unwrap().clone()
+    }
+
+    /// Every `commit_scan_result_with_score` call's `(last_scan_at,
+    /// scan_findings_rows)` pair, in call order — the timestamp and the
+    /// rows it was committed beside, which the real adapter writes in one
+    /// transaction. Tests asserting that the two agree (the equality the
+    /// SQL last-scan anchor compares) read this rather than correlating
+    /// two snapshots.
+    pub fn scan_result_commits(&self) -> Vec<(DateTime<Utc>, Vec<ScanFindingsRow>)> {
+        self.scan_result_commits.lock().unwrap().clone()
     }
 
     /// Every `(repository_id, ScoreDelta)` passed to
@@ -3301,6 +3322,10 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
             .lock()
             .unwrap()
             .push((artifact.id, last_scan_at));
+        self.scan_result_commits
+            .lock()
+            .unwrap()
+            .push((last_scan_at, rows.clone()));
         // Record the SBOM-replace surface BEFORE
         // state mutation so tests asserting "no SBOM ⇒ no projection
         // write recorded" see the absence even when the rest of the
