@@ -91,7 +91,7 @@ use std::sync::Arc;
 use hort_adapters_scanner_trivy::{TrivyAdapter, TrivyConfig};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::{NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort};
+use hort_domain::ports::scanner::{NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit, ScannerPort};
 use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ByteRange, ContentHash, Finding};
@@ -182,7 +182,7 @@ async fn scan_fixture(
     let adapter = TrivyAdapter::new(config, Arc::new(FixtureStorage { bytes }));
     let hash = placeholder_hash();
     let target = ScanTarget {
-        content_hash: &hash,
+        unit: ScanUnit::Blob(&hash),
         format: match coords.format {
             RepositoryFormat::Maven => "maven",
             RepositoryFormat::Npm => "npm",

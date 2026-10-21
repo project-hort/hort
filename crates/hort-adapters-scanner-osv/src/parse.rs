@@ -37,7 +37,8 @@
 
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::types::{
-    collapse_alias_groups, is_informational_class, ComponentRelation, Finding, SeverityBasis,
+    collapse_alias_groups, is_informational_class, ComponentRelation, Finding, FindingStatement,
+    SeverityBasis,
 };
 use serde::Deserialize;
 
@@ -523,6 +524,13 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
         informational_class,
         severity_basis,
         component_relation: ComponentRelation::NotEstablished,
+        // This backend's whole input is the supplied SBOM — a component
+        // list, not a report over a materialised tree — so it read no
+        // section about a filesystem and has no side of ADR 0064 D2's
+        // line to state. `Unstated` condemns, which is the fail-closed
+        // reading of an unstated side and the only one available to a
+        // producer that looked at no filesystem.
+        statement: FindingStatement::Unstated,
     }
 }
 

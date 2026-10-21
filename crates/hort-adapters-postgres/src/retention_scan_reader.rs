@@ -23,7 +23,7 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::repo_security_score_repository::RepoSecurityScore;
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
-use hort_domain::types::{ComponentRelation, Finding, SeverityBasis};
+use hort_domain::types::{ComponentRelation, Finding, FindingStatement, SeverityBasis};
 
 use crate::BoxFuture;
 
@@ -96,6 +96,16 @@ impl FindingRow {
             // established one — and the fail-closed one: the finding
             // keeps the release authority it has today.
             component_relation: ComponentRelation::NotEstablished,
+            // Nor does it have one for what the finding's statement was
+            // about. The statement *does* persist in the CAS
+            // `findings_blob` — which is where every verdict path reads
+            // its findings from — but this projection predates it and has
+            // no column, so `Unstated` is the honest reading here and the
+            // fail-closed one: nothing in these rows recorded a side, and
+            // an unstated side condemns. The retention evaluator is the
+            // only consumer of this port and takes no release decision,
+            // so the reading costs nothing beyond what it says.
+            statement: FindingStatement::Unstated,
         })
     }
 }

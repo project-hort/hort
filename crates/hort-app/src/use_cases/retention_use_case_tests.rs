@@ -127,6 +127,7 @@ fn finding(sev: SeverityThreshold, cvss: Option<f32>, fixed: Vec<&str>) -> Findi
         informational_class: None,
         severity_basis: hort_domain::types::SeverityBasis::Assessed,
         component_relation: ComponentRelation::NotEstablished,
+        statement: hort_domain::types::FindingStatement::Unstated,
     }
 }
 

@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use hort_domain::entities::scan_policy::{NegligibleAction, ScanEnforcement, SeverityThreshold};
+use hort_domain::entities::scan_policy::{
+    CompositeVerdictMode, NegligibleAction, ScanEnforcement, SeverityThreshold,
+};
 use hort_domain::events::ApiActor;
 use hort_domain::policy::scan::DefaultPolicy;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
@@ -46,6 +48,13 @@ pub struct EffectiveScanPolicyView {
     pub scan_backends: Vec<String>,
     pub enforcement: ScanEnforcement,
     pub negligible_action: NegligibleAction,
+    /// Whether a composed OCI image's scan verdict decides its
+    /// manifest's release (ADR 0064 D6). Carried here for the reason
+    /// every other field is: this read exists so an operator can see
+    /// what the release path actually enforces, and since promotion the
+    /// composite verdict is one of the things it does. Resolves to
+    /// [`CompositeVerdictMode::Observed`] when no policy is bound.
+    pub composite_verdict_mode: CompositeVerdictMode,
     pub quarantine_duration_secs: i64,
 }
 
@@ -93,6 +102,7 @@ impl EffectiveRepositoryConfigUseCase {
                 scan_backends: p.scan_backends,
                 enforcement: p.enforcement,
                 negligible_action: p.negligible_action,
+                composite_verdict_mode: p.composite_verdict_mode,
                 quarantine_duration_secs: p.quarantine_duration_secs,
             },
             None => EffectiveScanPolicyView {
@@ -102,6 +112,7 @@ impl EffectiveRepositoryConfigUseCase {
                 scan_backends: DefaultPolicy::block_on_critical_default_backends(),
                 enforcement: DefaultPolicy::enforcement(),
                 negligible_action: DefaultPolicy::negligible_action(),
+                composite_verdict_mode: DefaultPolicy::composite_verdict_mode(),
                 quarantine_duration_secs: DefaultPolicy::quarantine_duration_secs(),
             },
         };
@@ -119,7 +130,7 @@ impl EffectiveRepositoryConfigUseCase {
 mod tests {
     use chrono::Utc;
     use hort_domain::entities::scan_policy::{
-        ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+        CompositeVerdictMode, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::error::DomainError;
     use hort_domain::events::PolicyScope;
@@ -148,6 +159,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Warn,
             enforcement: ScanEnforcement::Record,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -175,8 +187,37 @@ mod tests {
         assert_eq!(view.enforcement, DefaultPolicy::enforcement());
         assert_eq!(view.negligible_action, DefaultPolicy::negligible_action());
         assert_eq!(
+            view.composite_verdict_mode,
+            DefaultPolicy::composite_verdict_mode()
+        );
+        assert_eq!(
             view.quarantine_duration_secs,
             DefaultPolicy::quarantine_duration_secs()
+        );
+    }
+
+    /// The read exists so an operator can see what the release path
+    /// actually enforces, and since ADR 0064 D6 the composed-image
+    /// verdict is one of the things it does — so a promoted policy has
+    /// to be visible here, not only in the YAML the operator wrote.
+    #[tokio::test]
+    async fn effective_scan_policy_surfaces_a_promoted_composite_verdict() {
+        let repo_id = Uuid::new_v4();
+        let mut p = projection(PolicyScope::Repository(repo_id));
+        p.composite_verdict_mode = CompositeVerdictMode::Promoted;
+        let projections = Arc::new(MockPolicyProjectionRepository::new());
+        projections.insert(p);
+        let uc = EffectiveRepositoryConfigUseCase::new(projections);
+
+        let view = uc
+            .effective_scan_policy(api_actor(), admin_privileges(), repo_id)
+            .await
+            .expect("admin happy path");
+
+        assert_eq!(
+            view.composite_verdict_mode,
+            CompositeVerdictMode::Promoted,
+            "a posture that gates release must be readable from the effective-config read"
         );
     }
 

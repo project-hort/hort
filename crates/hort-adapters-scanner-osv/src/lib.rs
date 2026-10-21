@@ -607,7 +607,7 @@ mod tests {
         coords: &'a hort_domain::types::ArtifactCoords,
     ) -> ScanTarget<'a> {
         ScanTarget {
-            content_hash: hash,
+            unit: hort_domain::ports::scanner::ScanUnit::Blob(hash),
             format: "npm",
             coords,
             kind: hort_domain::types::ArtifactKind::NpmTarball,

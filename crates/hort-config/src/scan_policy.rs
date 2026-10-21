@@ -15,7 +15,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use hort_domain::entities::scan_policy::{
-    NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold, SignerIdentityPattern,
+    CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
+    SignerIdentityPattern,
 };
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +135,27 @@ pub struct ScanPolicySpec {
     /// are persisted, and the artifact is not rejected.
     #[serde(default = "default_enforcement")]
     pub enforcement: String,
+    /// Whether a composed OCI image's scan verdict decides its
+    /// manifest's release (`observed | promoted`). Validated via
+    /// [`CompositeVerdictMode::FromStr`] in [`validate_scan_policy`].
+    /// Defaults to `observed` when omitted — the behaviour of every
+    /// policy that predates the field, so an existing tree needs no
+    /// migration.
+    ///
+    /// Under `observed` the composition is still resolved, acquired,
+    /// scanned and recorded as an observation; what the field grants is
+    /// release authority over the manifest. Promotion is an operator act
+    /// against named criteria (ADR 0064 D6) because a composite verdict
+    /// adds rejections across an existing estate and a rejection is
+    /// terminal.
+    ///
+    /// `promoted` with an empty `scanBackends` is an apply-time reject:
+    /// a waived scan returns before a composition is resolved, so no
+    /// manifest ever carries a composite assessment for the promotion to
+    /// act on (ADR 0015 / ADR 0016 — see
+    /// [`validate_scan_policy_promoted_composite_requires_scan_backends`](crate::desired::validate_scan_policy_promoted_composite_requires_scan_backends)).
+    #[serde(default = "default_composite_verdict_mode")]
+    pub composite_verdict_mode: String,
 }
 
 /// Out-of-the-box `scanBackends` default when the YAML omits the
@@ -196,6 +218,14 @@ fn default_negligible_action() -> String {
 /// Mirrors [`ScanEnforcement::default`].
 fn default_enforcement() -> String {
     ScanEnforcement::default().to_string()
+}
+
+/// Out-of-the-box `compositeVerdictMode` default when the YAML omits
+/// the field: `observed`, the no-release-authority default every
+/// pre-existing policy behaves as. Mirrors
+/// [`CompositeVerdictMode::default`].
+fn default_composite_verdict_mode() -> String {
+    CompositeVerdictMode::default().to_string()
 }
 
 /// Parse one `ScanPolicy` envelope.
@@ -322,6 +352,23 @@ pub fn validate_scan_policy(env: &Envelope<ScanPolicySpec>) -> Vec<ValidationErr
             field: "spec.enforcement",
             got: env.spec.enforcement.clone(),
             expected: vec!["reject", "record"],
+        });
+    }
+
+    // `compositeVerdictMode` parses via the domain enum. An unknown
+    // value is a typed reject naming the field and the two valid values
+    // — mirrors `enforcement`, and for the same reason: the mode is
+    // enforced at runtime by the scan orchestrator's composite path, so
+    // silently defaulting a typo to `observed` would tell an operator
+    // their composed-image verdicts gate release while nothing gates
+    // (ADR 0015). The `promoted` × empty-`scanBackends` combination is a
+    // separate, cross-field rule and belongs to the apply-time linter
+    // row, not here.
+    if CompositeVerdictMode::from_str(&env.spec.composite_verdict_mode).is_err() {
+        errors.push(ValidationError::UnknownEnumValue {
+            field: "spec.compositeVerdictMode",
+            got: env.spec.composite_verdict_mode.clone(),
+            expected: vec!["observed", "promoted"],
         });
     }
 
@@ -777,6 +824,87 @@ mod tests {
                 s.contains("enforcement") && s.contains("recrod")
             }),
             "a near-miss enforcement value must reject loudly: {errors:?}"
+        );
+    }
+
+    // `compositeVerdictMode` round-trip + default + validation
+    // (ADR 0064 D6).
+    #[test]
+    fn parse_round_trips_explicit_composite_verdict_mode_promoted() {
+        let body = "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  compositeVerdictMode: promoted
+  licensePolicy: {}
+";
+        let env = parse_scan_policy(&p(), yaml("with-composite", body).as_bytes()).unwrap();
+        assert_eq!(env.spec.composite_verdict_mode, "promoted");
+        assert!(validate_scan_policy(&env).is_empty());
+    }
+
+    #[test]
+    fn parse_omitted_composite_verdict_mode_defaults_to_observed() {
+        // Zero-migration guarantee: an existing policy file that never
+        // mentions `compositeVerdictMode` parses to the no-authority
+        // default, so every deployed tree keeps gating exactly what it
+        // gates today — promotion is an operator act, never something a
+        // release performs on their behalf (ADR 0064 D6).
+        let body = "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: false
+  licensePolicy: {}
+";
+        let env = parse_scan_policy(&p(), yaml("default-composite", body).as_bytes()).unwrap();
+        assert_eq!(env.spec.composite_verdict_mode, "observed");
+        assert!(validate_scan_policy(&env).is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_composite_verdict_mode() {
+        let body = "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: false
+  compositeVerdictMode: enforce
+  licensePolicy: {}
+";
+        let env = parse_scan_policy(&p(), yaml("p", body).as_bytes()).unwrap();
+        let errors = validate_scan_policy(&env);
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::UnknownEnumValue { field, got, expected }
+                if *field == "spec.compositeVerdictMode"
+                    && got == "enforce"
+                    && *expected == vec!["observed", "promoted"]
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_near_miss_composite_verdict_mode_typo() {
+        // The footgun: a typo that silently defaulted to `observed`
+        // would leave an operator believing their composed-image
+        // verdicts gate release while nothing gates.
+        let body = "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: false
+  compositeVerdictMode: promotd
+  licensePolicy: {}
+";
+        let env = parse_scan_policy(&p(), yaml("p", body).as_bytes()).unwrap();
+        let errors = validate_scan_policy(&env);
+        assert!(
+            errors.iter().any(|e| {
+                let s = e.to_string();
+                s.contains("compositeVerdictMode") && s.contains("promotd")
+            }),
+            "a near-miss composite verdict mode must reject loudly: {errors:?}"
         );
     }
 

@@ -21,6 +21,11 @@ pub mod authority_lifecycle;
 pub mod checkpoint_anchor;
 pub mod checkpoint_emitter;
 pub mod claim_mapping_repository;
+// The shadow composite-scan observation projection (ADR 0064 D6): the
+// durable evidence an operator promotes the composed verdict on. A
+// projection and not an event, because the artifact's event stream is
+// where release authority is derived from.
+pub mod composite_scan_observation;
 pub mod constituent_status;
 pub mod content_reference_index;
 // Three curation read-surface ports that `CurationUseCase` holds as

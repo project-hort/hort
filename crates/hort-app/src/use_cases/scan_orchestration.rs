@@ -35,10 +35,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
-use hort_domain::entities::scan_policy::SeverityThreshold;
+use hort_domain::entities::scan_policy::{
+    ExclusionProjection, ScanPolicyProjection, SeverityThreshold,
+};
 use hort_domain::error::DomainError;
 use hort_domain::events::ScanAssessment;
-use hort_domain::policy::scan::DefaultPolicy;
+use hort_domain::policy::scan::{composite_verdict_mode_of, DefaultPolicy};
 use hort_domain::ports::advisory::AdvisoryPort;
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
@@ -47,10 +49,12 @@ use hort_domain::ports::jobs_repository::{JobsRepository, ScanJob};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scanner::{
-    EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort,
+    EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit, ScannerPort,
     SCAN_REPORT_TOO_LARGE_MARKER,
 };
 use hort_domain::ports::storage::StoragePort;
+use hort_domain::ports::upstream_proxy::UpstreamProxy;
+use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::types::{
     severity_label, ArtifactCoords, ArtifactKind, ComponentRelation, Finding, PayloadAccess, Sbom,
 };
@@ -70,8 +74,13 @@ use crate::result_write_fence::surface_result_write;
 // the number and the window it spans cannot diverge again.
 use crate::retry_backoff::compute_backoff;
 use crate::scanning::any_scan_backend_applies_to;
+use crate::use_cases::composite_scan::{
+    CompositeDisposition, CompositeScan, CompositeVerdict, ShadowObservationSink,
+    COMPOSITE_CONTRIBUTOR,
+};
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
+use crate::use_cases::scan_kind_resolution::scan_kind_of;
 
 /// True when a scanner backend's error
 /// is the distinguishable "report exceeded cap" failure (the adapter
@@ -196,6 +205,18 @@ pub enum ScanRunOutcome {
         /// case (no backend produced output) is impossible: we land on
         /// `Failed` instead.
         scanner: String,
+        /// What this artifact's own format handler said its bytes are,
+        /// resolved once by the run that produced `findings`.
+        ///
+        /// Carried on the outcome rather than re-resolved by
+        /// `record_outcome`, because it is an input to the verdict
+        /// `QuarantineUseCase::record_scan_result` computes over those
+        /// same findings (ADR 0064 D2, via
+        /// `Finding::may_condemn_artifact`). A second resolution would be
+        /// a second answer about one run: the scanner materialised the
+        /// payload under this kind, and a verdict taken under a different
+        /// one would be judging a different artifact.
+        kind: ArtifactKind,
         /// Deduplicated findings in scanner-emit order.
         findings: Vec<Finding>,
         /// Whether a package surface was examined, or there was none to
@@ -217,7 +238,16 @@ pub enum ScanRunOutcome {
     },
     /// Policy declared no scan backends — emit a clean
     /// `ScanCompleted(0)` and complete the job.
-    SkippedNoBackends,
+    ///
+    /// Carries the artifact's `kind` for [`Self::Completed`]'s reason:
+    /// this arm records a scan result too, so it reaches the verdict
+    /// function, and the kind is one of that function's inputs. There is
+    /// nothing in a waived scan for it to decide — the finding list is
+    /// empty — but supplying a placeholder here would put a
+    /// release-authority input in the orchestrator's gift rather than the
+    /// handler's, which is exactly what the next arm to grow a finding
+    /// list would inherit.
+    SkippedNoBackends { kind: ArtifactKind },
     /// Every configured backend ran without error and **none of them
     /// produced a verdict**: each reported it had nothing to analyse
     /// (`ScanAnalysis::NothingAnalysable`), and at least one of those
@@ -285,9 +315,29 @@ pub struct ScanOrchestrationUseCase {
     /// time since it shipped; this field puts the SBOM path on the same
     /// footing).
     storage: Arc<dyn StoragePort>,
+    /// Upstream blob fetch for the composite path's constituent
+    /// acquisition. A composed OCI image is the scan unit of a manifest
+    /// (ADR 0064 D1), and for a **pull-through** manifest the layers that
+    /// composition names are routinely not local — the client pull that
+    /// would warm them begins with the manifest whose verdict is being
+    /// gated, so waiting is not available. Reached only from the composite
+    /// path, and only for a repository whose configuration names an
+    /// upstream; every other scan costs no upstream round-trip.
+    upstream_proxy: Arc<dyn UpstreamProxy>,
+    /// Establishes whether the scanned artifact's repository has an
+    /// upstream for its name, from the same configuration a client pull of
+    /// that name would resolve through. A hosted repository resolves to
+    /// nothing, and an absent constituent there is a real refusal.
+    upstream_resolver: Arc<dyn UpstreamResolver>,
     scanners: HashMap<String, Arc<dyn ScannerPort>>,
     handlers: HashMap<String, Arc<dyn FormatHandler>>,
     quarantine: Arc<QuarantineUseCase>,
+    /// Where the composite path's shadow assessment leaves its durable
+    /// evidence (ADR 0064 D6). A sink and not the projection's
+    /// repository: the orchestrator is what commits the artifact's own
+    /// scan result, and nothing that decides release may hold a handle
+    /// on a table of shadow verdicts.
+    observations: Arc<ShadowObservationSink>,
     config: ScanOrchestrationConfig,
 }
 
@@ -301,9 +351,12 @@ impl ScanOrchestrationUseCase {
         policy_projections: Arc<dyn PolicyProjectionRepository>,
         advisory: Arc<dyn AdvisoryPort>,
         storage: Arc<dyn StoragePort>,
+        upstream_proxy: Arc<dyn UpstreamProxy>,
+        upstream_resolver: Arc<dyn UpstreamResolver>,
         scanners: HashMap<String, Arc<dyn ScannerPort>>,
         handlers: HashMap<String, Arc<dyn FormatHandler>>,
         quarantine: Arc<QuarantineUseCase>,
+        observations: Arc<ShadowObservationSink>,
         config: ScanOrchestrationConfig,
     ) -> Self {
         Self {
@@ -314,9 +367,12 @@ impl ScanOrchestrationUseCase {
             policy_projections,
             advisory,
             storage,
+            upstream_proxy,
+            upstream_resolver,
             scanners,
             handlers,
             quarantine,
+            observations,
             config,
         }
     }
@@ -357,6 +413,42 @@ impl ScanOrchestrationUseCase {
         // Step 1: load the artifact.
         let artifact = self.artifacts.find_by_id(job.artifact_id).await?;
 
+        // Two things only the artifact's own format handler can answer,
+        // both off this registry under this one key — and resolved HERE,
+        // before any arm can return, because `kind` is an input to the
+        // verdict every arm that records one reaches: an
+        // operator-waived scan (`SkippedNoBackends`) records a result
+        // too, and a default supplied for it would be a release-authority
+        // decision taken by this function rather than by the artifact's
+        // handler.
+        //
+        // `kind` goes through `scan_kind_of` rather than this `handler`
+        // binding, which costs a second `HashMap` read and buys the thing
+        // that matters: the policy re-evaluation paths resolve the kind
+        // through the same helper, so a verdict re-taken over an
+        // artifact's stored findings cannot read a different role for the
+        // row than this run read.
+        //
+        // `kind` — what the bytes are, so an adapter can materialise them
+        // the way its analyzers expect: a content scanner selects
+        // analyzers by file name and directory layout, and a bare content
+        // hash cannot answer "under what name?". It is also the role half
+        // of ADR 0064 D2's line, which `Finding::may_condemn_artifact`
+        // spends at the verdict. `Other` when no handler is registered
+        // for the format — the honest "no materialisation applies"
+        // answer, and a non-constituent, so every finding keeps its
+        // authority rather than a guess letting an unexamined artifact
+        // look clean.
+        //
+        // `payload_contains_components` — whether the payload carries the
+        // code of the components its BOM lists, which is what decides
+        // whether a finding against a non-subject component is about this
+        // artifact at all (ADR 0056). With no handler registered the
+        // trait's fail-closed default applies: no evidence was gathered
+        // that would take authority away from a finding.
+        let handler = self.handlers.get(&job.format);
+        let kind = scan_kind_of(&self.handlers, &job.format, &artifact);
+
         // Step 2: resolve active policy and derive backends.
         // Backend selection lives on the policy
         // projection. Resolution order:
@@ -379,7 +471,7 @@ impl ScanOrchestrationUseCase {
                     artifact_id = %artifact.id,
                     "scan skipped — policy declares empty scanBackends list",
                 );
-                return Ok(ScanRunOutcome::SkippedNoBackends);
+                return Ok(ScanRunOutcome::SkippedNoBackends { kind });
             }
             None => DefaultPolicy::block_on_critical_default_backends(),
         };
@@ -394,8 +486,29 @@ impl ScanOrchestrationUseCase {
                 artifact_id = %artifact.id,
                 "scan skipped — resolved backend list is empty",
             );
-            return Ok(ScanRunOutcome::SkippedNoBackends);
+            return Ok(ScanRunOutcome::SkippedNoBackends { kind });
         }
+
+        // The resolved composite-verdict posture for this repository
+        // (ADR 0064 D6). Read once, from the policy just resolved, and
+        // spent twice below — on the log level an abstention earns, and on
+        // the partition that decides whether an abstention holds the
+        // artifact. Both are the same question about the same run, so a
+        // second resolution would be a second answer.
+        //
+        // What it decides for a **constituent** is ADR 0064 D2's
+        // loosening: an OCI layer's filesystem is assessed as part of the
+        // composition that binds it, so an absence of *that* assessment —
+        // "I have no decoder for this container" — is the composition's
+        // business and not the layer's. The derivation that pairs the
+        // posture with the row's kind lives in
+        // `NotAnalysable::gates_release`; the finding side pairs the same
+        // two inputs in `Finding::may_condemn_artifact`, which the
+        // consumer reaches through `evaluate_scan_result` with the `kind`
+        // resolved above — so an absent assessment and a finding over the
+        // same surface cannot disagree about whether this row is a
+        // constituent.
+        let composite_verdict = composite_verdict_mode_of(policy.as_ref());
 
         // Step 3-5: extract SBOM via the format handler (best-effort).
         let subject = self.subject_for_artifact(&artifact).await?;
@@ -403,25 +516,6 @@ impl ScanOrchestrationUseCase {
             .try_extract_sbom(&artifact, &subject, &job.format)
             .await;
 
-        // Two things only the artifact's own format handler can answer,
-        // resolved from the single lookup both need.
-        //
-        // `kind` — what the bytes are, so an adapter can materialise them
-        // the way its analyzers expect: a content scanner selects
-        // analyzers by file name and directory layout, and a bare content
-        // hash cannot answer "under what name?". `Other` when no handler
-        // is registered for the format, which is the honest "no
-        // materialisation applies" answer rather than a guess that would
-        // let an unexamined artifact look clean.
-        //
-        // `payload_contains_components` — whether the payload carries the
-        // code of the components its BOM lists, which is what decides
-        // whether a finding against a non-subject component is about this
-        // artifact at all (ADR 0056). With no handler registered the
-        // trait's fail-closed default applies: no evidence was gathered
-        // that would take authority away from a finding.
-        let handler = self.handlers.get(&job.format);
-        let kind = handler.map_or(ArtifactKind::Other, |h| h.scan_kind(&artifact));
         let relations = ComponentRelations {
             sbom: sbom.as_ref(),
             payload_contains_components: handler.is_none_or(|h| h.payload_contains_components()),
@@ -453,7 +547,7 @@ impl ScanOrchestrationUseCase {
         };
 
         let target = ScanTarget {
-            content_hash: &artifact.sha256_checksum,
+            unit: ScanUnit::Blob(&artifact.sha256_checksum),
             format: &job.format,
             coords: &subject.coords,
             kind,
@@ -569,7 +663,7 @@ impl ScanOrchestrationUseCase {
                     // asks nothing of anyone, so it is `debug!`: warning
                     // once per blob would bury the actionable half.
                     // Per-artifact detail stays on the span either way.
-                    if why.gates_release() {
+                    if why.gates_release(kind, composite_verdict) {
                         tracing::warn!(
                             artifact_id = %artifact.id,
                             scanner = backend,
@@ -617,6 +711,179 @@ impl ScanOrchestrationUseCase {
                 }
             }
         }
+        // The composed-image assessment (ADR 0064 D1). It is produced,
+        // mapped, logged and recorded on every manifest scan; whether it
+        // reaches the artifact is the resolved policy's
+        // `composite_verdict_mode` (ADR 0064 D6). Under `observed` — the
+        // default, and every policy that predates the field — the
+        // returned verdict is `Withheld` and this run's outcome is
+        // byte-for-byte what it would be with no composite path at all.
+        // Under `promoted` the composition's answer joins the loop's own
+        // bookkeeping below, which is the path the manifest's verdict
+        // already takes; nothing reads the observation projection to
+        // decide anything, which is what keeps that table a measurement
+        // surface. Only an OCI image manifest has a composition; every
+        // other row returns immediately.
+        //
+        // Placed after the loop so it cannot perturb what the loop
+        // *produced*, and before the partition below because that
+        // partition is where a promoted composition's answer has to be
+        // counted: an image manifest's own bytes carry no package
+        // surface, so without the fold every promoted manifest would
+        // take the partition's not-applicable early return no matter
+        // what the composition said.
+        //
+        // The assessment leaves a durable row (ADR 0064 D6): a `tracing`
+        // line reaches a log aggregator if one is configured and is gone
+        // when its retention expires, and the promotion criterion —
+        // "across this estate, what would promoting the composite
+        // verdict have changed?" — has to be a query. The exclusion set
+        // that row's two sides are judged against is resolved **here**,
+        // once, and handed down; the counterfactual never fetches its
+        // own, because a second resolution is a second set and the row
+        // would be comparing two verdicts reached under different rules.
+        //
+        // Resolved only for the one row shape the composite path acts
+        // on. Every other artifact in every other format reaches this
+        // line, and a round trip for a row that is never written is a
+        // round trip per scan.
+        let composite_exclusions: Option<Vec<ExclusionProjection>> =
+            if kind == ArtifactKind::OciManifest {
+                self.exclusions_for_composite_observation(policy.as_ref())
+                    .await
+            } else {
+                None
+            };
+        let composite = CompositeScan {
+            storage: &self.storage,
+            upstream_proxy: &self.upstream_proxy,
+            upstream_resolver: &self.upstream_resolver,
+            scanners: &self.scanners,
+            artifact: &artifact,
+            format: &job.format,
+            coords: &subject.coords,
+            kind,
+            backends: &backends,
+            sbom: sbom.as_ref(),
+            observations: &self.observations,
+            policy: policy.as_ref(),
+            exclusions: composite_exclusions.as_deref(),
+            primary_findings: &accumulated,
+            allow_informed_downgrade: self.config.allow_informed_downgrade,
+        }
+        .run()
+        .await;
+
+        // The composite path's one request of the run: another attempt,
+        // because the composition was not produced for a condition that
+        // may clear — an upstream that is down, rate-limiting or slow,
+        // storage that did not answer. With acquisition that is the
+        // *routine* failure, and reporting it as a deterministic
+        // no-verdict would turn a momentary hiccup into a
+        // permanent-looking absence of assessment.
+        //
+        // It is routed through `Failed`, which is the path the
+        // orchestrator ALREADY uses for a retryable scan failure:
+        // `record_outcome` reschedules on the shared backoff and the job's
+        // own `max_attempts` is the bound, so a transient classification
+        // never means unbounded attempts. Nothing parallel is invented and
+        // no new terminal state exists.
+        //
+        // Three guards, and each one is what keeps this request free of
+        // release authority:
+        //
+        // - **The attempt budget still has room.** On the last attempt the
+        //   request is declined and the primary outcome is recorded
+        //   exactly as it would have been — so the composite can never
+        //   reach `record_outcome`'s retry-exhausted arm, which transitions
+        //   the artifact to `scan_indeterminate`. Exhausting the budget
+        //   lands back on the deterministic outcome: still no composite
+        //   verdict, and now also no more tries.
+        // - **No backend produced a verdict** (`contributors` empty) and
+        //   **nothing was found** (`accumulated` empty). Both are outcomes
+        //   the primary axis earned over the manifest's own bytes, and a
+        //   retry would delay them — a clean `ScanCompleted` in the first
+        //   case, a reject in the second. The composite path has no
+        //   authority to spend either, promoted or not: promotion decides
+        //   whose verdict gates, never whose outcome is thrown away.
+        // - **No backend errored.** That run is already taking the
+        //   retryable path below, with its own message; overriding it here
+        //   would replace the operator's actual error with a second one.
+        //
+        // What the request does cost when it is granted: the manifest's
+        // own `ScanCompleted` waits out the backoff. That is bounded by the
+        // budget, and it is unobservable to a client in the case that
+        // produces it — when the upstream will not serve the layers to
+        // hort, it will not serve them to a pull through hort either, so
+        // the image was not pullable during the wait regardless.
+        if let CompositeDisposition::Retry(why) = composite.disposition {
+            if accumulated.is_empty()
+                && contributors.is_empty()
+                && total_failed == 0
+                && job.attempts < self.config.max_attempts
+            {
+                return Ok(ScanRunOutcome::Failed(format!(
+                    "the composed image of artifact {} could not be produced on attempt {} \
+                     of {}: {why}",
+                    artifact.id, job.attempts, self.config.max_attempts
+                )));
+            }
+            tracing::warn!(
+                artifact_id = %artifact.id,
+                attempts = job.attempts,
+                max_attempts = self.config.max_attempts,
+                reason = %why,
+                "composite scan: no further attempt for the composed image — the run has an \
+                 outcome of its own, or the attempt budget is spent; the composition stays \
+                 unassessed for this run",
+            );
+        }
+
+        // A **promoted** composition's answer, folded into the same
+        // per-unit bookkeeping a backend's answer over the manifest's own
+        // bytes goes into (ADR 0064 D6). Under `observed` this is
+        // `Withheld` and the match is three no-ops, which is what makes
+        // "an unpromoted run is byte-for-byte today's behaviour" a
+        // property of one place rather than of every arm below.
+        //
+        // The fold is **after** the retry decision because a granted
+        // retry has already returned: a transient refusal asks for
+        // another attempt first, and only once that request is declined —
+        // the budget is spent, or the run earned an outcome of its own —
+        // does its absence become the manifest's unassessed filesystem.
+        //
+        // `total_attempted` grows with it, and that is the load-bearing
+        // part rather than bookkeeping tidiness: the partition below
+        // fires when *every* unit asked produced no verdict, so a
+        // composition that was assessed has to be one of the units
+        // asked. Without it a promoted manifest whose composition came
+        // back clean would still take the not-applicable early return —
+        // recording "nothing to assess" about an image that was
+        // assembled and examined.
+        match composite.verdict {
+            CompositeVerdict::Withheld => {}
+            CompositeVerdict::Assessed { evidence, findings } => {
+                total_attempted += 1;
+                contributors.push(COMPOSITE_CONTRIBUTOR.to_string());
+                // Tagged through the same relation rule every other
+                // producer's batch goes through, with the basis the
+                // composite path read off the backend that answered —
+                // so a composite finding naming a package the BOM never
+                // listed is classified exactly as the same backend's
+                // blob finding would be.
+                accumulated.extend(relations.tag(findings, evidence));
+            }
+            CompositeVerdict::Absent(why) => {
+                total_attempted += 1;
+                // An abstention and not a `total_failed`: the question of
+                // whether another attempt is worth making was already
+                // asked and answered above, and counting it as a failure
+                // here would route the run through the retryable path a
+                // second time under a different message.
+                abstentions.push((COMPOSITE_CONTRIBUTOR.to_string(), why));
+            }
+        }
+
         // No backend produced a verdict. Two different situations, and
         // the error case takes precedence: an errored backend might
         // succeed on retry, so if even one failed we take the retryable
@@ -649,12 +916,15 @@ impl ScanOrchestrationUseCase {
             // Partition the abstentions. Two classes that must not be
             // conflated:
             //
-            // - An *expected* surface that could not be assessed
-            //   (`UnusableArchive`, `NoAnalyzerMatched`) is the absent
-            //   verdict ADR 0007 holds on: fail closed, exactly as
-            //   before. One of these is enough to hold the artifact even
-            //   when the rest are not-applicable — the unassessed
-            //   surface is still unassessed.
+            // - An *expected* surface that could not be assessed —
+            //   every abstention whose `gates_release()` is true — is
+            //   the absent verdict ADR 0007 holds on: fail closed,
+            //   exactly as before. One of these is enough to hold the
+            //   artifact even when the rest are not-applicable, because
+            //   the unassessed surface is still unassessed. The
+            //   partition is read off `gates_release` rather than from a
+            //   list of variant names here, so splitting or adding a
+            //   reason cannot silently move an artifact across it.
             // - An artifact with *no* package surface by construction
             //   (an OCI manifest row, a non-tar OCI blob such as the
             //   image config) is outside the scan axis entirely. No
@@ -670,17 +940,28 @@ impl ScanOrchestrationUseCase {
             // artifact, so "nothing to assess" would be a false
             // statement and would drop a real finding — that case keeps
             // the fail-closed hold.
-            if accumulated.is_empty() && !abstentions.iter().any(|(_, why)| why.gates_release()) {
+            if accumulated.is_empty()
+                && !abstentions
+                    .iter()
+                    .any(|(_, why)| why.gates_release(kind, composite_verdict))
+            {
                 tracing::info!(
                     artifact_id = %artifact.id,
                     format = %job.format,
                     kind = kind.as_str(),
                     scanner = %backends.join(","),
-                    "artifact carries no package surface — recording a completed \
-                     not-applicable assessment (nothing to assess, so nothing to hold for)",
+                    reasons = %abstentions
+                        .iter()
+                        .map(|(backend, why)| format!("{backend}={}", why.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    composite_verdict = %composite_verdict,
+                    "no assessable surface belongs to this artifact — recording a completed \
+                     not-applicable assessment (nothing for a hold to wait on)",
                 );
                 return Ok(ScanRunOutcome::Completed {
                     scanner: backends.join(","),
+                    kind,
                     findings: Vec::new(),
                     assessment: ScanAssessment::NotApplicable,
                     sbom,
@@ -735,10 +1016,50 @@ impl ScanOrchestrationUseCase {
         // format handler over the payload.
         Ok(ScanRunOutcome::Completed {
             scanner: scanner_label,
+            kind,
             findings: merged,
             assessment: ScanAssessment::Analysed,
             sbom,
         })
+    }
+
+    /// The exclusion set the shadow composite observation's two sides
+    /// are judged against, or `None` when this run cannot supply one.
+    ///
+    /// `None` is not "no exclusions". An empty set in its place would
+    /// judge the counterfactual more harshly than the primary axis was
+    /// judged and attribute the difference to the composition, so the
+    /// caller skips the row instead. The read's failure is swallowed
+    /// here for the reason the whole unit exists under: the shadow may
+    /// not fail a scan, and this read happens only because the shadow
+    /// wants it. The primary path resolves its own exclusions inside
+    /// `record_scan_result`, where a failure still propagates exactly
+    /// as it did before.
+    async fn exclusions_for_composite_observation(
+        &self,
+        policy: Option<&ScanPolicyProjection>,
+    ) -> Option<Vec<ExclusionProjection>> {
+        // No policy resolved ⇒ no policy to carry exclusions, which is
+        // a known-empty set rather than an unresolved one.
+        let Some(policy) = policy else {
+            return Some(Vec::new());
+        };
+        match self
+            .policy_projections
+            .list_exclusions_for_policy(policy.policy_id)
+            .await
+        {
+            Ok(exclusions) => Some(exclusions),
+            Err(e) => {
+                tracing::warn!(
+                    policy_id = %policy.policy_id,
+                    error = %e,
+                    "composite scan: could not resolve the policy's exclusions for the \
+                     shadow observation; no observation is recorded for this run",
+                );
+                None
+            }
+        }
     }
 
     /// Persist a [`ScanRunOutcome`]. The success branches forward the
@@ -757,7 +1078,7 @@ impl ScanOrchestrationUseCase {
     #[tracing::instrument(skip(self, outcome))]
     pub async fn record_outcome(&self, job: &ScanJob, outcome: ScanRunOutcome) -> AppResult<()> {
         match outcome {
-            ScanRunOutcome::SkippedNoBackends => {
+            ScanRunOutcome::SkippedNoBackends { kind } => {
                 // Emit a clean ScanCompleted via the consumer. The
                 // reject path is a no-op for zero findings; the
                 // delta path is a no-op when both prior and current
@@ -777,6 +1098,7 @@ impl ScanOrchestrationUseCase {
                         "(none)".to_string(),
                         Vec::new(),
                         ScanAssessment::Analysed,
+                        kind,
                         None,
                     )
                     .await?;
@@ -797,6 +1119,7 @@ impl ScanOrchestrationUseCase {
             }
             ScanRunOutcome::Completed {
                 scanner,
+                kind,
                 findings,
                 assessment,
                 sbom,
@@ -835,6 +1158,7 @@ impl ScanOrchestrationUseCase {
                         scanner,
                         findings,
                         assessment,
+                        kind,
                         sbom.as_ref(),
                     )
                     .await?;
@@ -1270,6 +1594,15 @@ impl ScanOrchestrationUseCase {
 /// adapters also sit below the format layer (ADR 0008) and cannot ask a
 /// `FormatHandler` whether the payload contains its components.
 ///
+/// This pass writes **one** fact and no longer touches the other. A
+/// finding's [`FindingStatement`] is the producer's own half of
+/// ADR 0064 D2's line and arrives already stated; *whose* filesystem the
+/// claim is about is the row's [`ArtifactKind`], which
+/// [`Finding::may_condemn_artifact`] composes where it decides rather
+/// than anything storing the two already joined (ADR 0040 — see that
+/// predicate). So there is nothing for this pass to place, and the
+/// statement field is read-only outside the file that defines it.
+///
 /// # The rule
 ///
 /// The join key is the one [`hort_domain::types::SbomComponent`]'s own
@@ -1369,7 +1702,7 @@ impl ComponentRelations<'_> {
 ///
 /// The surviving row's `component_relation` is resolved separately from the
 /// ranking — see the collision arm below.
-fn merge_findings(input: Vec<Finding>, allow_informed_downgrade: bool) -> Vec<Finding> {
+pub(crate) fn merge_findings(input: Vec<Finding>, allow_informed_downgrade: bool) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::with_capacity(input.len());
     let mut seen: Vec<(String, String, usize)> = Vec::with_capacity(input.len());
     for f in input {

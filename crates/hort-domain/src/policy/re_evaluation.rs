@@ -29,7 +29,38 @@
 //! ([`crate::types::Finding::may_condemn_artifact`]), in that order and
 //! before any threshold is walked. One of the two skipping the narrowing
 //! is what leaves an artifact held on a verdict a fresh scan of the same
-//! findings would not reach. The one place they knowingly differ is the
+//! findings would not reach.
+//!
+//! **The identical question, not identical inputs.** Both functions put
+//! the same predicate to the same finding list; one of the predicate's
+//! inputs differs between the paths *that drive this one*, deliberately,
+//! and the difference is ADR 0064 D6's. `composite_verdict` is a
+//! parameter here rather than resolved from `policy`, because the two
+//! callers of a re-evaluation are not the same act:
+//!
+//! * the **automatic loosening** pass — an exclusion added, a threshold
+//!   raised, a policy archived — pins
+//!   [`CompositeVerdictMode::Observed`]. D6 reserves recovery of the
+//!   existing estate to the operator: "constituents already terminally
+//!   rejected on filesystem findings are not un-rejected
+//!   automatically". With the statement persisted, a resolved posture
+//!   here would un-reject exactly that population as a side effect of an
+//!   unrelated loosening, with no fresh assessment behind it.
+//! * the **operator's explicit curation re-evaluation** passes the
+//!   resolved posture, because that is the sanctioned recovery D6 points
+//!   at. Nothing is silent about it: a curator asked for this artifact to
+//!   be judged again.
+//! * the **tighten** direction goes through
+//!   [`crate::policy::evaluate_scan_result`], which resolves the posture
+//!   from the policy it is already under — the same way a fresh scan
+//!   does, and necessarily so: a pinned `Observed` there would re-reject
+//!   the constituent a promoted fresh scan had just let through, on the
+//!   next threshold change, terminally.
+//!
+//! So the asymmetry is between *drivers*, not between the two verdict
+//! functions, and it is stated at each call site with its reason.
+//!
+//! The one place the two functions knowingly differ is the
 //! aggregate-summary fallback, which has no per-finding data to narrow —
 //! an accepted, fail-closed residual documented on
 //! [`decide_rejected_transition`].
@@ -66,9 +97,11 @@
 use chrono::{DateTime, Utc};
 
 use crate::entities::artifact::Artifact;
-use crate::entities::scan_policy::{ExclusionProjection, ScanEnforcement, ScanPolicyProjection};
+use crate::entities::scan_policy::{
+    CompositeVerdictMode, ExclusionProjection, ScanEnforcement, ScanPolicyProjection,
+};
 use crate::events::SeveritySummary;
-use crate::types::{severity_summary_from_findings, ArtifactCoords, Finding};
+use crate::types::{severity_summary_from_findings, ArtifactCoords, ArtifactKind, Finding};
 
 use super::cve::evaluate_cve_thresholds;
 use super::exclusion::{filter_excluded_findings, filter_excluded_summary};
@@ -165,14 +198,34 @@ pub enum ReEvaluationOutcome {
 /// `now` is the current wall-clock; passed in by the caller for the
 /// same reason.
 ///
+/// `kind` is what the artifact's own format handler says its bytes are,
+/// resolved by the application caller through the handler registry (never
+/// from a path prefix, which would be a second copy of `scan_kind`). It
+/// is the role half of ADR 0064 D2's line — see
+/// [`crate::types::Finding::may_condemn_artifact`].
+///
+/// `composite_verdict` is a **parameter, not a resolution**, and that is
+/// the one input on which the drivers of a re-evaluation deliberately
+/// differ: the automatic loosening pass pins
+/// [`CompositeVerdictMode::Observed`] so that promotion never un-rejects
+/// a terminal constituent by itself, while the operator's explicit
+/// curation re-evaluation passes
+/// [`crate::policy::composite_verdict_mode_of`]'s answer so the
+/// sanctioned recovery still works. The module rustdoc gives the full
+/// reason (ADR 0064 D6); a caller choosing between them is choosing which
+/// act this is, and must say so where it chooses.
+///
 /// See module rustdoc for the boundary semantics
 /// (`quarantine_deadline <= now` favours `ResetToReleased`).
+#[allow(clippy::too_many_arguments)]
 pub fn decide_rejected_transition(
     artifact: &Artifact,
+    kind: ArtifactKind,
     last_scan_summary: &SeveritySummary,
     last_findings: Option<&[Finding]>,
     policy: Option<&ScanPolicyProjection>,
     updated_exclusions: &[ExclusionProjection],
+    composite_verdict: CompositeVerdictMode,
     quarantine_deadline: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> ReEvaluationOutcome {
@@ -231,12 +284,23 @@ pub fn decide_rejected_transition(
             // whichever one a later edit forgets.
             //
             // `Finding::may_condemn_artifact` is the single definition of
-            // the question; re-deriving it by matching on the relation here
-            // is what `hort-app/tests/condemning_rule_is_single_sourced.rs`
+            // the question; re-deriving it by matching on the relation — or
+            // on the statement — here is what
+            // `hort-app/tests/condemning_rule_is_single_sourced.rs`
             // rejects.
+            //
+            // `kind` and `composite_verdict` are the two inputs the
+            // predicate's second question needs (ADR 0064 D2): what each
+            // finding's statement is about depends on the row's role as
+            // well as on what the producer read. Both arrive from the
+            // caller — `kind` resolved from the artifact's own format
+            // handler, the posture *chosen* rather than resolved, because
+            // the loosening pass and the operator's curation
+            // re-evaluation are different acts with different answers.
+            // See this function's rustdoc and the module docs.
             let filtered = filter_excluded_findings(findings, updated_exclusions, &coords, now);
             let mut condemning = filtered.remaining_findings;
-            condemning.retain(Finding::may_condemn_artifact);
+            condemning.retain(|f| f.may_condemn_artifact(kind, composite_verdict));
             severity_summary_from_findings(&condemning)
         }
         // The aggregate-summary fallback cannot consult the relation —
@@ -296,14 +360,21 @@ mod tests {
     use super::*;
     use crate::entities::artifact::QuarantineStatus;
     use crate::entities::repository::RepositoryFormat;
+    use crate::entities::scan_policy::CompositeVerdictMode;
     use crate::entities::scan_policy::{NegligibleAction, ProvenanceMode, SeverityThreshold};
     use crate::events::PolicyScope;
-    use crate::policy::{evaluate_scan_result, ScanOutcome};
+    use crate::policy::{composite_verdict_mode_of, evaluate_scan_result, ScanOutcome};
     use crate::types::{ComponentRelation, ContentHash, Finding};
     use chrono::TimeZone;
     use uuid::Uuid;
 
     const VALID_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// The kind every test below hands the predicate unless it is about
+    /// the role half of ADR 0064 D2's line: a row that is **not** a
+    /// composition constituent, so nothing in the statement axis can be
+    /// what produced the outcome being asserted.
+    const TEST_KIND: ArtifactKind = ArtifactKind::NpmTarball;
 
     fn ts(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0)
@@ -365,6 +436,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),
@@ -396,10 +468,12 @@ mod tests {
         let exclusions = vec![exclusion("CVE-A")];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             None, // last_findings: fallback path
             None,
             &exclusions,
+            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -414,10 +488,12 @@ mod tests {
         let policy = projection(SeverityThreshold::High);
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             None,
             Some(&policy),
             &[],
+            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -433,10 +509,12 @@ mod tests {
         let exclusions = vec![exclusion("CVE-A")];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             None,
             None,
             &exclusions,
+            CompositeVerdictMode::Observed,
             Some(ts(2_000_000)), // computed deadline
             ts(1_000_000),       // now < deadline
         );
@@ -451,10 +529,12 @@ mod tests {
         let exclusions = vec![exclusion("CVE-A")];
         let outcome = decide_rejected_transition(
             &rejected_artifact("xz-utils"),
+            TEST_KIND,
             &summary,
             None,
             None,
             &exclusions,
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)), // computed deadline
             ts(2_000_000),       // now > deadline
         );
@@ -469,10 +549,12 @@ mod tests {
         let exclusions = vec![exclusion("CVE-A")];
         let outcome = decide_rejected_transition(
             &rejected_artifact("xz-utils"),
+            TEST_KIND,
             &summary,
             None,
             None,
             &exclusions,
+            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -488,10 +570,12 @@ mod tests {
         let now = ts(2_000_000);
         let outcome = decide_rejected_transition(
             &rejected_artifact("xz-utils"),
+            TEST_KIND,
             &summary,
             None,
             None,
             &exclusions,
+            CompositeVerdictMode::Observed,
             Some(now),
             now,
         );
@@ -508,10 +592,12 @@ mod tests {
         let summary = summary(0, 0, 0, 0);
         let outcome = decide_rejected_transition(
             &rejected_artifact("xz-utils"),
+            TEST_KIND,
             &summary,
             None,
             None,
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(2_000_000)),
             ts(1_000_000),
         );
@@ -523,10 +609,12 @@ mod tests {
         let summary = summary(0, 0, 0, 0);
         let outcome = decide_rejected_transition(
             &rejected_artifact("xz-utils"),
+            TEST_KIND,
             &summary,
             None,
             None,
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -558,10 +646,12 @@ mod tests {
         let policy = projection_with_enforcement(SeverityThreshold::High, ScanEnforcement::Record);
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             Some(&findings),
             Some(&policy),
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -579,10 +669,12 @@ mod tests {
         let policy = projection_with_enforcement(SeverityThreshold::High, ScanEnforcement::Record);
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             Some(&findings),
             Some(&policy),
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(2_000_000)),
             ts(1_000_000),
         );
@@ -600,10 +692,12 @@ mod tests {
         let policy = projection_with_enforcement(SeverityThreshold::High, ScanEnforcement::Reject);
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             Some(&findings),
             Some(&policy),
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -630,10 +724,12 @@ mod tests {
         };
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             Some(&findings),
             Some(&policy),
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -649,10 +745,12 @@ mod tests {
         let findings = vec![finding("CVE-REAL", SeverityThreshold::Critical)];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             Some(&findings),
             None,
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -703,10 +801,12 @@ mod tests {
         let exclusions = vec![exclusion("CVE-A")];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             None,
             None,
             &exclusions,
+            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -729,7 +829,169 @@ mod tests {
             informational_class: None,
             severity_basis: crate::types::SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
+            statement: crate::types::FindingStatement::Unstated,
         }
+    }
+
+    /// A stored finding as the Trivy adapter produced it from a
+    /// `Vulnerabilities` entry — a claim about the filesystem the
+    /// materialised bytes compose into, which **persists**, so this is
+    /// what a hydrated constituent finding actually looks like.
+    fn filesystem_finding(vuln: &str, sev: SeverityThreshold) -> Finding {
+        let mut f = finding(vuln, sev);
+        f.statement = crate::types::FindingStatement::Filesystem;
+        f
+    }
+
+    /// **ADR 0064 D6: the loosening does not reach the already-rejected
+    /// estate.** A constituent rejected on its own filesystem findings
+    /// stays rejected when the *automatic* loosening pass recomputes its
+    /// verdict, even where the policy that governs it has promoted the
+    /// composite verdict.
+    ///
+    /// **This passes for a different reason than it used to, and the
+    /// reason is the point of the change.** It used to pass because the
+    /// statement did not persist: a hydrated finding read `Unstated`, so
+    /// there was nothing for a loosening to key on — and the same absence
+    /// made the tighten pass terminally reject constituents a promoted
+    /// fresh scan had just released. The statement now persists, so the
+    /// stored finding below really does say `Filesystem` and the row
+    /// really is a constituent; what holds D6 is the posture this path
+    /// **pins**, `CompositeVerdictMode::Observed`, which is the input the
+    /// caller chooses rather than resolves. A test that still passed
+    /// after its mechanism changed is a test nobody re-read, so: the
+    /// assertion below is now about the pin.
+    ///
+    /// Asserted against the same input under both *policies*, because the
+    /// claim is that the policy's posture makes no difference on this
+    /// path — the pin is what answers. An un-rejection here would be a
+    /// population released with no fresh assessment, which is the hazard
+    /// that disqualified `ScanEnforcement::Record` for this job in the
+    /// first place.
+    ///
+    /// Recovering the estate is the operator's, through the curation
+    /// re-evaluation, which passes the resolved posture instead —
+    /// `the_operators_curation_re_evaluation_can_recover_the_same_row`
+    /// is the other half of the pair.
+    #[test]
+    fn a_promoted_policy_does_not_un_reject_a_constituent_over_its_stored_findings() {
+        let artifact = rejected_artifact("lodash");
+        let summary = summary(1, 0, 0, 0);
+        // What the stored findings blob yields, through the blob: a
+        // filesystem claim the producer made and the wire form kept.
+        let blob = serde_json::to_string(&[filesystem_finding(
+            "CVE-2021-23337",
+            SeverityThreshold::Critical,
+        )])
+        .unwrap();
+        let stored: Vec<Finding> = serde_json::from_str(&blob).unwrap();
+        assert_eq!(
+            stored[0].statement,
+            crate::types::FindingStatement::Filesystem,
+            "the premise: the loosening now has a real statement in front of it",
+        );
+
+        let promoted = ScanPolicyProjection {
+            composite_verdict_mode: CompositeVerdictMode::Promoted,
+            ..projection(SeverityThreshold::Critical)
+        };
+        for policy in [projection(SeverityThreshold::Critical), promoted] {
+            let outcome = decide_rejected_transition(
+                &artifact,
+                // A constituent — the one kind whose filesystem claim
+                // could move at all, so the pin is what is being tested
+                // rather than the kind.
+                ArtifactKind::OciBlob,
+                &summary,
+                Some(&stored),
+                Some(&policy),
+                &[],
+                // The automatic loosening pass's pin.
+                CompositeVerdictMode::Observed,
+                None,
+                ts(1_000_000),
+            );
+            assert_eq!(
+                outcome,
+                ReEvaluationOutcome::StillRejected,
+                "composite_verdict_mode = {} must not move a terminal row",
+                policy.composite_verdict_mode
+            );
+        }
+    }
+
+    /// The other half of the pair D6 requires: the operator's explicit
+    /// curation re-evaluation passes the **resolved** posture, so the
+    /// sanctioned recovery of the same row works.
+    ///
+    /// Without this, the pin above would not be an asymmetry between two
+    /// drivers — it would be a dead end, and D6's "recovering the existing
+    /// estate is operator-driven, through the curation re-evaluation"
+    /// would name a path that cannot do it.
+    #[test]
+    fn the_operators_curation_re_evaluation_can_recover_the_same_row() {
+        let artifact = rejected_artifact("lodash");
+        let summary = summary(1, 0, 0, 0);
+        let stored = vec![filesystem_finding(
+            "CVE-2021-23337",
+            SeverityThreshold::Critical,
+        )];
+        let promoted = ScanPolicyProjection {
+            composite_verdict_mode: CompositeVerdictMode::Promoted,
+            ..projection(SeverityThreshold::Critical)
+        };
+
+        let outcome = decide_rejected_transition(
+            &artifact,
+            ArtifactKind::OciBlob,
+            &summary,
+            Some(&stored),
+            Some(&promoted),
+            &[],
+            // What the curation endpoint passes: the posture the policy
+            // actually resolves to.
+            composite_verdict_mode_of(Some(&promoted)),
+            None,
+            ts(1_000_000),
+        );
+        assert_eq!(
+            outcome,
+            ReEvaluationOutcome::ResetToReleased,
+            "a curator asked for this row to be judged again, and under the \
+             policy's own promoted posture its isolated package set is \
+             evidence rather than the verdict",
+        );
+    }
+
+    /// And the kind still scopes it: the operator's re-evaluation of a
+    /// **non**-constituent row under the same promoted policy keeps the
+    /// rejection. The recovery D6 sanctions is of constituents, not of
+    /// everything a global policy reaches.
+    #[test]
+    fn the_operators_re_evaluation_does_not_recover_a_non_constituent_row() {
+        let artifact = rejected_artifact("lodash");
+        let summary = summary(1, 0, 0, 0);
+        let stored = vec![filesystem_finding(
+            "CVE-2021-23337",
+            SeverityThreshold::Critical,
+        )];
+        let promoted = ScanPolicyProjection {
+            composite_verdict_mode: CompositeVerdictMode::Promoted,
+            ..projection(SeverityThreshold::Critical)
+        };
+
+        let outcome = decide_rejected_transition(
+            &artifact,
+            TEST_KIND,
+            &summary,
+            Some(&stored),
+            Some(&promoted),
+            &[],
+            composite_verdict_mode_of(Some(&promoted)),
+            None,
+            ts(1_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::StillRejected);
     }
 
     #[test]
@@ -766,10 +1028,12 @@ mod tests {
         }];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             Some(&findings),
             None,
             &exclusions,
+            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -793,10 +1057,12 @@ mod tests {
         let exclusions = vec![exclusion("CVE-UNRELATED")];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             Some(&findings),
             None,
             &exclusions,
+            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -848,10 +1114,12 @@ mod tests {
         let exclusions = vec![exclusion("CVE-UNRELATED")];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             Some(&findings),
             Some(&policy),
             &exclusions,
+            CompositeVerdictMode::Observed,
             // Deadline in the future — irrelevant under Block, the
             // outcome must be StillRejected regardless.
             Some(ts(2_000_000)),
@@ -879,10 +1147,12 @@ mod tests {
         let exclusions = vec![exclusion("CVE-UNRELATED")];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             Some(&findings),
             Some(&policy),
             &exclusions,
+            CompositeVerdictMode::Observed,
             // Deadline elapsed → ResetToReleased.
             Some(ts(1_000_000)),
             ts(2_000_000),
@@ -905,10 +1175,12 @@ mod tests {
         let exclusions = vec![exclusion("CVE-A")];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             Some(&[]),
             None,
             &exclusions,
+            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -974,10 +1246,12 @@ mod tests {
         let findings = vec![subject_critical("CVE-SUBJECT")];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary(1, 0, 0, 0),
             Some(&findings),
             None,
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1001,10 +1275,12 @@ mod tests {
         )];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary(1, 0, 0, 0),
             Some(&findings),
             None,
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1025,10 +1301,12 @@ mod tests {
         )];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary(1, 0, 0, 0),
             Some(&findings),
             None,
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1048,10 +1326,12 @@ mod tests {
         let findings = vec![not_contained_critical("CVE-ELSEWHERE")];
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary(1, 0, 0, 0),
             Some(&findings),
             None,
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1092,8 +1372,14 @@ mod tests {
         let exclusions = vec![exclusion("CVE-SUBJECT")];
         let now = ts(2_000_000);
 
-        let fresh_scan =
-            evaluate_scan_result(&coords_of(&artifact), &findings, None, &exclusions, now);
+        let fresh_scan = evaluate_scan_result(
+            &coords_of(&artifact),
+            TEST_KIND,
+            &findings,
+            None,
+            &exclusions,
+            now,
+        );
         assert_eq!(
             fresh_scan,
             ScanOutcome::Clean,
@@ -1102,10 +1388,12 @@ mod tests {
 
         let re_evaluated = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary(2, 0, 0, 0),
             Some(&findings),
             None,
             &exclusions,
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             now,
         );
@@ -1132,14 +1420,22 @@ mod tests {
             ),
         ];
 
-        let fresh_scan =
-            evaluate_scan_result(&coords_of(&artifact), &findings, None, &[], ts(2_000_000));
+        let fresh_scan = evaluate_scan_result(
+            &coords_of(&artifact),
+            TEST_KIND,
+            &findings,
+            None,
+            &[],
+            ts(2_000_000),
+        );
         let re_evaluated = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary(1, 1, 0, 0),
             Some(&findings),
             None,
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1172,10 +1468,12 @@ mod tests {
         let policy = projection_with_negligible(SeverityThreshold::High, NegligibleAction::Block);
         let outcome = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary,
             Some(&findings),
             Some(&policy),
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1201,19 +1499,23 @@ mod tests {
 
         let with_findings = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary(1, 0, 0, 0),
             Some(&findings),
             None,
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
         let blob_unhydratable = decide_rejected_transition(
             &artifact,
+            TEST_KIND,
             &summary(1, 0, 0, 0),
             None,
             None,
             &[],
+            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );

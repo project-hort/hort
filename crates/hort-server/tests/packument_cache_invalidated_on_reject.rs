@@ -268,6 +268,7 @@ fn build_curation_use_case_with_invalidator(
         repository_access,
         Arc::new(MockCurationRuleRepository::new()),
         Arc::new(MockStoragePort::new()),
+        hort_formats::compiled_in_format_handlers(),
     )
     .with_upstream_index_cache_invalidator(invalidator)
 }

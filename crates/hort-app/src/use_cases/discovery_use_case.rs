@@ -902,6 +902,8 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: hort_domain::entities::scan_policy::NegligibleAction::Ignore,
             enforcement: hort_domain::entities::scan_policy::ScanEnforcement::Reject,
+            composite_verdict_mode:
+                hort_domain::entities::scan_policy::CompositeVerdictMode::Observed,
             stream_version: 1,
             created_at: now,
             updated_at: now,

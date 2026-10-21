@@ -309,6 +309,9 @@ async fn apply_inner(
         // pass's active-curation precondition reads live curation rules.
         curation_rule_repo.clone(),
         policy_jobs,
+        // The compiled-in registry both directions of the re-evaluation
+        // pass resolve an artifact's `ArtifactKind` through (ADR 0064 D2).
+        hort_formats::compiled_in_format_handlers(),
     ));
     // Gitops writer for the
     // `repository_upstream_mappings` table (there is no admin

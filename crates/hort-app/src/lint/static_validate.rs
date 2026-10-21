@@ -47,8 +47,8 @@ use hort_config::DesiredState;
 use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::rbac::{ClaimMapping, GrantSubject, Permission, PermissionGrant};
 use hort_domain::entities::scan_policy::{
-    NegligibleAction, ProvenanceConfigError, ProvenanceConfigWarning, ProvenanceMode,
-    ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+    CompositeVerdictMode, NegligibleAction, ProvenanceConfigError, ProvenanceConfigWarning,
+    ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use hort_domain::events::PolicyScope;
 use uuid::Uuid;
@@ -194,6 +194,25 @@ pub(crate) const RULE_VIRTUAL_MEMBER_FORMAT_NOT_ENFORCED: &str =
 pub(crate) const RULE_SCAN_POLICY_MAX_ARTIFACT_AGE_NOT_IMPLEMENTED: &str =
     "scan_policy_max_artifact_age_not_implemented";
 
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when a `ScanPolicy`
+/// envelope promotes the composed-image verdict to release authority
+/// (`compositeVerdictMode: promoted`) while declaring no scanner
+/// backends. The waiver wins: `run_scan` returns `SkippedNoBackends`
+/// before a composition is resolved, so the promotion grants authority
+/// to a verdict no manifest in scope ever carries (ADR 0064 D6 ×
+/// ADR 0016's cross-opt-in matrix, closed as the ADR 0015 inert-field
+/// block). The composition-axis sibling of
+/// [`RULE_TRUST_UPSTREAM_PUBLISH_TIME_REQUIRES_SCAN_BACKENDS`], whose
+/// other half is the same empty backend list. One increment per
+/// offending `ScanPolicy`. **Not** retired by a future implementation:
+/// a waived scan has nothing to promote under any of them.
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_COMPOSITE_VERDICT_PROMOTED_REQUIRES_SCAN_BACKENDS: &str =
+    "composite_verdict_promoted_requires_scan_backends";
+
 /// The snapshot-free apply-config lint rules.
 ///
 /// The discriminant is carried on every [`LintFinding`] so the apply
@@ -279,6 +298,14 @@ pub enum LinterRule {
     /// appending is the only placement that leaves every existing
     /// config's reject message exactly as it was.
     SaRotationTargetConflict,
+    /// Row 15 — a `ScanPolicy` promoting the composed-image verdict to
+    /// release authority (`compositeVerdictMode: promoted`) while
+    /// declaring no scanner backends, so the promotion has nothing to
+    /// act on (ADR 0064 D6 × ADR 0016). Reject + metric. Appended after
+    /// row 14, same reason: apply aborts on the first row with error
+    /// findings, so appending is the only placement that leaves every
+    /// existing config's reject message exactly as it was.
+    CompositeVerdictPromotedRequiresScanBackends,
 }
 
 impl LinterRule {
@@ -317,6 +344,9 @@ impl LinterRule {
             }
             Self::ScanPolicyMaxArtifactAgeNotImplemented => {
                 Some(RULE_SCAN_POLICY_MAX_ARTIFACT_AGE_NOT_IMPLEMENTED)
+            }
+            Self::CompositeVerdictPromotedRequiresScanBackends => {
+                Some(RULE_COMPOSITE_VERDICT_PROMOTED_REQUIRES_SCAN_BACKENDS)
             }
             Self::SaIssuerFk
             | Self::UnderConstrainedFederatedIdentities
@@ -665,6 +695,26 @@ impl StaticConfigValidator {
             report.errors.push(LintFinding::error(
                 LinterRule::SaRotationTargetConflict,
                 message,
+            ));
+        }
+
+        // Row 15 — a `ScanPolicy` promoting the composed-image verdict
+        // to release authority while waiving scanning outright. The two
+        // opt-ins cancel: the waiver returns before a composition is
+        // resolved, so the promotion grants authority to a verdict no
+        // manifest in scope ever carries (ADR 0064 D6 × ADR 0016, closed
+        // as the ADR 0015 inert-field block). Appended after row 14 for
+        // row 9's own reason — apply aborts on the first row with error
+        // findings, so appending is the only placement that leaves every
+        // existing config's reject message exactly as it was.
+        for err in
+            hort_config::desired::validate_scan_policy_promoted_composite_requires_scan_backends(
+                desired,
+            )
+        {
+            report.errors.push(LintFinding::error(
+                LinterRule::CompositeVerdictPromotedRequiresScanBackends,
+                err.to_string(),
             ));
         }
 
@@ -1351,6 +1401,7 @@ fn provenance_projection_for_lint(
         rescan_interval_hours: 0,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
+        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: now,
         updated_at: now,
@@ -1537,6 +1588,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
+                composite_verdict_mode: "observed".into(),
             },
         }
     }
@@ -1962,6 +2014,7 @@ mod tests {
                     rescan_interval_hours: 24,
                     negligible_action: "ignore".into(),
                     enforcement: "reject".into(),
+                    composite_verdict_mode: "observed".into(),
                 },
             }],
             ..Default::default()
@@ -2820,6 +2873,90 @@ mod tests {
     #[test]
     fn row14_emits_no_linter_metric() {
         assert_eq!(LinterRule::SaRotationTargetConflict.metric_rule(), None);
+    }
+
+    // ---- row 15: compositeVerdictMode x scanBackends -------------------
+
+    /// Every row-15 finding in a report, by message, so a test asserts
+    /// what the operator reads rather than a count.
+    fn promoted_composite_findings(report: &StaticLintReport) -> Vec<&str> {
+        report
+            .errors
+            .iter()
+            .filter(|f| f.rule == LinterRule::CompositeVerdictPromotedRequiresScanBackends)
+            .map(|f| f.message.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn row15_promoted_composite_with_no_backends_rejects() {
+        let mut env = scan_policy_global("p-waived-but-promoted", vec![]);
+        env.spec.composite_verdict_mode = "promoted".into();
+        let desired = DesiredState {
+            scan_policies: vec![env],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let findings = promoted_composite_findings(&report);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].contains("p-waived-but-promoted"),
+            "{findings:?}"
+        );
+    }
+
+    /// Each half alone is a supported posture — which is what makes this
+    /// a cross-opt-in collapse rather than an inert field.
+    #[test]
+    fn row15_either_half_alone_is_accepted() {
+        let mut promoted = scan_policy_global("p-promoted-scanning", vec!["trivy"]);
+        promoted.spec.composite_verdict_mode = "promoted".into();
+        let waived = scan_policy_global("p-waived", vec![]);
+        for env in [promoted, waived] {
+            let desired = DesiredState {
+                scan_policies: vec![env],
+                ..Default::default()
+            };
+            let report = oci_validator().validate(&desired);
+            assert!(
+                promoted_composite_findings(&report).is_empty(),
+                "{:?}",
+                report.errors
+            );
+        }
+    }
+
+    /// Row 15 is appended: a bundle tripping an earlier row AND row 15
+    /// still rejects with the earlier row's message, because apply
+    /// aborts on the first row with error findings.
+    #[test]
+    fn row15_is_appended_after_the_existing_rows() {
+        let mut inert = repo_env("npm-inert", "npm");
+        inert.spec.prefetch_policy.max_age_days = Some(90);
+        let mut promoted = scan_policy_global("p-waived-but-promoted", vec![]);
+        promoted.spec.composite_verdict_mode = "promoted".into();
+        let desired = DesiredState {
+            repositories: vec![inert],
+            scan_policies: vec![promoted],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert_eq!(
+            report.errors.first().map(|f| f.rule),
+            Some(LinterRule::PrefetchMaxAgeDaysNotImplemented),
+            "row 6 must still be the first error — row 15 is appended last"
+        );
+        assert_eq!(promoted_composite_findings(&report).len(), 1);
+    }
+
+    /// Row 15's metric key is the one the catalog and the apply's
+    /// emission site share.
+    #[test]
+    fn row15_emits_its_catalogued_linter_metric() {
+        assert_eq!(
+            LinterRule::CompositeVerdictPromotedRequiresScanBackends.metric_rule(),
+            Some("composite_verdict_promoted_requires_scan_backends"),
+        );
     }
 
     fn grant_findings(report: &StaticLintReport) -> usize {

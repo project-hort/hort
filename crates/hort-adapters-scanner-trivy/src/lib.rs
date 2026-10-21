@@ -36,15 +36,19 @@
 //! - **A verdict** — Trivy reported at least one analysed target. The
 //!   finding list, empty or not, is the verdict.
 //! - **Nothing to analyse** — no materialisation applies to this kind, the
-//!   payload's container could not be safely opened, or Trivy returned a
+//!   payload's container could not be safely opened, a composed image
+//!   could not be assembled, or Trivy returned a
 //!   report with no `Results` at all. There is no verdict. An empty
 //!   report from an `fs`-mode invocation is a surface that went
 //!   unassessed, so the orchestrator holds the artifact fail-closed (ADR
 //!   0007) rather than recording a clean scan of bytes nothing examined.
 //!   An empty report from a `rootfs`-mode invocation is different: that
-//!   target runs every analyzer over the whole tree, so an empty result
-//!   means the tree has no package surface at all — a completed "not
-//!   applicable" fact, not a hold.
+//!   invocation reads *one layer* as a whole filesystem, and its empty
+//!   result is a completed "not applicable" fact about those bytes rather
+//!   than a hold — the layer's package surface belongs to the composition
+//!   it is part of (ADR 0064, amending ADR 0007). An empty report from an
+//!   `image`-mode invocation is neither: the composition *is* the thing
+//!   that was supposed to be assessed, so it fails closed.
 //! - **A failure** — the binary is missing, the child timed out, the
 //!   report blew its cap. `Err`, and retryable.
 //!
@@ -54,11 +58,14 @@
 //! - [`parse`] — Trivy JSON wire types + finding mapper (pure)
 //! - [`extract`] — bounded, path-safe archive extraction
 //! - [`workspace`] — materialisation by kind (adapter-internal I/O)
+//! - [`oci_layout`] — materialisation of a composed OCI image as an
+//!   image layout, under a whole-image budget (ADR 0064 D1)
 //! - this module — `TrivyAdapter` itself + the `ScannerPort` impl
 //!
 //! See `docs/architecture/explanation/scanning-pipeline.md`.
 
 mod extract;
+mod oci_layout;
 mod parse;
 mod purl;
 mod severity;
@@ -165,14 +172,20 @@ where
 // Public parser entry point
 // ---------------------------------------------------------------------------
 
-/// Parse a `trivy <fs|rootfs> --format json` document and return the lowered
-/// [`Finding`] list, applying the same per-finding cap filter
+/// Parse a `trivy <fs|rootfs|image> --format json` document and return the
+/// lowered [`Finding`] list, applying the same per-finding cap filter
 /// [`TrivyAdapter::scan`] applies.
 ///
 /// Exposed publicly for fixture-based testing (the adapter's own
 /// integration tests in `tests/` consume this) and for any future
 /// caller that needs to re-parse a Trivy report archived elsewhere.
 /// `Err(DomainError::Validation)` on malformed JSON.
+///
+/// Each returned finding carries the side of ADR 0064 D2's line its
+/// report section put it on; which artifact's filesystem that claim is
+/// about is composed at the verdict from the row's `ArtifactKind`
+/// ([`Finding::may_condemn_artifact`](hort_domain::types::Finding::may_condemn_artifact)),
+/// not decided by this parse.
 pub fn parse_findings_from_json(stdout: &[u8]) -> DomainResult<Vec<Finding>> {
     let report = parse_trivy_report(stdout)
         .map_err(|e| DomainError::Validation(format!("trivy adapter: malformed JSON: {e}")))?;
@@ -280,15 +293,20 @@ impl TrivyAdapter {
         Self { config, storage }
     }
 
-    /// Build the argv vector for `trivy <fs|rootfs> --format json …`.
+    /// Build the argv vector for `trivy <fs|rootfs|image> --format json …`.
     /// Pulled out of [`Self::run_scan`] so it is unit-testable without
     /// touching the real binary.
     ///
     /// The subcommand comes from the materialisation: an extracted image
     /// layer is a root filesystem, and only `trivy rootfs` runs the
     /// OS-package analyzers over it
-    /// (<https://trivy.dev/latest/docs/target/rootfs/>). Every other flag
-    /// is identical between the two targets.
+    /// (<https://trivy.dev/latest/docs/target/rootfs/>); a composed image
+    /// is an OCI image layout, which `trivy image` reads through
+    /// `--input` (<https://trivy.dev/latest/docs/target/container_image/>)
+    /// — the invocation ADR 0064's measurement was taken against. Every
+    /// other flag is identical across the three targets, which is what
+    /// keeps the severity filter, the timeout and the DB cache from
+    /// drifting per mode.
     fn scan_argv(&self, mode: ScanMode, target_dir: &str) -> Vec<String> {
         let mut argv: Vec<String> = vec![
             mode.subcommand().to_string(),
@@ -305,6 +323,13 @@ impl TrivyAdapter {
         if let Some(db_dir) = &self.config.db_dir {
             argv.push("--cache-dir".to_string());
             argv.push(db_dir.to_string_lossy().into_owned());
+        }
+        // `trivy image` names its subject by *reference* positionally and
+        // would try to resolve a directory path as a registry reference;
+        // a local layout is handed over with `--input` instead. `fs` and
+        // `rootfs` take the path positionally.
+        if mode == ScanMode::Image {
+            argv.push("--input".to_string());
         }
         argv.push(target_dir.to_string());
         argv
@@ -579,6 +604,36 @@ impl ScannerPort for TrivyAdapter {
                 // it and make the whole future non-`Send`.
                 let materialised = ws.listing().await;
                 match mode {
+                    // A composition that reports nothing has no excuse to
+                    // offer. The `rootfs` rule below exists because a
+                    // *layer's* package surface belongs to the
+                    // composition it is part of — but a composition IS
+                    // that thing, assembled from every constituent the
+                    // manifest declared and verified on the way in, so
+                    // "no package surface by construction" is not
+                    // available to it. Either the image genuinely holds
+                    // no package surface anywhere (which for a runnable
+                    // filesystem is remarkable rather than routine) or
+                    // the scanner did not read what hort assembled; the
+                    // two are indistinguishable from here, and only one
+                    // of them is safe to release on. So it fails closed,
+                    // and the materialised listing stays at `warn!`
+                    // because it is the evidence that tells them apart.
+                    ScanMode::Image => {
+                        tracing::warn!(
+                            scanner = "trivy",
+                            kind = target.kind.as_str(),
+                            format = target.format,
+                            subcommand = mode.subcommand(),
+                            stderr_tail = stderr_tail(&stderr),
+                            materialised,
+                            "trivy adapter: composed image carries no analysed target; \
+                             no composite verdict"
+                        );
+                        return Ok(ScanAnalysis::NothingAnalysable(
+                            NotAnalysable::NoAnalyzerMatched,
+                        ));
+                    }
                     // `rootfs` runs every OS-package, language and binary
                     // analyzer over the whole extracted tree. An empty
                     // report there is not a pairing mismatch — it is the
@@ -637,7 +692,7 @@ impl ScannerPort for TrivyAdapter {
 
             tracing::info!(
                 scanner = "trivy",
-                content_hash = %target.content_hash,
+                content_hash = %target.subject_hash(),
                 kind = target.kind.as_str(),
                 subcommand = mode.subcommand(),
                 analysed_targets = report.results.len(),
@@ -684,6 +739,7 @@ mod tests {
 
     use std::io::Cursor;
 
+    use hort_domain::ports::scanner::{ComposedImage, ScanUnit};
     use hort_domain::ports::storage::{PutResult, StoragePort as P};
     use hort_domain::ports::BoxFuture as Bf;
     use hort_domain::types::{ByteRange, ContentHash as Ch};
@@ -796,12 +852,64 @@ mod tests {
             .expect("64 hex chars parse")
     }
 
+    fn oci_manifest_coords() -> hort_domain::types::ArtifactCoords {
+        hort_domain::types::ArtifactCoords {
+            name: "library/nginx".to_string(),
+            name_as_published: "library/nginx".to_string(),
+            version: Some("1.27".to_string()),
+            path: "manifests/sha256:aaaa".to_string(),
+            format: hort_domain::entities::repository::RepositoryFormat::Oci,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    /// A two-layer composition. Only constructible through
+    /// `ComposedImage::new` from an `ImageLayout`, which is what makes a
+    /// malformed composite unrepresentable here as in production.
+    fn composed_image() -> ComposedImage {
+        let digest = |seed: char| -> Ch {
+            std::iter::repeat_n(seed, 64)
+                .collect::<String>()
+                .parse()
+                .expect("synthetic sha256")
+        };
+        ComposedImage::new(
+            digest('a'),
+            hort_domain::oci::ImageLayout {
+                config: digest('c'),
+                layers: vec![
+                    hort_domain::oci::ImageLayoutLayer {
+                        hash: digest('1'),
+                        media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                    },
+                    hort_domain::oci::ImageLayoutLayer {
+                        hash: digest('2'),
+                        media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                    },
+                ],
+                manifest_media_type: hort_domain::oci::OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            },
+        )
+    }
+
+    fn composite_target<'a>(
+        coords: &'a hort_domain::types::ArtifactCoords,
+        image: &'a ComposedImage,
+    ) -> ScanTarget<'a> {
+        ScanTarget {
+            unit: ScanUnit::Image(image),
+            format: "oci",
+            coords,
+            kind: hort_domain::types::ArtifactKind::OciManifest,
+        }
+    }
+
     fn jar_target<'a>(
         hash: &'a Ch,
         coords: &'a hort_domain::types::ArtifactCoords,
     ) -> ScanTarget<'a> {
         ScanTarget {
-            content_hash: hash,
+            unit: ScanUnit::Blob(hash),
             format: "maven",
             coords,
             kind: hort_domain::types::ArtifactKind::MavenJar,
@@ -813,7 +921,7 @@ mod tests {
         coords: &'a hort_domain::types::ArtifactCoords,
     ) -> ScanTarget<'a> {
         ScanTarget {
-            content_hash: hash,
+            unit: ScanUnit::Blob(hash),
             format: "maven",
             coords,
             kind: hort_domain::types::ArtifactKind::MavenPom,
@@ -919,6 +1027,26 @@ mod tests {
         // rest of the argv must not drift from the `fs` form.
         let fs_argv = adapter().scan_argv(ScanMode::Fs, "/tmp/scan");
         assert_eq!(argv[1..], fs_argv[1..]);
+    }
+
+    /// A composed image is handed over as a local OCI layout:
+    /// `trivy image --input <dir>`. The `--input` is load-bearing —
+    /// `trivy image` reads a positional argument as a *registry
+    /// reference* and would try to resolve the directory path as one.
+    #[test]
+    fn scan_argv_hands_a_composed_layout_to_the_image_target_through_input() {
+        let argv = adapter().scan_argv(ScanMode::Image, "/tmp/layout");
+        assert_eq!(argv[0], "image");
+        assert_eq!(
+            argv[argv.len() - 2..],
+            ["--input".to_string(), "/tmp/layout".to_string()],
+            "a local layout is an --input, never a positional reference: {argv:?}"
+        );
+        // Every other flag is identical to the other two targets, which
+        // is what keeps the severity filter, the timeout and the DB cache
+        // from drifting per mode.
+        let fs_argv = adapter().scan_argv(ScanMode::Fs, "/tmp/layout");
+        assert_eq!(argv[1..argv.len() - 2], fs_argv[1..fs_argv.len() - 1]);
     }
 
     // -- empty-report diagnostics ---------------------------------------
@@ -1279,6 +1407,67 @@ mod tests {
         }
     }
 
+    /// The composite's own answer to the same question, and the one it
+    /// must NOT give: `NotApplicable`. The `rootfs` rule above exists
+    /// because a layer's package surface belongs to the composition — a
+    /// composition has no such excuse, since it *is* the thing that was
+    /// supposed to be assessed. So an empty report over an assembled
+    /// image fails closed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_with_no_results_in_image_mode_is_a_hold_not_not_applicable() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let coords = oci_manifest_coords();
+        let image = composed_image();
+        for report in [r#"{}"#, r#"{"Results":null}"#, r#"{"Results":[]}"#] {
+            let analysis =
+                scan_against_fake_trivy_target(report, &composite_target(&coords, &image))
+                    .await
+                    .expect("the child exited 0, so the scan itself succeeded");
+            assert_eq!(
+                analysis,
+                ScanAnalysis::NothingAnalysable(NotAnalysable::NoAnalyzerMatched),
+                "report {report} over a composed image must hold, not release"
+            );
+            assert_ne!(
+                analysis,
+                ScanAnalysis::NothingAnalysable(NotAnalysable::NotApplicable),
+                "a composition that reports nothing is not an absent surface"
+            );
+        }
+    }
+
+    /// A composition whose constituents are not all in storage never
+    /// reaches the CLI, and the outcome is the one no assembled
+    /// composition can produce. The bogus binary path is the proof that
+    /// no invocation happened: reaching it would surface as a "not found"
+    /// `Invariant`.
+    #[tokio::test]
+    async fn an_unassemblable_composition_abstains_without_invoking_the_cli() {
+        let c = TrivyConfig {
+            trivy_bin: PathBuf::from("/no/such/trivy/binary/exists/here"),
+            ..TrivyConfig::default()
+        };
+        let adapter = TrivyAdapter::new(
+            c,
+            Arc::new(StubStorage(Get::NotFound)) as Arc<dyn StoragePort>,
+        );
+        let coords = oci_manifest_coords();
+        let image = composed_image();
+        let analysis = adapter
+            .scan(&composite_target(&coords, &image), None)
+            .await
+            .expect("an unassemblable composition is an abstention, not a backend failure");
+        assert_eq!(
+            analysis,
+            ScanAnalysis::NothingAnalysable(NotAnalysable::IncompleteComposition),
+            "\"I could not build the image\" must not arrive looking like \
+             \"I built it and it reported nothing\""
+        );
+    }
+
     /// The other side of the same distinction: a report that *does* carry
     /// an analysed target with no vulnerabilities IS a clean verdict.
     #[cfg(unix)]
@@ -1330,7 +1519,7 @@ mod tests {
         let h = sample_hash();
         let coords = jar_coords();
         let target = ScanTarget {
-            content_hash: &h,
+            unit: ScanUnit::Blob(&h),
             format: "oci",
             coords: &coords,
             kind: hort_domain::types::ArtifactKind::OciManifest,

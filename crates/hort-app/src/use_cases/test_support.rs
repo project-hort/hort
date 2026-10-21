@@ -43,6 +43,9 @@ use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
 use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
+use hort_domain::ports::composite_scan_observation::{
+    CompositeScanObservation, CompositeScanObservationRepository,
+};
 use hort_domain::ports::constituent_status::{
     terminal_statuses_by_refusal_precedence, ConstituentStatusReader, TerminalConstituent,
 };
@@ -3565,6 +3568,14 @@ pub struct MockStoragePort {
     /// `record_scan_result` aborting before any event-store
     /// append) seed this slot via [`fail_next_put`].
     inject_put_error: Mutex<Option<DomainError>>,
+    /// A **persistent** `put` failure: every call returns it, never
+    /// drained. Mirrors `inject_get_error`'s posture and exists for the
+    /// same reason — a caller that retries (the composite path's
+    /// per-constituent attempt bound) must fail on every attempt rather
+    /// than recovering on the second, which is what distinguishes "the
+    /// store is down" from "one write was unlucky". See
+    /// [`MockStoragePort::fail_put_persistent`].
+    inject_put_error_always: Mutex<Option<DomainError>>,
     /// When set, the put call whose 1-based ordinal
     /// equals or exceeds the threshold returns the seeded error,
     /// after that call drains and stops being matched. Tests that
@@ -3599,6 +3610,13 @@ pub struct MockStoragePort {
     /// the provenance cascade re-drive gate: a cascaded constituent's
     /// skip-verify must not re-walk bytes) use [`get_call_count`].
     get_calls: AtomicUsize,
+    /// Counter incremented on every `size_of` call — hit, miss or
+    /// injected failure. Tests that assert "this bound refused before any
+    /// storage round-trip" use [`size_of_call_count`]: a presence probe is
+    /// the cheapest I/O on the composite path, so a bound that is supposed
+    /// to be decided from a document's own bytes is only shown to be by
+    /// the probe count being zero.
+    size_of_calls: AtomicUsize,
     /// Counter incremented on every `delete` call — used by the
     /// declared-hash rollback tests to assert the
     /// rollback happened when no other row references the hash, and
@@ -3608,6 +3626,13 @@ pub struct MockStoragePort {
     /// need to assert WHICH hash was rolled back use this; a bare count
     /// suffices for most cases.
     deleted_hashes: Mutex<Vec<ContentHash>>,
+    /// Hashes whose `size_of` returns a backend failure (persistent, NOT
+    /// consumed on use) instead of a size or a `NotFound`. Distinct from
+    /// `inject_get_error`, which is a `NotFound` — the point of this hook
+    /// is the OTHER arm: a store that could not be asked, which a caller
+    /// must not read as an absence. See
+    /// [`MockStoragePort::fail_size_of`].
+    inject_size_of_error: Mutex<std::collections::HashSet<ContentHash>>,
     /// Backend label returned by [`StoragePort::backend_label`]. Defaults
     /// to `"memory"` so scrub-use-case tests can assert the metric's
     /// `backend` label without ambiguity. Tests that explicitly want the
@@ -3629,13 +3654,16 @@ impl MockStoragePort {
             shard_truncations: Mutex::new(Vec::new()),
             put_calls: AtomicUsize::new(0),
             get_calls: AtomicUsize::new(0),
+            size_of_calls: AtomicUsize::new(0),
             delete_calls: AtomicUsize::new(0),
             deleted_hashes: Mutex::new(Vec::new()),
             backend_label: Mutex::new("memory"),
             inject_put_error: Mutex::new(None),
+            inject_put_error_always: Mutex::new(None),
             inject_put_error_after: Mutex::new(None),
             inject_get_truncated: Mutex::new(HashMap::new()),
             inject_get_error: Mutex::new(std::collections::HashSet::new()),
+            inject_size_of_error: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -3647,6 +3675,19 @@ impl MockStoragePort {
     /// (no event-store append, no per-finding rows persisted).
     pub fn fail_next_put(&self, err: DomainError) {
         *self.inject_put_error.lock().unwrap() = Some(err);
+    }
+
+    /// Arm a **persistent** `put` failure — every call returns `err`.
+    pub fn fail_put_persistent(&self, err: DomainError) {
+        *self.inject_put_error_always.lock().unwrap() = Some(err);
+    }
+
+    /// Make `size_of` for `hash` fail with a backend error — persistent,
+    /// not consumed. The point is the arm an absence is NOT: a caller
+    /// surveying presence must not read "the store could not be asked" as
+    /// "the object is not here".
+    pub fn fail_size_of(&self, hash: ContentHash) {
+        self.inject_size_of_error.lock().unwrap().insert(hash);
     }
 
     /// Arm a one-shot `put` failure that fires only
@@ -3798,6 +3839,15 @@ impl MockStoragePort {
         self.get_calls.load(Ordering::Relaxed)
     }
 
+    /// Number of times `size_of` has been invoked (hit, miss or injected
+    /// failure). Used by tests asserting a bound refused before any
+    /// storage round-trip — the constituent-count bound on the composite
+    /// path is decided from the manifest's own bytes, and the probe count
+    /// is what shows it.
+    pub fn size_of_call_count(&self) -> usize {
+        self.size_of_calls.load(Ordering::Relaxed)
+    }
+
     /// Number of times `delete` has been invoked. Used by declared-hash
     /// rollback tests to assert both positive
     /// (rollback happened) and negative (blob shared — rollback
@@ -3828,7 +3878,12 @@ impl StoragePort for MockStoragePort {
         // `MockArtifactLifecycle`). The seeded error fires only after
         // the input stream has been drained, mirroring the production
         // adapters' streaming-then-fail order.
-        let injected = self.inject_put_error.lock().unwrap().take();
+        let injected = self
+            .inject_put_error
+            .lock()
+            .unwrap()
+            .take()
+            .or_else(|| self.inject_put_error_always.lock().unwrap().clone());
         // Staggered toggle for targeting the second
         // (or later) put. Consume only when `call_idx > skip`;
         // otherwise leave the toggle armed for a later call.
@@ -4008,6 +4063,15 @@ impl StoragePort for MockStoragePort {
     }
 
     fn size_of(&self, hash: &ContentHash) -> BoxFut<'_, DomainResult<u64>> {
+        self.size_of_calls.fetch_add(1, Ordering::Relaxed);
+        if self.inject_size_of_error.lock().unwrap().contains(hash) {
+            let id = hash.to_string();
+            return Box::pin(async move {
+                Err(DomainError::Invariant(format!(
+                    "storage size_of failed: injected backend failure for {id}"
+                )))
+            });
+        }
         let result = match self.data.lock().unwrap().get(hash) {
             Some(bytes) => Ok(bytes.len() as u64),
             None => Err(DomainError::NotFound {
@@ -4068,6 +4132,61 @@ impl StoragePort for MockStoragePort {
     fn backend_label(&self) -> &'static str {
         *self.backend_label.lock().unwrap()
     }
+}
+
+// ---------------------------------------------------------------------------
+// OCI composition documents
+// ---------------------------------------------------------------------------
+
+/// The layer `mediaType` the composition fixtures declare — a gzip tar, the
+/// ordinary one and one [`hort_domain::oci::strict_manifest_nomination`]
+/// accepts as openable.
+pub const OCI_GZIP_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+
+/// A single-image OCI manifest **document**, serialised the way it is stored,
+/// naming `config` and `layers` in order.
+///
+/// Shared rather than per-test-module because the composite path's two levels
+/// — resolving a composition and acquiring its constituents — have to agree
+/// about the document they are reading: the resolution reads these bytes out
+/// of CAS and the acquisition fetches exactly the digests they name, so a
+/// second copy of this builder is a place for the two to drift apart.
+pub fn oci_image_manifest_bytes(config: &ContentHash, layers: &[&ContentHash]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": format!("sha256:{config}"),
+            "size": 7,
+        },
+        "layers": layers.iter().map(|h| serde_json::json!({
+            "mediaType": OCI_GZIP_LAYER_MEDIA_TYPE,
+            "digest": format!("sha256:{h}"),
+            "size": 100,
+        })).collect::<Vec<_>>(),
+    }))
+    .expect("manifest serialises")
+}
+
+/// An image **config** document whose `rootfs` declares `diff_ids` entries —
+/// one per manifest layer, which is the arity the strict parse checks.
+///
+/// The values deliberately match no layer digest: a `diff_id` is the digest
+/// of the uncompressed tar and a layer digest the digest of the compressed
+/// blob, so only the arity is checkable.
+pub fn oci_image_config_bytes(diff_ids: usize) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "architecture": "amd64",
+        "os": "linux",
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": (0..diff_ids)
+                .map(|i| format!("sha256:{:064x}", i + 0xd1ff_0000))
+                .collect::<Vec<_>>(),
+        },
+    }))
+    .expect("config serialises")
 }
 
 // ---------------------------------------------------------------------------
@@ -6326,6 +6445,17 @@ pub struct MockUpstreamProxy {
     /// returns an `upstream:not_found:…` error by default (#53), so
     /// this hook exists specifically to simulate the *other* branch.
     next_blob_error: Mutex<Option<DomainError>>,
+    /// **Persistent** per-digest failures for `fetch_blob`, keyed on the
+    /// `sha256:<hex>` digest string. Unlike `next_blob_error` these are
+    /// not drained, so a caller that retries one constituent sees the same
+    /// answer every attempt — which is what makes a per-constituent
+    /// attempt bound observable.
+    blob_errors: Mutex<HashMap<String, DomainError>>,
+    /// Every `fetch_blob` digest, in call order. Lets a test assert WHICH
+    /// constituents went to the upstream and how many times — the only
+    /// observation that distinguishes "only the absent ones were fetched"
+    /// from "they all were".
+    blob_fetch_log: Mutex<Vec<String>>,
     manifests: Mutex<HashMap<(String, String, String), ManifestFetch>>,
     /// One-shot failure for the next `fetch_manifest` call. Drained on
     /// consumption. Used to drive the `UpstreamUnavailable` path
@@ -6383,6 +6513,8 @@ impl MockUpstreamProxy {
         Self {
             blobs: Mutex::new(HashMap::new()),
             next_blob_error: Mutex::new(None),
+            blob_errors: Mutex::new(HashMap::new()),
+            blob_fetch_log: Mutex::new(Vec::new()),
             manifests: Mutex::new(HashMap::new()),
             next_manifest_error: Mutex::new(None),
             metadata: Mutex::new(HashMap::new()),
@@ -6555,6 +6687,29 @@ impl MockUpstreamProxy {
         );
     }
 
+    /// Seed a **persistent** failure for one blob digest (the
+    /// `sha256:<hex>` form `fetch_blob` is called with). Every attempt for
+    /// that digest fails with `err`; other digests are unaffected.
+    pub fn fail_blob_with(&self, digest: &str, err: DomainError) {
+        self.blob_errors
+            .lock()
+            .unwrap()
+            .insert(digest.to_string(), err);
+    }
+
+    /// Drop a persistent per-digest blob failure, so a later attempt is
+    /// served the seeded fixture. The upstream recovering is the point of
+    /// the retry budget, and a test that cannot express it cannot assert
+    /// what survives across attempts.
+    pub fn clear_blob_error(&self, digest: &str) {
+        self.blob_errors.lock().unwrap().remove(digest);
+    }
+
+    /// Every `fetch_blob` digest, in call order.
+    pub fn blob_fetches(&self) -> Vec<String> {
+        self.blob_fetch_log.lock().unwrap().clone()
+    }
+
     /// Seed a one-shot failure on the next
     /// `fetch_referrers` call. Cleared on consumption. Mirrors
     /// [`Self::fail_next_manifest_with`] / [`Self::fail_next_metadata_with`].
@@ -6600,7 +6755,13 @@ impl UpstreamProxy for MockUpstreamProxy {
         upstream_name: String,
         digest: String,
     ) -> BoxFuture<'_, DomainResult<BlobFetch>> {
-        let injected = self.next_blob_error.lock().unwrap().take();
+        let injected = self
+            .next_blob_error
+            .lock()
+            .unwrap()
+            .take()
+            .or_else(|| self.blob_errors.lock().unwrap().get(&digest).cloned());
+        self.blob_fetch_log.lock().unwrap().push(digest.clone());
         let key = (mapping.path_prefix, upstream_name, digest);
         let entry = self.blobs.lock().unwrap().get(&key).cloned();
         Box::pin(async move {
@@ -7089,6 +7250,105 @@ mod upstream_metadata_mock_tests {
 // ---------------------------------------------------------------------------
 // MockScanFindingsRepository
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// MockCompositeScanObservationRepository
+// ---------------------------------------------------------------------------
+
+/// Test mock for the [`CompositeScanObservationRepository`] outbound
+/// port — the shadow composite-scan observation projection.
+///
+/// **Round-trips**: `find_by_artifact` serves what `record` accepted,
+/// replacing per artifact exactly as the Postgres adapter's upsert does,
+/// so a test can assert that a second assessment replaced the first
+/// rather than adding a row. For the same reason it also calls
+/// [`CompositeScanObservation::validate`] on the way in and returns the
+/// error — the production adapter validates before it binds, so an
+/// observation this mock accepted and the adapter would reject is a row
+/// no producer in the system can write.
+///
+/// [`Self::writes`] is the full write log in call order (including
+/// replacements), so "replaced, not appended" is assertable as two
+/// writes and one row.
+pub struct MockCompositeScanObservationRepository {
+    rows: Mutex<Vec<CompositeScanObservation>>,
+    writes: Mutex<Vec<CompositeScanObservation>>,
+    next_error: Mutex<Option<DomainError>>,
+}
+
+#[allow(dead_code)]
+impl MockCompositeScanObservationRepository {
+    pub fn new() -> Self {
+        Self {
+            rows: Mutex::new(Vec::new()),
+            writes: Mutex::new(Vec::new()),
+            next_error: Mutex::new(None),
+        }
+    }
+
+    /// Every stored row — one per artifact, as in the table.
+    pub fn rows(&self) -> Vec<CompositeScanObservation> {
+        self.rows.lock().unwrap().clone()
+    }
+
+    /// The stored row for `artifact_id`, if any.
+    pub fn row_for(&self, artifact_id: Uuid) -> Option<CompositeScanObservation> {
+        self.rows
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|o| o.artifact_id == artifact_id)
+            .cloned()
+    }
+
+    /// Every accepted write, in call order.
+    pub fn writes(&self) -> Vec<CompositeScanObservation> {
+        self.writes.lock().unwrap().clone()
+    }
+
+    /// Arm the next `record` to fail. Cleared after that call.
+    pub fn fail_next_record(&self, err: DomainError) {
+        *self.next_error.lock().unwrap() = Some(err);
+    }
+}
+
+impl Default for MockCompositeScanObservationRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CompositeScanObservationRepository for MockCompositeScanObservationRepository {
+    fn record<'a>(
+        &'a self,
+        observation: &'a CompositeScanObservation,
+    ) -> BoxFut<'a, DomainResult<()>> {
+        Box::pin(async move {
+            if let Some(err) = self.next_error.lock().unwrap().take() {
+                return Err(err);
+            }
+            observation.validate()?;
+            let mut rows = self.rows.lock().unwrap();
+            match rows
+                .iter_mut()
+                .find(|o| o.artifact_id == observation.artifact_id)
+            {
+                Some(existing) => *existing = observation.clone(),
+                None => rows.push(observation.clone()),
+            }
+            self.writes.lock().unwrap().push(observation.clone());
+            Ok(())
+        })
+    }
+
+    fn find_by_artifact(
+        &self,
+        artifact_id: Uuid,
+    ) -> BoxFut<'_, DomainResult<Option<CompositeScanObservation>>> {
+        let found = self.row_for(artifact_id);
+        Box::pin(async move { Ok(found) })
+    }
+}
 
 /// Test mock for the [`ScanFindingsRepository`] outbound port.
 ///

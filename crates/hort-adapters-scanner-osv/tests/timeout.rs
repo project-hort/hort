@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use hort_adapters_scanner_osv::{OsvScannerAdapter, OsvScannerConfig};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::DomainError;
-use hort_domain::ports::scanner::{ScanTarget, ScannerPort};
+use hort_domain::ports::scanner::{ScanTarget, ScanUnit, ScannerPort};
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ContentHash, Sbom};
 
 /// Serializes every write-then-exec fixture in this test binary. An
@@ -113,7 +113,7 @@ async fn osv_scan_timeout_kills_hung_child_within_configured_window() {
     let started = Instant::now();
     let coords = placeholder_coords();
     let target = ScanTarget {
-        content_hash: &hash,
+        unit: ScanUnit::Blob(&hash),
         format: "npm",
         coords: &coords,
         kind: ArtifactKind::NpmTarball,

@@ -888,6 +888,7 @@ pub(crate) mod tests {
                     informational_class: None,
                     severity_basis: crate::types::SeverityBasis::Assessed,
                     component_relation: crate::types::ComponentRelation::NotEstablished,
+                    statement: crate::types::FindingStatement::Unstated,
                 }],
                 previously_clean_at: Utc::now(),
             }),

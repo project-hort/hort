@@ -59,7 +59,7 @@ use std::path::PathBuf;
 use hort_adapters_scanner_osv::{OsvScannerAdapter, OsvScannerConfig};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::{ScanAnalysis, ScanTarget, ScannerPort};
+use hort_domain::ports::scanner::{ScanAnalysis, ScanTarget, ScanUnit, ScannerPort};
 use hort_domain::types::sbom::SbomComponent;
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ContentHash, Ecosystem, Finding, Sbom};
 
@@ -113,7 +113,7 @@ async fn scan_sbom(coords: &ArtifactCoords, sbom: &Sbom) -> Option<DomainResult<
     let adapter = OsvScannerAdapter::new(config);
     let hash = placeholder_hash();
     let target = ScanTarget {
-        content_hash: &hash,
+        unit: ScanUnit::Blob(&hash),
         format: match coords.format {
             RepositoryFormat::Maven => "maven",
             RepositoryFormat::Npm => "npm",

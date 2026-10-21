@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use hort_domain::types::{ComponentRelation, Finding};
+use hort_domain::types::{ComponentRelation, Finding, FindingStatement};
 use serde::Deserialize;
 
 use crate::purl::build_purl;
@@ -119,6 +119,62 @@ pub(crate) struct TrivyCvss {
     #[serde(rename = "V3Vector", default)]
     #[allow(dead_code)]
     pub(crate) v3_vector: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Report sections and what they are statements about
+// ---------------------------------------------------------------------------
+
+/// Which section of a Trivy report a finding was read out of.
+///
+/// One variant, because hort consumes one section: [`aggregate_findings`]
+/// reads `Results[].Vulnerabilities` and nothing else. Trivy also emits
+/// `Results[].Secrets` (its secret scanner is on by default),
+/// `Misconfigurations` and `Licenses`; none of them is deserialised by
+/// [`TrivyResult`], so none of them reaches a [`Finding`] today.
+///
+/// The enum exists so that changes when a section is added. ADR 0064 D2
+/// splits findings by whether the claim is about the bytes or about the
+/// filesystem those bytes compose into, and the section a finding came
+/// out of is what decides which — a secret is in the bytes however they
+/// are composed; an installed package is a fact about an assembled tree.
+/// Deserialising a second section without answering that question would
+/// silently give a byte statement the composition's posture, which is how
+/// a later secrets backend gets disarmed by a decision taken before it
+/// existed. Here, the compiler asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportSection {
+    /// `Results[].Vulnerabilities` — an installed package matched an
+    /// advisory. A claim about the package set of the tree Trivy walked.
+    Vulnerabilities,
+}
+
+/// What a finding read out of `section` is a statement **about**
+/// (ADR 0064 D2).
+///
+/// The section is the **adapter's own** fact and nothing downstream can
+/// recover it: the report is consumed here, and which of its sections an
+/// entry came out of is exactly what decides whether the claim is about
+/// the bytes or about the filesystem they compose into.
+///
+/// What it deliberately does *not* decide is **whose** filesystem. That
+/// is a property of the artifact under scan rather than of the report,
+/// and a release-authority decision resting on an adapter echoing back a
+/// value the application layer handed it is a decision one adapter could
+/// get wrong for every artifact. So this answers the half it knows — the
+/// half that persists on the finding — and
+/// [`Finding::may_condemn_artifact`](hort_domain::types::Finding::may_condemn_artifact)
+/// composes it with the row's `ArtifactKind` where the verdict is taken.
+/// There is no value this function could return that means "a
+/// constituent's filesystem": the enum has no such variant, by design.
+///
+/// Exhaustive over [`ReportSection`] with no wildcard arm: a section
+/// added to the taxonomy has to state its side here or it does not
+/// compile.
+pub(crate) const fn statement_of(section: ReportSection) -> FindingStatement {
+    match section {
+        ReportSection::Vulnerabilities => FindingStatement::Filesystem,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +309,11 @@ fn vuln_to_finding(trivy_type: &str, vuln: &TrivyVulnerability) -> Finding {
         // floor; `Assessed` for every band Trivy actually reported.
         severity_basis,
         component_relation: ComponentRelation::NotEstablished,
+        // Read out of the one section this parser deserialises
+        // (ADR 0064 D2). The mapping is [`statement_of`]'s, not this
+        // site's, so a second deserialised section cannot pick its own
+        // answer here.
+        statement: statement_of(ReportSection::Vulnerabilities),
     }
 }
 
@@ -353,6 +414,59 @@ mod tests {
     fn parse_malformed_json_propagates_serde_error() {
         let r = parse_trivy_report(b"{not json");
         assert!(r.is_err());
+    }
+
+    // ----- which side of ADR 0064 D2's line a finding is on -----------------
+
+    /// A `Vulnerabilities` entry is a claim about an installed package
+    /// set, which is a claim about an assembled filesystem rather than
+    /// about the bytes — the side of ADR 0064 D2's line this adapter can
+    /// answer from what it read.
+    ///
+    /// The mapping is exhaustive over the sections hort deserialises, so
+    /// the pin is one assertion today and a compile error the day a second
+    /// section lands. A `Secrets` entry would be
+    /// [`FindingStatement::Bytes`]; Trivy's secret scanner is on by
+    /// default and its findings are simply not deserialised
+    /// ([`TrivyResult`] has no field for them), which is why hort consumes
+    /// only the second kind today.
+    #[test]
+    fn a_vulnerability_is_a_statement_about_an_assembled_filesystem() {
+        assert_eq!(
+            statement_of(ReportSection::Vulnerabilities),
+            FindingStatement::Filesystem,
+        );
+    }
+
+    /// And the mapping reaches the finding rather than living beside it.
+    #[test]
+    fn the_lowered_finding_carries_the_statement_its_section_put_it_on() {
+        let v = vuln_skeleton();
+        let f = vuln_to_finding("npm", &v);
+        assert_eq!(f.statement, FindingStatement::Filesystem);
+    }
+
+    /// Every finding in a report, not just the first: a batch where one
+    /// entry carried no statement would be a batch with one unexplained
+    /// gating decision in it.
+    #[test]
+    fn every_finding_of_a_report_states_its_side() {
+        let doc = br#"{"Results":[{"Target":"image","Class":"os-pkgs","Type":"debian",
+            "Vulnerabilities":[
+              {"VulnerabilityID":"CVE-2024-1","PkgName":"a","InstalledVersion":"1","Severity":"HIGH"},
+              {"VulnerabilityID":"CVE-2024-2","PkgName":"b","InstalledVersion":"2","Severity":"LOW"}
+            ]}]}"#;
+        let report = parse_trivy_report(doc).expect("parse");
+        let findings = aggregate_findings(&report);
+        assert_eq!(findings.len(), 2);
+        for f in &findings {
+            assert_eq!(
+                f.statement,
+                FindingStatement::Filesystem,
+                "{}: every entry states its side",
+                f.vulnerability_id
+            );
+        }
     }
 
     // ----- vuln_to_finding lowering -----------------------------------------

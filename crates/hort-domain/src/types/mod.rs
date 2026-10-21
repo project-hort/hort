@@ -19,7 +19,7 @@ pub use artifact_kind::ArtifactKind;
 pub use checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 pub use finding::{
     component_relation_label, highest_severity, is_informational_class, severity_label,
-    severity_summary_from_findings, ComponentRelation, Finding, SeverityBasis,
+    severity_summary_from_findings, ComponentRelation, Finding, FindingStatement, SeverityBasis,
 };
 pub use idempotency_key::IdempotencyKey;
 pub use sbom::{Ecosystem, PayloadAccess, Sbom, SbomComponent};

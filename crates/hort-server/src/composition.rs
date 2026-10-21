@@ -2938,6 +2938,11 @@ pub async fn build_app_context(
             // policy-mutation pass consults.
             curation_rules.clone(),
             storage.clone(),
+            // `reevaluate` resolves the artifact's `ArtifactKind` through
+            // the same compiled-in registry the scan run and the policy
+            // re-evaluation pass use, because that kind is an input to the
+            // verdict it re-derives (ADR 0064 D2).
+            hort_formats::compiled_in_format_handlers(),
         )
         // Inject the upstream-index cache
         // invalidator. The post-`block_one` hook calls it best-effort
@@ -2993,6 +2998,11 @@ pub async fn build_app_context(
         // off the request path. Same jobs adapter the ingest scan-enqueue
         // path uses.
         jobs_repo.clone(),
+        // Both directions of that pass resolve the artifact's
+        // `ArtifactKind` through the compiled-in registry — the same one
+        // the scan run uses, so the re-derived verdict reads the row's
+        // role the way the scan read it (ADR 0064 D2).
+        hort_formats::compiled_in_format_handlers(),
     ));
 
     // `WheelMetadataUseCase`. Composed over the
@@ -4230,8 +4240,8 @@ mod tests {
         archived: bool,
     ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-            SeverityThreshold,
+            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
+            ScanPolicyProjection, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
         ScanPolicyProjection {
@@ -4251,6 +4261,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

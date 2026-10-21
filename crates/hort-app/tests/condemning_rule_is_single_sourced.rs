@@ -4,37 +4,53 @@
 //!
 //! ## The invariant
 //!
-//! A finding names a component. Whether that component's code is *in* the
-//! artifact decides whether the finding may hold the artifact's release
-//! (ADR 0056 as amended 2026-10-15), and that question is answered in one
-//! place: [`Finding::may_condemn_artifact`] in [`DEFINITION_FILE`], with
-//! [`ComponentRelation::more_condemning`] beside it as the order two
-//! disagreeing relations reconcile to.
+//! A finding names a component, and says what kind of statement it is
+//! making. Whether that component's code is *in* the artifact
+//! (ADR 0056 as amended 2026-10-15) and whether the statement is about
+//! *this* artifact's filesystem at all (ADR 0064 D2) together decide
+//! whether the finding may hold the artifact's release, and that question
+//! is answered in one place: [`Finding::may_condemn_artifact`] in
+//! [`DEFINITION_FILE`], with [`ComponentRelation::more_condemning`]
+//! beside it as the order two disagreeing relations reconcile to.
 //!
-//! The rule is three lines of `match`, and every place that needs it sits
-//! in a different file from the field: the threshold walk in
+//! The statement half takes **two** inputs, and that is why it is worth
+//! policing as hard as the relation half. A producer states only what it
+//! read (`Bytes` / `Filesystem` / `Unstated`); whose filesystem the claim
+//! is about is the row's `ArtifactKind`, and the predicate composes the
+//! two where it decides rather than anything storing them already joined
+//! (ADR 0040 — storing a composition is storing a conclusion). So the
+//! conjunction `kind.is_composition_constituent() &&
+//! composite_verdict.carries_release_authority()` is part of the single
+//! definition, pinned by [`the_scanned_corpus_is_real`]: a copy of it
+//! elsewhere, or its deletion here, is the same class of defect as a
+//! second copy of the match.
+//!
+//! The rule is two short `match`es, and every place that needs it sits
+//! in a different file from the fields: the threshold walk in
 //! `hort-domain/src/policy/scan.rs`, the re-evaluation of a `Rejected`
 //! artifact over its stored findings in
-//! `hort-domain/src/policy/re_evaluation.rs`, the merge tie-break in
+//! `hort-domain/src/policy/re_evaluation.rs`, and the merge tie-break in
 //! `hort-app/src/use_cases/scan_orchestration.rs`. Matching on
-//! `component_relation` inline at any of them is shorter than calling the
-//! predicate, compiles, and passes the suite — and a second copy answers
-//! the same question in a second voice, which is how the copies come to
-//! disagree.
+//! `component_relation` — or on `statement` — inline at any of them is
+//! shorter than calling the predicate, compiles, and passes the suite —
+//! and a second copy answers the same question in a second voice, which
+//! is how the copies come to disagree.
 //!
 //! Convention alone does not hold this shape in this codebase, measured:
 //! the https-metadata rule was re-typed five times before
 //! `https_rule_is_single_sourced.rs` was written, and the sixth consumer
 //! carried no copy at all. Which direction a stray copy would be wrong in
-//! is not symmetric either — `ComponentRelation::NotEstablished` is the
-//! `Default`, so a copy that forgets an arm most naturally drops the
-//! condemning reading of absent evidence and disarms the whole stored
-//! corpus (a fail-open regression against ADR 0007).
+//! is not symmetric either — `ComponentRelation::NotEstablished` and
+//! `FindingStatement::Unstated` are both the `Default`, so a copy that
+//! forgets an arm most naturally drops the condemning reading of absent
+//! evidence and disarms the whole stored corpus (a fail-open regression
+//! against ADR 0007).
 //!
 //! ## The property
 //!
 //! Across every crate's production Rust, a **decision form** read of
-//! `.component_relation` appears only in [`DEFINITION_FILE`].
+//! `.component_relation` or of `.statement` appears only in
+//! [`DEFINITION_FILE`].
 //!
 //! A *decision form* is the field read used to decide something — the
 //! needle immediately followed by:
@@ -48,8 +64,11 @@
 //! Everything else the field is reached for is deliberately **not** a hit,
 //! because none of it re-answers the question:
 //!
-//! * `f.component_relation = relation;` — a write. The tagging site writes
-//!   the fact; the fact is not the verdict.
+//! * `f.component_relation = relation;` — a write. The tagging site
+//!   writes the fact; a fact is not the verdict. (`.statement` has no
+//!   production write left in the pipeline at all — see
+//!   [`the_statement_is_not_restated_above_its_producers`], which polices
+//!   that separately and for a different reason.)
 //! * `component_relation: ComponentRelation::NotEstablished,` — a
 //!   struct-literal initialiser, which carries no leading `.` and so does
 //!   not match the needle at all. There are a dozen production ones, and
@@ -89,10 +108,11 @@
 //! which is how guards in this family die. So:
 //!
 //! * [`the_scanned_corpus_is_real`] — the definition file still holds
-//!   exactly one decision-form read (the predicate's own `match`) and
-//!   still defines the predicate, the enum, the order and its rank
-//!   function. A rename of any of them turns this red, which is the moment
-//!   to re-read what the single definition is.
+//!   exactly one decision-form read per policed field (the predicate's own
+//!   two `match`es) and still defines the predicate, both enums, the
+//!   order, its rank function, and the two halves of the statement
+//!   conjunction. A rename or a deletion of any of them turns this red,
+//!   which is the moment to re-read what the single definition is.
 //! * [`every_consumer_reaches_the_rule_rather_than_its_own_copy`] — the
 //!   census of production call sites, with per-file counts, matched
 //!   **exactly**: a call that disappeared is a consumer that stopped
@@ -134,8 +154,18 @@ use rust_scan::{is_ident_byte, line_of, production_region, skip_ws, walk_rust, w
 /// The one production file allowed to answer the question.
 const DEFINITION_FILE: &str = "crates/hort-domain/src/types/finding.rs";
 
-/// The field whose reads are policed.
-const FIELD: &str = ".component_relation";
+/// The fields whose reads are policed, each with the type it is declared
+/// as — the second half is what the corpus counter-assertion checks the
+/// declaration of.
+///
+/// Both carry release authority through the one predicate, and both have
+/// a condemning `Default`, so a stray copy of either is wrong in the
+/// fail-open direction. Policing them together rather than in two guards
+/// is the point: they are two halves of one question.
+const FIELDS: &[(&str, &str)] = &[
+    (".component_relation", "ComponentRelation"),
+    (".statement", "FindingStatement"),
+];
 
 /// The predicate, the order, its rank function and the enum that carries
 /// the four observations. Named so a rename fails the counter-assertion
@@ -144,6 +174,35 @@ const PREDICATE_FN: &str = "may_condemn_artifact";
 const ORDER_FN: &str = "more_condemning";
 const RANK_FN: &str = "containment_claim_rank";
 const RELATION_ENUM: &str = "ComponentRelation";
+/// The statement taxonomy (ADR 0064 D2).
+const STATEMENT_ENUM: &str = "FindingStatement";
+
+/// The two halves of the statement axis's conjunction. They are the
+/// *replacement* for the placement function this guard used to pin: the
+/// role half no longer lives in a function of its own, it lives inside
+/// the predicate's `Filesystem` arm — so what has to be pinned is that
+/// the arm still composes both, in the definition file and nowhere else.
+/// Deleting either half would leave the match compiling, the suite
+/// green, and ADR 0064 D2's loosening either unscoped (every format) or
+/// unconditional (no operator act required).
+const CONJUNCTION_HALVES: &[&str] = &["is_composition_constituent", "carries_release_authority"];
+
+/// The pipeline **above** the producers — the layers a finding travels
+/// through between the adapter that stated its `statement` and the
+/// verdict that reads it (ADR 0008's layering, the same scoping
+/// `https_rule_is_single_sourced` uses one axis over).
+///
+/// Nothing here may re-state a finding's statement. A producer adapter
+/// (`crates/hort-adapters-scanner-*`, `crates/hort-adapters-advisory-*`)
+/// is deliberately **out** of scope: stating what it read is its whole
+/// job, and whether it does so by struct-literal initialiser or by
+/// assignment is a style choice, not an invariant.
+const PIPELINE_ABOVE_PRODUCERS: &[&str] = &[
+    "crates/hort-domain/src/",
+    "crates/hort-app/src/",
+    "crates/hort-formats/src/",
+    "crates/hort-http-",
+];
 
 /// Every production consumer of the rule, with the number of calls each
 /// makes. Pinned counts, not a presence check — see the module docs.
@@ -181,13 +240,15 @@ const EXPECTED_CALL_SITES: &[(&str, &str, usize)] = &[
     ),
 ];
 
-/// One decision-form read of the field.
+/// One decision-form read of one of the policed fields.
 #[derive(Debug, PartialEq, Eq)]
 struct Read {
     /// Workspace-relative path, forward slashes.
     rel: String,
     /// 1-based line of the read.
     line: usize,
+    /// Which field was read, for the failure message.
+    field: &'static str,
     /// The form that classified it, for the failure message.
     form: &'static str,
 }
@@ -239,17 +300,18 @@ fn enclosing_statement(text: &str, offset: usize) -> &str {
     &text[start..end]
 }
 
-/// Which decision form, if any, the read at `at` is part of. `at` is the
-/// offset of the `.` opening [`FIELD`] in already-blanked `text`.
+/// Which decision form, if any, the read of `field` at `at` is part of.
+/// `at` is the offset of the `.` opening `field` in already-blanked
+/// `text`.
 ///
 /// Classified by what immediately follows the field — see the module docs
 /// for why a write, a struct-literal initialiser and a method call on the
-/// relation are all deliberately not decisions.
-fn decision_form(text: &str, at: usize) -> Option<&'static str> {
+/// fact are all deliberately not decisions.
+fn decision_form(text: &str, field: &str, at: usize) -> Option<&'static str> {
     let bytes = text.as_bytes();
-    let after = at + FIELD.len();
-    // `.component_relation_label` is a different identifier, not this
-    // field.
+    let after = at + field.len();
+    // `.component_relation_label` is a different identifier, not the
+    // field; so is `.statement_of`.
     if bytes.get(after).copied().is_some_and(is_ident_byte) {
         return None;
     }
@@ -278,16 +340,19 @@ fn decision_reads(root: &Path) -> Vec<Read> {
         }
         let source = fs::read_to_string(&path).expect("source file is readable UTF-8");
         let text = production_region(&source);
-        let mut search = 0usize;
-        while let Some(found) = text[search..].find(FIELD) {
-            let at = search + found;
-            search = at + 1;
-            if let Some(form) = decision_form(&text, at) {
-                out.push(Read {
-                    rel: rel.clone(),
-                    line: line_of(&text, at),
-                    form,
-                });
+        for (field, _) in FIELDS {
+            let mut search = 0usize;
+            while let Some(found) = text[search..].find(field) {
+                let at = search + found;
+                search = at + 1;
+                if let Some(form) = decision_form(&text, field, at) {
+                    out.push(Read {
+                        rel: rel.clone(),
+                        line: line_of(&text, at),
+                        field,
+                        form,
+                    });
+                }
             }
         }
     }
@@ -330,7 +395,12 @@ fn the_condemning_rule_has_exactly_one_definition() {
     let stray: Vec<String> = decision_reads(&root)
         .into_iter()
         .filter(|read| read.rel != DEFINITION_FILE)
-        .map(|read| format!("{}:{} — {}", read.rel, read.line, read.form))
+        .map(|read| {
+            format!(
+                "{}:{} — {} read as a {}",
+                read.rel, read.line, read.field, read.form
+            )
+        })
         .collect();
 
     assert!(
@@ -403,28 +473,47 @@ fn the_scanned_corpus_is_real() {
         .into_iter()
         .filter(|read| read.rel == DEFINITION_FILE)
         .collect();
+    // Two: `may_condemn_artifact`'s match per policed field. The role
+    // half of the statement axis is a conjunction inside one of those
+    // arms rather than a match of its own, so it is pinned by
+    // `CONJUNCTION_HALVES` below instead.
     assert_eq!(
         definitions.len(),
-        1,
-        "expected exactly one decision-form read in {DEFINITION_FILE} — \
-         `Finding::{PREDICATE_FN}`'s own match. Found {}: {:?}. Zero means the \
-         needle no longer matches the rule and the single-definition test \
-         above is vacuously green; more than one means the file grew a second \
-         reader that needs reading before this count is updated",
+        2,
+        "expected exactly two decision-form reads in {DEFINITION_FILE} — \
+         `Finding::{PREDICATE_FN}`'s match per policed field. Found {}: {:?}. \
+         Fewer means a needle no longer matches the rule and the \
+         single-definition test above is vacuously green for that field; more \
+         means the file grew a reader that needs reading before this count is \
+         updated",
         definitions.len(),
         definitions,
     );
+    for (field, _) in FIELDS {
+        assert!(
+            definitions.iter().any(|read| read.field == *field),
+            "{DEFINITION_FILE} holds no decision-form read of {field}; the scan \
+             for it is vacuously green"
+        );
+    }
 
     let source = fs::read_to_string(root.join(DEFINITION_FILE))
         .expect("the definition file is readable UTF-8");
     let text = production_region(&source);
-    for (what, needle) in [
+    let mut needles = vec![
         ("the predicate", format!("pub fn {PREDICATE_FN}(")),
         ("the reconciliation order", format!("pub fn {ORDER_FN}(")),
         ("its rank function", format!("fn {RANK_FN}(")),
         ("the relation enum", format!("pub enum {RELATION_ENUM}")),
-        ("the field", format!("pub {}: {RELATION_ENUM}", &FIELD[1..])),
-    ] {
+        ("the statement enum", format!("pub enum {STATEMENT_ENUM}")),
+    ];
+    for half in CONJUNCTION_HALVES {
+        needles.push(("a half of the statement conjunction", format!("{half}()")));
+    }
+    for (field, declared_as) in FIELDS {
+        needles.push(("the field", format!("pub {}: {declared_as}", &field[1..])));
+    }
+    for (what, needle) in needles {
         assert_eq!(
             text.matches(&needle).count(),
             1,
@@ -432,6 +521,159 @@ fn the_scanned_corpus_is_real() {
              (`{needle}`); if it moved, this guard is watching the wrong file",
         );
     }
+}
+
+/// Every production write of `.statement` in [`PIPELINE_ABOVE_PRODUCERS`],
+/// as `(file, line)`.
+///
+/// A *write* is the needle followed by a single `=` that is not part of
+/// `==`, `!=`, `<=` or `>=` — the assignment form, and the only way a
+/// field can be re-stated.
+fn statement_writes(root: &Path) -> Vec<(String, usize)> {
+    const NEEDLE: &str = ".statement";
+    let mut out = Vec::new();
+    for path in production_sources(root) {
+        let rel = relative(root, &path);
+        if is_inline_test_module(&rel)
+            || !PIPELINE_ABOVE_PRODUCERS.iter().any(|p| rel.starts_with(p))
+        {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("source file is readable UTF-8");
+        let text = production_region(&source);
+        let bytes = text.as_bytes();
+        let mut search = 0usize;
+        while let Some(found) = text[search..].find(NEEDLE) {
+            let at = search + found;
+            search = at + 1;
+            let after = at + NEEDLE.len();
+            // `.statement_of` and friends are different identifiers.
+            if bytes.get(after).copied().is_some_and(is_ident_byte) {
+                continue;
+            }
+            let next = skip_ws(bytes, after);
+            let rest = &text[next.min(text.len())..];
+            if rest.starts_with('=') && !rest.starts_with("==") {
+                out.push((rel.clone(), line_of(&text, at)));
+            }
+        }
+    }
+    out
+}
+
+/// **A finding's statement is stated once, by its producer, and never
+/// re-stated on the way to the verdict.**
+///
+/// This is the half of the invariant the decision-form scan cannot see.
+/// The statement persists now, so a pass that re-wrote it would not be
+/// re-deriving the *rule* — it would be rewriting the *fact* the rule
+/// reads, which is worse: the stored finding and the fresh one would say
+/// different things about the same scanner output, and the verdict
+/// re-taken over the blob would answer a question the scan never asked.
+/// (That divergence, in the opposite direction, is exactly the trapdoor
+/// persisting the field closed.)
+///
+/// The pass that used to write it placed the producer's half against the
+/// row's `ArtifactKind` — a composition, and therefore a conclusion
+/// (ADR 0040). The composition now happens inside
+/// [`Finding::may_condemn_artifact`], where it is spent rather than
+/// stored, so there is nothing above the producers for a write to do.
+///
+/// Scope is [`PIPELINE_ABOVE_PRODUCERS`] — derived from ADR 0008's
+/// layering, not enumerated — and a producer adapter is out of it
+/// because stating what it read is its job. **No allow-list**: a
+/// pipeline site that genuinely needs to write this field is a review
+/// conversation about whether it is storing a conclusion.
+///
+/// Blind spot, as ever: a write reached through a differently-named
+/// binding, or a whole `Finding` rebuilt field-by-field from another one.
+#[test]
+fn the_statement_is_not_restated_above_its_producers() {
+    let root = workspace_root();
+    let writes: Vec<String> = statement_writes(&root)
+        .into_iter()
+        .map(|(rel, line)| format!("{rel}:{line}"))
+        .collect();
+    assert!(
+        writes.is_empty(),
+        "`.statement` is written in the pipeline above the producers ({} \
+         site(s)). The producer states what it read; whose filesystem the \
+         claim is about belongs in `Finding::{PREDICATE_FN}`, composed from \
+         the row's `ArtifactKind` where the decision is taken, not written \
+         onto the finding — a stored composition is a stored conclusion \
+         (ADR 0040), and a re-stated fact makes the blob and the fresh scan \
+         disagree.\nWrites:\n  {}",
+        writes.len(),
+        writes.join("\n  "),
+    );
+}
+
+/// Counter-assertion for the scan above: its write-matcher really does
+/// recognise the shape it exists to reject, and really does leave the
+/// forms that are not writes alone. Asserted on fixture text, because
+/// the live scan's only honest answer today is "nothing", and a matcher
+/// that recognised nothing would give the same answer.
+#[test]
+fn the_write_matcher_catches_an_assignment_and_nothing_else() {
+    let dir = std::env::temp_dir().join(format!(
+        "hort-condemning-guard-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let src = dir.join("crates/hort-app/src");
+    fs::create_dir_all(&src).expect("fixture tree is creatable");
+
+    let cases: &[(&str, &str, bool)] = &[
+        (
+            "write.rs",
+            "fn t(f: &mut Finding) { f.statement = x; }\n",
+            true,
+        ),
+        (
+            "wrapped.rs",
+            "fn t(f: &mut Finding) { f\n    .statement\n    = x; }\n",
+            true,
+        ),
+        (
+            "compare.rs",
+            "fn t(f: &Finding) -> bool { f.statement == x }\n",
+            false,
+        ),
+        (
+            "initialiser.rs",
+            "fn t() -> Finding { Finding { statement: x } }\n",
+            false,
+        ),
+        (
+            "longer_ident.rs",
+            "fn t(f: &Finding) { f.statement_of = x; }\n",
+            false,
+        ),
+        (
+            "cfg_test.rs",
+            "#[cfg(test)]\nmod t { fn t(f: &mut Finding) { f.statement = x; } }\n",
+            false,
+        ),
+    ];
+    for (name, body, _) in cases {
+        fs::write(src.join(name), body).expect("fixture file is writable");
+    }
+
+    let found: Vec<String> = statement_writes(&dir)
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .collect();
+    for (name, _, is_write) in cases {
+        let rel = format!("crates/hort-app/src/{name}");
+        assert_eq!(
+            found.contains(&rel),
+            *is_write,
+            "{name}: the write-matcher must {} this form\nfound: {found:?}",
+            if *is_write { "catch" } else { "ignore" },
+        );
+    }
+
+    fs::remove_dir_all(&dir).expect("fixture tree is removable");
 }
 
 /// The test-code exclusion is derived, not conventional: every
@@ -490,11 +732,15 @@ fn every_skipped_test_file_is_really_compiled_out() {
 // the tree.
 // ---------------------------------------------------------------------------
 
-/// `decision_form` over `fixture`, at the first occurrence of the field.
+/// The relation field, as the matcher fixtures below name it.
+const RELATION_FIELD: &str = ".component_relation";
+
+/// `decision_form` over `fixture`, at the first occurrence of
+/// [`RELATION_FIELD`].
 fn classify(fixture: &str) -> Option<&'static str> {
     let text = production_region(fixture);
-    let at = text.find(FIELD).expect("fixture names the field");
-    decision_form(&text, at)
+    let at = text.find(RELATION_FIELD).expect("fixture names the field");
+    decision_form(&text, RELATION_FIELD, at)
 }
 
 #[test]
@@ -539,7 +785,7 @@ fn the_matcher_ignores_a_write() {
 fn the_matcher_ignores_a_struct_literal_initialiser() {
     let fixture = "Finding { purl: p, component_relation: ComponentRelation::NotEstablished }";
     assert_eq!(
-        production_region(fixture).find(FIELD),
+        production_region(fixture).find(RELATION_FIELD),
         None,
         "an initialiser carries no leading dot, so it is not even a read",
     );
@@ -570,11 +816,11 @@ fn the_matcher_does_not_read_the_field_out_of_a_longer_identifier() {
 fn the_matcher_ignores_a_comparison_inside_a_comment_or_a_literal() {
     assert_eq!(
         production_region("// if f.component_relation == ComponentRelation::Subject {}")
-            .find(FIELD),
+            .find(RELATION_FIELD),
         None,
     );
     assert_eq!(
-        production_region("let s = \"f.component_relation == x\";").find(FIELD),
+        production_region("let s = \"f.component_relation == x\";").find(RELATION_FIELD),
         None,
     );
 }
@@ -583,5 +829,5 @@ fn the_matcher_ignores_a_comparison_inside_a_comment_or_a_literal() {
 fn the_matcher_ignores_a_cfg_test_item() {
     let fixture =
         "#[cfg(test)]\nmod tests {\n    fn t() { match f.component_relation { _ => 1 } }\n}\n";
-    assert_eq!(production_region(fixture).find(FIELD), None);
+    assert_eq!(production_region(fixture).find(RELATION_FIELD), None);
 }

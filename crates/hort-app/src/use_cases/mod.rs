@@ -10,6 +10,11 @@ pub mod authenticate_use_case;
 // `NotFound` shape.
 pub(crate) mod cas_bounded_read;
 pub mod cas_scrub_use_case;
+// The composed scan unit of an OCI image manifest (ADR 0064 D1):
+// resolving it from the manifest's own bytes, and the shadow assessment
+// that runs it with no release authority (D6).
+pub(crate) mod composite_scan;
+pub(crate) mod constituent_acquisition;
 pub mod content_reference;
 // Curator decisions: `waive` + `block` (single-artifact and
 // `BlockTarget::VersionList` with continue-on-error), plus the `list_*`
@@ -102,7 +107,12 @@ pub mod patch_candidate_use_case;
 // Shared active-scan-policy resolver (issue #76, item 1/2) — extracted
 // from seven private, byte-identical copies. See module docs.
 pub(crate) mod policy_resolution;
+// The one place the application layer asks an artifact's own format
+// handler what its bytes are. Four verdict-adjacent call sites need the
+// answer and all four must get the same one for a given row; see the
+// module docs.
 pub mod policy_use_case;
+pub(crate) mod scan_kind_resolution;
 // Prefetch trigger `on_dist_tag_move`
 // (`docs/architecture/explanation/prefetch-pipeline.md`).
 // Stateless planner consumed by the per-format index/metadata serve
@@ -224,6 +234,11 @@ pub mod virtual_resolution;
 // from CAS. See `docs/architecture/how-to/pypi-pull-through.md`.
 pub mod wheel_metadata_use_case;
 
+// The shadow composite assessment's evidence sink (ADR 0064 D6). The
+// module stays crate-private — `ShadowCompositeScan` and the resolution
+// are internal — but the composition root has to hand the orchestrator
+// somewhere to write, so the sink itself is part of the public surface.
+pub use composite_scan::ShadowObservationSink;
 pub use group_reconcile_use_case::{GroupReconcileUseCase, ReconcileReport};
 pub use policy_use_case::{
     AddExclusionCommand, CreatePolicyCommand, FieldChange, PolicyUseCase, RemoveExclusionCommand,

@@ -217,6 +217,7 @@ fn single_critical_finding() -> Vec<Finding> {
         informational_class: None,
         severity_basis: hort_domain::types::SeverityBasis::Assessed,
         component_relation: hort_domain::types::ComponentRelation::NotEstablished,
+        statement: hort_domain::types::FindingStatement::Unstated,
     };
     // Sanity-check the validator against our hand-built fixture so a
     // future field-cap change surfaces against this test, not a
@@ -240,6 +241,10 @@ async fn invoke_rescan_reject(ctx: &Arc<AppContext>, artifact_id: Uuid) {
             "rescan-rejection-test-scanner".into(),
             single_critical_finding(),
             hort_domain::events::ScanAssessment::Analysed,
+            // The fixture's finding states nothing, so it condemns on
+            // every kind; `Other` is also what the registry answers for
+            // this test's synthetic format.
+            hort_domain::types::ArtifactKind::Other,
             None,
         )
         .await

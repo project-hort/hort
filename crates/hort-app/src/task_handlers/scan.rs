@@ -140,6 +140,7 @@ impl TaskHandler for ScanTaskHandler {
                     scanner,
                     findings,
                     assessment,
+                    kind: _,
                     sbom: _,
                 } => {
                     // `assessment` rides the summary so the jobs row
@@ -153,7 +154,7 @@ impl TaskHandler for ScanTaskHandler {
                         "assessment": assessment.as_str(),
                     })
                 }
-                ScanRunOutcome::SkippedNoBackends => {
+                ScanRunOutcome::SkippedNoBackends { kind: _ } => {
                     serde_json::json!({ "skipped": "no_backends" })
                 }
                 ScanRunOutcome::NothingAnalysable { scanner, reason } => {

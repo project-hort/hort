@@ -44,6 +44,8 @@
 //! without restarting the process: the host re-reads manifests and
 //! re-registers routes for any changed modules. (Not implemented in v1.)
 
+use hort_domain::ports::format_handler::FormatHandler;
+
 pub mod archive_bounds;
 pub mod cargo;
 // Format-agnostic index-construction trait skeleton (`IndexFilter`,
@@ -66,6 +68,37 @@ pub(crate) mod sbom_helpers;
 // (`parse_upstream_checksum`, `extract_upstream_versions`,
 // `extract_dependency_specs`). See ADR 0026.
 pub(crate) mod stream_helpers;
+
+/// The compiled-in format-handler registry, keyed by the handler key
+/// each composition root looks a format up under —
+/// `RepositoryFormat::to_string()`, which is also what the ingest-time
+/// scan enqueue writes onto `jobs.format`.
+///
+/// Until the WASM module loader lands (ADR 0005) this is the canonical
+/// list, and it lives here — in the crate that owns the handlers —
+/// because every binary that needs it needs *the same* one. The scan
+/// run, both directions of the policy re-evaluation pass and the
+/// curator's single-artifact re-evaluation all resolve an artifact's
+/// `ArtifactKind` through this map, and that kind decides whether a
+/// stored filesystem finding gates the row it was found on (ADR 0064
+/// D2). Two registries free to drift would let a verdict re-taken over
+/// stored findings read a different role for one row than the scan run
+/// read.
+///
+/// Constructing it opens nothing: every handler is a unit struct.
+#[must_use]
+pub fn compiled_in_format_handlers(
+) -> std::collections::HashMap<String, std::sync::Arc<dyn FormatHandler>> {
+    use std::sync::Arc;
+    let mut handlers: std::collections::HashMap<String, Arc<dyn FormatHandler>> =
+        std::collections::HashMap::new();
+    handlers.insert("pypi".into(), Arc::new(pypi::PyPiFormatHandler));
+    handlers.insert("cargo".into(), Arc::new(cargo::CargoFormatHandler));
+    handlers.insert("npm".into(), Arc::new(npm::NpmFormatHandler));
+    handlers.insert("oci".into(), Arc::new(oci::OciFormatHandler));
+    handlers.insert("maven".into(), Arc::new(maven::MavenFormatHandler));
+    handlers
+}
 
 // Cross-crate test fixtures for archive construction. Gated by the
 // `test-support` feature so downstream test consumers (`hort-http-pypi`,

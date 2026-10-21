@@ -110,7 +110,7 @@ use hort_app::use_cases::test_support::{
 use hort_app::use_cases::CallerPrivileges;
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
 use hort_domain::entities::scan_policy::{
-    NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
+    CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
 };
 use hort_domain::error::DomainResult;
 use hort_domain::events::Actor;
@@ -293,6 +293,7 @@ fn build_curation_use_case(
         default_repository_access(),
         Arc::new(MockCurationRuleRepository::new()),
         Arc::new(MockStoragePort::new()),
+        hort_formats::compiled_in_format_handlers(),
     )
 }
 
@@ -333,6 +334,7 @@ fn build_policy_use_case(
         default_repository_access(),
         curation_rules,
         jobs,
+        hort_formats::compiled_in_format_handlers(),
     )
 }
 
@@ -357,6 +359,7 @@ fn sample_create_policy_command() -> CreatePolicyCommand {
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
+        composite_verdict_mode: CompositeVerdictMode::Observed,
     }
 }
 

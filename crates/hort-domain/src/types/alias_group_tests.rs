@@ -33,6 +33,7 @@ fn bare_mirror(purl: &str, id: &str, aliases: &[&str]) -> Finding {
         informational_class: None,
         severity_basis: SeverityBasis::Unassessed,
         component_relation: ComponentRelation::NotEstablished,
+        statement: crate::types::FindingStatement::Unstated,
     }
 }
 
@@ -45,6 +46,7 @@ fn informational(purl: &str, id: &str, class: &str, aliases: &[&str]) -> Finding
         informational_class: Some(class.into()),
         severity_basis: SeverityBasis::Assessed,
         component_relation: ComponentRelation::NotEstablished,
+        statement: crate::types::FindingStatement::Unstated,
         ..bare_mirror(purl, id, aliases)
     }
 }
@@ -56,6 +58,7 @@ fn scored(purl: &str, id: &str, score: f32, sev: SeverityThreshold, aliases: &[&
         cvss_score: Some(score),
         severity_basis: SeverityBasis::Assessed,
         component_relation: ComponentRelation::NotEstablished,
+        statement: crate::types::FindingStatement::Unstated,
         ..bare_mirror(purl, id, aliases)
     }
 }
@@ -68,6 +71,7 @@ fn label_only(purl: &str, id: &str, sev: SeverityThreshold, aliases: &[&str]) ->
         severity: sev,
         severity_basis: SeverityBasis::Assessed,
         component_relation: ComponentRelation::NotEstablished,
+        statement: crate::types::FindingStatement::Unstated,
         ..bare_mirror(purl, id, aliases)
     }
 }

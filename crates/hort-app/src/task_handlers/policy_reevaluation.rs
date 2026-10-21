@@ -124,6 +124,7 @@ impl TaskHandler for PolicyReEvaluationHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     use chrono::{DateTime, Utc};
 
@@ -199,6 +200,7 @@ mod tests {
             repository_access,
             curation_rules,
             jobs,
+            HashMap::new(),
         );
         PolicyReEvaluationHandler::new(Arc::new(use_case))
     }
