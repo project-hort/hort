@@ -1,10 +1,11 @@
-//! JWT-only invariant for the discovery endpoint (ADR 0013).
+//! Token-kind posture of the discovery endpoint (ADR 0013).
 //!
-//! Asserts the three security-load-bearing posture guarantees of the
-//! JWT-only discovery surface:
+//! Asserts the four security-load-bearing posture guarantees of the
+//! discovery surface:
 //!
 //! 1. `TokenKind::Pat` → `403 Forbidden` with the exact reason string
-//!    *"this endpoint requires a CLI session token"*, AND the
+//!    *"this endpoint requires a CLI session or service-account token"*,
+//!    AND the
 //!    `hort_discovery_list_versions_total{result="token_kind_denied"}`
 //!    counter ticks exactly once.
 //! 2. `TokenKind::CliSession` + `Permission::Read` → `200 OK` with the
@@ -17,6 +18,15 @@
 //!    `hort_discovery_list_versions_total` counter does NOT tick — a future
 //!    maintainer who starts emitting an `anonymous_denied`-shaped `result`
 //!    label (which the catalog does not allow) would break this test.
+//! 4. `TokenKind::ServiceAccount` + `Permission::Read` → `200 OK`. The
+//!    triage caller this endpoint was specified for
+//!    (`docs/ci/hort-quarantine-integration.md`) is a non-admin service
+//!    account, and the bearer federation mints for it is a native token,
+//!    not a CLI-session JWT — so "JWT-only" was never the posture this
+//!    surface was specified to have. PATs stay refused (guarantee 1); the
+//!    kind gate admits exactly the two kinds, and `Permission::Read` is
+//!    what separates an authorized service account from an unauthorized
+//!    one.
 //!
 //! # `#[serial(hort_pg_db)]`
 //!
@@ -53,7 +63,7 @@ use uuid::Uuid;
 use hort_app::rbac::RbacEvaluator;
 use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 use hort_app::use_cases::self_service_prefetch_use_case::SelfServicePrefetchUseCase;
-use hort_domain::entities::api_token::TokenKind;
+use hort_domain::entities::api_token::{TokenCap, TokenKind};
 use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::managed_by::ManagedBy;
@@ -93,6 +103,22 @@ fn evaluator_read(claim: &str, repo_id: Uuid) -> RbacEvaluator {
     RbacEvaluator::new(vec![PermissionGrant {
         id: Uuid::new_v4(),
         subject: GrantSubject::Claims(vec![claim.into()]),
+        repository_id: Some(repo_id),
+        permission: Permission::Read,
+        created_at: Utc::now(),
+        managed_by: ManagedBy::Local,
+        managed_by_digest: None,
+    }])
+}
+
+/// A `Permission::Read` grant on the repo keyed to `user_id` — the shape
+/// a `kind: serviceAccount` gitops subject resolves to at apply
+/// (ADR 0037). A service-account bearer is claimless (ADR 0012), so a
+/// `GrantSubject::Claims` grant could never authorize one.
+fn evaluator_read_for_user(user_id: Uuid, repo_id: Uuid) -> RbacEvaluator {
+    RbacEvaluator::new(vec![PermissionGrant {
+        id: Uuid::new_v4(),
+        subject: GrantSubject::User(user_id),
         repository_id: Some(repo_id),
         permission: Permission::Read,
         created_at: Utc::now(),
@@ -236,7 +262,7 @@ fn pat_principal_returns_403_with_exact_reason_and_ticks_token_kind_denied_once(
             );
             let body = body_string(resp).await;
             assert!(
-                body.contains("this endpoint requires a CLI session token"),
+                body.contains("this endpoint requires a CLI session or service-account token"),
                 "exact reason string missing — body: {body}",
             );
         });
@@ -331,6 +357,90 @@ fn cli_session_with_read_returns_200_and_listing_shape_and_ticks_success() {
         })
         .sum::<u64>();
     assert_eq!(success, 1, "expected one success tick");
+}
+
+// ---------------------------------------------------------------------------
+// 4. ServiceAccount + Permission::Read → 200, and the withheld version is
+//    NAMED. This is the caller `docs/ci/hort-quarantine-integration.md`
+//    specifies for this surface: a non-admin service account that
+//    classifies each locked dependency off `status.kind`, which is why a
+//    `rejected` row (not a `released` one) is what this test reads back —
+//    a listing that omitted the withheld version would be a 200 the triage
+//    job could not act on.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial(hort_pg_db)]
+fn service_account_with_read_returns_200_and_names_the_withheld_version() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let prom_handle = PrometheusBuilder::new().build_recorder().handle();
+
+    metrics::with_local_recorder(&recorder, || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let repo = npm_repo();
+            let repo_id = repo.id;
+            let key = repo.key.clone();
+            let user_id = Uuid::new_v4();
+            let (router, mocks) =
+                build_router_with_rbac(evaluator_read_for_user(user_id, repo_id), prom_handle);
+            mocks.repositories.insert(repo);
+            mocks.artifacts.seed_package_version_status(
+                repo_id,
+                "left-pad",
+                vec![("1.0.0".into(), QuarantineStatus::Rejected)],
+            );
+
+            let url = format!("/api/v1/repositories/{}/discovery/versions/left-pad", key);
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(url)
+                .body(Body::empty())
+                .unwrap();
+            // Claimless + cap-bound: the shape federation mints for a
+            // service account (ADR 0012 claimless, ADR 0044 cap snapshot),
+            // so authority comes from the User-subject grant through the
+            // full two-leg AND.
+            let mut actor = caller_with_token_kind(&[], Some(TokenKind::ServiceAccount));
+            actor.user_id = user_id;
+            actor.token_cap = Some(TokenCap {
+                permissions: vec![Permission::Read],
+                repository_ids: None,
+            });
+            auth_test::inject_optional_principal_some(&mut req, actor);
+
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a service account holding Permission::Read must get the listing",
+            );
+            let body = body_string(resp).await;
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["versions"].as_array().unwrap().len(), 1);
+            assert_eq!(parsed["versions"][0]["version"], "1.0.0");
+            assert_eq!(parsed["versions"][0]["status"]["kind"], "rejected");
+        });
+    });
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let denied = snapshot
+        .iter()
+        .filter(|(key, _, _, _)| key.key().name() == "hort_discovery_list_versions_total")
+        .filter(|(key, _, _, _)| {
+            key.key()
+                .labels()
+                .any(|l| l.key() == "result" && l.value() == "token_kind_denied")
+        })
+        .count();
+    assert_eq!(
+        denied, 0,
+        "the token-kind gate must not have ticked for a service-account caller",
+    );
 }
 
 // ---------------------------------------------------------------------------

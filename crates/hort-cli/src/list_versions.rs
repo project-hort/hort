@@ -628,14 +628,17 @@ mod tests {
     #[tokio::test]
     async fn http_403_token_kind_denied_surfaces_as_error() {
         // The use case returns Forbidden with the message
-        // "this endpoint requires a CLI session token" when the caller's
-        // `token_kind != Some(CliSession)`. The CLI surfaces the upstream
-        // body verbatim via `response_to_error`.
+        // "this endpoint requires a CLI session or service-account token"
+        // when the caller's `token_kind` is neither `CliSession` nor
+        // `ServiceAccount` (a PAT, or no kind at all). The CLI surfaces the
+        // upstream body verbatim via `response_to_error`.
         let mut server = Server::new_async().await;
         let m = server
             .mock("GET", "/api/v1/repositories/r/discovery/versions/p")
             .with_status(403)
-            .with_body(r#"{"error":{"code":"forbidden","message":"this endpoint requires a CLI session token"}}"#)
+            .with_body(
+                r#"{"error":{"code":"forbidden","message":"this endpoint requires a CLI session or service-account token"}}"#,
+            )
             .create_async()
             .await;
 
@@ -654,7 +657,7 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("403"), "403 status surfaced: {msg}");
         assert!(
-            msg.contains("CLI session token"),
+            msg.contains("CLI session or service-account token"),
             "server message surfaced: {msg}"
         );
         m.assert_async().await;

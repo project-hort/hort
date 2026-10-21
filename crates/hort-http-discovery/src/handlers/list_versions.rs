@@ -14,7 +14,7 @@
 //!    `Some(_)` on a valid token, `None` when absent or unvalidatable. The
 //!    handler does NOT enforce anonymous here; it threads
 //!    `Option<&CallerPrincipal>` into the use case, which rejects `None`
-//!    with 401 (CliSession gate, ADR 0013).
+//!    with 401 (read-endpoint principal guard, ADR 0013).
 //! 2. Invoke
 //!    [`DiscoveryUseCase::list_versions`](hort_app::use_cases::discovery_use_case::DiscoveryUseCase::list_versions).
 //! 3. Map `Err(AppError::Domain(_))` → `ApiError` (the existing
@@ -59,8 +59,8 @@ use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 ///   GET routes through `extract_optional_principal`, NOT
 ///   `require_principal`, so the 401 is enforced one layer down, not by
 ///   the middleware — read-endpoint pattern, ADR 0013).
-/// - `403 Forbidden` — token-kind denial (PAT / service-account / no
-///   `token_kind`) OR `Permission::Read` denial.
+/// - `403 Forbidden` — token-kind denial (PAT / no `token_kind`) OR
+///   `Permission::Read` denial.
 /// - `404 Not Found` — repo key unknown (anti-enumeration; the use case
 ///   collapses `repository.find_by_key` `NotFound` to the same
 ///   envelope an invisible repo would produce).

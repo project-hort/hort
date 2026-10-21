@@ -30,5 +30,7 @@ prefetch trigger.
 
 - ADR 0008, self-documented with a verification command.
 - Both endpoints require an authenticated principal carrying
-  `TokenKind::CliSession` — PATs and service-account tokens are rejected
-  with 403, enforced inside the use case.
+  `TokenKind::CliSession` or `TokenKind::ServiceAccount` — PATs are
+  rejected with 403, enforced inside the use case. The kind alone grants no
+  authority; the `Permission::Read` (discovery) / `Permission::Read ∧
+  Permission::Prefetch` (prefetch) check behind it is what admits a caller.

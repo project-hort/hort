@@ -25,10 +25,17 @@
 //!
 //! # Gate order
 //!
-//! 1. **Token-kind gate** — `caller.token_kind == Some(TokenKind::CliSession)`
-//!    is required. PATs and service-account tokens are rejected with
-//!    `Forbidden`. This fires first (cheapest — no repo resolution
-//!    required) and emits `result="token_kind_denied"`.
+//! 1. **Token-kind gate** — `caller.token_kind` must be `CliSession` OR
+//!    `ServiceAccount`. The CI triage caller this surface was specified
+//!    for (`docs/ci/hort-quarantine-integration.md`) is a read-only,
+//!    non-admin service account keyed on
+//!    [`DiscoveryVersionStatus`], so a CliSession-only gate refuses the
+//!    one identity the endpoint exists to serve — and refuses it *with*
+//!    the grants that document prescribes. PATs (and no token kind at
+//!    all) are still rejected with `Forbidden`. This fires first
+//!    (cheapest — no repo resolution required) and emits
+//!    `result="token_kind_denied"`. The gate alone grants NO authority:
+//!    Gate 2 is what admits or denies a service-account caller.
 //! 2. **RBAC gate** — `Permission::Read` on the resolved repo. Denial
 //!    emits `result="permission_denied"`.
 //! 3. **OCI rejection** — if the upstream call returns
@@ -119,7 +126,20 @@ const OCI_UNSUPPORTED_MESSAGE: &str =
     "discovery + prefetch are not supported for OCI; use registry-protocol-native \
      catalog/tags endpoints, or warm via crane pull";
 
-const TOKEN_KIND_DENIED_MESSAGE: &str = "this endpoint requires a CLI session token";
+// The triage caller this endpoint was specified for
+// (docs/ci/hort-quarantine-integration.md §"The hort side") is a
+// read + prefetch-only, non-admin ServiceAccount bearer that classifies each
+// locked dependency off `DiscoveryVersionStatus`, and the grant that same
+// document prescribes for it is `permission: read`. ServiceAccount is
+// therefore accepted here alongside CliSession; the RBAC gate immediately
+// below (Gate 2) is what actually authorizes it (`Permission::Read` on the
+// resolved repository) — no separate SA-specific logic. PATs stay rejected,
+// matching the self-service prefetch route in
+// `self_service_prefetch_use_case.rs`: admitting them is a question about
+// ADR 0013's token-kind hierarchy, and it has to be answered for both routes
+// at once rather than drifting apart one route at a time.
+const TOKEN_KIND_DENIED_MESSAGE: &str =
+    "this endpoint requires a CLI session or service-account token";
 
 /// Application use case for the repo-keyed discovery endpoint.
 ///
@@ -185,12 +205,20 @@ impl DiscoveryUseCase {
         // yet; emit `FORMAT_UNKNOWN` per the catalog's missing-format
         // sentinel rule. The `repository` label collapses to
         // `REPOSITORY_ALL` for pre-resolution gate ticks.
-        if caller.token_kind != Some(TokenKind::CliSession) {
+        //
+        // CliSession OR ServiceAccount — see the
+        // `TOKEN_KIND_DENIED_MESSAGE` comment above for why the
+        // service-account kind is admitted. PATs and the no-token-kind case
+        // remain denied here.
+        if !matches!(
+            caller.token_kind,
+            Some(TokenKind::CliSession) | Some(TokenKind::ServiceAccount)
+        ) {
             tracing::info!(
                 caller_user_id = %caller.user_id,
                 caller_token_kind = ?caller.token_kind,
                 outcome = "denied",
-                "discovery list_versions denied: token kind is not CliSession",
+                "discovery list_versions denied: token kind is not CliSession or ServiceAccount",
             );
             emit_discovery_list_versions(
                 values::FORMAT_UNKNOWN,
@@ -470,6 +498,7 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
+    use hort_domain::entities::api_token::TokenCap;
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::caller::CallerPrincipal;
     use hort_domain::entities::managed_by::ManagedBy;
@@ -507,6 +536,61 @@ mod tests {
         let mut c = caller_cli_session(claims);
         c.token_kind = kind;
         c
+    }
+
+    /// A faithful service-account principal for `user_id`, cap-bound to
+    /// `cap`.
+    ///
+    /// **Claimless by construction** — only the short-lived, IdP-backed
+    /// `CliSession` kind carries non-admin claims (ADR 0012/0013); a
+    /// federation-minted service-account bearer arrives with `claims: []`,
+    /// so a `GrantSubject::Claims` grant can never authorize it and its
+    /// authority has to come from a `GrantSubject::User` grant on the
+    /// backing user. **Cap-bound by construction** — the exchange snapshots
+    /// the SA's effective grants onto the bearer (ADR 0044), so a
+    /// production SA principal always arrives with `Some(cap)` and is
+    /// evaluated under the full two-leg AND (grants ∧ cap), never under the
+    /// cap-free shortcut a `None` cap would take.
+    fn caller_service_account(user_id: Uuid, cap: Vec<Permission>) -> CallerPrincipal {
+        let mut c = caller_with_token_kind(&[], Some(TokenKind::ServiceAccount));
+        c.user_id = user_id;
+        c.token_cap = Some(TokenCap {
+            permissions: cap,
+            repository_ids: None,
+        });
+        c
+    }
+
+    /// A `CliSession` principal for `user_id`, claimless and cap-free —
+    /// the CliSession half of a comparison whose only variables are the
+    /// token kind and the cap leg those kinds legitimately differ on
+    /// (ADR 0036: CliSession carries a `None` cap by design). Both halves
+    /// resolve their authority through the SAME
+    /// [`evaluator_with_user_grant`] row, so the listing each one gets is
+    /// comparable without a second grant shape in play.
+    fn caller_cli_session_for(user_id: Uuid) -> CallerPrincipal {
+        let mut c = caller_cli_session(&[]);
+        c.user_id = user_id;
+        c
+    }
+
+    /// A single `GrantSubject::User` grant — the shape a
+    /// `kind: serviceAccount` gitops subject resolves to at apply
+    /// (ADR 0037).
+    fn evaluator_with_user_grant(
+        user_id: Uuid,
+        repo_id: Uuid,
+        permission: Permission,
+    ) -> RbacEvaluator {
+        RbacEvaluator::new(vec![PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::User(user_id),
+            repository_id: Some(repo_id),
+            permission,
+            created_at: Utc::now(),
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+        }])
     }
 
     fn npm_repo() -> Repository {
@@ -706,28 +790,221 @@ mod tests {
         );
     }
 
-    #[test]
-    fn token_kind_denied_for_service_account() {
-        let snap = capture(|| {
-            Box::pin(async {
+    // --- Gate 1: the two admitted kinds ----------------------------------
+    //
+    // The triage caller this endpoint was specified for is a read-only,
+    // non-admin service account, so the gate admits `ServiceAccount`
+    // alongside `CliSession`. The three tests below share ONE scenario
+    // (`assert_full_overlay_for`, which asserts the entire listing) so that
+    // "a service account sees exactly what a CLI session sees" is an
+    // assertion over every status variant rather than a claim, and the two
+    // denial tests share one scenario for the same reason: both gates
+    // return `Forbidden`, so only the metric tells a caller refused for its
+    // KIND apart from one refused for its AUTHORITY.
+
+    /// Drive one package carrying **every** [`DiscoveryVersionStatus`]
+    /// variant for `actor`, assert the complete `version → status` map, and
+    /// assert the call ticked `success` and neither denial label.
+    ///
+    /// `user_id` is the subject of the single `Permission::Read` grant, so
+    /// every admitted kind is authorized through the same row.
+    fn assert_full_overlay_for(user_id: Uuid, actor: CallerPrincipal) {
+        let snap = capture(move || {
+            Box::pin(async move {
                 let repo = npm_repo();
                 let repo_id = repo.id;
-                let h = wire(repo, evaluator_with_read_grant("dev", repo_id));
-                let actor = caller_with_token_kind(&["dev"], Some(TokenKind::ServiceAccount));
-                let err =
-                    h.uc.list_versions("any-key", "left-pad", Some(&actor))
+                let repo_key = repo.key.clone();
+                let h = wire(
+                    repo,
+                    evaluator_with_user_grant(user_id, repo_id, Permission::Read),
+                );
+                h.mappings
+                    .upsert(mapping(repo_id))
+                    .await
+                    .expect("seed mapping");
+                // Upstream advertises one version hort holds (must keep its
+                // real status) and one it does not (`Unknown`).
+                h.upstream.insert_versions(
+                    "npm",
+                    "left-pad",
+                    Ok(vec!["1.0.0".into(), "9.9.9".into()]),
+                );
+                // An anchored `Quarantined` row: `anchor + default window` is
+                // future-dated, so this is the active-window arm.
+                let anchor = Utc::now();
+                h.artifacts
+                    .seed_artifact(quarantined_artifact(repo_id, "left-pad", "1.2.0", anchor));
+                // Anchorless rows. `Quarantined` with no anchor takes the
+                // conservative awaiting-release arm.
+                h.artifacts.seed_package_version_status(
+                    repo_id,
+                    "left-pad",
+                    vec![
+                        ("1.0.0".into(), QuarantineStatus::Released),
+                        ("1.1.0".into(), QuarantineStatus::Quarantined),
+                        ("0.9.0".into(), QuarantineStatus::Rejected),
+                        ("0.8.0".into(), QuarantineStatus::ScanIndeterminate),
+                        ("0.7.0".into(), QuarantineStatus::None),
+                    ],
+                );
+                let listing =
+                    h.uc.list_versions(&repo_key, "left-pad", Some(&actor))
                         .await
-                        .expect_err("service account token must be rejected");
-                assert!(matches!(err, AppError::Domain(DomainError::Forbidden(_))));
+                        .expect("an admitted kind holding Permission::Read must get the listing");
+                let by_version: HashMap<&str, &DiscoveryVersionStatus> = listing
+                    .versions
+                    .iter()
+                    .map(|v| (v.version.as_str(), &v.status))
+                    .collect();
+                assert_eq!(
+                    by_version.len(),
+                    7,
+                    "6 held + 1 upstream-only; listing: {:?}",
+                    listing.versions,
+                );
+                assert_eq!(by_version["1.0.0"], &DiscoveryVersionStatus::Released);
+                assert_eq!(by_version["0.7.0"], &DiscoveryVersionStatus::Released);
+                assert_eq!(
+                    by_version["1.2.0"],
+                    &DiscoveryVersionStatus::Quarantined {
+                        quarantine_until: anchor
+                            + Duration::seconds(DefaultPolicy::quarantine_duration_secs()),
+                    },
+                );
+                // The two statuses no other read surface emits — a withheld
+                // version is NAMED here, which is the whole reason the
+                // triage caller reads this endpoint.
+                assert_eq!(
+                    by_version["1.1.0"],
+                    &DiscoveryVersionStatus::QuarantinedAwaitingRelease,
+                );
+                assert_eq!(by_version["0.9.0"], &DiscoveryVersionStatus::Rejected);
+                assert_eq!(
+                    by_version["0.8.0"],
+                    &DiscoveryVersionStatus::ScanIndeterminate,
+                );
+                assert_eq!(by_version["9.9.9"], &DiscoveryVersionStatus::Unknown);
             })
         });
+        assert_eq!(
+            counter_value(&snap, "hort_discovery_list_versions_total", "success"),
+            Some(1),
+        );
         assert_eq!(
             counter_value(
                 &snap,
                 "hort_discovery_list_versions_total",
                 "token_kind_denied"
             ),
-            Some(1)
+            None,
+            "an admitted kind must not tick the token-kind gate",
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_discovery_list_versions_total",
+                "permission_denied"
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn service_account_with_read_grant_gets_the_full_listing() {
+        let user_id = Uuid::new_v4();
+        assert_full_overlay_for(
+            user_id,
+            caller_service_account(user_id, vec![Permission::Read]),
+        );
+    }
+
+    #[test]
+    fn cli_session_gets_the_same_full_listing_as_a_service_account() {
+        // Same grant, same package, same seeded rows, same assertions as
+        // the service-account case above — only the token kind differs, so
+        // this pins that widening the gate changed nothing a CliSession
+        // caller sees.
+        let user_id = Uuid::new_v4();
+        assert_full_overlay_for(user_id, caller_cli_session_for(user_id));
+    }
+
+    /// Assert that `actor` is refused by the **RBAC** gate and not by the
+    /// token-kind gate: the `Forbidden` carries the RBAC gate's wording,
+    /// `permission_denied` ticks once, and `token_kind_denied` does not tick
+    /// at all. Asserting only `Forbidden` would pass against a gate that
+    /// never moved.
+    fn assert_denied_by_rbac_not_by_kind(
+        repo: Repository,
+        evaluator: RbacEvaluator,
+        actor: CallerPrincipal,
+    ) {
+        let snap = capture(move || {
+            Box::pin(async move {
+                let repo_key = repo.key.clone();
+                let h = wire(repo, evaluator);
+                let err =
+                    h.uc.list_versions(&repo_key, "left-pad", Some(&actor))
+                        .await
+                        .expect_err("a caller without Permission::Read must be denied");
+                match err {
+                    AppError::Domain(DomainError::Forbidden(msg)) => assert!(
+                        msg.contains("Permission::Read required on repository"),
+                        "expected the RBAC gate's wording, not the token-kind gate's: {msg}",
+                    ),
+                    other => panic!("expected Forbidden, got {other:?}"),
+                }
+            })
+        });
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_discovery_list_versions_total",
+                "permission_denied"
+            ),
+            Some(1),
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_discovery_list_versions_total",
+                "token_kind_denied"
+            ),
+            None,
+            "the token-kind gate admitted this caller; only RBAC refused it",
+        );
+    }
+
+    #[test]
+    fn service_account_without_a_read_grant_is_permission_denied_not_token_kind_denied() {
+        // The grants leg denies. The evaluator holds a grant whose SUBJECT
+        // matches — deliberately not an empty grant table — but whose
+        // permission is not `Read`, so what refuses the caller is the Read
+        // check and nothing else.
+        let repo = npm_repo();
+        let repo_id = repo.id;
+        let user_id = Uuid::new_v4();
+        assert_denied_by_rbac_not_by_kind(
+            repo,
+            evaluator_with_user_grant(user_id, repo_id, Permission::Prefetch),
+            caller_service_account(user_id, vec![Permission::Read]),
+        );
+    }
+
+    #[test]
+    fn service_account_whose_cap_omits_read_is_permission_denied_not_token_kind_denied() {
+        // The cap leg denies. A service account holding no grants at
+        // exchange time mints a bearer with an empty-permissions cap: the
+        // token authorizes nothing, and the refusal must still come from
+        // RBAC rather than from the kind — otherwise an operator reading
+        // the metric would go looking for the wrong credential instead of
+        // the missing grant.
+        let repo = npm_repo();
+        let repo_id = repo.id;
+        let user_id = Uuid::new_v4();
+        assert_denied_by_rbac_not_by_kind(
+            repo,
+            evaluator_with_user_grant(user_id, repo_id, Permission::Read),
+            caller_service_account(user_id, Vec::new()),
         );
     }
 
@@ -785,23 +1062,50 @@ mod tests {
 
     // --- repository not found --------------------------------------------
 
-    #[tokio::test]
-    async fn unknown_repository_key_returns_notfound() {
-        let repo = npm_repo();
-        let repo_id = repo.id;
-        let h = wire(repo, evaluator_with_read_grant("dev", repo_id));
-        let actor = caller_cli_session(&["dev"]);
-        let err =
-            h.uc.list_versions("does-not-exist", "left-pad", Some(&actor))
-                .await
-                .expect_err("unknown repo must NotFound");
-        assert!(matches!(
-            err,
-            AppError::Domain(DomainError::NotFound {
-                entity: "Repository",
-                ..
+    #[test]
+    fn unknown_repository_key_returns_notfound_with_no_tick_for_every_admitted_kind() {
+        // Anti-enumeration: a caller who may ask cannot learn which repo
+        // keys exist, and the resolution failure ticks nothing — for BOTH
+        // admitted kinds, so widening the gate did not hand the newly
+        // admitted kind a repo-existence oracle the other one lacks.
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = npm_repo();
+                let repo_id = repo.id;
+                let user_id = Uuid::new_v4();
+                let h = wire(
+                    repo,
+                    evaluator_with_user_grant(user_id, repo_id, Permission::Read),
+                );
+                for actor in [
+                    caller_cli_session_for(user_id),
+                    caller_service_account(user_id, vec![Permission::Read]),
+                ] {
+                    let err =
+                        h.uc.list_versions("does-not-exist", "left-pad", Some(&actor))
+                            .await
+                            .expect_err("unknown repo must NotFound");
+                    assert!(
+                        matches!(
+                            err,
+                            AppError::Domain(DomainError::NotFound {
+                                entity: "Repository",
+                                ..
+                            })
+                        ),
+                        "token kind {:?} got {err:?}",
+                        actor.token_kind,
+                    );
+                }
             })
-        ));
+        });
+        assert_eq!(
+            snap.iter()
+                .filter(|(k, _)| k.key().name() == "hort_discovery_list_versions_total")
+                .count(),
+            0,
+            "the anti-enumeration NotFound must not tick any result label",
+        );
     }
 
     // --- no upstream mapping ---------------------------------------------

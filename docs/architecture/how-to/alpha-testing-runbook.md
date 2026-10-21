@@ -268,8 +268,9 @@ export READER_TOKEN="$(get_token reader-user reader)"
 ```
 
 Use `$ADMIN_TOKEN` wherever the Track-A steps use `$ADMIN_PAT`. For the
-discovery/prefetch endpoints (§9), which require a `TokenKind::CliSession`,
-use `hort-cli auth login` (§5·B) instead of a raw bearer.
+discovery/prefetch endpoints (§9), which require a `TokenKind::CliSession` or
+`TokenKind::ServiceAccount` — a raw OIDC bearer carries neither — use
+`hort-cli auth login` (§5·B) instead of a raw bearer.
 
 **Assertion (§3·B.a):** `get_token` returns a non-empty JWT; decoding its
 payload shows `iss: http://localhost:25380/realms/hort`, `aud: hort-server`,
