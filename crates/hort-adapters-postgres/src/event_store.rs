@@ -1308,12 +1308,15 @@ async fn append_with_conn(
         let event_type = event.event_type();
         let event_data = &serialized[i];
 
-        // Compute this event's hash over the canonical form of the
-        // typed event + the predecessor hash. Pure and infallible —
-        // `canonical_event_bytes` serializes an already-`validate()`d
-        // typed `DomainEvent`, so the append path gains NO new fallible
-        // step. `event_version` is the literal `1` bound below; keep
-        // the two in lockstep.
+        // Compute this event's hash over the canonical form of the row
+        // being written + the predecessor hash. `payload` is
+        // `event_data` — the very value bound to the column eleven lines
+        // below, not a second derivation of it — so the bytes the hash
+        // attests and the bytes the row holds are the same object by
+        // construction. Pure and infallible: `canonical_event_bytes`
+        // serializes a `serde_json::Value`, so the append path gains NO
+        // new fallible step. `event_version` is the literal `1` bound
+        // below; keep the two in lockstep.
         let event_version: u32 = 1;
         let chain_input = ChainInput {
             prev_event_hash,
@@ -1323,7 +1326,7 @@ async fn append_with_conn(
             stream_position: stream_position as u64,
             event_type,
             event_version,
-            event,
+            payload: event_data,
             correlation_id: batch.correlation_id,
             causation_id: batch.causation_id,
             actor: ActorCanonical {
@@ -1758,7 +1761,15 @@ mod tests {
     /// genesis sentinel, each subsequent event from the prior hash.
     /// The stored hash is computed with [`synthetic_envelope`] so the
     /// synthetic `row_view` reconstruction round-trips exactly.
-    fn chained_admin_rows(stream_id: &str, n: u64) -> Vec<(DomainEvent, EventHash, EventHash)> {
+    ///
+    /// The first tuple element is the **stored payload** — what
+    /// `event_data` would hold, produced by the same
+    /// `serialize_event_data` the append path binds — because that is
+    /// what the hash covers.
+    fn chained_admin_rows(
+        stream_id: &str,
+        n: u64,
+    ) -> Vec<(serde_json::Value, EventHash, EventHash)> {
         let mut prev = genesis_hash();
         let mut out = Vec::new();
         for i in 0..n {
@@ -1767,6 +1778,7 @@ mod tests {
                 rejected_by: RejectionReason::Scanner,
                 reason: format!("CVE-{i}"),
             });
+            let payload = serialize_event_data(&ev);
             let env = synthetic_envelope(i);
             let inp = ChainInput {
                 prev_event_hash: prev,
@@ -1776,13 +1788,13 @@ mod tests {
                 stream_position: i,
                 event_type: ev.event_type(),
                 event_version: 1,
-                event: &ev,
+                payload: &payload,
                 correlation_id: env.correlation_id,
                 causation_id: env.causation_id,
                 actor: env.actor,
             };
             let h = compute_event_hash(&inp);
-            out.push((ev, prev, h));
+            out.push((payload, prev, h));
             prev = h;
         }
         out
@@ -1798,7 +1810,7 @@ mod tests {
     fn row_view<'a>(
         stream_id: &'a str,
         position: u64,
-        event: &'a DomainEvent,
+        payload: &'a serde_json::Value,
         env: RowEnvelope<'a>,
         stored_prev: EventHash,
         stored_hash: EventHash,
@@ -1810,9 +1822,15 @@ mod tests {
                 stream_id,
                 stream_category: env.stream_category,
                 stream_position: position,
-                event_type: event.event_type(),
+                // The stored `event_type` column and the envelope's
+                // `type` key are both written from `event_type()` on the
+                // append path, so reading it off the payload keeps this
+                // helper to the inputs a stored row actually carries.
+                event_type: payload["type"]
+                    .as_str()
+                    .expect("a stored envelope carries a `type` string"),
                 event_version: 1,
-                event,
+                payload,
                 correlation_id: env.correlation_id,
                 causation_id: env.causation_id,
                 actor: env.actor,
@@ -1832,6 +1850,7 @@ mod tests {
     /// `event_hash` for genuinely-appended rows.
     struct OwnedDbRow {
         persisted: PersistedEvent,
+        event_data: serde_json::Value,
         stream_id: String,
         stream_category: String,
         actor_type: String,
@@ -1850,7 +1869,7 @@ mod tests {
             row_view(
                 &self.stream_id,
                 self.persisted.stream_position,
-                &self.persisted.event,
+                &self.event_data,
                 RowEnvelope {
                     event_id: self.persisted.event_id,
                     stream_category: &self.stream_category,
@@ -1911,6 +1930,10 @@ mod tests {
             // the `EventRow` (mirrors production `read_stream_rows`,
             // which clones these out of `EventRow` for `OwnedRow`).
             let stream_id_owned = r.stream_id.clone();
+            // The payload as the column holds it — the object the hash
+            // attests. Cloned before `TryFrom` consumes the `EventRow`,
+            // for the same reason the envelope columns are.
+            let event_data = r.event_data.clone();
             let stream_category = r.stream_category.clone();
             let actor_type = r.actor_type.clone();
             let actor_id = r.actor_id;
@@ -1928,6 +1951,7 @@ mod tests {
                 .expect("a genuinely-appended row deserializes via TryFrom<EventRow>");
             out.push(OwnedDbRow {
                 persisted,
+                event_data,
                 stream_id: stream_id_owned,
                 stream_category,
                 actor_type,
@@ -1960,11 +1984,14 @@ mod tests {
     }
 
     /// CENTERPIECE: a tampered stored row fails verification. A
-    /// privileged adversary mutates the persisted `event_data`
-    /// (modelled here by substituting the typed event the verifier
-    /// reconstructs from that row) while leaving the stored
-    /// `event_hash` untouched — `verify_stream_chain` recomputes and
+    /// privileged adversary rewrites the persisted `event_data` while
+    /// leaving the stored `event_hash` untouched —
+    /// `verify_stream_chain` recomputes over the rewritten payload and
     /// flags `HashMismatch` at exactly the tampered position.
+    ///
+    /// The tamper is applied to the stored payload itself rather than to
+    /// a typed event standing in for it, which is both what an attacker
+    /// with `UPDATE` on the table does and what the hash now covers.
     #[test]
     fn tampered_row_fails_verification() {
         let sid = "artifact-deadbeef";
@@ -1980,12 +2007,9 @@ mod tests {
         // Tamper: rewrite the payload of the row at position 2 (the
         // attacker edits event_data in the table) but cannot recompute
         // the chain because the chain head is externally anchored.
-        let forged = DomainEvent::ArtifactRejected(ArtifactRejected {
-            artifact_id: Uuid::from_u128(0xDEAD),
-            rejected_by: RejectionReason::Admin,
-            reason: "exonerated by insider".into(),
-        });
-        rows[2].input.event = &forged;
+        let mut forged = chained[2].0.clone();
+        forged["data"]["reason"] = serde_json::json!("exonerated by insider");
+        rows[2].input.payload = &forged;
 
         assert_eq!(
             verify_stream_chain(&StreamRows::new(&rows)),

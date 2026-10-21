@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handed on can no longer overwrite the worker now running it (#355).
 - **hort no longer accepts an outbound TLS certificate path through the
   distrusted emSign intermediates** (RUSTSEC-2026-0381, -0382, -0383) (#356).
+- **`hort-server verify-event-chain` no longer reports tampering on untouched
+  rows**, and now detects a payload key that matches no event field. No stored
+  `event_hash` changes (#272).
 
 ## [0.15.0] - 2026-10-18
 

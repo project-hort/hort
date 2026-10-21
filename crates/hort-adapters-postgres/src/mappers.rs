@@ -573,32 +573,16 @@ impl TryFrom<EventRow> for PersistedEvent {
 /// Serialize a `DomainEvent` into the tagged JSON format stored in `event_data`.
 ///
 /// Format: `{"type": "ArtifactIngested", "data": { ... payload ... }}`
+///
+/// Delegates to `hort_domain::events::stored_payload_envelope`, which is
+/// the **single** producer of that shape. It used to be built here and
+/// mirrored in the chain's `canonical_payload_bytes`, and the chain's
+/// claim is that the bytes it hashed are the bytes this function wrote —
+/// a claim a mirror can only approximate. The append path now binds this
+/// value to the column and passes the same value into `ChainInput`, so
+/// the two are one object rather than two agreeing derivations.
 pub(crate) fn serialize_event_data(event: &DomainEvent) -> serde_json::Value {
-    let data = serde_json::to_value(event).expect("DomainEvent must be serializable");
-    // serde serializes the enum as `{"<serde_key>": { fields }}`.
-    // We re-shape to `{"type": "<event_type>", "data": { fields }}`.
-    //
-    // The stored `type` column carries `event_type()` — for
-    // `RetentionPolicyChanged` that is the inner-discriminated
-    // `RetentionPolicyCreated`/`…Updated`/`…Archived`/`…Evaluated`.
-    // The `map.remove` MUST use `serde_variant_key()` — the actual
-    // externally-tagged enum key serde emitted — which equals
-    // `event_type()` for every other variant but is the wrapper key
-    // `RetentionPolicyChanged` for the retention wrapper. Using
-    // `event_type()` here would `remove` a non-existent key and
-    // silently null the payload.
-    let event_type = event.event_type();
-    let serde_key = event.serde_variant_key();
-    let payload = match data {
-        serde_json::Value::Object(mut map) => {
-            map.remove(serde_key).unwrap_or(serde_json::Value::Null)
-        }
-        other => other,
-    };
-    serde_json::json!({
-        "type": event_type,
-        "data": payload
-    })
+    hort_domain::events::stored_payload_envelope(event)
 }
 
 /// Deserialize a `DomainEvent` from the tagged JSON format.

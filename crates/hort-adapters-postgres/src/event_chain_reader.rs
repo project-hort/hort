@@ -11,6 +11,12 @@
 //! `prev_event_hash`/`event_hash` chain columns `PersistedEvent` cannot
 //! carry surfaced without widening `EventStore`.
 //!
+//! The rows this reader returns carry **no typed event**. The hash is
+//! recomputed from the `event_data` payload as the column holds it, so
+//! nothing on this path deserializes a `DomainEvent` and chain
+//! verification does not depend on whether today's types can still
+//! decode a stored payload.
+//!
 //! The shared chain-read helpers (`retention_stream_id`, `to_event_hash`,
 //! `sealed_record_from_row`) are reused from
 //! [`crate::event_chain_head_reader`] — the same parsing the emitter and
@@ -20,12 +26,11 @@
 use sqlx::{PgPool, Row};
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::events::{ChainRow, PersistedEvent, SealedStreamRecord};
+use hort_domain::events::{ChainRow, SealedStreamRecord};
 use hort_domain::ports::event_chain_reader::EventChainReaderPort;
 use hort_domain::ports::BoxFuture;
 
 use crate::event_chain_head_reader::{retention_stream_id, sealed_record_from_row, to_event_hash};
-use crate::mappers::EventRow;
 
 /// Bounded page size for per-stream reads — streams are paged so the
 /// verifier never buffers the whole table.
@@ -97,15 +102,18 @@ impl EventChainReaderPort for PgEventChainReader {
             let mut out = Vec::new();
             let mut after_position: i64 = -1;
             loop {
-                // Selects the `EventRow` columns plus the two `bytea` chain
-                // columns `PersistedEvent` cannot carry — exactly the shape
-                // the in-CLI verifier used, now adapter-local.
+                // Exactly the columns the canonical hash binds, plus the
+                // two `bytea` chain columns it is checked against.
+                // `global_position` and `stored_at` are deliberately
+                // absent: they are store-assigned and excluded from the
+                // hash by design, so reading them would widen the
+                // verifier's input past what it attests.
                 let rows = sqlx::query(
                     r#"SELECT
                            event_id, stream_id, stream_category, stream_position,
-                           global_position, event_type, event_version, event_data,
+                           event_type, event_version, event_data,
                            correlation_id, causation_id, actor_type, actor_id,
-                           actor_source_file, actor_spec_digest, stored_at,
+                           actor_source_file, actor_spec_digest,
                            prev_event_hash, event_hash
                        FROM events
                        WHERE stream_id = $1
@@ -125,52 +133,39 @@ impl EventChainReaderPort for PgEventChainReader {
                 }
                 let n = rows.len();
                 for row in &rows {
-                    let event_row = EventRow {
-                        event_id: row.get("event_id"),
-                        stream_id: row.get("stream_id"),
-                        stream_category: row.get("stream_category"),
-                        stream_position: row.get("stream_position"),
-                        global_position: row.get("global_position"),
-                        event_type: row.get("event_type"),
-                        event_version: row.get("event_version"),
+                    // Every field is taken straight off the row, in the
+                    // form the column holds it: the canonical hash binds
+                    // the stored bytes, never a re-serialization of a
+                    // typed `Actor` or `DomainEvent`. Nothing here
+                    // deserializes the payload — the verifier recomputes
+                    // the hash from `event_data` itself, so a row whose
+                    // payload today's types can no longer decode is still
+                    // verifiable. (While this read went through
+                    // `PersistedEvent::try_from`, such a row failed with
+                    // an operational error before the verifier reached
+                    // the hash — the one tool that could prove the row
+                    // intact refused to run on it.)
+                    let prev: Vec<u8> = row.get("prev_event_hash");
+                    let hash: Vec<u8> = row.get("event_hash");
+                    let stream_position: i64 = row.get("stream_position");
+                    let event_version: i32 = row.get("event_version");
+                    after_position = stream_position;
+                    out.push(ChainRow {
                         event_data: row.get("event_data"),
+                        event_id: row.get("event_id"),
+                        stream_id: stream_id.to_string(),
+                        stream_category: row.get("stream_category"),
+                        stream_position: stream_position as u64,
+                        event_type: row.get("event_type"),
+                        event_version: event_version as u32,
                         correlation_id: row.get("correlation_id"),
                         causation_id: row.get("causation_id"),
                         actor_type: row.get("actor_type"),
                         actor_id: row.get("actor_id"),
                         actor_source_file: row.get("actor_source_file"),
                         actor_spec_digest: row.get("actor_spec_digest"),
-                        stored_at: row.get("stored_at"),
-                    };
-                    // The four actor columns + stream strings must be kept
-                    // in their exact stored form (the canonical hash binds
-                    // the stored bytes, not a re-serialization of the typed
-                    // `Actor`) — clone before `try_from` consumes the row.
-                    let stream_category = event_row.stream_category.clone();
-                    let actor_type = event_row.actor_type.clone();
-                    let actor_id = event_row.actor_id;
-                    let actor_source_file = event_row.actor_source_file.clone();
-                    let actor_spec_digest = event_row.actor_spec_digest.clone();
-                    let prev: Vec<u8> = row.get("prev_event_hash");
-                    let hash: Vec<u8> = row.get("event_hash");
-                    let stored_prev = to_event_hash(&prev, "prev_event_hash")?;
-                    let stored_hash = to_event_hash(&hash, "event_hash")?;
-                    // `TryFrom<EventRow>` — the existing adapter
-                    // deserialization path. A deserialization failure is an
-                    // operational error (corrupt row not attributable to a
-                    // chain mutation), surfaced as `Err`, not a chain break.
-                    let persisted = PersistedEvent::try_from(event_row)?;
-                    after_position = persisted.stream_position as i64;
-                    out.push(ChainRow {
-                        persisted,
-                        stream_id: stream_id.to_string(),
-                        stream_category,
-                        actor_type,
-                        actor_id,
-                        actor_source_file,
-                        actor_spec_digest,
-                        stored_prev,
-                        stored_hash,
+                        stored_prev: to_event_hash(&prev, "prev_event_hash")?,
+                        stored_hash: to_event_hash(&hash, "event_hash")?,
                     });
                 }
                 if (n as i64) < STREAM_PAGE {
@@ -252,7 +247,7 @@ mod tests {
             let rows = reader.read_stream_chain(first).await.unwrap();
             assert!(
                 rows.windows(2)
-                    .all(|w| w[0].persisted.stream_position < w[1].persisted.stream_position),
+                    .all(|w| w[0].stream_position < w[1].stream_position),
                 "rows ordered by ascending stream_position"
             );
             let views: Vec<_> = rows.iter().map(ChainRow::as_stream_row).collect();
