@@ -17,12 +17,19 @@
 //!   fail-closed ineligible. That refusal is *correct* (ADR 0041
 //!   invariant #6(a)): a scan re-judgement must never clear a provenance
 //!   rejection.
-//! - `release` / `waive` never applies — the source-state guard admits
-//!   only `Quarantined` / `ScanIndeterminate`.
+//! - `release` / `waive` does not reach them either. `Rejected` *is* a
+//!   release source state, for the curator's manual waive alone, and
+//!   that waive reaches the provenance axis
+//!   ([`is_curator_overridable`](hort_domain::entities::artifact::is_curator_overridable)).
+//!   But these rows carry no recorded reason at all — a provenance
+//!   rejection left `rejection_reason = None`, as above — and the axis
+//!   conjunct refuses a reason-less rejection fail-closed: a release that
+//!   guessed from an absent reason would override whatever actually
+//!   condemned the artifact.
 //! - Re-pushing produces no ingest: the content is already present, so
 //!   the push is a no-op.
 //!
-//! So the only named exit from `Rejected` leads to the one check that
+//! So every named exit from `Rejected` runs into a check that
 //! structurally excludes this rejection kind. This module is the missing
 //! exit.
 //!

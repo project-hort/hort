@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   findings or for a container hort cannot decode; worker scratch disk and
   upstream egress rise either way (#353).
 
+### Fixed
+
+- **An OCI push no longer fails against a rejected blob or manifest.** The
+  pre-upload `HEAD` a pusher issues reports existence to a caller with granted
+  Write; the content `GET` stays refused for everyone (#357).
+
 ### Security
 
 - **The event-chain verifier judges a run against every anchored checkpoint,
