@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Three findings surfaces now report the artifact's last scan rather than
+  every scan it ever had.** The curation queue's `finding_count` /
+  `max_severity`, the patch-candidate listing (and the order it ranks by), and
+  the retention evaluator's findings read all fall once an artifact has been
+  rescanned; a vulnerability a later scan no longer reports drives no
+  retention expiry, and a released predecessor whose last scan found nothing
+  stops being offered as a patch target. No scan history is removed (#360).
 - **The provenance-misrejection repair reaches a rejection no signature can
   ever contradict.** `POST /api/v1/admin/quarantine/provenance-misrejections/repair`
   now also returns an artifact whose only provenance verdict is an unsigned

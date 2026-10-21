@@ -113,24 +113,66 @@ async fn seed_artifact(
     id
 }
 
-/// Seed one `scan_findings` row.
+/// Seed one scan: its `scan_findings` rows plus the
+/// `artifacts.last_scan_at` advance, in one transaction.
+///
+/// This is the pairing `PgArtifactLifecycle::commit_scan_result_with_score`
+/// makes in production — the per-finding rows and the `last_scan_at` write
+/// land in the same SQL transaction, bound from the same timestamp the rows
+/// carry as `detected_at`. The queue's findings LATERAL anchors on exactly
+/// that equality, so a seeder that wrote rows without advancing the anchor
+/// would be seeding a state no scan can produce.
+///
+/// `vulnerabilities` is one `(vulnerability_id, severity)` pair per finding.
+/// An empty slice is a **clean scan**: no row is written and the anchor still
+/// advances.
+async fn seed_scan(
+    pool: &PgPool,
+    artifact_id: Uuid,
+    detected_at: DateTime<Utc>,
+    vulnerabilities: &[(&str, &str)],
+) {
+    let scan_id = Uuid::new_v4();
+    let mut tx = pool.begin().await.expect("seed_scan begin");
+    for (vulnerability_id, severity) in vulnerabilities {
+        sqlx::query(
+            r#"INSERT INTO public.scan_findings
+                  (artifact_id, scan_id, purl, vulnerability_id, severity,
+                   source_scanner, title, detected_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+        )
+        .bind(artifact_id)
+        .bind(scan_id)
+        .bind(format!("pkg:test/{}@1.0", artifact_id.simple()))
+        .bind(*vulnerability_id)
+        .bind(*severity)
+        .bind("test-scanner")
+        .bind("integration-test finding")
+        .bind(detected_at)
+        .execute(&mut *tx)
+        .await
+        .expect("seed_scan finding row");
+    }
+    sqlx::query("UPDATE public.artifacts SET last_scan_at = $1 WHERE id = $2")
+        .bind(detected_at)
+        .bind(artifact_id)
+        .execute(&mut *tx)
+        .await
+        .expect("seed_scan last_scan_at");
+    tx.commit().await.expect("seed_scan commit");
+}
+
+/// One scan reporting one finding at `severity`, committed now. The shape
+/// most tests here want; multi-scan histories call [`seed_scan`] directly.
 async fn seed_finding(pool: &PgPool, artifact_id: Uuid, severity: &str) {
-    sqlx::query(
-        r#"INSERT INTO public.scan_findings
-              (artifact_id, scan_id, purl, vulnerability_id, severity,
-               source_scanner, title, detected_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, now())"#,
+    let vuln = format!("CVE-TEST-{}", artifact_id.simple());
+    seed_scan(
+        pool,
+        artifact_id,
+        truncate_us(Utc::now()),
+        &[(vuln.as_str(), severity)],
     )
-    .bind(artifact_id)
-    .bind(Uuid::new_v4())
-    .bind(format!("pkg:test/{}@1.0", artifact_id.simple()))
-    .bind(format!("CVE-TEST-{}", artifact_id.simple()))
-    .bind(severity)
-    .bind("test-scanner")
-    .bind("integration-test finding")
-    .execute(pool)
-    .await
-    .expect("seed_finding");
+    .await;
 }
 
 /// Seed a non-archived repo-scoped policy with the requested
@@ -896,6 +938,273 @@ async fn list_queue_rejected_without_event_has_none_rejection_reason_kind() {
         "no LATERAL match => None (defensive); got {:?}",
         row.rejection_reason_kind
     );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// The queue's finding summary answers about the artifact's LAST scan.
+//
+// `scan_findings` is per-scan history: every run writes under a fresh
+// `scan_id` and nothing removes the previous run's rows. The four tests
+// below pin that the summary is the last run's and not the union, including
+// the two cases that rule out the wrong anchors — a clean last scan (which
+// writes no row, so nothing inside the table can anchor on it) and a second
+// scan reporting a proper subset of the first (which a de-duplicating fix
+// would get wrong while looking right).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_finding_count_is_the_last_scan_not_the_union() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("quarantined"),
+        now - Duration::hours(10),
+        Some(now - Duration::hours(10)),
+    )
+    .await;
+
+    // Three scans. The first two report three findings between them; the
+    // last reports one. The union is four rows; the answer is one.
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(3),
+        &[("CVE-A", "critical"), ("CVE-B", "high")],
+    )
+    .await;
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(2),
+        &[("CVE-C", "high")],
+    )
+    .await;
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(1),
+        &[("CVE-D", "low")],
+    )
+    .await;
+
+    let total: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scan_findings WHERE artifact_id = $1")
+            .bind(artifact)
+            .fetch_one(&pool)
+            .await
+            .expect("count all rows");
+    assert_eq!(total, 4, "the history itself must be intact");
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    let entry = rows
+        .iter()
+        .find(|e| e.artifact_id == artifact)
+        .expect("artifact in queue");
+    assert_eq!(entry.finding_count, 1, "the last scan found one finding");
+    assert_eq!(
+        entry.max_severity,
+        Some(SeverityThreshold::Low),
+        "max_severity is the last scan's highest, not the artifact's \
+         all-time highest (Critical, from the first scan)"
+    );
+
+    // The read removed nothing.
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scan_findings WHERE artifact_id = $1")
+            .bind(artifact)
+            .fetch_one(&pool)
+            .await
+            .expect("count all rows after read");
+    assert_eq!(after, 4);
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_clean_last_scan_reads_as_clean() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("quarantined"),
+        now - Duration::hours(10),
+        Some(now - Duration::hours(10)),
+    )
+    .await;
+
+    // A dirty scan, then a clean one. The clean run writes no row at all,
+    // which is exactly why an anchor taken from inside `scan_findings`
+    // cannot satisfy this: the newest `scan_id` *present* is still the
+    // dirty run's.
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(2),
+        &[("CVE-A", "critical"), ("CVE-B", "high")],
+    )
+    .await;
+    seed_scan(&pool, artifact, now - Duration::hours(1), &[]).await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    let entry = rows
+        .iter()
+        .find(|e| e.artifact_id == artifact)
+        .expect("a clean-last-scan artifact still surfaces in the queue");
+    assert_eq!(entry.finding_count, 0);
+    assert_eq!(entry.max_severity, None);
+
+    // The earlier scan's rows are still there — this unit removes no
+    // history, it only stops reading it as current.
+    let total: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scan_findings WHERE artifact_id = $1")
+            .bind(artifact)
+            .fetch_one(&pool)
+            .await
+            .expect("count all rows");
+    assert_eq!(total, 2);
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_last_scan_subset_is_the_subset_not_the_union() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("quarantined"),
+        now - Duration::hours(10),
+        Some(now - Duration::hours(10)),
+    )
+    .await;
+
+    // The counter-assertion. The second scan reports a PROPER SUBSET of the
+    // first — same vulnerability ids, one of them dropped, and the dropped
+    // one is the severe one. Collapsing the history by de-duplicating
+    // `vulnerability_id` would answer `2` / Critical and look plausible;
+    // the last scan says `1` / High.
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(2),
+        &[("CVE-A", "critical"), ("CVE-B", "high")],
+    )
+    .await;
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(1),
+        &[("CVE-B", "high")],
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    let entry = rows
+        .iter()
+        .find(|e| e.artifact_id == artifact)
+        .expect("artifact in queue");
+    assert_eq!(
+        entry.finding_count, 1,
+        "a DISTINCT-shaped fix would answer 2 here"
+    );
+    assert_eq!(entry.max_severity, Some(SeverityThreshold::High));
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_never_scanned_artifact_reads_as_clean() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    // No scan at all: `last_scan_at` is NULL, the anchor matches nothing,
+    // and `COALESCE(f.finding_count, 0)` has to render that as a clean row
+    // rather than dropping the artifact out of the queue.
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("quarantined"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    let entry = rows
+        .iter()
+        .find(|e| e.artifact_id == artifact)
+        .expect("a never-scanned quarantined artifact still surfaces");
+    assert_eq!(entry.finding_count, 0);
+    assert_eq!(entry.max_severity, None);
 
     cleanup_repo(&pool, repo_id).await;
 }

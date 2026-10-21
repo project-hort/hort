@@ -12,6 +12,35 @@
 //! findings. Rows written before migration 029 read as an empty array
 //! until rescan. `references` and `aliases` remain in the per-finding
 //! CAS blob (`ScanCompleted.findings_blob`) and are empty here.
+//!
+//! ## The read answers about the artifact's LAST scan
+//!
+//! `scan_findings` is per-scan history: every run writes its rows under a
+//! fresh `scan_id` and nothing removes the previous run's. A read filtered
+//! on `artifact_id` alone therefore hands the retention evaluator the
+//! union of every scan the artifact ever had — and that evaluator's
+//! predicate drives an `ArtifactExpired`, i.e. a deletion. A
+//! vulnerability a later scan no longer reports must drive no retention
+//! decision, so the read is scoped: `sf.detected_at = a.last_scan_at`
+//! selects exactly one scan's rows, since every row of one scan shares the
+//! one `detected_at` the run was committed with.
+//!
+//! **The anchor is `artifacts.last_scan_at`.**
+//! `PgArtifactLifecycle::commit_scan_result_with_score` writes that column
+//! and inserts the per-finding rows in the SAME transaction, from the same
+//! `DateTime<Utc>` the rows' `detected_at` is bound from, so the anchor
+//! cannot disagree with the rows it selects. An anchor taken from inside
+//! `scan_findings` — the newest `scan_id` present, say — would hand back
+//! the previous, dirty run for an artifact whose latest scan found
+//! nothing, because a clean scan writes no row. `last_scan_at` advances on
+//! that clean run and matches nothing, which is the honest answer.
+//!
+//! This is **not** the freshness gate. That gate asks *is there a recent
+//! enough scan at all*, answers it from the artifact's own event stream
+//! (`RetentionUseCase::scan_is_fresh` in
+//! `crates/hort-app/src/use_cases/retention_use_case.rs`), and is
+//! unchanged: scoping the findings to the last scan says nothing about how
+//! old that scan is.
 
 use std::str::FromStr;
 
@@ -157,11 +186,22 @@ impl RetentionScanReader for PgRetentionScanReader {
         Box::pin(async move {
             let rows = sqlx::query_as::<_, FindingRow>(
                 r#"
-                SELECT purl, vulnerability_id, severity, cvss_score,
-                       source_scanner, title, fixed_versions, informational_class
-                FROM scan_findings
-                WHERE artifact_id = $1
-                ORDER BY detected_at ASC
+                SELECT sf.purl, sf.vulnerability_id, sf.severity, sf.cvss_score,
+                       sf.source_scanner, sf.title, sf.fixed_versions,
+                       sf.informational_class
+                FROM scan_findings sf
+                JOIN artifacts a ON a.id = sf.artifact_id
+                WHERE sf.artifact_id = $1
+                  -- The last scan's rows and nothing else. See the module
+                  -- docs: a predicate that drives a DELETE must not fire on
+                  -- a vulnerability a later scan no longer reports.
+                  AND sf.detected_at = a.last_scan_at
+                -- `detected_at` is constant across one scan's rows, so the
+                -- tiebreakers are what make the order deterministic. The
+                -- evaluator is order-independent (max / any / len); a stable
+                -- order is for the tests and for anyone reading a log.
+                ORDER BY sf.detected_at ASC, sf.vulnerability_id ASC,
+                         sf.purl ASC, sf.source_scanner ASC
                 "#,
             )
             .bind(artifact_id)
@@ -360,37 +400,51 @@ mod tests {
         // No score row yet.
         assert!(reader.repo_security_score(repo_id).await.unwrap().is_none());
 
-        // Insert one scored finding (no `informational_class` column →
-        // relies on the migration-015 nullable column reading back NULL) +
-        // a score row.
+        // One scan's two rows: a scored finding (no `informational_class`
+        // column → relies on the nullable column reading back NULL) and an
+        // informational one (explicit class, which must read back verbatim).
+        //
+        // ONE `scan_id` and ONE `detected_at`, paired with an
+        // `artifacts.last_scan_at` carrying the same timestamp — the shape
+        // `PgArtifactLifecycle::commit_scan_result_with_score` writes in a
+        // single transaction, and the shape this reader's last-scan anchor
+        // selects. Two rows under different `detected_at` values would be
+        // two scans, which no single run produces.
+        let scan_id = Uuid::new_v4();
+        let detected_at = Utc::now();
         sqlx::query(
             r#"INSERT INTO scan_findings
                (artifact_id, scan_id, purl, vulnerability_id, severity,
                 cvss_score, source_scanner, title, detected_at)
-               VALUES ($1,$2,$3,'CVE-RR-1','critical',9.8,'trivy','t',now())"#,
+               VALUES ($1,$2,$3,'CVE-RR-1','critical',9.8,'trivy','t',$4)"#,
         )
         .bind(artifact_id)
-        .bind(Uuid::new_v4())
+        .bind(scan_id)
         .bind(format!("pkg:pypi/rr-{}@1", artifact_id.simple()))
+        .bind(detected_at)
         .execute(&pool)
         .await
         .expect("insert finding");
-        // Insert an informational finding (explicit
-        // `informational_class = 'unmaintained'`) — the persisted class
-        // must read back verbatim, not NULL.
         sqlx::query(
             r#"INSERT INTO scan_findings
                (artifact_id, scan_id, purl, vulnerability_id, severity,
                 cvss_score, source_scanner, title, detected_at, informational_class)
                VALUES ($1,$2,$3,'RUSTSEC-RR-2','low',NULL,'osv','unmaintained',
-                       now() + interval '1 second', 'unmaintained')"#,
+                       $4, 'unmaintained')"#,
         )
         .bind(artifact_id)
-        .bind(Uuid::new_v4())
+        .bind(scan_id)
         .bind(format!("pkg:cargo/rr-info-{}@1", artifact_id.simple()))
+        .bind(detected_at)
         .execute(&pool)
         .await
         .expect("insert informational finding");
+        sqlx::query("UPDATE artifacts SET last_scan_at = $1 WHERE id = $2")
+            .bind(detected_at)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .expect("pair the rows with the last-scan anchor");
         sqlx::query(
             r#"INSERT INTO repo_security_scores
                (repository_id, released_count, critical_count, last_scan_at)
