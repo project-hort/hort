@@ -430,7 +430,7 @@ mod tests {
     use hort_domain::entities::artifact::{QuarantineStatus, ReleaseOrigin};
     use hort_domain::entities::repository::Repository;
     use hort_domain::entities::scan_policy::{
-        NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
+        CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
     };
     use hort_domain::events::{DomainEvent, PolicyScope};
     use hort_domain::ports::artifact_lifecycle::IngestEnqueue;
@@ -467,6 +467,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: now,
             updated_at: now,

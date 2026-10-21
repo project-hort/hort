@@ -47,7 +47,7 @@ use hort_domain::ports::advisory::{AdvisoryDiffResult, AdvisoryPort};
 use hort_domain::ports::ephemeral_store::EphemeralStore;
 use hort_domain::types::{
     collapse_alias_groups, is_informational_class, ComponentRelation, Ecosystem, Finding,
-    SbomComponent, SeverityBasis,
+    FindingStatement, SbomComponent, SeverityBasis,
 };
 
 use crate::bulk::{osv_label_to_ecosystem, pull_one_ecosystem, BulkFetchErrorKind};
@@ -565,6 +565,16 @@ impl OsvAdvisoryAdapter {
             informational_class,
             severity_basis,
             component_relation: ComponentRelation::NotEstablished,
+            // The enrichment path is handed the component list and
+            // nothing else, so it read no report section over a
+            // materialised tree and has no side of ADR 0064 D2's line to
+            // state. `Unstated` condemns — the fail-closed reading, and
+            // the only honest one for a producer that looked at no
+            // filesystem. It is also what the Redis cache round-trip
+            // yields on a hit, so a cached advisory finding and a freshly
+            // queried one carry the same value and the posture cannot
+            // depend on cache state.
+            statement: FindingStatement::Unstated,
         }
     }
 }

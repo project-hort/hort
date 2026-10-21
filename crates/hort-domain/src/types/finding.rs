@@ -21,9 +21,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::entities::scan_policy::SeverityThreshold;
+use crate::entities::scan_policy::{CompositeVerdictMode, SeverityThreshold};
 use crate::error::{DomainError, DomainResult};
 use crate::events::SeveritySummary;
+use crate::types::ArtifactKind;
 
 /// Per-finding length caps. Bytes, not chars. Each is
 /// validated in [`Finding::validate`]; violators surface as
@@ -172,6 +173,39 @@ pub struct Finding {
     /// struct.
     #[serde(default)]
     pub component_relation: ComponentRelation,
+    /// What this finding's statement is **about** — the bytes it was read
+    /// out of, or the filesystem those bytes compose into. See
+    /// [`FindingStatement`].
+    ///
+    /// **Persists**, and carries only the producer's half of ADR 0064
+    /// D2's line. What the producer read is its own fact and is
+    /// unrecoverable afterwards, so a verdict re-taken over stored
+    /// findings has to be able to read it or it answers a different
+    /// question from the one the fresh scan answered — which is what the
+    /// tighten pass did while this field was transient: it read every
+    /// stored finding as `Unstated`, condemned, and terminally rejected
+    /// the same constituent a fresh scan under the same promoted policy
+    /// had just let through. Whose filesystem the claim is about is
+    /// **not** stored, because it is derivable from the row's
+    /// [`ArtifactKind`] at any time; see [`FindingStatement`] on why the
+    /// composition of the two is not a variant.
+    ///
+    /// `#[serde(default, skip_serializing_if = …)]` on the `Unstated`
+    /// default, never a bare `#[serde(default)]`: a bare one re-serialises
+    /// an older stored payload with a key it does not have, which breaks
+    /// the event chain for every `ArtifactBecameVulnerable` written before
+    /// this field persisted. With the skip, a finding whose statement is
+    /// `Unstated` serialises to exactly the bytes it did before — the CAS
+    /// findings blob and the event payload are unmoved, and so is the
+    /// 64 KB serialised event cap's headroom for that population. A
+    /// *stated* finding costs the key (`,"statement":"filesystem"`), which
+    /// is the price of the field being readable at all.
+    ///
+    /// Same no-re-validation posture as every other shape-evolution on
+    /// this struct: a payload missing the key deserialises as `Unstated`,
+    /// which condemns.
+    #[serde(default, skip_serializing_if = "FindingStatement::is_unstated")]
+    pub statement: FindingStatement,
 }
 
 /// Whether a finding's `severity` is a real reading or the fail-closed
@@ -318,6 +352,120 @@ impl ComponentRelation {
             ComponentRelation::NotEstablished => 1,
             ComponentRelation::NotContained => 0,
         }
+    }
+}
+
+/// What a finding's statement is **about**: the bytes it was read out of,
+/// or the filesystem those bytes compose into (ADR 0064 D2).
+///
+/// The line this enum draws is whether the claim's truth depends on how
+/// the bytes are composed. "This blob carries a leaked key" or "these
+/// bytes are malware" is true of them however they are assembled, so such
+/// a finding keeps gating the artifact it was found on. "This package is
+/// installed and vulnerable" is true only of an assembled tree: a later
+/// layer can delete the package, so the claim is not about any one
+/// constituent's bytes — and for a constituent of a composition hort
+/// assesses as a whole (ADR 0064 D1), the composition is where the claim
+/// belongs.
+///
+/// **Set by the producer, from what it actually read, and by nobody
+/// else.** A payload scanner knows which section of its report a finding
+/// came out of and what it was pointed at; nothing downstream can recover
+/// either, which is why the value persists (see [`Finding::statement`]).
+/// Required of every producer for the reason
+/// [`ScannerPort::evidence_basis`](crate::ports::scanner::ScannerPort::evidence_basis)
+/// is required with no default: a value nobody stated is a claim about a
+/// backend's own output that nobody checked.
+///
+/// Today every finding hort consumes is a package-vulnerability claim —
+/// the Trivy report parser reads only `Vulnerabilities` — so D2 moves all
+/// of them. The line is drawn now **because** that is true: a later
+/// secrets or malware backend must not be silently disarmed by a decision
+/// taken when no such backend existed.
+///
+/// # Three variants, and why there is no fourth
+///
+/// Persist the fact, derive the interpretation (ADR 0040). The three
+/// variants are exactly what a producer can state about its own output,
+/// and **"a claim about the filesystem one constituent of a composition
+/// makes in isolation" is deliberately not among them** — that is the
+/// composition of two facts, the producer's half and the
+/// [`ArtifactKind`] of the row the finding was found on, and storing a
+/// composition is storing a conclusion. The row's kind is derivable from
+/// the artifact at any time; the producer's half is not. So only the
+/// producer's half is a field, and
+/// [`Finding::may_condemn_artifact`] composes the two where it decides,
+/// the way
+/// [`NotAnalysable::gates_release`](crate::ports::scanner::NotAnalysable::gates_release)
+/// already does for an *absent* assessment of the same surface — which
+/// also means a stored finding **cannot** carry the conclusion, as a
+/// property of this type rather than of a convention about who writes it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingStatement {
+    /// About **the bytes** the finding was read out of — true of them
+    /// however they are composed. A leaked credential or a malware
+    /// signature is in those bytes whatever tree they end up in, so such
+    /// a finding keeps gating its own artifact under every posture.
+    ///
+    /// No backend hort ships produces one today (see the type docs); the
+    /// variant exists so the first one that does has a side to state.
+    Bytes,
+    /// About **the filesystem those bytes compose into**.
+    ///
+    /// Whose filesystem that is, this variant does not say, because the
+    /// producer cannot: for a composed OCI image (ADR 0064 D1) or any
+    /// payload whose materialised tree is the whole artifact — an npm
+    /// tarball installed under `node_modules`, a wheel, an sdist, a
+    /// `.crate` — it is the artifact's own, and for a constituent of a
+    /// composition hort assesses as one unit it is a tree nothing runs.
+    /// [`Finding::may_condemn_artifact`] resolves that against the row's
+    /// [`ArtifactKind`]; see the type docs.
+    Filesystem,
+    /// No producer stated a side. The `Default`, and what a record
+    /// written before this field existed reads as.
+    ///
+    /// Two live populations reach it, and both are fail-closed: a
+    /// producer that read no report section about a filesystem at all —
+    /// the SBOM-driven backends and the advisory-enrichment path, whose
+    /// whole input is a component list; and a finding reconstructed from
+    /// a projection row, which has no column for the statement.
+    ///
+    /// Condemns, for [`ComponentRelation::NotEstablished`]'s reason: an
+    /// unstated side is an absence of evidence, and the fail-closed
+    /// reading of absent evidence is that the finding still counts
+    /// (ADR 0007).
+    #[default]
+    Unstated,
+}
+
+impl FindingStatement {
+    /// Whether no producer stated a side. Spent on the
+    /// `skip_serializing_if` that keeps an `Unstated` statement out of
+    /// the wire form entirely — see [`Finding::statement`].
+    #[must_use]
+    pub const fn is_unstated(&self) -> bool {
+        matches!(self, Self::Unstated)
+    }
+
+    /// Stable lowercase identifier for logs — and the serialised form,
+    /// which `#[serde(rename_all = "snake_case")]` derives to the same
+    /// strings. Kept in step by
+    /// `the_log_label_and_the_wire_form_are_the_same_string`, so a
+    /// renamed label cannot silently become a second vocabulary.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::Filesystem => "filesystem",
+            Self::Unstated => "unstated",
+        }
+    }
+}
+
+impl std::fmt::Display for FindingStatement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -511,13 +659,91 @@ impl Finding {
     /// not a second answer: it says which of two relations reported for one
     /// advisory survives their reconciliation, and its bottom element is
     /// exactly the relation this predicate refuses.
-    pub fn may_condemn_artifact(&self) -> bool {
-        match self.component_relation {
+    ///
+    /// # The second question, and why it is the same question
+    ///
+    /// Two independent facts can take a finding's authority over *this*
+    /// artifact away, and both are asked here because they are one
+    /// question — "may this finding condemn the artifact it was found
+    /// on?" — not two. A second predicate for the second fact would be a
+    /// second voice answering it, which is what
+    /// `hort-app/tests/condemning_rule_is_single_sourced.rs` exists to
+    /// prevent.
+    ///
+    /// The second fact is **what the finding's statement is about**
+    /// ([`FindingStatement`], ADR 0064 D2) — and it takes two inputs to
+    /// spend, because the producer states only half of it. A claim about
+    /// the filesystem one *constituent* of a composition makes in
+    /// isolation is not a claim about the composition anything runs: a
+    /// later layer adds packages an earlier one cannot be read for, and
+    /// removes packages it carries, so no composition of per-constituent
+    /// verdicts reconstructs the composed package set. Where an operator
+    /// has promoted the composite verdict (`composite_verdict`), the
+    /// composition is assessed as one unit and carries the filesystem
+    /// verdict, so the constituent's own filesystem findings are evidence
+    /// and nothing more. Under every other posture they gate exactly as
+    /// they do today — which is what makes an unpromoted repository
+    /// byte-for-byte unchanged a property of this one match.
+    ///
+    /// So the [`FindingStatement::Filesystem`] arm is where `kind` and
+    /// `composite_verdict` are composed, and it is composed **here**
+    /// rather than stored on the finding: the producer's half is a fact
+    /// nothing downstream can recover, the row's half is derivable from
+    /// the artifact whenever it is wanted, and a field holding the two
+    /// already joined would be a stored conclusion (ADR 0040). The same
+    /// two inputs, in the same conjunction, are what
+    /// [`NotAnalysable::gates_release`](crate::ports::scanner::NotAnalysable::gates_release)
+    /// composes for an *absent* assessment of that same surface — and
+    /// "which rows are constituents?" is
+    /// [`ArtifactKind::is_composition_constituent`]'s single answer in
+    /// both, so a finding and an absence cannot disagree about one row.
+    ///
+    /// Both inputs are required, and together: promotion alone would move
+    /// the obligation for every format ADR 0064 leaves undecided, and the
+    /// kind alone would move it before an operator had granted the
+    /// composite verdict any authority.
+    ///
+    /// The other two statements condemn, and each for its own reason:
+    /// [`FindingStatement::Bytes`] is true of the bytes however they are
+    /// composed, so no composition above it can take the claim; and
+    /// [`FindingStatement::Unstated`] condemns for
+    /// [`ComponentRelation::NotEstablished`]'s reason — an unstated side
+    /// is an absence of evidence, and the fail-closed reading of absent
+    /// evidence is that the finding still counts (ADR 0007).
+    ///
+    /// Exhaustive with no wildcard on either axis, for the same reason:
+    /// a new relation, or a new kind of statement, is a compile error
+    /// until it is given release authority or denied it here.
+    ///
+    /// `kind` is what the artifact's own format handler says its bytes
+    /// are, and `composite_verdict` is a **resolved** posture — normally
+    /// [`crate::policy::composite_verdict_mode_of`] over the policy that
+    /// governs the artifact's repository, never a per-finding field,
+    /// because promotion is a property of that policy and a finding
+    /// carrying its own copy could disagree with it. One caller pins the
+    /// posture to [`CompositeVerdictMode::Observed`] instead of resolving
+    /// it, deliberately and for ADR 0064 D6's reason — see
+    /// [`crate::policy::decide_rejected_transition`].
+    pub fn may_condemn_artifact(
+        &self,
+        kind: ArtifactKind,
+        composite_verdict: CompositeVerdictMode,
+    ) -> bool {
+        let carries_the_component = match self.component_relation {
             ComponentRelation::Subject => true,
             ComponentRelation::Contained => true,
             ComponentRelation::NotContained => false,
             ComponentRelation::NotEstablished => true,
-        }
+        };
+        let decides_this_artifact = match self.statement {
+            FindingStatement::Bytes => true,
+            FindingStatement::Unstated => true,
+            FindingStatement::Filesystem => {
+                !(kind.is_composition_constituent()
+                    && composite_verdict.carries_release_authority())
+            }
+        };
+        carries_the_component && decides_this_artifact
     }
 
     /// Validate the per-finding length caps.
@@ -598,7 +824,36 @@ mod tests {
             informational_class: None,
             severity_basis: SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
+            statement: FindingStatement::Unstated,
         }
+    }
+
+    /// Every [`FindingStatement`], written out rather than iterated, so a
+    /// new variant is a compile error in each matrix below instead of a
+    /// silently unswept case. Mirrors `ALL_RELATIONS`.
+    fn every_statement() -> [FindingStatement; 3] {
+        [
+            FindingStatement::Bytes,
+            FindingStatement::Filesystem,
+            FindingStatement::Unstated,
+        ]
+    }
+
+    /// Every [`ArtifactKind`] — one constituent and every non-constituent
+    /// — so the kind axis of the predicate's matrix is swept rather than
+    /// sampled.
+    fn every_kind() -> [ArtifactKind; 9] {
+        [
+            ArtifactKind::OciBlob,
+            ArtifactKind::OciManifest,
+            ArtifactKind::MavenJar,
+            ArtifactKind::MavenPom,
+            ArtifactKind::NpmTarball,
+            ArtifactKind::CargoCrate,
+            ArtifactKind::PyWheel,
+            ArtifactKind::PySdist,
+            ArtifactKind::Other,
+        ]
     }
 
     // ----- Serde round-trips -----------------------------------------------
@@ -626,6 +881,7 @@ mod tests {
             informational_class: None,
             severity_basis: SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
+            statement: FindingStatement::Unstated,
         };
         let json = serde_json::to_string(&f).unwrap();
         let back: Finding = serde_json::from_str(&json).unwrap();
@@ -677,6 +933,158 @@ mod tests {
         f.aliases = vec!["a".repeat(MAX_VULNERABILITY_ID_LEN + 1)];
         let err = f.validate().unwrap_err();
         assert!(err.to_string().contains("aliases[0]"), "{err}");
+    }
+
+    // ----- FindingStatement ------------------------------------------------
+
+    /// **The one byte-compatibility assertion the field rests on.** A
+    /// finding whose statement is the `Unstated` default serialises to
+    /// exactly the bytes it did before the field persisted — no
+    /// `statement` key at all.
+    ///
+    /// Two places serialise a `Finding`: the CAS findings blob and
+    /// `ArtifactBecameVulnerable.new_findings`, the second an event
+    /// payload under a 64 KB cap. A bare `#[serde(default)]` would
+    /// re-serialise every record already written with a key it does not
+    /// have, breaking the chain for every such event; the
+    /// `skip_serializing_if` is what keeps that whole population's
+    /// canonical bytes unmoved.
+    #[test]
+    fn an_unstated_statement_adds_no_key_to_the_wire_form() {
+        let unstated = valid_finding();
+        assert_eq!(unstated.statement, FindingStatement::Unstated);
+        let json = serde_json::to_string(&unstated).unwrap();
+        assert!(
+            !json.contains("statement"),
+            "an unstated statement must not appear in the wire form at all, \
+             or every record already written changes shape: {json}"
+        );
+    }
+
+    /// **A stored payload written before this field persisted
+    /// re-serialises to itself, byte for byte.** This is the event-chain
+    /// property, asserted on a literal rather than on a round trip of a
+    /// value this code built: the string below is a `Finding` as the CAS
+    /// findings blob and `ArtifactBecameVulnerable.new_findings` held it
+    /// when `statement` was `#[serde(skip)]` — no `statement` key,
+    /// because `skip` never wrote one.
+    ///
+    /// A bare `#[serde(default)]` would pass the deserialise half and
+    /// fail this one, re-emitting the payload with a key it does not
+    /// have and breaking the chain hash of every event that carries
+    /// findings. `#[serde(default, skip_serializing_if = …)]` is what
+    /// makes the two halves agree.
+    #[test]
+    fn a_pre_existing_stored_payload_reserialises_to_itself() {
+        const STORED: &str = r#"{"purl":"pkg:npm/lodash@4.17.20","vulnerability_id":"CVE-2021-23337","severity":"High","cvss_score":7.2,"title":"Command Injection in lodash","fixed_versions":["4.17.21"],"source_scanner":"trivy","references":["https://nvd.nist.gov/vuln/detail/CVE-2021-23337"],"aliases":["GHSA-35jh-r3h4-6jhm"],"informational_class":null,"severity_basis":"assessed","component_relation":"not_established"}"#;
+
+        let parsed: Finding = serde_json::from_str(STORED).expect("a stored payload still parses");
+        assert_eq!(parsed.statement, FindingStatement::Unstated);
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            STORED,
+            "a payload written before the field persisted must re-serialise \
+             to the identical bytes, or the event chain breaks for every \
+             `ArtifactBecameVulnerable` already stored"
+        );
+        assert_eq!(
+            parsed,
+            valid_finding(),
+            "and the literal above really is this module's canonical \
+             finding, so the assertion is about the shape and not about a \
+             string nobody checked"
+        );
+    }
+
+    /// And the other direction of the same compatibility: a payload with
+    /// no `statement` key — every blob and event written before this
+    /// field persisted — deserialises to the condemning default rather
+    /// than failing.
+    #[test]
+    fn a_payload_without_the_key_deserialises_as_unstated() {
+        let unstated = valid_finding();
+        let json = serde_json::to_string(&unstated).unwrap();
+        let back: Finding = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.statement, FindingStatement::Unstated);
+        assert_eq!(back, unstated);
+    }
+
+    /// **What the field is for.** A statement a producer *did* make
+    /// survives the round trip, so a verdict re-taken over stored
+    /// findings reads the same fact the fresh scan read. Before this, the
+    /// field was transient and every stored finding came back `Unstated`
+    /// — which condemns, so the tighten pass terminally rejected the same
+    /// constituent a promoted fresh scan had just let through.
+    #[test]
+    fn a_stated_statement_survives_the_round_trip() {
+        for stated in [FindingStatement::Bytes, FindingStatement::Filesystem] {
+            let mut f = valid_finding();
+            f.statement = stated;
+            let json = serde_json::to_string(&f).unwrap();
+            assert!(
+                json.contains(&format!("\"statement\":\"{stated}\"")),
+                "{stated}: the producer's half must reach the wire: {json}"
+            );
+            let back: Finding = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.statement, stated);
+            assert_eq!(back, f, "{stated}: and nothing else moves");
+        }
+    }
+
+    /// The log label and the serialised token are the same string, by
+    /// assertion rather than by two lists that happen to agree: the
+    /// `rename_all = "snake_case"` derive and [`FindingStatement::as_str`]
+    /// are independent definitions of one vocabulary, and an operator
+    /// grepping a log line for what a stored finding says needs them to
+    /// match.
+    #[test]
+    fn the_log_label_and_the_wire_form_are_the_same_string() {
+        for statement in every_statement() {
+            let json = serde_json::to_string(&statement).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{}\"", statement.as_str()),
+                "{statement}: label and wire form must not be two vocabularies"
+            );
+        }
+    }
+
+    /// There is no variant for "a constituent's filesystem", and that is
+    /// the design rather than an omission: it is the composition of the
+    /// producer's half with the row's [`ArtifactKind`], and a composition
+    /// is a conclusion (ADR 0040). So a *stored* finding cannot carry one
+    /// — which this asserts the only way a wire form can be asserted, by
+    /// refusing the token.
+    #[test]
+    fn the_wire_form_admits_no_composed_statement() {
+        let err = serde_json::from_str::<FindingStatement>("\"constituent_filesystem\"")
+            .expect_err("a composed statement is not a producer's fact");
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "the wire form must reject it outright: {err}"
+        );
+    }
+
+    #[test]
+    fn the_unstated_side_is_the_default() {
+        assert_eq!(FindingStatement::default(), FindingStatement::Unstated);
+    }
+
+    #[test]
+    fn every_statement_has_a_distinct_lowercase_label() {
+        let all = every_statement();
+        let mut seen: Vec<&str> = all.iter().map(FindingStatement::as_str).collect();
+        let total = seen.len();
+        for s in &seen {
+            assert!(
+                s.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{s} must be lowercase snake_case"
+            );
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "labels must be unique: {seen:?}");
+        assert_eq!(FindingStatement::Bytes.to_string(), "bytes");
     }
 
     // ----- validate() — at-cap (passes) ------------------------------------
@@ -825,6 +1233,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: FindingStatement::Unstated,
             },
             Finding {
                 purl: "pkg:npm/b@1".into(),
@@ -839,6 +1248,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: FindingStatement::Unstated,
             },
             Finding {
                 purl: "pkg:npm/c@1".into(),
@@ -853,6 +1263,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: FindingStatement::Unstated,
             },
             Finding {
                 purl: "pkg:npm/d@1".into(),
@@ -867,6 +1278,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: FindingStatement::Unstated,
             },
             Finding {
                 purl: "pkg:npm/e@1".into(),
@@ -881,6 +1293,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: FindingStatement::Unstated,
             },
         ];
         let s = severity_summary_from_findings(&findings);
@@ -1062,6 +1475,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: FindingStatement::Unstated,
             },
             Finding {
                 purl: "pkg:npm/b@1".into(),
@@ -1076,6 +1490,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: FindingStatement::Unstated,
             },
             Finding {
                 purl: "pkg:npm/c@1".into(),
@@ -1090,6 +1505,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: FindingStatement::Unstated,
             },
         ];
         assert_eq!(highest_severity(&findings), Some(SeverityThreshold::High));
@@ -1274,9 +1690,14 @@ mod tests {
         .to_string();
         let parsed: Finding = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed.component_relation, ComponentRelation::NotEstablished);
+        assert_eq!(
+            parsed.statement,
+            FindingStatement::Unstated,
+            "and the statement key is absent from the same payload",
+        );
         assert!(
-            parsed.may_condemn_artifact(),
-            "a record written before the field existed keeps today's authority",
+            parsed.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed),
+            "a record written before the fields existed keeps today's authority",
         );
     }
 
@@ -1378,6 +1799,11 @@ mod tests {
 
     // ----- may_condemn_artifact --------------------------------------------
 
+    /// A kind that is never a constituent, for the relation-axis tests —
+    /// they are about the component half and must not be answered by the
+    /// role half.
+    const NON_CONSTITUENT: ArtifactKind = ArtifactKind::NpmTarball;
+
     /// The case that must not regress. A finding about the artifact's own
     /// subject component keeps full release authority; an over-broad
     /// predicate here disarms the scanner silently.
@@ -1385,7 +1811,7 @@ mod tests {
     fn a_subject_finding_may_condemn() {
         let mut f = valid_finding();
         f.component_relation = ComponentRelation::Subject;
-        assert!(f.may_condemn_artifact());
+        assert!(f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed));
     }
 
     /// A format whose payload carries its closure (an OCI image and its
@@ -1395,7 +1821,7 @@ mod tests {
     fn a_contained_component_finding_may_condemn() {
         let mut f = valid_finding();
         f.component_relation = ComponentRelation::Contained;
-        assert!(f.may_condemn_artifact());
+        assert!(f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed));
     }
 
     /// The one relation that withholds authority: the artifact resolved the
@@ -1405,7 +1831,7 @@ mod tests {
     fn a_not_contained_component_finding_may_not_condemn() {
         let mut f = valid_finding();
         f.component_relation = ComponentRelation::NotContained;
-        assert!(!f.may_condemn_artifact());
+        assert!(!f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed));
     }
 
     /// Absence of evidence is not evidence of non-containment: an
@@ -1414,7 +1840,167 @@ mod tests {
     fn a_not_established_relation_may_condemn() {
         let mut f = valid_finding();
         f.component_relation = ComponentRelation::NotEstablished;
-        assert!(f.may_condemn_artifact());
+        assert!(f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed));
+    }
+
+    // -- the statement axis (ADR 0064 D2) ----------------------------------
+
+    /// **The pair the loosening is.** Over the same artifact — an OCI
+    /// layer — under the same promoted policy: a claim about the
+    /// filesystem this constituent composes in isolation stops condemning
+    /// it, and a claim about its bytes does not.
+    ///
+    /// Asserted together because either half alone is satisfied by a rule
+    /// that is wrong. "Nothing moves" passes the second assertion; "every
+    /// filesystem claim moves" passes the first. Only the pair says the
+    /// line is where ADR 0064 D2 draws it — and the second half is the
+    /// one that matters for a backend hort has not shipped yet: a secrets
+    /// or malware finding must not be disarmed by a decision taken when
+    /// no such backend existed.
+    #[test]
+    fn under_promotion_a_constituents_filesystem_claim_stops_condemning_and_its_bytes_do_not() {
+        let mut filesystem = valid_finding();
+        filesystem.statement = FindingStatement::Filesystem;
+        let mut bytes = valid_finding();
+        bytes.statement = FindingStatement::Bytes;
+
+        assert!(
+            !filesystem.may_condemn_artifact(ArtifactKind::OciBlob, CompositeVerdictMode::Promoted),
+            "a constituent's isolated package set is evidence; the composition \
+             that binds it carries the verdict"
+        );
+        assert!(
+            bytes.may_condemn_artifact(ArtifactKind::OciBlob, CompositeVerdictMode::Promoted),
+            "a leaked key or a malware signature is in those bytes however \
+             they are composed, so it keeps gating its own artifact"
+        );
+    }
+
+    /// And the whole matrix — every statement × every kind × both
+    /// postures — so "an unpromoted repository is byte-for-byte
+    /// unchanged" and "a non-constituent format is untouched" are both
+    /// properties of this one predicate rather than of each caller:
+    /// exactly one cell of the fifty-four differs from what it was before
+    /// ADR 0064 D2.
+    ///
+    /// The expectation is spelled out from the two facts rather than read
+    /// back off the predicate, so a change to the rule shows up here as a
+    /// failure instead of moving both sides at once.
+    #[test]
+    fn exactly_one_statement_kind_and_posture_triple_withholds_authority() {
+        for statement in every_statement() {
+            for kind in every_kind() {
+                for mode in [
+                    CompositeVerdictMode::Observed,
+                    CompositeVerdictMode::Promoted,
+                ] {
+                    let mut f = valid_finding();
+                    f.statement = statement;
+                    let moved = statement == FindingStatement::Filesystem
+                        && kind == ArtifactKind::OciBlob
+                        && mode == CompositeVerdictMode::Promoted;
+                    assert_eq!(
+                        f.may_condemn_artifact(kind, mode),
+                        !moved,
+                        "{statement} on a {kind} under {mode} must {} condemn",
+                        if moved { "not" } else { "still" }
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Both inputs are required, and together.** The kind alone would
+    /// move the obligation before an operator granted the composite
+    /// verdict any authority; the posture alone would move it for every
+    /// format ADR 0064 leaves undecided. Stated as the two one-input
+    /// slices of the cell above, because that is what a rule reading only
+    /// one of them would pass.
+    #[test]
+    fn neither_the_kind_nor_the_posture_alone_moves_the_obligation() {
+        let mut f = valid_finding();
+        f.statement = FindingStatement::Filesystem;
+
+        assert!(
+            f.may_condemn_artifact(ArtifactKind::OciBlob, CompositeVerdictMode::Observed),
+            "a constituent that stopped gating before promotion would be a \
+             constituent nothing gates — the obligation dropped, not moved"
+        );
+        assert!(
+            f.may_condemn_artifact(ArtifactKind::NpmTarball, CompositeVerdictMode::Promoted),
+            "a global `compositeVerdictMode: promoted` must not disarm an npm \
+             estate: the tarball's materialised tree is the artifact's own"
+        );
+        assert!(
+            f.may_condemn_artifact(ArtifactKind::OciManifest, CompositeVerdictMode::Promoted),
+            "the composition is not a constituent of itself, so the row that \
+             carries the composite verdict keeps its own filesystem findings"
+        );
+    }
+
+    /// The two axes compose by conjunction, not by precedence: either one
+    /// alone is enough to withhold authority, and neither can hand it
+    /// back.
+    #[test]
+    fn both_axes_have_to_admit_a_finding() {
+        let mut f = valid_finding();
+        f.component_relation = ComponentRelation::NotContained;
+        f.statement = FindingStatement::Bytes;
+        assert!(
+            !f.may_condemn_artifact(ArtifactKind::OciBlob, CompositeVerdictMode::Promoted),
+            "a component the artifact does not carry never condemns, whatever \
+             the statement is about"
+        );
+
+        f.component_relation = ComponentRelation::Subject;
+        f.statement = FindingStatement::Filesystem;
+        assert!(
+            !f.may_condemn_artifact(ArtifactKind::OciBlob, CompositeVerdictMode::Promoted),
+            "a subject relation does not win back the authority the moved \
+             obligation took away"
+        );
+    }
+
+    /// **The trapdoor this field's persistence closed, as a property of
+    /// the type.** A finding read back out of the stored blob answers the
+    /// predicate exactly as the one the producer handed over did — so the
+    /// verdict a fresh scan reached and the verdict re-taken over the
+    /// stored findings cannot differ on what the finding is about.
+    ///
+    /// While the statement was transient this assertion ran the other
+    /// way: the rehydrated finding read `Unstated`, which condemns, and
+    /// the tighten pass therefore rejected the constituent a promoted
+    /// fresh scan had just let through — terminally, since
+    /// `ScanPolicyRetroactive → Rejected` is revisited by no rescan. What
+    /// keeps promotion from un-rejecting the *already*-rejected estate
+    /// (ADR 0064 D6) is now the posture the automatic loosening pass pins,
+    /// not an absent value — see
+    /// [`crate::policy::decide_rejected_transition`].
+    #[test]
+    fn a_finding_read_back_out_of_the_blob_answers_exactly_as_the_original() {
+        for statement in every_statement() {
+            let mut stored = valid_finding();
+            stored.statement = statement;
+            stored.component_relation = ComponentRelation::Contained;
+
+            let raw = serde_json::to_string(&stored).unwrap();
+            let rehydrated: Finding = serde_json::from_str(&raw).unwrap();
+            assert_eq!(rehydrated.statement, statement);
+
+            for kind in every_kind() {
+                for mode in [
+                    CompositeVerdictMode::Observed,
+                    CompositeVerdictMode::Promoted,
+                ] {
+                    assert_eq!(
+                        rehydrated.may_condemn_artifact(kind, mode),
+                        stored.may_condemn_artifact(kind, mode),
+                        "{statement} on a {kind} under {mode}: a stored finding \
+                         must not answer differently from the one that was stored"
+                    );
+                }
+            }
+        }
     }
 
     /// The predicate answers one question and only that question. Folding in
@@ -1422,7 +2008,7 @@ mod tests {
     /// `NotContained` Critical condemn again — or, worse, silently remove
     /// authority from a subject finding whose severity could not be read.
     #[test]
-    fn may_condemn_artifact_reads_only_the_component_relation() {
+    fn may_condemn_artifact_reads_only_the_component_relation_and_the_statement() {
         for severity in [
             SeverityThreshold::Critical,
             SeverityThreshold::High,
@@ -1446,13 +2032,13 @@ mod tests {
 
                 f.component_relation = ComponentRelation::NotContained;
                 assert!(
-                    !f.may_condemn_artifact(),
+                    !f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed),
                     "a non-contained component never condemns: {f:?}"
                 );
 
                 f.component_relation = ComponentRelation::Subject;
                 assert!(
-                    f.may_condemn_artifact(),
+                    f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed),
                     "a subject finding always condemns: {f:?}"
                 );
             }
@@ -1555,11 +2141,14 @@ mod tests {
         for a in ALL_RELATIONS {
             for b in ALL_RELATIONS {
                 let winner = a.more_condemning(b);
-                if with_relation(a).may_condemn_artifact()
-                    || with_relation(b).may_condemn_artifact()
+                if with_relation(a)
+                    .may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed)
+                    || with_relation(b)
+                        .may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed)
                 {
                     assert!(
-                        with_relation(winner).may_condemn_artifact(),
+                        with_relation(winner)
+                            .may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed),
                         "{a:?} + {b:?} resolved to {winner:?}, which cannot condemn \
                          although an input could",
                     );
@@ -1660,7 +2249,8 @@ mod tests {
                 .all(|other| relation.more_condemning(*other) == *other || *other == relation);
             assert_eq!(
                 is_bottom,
-                !with_relation(relation).may_condemn_artifact(),
+                !with_relation(relation)
+                    .may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed),
                 "{relation:?}: sitting at the bottom of the containment order and \
                  being refused release authority must be the same thing",
             );

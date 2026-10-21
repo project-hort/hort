@@ -24,10 +24,12 @@
 //!    [`crate::types::Finding::may_condemn_artifact`] narrows the
 //!    survivors to the findings that may decide *this* artifact's
 //!    verdict: one naming a component whose code the artifact does not
-//!    carry is dropped from the **condemning** set, and the summary the
-//!    tier walk and the negligible lane read is recomputed over what is
-//!    left. Nothing is removed from the record — see that predicate and
-//!    ADR 0056's 2026-10-15 amendment.
+//!    carry — or making a filesystem claim about a tree that belongs to
+//!    a composition rather than to this row (`kind` plus the resolved
+//!    posture, ADR 0064 D2) — is dropped from the **condemning** set, and
+//!    the summary the tier walk and the negligible lane read is
+//!    recomputed over what is left. Nothing is removed from the record —
+//!    see that predicate and ADR 0056's 2026-10-15 amendment.
 //!
 //!    [`crate::policy::decide_rejected_transition`] applies the same
 //!    narrowing at the same point, because it is the other function that
@@ -84,10 +86,11 @@
 use chrono::{DateTime, Utc};
 
 use crate::entities::scan_policy::{
-    ExclusionProjection, NegligibleAction, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+    CompositeVerdictMode, ExclusionProjection, NegligibleAction, ScanEnforcement,
+    ScanPolicyProjection, SeverityThreshold,
 };
 use crate::events::PolicyViolation;
-use crate::types::{severity_summary_from_findings, ArtifactCoords, Finding};
+use crate::types::{severity_summary_from_findings, ArtifactCoords, ArtifactKind, Finding};
 
 use super::cve::evaluate_cve_thresholds;
 use super::exclusion::filter_excluded_findings;
@@ -231,6 +234,44 @@ impl DefaultPolicy {
     pub const fn enforcement() -> ScanEnforcement {
         ScanEnforcement::Reject
     }
+
+    /// Default `composite_verdict_mode` when no operator `ScanPolicy` is
+    /// configured for a repo (ADR 0064 D6).
+    ///
+    /// Returns [`CompositeVerdictMode::Observed`] — the composed image of
+    /// an OCI manifest is still assessed and recorded, and its verdict
+    /// decides nothing. This is the one default whose fail-safe direction
+    /// runs the *other* way from [`Self::enforcement`]'s: promotion is an
+    /// operator act against named criteria, because a composite verdict
+    /// adds rejections across an existing estate and `Rejected` is
+    /// terminal. A default that promoted would be a release deciding for
+    /// an operator what D6 reserves to them.
+    pub const fn composite_verdict_mode() -> CompositeVerdictMode {
+        CompositeVerdictMode::Observed
+    }
+}
+
+/// The **resolved** composite-verdict posture for the repository a
+/// `policy` governs (ADR 0064 D6).
+///
+/// `None` — no operator policy resolved — is
+/// [`CompositeVerdictMode::Observed`] via
+/// [`DefaultPolicy::composite_verdict_mode`], because promotion is an
+/// operator act against named criteria and the built-in default policy
+/// has no operator behind it.
+///
+/// The single definition of the question, for the reason the two
+/// verdict functions share [`Finding::may_condemn_artifact`]: the
+/// posture decides whether a constituent's filesystem findings gate, and
+/// whether the absence of a composite assessment holds a manifest, and
+/// two sites resolving it separately could answer differently about one
+/// repository. Mirrors `provenance_mode_of` in the application layer,
+/// one axis over.
+#[must_use]
+pub fn composite_verdict_mode_of(policy: Option<&ScanPolicyProjection>) -> CompositeVerdictMode {
+    policy
+        .map(|p| p.composite_verdict_mode)
+        .unwrap_or_else(DefaultPolicy::composite_verdict_mode)
 }
 
 /// Compute the quarantine observation-window **deadline** from the stored
@@ -271,8 +312,19 @@ pub fn effective_quarantine_deadline(
 /// supplied `policy`'s id — the application layer is responsible for
 /// fetching the right exclusion set for the resolved policy and
 /// passing it in. An empty slice is the "no exclusions" case.
+///
+/// `kind` is what the artifact's own format handler says its bytes are
+/// ([`FormatHandler::scan_kind`](crate::ports::format_handler::FormatHandler::scan_kind)),
+/// and it is an assessment input beside `coords` rather than a field on
+/// them: `coords` are request coordinates, and this is a property of the
+/// payload. [`Finding::may_condemn_artifact`] spends it on ADR 0064 D2's
+/// role half — whether a filesystem claim is about the filesystem this
+/// artifact *is* or about one it is a constituent of. Every caller
+/// resolves it through the handler registry, never from a path prefix,
+/// which would be a second copy of `scan_kind`.
 pub fn evaluate_scan_result(
     coords: &ArtifactCoords,
+    kind: ArtifactKind,
     findings: &[Finding],
     policy: Option<&ScanPolicyProjection>,
     exclusions: &[ExclusionProjection],
@@ -312,13 +364,31 @@ pub fn evaluate_scan_result(
     // compile error instead of a judgement call.
     //
     // `Finding::may_condemn_artifact` is the single definition of the
-    // question; re-deriving it by matching on the relation here is what
+    // question; re-deriving it by matching on the relation — or on the
+    // statement — here is what
     // `hort-app/tests/condemning_rule_is_single_sourced.rs` rejects.
     // `decide_rejected_transition` is its only other consumer and narrows
     // at the point this function does — the two verdict functions have to
     // agree about which findings may decide one finding list.
+    //
+    // The predicate asks a second question of the same input, and `kind`
+    // plus the resolved composite-verdict posture are what it needs to
+    // answer it: a finding about the filesystem one *constituent* of a
+    // composition makes in isolation is evidence rather than the verdict
+    // once an operator has promoted the composition's own verdict
+    // (ADR 0064 D2). The posture is resolved here, from the policy this
+    // evaluation is already under, so the narrowing and the posture cannot
+    // come from different repositories; `kind` arrives from the caller,
+    // which resolved it from the artifact's own format handler.
+    //
+    // This is the path a **fresh scan** takes, and also the **tighten**
+    // re-evaluation over an artifact's stored findings. Both resolve the
+    // posture rather than pinning it, which is what keeps them answering
+    // one question: a constituent a promoted policy let through on a fresh
+    // scan is not then re-rejected by the next threshold change.
+    let composite_verdict = composite_verdict_mode_of(policy);
     let mut condemning = filtered.remaining_findings;
-    condemning.retain(Finding::may_condemn_artifact);
+    condemning.retain(|f| f.may_condemn_artifact(kind, composite_verdict));
     let condemning_summary = severity_summary_from_findings(&condemning);
 
     // Step 2 — resolve threshold.
@@ -473,6 +543,7 @@ pub fn has_license_policy(value: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
     use crate::entities::repository::RepositoryFormat;
+    use crate::entities::scan_policy::CompositeVerdictMode;
     use crate::entities::scan_policy::{
         ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
     };
@@ -480,6 +551,13 @@ mod tests {
     use crate::types::ComponentRelation;
     use chrono::TimeZone;
     use uuid::Uuid;
+
+    /// The kind every test below evaluates under unless it is about the
+    /// role half of ADR 0064 D2's line: a row that is **not** a
+    /// composition constituent, so nothing in the statement axis can be
+    /// what produced the outcome being asserted. The constituent cases
+    /// name [`ArtifactKind::OciBlob`] literally.
+    const TEST_KIND: ArtifactKind = ArtifactKind::NpmTarball;
 
     fn ts(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0)
@@ -512,6 +590,7 @@ mod tests {
             informational_class: None,
             severity_basis: crate::types::SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
+            statement: crate::types::FindingStatement::Unstated,
         }
     }
 
@@ -572,6 +651,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),
@@ -740,7 +820,14 @@ mod tests {
 
     #[test]
     fn no_findings_no_policy_returns_clean() {
-        let r = evaluate_scan_result(&coords("anything"), &no_findings(), None, &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("anything"),
+            TEST_KIND,
+            &no_findings(),
+            None,
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -756,6 +843,7 @@ mod tests {
         );
         let r = evaluate_scan_result(
             &coords("anything"),
+            TEST_KIND,
             &no_findings(),
             Some(&policy),
             &[],
@@ -767,7 +855,14 @@ mod tests {
     #[test]
     fn high_finding_under_critical_threshold_returns_clean() {
         // The default threshold (Critical) lets `high` through.
-        let r = evaluate_scan_result(&coords("any"), &findings(0, 5, 0, 0), None, &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings(0, 5, 0, 0),
+            None,
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -776,6 +871,7 @@ mod tests {
         let policy = projection(SeverityThreshold::Critical, serde_json::Value::Null);
         let r = evaluate_scan_result(
             &coords("any"),
+            TEST_KIND,
             &findings(0, 1, 0, 0),
             Some(&policy),
             &[],
@@ -788,7 +884,14 @@ mod tests {
 
     #[test]
     fn critical_finding_no_policy_rejects_via_default() {
-        let r = evaluate_scan_result(&coords("any"), &findings(1, 0, 0, 0), None, &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings(1, 0, 0, 0),
+            None,
+            &[],
+            ts(0),
+        );
         match r {
             ScanOutcome::Reject(violations) => {
                 assert_eq!(violations.len(), 1);
@@ -806,6 +909,7 @@ mod tests {
         let policy = projection(SeverityThreshold::Low, serde_json::Value::Null);
         let r = evaluate_scan_result(
             &coords("any"),
+            TEST_KIND,
             &findings(1, 0, 0, 0),
             Some(&policy),
             &[],
@@ -826,6 +930,7 @@ mod tests {
         let policy = projection(SeverityThreshold::High, serde_json::Value::Null);
         let r = evaluate_scan_result(
             &coords("any"),
+            TEST_KIND,
             &findings(0, 1, 0, 0),
             Some(&policy),
             &[],
@@ -848,7 +953,7 @@ mod tests {
         // CVE-id match.
         let critical = vec![finding("CVE-A", SeverityThreshold::Critical)];
         let exs = vec![exclusion(1, "CVE-A", None, None)];
-        let r = evaluate_scan_result(&coords("xz-utils"), &critical, None, &exs, ts(0));
+        let r = evaluate_scan_result(&coords("xz-utils"), TEST_KIND, &critical, None, &exs, ts(0));
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -859,7 +964,7 @@ mod tests {
         let now = ts(2_000_000);
         let critical = vec![finding("CVE-A", SeverityThreshold::Critical)];
         let exs = vec![exclusion(1, "CVE-A", None, Some(ts(1_000_000)))];
-        let r = evaluate_scan_result(&coords("any"), &critical, None, &exs, now);
+        let r = evaluate_scan_result(&coords("any"), TEST_KIND, &critical, None, &exs, now);
         match r {
             ScanOutcome::Reject(v) => assert_eq!(v.len(), 1),
             other => panic!("expected Reject, got {other:?}"),
@@ -877,7 +982,14 @@ mod tests {
             SeverityThreshold::Critical,
             serde_json::json!("not-a-policy"),
         );
-        let r = evaluate_scan_result(&coords("any"), &no_findings(), Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &no_findings(),
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -896,7 +1008,14 @@ mod tests {
                 "action": "Block",
             }),
         );
-        let r = evaluate_scan_result(&coords("any"), &no_findings(), Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &no_findings(),
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -908,7 +1027,14 @@ mod tests {
         // empty-object path returning `(vec![], Warn)` and accidentally
         // shifting the scan accumulator off Allow.
         let policy = projection(SeverityThreshold::Critical, serde_json::json!({}));
-        let r = evaluate_scan_result(&coords("any"), &no_findings(), Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &no_findings(),
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -925,6 +1051,7 @@ mod tests {
         );
         let r = evaluate_scan_result(
             &coords("any"),
+            TEST_KIND,
             &findings(1, 0, 0, 0),
             Some(&policy),
             &[],
@@ -955,7 +1082,14 @@ mod tests {
         // informational findings never block. This is exactly the
         // post-Part-A behaviour.
         let findings = vec![informational_finding("RUSTSEC-2026-0173")];
-        let r = evaluate_scan_result(&coords("proc-macro-error2"), &findings, None, &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("proc-macro-error2"),
+            TEST_KIND,
+            &findings,
+            None,
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -963,7 +1097,14 @@ mod tests {
     fn negligible_only_ignore_policy_is_clean() {
         let policy = projection_with_negligible(NegligibleAction::Ignore);
         let findings = vec![informational_finding("RUSTSEC-2026-0173")];
-        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -974,7 +1115,14 @@ mod tests {
         // (a future enhancement surfaces it via PolicyEvaluated(Pass)).
         let policy = projection_with_negligible(NegligibleAction::Warn);
         let findings = vec![informational_finding("RUSTSEC-2026-0173")];
-        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -982,7 +1130,14 @@ mod tests {
     fn negligible_only_block_policy_rejects() {
         let policy = projection_with_negligible(NegligibleAction::Block);
         let findings = vec![informational_finding("RUSTSEC-2026-0173")];
-        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         match r {
             ScanOutcome::Reject(violations) => {
                 assert_eq!(violations.len(), 1);
@@ -1001,6 +1156,7 @@ mod tests {
         let policy = projection_with_negligible(NegligibleAction::Block);
         let r = evaluate_scan_result(
             &coords("any"),
+            TEST_KIND,
             &findings(0, 0, 0, 1),
             Some(&policy),
             &[],
@@ -1019,7 +1175,14 @@ mod tests {
             finding("CVE-CRIT", SeverityThreshold::Critical),
             informational_finding("RUSTSEC-2026-0173"),
         ];
-        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         match r {
             ScanOutcome::Reject(violations) => {
                 // The CVE violation fires; the Ignore'd negligible adds none.
@@ -1039,7 +1202,14 @@ mod tests {
             finding("CVE-CRIT", SeverityThreshold::Critical),
             informational_finding("RUSTSEC-2026-0173"),
         ];
-        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         match r {
             ScanOutcome::Reject(violations) => {
                 assert_eq!(violations.len(), 2);
@@ -1058,7 +1228,14 @@ mod tests {
         let policy = projection_with_negligible(NegligibleAction::Block);
         let findings = vec![informational_finding("RUSTSEC-2026-0173")];
         let exs = vec![exclusion(1, "RUSTSEC-2026-0173", None, None)];
-        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &exs, ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &exs,
+            ts(0),
+        );
         assert_eq!(
             r,
             ScanOutcome::Clean,
@@ -1090,6 +1267,7 @@ mod tests {
         let policy = projection_with_enforcement(ScanEnforcement::Record);
         let r = evaluate_scan_result(
             &coords("any"),
+            TEST_KIND,
             &findings(1, 0, 0, 0),
             Some(&policy),
             &[],
@@ -1122,10 +1300,22 @@ mod tests {
         let mut record_policy = projection_with_enforcement(ScanEnforcement::Record);
         record_policy.negligible_action = NegligibleAction::Block;
 
-        let rejected =
-            evaluate_scan_result(&coords("any"), &findings, Some(&reject_policy), &[], ts(0));
-        let recorded =
-            evaluate_scan_result(&coords("any"), &findings, Some(&record_policy), &[], ts(0));
+        let rejected = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&reject_policy),
+            &[],
+            ts(0),
+        );
+        let recorded = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&record_policy),
+            &[],
+            ts(0),
+        );
         match (rejected, recorded) {
             (ScanOutcome::Reject(a), ScanOutcome::FindingsRecorded(b)) => {
                 assert_eq!(a, b, "record must not alter the computed violations");
@@ -1144,6 +1334,7 @@ mod tests {
         let policy = projection_with_enforcement(ScanEnforcement::Record);
         let r = evaluate_scan_result(
             &coords("any"),
+            TEST_KIND,
             &findings(0, 1, 0, 0),
             Some(&policy),
             &[],
@@ -1159,7 +1350,14 @@ mod tests {
         // modes.
         let mut policy = projection_with_enforcement(ScanEnforcement::Record);
         policy.license_policy = serde_json::json!("not-a-policy");
-        let r = evaluate_scan_result(&coords("any"), &no_findings(), Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &no_findings(),
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -1171,7 +1369,14 @@ mod tests {
         let policy = projection_with_enforcement(ScanEnforcement::Record);
         let critical = vec![finding("CVE-A", SeverityThreshold::Critical)];
         let exs = vec![exclusion(1, "CVE-A", None, None)];
-        let r = evaluate_scan_result(&coords("xz-utils"), &critical, Some(&policy), &exs, ts(0));
+        let r = evaluate_scan_result(
+            &coords("xz-utils"),
+            TEST_KIND,
+            &critical,
+            Some(&policy),
+            &exs,
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -1183,7 +1388,14 @@ mod tests {
         let mut policy = projection_with_enforcement(ScanEnforcement::Record);
         policy.negligible_action = NegligibleAction::Block;
         let findings = vec![informational_finding("RUSTSEC-2026-0173")];
-        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         match r {
             ScanOutcome::FindingsRecorded(violations) => {
                 assert_eq!(violations.len(), 1);
@@ -1200,13 +1412,20 @@ mod tests {
         let policy = projection_with_enforcement(ScanEnforcement::Reject);
         let with_policy = evaluate_scan_result(
             &coords("any"),
+            TEST_KIND,
             &findings(1, 0, 0, 0),
             Some(&policy),
             &[],
             ts(0),
         );
-        let no_policy =
-            evaluate_scan_result(&coords("any"), &findings(1, 0, 0, 0), None, &[], ts(0));
+        let no_policy = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings(1, 0, 0, 0),
+            None,
+            &[],
+            ts(0),
+        );
         assert!(matches!(with_policy, ScanOutcome::Reject(_)));
         assert!(matches!(no_policy, ScanOutcome::Reject(_)));
     }
@@ -1238,7 +1457,14 @@ mod tests {
             ComponentRelation::Subject,
             finding("CVE-SUBJECT", SeverityThreshold::Critical),
         )];
-        let r = evaluate_scan_result(&coords("hyper-util"), &findings, None, &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("hyper-util"),
+            TEST_KIND,
+            &findings,
+            None,
+            &[],
+            ts(0),
+        );
         assert!(
             matches!(r, ScanOutcome::Reject(_)),
             "a finding about the artifact itself keeps full release authority, got {r:?}",
@@ -1256,7 +1482,7 @@ mod tests {
             ComponentRelation::Contained,
             finding("CVE-LAYER", SeverityThreshold::Critical),
         )];
-        let r = evaluate_scan_result(&coords("app"), &findings, None, &[], ts(0));
+        let r = evaluate_scan_result(&coords("app"), TEST_KIND, &findings, None, &[], ts(0));
         assert!(matches!(r, ScanOutcome::Reject(_)), "{r:?}");
     }
 
@@ -1270,7 +1496,7 @@ mod tests {
             ComponentRelation::NotEstablished,
             finding("CVE-LEGACY", SeverityThreshold::Critical),
         )];
-        let r = evaluate_scan_result(&coords("any"), &findings, None, &[], ts(0));
+        let r = evaluate_scan_result(&coords("any"), TEST_KIND, &findings, None, &[], ts(0));
         assert!(matches!(r, ScanOutcome::Reject(_)), "{r:?}");
     }
 
@@ -1286,7 +1512,7 @@ mod tests {
             ComponentRelation::NotContained,
             finding("CVE-ELSEWHERE", SeverityThreshold::Critical),
         )];
-        let r = evaluate_scan_result(&coords("any"), &findings, None, &[], ts(0));
+        let r = evaluate_scan_result(&coords("any"), TEST_KIND, &findings, None, &[], ts(0));
         assert_eq!(
             r,
             ScanOutcome::Clean,
@@ -1313,7 +1539,14 @@ mod tests {
             finding("RUSTSEC-2026-0004", SeverityThreshold::Critical),
         );
         pinned.purl = "pkg:cargo/h2@0.4.13".into();
-        let r = evaluate_scan_result(&coords("hyper-util"), &[pinned], None, &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("hyper-util"),
+            TEST_KIND,
+            &[pinned],
+            None,
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -1332,7 +1565,7 @@ mod tests {
                 finding("CVE-HERE", SeverityThreshold::Critical),
             ),
         ];
-        let r = evaluate_scan_result(&coords("any"), &findings, None, &[], ts(0));
+        let r = evaluate_scan_result(&coords("any"), TEST_KIND, &findings, None, &[], ts(0));
         match r {
             ScanOutcome::Reject(violations) => assert_eq!(
                 violations.len(),
@@ -1360,8 +1593,8 @@ mod tests {
             ComponentRelation::NotEstablished,
         ] {
             let one = about(relation, finding("CVE-SWEEP", SeverityThreshold::Critical));
-            let condemns = one.may_condemn_artifact();
-            let r = evaluate_scan_result(&coords("any"), &[one], None, &[], ts(0));
+            let condemns = one.may_condemn_artifact(TEST_KIND, CompositeVerdictMode::Observed);
+            let r = evaluate_scan_result(&coords("any"), TEST_KIND, &[one], None, &[], ts(0));
             assert_eq!(
                 matches!(r, ScanOutcome::Reject(_)),
                 condemns,
@@ -1382,7 +1615,14 @@ mod tests {
             ComponentRelation::NotContained,
             informational_finding("RUSTSEC-2026-0173"),
         )];
-        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean, "{r:?}");
     }
 
@@ -1397,13 +1637,159 @@ mod tests {
             ComponentRelation::NotEstablished,
             informational_finding("RUSTSEC-2026-0173"),
         )];
-        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         match r {
             ScanOutcome::Reject(violations) => {
                 assert_eq!(violations.len(), 1);
                 assert_eq!(violations[0].rule, NEGLIGIBLE_RULE);
             }
             other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    // -- the statement axis (ADR 0064 D2) ----------------------------------
+
+    /// A stored finding as the Trivy adapter produced it from a
+    /// `Vulnerabilities` entry: a claim about the filesystem the
+    /// materialised bytes compose into. Whose filesystem that is, the
+    /// producer does not say — the row's kind decides, which is what
+    /// these tests vary.
+    fn filesystem_finding(vuln: &str, sev: SeverityThreshold) -> Finding {
+        let mut f = finding(vuln, sev);
+        f.statement = crate::types::FindingStatement::Filesystem;
+        f
+    }
+
+    /// A promoted policy at `threshold`.
+    fn promoted(threshold: SeverityThreshold) -> ScanPolicyProjection {
+        ScanPolicyProjection {
+            composite_verdict_mode: CompositeVerdictMode::Promoted,
+            ..projection(threshold, serde_json::Value::Null)
+        }
+    }
+
+    /// **The trapdoor, closed.** A constituent cleared by a fresh scan
+    /// under a promoted policy is still clear when an operator *lowers* a
+    /// threshold and the tighten pass re-derives the verdict over the
+    /// same **stored** findings.
+    ///
+    /// Both halves run through this one function, because the tighten
+    /// pass is this function over the stored findings blob — so the only
+    /// thing that differs between them is the threshold the operator
+    /// moved. While the statement was transient the second half rejected:
+    /// a hydrated finding read `Unstated`, which condemns, and
+    /// `ScanPolicyRetroactive → Rejected` is revisited by no rescan. The
+    /// finding is serialised and read back here rather than reused by
+    /// value, because "it survives the blob" is the half that was broken.
+    #[test]
+    fn a_threshold_tighten_does_not_re_reject_a_promoted_constituent() {
+        let fresh = vec![filesystem_finding(
+            "CVE-2022-LAYER",
+            SeverityThreshold::High,
+        )];
+        assert_eq!(
+            evaluate_scan_result(
+                &coords("layer"),
+                ArtifactKind::OciBlob,
+                &fresh,
+                Some(&promoted(SeverityThreshold::Critical)),
+                &[],
+                ts(0),
+            ),
+            ScanOutcome::Clean,
+            "the fresh scan under a promoted policy lets the layer through: \
+             the composition that binds it carries the filesystem verdict",
+        );
+
+        // What the tighten pass actually reads: the stored findings blob.
+        let blob = serde_json::to_string(&fresh).unwrap();
+        let stored: Vec<Finding> = serde_json::from_str(&blob).unwrap();
+
+        assert_eq!(
+            evaluate_scan_result(
+                &coords("layer"),
+                ArtifactKind::OciBlob,
+                &stored,
+                Some(&promoted(SeverityThreshold::High)),
+                &[],
+                ts(0),
+            ),
+            ScanOutcome::Clean,
+            "lowering the threshold must not terminally reject the layer the \
+             same policy just released — the verdict re-taken over stored \
+             findings has to read the same fact the fresh scan read",
+        );
+    }
+
+    /// And the counter-case that says the test above is not vacuous: the
+    /// identical stored findings, at the identical lowered threshold,
+    /// reject under the default posture. The tighten pass is doing real
+    /// work; what changed is only that it now reads the statement.
+    #[test]
+    fn the_same_tighten_still_rejects_an_unpromoted_constituent() {
+        let fresh = vec![filesystem_finding(
+            "CVE-2022-LAYER",
+            SeverityThreshold::High,
+        )];
+        let blob = serde_json::to_string(&fresh).unwrap();
+        let stored: Vec<Finding> = serde_json::from_str(&blob).unwrap();
+        let r = evaluate_scan_result(
+            &coords("layer"),
+            ArtifactKind::OciBlob,
+            &stored,
+            Some(&projection(
+                SeverityThreshold::High,
+                serde_json::Value::Null,
+            )),
+            &[],
+            ts(0),
+        );
+        assert!(
+            matches!(r, ScanOutcome::Reject(_)),
+            "an unpromoted constituent gates on its own filesystem findings \
+             exactly as it did before ADR 0064 D2: {r:?}",
+        );
+    }
+
+    /// A promoted policy is **not** a global disarm: the same stored
+    /// filesystem finding at the same lowered threshold still rejects
+    /// every row whose materialised tree is its own. `compositeVerdictMode`
+    /// is a `ScanPolicy` field and a global policy reaches every
+    /// repository, so this is the assertion that keeps an operator
+    /// promoting their OCI estate from disarming their npm one.
+    #[test]
+    fn promotion_does_not_disarm_a_row_whose_filesystem_is_its_own() {
+        let stored = vec![filesystem_finding("CVE-2022-TREE", SeverityThreshold::High)];
+        for kind in [
+            ArtifactKind::OciManifest,
+            ArtifactKind::NpmTarball,
+            ArtifactKind::CargoCrate,
+            ArtifactKind::PyWheel,
+            ArtifactKind::PySdist,
+            ArtifactKind::MavenJar,
+            ArtifactKind::MavenPom,
+            ArtifactKind::Other,
+        ] {
+            let r = evaluate_scan_result(
+                &coords("pkg"),
+                kind,
+                &stored,
+                Some(&promoted(SeverityThreshold::High)),
+                &[],
+                ts(0),
+            );
+            assert!(
+                matches!(r, ScanOutcome::Reject(_)),
+                "{kind}: the materialised tree is this artifact's own, so a \
+                 promoted composite verdict has nothing to move the claim to: {r:?}",
+            );
         }
     }
 
@@ -1419,7 +1805,14 @@ mod tests {
             ComponentRelation::NotContained,
             finding("CVE-ELSEWHERE", SeverityThreshold::Critical),
         )];
-        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -1433,7 +1826,14 @@ mod tests {
             ComponentRelation::NotContained,
             finding("CVE-LOW", SeverityThreshold::Low),
         )];
-        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        let r = evaluate_scan_result(
+            &coords("any"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &[],
+            ts(0),
+        );
         assert_eq!(r, ScanOutcome::Clean);
     }
 
@@ -1453,7 +1853,7 @@ mod tests {
             ),
         ];
         let exs = vec![exclusion(7, "CVE-HERE", None, None)];
-        let r = evaluate_scan_result(&coords("any"), &findings, None, &exs, ts(0));
+        let r = evaluate_scan_result(&coords("any"), TEST_KIND, &findings, None, &exs, ts(0));
         assert_eq!(r, ScanOutcome::Clean, "{r:?}");
     }
 

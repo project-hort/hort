@@ -23,10 +23,20 @@
 //! and Rootfs only**, while a **pre-build declaration** (`pom.xml`,
 //! `package-lock.json`, `requirements.txt`, `poetry.lock`, `uv.lock`,
 //! `gradle.lockfile`) is analysed by **Filesystem and Repository only**.
-//! `Cargo.lock` is read by all four. Hort has no container image to scan,
-//! so the choice for every row is `rootfs` or `fs`, and picking the wrong
-//! one means the analyzer never runs: the report comes back with no
-//! analysed target and the artifact can never get a verdict.
+//! `Cargo.lock` is read by all four. Picking the wrong one means the
+//! analyzer never runs: the report comes back with no analysed target and
+//! the artifact can never get a verdict.
+//!
+//! The table below is the **per-blob** path, and its mode column is
+//! therefore `rootfs` or `fs`. There is a third mode, and it is not in
+//! the table because it is not chosen by a kind: an image manifest
+//! together with the config and layers its bytes name is materialised as
+//! an OCI image layout and scanned with `trivy image --input`
+//! (ADR 0064 D1, [`crate::oci_layout`]). That the Container Image target
+//! was once written off here — "hort has no container image to scan" —
+//! was a derivation, not a decision: hort holds the manifest, the config
+//! and every layer, and the manifest bytes name them in order. The
+//! material was always present; it was never assembled.
 //!
 //! | [`ArtifactKind`]              | on disk                                  | Trivy mode | why that mode |
 //! |-------------------------------|------------------------------------------|------------|---------------|
@@ -82,11 +92,14 @@
 //!
 //! # Fail-closed, not best-effort
 //!
-//! Nothing here degrades. A payload whose container cannot be opened, or
-//! whose entries trip a bound in [`crate::extract`], yields
-//! [`NotAnalysable::UnusableArchive`] and no scan — never a partially
-//! extracted tree. A half-unpacked archive scanned as if it were whole is
-//! precisely the false-clean this module exists to eliminate.
+//! Nothing here degrades. A payload whose entries trip a bound in
+//! [`crate::extract`] yields [`NotAnalysable::UnusableArchive`], and a
+//! payload in a container this adapter has no decoder for yields
+//! [`NotAnalysable::UnsupportedContainer`] ([`refusal_of`] is the one
+//! definition of which is which). Either way no scan runs — never a
+//! partially extracted tree. A half-unpacked archive scanned as if it
+//! were whole is precisely the false-clean this module exists to
+//! eliminate.
 //!
 //! Cleanup is RAII: the returned [`TempDir`] removes the whole tree on
 //! `Drop`, which fires whether the scan succeeded, failed, or panicked.
@@ -102,13 +115,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::{NotAnalysable, ScanTarget};
+use hort_domain::oci::ImageBudget;
+use hort_domain::ports::scanner::{ComposedImage, NotAnalysable, ScanTarget, ScanUnit};
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ContentHash};
 use tempfile::{Builder, TempDir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::extract::{extract_tar, extract_zip, ExtractBounds, ExtractError, ExtractStats};
+use crate::oci_layout::write_image_layout;
 
 /// Chunk size for the streaming CAS→tempfile copy. 64 KiB is the
 /// usual sweet spot for `read`/`write` syscall amortisation without
@@ -171,6 +186,16 @@ pub(crate) enum ScanMode {
     /// `trivy rootfs <dir>` — the extracted tree is a root filesystem, so
     /// the OS-package analyzers apply on top of the language ones.
     Rootfs,
+    /// `trivy image --input <dir>` — the directory is an OCI image
+    /// layout, and the scanner composes the layers itself: it applies
+    /// them in manifest order, resolves whiteouts and opaque whiteouts,
+    /// and derives the OS identity from the composed tree (ADR 0064 D1).
+    ///
+    /// The distinction from [`Self::Rootfs`] is not the analyzer set but
+    /// *what the analyzers see*: `rootfs` reads one layer as if it were a
+    /// whole filesystem, which is how a package database in a layer with
+    /// no OS marker of its own goes unassessed.
+    Image,
 }
 
 impl ScanMode {
@@ -179,6 +204,7 @@ impl ScanMode {
         match self {
             Self::Fs => "fs",
             Self::Rootfs => "rootfs",
+            Self::Image => "image",
         }
     }
 }
@@ -386,15 +412,22 @@ pub(crate) fn format_is_analysable(format: &str) -> bool {
         .any(|(f, kinds)| *f == format && kinds.iter().copied().any(kind_is_materialisable))
 }
 
-/// Decide the materialisation for a target. The module doc's table is
-/// this function; the "why that mode" column cites Trivy's coverage
-/// matrix, which is the authority on which target runs which analyzer.
-fn plan_for(target: &ScanTarget<'_>) -> Plan {
-    match target.kind {
+/// Decide the materialisation for a single stored object. The module
+/// doc's table is this function; the "why that mode" column cites Trivy's
+/// coverage matrix, which is the authority on which target runs which
+/// analyzer.
+///
+/// Takes the kind and the coords rather than the whole
+/// [`ScanTarget`](hort_domain::ports::scanner::ScanTarget) because the
+/// table is about one blob: a composed image is materialised from its own
+/// resolved description (see [`crate::oci_layout`]) and never reaches
+/// here.
+fn plan_for(kind: ArtifactKind, coords: &ArtifactCoords) -> Plan {
+    match kind {
         // A Java archive is a post-build artifact, claimed only by the
         // Image and Rootfs targets.
         ArtifactKind::MavenJar => Plan::SingleFile {
-            name: java_archive_filename(target.coords),
+            name: java_archive_filename(coords),
             mode: ScanMode::Rootfs,
         },
         // Trivy's Maven analyzer keys on the literal name `pom.xml`; the
@@ -407,7 +440,7 @@ fn plan_for(target: &ScanTarget<'_>) -> Plan {
         // A `package.json` is claimed only under `node_modules`, and only
         // by the Image and Rootfs targets.
         ArtifactKind::NpmTarball => Plan::Relocated {
-            dest: npm_package_dir(target.coords),
+            dest: npm_package_dir(coords),
             mode: ScanMode::Rootfs,
         },
         // A `.crate`'s analysable content is `Cargo.toml` plus, when the
@@ -567,7 +600,130 @@ pub(crate) async fn materialise(
     target: &ScanTarget<'_>,
     max_artifact_size: u64,
 ) -> DomainResult<Materialised> {
-    let plan = plan_for(target);
+    match target.unit {
+        // A composition is materialised from its own resolved
+        // description and from nothing else. Note what the per-blob
+        // table below would make of the same row: an image manifest's
+        // kind is `OciManifest`, whose plan is `NotApplicable`, because
+        // the manifest's *own* bytes carry no package surface. The
+        // composition it names does, and it is a different input.
+        ScanUnit::Image(image) => materialise_image(storage, target, image).await,
+        ScanUnit::Blob(hash) => materialise_blob(storage, target, hash, max_artifact_size).await,
+    }
+}
+
+/// Materialise a composed OCI image as an image layout and point
+/// `trivy image --input` at it (ADR 0064 D1).
+///
+/// A refusal takes one of two shapes, and which one it takes is the
+/// refusal's own answer to "would running this again help"
+/// ([`LayoutRefusal::is_transient`]):
+///
+/// - **Deterministic** — the image declares more constituents or more
+///   bytes than hort will assemble, or a constituent is simply not in
+///   CAS. [`Materialised::Nothing`] carrying
+///   [`NotAnalysable::IncompleteComposition`], which no assembled
+///   composition can produce, so "I could not build the image" never
+///   arrives looking like "I built it and it reported nothing". The scan
+///   axis has a state for "no verdict" that the job queue will not spin
+///   on, and re-running an over-budget image is pure delay.
+/// - **Transient** — a stalled storage stream, a failed read, a full
+///   scratch disk. An `Err`, because that is the answer the orchestrator
+///   already reschedules: a backend that errored may succeed on the next
+///   attempt, so it earns the scan job's existing attempt budget. Folding
+///   it into the deterministic value instead would turn a momentary
+///   infrastructure condition into a permanent-looking absence of
+///   assessment.
+async fn materialise_image(
+    storage: &Arc<dyn StoragePort>,
+    target: &ScanTarget<'_>,
+    image: &ComposedImage,
+) -> DomainResult<Materialised> {
+    let tmp = Builder::new()
+        .prefix("hort-scan-trivy-image-")
+        .tempdir()
+        .map_err(|e| {
+            DomainError::Invariant(format!(
+                "trivy adapter: failed to create temp workspace: {e}"
+            ))
+        })?;
+    let layout_dir = tmp.path().join(TARGET_SUBDIR);
+    tokio::fs::create_dir(&layout_dir).await.map_err(|e| {
+        DomainError::Invariant(format!(
+            "trivy adapter: failed to create image layout directory: {e}"
+        ))
+    })?;
+
+    let budget = ImageBudget::default_for_composite_scan();
+    match write_image_layout(storage, image, &layout_dir, budget).await {
+        Ok(stats) => {
+            tracing::debug!(
+                scanner = "trivy",
+                manifest = %image.manifest(),
+                layers = image.layers().len(),
+                blobs = stats.blobs,
+                bytes = stats.bytes,
+                "trivy adapter: materialised a composed image layout"
+            );
+            Ok(Materialised::Ready {
+                ws: ScanWorkspace {
+                    tmp,
+                    target_dir: layout_dir,
+                    // Nothing is unpacked on this path, so there is no
+                    // archive entry to have skipped.
+                    skipped_links: 0,
+                },
+                mode: ScanMode::Image,
+            })
+        }
+        Err(refusal) if refusal.is_transient() => {
+            // `warn!` and an `Err`: the composition did not fail to
+            // exist, the machine failed to produce it, and the two must
+            // not land on the same outcome. The orchestrator's
+            // backend-error path reschedules under the job's own attempt
+            // budget; exhausting it lands back on the deterministic
+            // no-verdict below.
+            tracing::warn!(
+                scanner = "trivy",
+                manifest = %image.manifest(),
+                format = target.format,
+                layers = image.layers().len(),
+                reason = %refusal,
+                "trivy adapter: could not assemble the composed image for a transient \
+                 reason; no composite verdict this attempt"
+            );
+            Err(DomainError::Invariant(format!(
+                "trivy adapter: composing image sha256:{} did not complete: {refusal}",
+                image.manifest()
+            )))
+        }
+        Err(refusal) => {
+            // `warn!`, not `error!`: the worker is healthy and the
+            // composition is held, which is the designed outcome. The
+            // refusal names the constituent, which is the actionable
+            // part; the artifact id stays on the span.
+            tracing::warn!(
+                scanner = "trivy",
+                manifest = %image.manifest(),
+                format = target.format,
+                layers = image.layers().len(),
+                reason = %refusal,
+                "trivy adapter: refusing to assemble the composed image; no composite verdict"
+            );
+            Ok(Materialised::Nothing(NotAnalysable::IncompleteComposition))
+        }
+    }
+}
+
+/// Materialise one stored object by its [`ArtifactKind`] — the per-blob
+/// path, unchanged, bounded per artifact by `max_artifact_size`.
+async fn materialise_blob(
+    storage: &Arc<dyn StoragePort>,
+    target: &ScanTarget<'_>,
+    content_hash: &ContentHash,
+    max_artifact_size: u64,
+) -> DomainResult<Materialised> {
+    let plan = plan_for(target.kind, target.coords);
     if plan == Plan::NotApplicable {
         // No CAS read at all: there is no materialisation for these
         // bytes, so paying a storage round-trip to write a file nothing
@@ -600,7 +756,7 @@ pub(crate) async fn materialise(
         Plan::NotApplicable => unreachable!("handled above"),
         Plan::SingleFile { name, mode } => {
             let path = target_dir.join(&name);
-            stream_to_file(storage, target.content_hash, &path, max_artifact_size).await?;
+            stream_to_file(storage, content_hash, &path, max_artifact_size).await?;
             Ok(Materialised::Ready {
                 ws: ScanWorkspace {
                     tmp,
@@ -612,8 +768,7 @@ pub(crate) async fn materialise(
         }
         Plan::GzipTar { .. } | Plan::Relocated { .. } | Plan::Zip { .. } | Plan::OciBlob => {
             let download = tmp.path().join(DOWNLOAD_FILENAME);
-            let size =
-                stream_to_file(storage, target.content_hash, &download, max_artifact_size).await?;
+            let size = stream_to_file(storage, content_hash, &download, max_artifact_size).await?;
             let bounds = ExtractBounds::default_for_scan_materialisation();
             let extract_dir = target_dir.clone();
             let staging_dir = tmp.path().join(STAGING_SUBDIR);
@@ -660,21 +815,74 @@ pub(crate) async fn materialise(
                     Ok(Materialised::Nothing(NotAnalysable::NotApplicable))
                 }
                 Err(e) => {
+                    let why = refusal_of(&e);
                     // `warn!`, not `error!`: the worker is healthy and the
                     // artifact is held, which is the designed outcome. The
                     // guard that fired is the actionable part; the
                     // artifact id stays on the span.
+                    //
+                    // `abstention` is on the line because the two
+                    // refusals are different facts about different
+                    // things and an operator triaging a held artifact
+                    // needs to know which one happened — a compression
+                    // format hort has no decoder for reads nothing like
+                    // a zip bomb, and before the split they were the
+                    // same line.
                     tracing::warn!(
                         scanner = "trivy",
                         kind = kind.as_str(),
                         format = target.format,
                         reason = %e,
+                        abstention = why.as_str(),
                         "trivy adapter: refusing to materialise archive; no scan will run"
                     );
-                    Ok(Materialised::Nothing(NotAnalysable::UnusableArchive))
+                    Ok(Materialised::Nothing(why))
                 }
             }
         }
+    }
+}
+
+/// Which abstention one extraction refusal is.
+///
+/// The **one** definition of the mapping, so the log line's label and
+/// the value handed to the orchestrator cannot describe the refusal
+/// differently. An exhaustive match rather than a wildcard: a future
+/// `ExtractError` variant has to state which side it is on instead of
+/// inheriting an answer.
+///
+/// Both answers gate the artifact today
+/// ([`NotAnalysable::gates_release`]). The split says *what the refusal
+/// is a statement about*, which is the thing ADR 0064 D2 turns on:
+///
+/// - [`NotAnalysable::UnsupportedContainer`] — "I have no decoder for
+///   this container". The container was positively identified from its
+///   own leading bytes and nothing inside it was reached, so this is a
+///   fact about this adapter's decoder inventory, not about the
+///   payload. The composition decodes `tar+zstd` without difficulty.
+/// - [`NotAnalysable::UnusableArchive`] — everything else: a bound the
+///   archive tripped, an entry that tried to escape the workspace, an
+///   entry name that could not be put to the containment rule, or an
+///   archive that could not be read. All statements about the payload's
+///   own bytes.
+///
+/// [`ExtractError::Malformed`] is on the second side even though it
+/// covers "could not be read", and that is the deliberate fail-closed
+/// choice: the readers behind it (`tar::Archive::entries`,
+/// `zip::ZipArchive::new`, a `GzDecoder` handed non-gzip bytes) report
+/// a container they have no decoder for and a corrupt archive of a
+/// container they do decode with the same error, so the distinction is
+/// not available at this point. Guessing would move a real refusal off
+/// the gating side.
+fn refusal_of(error: &ExtractError) -> NotAnalysable {
+    match error {
+        ExtractError::UnsupportedContainer { .. } => NotAnalysable::UnsupportedContainer,
+        ExtractError::ExtractedBytesCap { .. }
+        | ExtractError::CompressionRatioCap { .. }
+        | ExtractError::EntryCap { .. }
+        | ExtractError::UncontainedPath
+        | ExtractError::UndecodableEntryName { .. }
+        | ExtractError::Malformed(_) => NotAnalysable::UnusableArchive,
     }
 }
 
@@ -735,10 +943,12 @@ fn extract_blocking(
                 }
                 // A layer this adapter could scan if it could decompress
                 // it. Refusing names the gap instead of silently
-                // reporting the layer clean.
-                Container::UnsupportedCompression(name) => Err(ExtractError::Malformed(format!(
-                    "unsupported layer compression: {name}"
-                ))),
+                // reporting the layer clean — and it names it as a
+                // missing decoder rather than as a complaint about the
+                // bytes, which is a different fact (ADR 0064 D2).
+                Container::UnsupportedCompression(container) => {
+                    Err(ExtractError::UnsupportedContainer { container })
+                }
                 // The image config JSON (or any other non-archive blob):
                 // genuinely no package surface, not a refusal.
                 Container::NotAnArchive => Ok(None),
@@ -820,22 +1030,48 @@ fn read_head(file: &mut std::fs::File, buf: &mut [u8]) -> Result<usize, ExtractE
     Ok(filled)
 }
 
-/// Streaming, size-capped CAS→file copy. Returns the number of bytes
-/// written, which the ratio cap downstream is measured against.
+/// What a bounded CAS→file copy did.
 ///
-/// The copy reads the storage stream in [`COPY_CHUNK_BYTES`] chunks and
-/// maintains a running `written` total. The cap check is
-/// `written + chunk_len > max_artifact_size` *before* the chunk is
-/// written, so a stream whose length is *exactly* the cap succeeds (the
-/// next `read` yields EOF, not an over-cap chunk) while a stream that
-/// produces even one byte beyond the cap is rejected — this is what
-/// distinguishes "hit the cap" from a legitimate at-cap EOF.
-async fn stream_to_file(
+/// Two outcomes rather than one `Result`, because over-cap is not an
+/// error of the copy: it is a fact about the object, and the two callers
+/// turn it into different refusals — a per-artifact
+/// `max-artifact-size` rejection on the single-blob path, a whole-image
+/// budget refusal on the composition path. Centralising the loop and
+/// leaving the verdict to the caller is what keeps one copy of the
+/// chunking and the off-by-one and no copies of the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundedCopy {
+    /// The whole object was written, in this many bytes.
+    Written(u64),
+    /// The stream produced more than `cap` bytes. Whatever was written
+    /// before the cap tripped is still on disk — the caller owns the
+    /// cleanup, and both of them discard the whole workspace rather than
+    /// handing a truncated file to a scanner.
+    OverCap,
+}
+
+/// Streaming, size-capped CAS→file copy.
+///
+/// Reads the storage stream in [`COPY_CHUNK_BYTES`] chunks with a running
+/// `written` total — no full-artifact RAM buffer, so resident memory is
+/// `O(COPY_CHUNK_BYTES)` rather than `O(object size)`. The cap check is
+/// `written + chunk_len > cap` *before* the chunk is written, so a stream
+/// whose length is *exactly* the cap succeeds (the next `read` yields
+/// EOF, not an over-cap chunk) while a stream that produces even one byte
+/// beyond the cap is refused — this is what distinguishes "hit the cap"
+/// from a legitimate at-cap EOF.
+///
+/// **The read verifies.** `StoragePort::get` is the verified read path
+/// (ADR 0003): every adapter wraps its backend stream in a reader that
+/// recomputes the SHA-256 and fails at EOF on a mismatch. So a corrupt
+/// object surfaces here as an `Err` from `read`, never as a short file
+/// the caller cannot tell from a complete one.
+pub(crate) async fn copy_capped(
     storage: &Arc<dyn StoragePort>,
     content_hash: &ContentHash,
     path: &Path,
-    max_artifact_size: u64,
-) -> DomainResult<u64> {
+    cap: u64,
+) -> DomainResult<BoundedCopy> {
     let mut reader = storage.get(content_hash).await?;
     let mut file = tokio::fs::File::create(path).await.map_err(|e| {
         DomainError::Invariant(format!(
@@ -843,9 +1079,6 @@ async fn stream_to_file(
         ))
     })?;
 
-    // Bounded streaming copy: fixed-size chunks, running byte count,
-    // no full-artifact RAM buffer. `buf` is reused across iterations
-    // so resident memory is O(COPY_CHUNK_BYTES), not O(artifact size).
     let mut buf = vec![0u8; COPY_CHUNK_BYTES];
     let mut written: u64 = 0;
     loop {
@@ -853,26 +1086,15 @@ async fn stream_to_file(
             DomainError::Invariant(format!("trivy adapter: failed to read storage stream: {e}"))
         })?;
         if n == 0 {
-            // EOF — the at-cap artifact lands here without ever
-            // tripping the over-cap branch below.
+            // EOF — the at-cap object lands here without ever tripping
+            // the over-cap branch below.
             break;
         }
         // Cap check *before* writing this chunk. `written + n` cannot
-        // wrap: `written <= max_artifact_size` holds on entry and `n`
-        // fits in `usize`/`u64`.
-        if written + (n as u64) > max_artifact_size {
-            // RAII: the caller's `TempDir` (and the partial file inside
-            // it) is removed when it drops on this error path.
-            tracing::warn!(
-                scanner = "trivy",
-                content_hash = %content_hash,
-                max_artifact_size,
-                "trivy adapter: artifact exceeds max-artifact-size cap; rejecting pre-scan"
-            );
-            return Err(DomainError::Invariant(format!(
-                "trivy adapter: artifact exceeds max-artifact-size cap \
-                 ({max_artifact_size} bytes); rejected pre-scan to protect the worker"
-            )));
+        // wrap: `written <= cap` holds on entry and `n` fits in
+        // `usize`/`u64`.
+        if written + (n as u64) > cap {
+            return Ok(BoundedCopy::OverCap);
         }
         file.write_all(&buf[..n]).await.map_err(|e| {
             DomainError::Invariant(format!(
@@ -886,7 +1108,35 @@ async fn stream_to_file(
         DomainError::Invariant(format!("trivy adapter: failed to flush artifact file: {e}"))
     })?;
 
-    Ok(written)
+    Ok(BoundedCopy::Written(written))
+}
+
+/// [`copy_capped`] with the single-blob path's verdict on an over-cap
+/// object: reject the artifact pre-scan. Returns the number of bytes
+/// written, which the ratio cap downstream is measured against.
+async fn stream_to_file(
+    storage: &Arc<dyn StoragePort>,
+    content_hash: &ContentHash,
+    path: &Path,
+    max_artifact_size: u64,
+) -> DomainResult<u64> {
+    match copy_capped(storage, content_hash, path, max_artifact_size).await? {
+        BoundedCopy::Written(written) => Ok(written),
+        BoundedCopy::OverCap => {
+            // RAII: the caller's `TempDir` (and the partial file inside
+            // it) is removed when it drops on this error path.
+            tracing::warn!(
+                scanner = "trivy",
+                content_hash = %content_hash,
+                max_artifact_size,
+                "trivy adapter: artifact exceeds max-artifact-size cap; rejecting pre-scan"
+            );
+            Err(DomainError::Invariant(format!(
+                "trivy adapter: artifact exceeds max-artifact-size cap \
+                 ({max_artifact_size} bytes); rejected pre-scan to protect the worker"
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -914,6 +1164,10 @@ mod tests {
         NotFound,
         /// Panic — asserts a kind must not cost a CAS read at all.
         Forbidden,
+        /// Fail the read with a **backend** error rather than an
+        /// absence — the two must not reach the same outcome, since only
+        /// one of them can change on a later attempt.
+        Broken,
     }
 
     struct StubStorage(Get);
@@ -929,21 +1183,30 @@ mod tests {
             &self,
             _hash: &ContentHash,
         ) -> BoxFuture<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
-            let bytes = match &self.0 {
-                Get::Bytes(b) => Some(b.clone()),
-                Get::NotFound => None,
+            enum Served {
+                Bytes(Vec<u8>),
+                Absent,
+                Broken,
+            }
+            let served = match &self.0 {
+                Get::Bytes(b) => Served::Bytes(b.clone()),
+                Get::NotFound => Served::Absent,
+                Get::Broken => Served::Broken,
                 Get::Forbidden => panic!("this artifact kind must not cost a CAS read"),
             };
             Box::pin(async move {
-                match bytes {
-                    Some(b) => {
+                match served {
+                    Served::Bytes(b) => {
                         let r: Box<dyn AsyncRead + Send + Unpin> = Box::new(Cursor::new(b));
                         Ok(r)
                     }
-                    None => Err(DomainError::NotFound {
+                    Served::Absent => Err(DomainError::NotFound {
                         entity: "content",
                         id: "x".into(),
                     }),
+                    Served::Broken => Err(DomainError::Invariant(
+                        "object store returned 503".to_string(),
+                    )),
                 }
             })
         }
@@ -977,6 +1240,23 @@ mod tests {
             format: RepositoryFormat::Maven,
             metadata: serde_json::Value::Null,
         }
+    }
+
+    /// A one-layer composition, for the refusal tests — the digests are
+    /// synthetic because no read ever succeeds in them.
+    fn sample_composed_image() -> ComposedImage {
+        use hort_domain::oci::{ImageLayout, ImageLayoutLayer, OCI_IMAGE_MANIFEST_MEDIA_TYPE};
+        ComposedImage::new(
+            sample_hash(),
+            ImageLayout {
+                config: sample_hash(),
+                layers: vec![ImageLayoutLayer {
+                    hash: sample_hash(),
+                    media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                }],
+                manifest_media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            },
+        )
     }
 
     fn storage_of(bytes: Vec<u8>) -> Arc<dyn StoragePort> {
@@ -1074,7 +1354,7 @@ mod tests {
         let storage = storage_of(bytes);
         let hash = sample_hash();
         let target = ScanTarget {
-            content_hash: &hash,
+            unit: ScanUnit::Blob(&hash),
             format: "maven",
             coords,
             kind,
@@ -1100,36 +1380,25 @@ mod tests {
 
     // -- plan derivation (pure) ----------------------------------------
 
-    /// Resolve the plan for `kind` against `c`, without storage.
-    fn plan_of(kind: ArtifactKind, c: &ArtifactCoords) -> Plan {
-        let hash = sample_hash();
-        plan_for(&ScanTarget {
-            content_hash: &hash,
-            format: "maven",
-            coords: c,
-            kind,
-        })
-    }
-
     #[test]
     fn plan_per_kind_matches_the_materialisation_table() {
         let c = coords("g:a", Some("1.0"), "g/a/1.0/a-1.0.jar");
         assert_eq!(
-            plan_of(ArtifactKind::MavenJar, &c),
+            plan_for(ArtifactKind::MavenJar, &c),
             Plan::SingleFile {
                 name: "a-1.0.jar".to_string(),
                 mode: ScanMode::Rootfs,
             }
         );
         assert_eq!(
-            plan_of(ArtifactKind::MavenPom, &c),
+            plan_for(ArtifactKind::MavenPom, &c),
             Plan::SingleFile {
                 name: "pom.xml".to_string(),
                 mode: ScanMode::Fs,
             }
         );
         assert_eq!(
-            plan_of(
+            plan_for(
                 ArtifactKind::NpmTarball,
                 &coords("lodash", Some("4.17.21"), "")
             ),
@@ -1139,24 +1408,24 @@ mod tests {
             }
         );
         assert_eq!(
-            plan_of(ArtifactKind::CargoCrate, &c),
+            plan_for(ArtifactKind::CargoCrate, &c),
             Plan::GzipTar { mode: ScanMode::Fs }
         );
         assert_eq!(
-            plan_of(ArtifactKind::PySdist, &c),
+            plan_for(ArtifactKind::PySdist, &c),
             Plan::GzipTar {
                 mode: ScanMode::Rootfs
             }
         );
         assert_eq!(
-            plan_of(ArtifactKind::PyWheel, &c),
+            plan_for(ArtifactKind::PyWheel, &c),
             Plan::Zip {
                 mode: ScanMode::Rootfs
             }
         );
-        assert_eq!(plan_of(ArtifactKind::OciBlob, &c), Plan::OciBlob);
-        assert_eq!(plan_of(ArtifactKind::OciManifest, &c), Plan::NotApplicable);
-        assert_eq!(plan_of(ArtifactKind::Other, &c), Plan::NotApplicable);
+        assert_eq!(plan_for(ArtifactKind::OciBlob, &c), Plan::OciBlob);
+        assert_eq!(plan_for(ArtifactKind::OciManifest, &c), Plan::NotApplicable);
+        assert_eq!(plan_for(ArtifactKind::Other, &c), Plan::NotApplicable);
     }
 
     /// The whole point of this item: the subcommand a kind is scanned
@@ -1168,7 +1437,7 @@ mod tests {
     #[test]
     fn scan_mode_per_kind_follows_the_coverage_matrix() {
         let c = coords("g:a", Some("1.0"), "g/a/1.0/a-1.0.jar");
-        let subcommand_of = |kind| match plan_of(kind, &c) {
+        let subcommand_of = |kind| match plan_for(kind, &c) {
             Plan::SingleFile { mode, .. }
             | Plan::GzipTar { mode }
             | Plan::Relocated { mode, .. }
@@ -1218,7 +1487,7 @@ mod tests {
         ] {
             assert_eq!(
                 kind_is_materialisable(kind),
-                plan_of(kind, &c) != Plan::NotApplicable,
+                plan_for(kind, &c) != Plan::NotApplicable,
                 "{kind}: the capability answer must follow the plan table"
             );
         }
@@ -1252,7 +1521,7 @@ mod tests {
             let materialisable: Vec<ArtifactKind> = kinds
                 .iter()
                 .copied()
-                .filter(|k| plan_of(*k, &c) != Plan::NotApplicable)
+                .filter(|k| plan_for(*k, &c) != Plan::NotApplicable)
                 .collect();
             assert!(
                 !materialisable.is_empty(),
@@ -1723,7 +1992,7 @@ mod tests {
         let c = coords("library/nginx", None, "manifests/sha256:aa");
         for kind in [ArtifactKind::OciManifest, ArtifactKind::Other] {
             let target = ScanTarget {
-                content_hash: &hash,
+                unit: ScanUnit::Blob(&hash),
                 format: "oci",
                 coords: &c,
                 kind,
@@ -1733,6 +2002,57 @@ mod tests {
                 .expect("materialise");
             assert_eq!(expect_nothing(&m), NotAnalysable::NotApplicable, "{kind}");
         }
+    }
+
+    // -- a composition that could not be assembled --------------------
+
+    /// A composed image whose constituents are **absent** from CAS: a
+    /// deterministic refusal, reported as the no-verdict value the job
+    /// queue will not spin on. By the time the adapter sees this, the
+    /// application layer has already decided whether the absence could be
+    /// acquired — so re-running reads the same absence.
+    #[tokio::test]
+    async fn an_absent_constituent_is_a_deterministic_no_verdict() {
+        let storage: Arc<dyn StoragePort> = Arc::new(StubStorage(Get::NotFound));
+        let image = sample_composed_image();
+        let c = coords("library/nginx", None, "manifests/sha256:aa");
+        let target = ScanTarget {
+            unit: ScanUnit::Image(&image),
+            format: "oci",
+            coords: &c,
+            kind: ArtifactKind::OciManifest,
+        };
+        let m = materialise(&storage, &target, u64::MAX)
+            .await
+            .expect("a deterministic refusal is not an error");
+        assert_eq!(expect_nothing(&m), NotAnalysable::IncompleteComposition);
+    }
+
+    /// The same shape of refusal with a **failed** read instead of an
+    /// absence: an `Err`, which is the answer the orchestrator already
+    /// reschedules. Folding it into the deterministic value would turn a
+    /// storage hiccup into a permanent-looking absence of assessment.
+    #[tokio::test]
+    async fn a_failed_constituent_read_is_a_retryable_error_not_a_no_verdict() {
+        let storage: Arc<dyn StoragePort> = Arc::new(StubStorage(Get::Broken));
+        let image = sample_composed_image();
+        let c = coords("library/nginx", None, "manifests/sha256:aa");
+        let target = ScanTarget {
+            unit: ScanUnit::Image(&image),
+            format: "oci",
+            coords: &c,
+            kind: ArtifactKind::OciManifest,
+        };
+        let r = materialise(&storage, &target, u64::MAX).await;
+        let Err(e) = r else {
+            panic!("a transient refusal must not arrive as a no-verdict: {r:?}");
+        };
+        let rendered = e.to_string();
+        assert!(rendered.contains("did not complete"), "{rendered}");
+        assert!(
+            rendered.contains("object store returned 503"),
+            "the backend's own words survive: {rendered}"
+        );
     }
 
     /// An OCI config blob is JSON, not a layer: no package surface, and
@@ -1750,19 +2070,113 @@ mod tests {
         assert_eq!(expect_nothing(&m), NotAnalysable::NotApplicable);
     }
 
-    /// A zstd layer is an archive this adapter cannot open. It is refused
-    /// — named as unusable rather than reported clean — so the gap is
-    /// visible instead of silently passing.
+    /// **The mapping table, by value.** Every `ExtractError` variant
+    /// reaches the side [`refusal_of`] assigns it, asserted on the
+    /// classifier itself so the table is pinned independently of which
+    /// payload happens to reach which variant.
+    ///
+    /// The exhaustive `match` inside `refusal_of` is what makes a new
+    /// variant a compile error there; this is what makes the *answers*
+    /// a test failure here.
+    #[test]
+    fn every_extraction_refusal_reaches_the_side_the_mapping_assigns_it() {
+        // Statements about the payload's own bytes.
+        for about_the_bytes in [
+            ExtractError::ExtractedBytesCap { cap: 1 },
+            ExtractError::CompressionRatioCap {
+                limit: 100,
+                compressed: 7,
+            },
+            ExtractError::EntryCap { cap: 1 },
+            ExtractError::UncontainedPath,
+            ExtractError::UndecodableEntryName { index: 0 },
+            // The undecidable case, deliberately on this side: the
+            // readers behind it report "no decoder for this" and "a
+            // corrupt archive of a container I do decode" identically,
+            // so there is nothing to tell them apart with and
+            // fail-closed is which way that goes.
+            ExtractError::Malformed("expected a tar archive: invalid gzip header".to_string()),
+        ] {
+            assert_eq!(
+                refusal_of(&about_the_bytes),
+                NotAnalysable::UnusableArchive,
+                "{about_the_bytes} is a statement about the payload's bytes"
+            );
+        }
+
+        // The one statement about this adapter's decoder inventory.
+        assert_eq!(
+            refusal_of(&ExtractError::UnsupportedContainer { container: "zstd" }),
+            NotAnalysable::UnsupportedContainer,
+        );
+
+        // And what the two now do, asserted here as a pair as well,
+        // because the mapping is what an operator sees: on a constituent
+        // whose composition carries the filesystem verdict the missing
+        // decoder stops holding the layer, while the hostile archive — a
+        // statement about these bytes — holds it either way
+        // (ADR 0064 D2). This adapter decides the *reason*; where each
+        // reason lands is `NotAnalysable::gates_release`'s.
+        let kind = ArtifactKind::OciBlob;
+        let promoted = hort_domain::entities::scan_policy::CompositeVerdictMode::Promoted;
+        assert!(
+            refusal_of(&ExtractError::UncontainedPath).gates_release(kind, promoted),
+            "an entry that tried to escape the workspace is about these bytes"
+        );
+        assert!(
+            !refusal_of(&ExtractError::UnsupportedContainer { container: "zstd" })
+                .gates_release(kind, promoted),
+            "a container this adapter cannot decode is a statement about hort; the \
+             composition that reads these bytes carries the verdict"
+        );
+    }
+
+    /// A container this adapter has no decoder for, reached end to end
+    /// through `materialise` without invoking Trivy — the magic bytes
+    /// are all `sniff_container` reads, so a seven-byte payload is a
+    /// sufficient fixture and no real zstd/xz/bzip2 stream is needed.
+    ///
+    /// `tar+zstd` is ADR 0064 D2's measured case: the scanner composes
+    /// it identically to `tar+gzip`, so these are bytes hort refuses and
+    /// a composition reads without difficulty. It is still refused here
+    /// rather than reported clean — the gap stays visible — but it is
+    /// now refused under its own name.
     #[tokio::test]
-    async fn oci_zstd_layer_is_an_unusable_archive() {
+    async fn a_layer_in_a_container_with_no_decoder_is_named_as_such() {
+        for (container, magic) in [
+            ("zstd", vec![0x28u8, 0xb5, 0x2f, 0xfd, 0x01, 0x02, 0x03]),
+            ("xz", vec![0xfd, b'7', b'z', b'X', b'Z', 0x00, 0x00]),
+            ("bzip2", vec![b'B', b'Z', b'h', b'9', 0x01, 0x02, 0x03]),
+        ] {
+            let c = coords("library/nginx", None, "blobs/sha256:aa");
+            let m = materialise_kind(ArtifactKind::OciBlob, &c, magic)
+                .await
+                .expect("a missing decoder is a no-verdict, not an error");
+            assert_eq!(
+                expect_nothing(&m),
+                NotAnalysable::UnsupportedContainer,
+                "a {container} layer is a container with no decoder, not a complaint about its \
+                 bytes"
+            );
+        }
+    }
+
+    /// The other half of the split, at the same layer: a payload whose
+    /// container *is* decoded and whose bytes are the problem keeps
+    /// reaching `UnusableArchive`.
+    ///
+    /// Asserted beside the test above rather than inferred from it,
+    /// because the two together are the claim — the statements are
+    /// different and both still gate.
+    #[tokio::test]
+    async fn a_layer_whose_bytes_are_the_problem_is_still_an_unusable_archive() {
         let c = coords("library/nginx", None, "blobs/sha256:aa");
-        let m = materialise_kind(
-            ArtifactKind::OciBlob,
-            &c,
-            vec![0x28, 0xb5, 0x2f, 0xfd, 0x01, 0x02, 0x03],
-        )
-        .await
-        .expect("materialise");
+        // A real gzip stream (so the container is decoded) wrapping a
+        // tar entry that tries to escape the workspace.
+        let bytes = gzip_tar(&[("../escaped", b"payload")]);
+        let m = materialise_kind(ArtifactKind::OciBlob, &c, bytes)
+            .await
+            .expect("materialise");
         assert_eq!(expect_nothing(&m), NotAnalysable::UnusableArchive);
     }
 
@@ -1806,7 +2220,7 @@ mod tests {
         let storage = storage_of(vec![0xAB; 64]);
         let hash = sample_hash();
         let target = ScanTarget {
-            content_hash: &hash,
+            unit: ScanUnit::Blob(&hash),
             format: "maven",
             coords: &c,
             kind: ArtifactKind::MavenJar,
@@ -1832,7 +2246,7 @@ mod tests {
         let storage = storage_of(payload.clone());
         let hash = sample_hash();
         let target = ScanTarget {
-            content_hash: &hash,
+            unit: ScanUnit::Blob(&hash),
             format: "maven",
             coords: &c,
             kind: ArtifactKind::MavenJar,
@@ -1853,7 +2267,7 @@ mod tests {
         let hash = sample_hash();
         let c = coords("g:a", Some("1.0"), "g/a/1.0/a-1.0.jar");
         let target = ScanTarget {
-            content_hash: &hash,
+            unit: ScanUnit::Blob(&hash),
             format: "maven",
             coords: &c,
             kind: ArtifactKind::MavenJar,

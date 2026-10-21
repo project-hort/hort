@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **An OCI image manifest is scanned as a composed image**, fetching layers a
+  pull-through repository does not already hold. Under
+  `compositeVerdictMode: promoted` the composition's verdict gates the
+  manifest, and an individual layer stops being withheld for its own package
+  findings or for a container hort cannot decode; worker scratch disk and
+  upstream egress rise either way (#353).
+
 ### Security
 
 - **The event-chain verifier judges a run against every anchored checkpoint,

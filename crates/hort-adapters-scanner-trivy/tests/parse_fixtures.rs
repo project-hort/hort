@@ -8,10 +8,28 @@
 
 use hort_adapters_scanner_trivy::parse_findings_from_json;
 use hort_domain::entities::scan_policy::SeverityThreshold;
+use hort_domain::types::FindingStatement;
 
 const CLEAN: &[u8] = include_bytes!("fixtures/clean_scan.json");
 const MIXED: &[u8] = include_bytes!("fixtures/mixed_severities.json");
 const MISSING: &[u8] = include_bytes!("fixtures/missing_title_and_cvss.json");
+
+/// Every fixture finding states the side its report section put it on —
+/// the parser's public boundary, asserted on real Trivy output rather
+/// than on a hand-built entry.
+#[test]
+fn every_fixture_finding_states_the_side_its_section_put_it_on() {
+    let findings = parse_findings_from_json(MIXED).expect("parse");
+    assert!(!findings.is_empty(), "the fixture must carry findings");
+    for f in &findings {
+        assert_eq!(
+            f.statement,
+            FindingStatement::Filesystem,
+            "{}: a Vulnerabilities entry is a claim about an assembled filesystem",
+            f.vulnerability_id
+        );
+    }
+}
 
 #[test]
 fn clean_scan_returns_empty_findings() {

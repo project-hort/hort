@@ -40,6 +40,7 @@ pub mod claim_mapping_repo;
 // one statement that turns a manifest's closure into the strongest
 // terminal verdict inside it, with the terminal vocabulary bound from
 // `QuarantineStatus::is_terminal` rather than written into the SQL.
+pub mod composite_scan_observations;
 pub mod constituent_status;
 // Transient write-contention (serialization failure / deadlock): the
 // sqlstate classifier and the bounded whole-transaction retry over it.

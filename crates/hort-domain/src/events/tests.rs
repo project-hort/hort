@@ -2207,6 +2207,7 @@ fn policy_field_clone_eq_serde() {
         PolicyField::RescanIntervalHours,
         PolicyField::NegligibleAction,
         PolicyField::Enforcement,
+        PolicyField::CompositeVerdictMode,
     ];
     for field in fields {
         let cloned = field.clone();
@@ -2246,6 +2247,16 @@ fn policy_field_is_gate_affecting_is_exactly_the_scan_gate_fields() {
     assert!(!PolicyField::MaxArtifactAge.is_gate_affecting());
     assert!(!PolicyField::ScanBackends.is_gate_affecting());
     assert!(!PolicyField::RescanIntervalHours.is_gate_affecting());
+    // `composite_verdict_mode` is `ScanBackends`' argument on the
+    // composition axis (ADR 0064 D6): it decides whether the NEXT scan's
+    // composed-image verdict reaches the manifest, and re-interprets no
+    // stored finding. Making it gate-affecting would be actively wrong,
+    // not merely unnecessary — the pass re-derives from stored findings,
+    // so `promoted` -> `observed` would un-reject the population a
+    // promoted composite had correctly rejected without assessing
+    // anything afresh, which is exactly the hazard that disqualified
+    // shipping the composite verdict under `ScanEnforcement::Record`.
+    assert!(!PolicyField::CompositeVerdictMode.is_gate_affecting());
 }
 
 // ---------------------------------------------------------------------------
@@ -2650,6 +2661,7 @@ fn sample_finding() -> crate::types::Finding {
         informational_class: None,
         severity_basis: crate::types::SeverityBasis::Assessed,
         component_relation: crate::types::ComponentRelation::NotEstablished,
+        statement: crate::types::FindingStatement::Unstated,
     }
 }
 

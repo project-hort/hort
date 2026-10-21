@@ -57,8 +57,8 @@ Two families ship:
 - **Trivy** (`crates/hort-adapters-scanner-trivy/`) pulls the artifact
   bytes from `StoragePort::get`, **materialises them by kind** into a
   `tempfile::TempDir` (removed on drop, including panic and error paths),
-  shells out to `trivy fs` or `trivy rootfs` with `--format json`, and
-  parses the report. It ignores the supplied SBOM and rediscovers
+  shells out to `trivy fs`, `trivy rootfs` or `trivy image --input` with
+  `--format json`, and parses the report. It ignores the supplied SBOM and rediscovers
   components from the payload itself — which is exactly what makes it the
   adjudicator of record against the actual bytes, and exactly why the
   materialisation has to be right.
@@ -342,7 +342,7 @@ artifact according to its `ArtifactKind`
 | `PyWheel` | ZIP extracted into the workspace | `rootfs` | `*.dist-info/METADATA` is post-build: Image and Rootfs only |
 | `OciBlob` — a tar layer | tar / gzip-tar extracted as a root filesystem | `rootfs` | a layer *is* a root filesystem |
 | `OciBlob` — anything else | nothing; no invocation | — | an image config carries no package surface |
-| `OciManifest` | nothing; no invocation | — | a manifest carries no package surface |
+| `OciManifest` | nothing; no invocation **for the row's own bytes** — but see [the composed image](#the-composed-image-is-the-scan-unit) | — | the manifest document itself carries no package surface; the composition it names does |
 | `Other` | nothing; no invocation | — | no handler claims these bytes |
 
 **The target column is not a free choice.** Trivy's
@@ -355,11 +355,17 @@ under `node_modules`, a cargo-auditable or Go binary) is analysed by
 **Image and Rootfs only**; a **pre-build declaration** (`pom.xml`,
 `package-lock.json`, `requirements.txt`, `poetry.lock`, `uv.lock`,
 `gradle.lockfile`) by **Filesystem and Repository only**; `Cargo.lock`
-by all four. Hort has no container image to scan, so every row is
-`rootfs` or `fs` — and picking the wrong one is silent: the analyzer
-never runs, the report names no analysed target, and the artifact can
-never get a verdict. A JAR scanned with `trivy fs` produces exactly that
-non-result.
+by all four. Picking the wrong one is silent: the analyzer never runs,
+the report names no analysed target, and the artifact can never get a
+verdict. A JAR scanned with `trivy fs` produces exactly that non-result.
+
+The table's target column is `rootfs` or `fs` because it is about **one
+stored object**. The Container Image target was once written off here —
+"hort has no container image to scan" — and that was a derivation rather
+than a decision: hort holds the manifest, the config and every layer, and
+the manifest's bytes name them in order. [ADR
+0064](../../adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
+assembles them; see [the composed image](#the-composed-image-is-the-scan-unit).
 
 The layouts follow from what the analyzers read. A **Java archive**
 needs only its extension: Trivy's JAR analyzer opens the archive itself
@@ -389,6 +395,246 @@ manifest's descriptor rather than on the blob's own row — so no
 classification of the row can tell them apart. `OciBlob` states that
 honestly and the materialiser decides by container: a tar (plain or gzip)
 is a layer; anything else (the config JSON) has no package surface.
+
+### The composed image is the scan unit
+
+A layer scanned on its own is **evidence**, not a verdict. Measured on a
+real multi-layer image: the base layer carried `/etc/os-release` and
+produced 240 findings, while the next layer carried a *complete package
+database with 25 more packages* and produced **zero** — without an OS
+marker in those same bytes the scanner recognises no operating system and
+never runs the package check. Twenty-five packages carrying 92 advisories
+went unassessed, and the only reason that image was rejected at all was an
+accident of provenance. [ADR
+0064](../../adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
+is that measurement's conclusion: **the unit of filesystem assessment for
+an OCI image is the image manifest.**
+
+So an `OciManifest` row now gets a second, separate assessment — of the
+composition its bytes name:
+
+1. **The application layer resolves what to scan — in the order a proxy
+   can actually do it.** `hort_app::use_cases::composite_scan` reads the
+   manifest document out of CAS and parses *it alone*
+   (`hort_domain::oci::strict_manifest_nomination`): index-ness, the
+   config descriptor, and every layer descriptor with its container. That
+   is the **strict** parse, which accounts for every declared descriptor
+   rather than skipping one it cannot resolve — a skipped layer would be a
+   strict subset of the image that the scanner analyses and reports *as*
+   the image: a clean verdict about the wrong subject. The constituent set
+   and its order come from the manifest bytes, never from the
+   `content_references` edges — the edges nominate, the bytes decide, and
+   only the bytes carry the order.
+
+   The config blob the manifest names is then **acquired before it is
+   read** (step 2), because a composition's own description is a
+   constituent too: on a pull-through manifest the config is as absent as
+   the layers are. Only once its bytes are present does
+   `ManifestNomination::complete_with_config` decide whether they describe
+   a runnable image at all. There is deliberately no form of the parse that
+   takes both documents at once: a caller holding one would reach for
+   config bytes before anything had established they exist, which is the
+   shape that made a cold proxy manifest unresolvable.
+2. **The constituents are made present, fetching them on a proxy — the
+   config first.** `hort_app::use_cases::constituent_acquisition` surveys
+   each constituent in CAS and, for whatever is absent, fetches it from the
+   repository's configured upstream through the same verified blob fetch a
+   client pull uses — every fetch is digest-verified against what the
+   manifest declared (ADR 0006), and a mismatch refuses the composition.
+   This is for **proxy repositories only**: a hosted push already required
+   every constituent to resolve before the manifest committed, so there is
+   nothing to fetch, and a hosted repository's absent constituent is a real
+   refusal. On a proxy the absence is the ordinary case — those edges are
+   registered by digest with no existence check, deliberately — and waiting
+   is not available, because the client pull that would warm the
+   constituents *begins with the manifest whose verdict is being gated*. So
+   hort fetches blobs no client has asked for.
+
+   It runs in **two phases, the config and then the layers**, and the
+   ordering is load-bearing rather than cosmetic: an *artifact* manifest —
+   a cosign signature, an SBOM attachment, a Helm chart — is a large,
+   legitimate population on a proxy, and its config says "no layered root
+   filesystem". Acquiring the whole nominated set up front would fetch
+   every one of their layers before learning there is nothing to compose —
+   egress spent on bytes hort will never assess, which is the outcome
+   "edges nominate and the bytes decide" exists to avoid.
+
+   A blob already in CAS is never fetched again, which is also what makes a
+   partly-done acquisition survive a retry: the completion criterion is
+   "the bytes are in CAS", and CAS is the registry's own store, claimed
+   against the GC by the manifest's own `oci_config` / `oci_layer` edges. No
+   job state, no checkpoint, nothing to reconcile. An operator sees this as
+   upstream egress and CAS growth a request did not ask for, attributed on
+   `hort_upstream_fetch_*` under its own `format` label.
+3. **The adapter materialises it as an OCI image layout.**
+   `crates/hort-adapters-scanner-trivy/src/oci_layout.rs` writes
+   `oci-layout`, `index.json` and `blobs/sha256/<digest>` for the
+   manifest, the config and every layer, then runs
+   `trivy image --input <dir>`. The blobs are copied **verbatim** —
+   nothing here decompresses a layer, and it cannot: the layout path *is*
+   the digest of those bytes, so decompressing on the way in would write a
+   file whose name no longer described its contents. The scanner
+   decompresses, and it composes `tar`, `tar+gzip` and `tar+zstd`
+   identically (measured against the pinned Trivy 0.70.0).
+4. **Completeness is a precondition of a verdict.** A constituent that is
+   missing, unreadable, of a container the composition cannot be described
+   with, or over the whole-image budget yields **no verdict** — never a
+   partial layout, never a clean verdict over a subset. A refused assembly
+   removes the directory it was building and reports
+   `incomplete_composition`, which is deliberately *not* the same value as
+   an assembled composition that reported nothing (`no_analyzer_matched`):
+   "I could not build the image" and "I built it and it reported nothing"
+   are facts about different things.
+
+   **No verdict is not the same as no further attempt.** A refusal about the
+   *image* — more constituents or more bytes than hort will assemble, a
+   digest the upstream does not have, bytes that failed verification, a
+   constituent absent with no upstream to acquire it from, a manifest
+   document that is not in CAS at all — is deterministic and is never
+   retried: re-running reads the same facts. A refusal about *availability*
+   — an unreachable, timed-out, rate-limited or 5xx upstream, a storage
+   backend that did not answer either a presence probe or one of the two
+   document reads, a composition phase that exceeded its wall clock — is
+   routed
+   through the path the scan job already has for a retryable backend
+   failure, bounded by that job's own attempt budget.
+   Exhausting the budget lands back on the deterministic outcome: still no
+   verdict, and now also no more tries. The classification is read off the
+   upstream port's own error vocabulary and off the typed storage error,
+   never off a rendered message.
+5. **An empty report over a composition is a hold, not "not applicable".**
+   The `rootfs` rule below exists because a *layer's* package surface
+   belongs to the composition it is part of. A composition has no such
+   excuse: it is the thing that was supposed to be assessed.
+
+**The whole-image budget** is the image's, not each blob's — a
+composition reads N blobs, and 1024 descriptors is a manifest the strict
+parse calls well-formed, so a per-blob bound reused here would multiply by
+the layer count. Three compile-time bounds, held in **one** place
+(`hort_domain::oci::ImageBudget`) and read by **both** phases: 8 GiB across
+every constituent (which for the layout *is* the scratch-disk footprint,
+since nothing is staged or unpacked beside it), 256 constituents, and 300 s
+of wall-clock per bounded **span** — that last one because the scanner's own
+`--timeout` only starts once the layout exists, so without it a stalled
+storage stream or upstream response could hold a worker slot indefinitely.
+A composite scan has exactly two of those spans: the **composition phase**
+and the layout write. A span is not a step: the composition phase's
+manifest-document read, config phase, config-document read and layer phase
+share **one** deadline between them, because what the bound protects is the
+worker slot and the slot does not care how the work was divided. The two
+document reads are inside it for a reason of their own — the read ceiling
+bounds a document's *bytes*, so a store trickling a kilobyte-scale manifest
+would otherwise hold a slot with no deadline at all.
+
+Acquiring a blob and writing it into a layout are different mechanisms in
+different crates, but they are bounded by the same quantities, and a second
+copy of those numbers could disagree with a direction: a byte ceiling on the
+fetch above the layout's would pull bytes over the network that the layout
+is then guaranteed to refuse. So neither phase states them for itself.
+Acquisition additionally charges the bytes *already* local, for the same
+reason — the budget bounds what the composition costs, not what one phase
+of it did. On top of them sits a per-constituent attempt bound of two, so a
+flapping upstream cannot spend a whole acquisition on one layer; the scan
+job's own attempt budget, not that two, is where an unavailable upstream is
+waited out. The per-blob limits are unchanged and still govern the per-blob
+path.
+
+**Its release authority is an operator's to grant.** Every composite
+assessment is produced, mapped, logged, counted
+(`hort_scan_composite_assessment_total`, `hort_scan_composite_comparison_total`)
+and recorded as a row in the `composite_scan_observations` projection
+beside the primary axis's own gate decision over the same run. What
+happens next is the resolved policy's `compositeVerdictMode`
+(ADR 0064 D6):
+
+- **`observed`** — the default, and the posture every policy that
+  predates the field is in. The assessment transitions no artifact,
+  writes no `ScanCompleted` and never reaches the release predicate; the
+  manifest row's outcome is byte-for-byte what it would be with no
+  composite path at all.
+- **`promoted`** — the composition's findings **are** the manifest row's
+  findings. They join the run's accumulator and reach the release
+  predicate exactly as a second backend's findings over the manifest's
+  own bytes would, under the policy's own `enforcement`; and a
+  composition that could **not** be produced joins the run's
+  abstentions as `incomplete_composition`, so the absent verdict holds
+  the manifest `scan_indeterminate` fail-closed. "Nothing to compose" —
+  an image index, or an artifact manifest whose config declares no
+  layered root filesystem — stays non-gating under promotion: those are
+  legitimate populations, not unassessed images.
+
+**Promotion is also what moves the obligation off a constituent**
+(ADR 0064 D2, ordered after the tightening by D6). Under `promoted`, an
+OCI blob's own filesystem findings stop deciding its verdict and
+`unsupported_container` stops holding it — the composition that binds it
+is the unit of filesystem assessment, and a package an upper layer
+deletes must not condemn the lower one. The findings stay in the record:
+the findings blob, the `scan_findings` rows and
+`ScanCompleted.severity_summary` are exactly what they were, and what
+changes is only the aggregate the thresholds are walked against. A
+statement about the layer's **bytes** — a leaked credential, a malware
+signature — keeps gating it under every posture; no backend hort ships
+produces one today, and the line is drawn now precisely so that the
+first one that does is not disarmed by a decision taken before it
+existed.
+
+Two consequences worth stating. A constituent with no composition above
+it — no parent manifest at all, or a parent that is an *artifact*
+manifest rather than a runnable image — also stops gating on its
+filesystem findings under promotion, with nothing taking the obligation
+over; the exposure is to a client that addresses the blob by digest and
+composes it outside hort, which is ADR 0064's accepted residual. And an
+already-`Rejected` constituent is **not** un-rejected by the automatic
+loosening pass, which pins `composite_verdict_mode: observed` when it
+re-derives a verdict for exactly that reason. Recovering that estate is
+the operator's, through the curation re-evaluation, which passes the
+policy's resolved posture instead.
+
+**What a finding carries, and what is derived from it.** The side of
+D2's line a finding is on is the *producer's* fact — it read a report
+section, and nothing downstream can recover which — so it persists on
+the finding (`bytes` / `filesystem`, or absent where no producer stated
+one). *Whose* filesystem a `filesystem` claim is about is not stored: it
+is the row's own `ArtifactKind`, derivable at any time, and the release
+predicate composes the two where it decides. So a verdict re-taken over
+an artifact's stored findings reads the same fact the fresh scan read,
+which is what makes the three paths agree:
+
+| path | posture | why |
+|---|---|---|
+| fresh scan | resolved from the policy | the assessment the operator promoted |
+| **tighten** (operator lowers a threshold) | resolved from the policy | or the first threshold change after a promotion would terminally re-reject every constituent the promotion had just released |
+| **automatic loosen** (exclusion added, threshold raised) | pinned `observed` | ADR 0064 D6: promotion must not un-reject the existing estate by itself |
+| operator's curation re-evaluation | resolved from the policy | the sanctioned, explicitly-requested recovery D6 points at |
+
+The only asymmetry is the pinned row, and it is a property of the
+*driver* rather than of the rule: all four put the identical predicate to
+the identical finding list.
+
+Promotion flows through the path the manifest's verdict already takes,
+never through a release path that reads
+`composite_scan_observations`. That table is the measurement surface,
+and a structural guard
+(`crates/hort-app/tests/shadow_observation_has_no_authority.rs`) is what
+keeps it one — "no release path reads this" is asserted rather than
+reviewed, promoted or not. The observation keeps being written either
+way; once promoted, its `composite_findings_decision` stops being a
+counterfactual and becomes a record of what also happened, which is how
+an operator confirms the promotion is behaving as the measurement
+predicted.
+
+Why an operator and not a release: `Rejected` is terminal and the
+periodic rescan never revisits it, so a new analysis path whose first
+production act could be irreversible would leave an estate only an
+explicit operator re-evaluation could recover. The named criteria are
+baseline completion and coverage, error and indeterminate rates,
+incremental findings and the images they affect, false-positive review,
+and capacity. Promotion is **per policy** so one repository can be
+promoted and watched first, and it drives **no** re-evaluation of the
+already-assessed population in either direction — that pass re-derives
+from stored findings, and demoting that way would un-reject what a
+promoted composite had correctly rejected with nothing fresh having
+looked at it.
 
 ### The Java vulnerability database
 
@@ -518,7 +764,10 @@ every real OS layer.
 
 A tripped guard yields `NothingAnalysable(UnusableArchive)`, never a
 partially-extracted tree. A half-unpacked archive scanned as if it were
-whole is a false-clean, which is worse than a refusal.
+whole is a false-clean, which is worse than a refusal. A payload the
+extractor never opened at all — a container it has no decoder for —
+yields `UnsupportedContainer` instead; both refuse, and the next section
+is why they are two values.
 
 These caps are **not** an operator surface: they are safety bounds on
 untrusted input, and an operator able to raise them could re-open the
@@ -532,28 +781,59 @@ while the port returned a bare `Vec<Finding>` they were the same value —
 and every Trivy scan of every format produced the second while being
 recorded as the first.
 
-A backend returns `NothingAnalysable(reason)` in three situations:
+A backend returns `NothingAnalysable(reason)` in five situations:
 
 - `not_applicable` — the kind carries no package surface (an OCI manifest
   or image config, a payload no handler claims). No scanner is invoked and
   no CAS read is paid. The same reason also covers a Trivy `rootfs`-mode
-  invocation that *was* run and came back with no `Results` section: that
-  target runs every OS-package, language and binary analyzer over the
-  whole materialised tree, so an empty report there is those analyzers
-  agreeing the tree has no package surface at all — a completed fact, not
-  an unassessed pairing.
+  invocation that *was* run and came back with no `Results` section — a
+  layer's package surface belongs to the composition it is part of (ADR
+  0064, amending ADR 0007), so an empty result over one layer is not an
+  unassessed pairing. Without that mapping a layer would never reach a
+  release authority of its own.
 - `unusable_archive` — the payload is an archive the adapter refused to
-  materialise (a guard tripped, or the container is one it cannot open,
-  such as a `zstd`-compressed layer).
-- `no_analyzer_matched` — the backend ran against a materialised tree in
-  `fs` mode and reported no analysed target at all (for Trivy, a report
-  with no `Results` section — absent, `null`, or empty). `fs` mode targets
+  materialise for a reason **about its own bytes**: a guard above
+  tripped, an entry tried to escape the workspace, an entry name could
+  not be decoded well enough to put to the containment rule, or the
+  archive could not be read at all.
+- `unsupported_container` — the payload is a container the adapter has
+  **no decoder for**, identified positively from its leading bytes
+  (`zstd`, `xz`, `bzip2`) rather than inferred from a failed read. The
+  bytes inside were never reached, so this says nothing about them: it
+  is a fact about hort's decoder inventory, and the same `tar+zstd`
+  layer that is refused here is composed without difficulty by the
+  scanner in `image` mode. ADR 0064 D2 places the statement with the
+  composition for exactly that reason, so on an OCI blob under a policy
+  that has **promoted** the composite verdict it no longer gates: the
+  composition that binds the layer is assessed as one unit and carries
+  its filesystem verdict. Under `observed` — the default — and on every
+  other artifact kind it gates exactly as before. "The archive could not
+  be read" stays on
+  `unusable_archive` deliberately: the readers behind it cannot tell a
+  container they have no decoder for from a corrupt archive of one they
+  do decode, and an undecidable case goes to the gating side.
+- `no_analyzer_matched` — the backend ran against a materialised tree and
+  reported no analysed target at all (for Trivy, a report with no
+  `Results` section — absent, `null`, or empty). In `fs` mode that targets
   one artifact whose analyzer either engages or does not, so an empty
-  result there stays an expected surface left unassessed.
+  result stays an expected surface left unassessed. In `image` mode it is
+  an assembled composition that reported nothing, which cannot be "no
+  package surface by construction" — the composition *is* the thing that
+  was supposed to be assessed.
+- `incomplete_composition` — a composed image could not be assembled: a
+  constituent was missing from storage, unreadable, the repository has no
+  upstream to acquire it from, or the composition tripped the whole-image
+  budget. No report about the image exists. Kept apart from
+  `no_analyzer_matched` on purpose, and that distinction is carried
+  through to what a promoted manifest inherits: an assembled composition
+  that every backend abstained on reports `no_analyzer_matched`, because
+  none of this value's causes is true of it. See [the composed
+  image](#the-composed-image-is-the-scan-unit).
 
-The orchestrator records the last two reasons on a backend's behalf in
-one case: when [the scanner capability map](#the-scanner-capability-map)
-already says this backend cannot analyse this format. The backend is
+The orchestrator records `no_analyzer_matched` and `not_applicable` on a
+backend's behalf in one case: when
+[the scanner capability map](#the-scanner-capability-map) already says
+this backend cannot analyse this format. The backend is
 then never invoked at all — the answer is known, and paying a CAS read
 and a subprocess for it would also lose the one fact an operator needs,
 that the *pairing* is wrong. Another backend covers the format ⇒
@@ -561,13 +841,22 @@ that the *pairing* is wrong. Another backend covers the format ⇒
 "never invoked" from "ran and found nothing"); nobody covers it ⇒
 `not_applicable`.
 
-The three reasons do **not** all gate the artifact, and
-`NotAnalysable::gates_release` is the single place that split is decided.
-`unusable_archive` and `no_analyzer_matched` are an *expected* surface
-that went unassessed — the absent verdict ADR 0007 holds on. By contrast
-`not_applicable` is the absence of a surface: no scanner could ever find
-a threat level in an OCI manifest row or an image config blob, so a hold
-has nothing to wait on and would never lift.
+The reasons do **not** all gate the artifact, and
+`NotAnalysable::gates_release` is the single place that split is decided
+— read it rather than an enumeration here, which is what goes stale when
+a reason is added or split. It takes the artifact's kind and the resolved
+`compositeVerdictMode` as well as the reason, because two of the three
+answers are about the artifact rather than only about the refusal:
+
+- `not_applicable` never gates, anywhere. It is the absence of a surface:
+  no scanner could ever find a threat level in an OCI manifest row or an
+  image config blob, so a hold has nothing to wait on and would never
+  lift.
+- `unsupported_container` does not gate an **OCI blob** under a
+  **promoted** policy, and gates everywhere else. The surface is real and
+  the composition that binds the layer assesses it (ADR 0064 D2).
+- everything else always gates: an expected surface went unassessed,
+  which is the absent verdict ADR 0007 holds on.
 
 The orchestrator treats an abstention as **no contribution**. If any other
 backend produced a verdict, that verdict stands and the abstention is a

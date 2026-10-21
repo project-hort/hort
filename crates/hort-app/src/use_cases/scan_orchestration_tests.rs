@@ -24,33 +24,47 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
+use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::repository::RepositoryType;
 use hort_domain::entities::scan_policy::{
-    NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+    CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+    SeverityThreshold,
 };
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{
     Actor, DomainEvent, PersistedEvent, PolicyScope, ScanCompleted, SeveritySummary, StreamId,
 };
 use hort_domain::ports::advisory::AdvisoryPort;
+use hort_domain::ports::composite_scan_observation::{CompositeAssessment, GateDecision};
 use hort_domain::ports::format_handler::{
     FormatHandler, PayloadSbom, PayloadSbomExtraction, SbomResolution,
 };
 use hort_domain::ports::jobs_repository::{
     JobStatus, JobsRepository, ResultWriteOutcome, ScanJob, TriggerSource,
 };
+use hort_domain::ports::repository_upstream_mapping_repository::{
+    RepositoryUpstreamMapping, UpstreamAuth,
+};
 use hort_domain::ports::scanner::{
-    EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort,
+    EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit, ScannerPort,
 };
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{
     ArtifactCoords, ArtifactKind, ComponentRelation, ContentHash, Ecosystem, Finding,
-    PayloadAccess, Sbom, SbomComponent, SeverityBasis,
+    FindingStatement, PayloadAccess, Sbom, SbomComponent, SeverityBasis,
 };
 
 use super::*;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
 use crate::use_cases::test_support::*;
+
+/// The kind these tests build an outcome under unless the test is about
+/// ADR 0064 D2's role half: a row that is **not** a composition
+/// constituent, so no stored statement can be what produced the verdict
+/// being asserted. The constituent cases wire
+/// `handler_map("oci", ArtifactKind::OciBlob)` and let `run_scan` resolve
+/// it, which is the path that matters for them.
+const TEST_SCAN_KIND: ArtifactKind = ArtifactKind::NpmTarball;
 
 // ---------------------------------------------------------------------------
 // Mock JobsRepository
@@ -186,6 +200,15 @@ struct MockScanner {
     seen_format: Mutex<Option<String>>,
     /// The stored path the last `scan` call's coords carried.
     seen_path: Mutex<Option<String>>,
+    /// Whether each `scan` call was handed a composed image rather than
+    /// a single blob, in call order. The composite assessment reaches a
+    /// backend through the same `scan` method, so this is how a test
+    /// tells the shadow invocation from the primary one.
+    seen_units: Mutex<Vec<ScanUnitShape>>,
+    /// What to answer a **composed image** with, when a test wants the
+    /// two invocations to differ. `None` → the same `response` every
+    /// other call gets.
+    composite_response: Mutex<Option<DomainResult<ScanAnalysis>>>,
     /// The formats this backend claims to analyse — the mock's
     /// programmable [`ScannerPort::applies_to`]. `None` (the default)
     /// means "every format", which is what the tests that drive
@@ -216,9 +239,19 @@ impl MockScanner {
             seen_kind: Mutex::new(None),
             seen_format: Mutex::new(None),
             seen_path: Mutex::new(None),
+            seen_units: Mutex::new(Vec::new()),
+            composite_response: Mutex::new(None),
             covers: None,
             evidence: EvidenceBasis::MaterialisedPayload,
         }
+    }
+
+    /// Answer a composed-image target with `response` instead of the
+    /// one every other target gets — so a test can give the composite a
+    /// finding and then assert that the finding went nowhere.
+    fn answering_composites_with(self, response: DomainResult<ScanAnalysis>) -> Self {
+        *self.composite_response.lock().unwrap() = Some(response);
+        self
     }
 
     /// Narrow this backend's capability to `formats` — the mock's half
@@ -255,6 +288,22 @@ impl MockScanner {
     fn seen_path(&self) -> Option<String> {
         self.seen_path.lock().unwrap().clone()
     }
+
+    /// What shape each `scan` call was handed, in call order.
+    fn seen_units(&self) -> Vec<ScanUnitShape> {
+        self.seen_units.lock().unwrap().clone()
+    }
+}
+
+/// Which [`ScanUnit`] variant a `scan` call was handed, flattened to a
+/// value a test can compare — the real enum borrows, so it cannot be
+/// stashed in a mock's history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanUnitShape {
+    /// One stored object.
+    Blob,
+    /// A composed image, with its layer count.
+    Image(usize),
 }
 
 impl ScannerPort for MockScanner {
@@ -284,12 +333,21 @@ impl ScannerPort for MockScanner {
         *self.seen_kind.lock().unwrap() = Some(target.kind);
         *self.seen_format.lock().unwrap() = Some(target.format.to_string());
         *self.seen_path.lock().unwrap() = Some(target.coords.path.clone());
-        let resp = self
-            .response
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("test forgot to seed scanner response");
+        let shape = match target.unit {
+            ScanUnit::Blob(_) => ScanUnitShape::Blob,
+            ScanUnit::Image(image) => ScanUnitShape::Image(image.layers().len()),
+        };
+        self.seen_units.lock().unwrap().push(shape);
+        let composite = self.composite_response.lock().unwrap().clone();
+        let resp = match (shape, composite) {
+            (ScanUnitShape::Image(_), Some(response)) => response,
+            _ => self
+                .response
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("test forgot to seed scanner response"),
+        };
         Box::pin(async move { resp })
     }
     fn health_check(&self) -> BoxFuture<'_, DomainResult<()>> {
@@ -352,6 +410,7 @@ fn finding(purl: &str, vuln: &str, sev: SeverityThreshold) -> Finding {
         informational_class: None,
         severity_basis: SeverityBasis::Assessed,
         component_relation: ComponentRelation::NotEstablished,
+        statement: FindingStatement::Unstated,
     }
 }
 
@@ -515,6 +574,11 @@ fn make_uc_with_policy_repo(
     (uc, jobs, events, storage, artifacts, repositories, policy)
 }
 
+/// [`make_uc_with_upstream`] with the **hosted** upstream shape: an empty
+/// resolver, so the composite path's constituent acquisition finds no
+/// upstream and never reaches the proxy. That is the right default for
+/// every test whose subject is not acquisition, and it is what the
+/// orchestrator did before acquisition existed.
 #[allow(clippy::type_complexity)]
 fn make_uc_with_policy_repo_and_handlers(
     scanners: HashMap<String, Arc<dyn ScannerPort>>,
@@ -531,6 +595,63 @@ fn make_uc_with_policy_repo_and_handlers(
     Arc<MockRepositoryRepository>,
     Arc<MockPolicyProjectionRepository>,
     Arc<MockArtifactMetadataRepository>,
+) {
+    let (
+        uc,
+        jobs,
+        events,
+        storage,
+        artifacts,
+        repositories,
+        policy,
+        metadata,
+        _proxy,
+        _resolver,
+        _observations,
+    ) = make_uc_with_upstream(
+        scanners,
+        advisory,
+        policy_projections,
+        handlers,
+        config,
+        Arc::new(MockUpstreamResolver::new()),
+    );
+    (
+        uc,
+        jobs,
+        events,
+        storage,
+        artifacts,
+        repositories,
+        policy,
+        metadata,
+    )
+}
+
+/// The full harness, with the composite path's upstream resolver supplied
+/// by the caller — a seeded one makes the artifact's repository a proxy, an
+/// empty one makes it hosted. Returns the `MockUpstreamProxy` it wired so a
+/// test can seed blob fixtures and count fetches.
+#[allow(clippy::type_complexity)]
+fn make_uc_with_upstream(
+    scanners: HashMap<String, Arc<dyn ScannerPort>>,
+    advisory: Arc<dyn AdvisoryPort>,
+    policy_projections: Arc<MockPolicyProjectionRepository>,
+    handlers: HashMap<String, Arc<dyn FormatHandler>>,
+    config: ScanOrchestrationConfig,
+    upstream_resolver: Arc<MockUpstreamResolver>,
+) -> (
+    ScanOrchestrationUseCase,
+    Arc<MockJobsRepository>,
+    Arc<MockEventStore>,
+    Arc<MockStoragePort>,
+    Arc<MockArtifactRepository>,
+    Arc<MockRepositoryRepository>,
+    Arc<MockPolicyProjectionRepository>,
+    Arc<MockArtifactMetadataRepository>,
+    Arc<MockUpstreamProxy>,
+    Arc<MockUpstreamResolver>,
+    Arc<MockCompositeScanObservationRepository>,
 ) {
     let artifacts = Arc::new(MockArtifactRepository::new());
     let events = Arc::new(MockEventStore::new());
@@ -560,6 +681,8 @@ fn make_uc_with_policy_repo_and_handlers(
         jobs.clone(),
     ));
 
+    let upstream_proxy = Arc::new(MockUpstreamProxy::new());
+    let observations = Arc::new(MockCompositeScanObservationRepository::new());
     let uc = ScanOrchestrationUseCase::new(
         jobs.clone(),
         artifacts.clone(),
@@ -568,9 +691,12 @@ fn make_uc_with_policy_repo_and_handlers(
         policy_projections.clone(),
         advisory,
         storage.clone(),
+        upstream_proxy.clone(),
+        upstream_resolver.clone(),
         scanners,
         handlers,
         quarantine,
+        Arc::new(ShadowObservationSink::new(observations.clone())),
         config,
     );
 
@@ -583,6 +709,9 @@ fn make_uc_with_policy_repo_and_handlers(
         repositories,
         policy_projections,
         artifact_metadata,
+        upstream_proxy,
+        upstream_resolver,
+        observations,
     )
 }
 
@@ -608,6 +737,7 @@ fn seed_global_policy(scan_backends: Vec<String>) -> ScanPolicyProjection {
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
+        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -965,7 +1095,7 @@ fn merge_never_lets_a_not_contained_row_disarm_a_condemning_one() {
             "{other:?}: must outrank an established non-containment",
         );
         assert!(
-            winner.may_condemn_artifact(),
+            winner.may_condemn_artifact(TEST_SCAN_KIND, CompositeVerdictMode::Observed),
             "{other:?}: the merged finding must keep the authority an input had",
         );
     }
@@ -1084,7 +1214,7 @@ async fn run_scan_skipped_no_backends_when_policy_declares_empty_list() {
     let job = sample_scan_job(artifact_id, 1);
 
     let outcome = uc.run_scan(&job).await.expect("run_scan");
-    assert!(matches!(outcome, ScanRunOutcome::SkippedNoBackends));
+    assert!(matches!(outcome, ScanRunOutcome::SkippedNoBackends { .. }));
 }
 
 #[tokio::test]
@@ -1149,6 +1279,7 @@ async fn run_scan_completed_with_single_backend_returns_findings_without_writing
         assessment: ScanAssessment::Analysed,
         scanner,
         findings,
+        kind: _,
         sbom: _,
     } = outcome
     else {
@@ -1225,6 +1356,7 @@ async fn run_scan_continues_when_one_of_two_backends_fails() {
         assessment: ScanAssessment::Analysed,
         scanner,
         findings,
+        kind: _,
         sbom: _,
     } = outcome
     else {
@@ -1570,9 +1702,14 @@ async fn record_outcome_skipped_no_backends_calls_record_scan_result_with_zeros(
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 1);
 
-    uc.record_outcome(&job, ScanRunOutcome::SkippedNoBackends)
-        .await
-        .expect("record_outcome");
+    uc.record_outcome(
+        &job,
+        ScanRunOutcome::SkippedNoBackends {
+            kind: TEST_SCAN_KIND,
+        },
+    )
+    .await
+    .expect("record_outcome");
 
     assert_eq!(jobs.completed_calls(), vec![job.id]);
     let batches = events.appended_batches();
@@ -1610,6 +1747,7 @@ async fn record_outcome_completed_first_ever_scan_emits_no_artifact_became_vulne
         SeverityThreshold::Critical,
     )];
     let outcome = ScanRunOutcome::Completed {
+        kind: TEST_SCAN_KIND,
         assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: findings.clone(),
@@ -1664,6 +1802,7 @@ async fn record_outcome_completed_with_prior_clean_emits_artifact_became_vulnera
 
     let new_findings = vec![finding("pkg:npm/foo@1", "CVE-1", SeverityThreshold::High)];
     let outcome = ScanRunOutcome::Completed {
+        kind: TEST_SCAN_KIND,
         assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: new_findings.clone(),
@@ -1739,6 +1878,7 @@ async fn record_outcome_completed_with_prior_partial_overlap_emits_only_new_find
         finding("pkg:npm/foo@1", "CVE-B", SeverityThreshold::Critical),
     ];
     let outcome = ScanRunOutcome::Completed {
+        kind: TEST_SCAN_KIND,
         assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: current,
@@ -1800,6 +1940,7 @@ async fn record_outcome_completed_identical_findings_emits_no_artifact_became_vu
     );
 
     let outcome = ScanRunOutcome::Completed {
+        kind: TEST_SCAN_KIND,
         assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: prior_findings.clone(),
@@ -1832,7 +1973,13 @@ async fn record_outcome_completed_identical_findings_emits_no_artifact_became_vu
 #[tokio::test]
 async fn record_outcome_writes_under_the_rows_own_attempt() {
     let cases: Vec<(&str, u32, ScanRunOutcome)> = vec![
-        ("mark_completed", 1, ScanRunOutcome::SkippedNoBackends),
+        (
+            "mark_completed",
+            1,
+            ScanRunOutcome::SkippedNoBackends {
+                kind: TEST_SCAN_KIND,
+            },
+        ),
         ("reschedule", 2, ScanRunOutcome::Failed("transient".into())),
         (
             "mark_failed",
@@ -2184,9 +2331,14 @@ fn make_uc_with_lifecycle(
         policy_projections,
         Arc::new(MockAdvisory::ok(vec![])),
         storage.clone(),
+        Arc::new(MockUpstreamProxy::new()),
+        Arc::new(MockUpstreamResolver::new()),
         HashMap::new(),
         HashMap::new(),
         quarantine,
+        Arc::new(ShadowObservationSink::new(Arc::new(
+            MockCompositeScanObservationRepository::new(),
+        ))),
         config,
     );
 
@@ -2387,6 +2539,7 @@ async fn record_outcome_path_a_single_batch_after_item_12() {
     );
 
     let outcome = ScanRunOutcome::Completed {
+        kind: TEST_SCAN_KIND,
         assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: vec![finding("pkg:npm/foo@1", "CVE-1", SeverityThreshold::High)],
@@ -3550,9 +3703,14 @@ mod metrics_emission_tests {
                     make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
                 let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
                 let job = sample_scan_job(artifact_id, 1);
-                uc.record_outcome(&job, ScanRunOutcome::SkippedNoBackends)
-                    .await
-                    .expect("record_outcome");
+                uc.record_outcome(
+                    &job,
+                    ScanRunOutcome::SkippedNoBackends {
+                        kind: TEST_SCAN_KIND,
+                    },
+                )
+                .await
+                .expect("record_outcome");
             })
         });
         let count = find_counter(&snap, "hort_scan_jobs_total", |labels| {
@@ -3654,9 +3812,14 @@ mod metrics_emission_tests {
                     make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
                 let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
                 let job = sample_scan_job(artifact_id, 1);
-                uc.record_outcome(&job, ScanRunOutcome::SkippedNoBackends)
-                    .await
-                    .expect("record_outcome");
+                uc.record_outcome(
+                    &job,
+                    ScanRunOutcome::SkippedNoBackends {
+                        kind: TEST_SCAN_KIND,
+                    },
+                )
+                .await
+                .expect("record_outcome");
             })
         });
         assert_eq!(
@@ -3678,6 +3841,7 @@ mod metrics_emission_tests {
                 let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
                 let job = sample_scan_job(artifact_id, 1);
                 let outcome = ScanRunOutcome::Completed {
+                    kind: TEST_SCAN_KIND,
                     assessment: ScanAssessment::Analysed,
                     scanner: "trivy".into(),
                     findings: vec![],
@@ -3707,6 +3871,7 @@ mod metrics_emission_tests {
                 let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
                 let job = sample_scan_job(artifact_id, 1);
                 let outcome = ScanRunOutcome::Completed {
+                    kind: TEST_SCAN_KIND,
                     assessment: ScanAssessment::Analysed,
                     scanner: "trivy".into(),
                     findings: vec![finding(
@@ -3957,6 +4122,7 @@ mod metrics_emission_tests {
                     );
 
                     let outcome = ScanRunOutcome::Completed {
+                        kind: TEST_SCAN_KIND,
                         assessment: ScanAssessment::Analysed,
                         scanner: "trivy".into(),
                         findings: vec![
@@ -4036,6 +4202,7 @@ mod metrics_emission_tests {
                         ],
                     );
                     let outcome = ScanRunOutcome::Completed {
+                        kind: TEST_SCAN_KIND,
                         assessment: ScanAssessment::Analysed,
                         scanner: "trivy".into(),
                         findings: vec![finding("pkg:npm/foo@1", "CVE-9", SeverityThreshold::High)],
@@ -4306,9 +4473,14 @@ mod metrics_emission_tests {
             policy_projections,
             Arc::new(MockAdvisory::ok(vec![])),
             storage,
+            Arc::new(MockUpstreamProxy::new()),
+            Arc::new(MockUpstreamResolver::new()),
             HashMap::new(),
             HashMap::new(),
             quarantine,
+            Arc::new(ShadowObservationSink::new(Arc::new(
+                MockCompositeScanObservationRepository::new(),
+            ))),
             config,
         )
     }
@@ -4857,6 +5029,7 @@ async fn run_scan_passes_other_when_no_handler_is_registered_for_the_format() {
 async fn run_scan_returns_nothing_analysable_not_a_clean_completion() {
     for reason in [
         NotAnalysable::UnusableArchive,
+        NotAnalysable::UnsupportedContainer,
         NotAnalysable::NoAnalyzerMatched,
     ] {
         let scanner = Arc::new(MockScanner::with_analysis(
@@ -5253,6 +5426,7 @@ async fn run_scan_on_an_oci_layer_neither_backend_can_read_records_not_applicabl
 async fn run_scan_holds_when_a_gating_abstention_joins_a_not_applicable_one() {
     for gating in [
         NotAnalysable::UnusableArchive,
+        NotAnalysable::UnsupportedContainer,
         NotAnalysable::NoAnalyzerMatched,
     ] {
         let not_applicable = Arc::new(MockScanner::with_analysis(
@@ -5394,6 +5568,7 @@ async fn record_outcome_not_applicable_records_scan_authority_and_does_not_hold(
         &job,
         ScanRunOutcome::Completed {
             scanner: "trivy".into(),
+            kind: TEST_SCAN_KIND,
             findings: Vec::new(),
             assessment: ScanAssessment::NotApplicable,
             sbom: None,
@@ -5460,9 +5635,14 @@ async fn record_outcome_skipped_no_backends_still_records_an_analysed_assessment
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 1);
 
-    uc.record_outcome(&job, ScanRunOutcome::SkippedNoBackends)
-        .await
-        .expect("record_outcome");
+    uc.record_outcome(
+        &job,
+        ScanRunOutcome::SkippedNoBackends {
+            kind: TEST_SCAN_KIND,
+        },
+    )
+    .await
+    .expect("record_outcome");
 
     assert_eq!(jobs.completed_calls(), vec![job.id]);
     let scan_completed = events
@@ -5843,6 +6023,97 @@ fn the_subject_wins_over_a_component_entry_with_the_same_purl() {
         declaring_format(&sbom).relation_for("pkg:cargo/leaf@1", EvidenceBasis::SuppliedSbom),
         ComponentRelation::Subject,
     );
+}
+
+/// **The tagging pass writes the relation and leaves the statement
+/// alone.** The producer's half of ADR 0064 D2's line arrives already
+/// stated and is a fact about the producer's own output; whose
+/// filesystem the claim is about is the row's `ArtifactKind`, which
+/// `Finding::may_condemn_artifact` composes where it decides rather than
+/// anything storing the two already joined (ADR 0040).
+///
+/// Asserted on the two rows whose *verdicts* differ, from identical
+/// input, so the property is visible at this level too: the stored
+/// statement is the same on a layer and on an npm tarball, and the
+/// predicate is what tells them apart. A pass that reintroduced a write
+/// here would fail the first pair of assertions; one that reintroduced a
+/// composed value would fail the second.
+#[test]
+fn the_tagging_pass_writes_the_relation_and_not_the_statement() {
+    let sbom = sbom_with(Some("pkg:cargo/subject@1"), &[]);
+    let mut from_producer = finding(
+        "pkg:deb/openssl@3.0.2",
+        "CVE-2022-1",
+        SeverityThreshold::High,
+    );
+    from_producer.statement = FindingStatement::Filesystem;
+
+    let layer = ComponentRelations {
+        sbom: Some(&sbom),
+        payload_contains_components: true,
+        format: "oci",
+    }
+    .tag(
+        vec![from_producer.clone()],
+        EvidenceBasis::MaterialisedPayload,
+    );
+    assert_eq!(
+        layer[0].statement,
+        FindingStatement::Filesystem,
+        "the producer's half passes through untouched"
+    );
+    assert_eq!(
+        layer[0].component_relation,
+        ComponentRelation::Contained,
+        "the relation half is what this pass writes"
+    );
+
+    let package = ComponentRelations {
+        sbom: Some(&sbom),
+        payload_contains_components: false,
+        format: "npm",
+    }
+    .tag(vec![from_producer], EvidenceBasis::MaterialisedPayload);
+    assert_eq!(
+        package[0].statement,
+        FindingStatement::Filesystem,
+        "and it is the same stored fact on a row whose tree is its own"
+    );
+
+    // The role is what tells the two apart, at the predicate and nowhere
+    // earlier.
+    assert!(
+        !layer[0].may_condemn_artifact(ArtifactKind::OciBlob, CompositeVerdictMode::Promoted),
+        "the layer's isolated package set is evidence under promotion"
+    );
+    assert!(
+        package[0].may_condemn_artifact(ArtifactKind::NpmTarball, CompositeVerdictMode::Promoted),
+        "an npm tarball's materialised tree is the artifact's own, so the \
+         same stored statement still gates it"
+    );
+}
+
+/// And the advisory path's batch: its statement is `Unstated`, which the
+/// pass likewise does not touch. The pass runs over it all the same —
+/// the relation half is exactly what it is there for.
+#[test]
+fn the_tagging_pass_leaves_an_unstated_statement_unstated() {
+    let sbom = sbom_with(Some("pkg:cargo/subject@1"), &["pkg:cargo/dep@2"]);
+    let advisory = finding("pkg:cargo/dep@2", "CVE-2022-2", SeverityThreshold::High);
+    assert_eq!(advisory.statement, FindingStatement::Unstated);
+
+    let tagged = ComponentRelations {
+        sbom: Some(&sbom),
+        payload_contains_components: true,
+        format: "oci",
+    }
+    .tag(vec![advisory], EvidenceBasis::SuppliedSbom);
+    assert_eq!(
+        tagged[0].statement,
+        FindingStatement::Unstated,
+        "a side nobody stated is not invented from the kind"
+    );
+    assert_eq!(tagged[0].component_relation, ComponentRelation::Contained);
 }
 
 /// A handler whose BOM a test chooses outright, with the format's
@@ -6334,5 +6605,2068 @@ async fn run_scan_tags_findings_when_no_handler_is_registered() {
         relation_of(&findings, "CVE-NOHANDLER"),
         ComponentRelation::Contained,
         "a payload-scanning backend found it in the artifact; no BOM says otherwise"
+    );
+}
+
+// ===========================================================================
+// The composed-image assessment is a shadow (ADR 0064 D1/D6)
+//
+// The unit of filesystem assessment for an OCI image is the manifest, and
+// `run_scan` now resolves and runs that composition — but **read-only**.
+// These pin both halves: that the composition reaches the backend at all,
+// and that nothing it says reaches the artifact. A new analysis path
+// whose first production act could be irreversible is what D6 exists to
+// prevent: `Rejected` is terminal and the periodic rescan never revisits
+// it.
+// ===========================================================================
+
+/// The `config` + `layers[]` document a manifest row's bytes are, as it
+/// is stored.
+fn stored_image_manifest(config: &ContentHash, layers: &[&ContentHash]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": format!("sha256:{config}"),
+            "size": 7,
+        },
+        "layers": layers.iter().map(|h| serde_json::json!({
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "digest": format!("sha256:{h}"),
+            "size": 100,
+        })).collect::<Vec<_>>(),
+    }))
+    .expect("manifest serialises")
+}
+
+/// An **image index** document — a manifest list, binding platform
+/// manifests by reference rather than describing a filesystem. The
+/// strict parse refuses it as "not an image", which is what keeps an
+/// index out of the composite path entirely (ADR 0064 D5).
+fn stored_image_index() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": format!("sha256:{}", synthetic_hash('a')),
+            "size": 500,
+            "platform": { "architecture": "amd64", "os": "linux" },
+        }],
+    }))
+    .expect("index serialises")
+}
+
+/// An image config declaring `n` `diff_ids` — deliberately unequal to any
+/// layer digest, since a `diff_id` is the digest of the *uncompressed*
+/// tar.
+fn stored_image_config(n: usize) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "architecture": "amd64",
+        "os": "linux",
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": (0..n)
+                .map(|i| format!("sha256:{:064x}", i + 0xd1ff_0000))
+                .collect::<Vec<_>>(),
+        },
+    }))
+    .expect("config serialises")
+}
+
+fn synthetic_hash(seed: char) -> ContentHash {
+    std::iter::repeat_n(seed, 64)
+        .collect::<String>()
+        .parse()
+        .expect("synthetic sha256")
+}
+
+/// A use case wired with one scanner and one handler, handing back the
+/// storage mock so a test can seed the manifest and config documents the
+/// composition is resolved from.
+#[allow(clippy::type_complexity)]
+fn make_uc_with_handler_and_storage(
+    backends: Vec<String>,
+    scanners: HashMap<String, Arc<dyn ScannerPort>>,
+    handlers: HashMap<String, Arc<dyn FormatHandler>>,
+) -> (
+    ScanOrchestrationUseCase,
+    Arc<MockEventStore>,
+    Arc<MockStoragePort>,
+    Arc<MockArtifactRepository>,
+    Arc<MockRepositoryRepository>,
+) {
+    make_uc_under_policy(seed_global_policy(backends), scanners, handlers)
+}
+
+/// The same, under a policy the caller built — so a test can vary the
+/// posture under test (`composite_verdict_mode`, `enforcement`) rather
+/// than the backend list.
+#[allow(clippy::type_complexity)]
+fn make_uc_under_policy(
+    policy: ScanPolicyProjection,
+    scanners: HashMap<String, Arc<dyn ScannerPort>>,
+    handlers: HashMap<String, Arc<dyn FormatHandler>>,
+) -> (
+    ScanOrchestrationUseCase,
+    Arc<MockEventStore>,
+    Arc<MockStoragePort>,
+    Arc<MockArtifactRepository>,
+    Arc<MockRepositoryRepository>,
+) {
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(policy);
+    let (uc, _jobs, events, storage, artifacts, repositories, _policy, _metadata) =
+        make_uc_with_policy_repo_and_handlers(
+            scanners,
+            Arc::new(MockAdvisory::ok(vec![])),
+            policy_projections,
+            handlers,
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    (uc, events, storage, artifacts, repositories)
+}
+
+/// [`seed_global_policy`] with the composed-image verdict **promoted** to
+/// release authority (ADR 0064 D6) — the operator act every test below
+/// stands on.
+fn seed_promoted_policy(scan_backends: Vec<String>) -> ScanPolicyProjection {
+    ScanPolicyProjection {
+        composite_verdict_mode: CompositeVerdictMode::Promoted,
+        ..seed_global_policy(scan_backends)
+    }
+}
+
+/// The composition reaches the backend as a composed image, with every
+/// layer the manifest declared — and the critical finding it comes back
+/// with changes **nothing**: the outcome is still the manifest row's own
+/// completed not-applicable assessment, carrying no findings, and no
+/// event is appended.
+#[tokio::test]
+async fn run_scan_assesses_the_composed_image_without_giving_it_any_authority() {
+    let scanner = Arc::new(
+        MockScanner::with_analysis(
+            "trivy",
+            // The manifest row's own bytes: no package surface, exactly
+            // as today.
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        )
+        // The composition: a critical finding. If any of it leaked into
+        // the run, the assertions below would see it.
+        .answering_composites_with(Ok(ScanAnalysis::Analysed(vec![finding(
+            "pkg:deb/debian/openssl@1.1.1n-0+deb11u3",
+            "CVE-2022-COMPOSITE",
+            SeverityThreshold::Critical,
+        )]))),
+    );
+    let (uc, events, storage, artifacts, repositories) = make_uc_with_handler_and_storage(
+        vec!["trivy".into()],
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+
+    // The manifest row's bytes, plus the config they name.
+    let (config, lower, upper) = (
+        synthetic_hash('c'),
+        synthetic_hash('1'),
+        synthetic_hash('2'),
+    );
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&lower, &upper]),
+    );
+    storage.insert_content(config, stored_image_config(2));
+    // Both layers local: this repository is hosted (the harness wires an
+    // empty upstream resolver), so a composition with an absent layer
+    // would be a real refusal rather than something to acquire.
+    storage.insert_content(lower, b"lower layer".to_vec());
+    storage.insert_content(upper, b"upper layer".to_vec());
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    // The composition was assembled and handed over — the primary blob
+    // invocation first, the shadow composite second.
+    assert_eq!(
+        scanner.seen_units(),
+        vec![ScanUnitShape::Blob, ScanUnitShape::Image(2)],
+        "the manifest's own bytes are scanned as a blob and its composition as an image"
+    );
+
+    // And none of what the composite said reached the artifact.
+    let ScanRunOutcome::Completed {
+        findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("the manifest row's own outcome must be unchanged, got {outcome:?}");
+    };
+    assert_eq!(
+        assessment,
+        ScanAssessment::NotApplicable,
+        "the composite verdict carries no authority yet; the row's assessment is its own"
+    );
+    assert!(
+        findings.is_empty(),
+        "a composite finding must not arrive on the manifest row's outcome: {findings:?}"
+    );
+    assert!(
+        events.appended_batches().is_empty(),
+        "run_scan appends nothing, and the shadow appends nothing either"
+    );
+}
+
+/// A manifest row whose composition cannot be resolved — here because
+/// its own bytes are not in storage — runs no composite invocation, and
+/// the row's outcome is untouched. Nothing retries and nothing holds on
+/// the shadow's behalf.
+#[tokio::test]
+async fn run_scan_with_an_unresolvable_composition_leaves_the_outcome_alone() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let (uc, _events, _storage, artifacts, repositories) = make_uc_with_handler_and_storage(
+        vec!["trivy".into()],
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, "oci");
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    assert_eq!(
+        scanner.seen_units(),
+        vec![ScanUnitShape::Blob],
+        "an unresolved composition is never handed to a backend"
+    );
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// Every non-manifest row — which is nearly every artifact in the
+/// system — pays nothing for the composite path: one invocation, over
+/// its own bytes, exactly as before.
+#[tokio::test]
+async fn run_scan_on_a_non_manifest_row_runs_one_blob_invocation() {
+    let scanner = Arc::new(MockScanner::new("trivy", Ok(vec![])));
+    let (uc, _events, _storage, artifacts, repositories) = make_uc_with_handler_and_storage(
+        vec!["trivy".into()],
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciBlob),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, "oci");
+    uc.run_scan(&job).await.expect("run_scan");
+    assert_eq!(scanner.seen_units(), vec![ScanUnitShape::Blob]);
+}
+
+// ===========================================================================
+// A proxy composition's constituents are acquired, not awaited (ADR 0064 D1)
+//
+// A pull-through manifest's layers are routinely not local — its
+// constituent edges are registered by digest with no existence check, and
+// the client pull that would warm them starts with the manifest whose
+// verdict is being gated. So the scan job fetches them. These pin the
+// three things that follow from that: a hosted row still refuses, a proxy
+// row acquires, and a *transient* acquisition failure takes the
+// orchestrator's existing retryable path instead of the deterministic
+// no-verdict a non-fetching path could get away with.
+// ===========================================================================
+
+/// The catch-all upstream mapping the acquisition tests resolve through.
+fn composite_upstream_mapping(repository_id: Uuid) -> RepositoryUpstreamMapping {
+    let now = Utc::now();
+    RepositoryUpstreamMapping {
+        id: Uuid::new_v4(),
+        repository_id,
+        path_prefix: String::new(),
+        upstream_url: "https://registry.example".into(),
+        upstream_name_prefix: None,
+        upstream_auth: UpstreamAuth::Anonymous,
+        secret_ref: None,
+        managed_by: ManagedBy::Local,
+        managed_by_digest: None,
+        insecure_upstream_url: false,
+        trust_upstream_publish_time: false,
+        mtls_cert_ref: None,
+        mtls_key_ref: None,
+        ca_bundle_ref: None,
+        pinned_cert_sha256: None,
+        allowed_realm_hosts: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// [`make_uc_with_handler_and_storage`] plus the composite path's upstream
+/// handles, so a test can make the artifact's repository a proxy and seed
+/// (or fail) the blobs its composition names.
+#[allow(clippy::type_complexity)]
+fn make_uc_with_handler_storage_and_upstream(
+    backends: Vec<String>,
+    scanners: HashMap<String, Arc<dyn ScannerPort>>,
+    handlers: HashMap<String, Arc<dyn FormatHandler>>,
+    config: ScanOrchestrationConfig,
+) -> (
+    ScanOrchestrationUseCase,
+    Arc<MockStoragePort>,
+    Arc<MockArtifactRepository>,
+    Arc<MockRepositoryRepository>,
+    Arc<MockUpstreamProxy>,
+    Arc<MockUpstreamResolver>,
+    Arc<MockCompositeScanObservationRepository>,
+) {
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_global_policy(backends));
+    let resolver = Arc::new(MockUpstreamResolver::new());
+    let (
+        uc,
+        _jobs,
+        _events,
+        storage,
+        artifacts,
+        repositories,
+        _policy,
+        _metadata,
+        proxy,
+        resolver,
+        observations,
+    ) = make_uc_with_upstream(
+        scanners,
+        Arc::new(MockAdvisory::ok(vec![])),
+        policy_projections,
+        handlers,
+        config,
+        resolver,
+    );
+    (
+        uc,
+        storage,
+        artifacts,
+        repositories,
+        proxy,
+        resolver,
+        observations,
+    )
+}
+
+/// The real SHA-256 of `bytes` — so a seeded upstream blob genuinely
+/// satisfies the digest the manifest declares, and the verification arm is
+/// exercised rather than bypassed.
+fn digest_of(bytes: &[u8]) -> ContentHash {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+        .parse()
+        .expect("a sha256 hex digest")
+}
+
+/// With no policy configured at all there is no policy to carry
+/// exclusions, which is a known-empty set and not an unresolved one —
+/// so the row is still written, judged by the built-in default.
+#[tokio::test]
+async fn a_repository_with_no_policy_still_records_an_observation() {
+    let scanner = Arc::new(
+        MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        )
+        .answering_composites_with(Ok(ScanAnalysis::Analysed(vec![finding(
+            "pkg:deb/debian/openssl@1.1.1n-0+deb11u3",
+            "CVE-2022-COMPOSITE",
+            SeverityThreshold::Critical,
+        )]))),
+    );
+    // No `insert` — `resolve_active_policy_for_repo` finds nothing and
+    // the orchestrator falls back to the built-in `["trivy"]`.
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    let (
+        uc,
+        _jobs,
+        _events,
+        storage,
+        artifacts,
+        repositories,
+        _policy,
+        _metadata,
+        _proxy,
+        _resolver,
+        observations,
+    ) = make_uc_with_upstream(
+        one_scanner(scanner.clone()),
+        Arc::new(MockAdvisory::ok(vec![])),
+        policy_projections,
+        handler_map("oci", ArtifactKind::OciManifest),
+        ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        Arc::new(MockUpstreamResolver::new()),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    seed_hosted_composition(&storage);
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    uc.run_scan(&job).await.expect("run_scan");
+
+    let row = observations
+        .row_for(artifact_id)
+        .expect("an observation under the default policy");
+    assert_eq!(row.assessment, CompositeAssessment::Assessed);
+    // `DefaultPolicy::block_on_critical` blocks on critical, and the
+    // composition found one — so promoting the composite verdict would
+    // change this artifact's outcome.
+    assert_eq!(row.composite_findings_decision, Some(GateDecision::Reject));
+    assert_eq!(row.primary_findings_decision, GateDecision::Clean);
+}
+
+/// Seed a two-layer image whose every constituent is local — the hosted
+/// shape, where an absent constituent would be a real refusal rather
+/// than something to acquire.
+fn seed_hosted_composition(storage: &Arc<MockStoragePort>) {
+    let (config, lower, upper) = (
+        synthetic_hash('c'),
+        synthetic_hash('1'),
+        synthetic_hash('2'),
+    );
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&lower, &upper]),
+    );
+    storage.insert_content(config, stored_image_config(2));
+    storage.insert_content(lower, b"lower layer".to_vec());
+    storage.insert_content(upper, b"upper layer".to_vec());
+}
+
+/// A cold proxy image: the manifest and config are local (the manifest
+/// because it is the row, the config because it was pulled with it), both
+/// layers are not. The scan fetches them from the repository's upstream
+/// and the composition then reaches the backend.
+#[tokio::test]
+async fn run_scan_acquires_a_cold_proxy_compositions_layers_and_then_assesses_it() {
+    let scanner = Arc::new(
+        MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        )
+        .answering_composites_with(Ok(ScanAnalysis::Analysed(vec![]))),
+    );
+    let (uc, storage, artifacts, repositories, proxy, resolver, observations) =
+        make_uc_with_handler_storage_and_upstream(
+            vec!["trivy".into()],
+            one_scanner(scanner.clone()),
+            handler_map("oci", ArtifactKind::OciManifest),
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let artifact = artifacts
+        .find_by_id(artifact_id)
+        .await
+        .expect("the seeded artifact");
+    resolver.insert(composite_upstream_mapping(artifact.repository_id));
+
+    let (lower_bytes, upper_bytes) = (b"lower layer".as_slice(), b"upper layer".as_slice());
+    let (lower, upper) = (digest_of(lower_bytes), digest_of(upper_bytes));
+    let config = synthetic_hash('c');
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&lower, &upper]),
+    );
+    storage.insert_content(config, stored_image_config(2));
+    for (hash, bytes) in [(&lower, lower_bytes), (&upper, upper_bytes)] {
+        proxy.insert_blob(
+            "",
+            &artifact.name,
+            &format!("sha256:{hash}"),
+            bytes.to_vec(),
+            None,
+        );
+    }
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    assert_eq!(
+        proxy.blob_fetches(),
+        vec![format!("sha256:{lower}"), format!("sha256:{upper}")],
+        "both absent layers were acquired, in manifest order"
+    );
+    assert_eq!(
+        scanner.seen_units(),
+        vec![ScanUnitShape::Blob, ScanUnitShape::Image(2)],
+        "the composition reaches the backend only because its layers were acquired"
+    );
+    // Still no release authority: the row's own outcome is unchanged.
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    // And the assessment left durable evidence, wired end to end: the
+    // orchestrator resolved the policy and its exclusions and handed
+    // both down, so the row carries a counterfactual beside what the
+    // manifest's own bytes concluded (ADR 0064 D6).
+    let row = observations
+        .row_for(artifact_id)
+        .expect("the shadow assessment recorded an observation");
+    assert_eq!(row.assessment, CompositeAssessment::Assessed);
+    assert_eq!(row.repository_id, artifact.repository_id);
+    assert_eq!(row.cost.fetched, 2, "both layers crossed the wire");
+    assert_eq!(row.composite_findings_decision, Some(GateDecision::Clean));
+    assert_eq!(row.primary_findings_decision, GateDecision::Clean);
+}
+
+/// The shadow observation's write is best-effort: when the projection
+/// refuses it, the artifact's own scan outcome, the events it produces
+/// and the job row are all exactly what they would have been.
+#[tokio::test]
+async fn a_failing_observation_write_leaves_the_outcome_the_events_and_the_job_row_alone() {
+    let scanner = Arc::new(
+        MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        )
+        .answering_composites_with(Ok(ScanAnalysis::Analysed(vec![finding(
+            "pkg:deb/debian/openssl@1.1.1n-0+deb11u3",
+            "CVE-2022-COMPOSITE",
+            SeverityThreshold::Critical,
+        )]))),
+    );
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_global_policy(vec!["trivy".into()]));
+    let (
+        uc,
+        jobs,
+        events,
+        storage,
+        artifacts,
+        repositories,
+        _policy,
+        _metadata,
+        _proxy,
+        _resolver,
+        observations,
+    ) = make_uc_with_upstream(
+        one_scanner(scanner.clone()),
+        Arc::new(MockAdvisory::ok(vec![])),
+        policy_projections,
+        handler_map("oci", ArtifactKind::OciManifest),
+        ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        Arc::new(MockUpstreamResolver::new()),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    seed_hosted_composition(&storage);
+    observations.fail_next_record(DomainError::Invariant("projection unavailable".into()));
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    // The composition was still assembled and handed over — only the
+    // row it would have left is missing.
+    assert_eq!(
+        scanner.seen_units(),
+        vec![ScanUnitShape::Blob, ScanUnitShape::Image(2)]
+    );
+    assert!(
+        observations.rows().is_empty(),
+        "the refused write left nothing behind"
+    );
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ref findings,
+                ..
+            } if findings.is_empty()
+        ),
+        "the manifest row's own outcome is unchanged: {outcome:?}"
+    );
+
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    assert_eq!(jobs.completed_calls(), vec![job.id]);
+    let batches = events.appended_batches();
+    assert_eq!(batches.len(), 1, "exactly the scan's own batch");
+    assert!(
+        batches[0]
+            .events
+            .iter()
+            .any(|e| matches!(&e.event, DomainEvent::ScanCompleted(_))),
+        "the artifact's own ScanCompleted still committed"
+    );
+}
+
+/// An exclusion set the run could not resolve means the two sides of the
+/// row would be judged by different rules, so no row is written — and
+/// the read's failure stays out of the scan, which resolves its own
+/// exclusions when it commits.
+#[tokio::test]
+async fn an_unresolvable_exclusion_set_records_no_observation_and_fails_no_scan() {
+    let scanner = Arc::new(
+        MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        )
+        .answering_composites_with(Ok(ScanAnalysis::Analysed(vec![]))),
+    );
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_global_policy(vec!["trivy".into()]));
+    policy_projections.fail_next_list_exclusions(DomainError::Invariant("pg down".into()));
+    let (
+        uc,
+        _jobs,
+        _events,
+        storage,
+        artifacts,
+        repositories,
+        _policy,
+        _metadata,
+        _proxy,
+        _resolver,
+        observations,
+    ) = make_uc_with_upstream(
+        one_scanner(scanner.clone()),
+        Arc::new(MockAdvisory::ok(vec![])),
+        policy_projections,
+        handler_map("oci", ArtifactKind::OciManifest),
+        ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        Arc::new(MockUpstreamResolver::new()),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    seed_hosted_composition(&storage);
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    assert!(observations.rows().is_empty());
+    assert_eq!(
+        scanner.seen_units(),
+        vec![ScanUnitShape::Blob, ScanUnitShape::Image(2)],
+        "the assessment itself still ran"
+    );
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// Every other artifact in every other format reaches the composite
+/// call, and none of them pays a round trip for a row that is never
+/// written: the exclusion read is gated on the one kind the composite
+/// path acts on.
+#[tokio::test]
+async fn a_non_manifest_row_costs_no_exclusion_read_and_leaves_no_observation() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::Analysed(vec![])),
+    ));
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_global_policy(vec!["trivy".into()]));
+    // Armed, and never consumed by `run_scan`: an npm row never reaches
+    // the composite path's exclusion read. `record_scan_result` is not
+    // called here, so nothing else consumes it either.
+    policy_projections.fail_next_list_exclusions(DomainError::Invariant("must not be read".into()));
+    let (
+        uc,
+        _jobs,
+        _events,
+        storage,
+        artifacts,
+        repositories,
+        policy,
+        _metadata,
+        _proxy,
+        _resolver,
+        observations,
+    ) = make_uc_with_upstream(
+        one_scanner(scanner.clone()),
+        Arc::new(MockAdvisory::ok(vec![])),
+        policy_projections,
+        handler_map("npm", ArtifactKind::NpmTarball),
+        ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        Arc::new(MockUpstreamResolver::new()),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    storage.insert_content(VALID_SHA256.parse().unwrap(), b"tarball".to_vec());
+
+    let job = scan_job_for_format(artifact_id, "npm");
+    uc.run_scan(&job).await.expect("run_scan");
+
+    assert!(observations.rows().is_empty());
+    // The armed one-shot failure is still armed, so nothing read it.
+    assert!(
+        policy
+            .list_exclusions_for_policy(Uuid::new_v4())
+            .await
+            .is_err(),
+        "the composite path must not have consumed the exclusion read"
+    );
+}
+
+/// A **hosted** repository has no upstream, so an absent constituent is a
+/// real refusal: no fetch is attempted, no backend is handed a
+/// composition, and the row's own outcome is untouched.
+#[tokio::test]
+async fn run_scan_on_a_hosted_row_with_an_absent_constituent_attempts_no_fetch() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let (uc, storage, artifacts, repositories, proxy, _resolver, _observations) =
+        make_uc_with_handler_storage_and_upstream(
+            vec!["trivy".into()],
+            one_scanner(scanner.clone()),
+            handler_map("oci", ArtifactKind::OciManifest),
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    // No mapping inserted: the resolver answers nothing.
+
+    let (config, layer) = (synthetic_hash('c'), synthetic_hash('1'));
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&layer]),
+    );
+    storage.insert_content(config, stored_image_config(1));
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    assert!(
+        proxy.blob_fetches().is_empty(),
+        "a hosted repository must not reach an upstream"
+    );
+    assert_eq!(
+        scanner.seen_units(),
+        vec![ScanUnitShape::Blob],
+        "an incomplete composition is never handed to a backend"
+    );
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "a deterministic composite refusal must not change the row's outcome: {outcome:?}"
+    );
+}
+
+/// A transient acquisition failure takes the orchestrator's existing
+/// retryable path: `Failed`, which `record_outcome` reschedules on the
+/// shared backoff under the job's own `max_attempts`. Nothing parallel is
+/// invented, and nothing terminal is written.
+#[tokio::test]
+async fn a_transient_acquisition_failure_asks_for_another_attempt() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let (uc, storage, artifacts, repositories, proxy, resolver, _observations) =
+        make_uc_with_handler_storage_and_upstream(
+            vec!["trivy".into()],
+            one_scanner(scanner.clone()),
+            handler_map("oci", ArtifactKind::OciManifest),
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let artifact = artifacts
+        .find_by_id(artifact_id)
+        .await
+        .expect("the seeded artifact");
+    resolver.insert(composite_upstream_mapping(artifact.repository_id));
+
+    let (config, layer) = (synthetic_hash('c'), synthetic_hash('1'));
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&layer]),
+    );
+    storage.insert_content(config, stored_image_config(1));
+    proxy.fail_blob_with(
+        &format!("sha256:{layer}"),
+        DomainError::Invariant("upstream:upstream_5xx:503 Service Unavailable".to_string()),
+    );
+
+    // Attempt 1 of 5: the request is granted.
+    let job = scan_job_for_format(artifact_id, "oci");
+    assert_eq!(job.attempts, 1);
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Failed(err) = &outcome else {
+        panic!("a transient acquisition failure earns a retry, got {outcome:?}");
+    };
+    assert!(
+        err.contains("could not be produced on attempt 1 of 5"),
+        "{err}"
+    );
+    assert!(err.contains("upstream_5xx"), "{err}");
+}
+
+/// The same transient failure on the **last** attempt: the request is
+/// declined and the row's own outcome is recorded exactly as it would have
+/// been. So the composite can never reach `record_outcome`'s
+/// retry-exhausted arm, which is the one that transitions the artifact to
+/// `scan_indeterminate` — exhausting the budget lands back on the
+/// deterministic outcome, with no release authority anywhere in the path.
+#[tokio::test]
+async fn an_exhausted_attempt_budget_declines_the_retry_and_records_the_rows_own_outcome() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let (uc, storage, artifacts, repositories, proxy, resolver, _observations) =
+        make_uc_with_handler_storage_and_upstream(
+            vec!["trivy".into()],
+            one_scanner(scanner.clone()),
+            handler_map("oci", ArtifactKind::OciManifest),
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let artifact = artifacts
+        .find_by_id(artifact_id)
+        .await
+        .expect("the seeded artifact");
+    resolver.insert(composite_upstream_mapping(artifact.repository_id));
+
+    let (config, layer) = (synthetic_hash('c'), synthetic_hash('1'));
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&layer]),
+    );
+    storage.insert_content(config, stored_image_config(1));
+    proxy.fail_blob_with(
+        &format!("sha256:{layer}"),
+        DomainError::Invariant("upstream:timeout:deadline exceeded".to_string()),
+    );
+
+    let job = ScanJob {
+        format: "oci".to_string(),
+        ..sample_scan_job(artifact_id, 5)
+    };
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "the last attempt records the row's own assessment, not a retry: {outcome:?}"
+    );
+}
+
+/// A transient acquisition failure does **not** override a run that found
+/// something. The shadow has no authority to delay a reject, so the
+/// finding is recorded on this attempt and the composite's request is
+/// declined.
+#[tokio::test]
+async fn a_transient_acquisition_failure_never_delays_a_finding() {
+    let scanner = Arc::new(MockScanner::new(
+        "trivy",
+        Ok(vec![finding(
+            "pkg:oci/manifest",
+            "CVE-2026-MANIFEST",
+            SeverityThreshold::High,
+        )]),
+    ));
+    let (uc, storage, artifacts, repositories, proxy, resolver, _observations) =
+        make_uc_with_handler_storage_and_upstream(
+            vec!["trivy".into()],
+            one_scanner(scanner.clone()),
+            handler_map("oci", ArtifactKind::OciManifest),
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let artifact = artifacts
+        .find_by_id(artifact_id)
+        .await
+        .expect("the seeded artifact");
+    resolver.insert(composite_upstream_mapping(artifact.repository_id));
+
+    let (config, layer) = (synthetic_hash('c'), synthetic_hash('1'));
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&layer]),
+    );
+    storage.insert_content(config, stored_image_config(1));
+    proxy.fail_blob_with(
+        &format!("sha256:{layer}"),
+        DomainError::Invariant("upstream:network_error:connection refused".to_string()),
+    );
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed { findings, .. } = &outcome else {
+        panic!("a finding must be recorded on this attempt, got {outcome:?}");
+    };
+    assert_eq!(findings.len(), 1);
+}
+
+// ===========================================================================
+// Promotion: the composed-image verdict gains release authority
+// (ADR 0064 D6, the tightening half)
+//
+// Everything above holds for a policy at the default
+// `CompositeVerdictMode::Observed`. These pin what changes when an
+// operator promotes, and — as much to the point — what does not. The
+// composition flows through the path the manifest's own verdict already
+// takes: its findings join the run's accumulator and its *absence* joins
+// the run's abstentions, so the release gate reads it under ADR 0007's
+// existing predicate. Nothing here reads `composite_scan_observations`;
+// `crates/hort-app/tests/shadow_observation_has_no_authority.rs` is what
+// keeps that true structurally.
+// ===========================================================================
+
+/// Seed the two documents a two-layer composition is resolved from, plus
+/// both layers, into a hosted repository's storage. The shape every
+/// promotion test below starts from.
+fn seed_two_layer_composition(storage: &Arc<MockStoragePort>) {
+    let (config, lower, upper) = (
+        synthetic_hash('c'),
+        synthetic_hash('1'),
+        synthetic_hash('2'),
+    );
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&lower, &upper]),
+    );
+    storage.insert_content(config, stored_image_config(2));
+    storage.insert_content(lower, b"lower layer".to_vec());
+    storage.insert_content(upper, b"upper layer".to_vec());
+}
+
+/// A manifest-row scanner: the row's own bytes carry no package surface
+/// (exactly as today), and the composition answers `composite`.
+fn manifest_scanner(composite: DomainResult<ScanAnalysis>) -> Arc<MockScanner> {
+    Arc::new(
+        MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        )
+        .answering_composites_with(composite),
+    )
+}
+
+/// **Promoted, with a blocking finding: the manifest is rejected.** The
+/// composite findings are the manifest row's findings — they reach
+/// `record_scan_result` with the run's assessment exactly as a
+/// single-blob backend's would, and the gate rejects on them.
+///
+/// Asserted through `record_outcome` rather than stopping at the
+/// `ScanRunOutcome`, because "rejects the manifest" is a claim about the
+/// artifact and not about a struct: the committed batch has to carry the
+/// `ArtifactRejected`.
+#[tokio::test]
+async fn a_promoted_composite_finding_rejects_the_manifest() {
+    let scanner = manifest_scanner(Ok(ScanAnalysis::Analysed(vec![finding(
+        "pkg:deb/debian/openssl@1.1.1n-0+deb11u3",
+        "CVE-2022-COMPOSITE",
+        SeverityThreshold::Critical,
+    )])));
+    let (uc, events, storage, artifacts, repositories) = make_uc_under_policy(
+        seed_promoted_policy(vec!["trivy".into()]),
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    seed_two_layer_composition(&storage);
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    // The composition was assembled and handed over, as it is under
+    // `observed` too — promotion changes what the answer *does*, never
+    // whether the work happens.
+    assert_eq!(
+        scanner.seen_units(),
+        vec![ScanUnitShape::Blob, ScanUnitShape::Image(2)],
+    );
+
+    let ScanRunOutcome::Completed {
+        ref findings,
+        assessment,
+        ref scanner,
+        ..
+    } = outcome
+    else {
+        panic!("a promoted composition's verdict completes the run, got {outcome:?}");
+    };
+    assert_eq!(
+        assessment,
+        ScanAssessment::Analysed,
+        "the composition was assembled and examined, so the assessment is not `NotApplicable`"
+    );
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].vulnerability_id, "CVE-2022-COMPOSITE");
+    assert_eq!(
+        scanner, "composite",
+        "the audit label names the scan unit — a manifest's verdict being its composed \
+         image's is the one thing a reader of ScanCompleted cannot otherwise tell"
+    );
+
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    let batches = events.appended_batches();
+    assert!(
+        batches
+            .iter()
+            .flat_map(|b| b.events.iter())
+            .any(|e| matches!(&e.event, DomainEvent::ArtifactRejected(_))),
+        "a promoted composite finding must reject the manifest: {batches:?}"
+    );
+}
+
+/// **Promoted, with no findings: the manifest releases.** An empty
+/// finding list from an assembled, examined composition is a clean
+/// verdict — and it is recorded as `Analysed`, not as the
+/// `NotApplicable` the manifest's own surface-free bytes would have
+/// earned. Without that the trail would say "nothing to assess" about an
+/// image that was assembled and looked at.
+#[tokio::test]
+async fn a_promoted_clean_composition_completes_the_manifest_as_analysed() {
+    let scanner = manifest_scanner(Ok(ScanAnalysis::Analysed(vec![])));
+    let (uc, events, storage, artifacts, repositories) = make_uc_under_policy(
+        seed_promoted_policy(vec!["trivy".into()]),
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    seed_two_layer_composition(&storage);
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    let ScanRunOutcome::Completed {
+        ref findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("a clean promoted composition completes the run, got {outcome:?}");
+    };
+    assert_eq!(assessment, ScanAssessment::Analysed);
+    assert!(findings.is_empty(), "{findings:?}");
+
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    let events: Vec<_> = events
+        .appended_batches()
+        .into_iter()
+        .flat_map(|b| b.events.into_iter().map(|e| e.event))
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ScanCompleted(_))),
+        "a clean verdict is a ScanCompleted: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ArtifactRejected(_))),
+        "and nothing rejects it: {events:?}"
+    );
+}
+
+/// **A promoted composition that could not be produced holds the
+/// manifest `scan_indeterminate`.** This is the refusal half of the
+/// tightening: under `observed` an unassembled composition is a log line
+/// and a row, and under `promoted` it is the absent verdict ADR 0007
+/// fails closed on — the composition is the unit of filesystem
+/// assessment, so an image that was never assembled is an image whose
+/// filesystem went unassessed.
+///
+/// The refusal here is deterministic (a layer absent from a *hosted*
+/// repository, which has no upstream to acquire from), so nothing
+/// retries: re-running reads the same facts.
+#[tokio::test]
+async fn a_promoted_deterministic_refusal_holds_the_manifest_indeterminate() {
+    let scanner = manifest_scanner(Ok(ScanAnalysis::Analysed(vec![])));
+    let (uc, events, storage, artifacts, repositories) = make_uc_under_policy(
+        seed_promoted_policy(vec!["trivy".into()]),
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+
+    // The manifest and its config, but not the layer it declares. The
+    // harness wires an empty upstream resolver, so this repository is
+    // hosted and the absence is final.
+    let (config, layer) = (synthetic_hash('c'), synthetic_hash('1'));
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&layer]),
+    );
+    storage.insert_content(config, stored_image_config(1));
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    assert!(
+        !scanner
+            .seen_units()
+            .iter()
+            .any(|u| matches!(u, ScanUnitShape::Image(_))),
+        "no scanner is pointed at a partial layout — completeness is a precondition of a \
+         verdict, never something the scan recovers from"
+    );
+    let ScanRunOutcome::NothingAnalysable { ref reason, .. } = outcome else {
+        panic!("a promoted composition that was never assembled has no verdict, got {outcome:?}");
+    };
+    assert!(
+        reason.contains("composite=incomplete_composition"),
+        "the breakdown must name the composed unit and its fail-closed reason: {reason}"
+    );
+
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "the manifest holds fail-closed"
+    );
+    let appended: Vec<_> = events
+        .appended_batches()
+        .into_iter()
+        .flat_map(|b| b.events.into_iter().map(|e| e.event))
+        .collect();
+    assert!(
+        !appended
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ScanCompleted(_))),
+        "and never records a clean ScanCompleted for an image nobody assembled: {appended:?}"
+    );
+}
+
+/// **A promoted composition the backend ran over and found nothing
+/// analysable in also holds — and reaches the manifest under its own
+/// name.** `NoAnalyzerMatched` over a [`ScanUnit::Image`] cannot mean
+/// "no package surface by construction": a composition *is* the thing
+/// that was supposed to be assessed. Both it and "I could not build the
+/// image" reach the same fail-closed hold, so nothing is mis-decided —
+/// but they are different facts, and the one the release gate records
+/// has to be the one that happened.
+///
+/// `incomplete_composition` says a constituent was missing, unreadable
+/// or over budget, and all three are false of a composition that was
+/// assembled and that every backend abstained on.
+#[tokio::test]
+async fn a_promoted_composition_with_no_analyzer_match_holds_the_manifest() {
+    let scanner = manifest_scanner(Ok(ScanAnalysis::NothingAnalysable(
+        NotAnalysable::NoAnalyzerMatched,
+    )));
+    let (uc, _events, storage, artifacts, repositories) = make_uc_under_policy(
+        seed_promoted_policy(vec!["trivy".into()]),
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    seed_two_layer_composition(&storage);
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    let ScanRunOutcome::NothingAnalysable { ref reason, .. } = outcome else {
+        panic!("an abstention over an assembled composition has no verdict, got {outcome:?}");
+    };
+    assert!(
+        reason.contains("composite=no_analyzer_matched"),
+        "the composition was complete and the scanners claimed nothing in it: {reason}"
+    );
+    assert!(
+        !reason.contains("incomplete_composition"),
+        "no constituent was missing, unreadable or over budget: {reason}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The obligation moves: a constituent under a promoted policy
+// (ADR 0064 D2 + D6)
+// ---------------------------------------------------------------------------
+
+/// [`finding`] as the Trivy adapter produces it from a
+/// `Vulnerabilities` entry: a claim about the filesystem the materialised
+/// bytes compose into. Which filesystem that is — the artifact's own or
+/// the one it is a constituent of — is the orchestrator's to place, so
+/// these tests state the producer's half and let the pass under test
+/// resolve the rest.
+fn filesystem_finding(vuln: &str, sev: SeverityThreshold) -> Finding {
+    let mut f = finding("pkg:deb/debian/openssl@1.1.1n-0+deb11u3", vuln, sev);
+    f.statement = FindingStatement::Filesystem;
+    f
+}
+
+/// And what a secrets or malware backend would stamp: a claim about the
+/// bytes, true of them however they are composed. No backend hort ships
+/// produces one, which is exactly why the line is drawn now.
+fn byte_statement_finding(vuln: &str, sev: SeverityThreshold) -> Finding {
+    let mut f = finding("pkg:deb/debian/openssl@1.1.1n-0+deb11u3", vuln, sev);
+    f.statement = FindingStatement::Bytes;
+    f
+}
+
+/// One OCI **blob** scan — a constituent — under the policy the caller
+/// supplies, driven through `run_scan` + `record_outcome` so the
+/// assertion is about the artifact row and the events rather than about
+/// a struct.
+#[allow(clippy::type_complexity)]
+async fn constituent_scan(
+    policy: ScanPolicyProjection,
+    analysis: DomainResult<ScanAnalysis>,
+) -> (
+    ScanRunOutcome,
+    Arc<MockEventStore>,
+    Arc<MockArtifactRepository>,
+    Uuid,
+    ScanOrchestrationUseCase,
+    ScanJob,
+) {
+    let scanner = Arc::new(MockScanner::with_analysis("trivy", analysis));
+    let (uc, events, _storage, artifacts, repositories) = make_uc_under_policy(
+        policy,
+        one_scanner(scanner),
+        handler_map("oci", ArtifactKind::OciBlob),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    (outcome, events, artifacts, artifact_id, uc, job)
+}
+
+fn committed_events(events: &Arc<MockEventStore>) -> Vec<DomainEvent> {
+    events
+        .appended_batches()
+        .into_iter()
+        .flat_map(|b| b.events.into_iter().map(|e| e.event))
+        .collect()
+}
+
+/// **The pair the loosening is, end to end.** Same layer, same critical
+/// finding, same promoted policy — and the only difference is what the
+/// finding is a statement about.
+///
+/// A claim about the filesystem this layer composes in isolation stops
+/// condemning it: the composition that binds it is assessed as one unit
+/// and carries the filesystem verdict (ADR 0064 D2). A claim about the
+/// layer's bytes still condemns it, because no composition changes
+/// whether a leaked key is in them.
+///
+/// Both halves assert the *artifact*, not the outcome struct, and both
+/// assert the finding is still **recorded**: the obligation moves, and
+/// the evidence stays where it was. A test that showed only the first
+/// half would be satisfied by a rule that disarmed every finding class.
+#[tokio::test]
+async fn under_promotion_a_constituents_filesystem_finding_stops_condemning_it_and_its_bytes_do_not(
+) {
+    let (outcome, events, artifacts, artifact_id, uc, job) = constituent_scan(
+        seed_promoted_policy(vec!["trivy".into()]),
+        Ok(ScanAnalysis::Analysed(vec![filesystem_finding(
+            "CVE-2022-FILESYSTEM",
+            SeverityThreshold::Critical,
+        )])),
+    )
+    .await;
+    let ScanRunOutcome::Completed {
+        ref findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("the layer was examined, so its run completes: {outcome:?}");
+    };
+    assert_eq!(assessment, ScanAssessment::Analysed);
+    assert_eq!(
+        findings.len(),
+        1,
+        "the finding is evidence and stays in the record: {findings:?}"
+    );
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    let appended = committed_events(&events);
+    assert!(
+        appended
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ScanCompleted(_))),
+        "the scan completed and is recorded: {appended:?}"
+    );
+    assert!(
+        !appended
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ArtifactRejected(_))),
+        "a constituent's isolated package set must not condemn it once its          composition carries the filesystem verdict: {appended:?}"
+    );
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::Quarantined,
+        "the layer stays on its own observation window, unrejected"
+    );
+
+    // The other half of the pair: the same artifact, the same policy, a
+    // statement about the bytes.
+    let (outcome, events, artifacts, artifact_id, uc, job) = constituent_scan(
+        seed_promoted_policy(vec!["trivy".into()]),
+        Ok(ScanAnalysis::Analysed(vec![byte_statement_finding(
+            "CVE-2022-BYTES",
+            SeverityThreshold::Critical,
+        )])),
+    )
+    .await;
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    let appended = committed_events(&events);
+    assert!(
+        appended
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ArtifactRejected(_))),
+        "a statement about these bytes is true of them however they are          composed, so it keeps gating its own artifact: {appended:?}"
+    );
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::Rejected,
+    );
+}
+
+/// **An unpromoted repository is byte-for-byte unchanged**, over every
+/// finding class and every refusal class a constituent can produce.
+///
+/// This is the test that says the loosening is an operator's act and
+/// nothing else: the same inputs the promoted tests above and below use,
+/// under the default posture, reach exactly the outcomes they reached
+/// before ADR 0064 D2 — a critical finding rejects whatever it is a
+/// statement about, and every gating refusal holds.
+#[tokio::test]
+async fn an_unpromoted_constituent_gates_exactly_as_today_on_every_class() {
+    for finding_under_test in [
+        filesystem_finding("CVE-2022-FILESYSTEM", SeverityThreshold::Critical),
+        byte_statement_finding("CVE-2022-BYTES", SeverityThreshold::Critical),
+        finding(
+            "pkg:deb/debian/openssl@1.1.1n-0+deb11u3",
+            "CVE-2022-UNSTATED",
+            SeverityThreshold::Critical,
+        ),
+    ] {
+        let statement = finding_under_test.statement;
+        let (outcome, events, artifacts, artifact_id, uc, job) = constituent_scan(
+            seed_global_policy(vec!["trivy".into()]),
+            Ok(ScanAnalysis::Analysed(vec![finding_under_test])),
+        )
+        .await;
+        uc.record_outcome(&job, outcome)
+            .await
+            .expect("record_outcome");
+        assert!(
+            committed_events(&events)
+                .iter()
+                .any(|e| matches!(e, DomainEvent::ArtifactRejected(_))),
+            "{statement}: an unpromoted repository rejects on every finding class"
+        );
+        assert_eq!(
+            artifacts
+                .get(artifact_id)
+                .expect("the artifact row")
+                .quarantine_status,
+            QuarantineStatus::Rejected,
+            "{statement}"
+        );
+    }
+
+    for refusal in [
+        NotAnalysable::UnsupportedContainer,
+        NotAnalysable::UnusableArchive,
+        NotAnalysable::NoAnalyzerMatched,
+        NotAnalysable::IncompleteComposition,
+    ] {
+        let (outcome, _events, artifacts, artifact_id, uc, job) = constituent_scan(
+            seed_global_policy(vec!["trivy".into()]),
+            Ok(ScanAnalysis::NothingAnalysable(refusal)),
+        )
+        .await;
+        assert!(
+            matches!(outcome, ScanRunOutcome::NothingAnalysable { .. }),
+            "{refusal}: an unassessed surface has no verdict, got {outcome:?}"
+        );
+        uc.record_outcome(&job, outcome)
+            .await
+            .expect("record_outcome");
+        assert_eq!(
+            artifacts
+                .get(artifact_id)
+                .expect("the artifact row")
+                .quarantine_status,
+            QuarantineStatus::ScanIndeterminate,
+            "{refusal}: an unpromoted constituent holds fail-closed"
+        );
+    }
+
+    // And the one refusal that has never gated, under the same posture.
+    let (outcome, _events, _artifacts, _id, _uc, _job) = constituent_scan(
+        seed_global_policy(vec!["trivy".into()]),
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// **The refusal pair, end to end.** On a constituent under a promoted
+/// policy, "I have no decoder for this container" stops holding the
+/// layer — the composition decodes it, and `tar+zstd` is ADR 0064 D2's
+/// measured case — while "this archive tripped an extraction bound" or
+/// "an entry tried to escape the workspace" keeps holding it.
+///
+/// Asserted together, because dropping both would disarm the zip-bomb
+/// refusal and dropping neither would leave the `tar+zstd` layer
+/// terminal with ADR 0062 withholding every image that binds it, which
+/// is the defect this moves. The non-gating side lands on a completed
+/// not-applicable assessment — scan authority exists, so the layer
+/// releases on its own time gate rather than waiting forever on an
+/// assessment that belongs to its composition.
+#[tokio::test]
+async fn a_promoted_constituent_stops_holding_on_a_missing_decoder_but_not_on_a_hostile_archive() {
+    let (outcome, _events, artifacts, artifact_id, uc, job) = constituent_scan(
+        seed_promoted_policy(vec!["trivy".into()]),
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::UnsupportedContainer,
+        )),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "a missing decoder is a statement about hort, not about the layer: {outcome:?}"
+    );
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    assert_ne!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "nothing holds the layer for an assessment its composition carries"
+    );
+
+    let (outcome, _events, artifacts, artifact_id, uc, job) = constituent_scan(
+        seed_promoted_policy(vec!["trivy".into()]),
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::UnusableArchive,
+        )),
+    )
+    .await;
+    assert!(
+        matches!(outcome, ScanRunOutcome::NothingAnalysable { .. }),
+        "an extraction bound tripped is about these bytes: {outcome:?}"
+    );
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "a hostile archive holds the layer wherever its filesystem verdict lives"
+    );
+}
+
+/// And the other refusals keep holding a promoted constituent too — only
+/// the missing decoder moved. Stated separately from the pair above
+/// because this is about the rest of the enum: a refusal that drifted
+/// onto the non-gating side would release a layer nothing assessed.
+#[tokio::test]
+async fn a_promoted_constituent_still_holds_on_every_other_refusal() {
+    for refusal in [
+        NotAnalysable::UnusableArchive,
+        NotAnalysable::NoAnalyzerMatched,
+        NotAnalysable::IncompleteComposition,
+    ] {
+        let (outcome, _events, artifacts, artifact_id, uc, job) = constituent_scan(
+            seed_promoted_policy(vec!["trivy".into()]),
+            Ok(ScanAnalysis::NothingAnalysable(refusal)),
+        )
+        .await;
+        uc.record_outcome(&job, outcome)
+            .await
+            .expect("record_outcome");
+        assert_eq!(
+            artifacts
+                .get(artifact_id)
+                .expect("the artifact row")
+                .quarantine_status,
+            QuarantineStatus::ScanIndeterminate,
+            "{refusal} is not the statement ADR 0064 D2 moves"
+        );
+    }
+}
+
+/// **A promoted policy does not loosen a format ADR 0064 leaves
+/// undecided.** The same statement on an npm tarball still condemns it:
+/// an installed npm tree is also a composition hort never assembles, but
+/// the analysis unit differs per format and the measurement behind
+/// ADR 0064 says nothing about them ("Not decided here").
+///
+/// This is the test that scopes the loosening. `compositeVerdictMode` is
+/// a `ScanPolicy` field and a **global** policy reaches every repository,
+/// so an operator promoting the composite verdict for their OCI estate
+/// must not thereby disarm their npm one.
+#[tokio::test]
+async fn promotion_does_not_loosen_a_format_adr_0064_leaves_undecided() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::Analysed(vec![filesystem_finding(
+            "CVE-2022-NPM",
+            SeverityThreshold::Critical,
+        )])),
+    ));
+    let (uc, events, _storage, artifacts, repositories) = make_uc_under_policy(
+        seed_promoted_policy(vec!["trivy".into()]),
+        one_scanner(scanner),
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, "npm");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    assert!(
+        committed_events(&events)
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ArtifactRejected(_))),
+        "an npm tarball is not a constituent of a composition hort assembles"
+    );
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::Rejected,
+    );
+}
+
+/// **A promoted OCI *manifest* keeps condemning on its composition's
+/// findings.** The mirror of the loosening, and the assertion that says
+/// the obligation **moved** rather than evaporating: the composite
+/// verdict's findings are about the filesystem the manifest *is*, so
+/// nothing takes their authority away.
+///
+/// Without this the two halves of ADR 0064 D2 could both be satisfied by
+/// a rule that disarmed every filesystem claim in the system.
+#[tokio::test]
+async fn a_promoted_manifests_composite_findings_still_condemn_it() {
+    let scanner = manifest_scanner(Ok(ScanAnalysis::Analysed(vec![finding(
+        "pkg:deb/debian/openssl@1.1.1n-0+deb11u3",
+        "CVE-2022-COMPOSITION",
+        SeverityThreshold::Critical,
+    )])));
+    let (uc, events, storage, artifacts, repositories) = make_uc_under_policy(
+        seed_promoted_policy(vec!["trivy".into()]),
+        one_scanner(scanner),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    seed_two_layer_composition(&storage);
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::Rejected,
+        "the composition is the filesystem its own findings are about"
+    );
+    assert!(committed_events(&events)
+        .iter()
+        .any(|e| matches!(e, DomainEvent::ArtifactRejected(_))));
+}
+
+/// **An image index is unaffected by promotion** (ADR 0064 D5). An index
+/// binds references rather than a runnable filesystem, so there is
+/// nothing to compose — and promotion must not make it gate on a
+/// composition it does not have. The row keeps the not-applicable
+/// assessment its own generic-manifest lifecycle gives it.
+#[tokio::test]
+async fn promotion_does_not_make_an_image_index_gate() {
+    let scanner = manifest_scanner(Ok(ScanAnalysis::Analysed(vec![finding(
+        "pkg:deb/debian/openssl@1.1.1n-0+deb11u3",
+        "CVE-2022-NEVER-ASKED",
+        SeverityThreshold::Critical,
+    )])));
+    let (uc, _events, storage, artifacts, repositories) = make_uc_under_policy(
+        seed_promoted_policy(vec!["trivy".into()]),
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    storage.insert_content(VALID_SHA256.parse().unwrap(), stored_image_index());
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    assert!(
+        !scanner
+            .seen_units()
+            .iter()
+            .any(|u| matches!(u, ScanUnitShape::Image(_))),
+        "an index is never composed, so the critical finding above is never asked for"
+    );
+    let ScanRunOutcome::Completed {
+        ref findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("an index keeps its own completed assessment, got {outcome:?}");
+    };
+    assert_eq!(
+        assessment,
+        ScanAssessment::NotApplicable,
+        "promotion leaves an index's not-applicable assessment exactly as it was"
+    );
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+/// **A config blob that is not an image config document resolves to
+/// "nothing to compose", and under promotion that stays non-gating.** An
+/// artifact manifest — a cosign signature, an SBOM attachment, a Helm
+/// chart — is a legitimate population, not an unassessed image, so
+/// refusing it would withhold a large share of every OCI estate on the
+/// strength of an image it was never supposed to be.
+#[tokio::test]
+async fn promotion_does_not_gate_an_artifact_manifest() {
+    let scanner = manifest_scanner(Ok(ScanAnalysis::Analysed(vec![])));
+    let (uc, _events, storage, artifacts, repositories) = make_uc_under_policy(
+        seed_promoted_policy(vec!["trivy".into()]),
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+
+    let (config, layer) = (synthetic_hash('c'), synthetic_hash('1'));
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&layer]),
+    );
+    // A cosign signature's config blob: not an image config document.
+    storage.insert_content(config, br#"{}"#.to_vec());
+    storage.insert_content(layer, b"signature payload".to_vec());
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    let ScanRunOutcome::Completed {
+        ref findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("an artifact manifest keeps its own completed assessment, got {outcome:?}");
+    };
+    assert_eq!(assessment, ScanAssessment::NotApplicable);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+/// **A promoted composition's blocking verdict under
+/// `enforcement: record` is recorded and not enforced** — the same
+/// withholding every layer finding already gets, reached on a new axis.
+/// So promotion plus `record` is a posture that measures findings and
+/// enforces none of them.
+///
+/// It is **not** a posture that gates nothing, and this test pins the
+/// half of that sentence that is easy to get wrong: `record` is read by
+/// `evaluate_scan_result`, which only ever sees a finding list, so the
+/// *refusal* path — which has no finding list and goes through
+/// `record_scan_indeterminate` — is untouched by it. That is why
+/// `promoted` × `record` is not a lint: one of its two halves still
+/// holds artifacts, so an operator who set it has not disarmed the
+/// promotion, only its rejections.
+#[tokio::test]
+async fn under_record_enforcement_a_promoted_composite_finding_is_recorded_not_enforced() {
+    let scanner = manifest_scanner(Ok(ScanAnalysis::Analysed(vec![finding(
+        "pkg:deb/debian/openssl@1.1.1n-0+deb11u3",
+        "CVE-2022-COMPOSITE",
+        SeverityThreshold::Critical,
+    )])));
+    let policy = ScanPolicyProjection {
+        enforcement: ScanEnforcement::Record,
+        ..seed_promoted_policy(vec!["trivy".into()])
+    };
+    let (uc, events, storage, artifacts, repositories) = make_uc_under_policy(
+        policy,
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    seed_two_layer_composition(&storage);
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+
+    let appended: Vec<_> = events
+        .appended_batches()
+        .into_iter()
+        .flat_map(|b| b.events.into_iter().map(|e| e.event))
+        .collect();
+    let failed = appended.iter().any(|e| {
+        matches!(
+            e,
+            DomainEvent::PolicyEvaluated(p)
+                if p.result == hort_domain::events::PolicyResult::Fail
+        )
+    });
+    assert!(
+        failed,
+        "the verdict is computed and audited exactly as under `reject`: {appended:?}"
+    );
+    assert!(
+        !appended
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ArtifactRejected(_))),
+        "`record` withholds the transition: {appended:?}"
+    );
+}
+
+/// **`record` does not withhold the refusal.** The companion to the test
+/// above, and the correction it exists for: a promoted composition that
+/// could not be produced holds the manifest `scan_indeterminate` under
+/// `enforcement: record` exactly as under `reject`, because
+/// `record_scan_indeterminate` never consults the enforcement mode —
+/// there is no finding list for `evaluate_scan_result` to withhold a
+/// verdict over.
+#[tokio::test]
+async fn record_enforcement_does_not_withhold_a_promoted_compositions_absence() {
+    let scanner = manifest_scanner(Ok(ScanAnalysis::Analysed(vec![])));
+    let policy = ScanPolicyProjection {
+        enforcement: ScanEnforcement::Record,
+        ..seed_promoted_policy(vec!["trivy".into()])
+    };
+    let (uc, _events, storage, artifacts, repositories) = make_uc_under_policy(
+        policy,
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+
+    // Manifest + config present, the declared layer absent, hosted
+    // repository: a deterministic refusal.
+    let (config, layer) = (synthetic_hash('c'), synthetic_hash('1'));
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&layer]),
+    );
+    storage.insert_content(config, stored_image_config(1));
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    assert!(
+        matches!(outcome, ScanRunOutcome::NothingAnalysable { .. }),
+        "got {outcome:?}"
+    );
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "the hold is not an `enforcement` decision and `record` cannot waive it"
+    );
+}
+
+/// **A later composite rejection on an already-released manifest behaves
+/// exactly as a later single-blob rejection does today** — the
+/// `trust_upstream_publish_time` row of the cross-opt-in matrix. That
+/// opt-in can collapse the observation window so a manifest releases
+/// before its composite scan has run, and the verdict then arrives on a
+/// released artifact. That is the ordinary rescan path and not a new
+/// case, which this pins by construction: the composite findings reach
+/// `record_scan_result` through the same argument a backend's do, so a
+/// timer-released artifact is re-blocked by one exactly as by the other.
+#[tokio::test]
+async fn a_promoted_composite_rejection_reblocks_a_timer_released_manifest() {
+    let scanner = manifest_scanner(Ok(ScanAnalysis::Analysed(vec![finding(
+        "pkg:deb/debian/openssl@1.1.1n-0+deb11u3",
+        "CVE-2022-COMPOSITE",
+        SeverityThreshold::Critical,
+    )])));
+    let (uc, events, storage, artifacts, repositories) = make_uc_under_policy(
+        seed_promoted_policy(vec!["trivy".into()]),
+        one_scanner(scanner.clone()),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    seed_two_layer_composition(&storage);
+
+    // The manifest already released on the quarantine timer — which is
+    // what `trust_upstream_publish_time` makes reachable before the
+    // composite scan has ever run.
+    let mut artifact = artifacts
+        .find_by_id(artifact_id)
+        .await
+        .expect("the seeded artifact");
+    artifact.quarantine_status = QuarantineStatus::Released;
+    artifacts.insert(artifact);
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+
+    assert!(
+        events
+            .appended_batches()
+            .iter()
+            .flat_map(|b| b.events.iter())
+            .any(|e| matches!(&e.event, DomainEvent::ArtifactRejected(_))),
+        "a timer release does not outweigh a fresh blocking verdict, whichever unit \
+         produced it"
+    );
+}
+
+/// **The observation row is written under promotion too, and agrees with
+/// what happened.** Once promoted, `composite_findings_decision` stops
+/// being a counterfactual and becomes a record of what also happened —
+/// which is how an operator confirms the promotion is behaving as the
+/// measurement predicted. The row's two columns stay per-axis either
+/// way, and for an image manifest — whose own bytes carry no package
+/// surface — the primary column is the clean one.
+#[tokio::test]
+async fn a_promoted_run_still_records_its_observation_and_the_row_agrees() {
+    let scanner = manifest_scanner(Ok(ScanAnalysis::Analysed(vec![finding(
+        "pkg:deb/debian/openssl@1.1.1n-0+deb11u3",
+        "CVE-2022-COMPOSITE",
+        SeverityThreshold::Critical,
+    )])));
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_promoted_policy(vec!["trivy".into()]));
+    let (
+        uc,
+        _jobs,
+        _events,
+        storage,
+        artifacts,
+        repositories,
+        _policy,
+        _metadata,
+        _proxy,
+        _resolver,
+        observations,
+    ) = make_uc_with_upstream(
+        one_scanner(scanner.clone()),
+        Arc::new(MockAdvisory::ok(vec![])),
+        policy_projections,
+        handler_map("oci", ArtifactKind::OciManifest),
+        ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        Arc::new(MockUpstreamResolver::new()),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    seed_two_layer_composition(&storage);
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    let rows = observations.rows();
+    assert_eq!(rows.len(), 1, "one row per assessment, promoted or not");
+    assert_eq!(rows[0].assessment, CompositeAssessment::Assessed);
+    assert_eq!(
+        rows[0].composite_findings_decision,
+        Some(GateDecision::Reject),
+        "under promotion this column is what also happened, not what would have"
+    );
+    assert_eq!(
+        rows[0].primary_findings_decision,
+        GateDecision::Clean,
+        "the manifest's own bytes carry no package surface, so the primary axis is clean \
+         — which is why the committed verdict equals the composite column"
+    );
+    let ScanRunOutcome::Completed { ref findings, .. } = outcome else {
+        panic!("got {outcome:?}");
+    };
+    assert_eq!(
+        findings.len(),
+        1,
+        "and the committed finding set is the composite one the row reports on"
+    );
+}
+
+/// **A promoted composition's transient refusal, once the attempt budget
+/// is spent, holds the manifest.** The retry request and its three
+/// guards are unchanged by promotion — a transient refusal still asks
+/// for another attempt first, because with acquisition an unreachable
+/// upstream is the routine failure rather than a statement about the
+/// image. What promotion changes is where the *declined* request lands:
+/// under `observed` the run records the manifest's own not-applicable
+/// assessment, and under `promoted` the composition's absence is the
+/// manifest's unassessed filesystem.
+#[tokio::test]
+async fn a_promoted_transient_refusal_holds_the_manifest_once_the_budget_is_spent() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_promoted_policy(vec!["trivy".into()]));
+    let (
+        uc,
+        _jobs,
+        _events,
+        storage,
+        artifacts,
+        repositories,
+        _policy,
+        _metadata,
+        proxy,
+        resolver,
+        _observations,
+    ) = make_uc_with_upstream(
+        one_scanner(scanner.clone()),
+        Arc::new(MockAdvisory::ok(vec![])),
+        policy_projections,
+        handler_map("oci", ArtifactKind::OciManifest),
+        ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        Arc::new(MockUpstreamResolver::new()),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let artifact = artifacts
+        .find_by_id(artifact_id)
+        .await
+        .expect("the seeded artifact");
+    resolver.insert(composite_upstream_mapping(artifact.repository_id));
+
+    let (config, layer) = (synthetic_hash('c'), synthetic_hash('1'));
+    storage.insert_content(
+        VALID_SHA256.parse().unwrap(),
+        stored_image_manifest(&config, &[&layer]),
+    );
+    storage.insert_content(config, stored_image_config(1));
+    proxy.fail_blob_with(
+        &format!("sha256:{layer}"),
+        DomainError::Invariant("upstream:timeout:deadline exceeded".to_string()),
+    );
+
+    // Attempt 1 of 5: the request is granted and nothing holds yet —
+    // identical to the unpromoted run, because whether a composition can
+    // be *produced* does not depend on whose verdict it would be.
+    let first = uc
+        .run_scan(&scan_job_for_format(artifact_id, "oci"))
+        .await
+        .expect("run_scan");
+    assert!(
+        matches!(first, ScanRunOutcome::Failed(_)),
+        "a transient refusal earns its retry under promotion too: {first:?}"
+    );
+
+    // Attempt 5 of 5: the request is declined, and now the absence is
+    // the manifest's.
+    let last_attempt = ScanJob {
+        format: "oci".to_string(),
+        ..sample_scan_job(artifact_id, 5)
+    };
+    let outcome = uc.run_scan(&last_attempt).await.expect("run_scan");
+    let ScanRunOutcome::NothingAnalysable { ref reason, .. } = outcome else {
+        panic!(
+            "with the budget spent and nothing composed, a promoted manifest has no verdict, \
+             got {outcome:?}"
+        );
+    };
+    assert!(
+        reason.contains("composite=incomplete_composition"),
+        "{reason}"
+    );
+
+    uc.record_outcome(&last_attempt, outcome)
+        .await
+        .expect("record_outcome");
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
     );
 }

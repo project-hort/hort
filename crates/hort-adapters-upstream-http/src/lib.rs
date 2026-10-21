@@ -2294,57 +2294,29 @@ fn map_reqwest_status(status: StatusCode) -> UpstreamErrorKind {
 /// Build a `DomainError::Invariant` with a sentinel prefix the
 /// caller can parse back into [`UpstreamErrorKind`]. Format:
 /// `upstream:<kind>:<detail>`.
+///
+/// Both halves of that codec live on the enum — see
+/// [`UpstreamErrorKind::into_domain_error`] — so the prefix and the kind
+/// table are stated once rather than once per direction. This stays as a
+/// free function because it is spelled at a dozen call sites in this file.
 fn classified_error(kind: UpstreamErrorKind, detail: &str) -> DomainError {
-    DomainError::Invariant(format!("upstream:{}:{}", kind.as_str(), detail))
+    kind.into_domain_error(detail)
 }
 
 /// Extract an [`UpstreamErrorKind`] back out of a sentinel-prefixed
-/// `DomainError`. Returns `None` for non-sentinel errors. Used by the
-/// upstream-http adapter to fire `hort_upstream_fetch_total` with the
-/// right `result` label without a custom error type leaking past the
-/// port boundary.
+/// `DomainError`. Returns `None` for non-sentinel errors. Used here to
+/// fire `hort_upstream_fetch_total` with the right `result` label without
+/// a custom error type leaking past the port boundary.
+///
+/// The table itself lives with the enum, as
+/// [`UpstreamErrorKind::from_domain_error`] — the decode half of
+/// `classified_error`'s encode, in the one place both halves can be read
+/// together. This re-export keeps the adapter's long-standing call sites
+/// spelled as they were and gives consumers outside this crate (the scan
+/// worker's constituent acquisition is the first) the same decoder rather
+/// than a second one.
 pub fn classify_error(err: &DomainError) -> Option<UpstreamErrorKind> {
-    // The typed storage-backstop variant carries its own honest `result`
-    // label (`metadata_too_large` / `manifest_too_large`), NOT the
-    // retired generic `body_too_large` that the buffer-cap path used to
-    // emit. The operator sees the right label and reaches for the right
-    // knob, instead of debugging the "upstream unavailable" sanitisation
-    // the metric label would have led them into (ADR 0026).
-    if let DomainError::UpstreamBodyTooLarge { fetch_class, .. } = err {
-        return Some(match fetch_class {
-            FetchClass::Metadata => UpstreamErrorKind::MetadataTooLarge,
-            FetchClass::Manifest => UpstreamErrorKind::ManifestTooLarge,
-        });
-    }
-    let DomainError::Invariant(msg) = err else {
-        return None;
-    };
-    let rest = msg.strip_prefix("upstream:")?;
-    let (kind_str, _) = rest.split_once(':')?;
-    Some(match kind_str {
-        "success" => UpstreamErrorKind::Success,
-        "not_found" => UpstreamErrorKind::NotFound,
-        "unauthorized" => UpstreamErrorKind::Unauthorized,
-        "rate_limited" => UpstreamErrorKind::RateLimited,
-        "upstream_4xx" => UpstreamErrorKind::Upstream4xx,
-        "upstream_5xx" => UpstreamErrorKind::Upstream5xx,
-        "network_error" => UpstreamErrorKind::NetworkError,
-        "timeout" => UpstreamErrorKind::Timeout,
-        "checksum_mismatch" => UpstreamErrorKind::ChecksumMismatch,
-        "parse_error" => UpstreamErrorKind::ParseError,
-        "body_too_large" => UpstreamErrorKind::BodyTooLarge,
-        // Reserved sentinel parses for parity with the catalog.
-        // Production emission uses the typed variant above; these arms
-        // keep `classify_error` total when a future caller emits via
-        // `classified_error` (e.g. tests).
-        "metadata_too_large" => UpstreamErrorKind::MetadataTooLarge,
-        "manifest_too_large" => UpstreamErrorKind::ManifestTooLarge,
-        "version_object_too_large" => UpstreamErrorKind::VersionObjectTooLarge,
-        // TLS-handshake outcomes (ADR 0010).
-        "pin_mismatch" => UpstreamErrorKind::PinMismatch,
-        "ca_unknown" => UpstreamErrorKind::CaUnknown,
-        _ => return None,
-    })
+    UpstreamErrorKind::from_domain_error(err)
 }
 
 /// Render a [`SecretSource`] as the snake_case literal that the

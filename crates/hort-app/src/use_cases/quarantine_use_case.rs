@@ -39,8 +39,8 @@ use hort_domain::ports::scan_findings_repository::ScanFindingsRow;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::sbom::Sbom;
 use hort_domain::types::{
-    highest_severity, severity_label, severity_summary_from_findings, ArtifactCoords, ContentHash,
-    Finding,
+    highest_severity, severity_label, severity_summary_from_findings, ArtifactCoords, ArtifactKind,
+    ContentHash, Finding,
 };
 use tokio::io::AsyncReadExt;
 
@@ -1195,6 +1195,16 @@ impl QuarantineUseCase {
     /// (e.g. an opaque format with no manifest), and stale-row
     /// cleanup for retired SBOMs is a future concern.
     ///
+    /// **`kind` parameter.** What the artifact's own format handler said
+    /// its bytes are, resolved by the scan run that produced `findings`
+    /// and carried here on its `ScanRunOutcome`. An assessment input, not
+    /// an audit label: [`evaluate_scan_result`] spends it on ADR 0064
+    /// D2's role half, deciding whether a finding's filesystem claim is
+    /// about this row or about the composition above it. Taken from the
+    /// caller rather than re-resolved here so the kind the scanner
+    /// materialised the payload under and the kind the verdict is taken
+    /// under cannot differ for one run.
+    ///
     /// **`assessment` parameter.** Lands verbatim on
     /// `ScanCompleted.assessment`. [`ScanAssessment::NotApplicable`]
     /// records a completed assessment of an artifact with no package
@@ -1211,6 +1221,7 @@ impl QuarantineUseCase {
         scanner: String,
         findings: Vec<Finding>,
         assessment: ScanAssessment,
+        kind: ArtifactKind,
         sbom: Option<&Sbom>,
     ) -> AppResult<()> {
         let stream_id = StreamId::artifact(artifact_id);
@@ -1317,7 +1328,8 @@ impl QuarantineUseCase {
         let mut artifact = paired.into_artifact();
 
         // Step 4 — evaluate per-finding outcome.
-        let outcome = evaluate_scan_result(&coords, &findings, policy.as_ref(), &exclusions, now);
+        let outcome =
+            evaluate_scan_result(&coords, kind, &findings, policy.as_ref(), &exclusions, now);
 
         let prior_findings: Vec<Finding> = match prior.as_ref() {
             Some((event, _ts)) => self.hydrate_prior_findings(event).await?,
@@ -2409,8 +2421,8 @@ mod tests {
 
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::scan_policy::{
-        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection,
-        SeverityThreshold,
+        CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode,
+        ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::events::{
         system_actor, Actor, DomainEvent, PersistedEvent, PolicyResult, PolicyScope, ReleaseReason,
@@ -2430,6 +2442,13 @@ mod tests {
     use crate::use_cases::test_support::*;
 
     use crate::use_cases::test_support::MockArtifactLifecycle;
+
+    /// The kind every test below records a scan result under unless it is
+    /// about ADR 0064 D2's role half: a row that is **not** a composition
+    /// constituent, so no stored statement can be what produced the
+    /// verdict being asserted. The constituent cases name
+    /// [`ArtifactKind::OciBlob`] literally.
+    const TEST_SCAN_KIND: ArtifactKind = ArtifactKind::NpmTarball;
 
     // -- Metric helpers -------------------------------------------------------
 
@@ -2646,6 +2665,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: hort_domain::types::FindingStatement::Unstated,
             });
         }
         for i in 0..severity.high {
@@ -2662,6 +2682,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: hort_domain::types::FindingStatement::Unstated,
             });
         }
         for i in 0..severity.medium {
@@ -2678,6 +2699,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: hort_domain::types::FindingStatement::Unstated,
             });
         }
         for i in 0..severity.low {
@@ -2694,6 +2716,7 @@ mod tests {
                 informational_class: None,
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: hort_domain::types::FindingStatement::Unstated,
             });
         }
         out
@@ -2941,6 +2964,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -3318,6 +3342,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -3449,6 +3474,7 @@ mod tests {
             "trivy".into(),
             one_critical_finding(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -3504,6 +3530,7 @@ mod tests {
             "trivy".into(),
             one_critical_finding(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -3539,6 +3566,7 @@ mod tests {
             "trivy".into(),
             one_critical_finding(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -3590,6 +3618,7 @@ mod tests {
             "trivy".into(),
             one_critical_finding(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -3629,6 +3658,7 @@ mod tests {
             "trivy".into(),
             one_critical_finding(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -3671,6 +3701,7 @@ mod tests {
             "trivy".into(),
             one_critical_finding(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -3717,6 +3748,7 @@ mod tests {
             "trivy".into(),
             one_critical_finding(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -3775,6 +3807,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -3840,6 +3873,7 @@ mod tests {
                 "trivy".into(),
                 Vec::new(),
                 ScanAssessment::Analysed,
+                TEST_SCAN_KIND,
                 None,
             )
             .await
@@ -3880,6 +3914,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -3928,6 +3963,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -3995,6 +4031,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4064,6 +4101,7 @@ mod tests {
             "trivy".into(),
             Vec::new(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4165,6 +4203,7 @@ mod tests {
                 "trivy".into(),
                 findings_from_summary(&severity),
                 ScanAssessment::Analysed,
+                TEST_SCAN_KIND,
                 None,
             )
             .await
@@ -4214,6 +4253,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4300,6 +4340,7 @@ mod tests {
                 "trivy".into(),
                 findings_from_summary(&severity),
                 ScanAssessment::Analysed,
+                TEST_SCAN_KIND,
                 None,
             )
             .await;
@@ -4355,6 +4396,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4405,6 +4447,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4453,6 +4496,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4498,6 +4542,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4546,6 +4591,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4596,6 +4642,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4639,6 +4686,7 @@ mod tests {
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4692,12 +4740,14 @@ mod tests {
             informational_class: None,
             severity_basis: hort_domain::types::SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
+            statement: hort_domain::types::FindingStatement::Unstated,
         }];
         uc.record_scan_result(
             artifact_id,
             "trivy".into(),
             findings,
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4802,6 +4852,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4841,6 +4892,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4884,6 +4936,7 @@ spec:
                 big_scanner,
                 findings_from_summary(&severity),
                 ScanAssessment::Analysed,
+                TEST_SCAN_KIND,
                 None,
             )
             .await
@@ -4909,6 +4962,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -4943,6 +4997,7 @@ spec:
                 "trivy".into(),
                 findings_from_summary(&severity),
                 ScanAssessment::Analysed,
+                TEST_SCAN_KIND,
                 None,
             )
             .await
@@ -4983,6 +5038,7 @@ spec:
                 "trivy".into(),
                 findings_from_summary(&severity),
                 ScanAssessment::Analysed,
+                TEST_SCAN_KIND,
                 None,
             )
             .await
@@ -5039,6 +5095,7 @@ spec:
             "trivy".into(),
             Vec::new(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -5130,6 +5187,7 @@ spec:
                     "trivy".into(),
                     Vec::new(),
                     ScanAssessment::Analysed,
+                    TEST_SCAN_KIND,
                     None,
                 )
                 .await
@@ -5195,6 +5253,7 @@ spec:
             "trivy".into(),
             Vec::new(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -5238,6 +5297,7 @@ spec:
             "trivy".into(),
             Vec::new(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -5323,6 +5383,7 @@ spec:
             "trivy".into(),
             Vec::new(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             Some(&sbom),
         )
         .await
@@ -5355,6 +5416,7 @@ spec:
             "trivy".into(),
             Vec::new(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -5394,6 +5456,7 @@ spec:
             "trivy".into(),
             Vec::new(),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             Some(&sbom),
         )
         .await
@@ -5482,6 +5545,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -5567,6 +5631,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -5626,6 +5691,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -6438,6 +6504,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -6601,6 +6668,7 @@ spec:
                 "trivy".into(),
                 findings_from_summary(&high_only),
                 ScanAssessment::Analysed,
+                TEST_SCAN_KIND,
                 None,
             )
             .await
@@ -6610,6 +6678,7 @@ spec:
                 "trivy".into(),
                 Vec::new(),
                 ScanAssessment::Analysed,
+                TEST_SCAN_KIND,
                 None,
             )
             .await
@@ -6688,6 +6757,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&high_only),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -6796,6 +6866,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -7265,6 +7336,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&row.findings),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -7315,6 +7387,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&row.findings),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -7450,6 +7523,7 @@ spec:
                 "trivy".into(),
                 one_critical_finding(),
                 ScanAssessment::Analysed,
+                TEST_SCAN_KIND,
                 None,
             )
             .await
@@ -9368,6 +9442,7 @@ spec:
                     "trivy".into(),
                     findings_from_summary(&severity),
                     ScanAssessment::Analysed,
+                    TEST_SCAN_KIND,
                     None,
                 )
                 .await
@@ -9427,6 +9502,7 @@ spec:
                     "trivy".into(),
                     findings_from_summary(&severity),
                     ScanAssessment::Analysed,
+                    TEST_SCAN_KIND,
                     None,
                 )
                 .await
@@ -9637,6 +9713,7 @@ spec:
                     "trivy".into(),
                     one_critical_finding(),
                     ScanAssessment::Analysed,
+                    TEST_SCAN_KIND,
                     None,
                 )
                 .await
@@ -9727,6 +9804,7 @@ spec:
                 "trivy".into(),
                 findings_from_summary(&severity),
                 ScanAssessment::Analysed,
+                TEST_SCAN_KIND,
                 None,
             )
             .await
@@ -9900,6 +9978,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -9933,6 +10012,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -9977,6 +10057,7 @@ spec:
             "trivy".into(),
             findings_from_summary(&severity),
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -10041,6 +10122,7 @@ spec:
             "trivy".into(),
             vec![],
             ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
             None,
         )
         .await
@@ -10179,6 +10261,7 @@ spec:
                 informational_class: None,
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
+                statement: hort_domain::types::FindingStatement::Unstated,
             });
         }
         // Sanity: confirm we cleared the cap before invoking the use case.
@@ -10194,6 +10277,7 @@ spec:
                 "trivy".into(),
                 findings,
                 ScanAssessment::Analysed,
+                TEST_SCAN_KIND,
                 None,
             )
             .await

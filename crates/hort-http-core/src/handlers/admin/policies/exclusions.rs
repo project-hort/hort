@@ -490,7 +490,8 @@ mod tests {
     use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
     use hort_domain::entities::repository::RepositoryFormat;
     use hort_domain::entities::scan_policy::{
-        NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+        CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
+        ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::policy::filter_excluded_findings;
     use hort_domain::ports::identity_provider::IdentityProvider;
@@ -579,6 +580,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: now,
             updated_at: now,
@@ -670,6 +672,7 @@ mod tests {
             informational_class: None,
             severity_basis: SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
+            statement: hort_domain::types::FindingStatement::Unstated,
         }
     }
 

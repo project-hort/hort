@@ -664,7 +664,7 @@ so they don't all hit the snapshot queries on the same edge
 | Metric | Type | Labels | Unit | Description |
 |---|---|---|---|---|
 | `hort_dispatcher_principal_resolved_total` | counter | `source ∈ {snapshot_present, snapshot_empty_admin, snapshot_empty_no_admin}` | — | One increment per principal synthesis in the subscription-delivery dispatcher — one per **active subscription per reconcile pass**, since the principal is re-synthesised for a running task as well as a new one, so the rate tracks the active-subscription count rather than the spawn rate. 3-series. `snapshot_present` = `subscription.snapshot_claims` was non-empty and was used as the evaluation claim set; `snapshot_empty_admin` = `snapshot_claims` empty but the owner carries the admin bit (evaluates with admin authority); `snapshot_empty_no_admin` = `snapshot_claims` empty and owner is not an admin — the operator diagnostic for "subscription created via PAT by a non-admin user" (such a subscription can never match a claims-scoped grant). |
-| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository and `prefetch_trigger_requires_version_discovery` per offending `prefetchPolicy.triggers` entry (the ADR 0015 inert-field rules); `scan_backend_capability` fires per offending (ScanPolicy, repository, `scanBackends` entry) pairing — the same ADR 0015 rule on the scan axis, rejecting a backend the compiled-in scanner capability map says cannot analyse that repository's format; `retention_unused_for_not_implemented` fires per offending `RetentionPolicy` whose predicate uses `UnusedFor` at the root or nested in a `Composite` (the same ADR 0015 rule on the retention axis, in its mislabelled rather than merely inert form — no last-download signal exists, so the evaluator falls back to the creation time and the predicate silently decides on age; the rule is retired when a real last-download anchor is wired); `scan_policy_license_policy_not_implemented` fires per offending `ScanPolicy` declaring a non-inert `licensePolicy` (the scan path evaluates it against an empty licence list, so every rule in it matches nothing — retired when a port surfaces an artifact's licences); `exclusion_scope_not_implemented` fires per offending `Exclusion` whose `scope` names a repository (the finding filter never reads the scope, so the waiver clears its CVE for every repository the parent policy governs — retired when per-repository scoping is enforced); `virtual_member_format_not_enforced` fires per offending (virtual repository, `virtualMembers` entry) pair whose formats differ (nothing compares them, so the member is resolved for the virtual's format and owns the names it holds there — retired when a format-compatibility model ships); `scan_policy_max_artifact_age_not_implemented` fires per offending `ScanPolicy` declaring a `maxArtifactAge` (the cap is projected, event-sourced and persisted while the age evaluator has no caller on any scan, release or retention path, so no artifact is ever flagged for age — retired when a consumer feeds the projected cap and the artifact's ingest instant through `evaluate_age_gates`). `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented`, `prefetch_trigger_requires_version_discovery`, `scan_backend_capability`, `retention_unused_for_not_implemented`, `scan_policy_license_policy_not_implemented`, `exclusion_scope_not_implemented`, `virtual_member_format_not_enforced`, `scan_policy_max_artifact_age_not_implemented` — cardinality is fixed at the rule count (13). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 13 rules × 3 results = 39. |
+| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository and `prefetch_trigger_requires_version_discovery` per offending `prefetchPolicy.triggers` entry (the ADR 0015 inert-field rules); `scan_backend_capability` fires per offending (ScanPolicy, repository, `scanBackends` entry) pairing — the same ADR 0015 rule on the scan axis, rejecting a backend the compiled-in scanner capability map says cannot analyse that repository's format; `retention_unused_for_not_implemented` fires per offending `RetentionPolicy` whose predicate uses `UnusedFor` at the root or nested in a `Composite` (the same ADR 0015 rule on the retention axis, in its mislabelled rather than merely inert form — no last-download signal exists, so the evaluator falls back to the creation time and the predicate silently decides on age; the rule is retired when a real last-download anchor is wired); `scan_policy_license_policy_not_implemented` fires per offending `ScanPolicy` declaring a non-inert `licensePolicy` (the scan path evaluates it against an empty licence list, so every rule in it matches nothing — retired when a port surfaces an artifact's licences); `exclusion_scope_not_implemented` fires per offending `Exclusion` whose `scope` names a repository (the finding filter never reads the scope, so the waiver clears its CVE for every repository the parent policy governs — retired when per-repository scoping is enforced); `virtual_member_format_not_enforced` fires per offending (virtual repository, `virtualMembers` entry) pair whose formats differ (nothing compares them, so the member is resolved for the virtual's format and owns the names it holds there — retired when a format-compatibility model ships); `scan_policy_max_artifact_age_not_implemented` fires per offending `ScanPolicy` declaring a `maxArtifactAge` (the cap is projected, event-sourced and persisted while the age evaluator has no caller on any scan, release or retention path, so no artifact is ever flagged for age — retired when a consumer feeds the projected cap and the artifact's ingest instant through `evaluate_age_gates`); `composite_verdict_promoted_requires_scan_backends` fires per offending `ScanPolicy` pairing `compositeVerdictMode: promoted` with an empty `scanBackends` — the ADR 0016 cross-opt-in rule on the composition axis, and the second rule whose other half is the same empty backend list: the waiver returns before a composed image is resolved, so the promotion grants release authority to a verdict no manifest in scope ever carries (never retired — a waived scan has nothing to promote under any implementation). `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented`, `prefetch_trigger_requires_version_discovery`, `scan_backend_capability`, `retention_unused_for_not_implemented`, `scan_policy_license_policy_not_implemented`, `exclusion_scope_not_implemented`, `virtual_member_format_not_enforced`, `scan_policy_max_artifact_age_not_implemented`, `composite_verdict_promoted_requires_scan_backends` — cardinality is fixed at the rule count (14). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 14 rules × 3 results = 42. |
 | `hort_effective_permissions_lookups_total` | counter | `result ∈ {ok, denied, not_found}` | — | One increment per call to the admin effective-permissions endpoint (`GET /api/v1/admin/users/:user_id/effective-permissions`). 3-series. `ok` = admin caller, inspected user resolved, view returned; `denied` = `require_admin()` rejected the caller (emitted before the early return; the inspected user was never resolved); `not_found` = caller was admin but the inspected `user_id` did not resolve to a user row. |
 
 Emitted by
@@ -2473,24 +2473,29 @@ that every `READ_PATH_PROXY_FORMATS` entry is wired, so an
 incomplete composition fails at boot. A silent fallback instance is
 the defect, not the remedy.
 
-The worker builds three **subsystem-labelled** instances that fetch
+The worker builds four **subsystem-labelled** instances that fetch
 through the same adapter but are not a single artifact format:
 `prefetch_tick` (the scheduled prefetch tick / leaf-pull, which
 walks npm/cargo/pypi), `provenance` (the upstream
-Sigstore-referrer fetch in the `provenance-verify` job), and
+Sigstore-referrer fetch in the `provenance-verify` job),
 `oci_index_child_ingest` (the eager per-child manifest fetch in the
 `oci-index-child-ingest` job — one outbound fetch per child an OCI
-image index declares). These are
+image index declares), and `composite_scan` (the constituent
+acquisition inside a `scan` job: the config and layer blobs a proxied
+image manifest's composition names and hort does not hold). These are
 intentional non-format `format` values so dashboards separate
 background traffic from the server hot path, and they are **not**
 converted to per-artifact-format labels: the prefetch tick walks
 npm/cargo/pypi within one job, so a per-format split there would
 name the artifact rather than the subsystem doing the work.
-`oci_index_child_ingest` is OCI-only but is still labelled by
-subsystem rather than folded into `format="oci"`: an operator
-triaging an upstream-fetch spike needs to tell "clients are pulling
-images" from "a base-image bump just fanned out one fetch per
-declared child", and the two are different capacity questions.
+`oci_index_child_ingest` and `composite_scan` are OCI-only but are
+still labelled by subsystem rather than folded into `format="oci"`: an
+operator triaging an upstream-fetch spike needs to tell "clients are
+pulling images" from "a base-image bump just fanned out one fetch per
+declared child" from "a rescan sweep is pulling whole images nobody
+asked for", and the three are different capacity questions.
+`composite_scan` is the only one of the four that no request can
+trigger, which is exactly why it must stay separable.
 Cloning
 one subsystem's proxy for another would mis-attribute its
 `hort_upstream_fetch_*` series (provenance traffic once emitted
@@ -3246,6 +3251,157 @@ NOT a label (architect "high-cardinality metric labels" rule);
 per-artifact drill-down is the `info!` audit line on the
 `→ scan_indeterminate` transition
 (`QuarantineUseCase::record_scan_indeterminate`).
+
+### Shadow composite scan
+
+The composed assessment of an OCI image manifest (ADR 0064) carries **no
+release authority** until an operator promotes it (ADR 0064 D6). These
+two counters are how the promotion criteria — baseline completion,
+coverage, error rate, and the incremental findings a promotion would
+add — become something an operator can watch move. The durable
+`composite_scan_observations` projection beside them answers only the
+estate's *current* state, one row per manifest.
+
+| Metric | Type | Labels | Unit | `result` values |
+|--------|------|--------|------|-----------------|
+| `hort_scan_composite_assessment_total` | counter | `result`, `authority` | — | `result`: `assessed`, `nothing_to_compose`, `deterministic_refusal`, `transient_refusal`; `authority`: `observed`, `promoted` |
+| `hort_scan_composite_comparison_total` | counter | `result` | — | `agree`, `composite_stricter`, `composite_permissive` |
+
+Source of truth for the result enums:
+- `hort_app::metrics::CompositeAssessmentResult` for
+  `hort_scan_composite_assessment_total.result`. Its four values are
+  lifted from
+  `hort_domain::ports::composite_scan_observation::CompositeAssessment`
+  via `From`, and the wire strings are **identical** to that enum's
+  `as_str` — which is also the `composite_scan_observations.assessment`
+  column value and its `CHECK` constraint. Deliberately the same strings
+  in all three places: a `GROUP BY assessment` over the table and a
+  `sum by (result)` over this counter are the same question, and an
+  operator reading D6's criteria combines them. The parity is pinned by
+  `composite_assessment_result_mirrors_the_stored_column_value`.
+- `hort_app::metrics::CompositeAuthority` for
+  `hort_scan_composite_assessment_total.authority`. Its two values are
+  lifted from `hort_domain::entities::scan_policy::CompositeVerdictMode`
+  via `From`, and the wire strings are **identical** to that enum's
+  `Display` — which is also the
+  `policy_projections.composite_verdict_mode` column value and its
+  `CHECK` constraint, for the reason above: an operator correlating
+  "which policies are promoted?" (a SQL question) with "what is
+  promotion gating?" (a PromQL one) is combining the two. Pinned by
+  `composite_authority_mirrors_the_policy_column_value`.
+- `hort_app::metrics::CompositeComparisonResult` for
+  `hort_scan_composite_comparison_total.result`. No domain counterpart:
+  the row stores the two gate decisions, not their comparison, so there
+  is nothing to mirror. `CompositeComparisonResult::of` is the one
+  definition, derived from the row's own two columns.
+
+Adding a variant to either enum requires updating this catalog in the
+same change.
+
+**`hort_scan_composite_assessment_total` semantics** — emitted by
+`hort_app::use_cases::composite_scan::CompositeScan::observe`,
+**one increment per composite assessment**, which is one per scan of an
+OCI image manifest row. A manifest that is not reached (any other
+artifact kind) produces no tick at all. The `result` taxonomy is closed
+at 4:
+
+- `assessed` — the composition was assembled and a backend answered
+  about it. The only value for which
+  `hort_scan_composite_comparison_total` also ticks. Its total **tracks
+  but does not equal** this bucket: an assessment whose exclusion set
+  could not be resolved is counted here and not there (see below), so a
+  persistent gap between the two is that read failing rather than a
+  miscount.
+- `nothing_to_compose` — the manifest is not a composed image: an image
+  index (ADR 0064 D5), a cosign signature, an SBOM attachment, a Helm
+  chart. The steady state for a large share of OCI rows and **not an
+  alert** — a sustained stream of these is the expected shape.
+- `deterministic_refusal` — a composition was expected and could not be
+  assembled, for a reason re-running reproduces. This is the **coverage
+  gap**: every tick is a manifest the composite verdict would have
+  nothing to say about, which is exactly what D6's baseline-completion
+  criterion is about. Operators watch the ratio against `assessed`.
+- `transient_refusal` — the same absence for a condition that may clear
+  (a store that did not answer, an unreachable upstream). Kept apart
+  from the value above because a momentary hiccup and a permanent
+  absence of assessment ask different things: a sustained rate here is
+  an infrastructure signal, not a coverage one.
+
+The three refusal values still tick: "how often is there nothing to
+assess?" is half of the coverage question, and a counter that only fired
+on success could not answer it. The counter also ticks when the run's
+exclusion set could not be resolved and **no row was written** — the
+assessment happened; what could not be done was judging its two sides by
+the same rules, and a counter that skipped it would understate coverage
+exactly when the exclusion read is failing.
+
+The `authority` label is the resolved policy's `composite_verdict_mode`
+(ADR 0064 D6) — whether this assessment **decided** the manifest's
+release or only measured it. The `result` arms cannot say: under
+`observed` a `deterministic_refusal` is the coverage gap an operator is
+weighing before promoting, and under `promoted` the same arm is a
+manifest held `scan_indeterminate` fail-closed. `observed` is the
+default and the value every policy that predates the field reports; a
+repository with no resolved policy at all reports `observed` too, since
+promotion is an operator act and the built-in default policy has no
+operator behind it. `promoted` on a series an operator did not expect is
+the signal that a promotion is wider in scope than they intended.
+
+**`hort_scan_composite_comparison_total` semantics** — emitted at the
+same site, **one increment per assessed composition**, derived from the
+observation row's `composite_findings_decision` and
+`primary_findings_decision`. This is D6's promotion criterion as a rate:
+"if the composite verdict carried authority, how many artifacts would
+change outcome, and in which direction?" Closed taxonomy of 3:
+
+- `agree` — the two sides hold the artifact the same way. Promoting
+  would change nothing for this artifact, and a promotion decision needs
+  this to be overwhelmingly the common value.
+- `composite_stricter` — the composite findings block where the primary
+  axis's do not. Promoting would **add** a hold. This is the measured
+  gap ADR 0064 exists for (packages a per-constituent scan never
+  assessed) and also where a false positive from the new analysis path
+  shows up first — which is why the verdict is readable before it is
+  enforcing.
+- `composite_permissive` — the primary axis's findings block where the
+  composite's do not. Promoting would **remove** a hold: the composed
+  filesystem does not carry what a constituent's isolated scan condemned
+  it for, a package a later layer deletes being the canonical shape.
+
+The comparison is on **whether the gate holds the artifact**, not on
+decision equality. `findings_recorded` and `reject` both mean "blocking
+violations under the active policy" and differ only in the policy's
+`enforcement` mode — and both sides of a row are judged under one
+resolved policy, so a row holding one of each is not reachable. Were it
+ever reachable it would be an enforcement-mode difference rather than a
+finding difference, which this counter does not measure; it folds onto
+`agree`, which keeps the taxonomy total with no value that cannot be
+emitted.
+
+**Neither counter carries a decision.** No `GateDecision` value reaches
+either series: `composite_stricter` says the composite blocks where the
+primary does not, without naming which blocking variant. The composite
+verdict carries no release authority, and a dashboard series keyed on
+its value would be that verdict escaping into something acted on.
+`artifact_id`, the manifest digest and the vulnerability ids are
+likewise not labels — per-manifest drill-down is the
+`composite_scan_observations` row and the `tracing` span.
+
+The acquisition egress these assessments cause has its own series and is
+**not** duplicated here: `hort_upstream_fetch_total{format="composite_scan"}`
+(see §"Upstream proxy" for why `composite_scan` is a subsystem label
+rather than `format="oci"`).
+
+Cardinality:
+- `hort_scan_composite_assessment_total`: 4 result × 2 authority values
+  → 8 series.
+- `hort_scan_composite_comparison_total`: 3 result values → 3 series.
+  Deliberately **not** split by `authority`: the comparison is the
+  promotion criterion, and the question "what would promoting change?"
+  is asked of an estate that has not promoted yet. After promotion the
+  same series reads as "is the promotion still behaving as the
+  measurement predicted?", which is the same two columns and does not
+  need a second label to separate.
 
 ### Rescan and advisory watch
 

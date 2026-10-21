@@ -398,6 +398,7 @@ mod tests {
             default_repository_access_for_policy(),
             Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
             Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
+            HashMap::new(),
         ));
         let uc = ApplyConfigUseCase::new(
             h.repos.clone(),

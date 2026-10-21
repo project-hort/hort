@@ -116,9 +116,30 @@ impl ExtractBounds {
 /// Why an extraction was refused.
 ///
 /// Every variant is terminal for that archive. None of them means "retry
-/// with a bigger cap": the caller maps all of them to the same
-/// fail-closed `UnusableArchive` outcome, and the variants exist so the
-/// log line names which guard fired.
+/// with a bigger cap".
+///
+/// The variants split in two, and the caller reads the split off the
+/// type rather than off a message:
+///
+/// - Every variant but [`Self::UnsupportedContainer`] is a statement
+///   about the **payload's own bytes** — a bound it tripped, a path it
+///   tried to escape through, a name that could not be decoded, or an
+///   archive that could not be read — and maps to
+///   `NotAnalysable::UnusableArchive`.
+/// - [`Self::UnsupportedContainer`] is a statement about **this
+///   adapter's decoder inventory**: the container was positively
+///   identified and there is no decoder for it. It maps to
+///   `NotAnalysable::UnsupportedContainer`.
+///
+/// Both outcomes gate the artifact today. The split exists because the
+/// two are not the same statement, and ADR 0064 D2 places only the
+/// second one with the composition rather than with the constituent.
+///
+/// [`Self::Malformed`] deliberately keeps the first side even though it
+/// covers "the archive could not be read": a reader that fails to open
+/// its input cannot tell a container it has no decoder for from a
+/// corrupt archive of a container it does decode, and an undecidable
+/// case goes to the gating side.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum ExtractError {
     #[error("extracted-bytes cap exceeded ({cap} bytes)")]
@@ -137,6 +158,16 @@ pub(crate) enum ExtractError {
     UndecodableEntryName { index: usize },
     #[error("archive could not be read: {0}")]
     Malformed(String),
+    /// The payload is a container this adapter has **no decoder for**,
+    /// identified positively from its own leading bytes rather than
+    /// inferred from a failed read. Nothing inside it was reached, so
+    /// this says nothing about those bytes.
+    ///
+    /// `container` is the compile-time name of the identified format
+    /// (`"zstd"`, `"xz"`, `"bzip2"`) — a fixed string from this crate,
+    /// never archive data, so it is safe in a metric-adjacent log field.
+    #[error("no decoder for this container: {container}")]
+    UnsupportedContainer { container: &'static str },
 }
 
 /// What an extraction produced, for the caller's log line.

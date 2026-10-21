@@ -178,6 +178,18 @@ pub mod labels {
     /// `SkippedOff` orchestrator arm has a valid label. Small, bounded
     /// cardinality (3 values).
     pub const MODE: &str = "mode";
+    /// Resolved `composite_verdict_mode` label on
+    /// `hort_scan_composite_assessment_total`. Closed taxonomy of 2, the
+    /// lowercase wire-form of
+    /// [`hort_domain::entities::scan_policy::CompositeVerdictMode`]'s
+    /// `Display`: `{observed, promoted}`. What it separates is the one
+    /// thing the assessment arms cannot say on their own — whether this
+    /// assessment *gated* the manifest or only measured it — so a
+    /// `deterministic_refusal` an operator is watching as a coverage gap
+    /// and a `deterministic_refusal` holding a manifest fail-closed are
+    /// two series rather than one. Doubles the counter's cardinality to
+    /// 8, which is nothing.
+    pub const AUTHORITY: &str = "authority";
 }
 
 /// Pinned `decision_point` label values for
@@ -870,6 +882,12 @@ pub enum UpstreamErrorKind {
     CaUnknown,
 }
 
+/// Sentinel that marks a `DomainError::Invariant` as carrying an
+/// [`UpstreamErrorKind`] classification. Stated once: it is read by the
+/// encode and the decode, and a prefix that drifted between them would
+/// silently turn every classified error into an unclassified one.
+const UPSTREAM_SENTINEL_PREFIX: &str = "upstream:";
+
 impl UpstreamErrorKind {
     /// Label value string — must match the catalog exactly.
     pub fn as_str(&self) -> &'static str {
@@ -891,6 +909,90 @@ impl UpstreamErrorKind {
             Self::PinMismatch => "pin_mismatch",
             Self::CaUnknown => "ca_unknown",
         }
+    }
+
+    /// Encode the kind into the `DomainError` the upstream-proxy port
+    /// hands back, with `detail` as the human-readable remainder.
+    ///
+    /// Format: `upstream:<kind>:<detail>`. The encode and the decode live
+    /// next to each other, and the prefix is stated once, because this is
+    /// a **codec** and the one way a codec fails is for its two halves to
+    /// drift. The adapter that produces these errors calls this; the
+    /// consumers that act on them call [`Self::from_domain_error`].
+    #[must_use]
+    pub fn into_domain_error(self, detail: &str) -> hort_domain::error::DomainError {
+        hort_domain::error::DomainError::Invariant(format!(
+            "{UPSTREAM_SENTINEL_PREFIX}{}:{detail}",
+            self.as_str()
+        ))
+    }
+
+    /// Recover the kind from a `DomainError` the upstream-proxy port
+    /// handed back — the decode half of [`Self::into_domain_error`].
+    ///
+    /// `UpstreamProxy` is a `hort-domain` port, so its failures travel as
+    /// `DomainError` and the classification rides a sentinel-prefixed
+    /// `Invariant` message (`upstream:<kind>:<detail>`) written by
+    /// [`Self::into_domain_error`]. That is crude — it is the price of
+    /// keeping a format-agnostic trait free of a concrete error type —
+    /// but it is a **codec**, and this is its one decoder: the
+    /// upstream-http adapter's own `classify_error` delegates here rather
+    /// than re-deriving the table, and so does every consumer that has to
+    /// act on *which* upstream condition it hit. A second decoder is how
+    /// two callers come to disagree about whether a 404 is retryable, and
+    /// a consumer that reached for `msg.contains("404")` instead would be
+    /// asking a question the vocabulary already answers.
+    ///
+    /// `None` for an error that carries no classification — a failure
+    /// that did not come from the upstream fetch at all. A caller that
+    /// must decide something has to say what it does with `None`; this
+    /// function will not guess for it.
+    #[must_use]
+    pub fn from_domain_error(err: &hort_domain::error::DomainError) -> Option<Self> {
+        use hort_domain::error::{DomainError, FetchClass};
+
+        // The typed storage-backstop variant carries its own honest
+        // `result` label (`metadata_too_large` / `manifest_too_large`),
+        // NOT the retired generic `body_too_large` that the buffer-cap
+        // path used to emit. The operator sees the right label and
+        // reaches for the right knob, instead of debugging the "upstream
+        // unavailable" sanitisation the metric label would have led them
+        // into (ADR 0026).
+        if let DomainError::UpstreamBodyTooLarge { fetch_class, .. } = err {
+            return Some(match fetch_class {
+                FetchClass::Metadata => Self::MetadataTooLarge,
+                FetchClass::Manifest => Self::ManifestTooLarge,
+            });
+        }
+        let DomainError::Invariant(msg) = err else {
+            return None;
+        };
+        let rest = msg.strip_prefix(UPSTREAM_SENTINEL_PREFIX)?;
+        let (kind_str, _) = rest.split_once(':')?;
+        Some(match kind_str {
+            "success" => Self::Success,
+            "not_found" => Self::NotFound,
+            "unauthorized" => Self::Unauthorized,
+            "rate_limited" => Self::RateLimited,
+            "upstream_4xx" => Self::Upstream4xx,
+            "upstream_5xx" => Self::Upstream5xx,
+            "network_error" => Self::NetworkError,
+            "timeout" => Self::Timeout,
+            "checksum_mismatch" => Self::ChecksumMismatch,
+            "parse_error" => Self::ParseError,
+            "body_too_large" => Self::BodyTooLarge,
+            // Reserved sentinel parses for parity with the catalog.
+            // Production emission uses the typed variant above; these
+            // arms keep the decode total when a future caller emits via
+            // `classified_error` (e.g. tests).
+            "metadata_too_large" => Self::MetadataTooLarge,
+            "manifest_too_large" => Self::ManifestTooLarge,
+            "version_object_too_large" => Self::VersionObjectTooLarge,
+            // TLS-handshake outcomes (ADR 0010).
+            "pin_mismatch" => Self::PinMismatch,
+            "ca_unknown" => Self::CaUnknown,
+            _ => return None,
+        })
     }
 }
 
@@ -2591,6 +2693,278 @@ impl ScanTerminalResult {
 pub fn emit_scan_terminal(result: ScanTerminalResult) {
     metrics::counter!(
         "hort_scan_terminal_total",
+        labels::RESULT => result.as_str(),
+    )
+    .increment(1);
+}
+
+// ---------------------------------------------------------------------------
+// Shadow composite scan (ADR 0064 D6)
+// ---------------------------------------------------------------------------
+
+use hort_domain::ports::composite_scan_observation::GateDecision;
+
+/// `result` label value of `hort_scan_composite_assessment_total`.
+///
+/// Closed taxonomy of 4, mirroring
+/// [`CompositeAssessment`](hort_domain::ports::composite_scan_observation::CompositeAssessment)
+/// — the same four values the `composite_scan_observations.assessment`
+/// column carries and its CHECK constraint enumerates. The strings are
+/// deliberately identical in all three places so a `GROUP BY assessment`
+/// over the table and a `sum by (result)` over this counter answer the
+/// same question in the same words.
+///
+/// A parallel enum rather than the domain type itself, with the mapping
+/// below and a parity test beside it: the enum keeps the metric
+/// vocabulary in this module where every other label value lives, the
+/// exhaustive [`From`] makes a fifth domain arm a compile error here,
+/// and the parity test makes a *string* drift a test failure. Neither
+/// alone would hold both halves.
+///
+/// **This counter decides nothing.** The shadow composite assessment
+/// carries no release authority until an operator promotes it (ADR 0064
+/// D6), and the row the counter is derived from is a projection no
+/// release path may read. What the counter adds over that row is the
+/// *shape over time*: D6's promotion criteria are baseline completion,
+/// coverage and error rates, and a one-row-per-manifest table answers
+/// only today's snapshot.
+///
+/// String values are normative — they appear verbatim in
+/// `docs/metrics-catalog.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeAssessmentResult {
+    /// The composition was assembled and a backend answered about it.
+    /// The only arm for which
+    /// `hort_scan_composite_comparison_total` also ticks — and not on
+    /// every one of them: see that counter's emitter for the one gap.
+    Assessed,
+    /// The manifest is not a composed image — an index, a cosign
+    /// signature, an SBOM attachment, a Helm chart. The steady state
+    /// for a large share of OCI rows; a sustained stream of these is
+    /// the expected shape, not an alert.
+    NothingToCompose,
+    /// A composition was expected and could not be assembled, for a
+    /// reason re-running reproduces. This is the **coverage gap** an
+    /// operator weighing promotion is watching: every tick here is a
+    /// manifest the composite verdict would have nothing to say about.
+    DeterministicRefusal,
+    /// The same absence for a condition that may clear — a store that
+    /// did not answer, an unreachable upstream. Kept apart from the arm
+    /// above because a momentary hiccup and a permanent absence of
+    /// assessment ask different things of an operator, and a sustained
+    /// rate here is an infrastructure signal rather than a coverage one.
+    TransientRefusal,
+}
+
+impl CompositeAssessmentResult {
+    /// Wire string. Catalog rule: must match `docs/metrics-catalog.md`
+    /// AND `CompositeAssessment::as_str` (hence the
+    /// `composite_scan_observations.assessment` CHECK) exactly.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Assessed => "assessed",
+            Self::NothingToCompose => "nothing_to_compose",
+            Self::DeterministicRefusal => "deterministic_refusal",
+            Self::TransientRefusal => "transient_refusal",
+        }
+    }
+}
+
+/// The domain outcome lifted into the emitting layer's vocabulary. The
+/// domain stays free of metric concerns; the mapping lives here, with
+/// the counter — the same precedent as [`SbomResolutionResult`]'s. The
+/// match is exhaustive, so a fifth outcome cannot reach the counter
+/// without being given a label.
+impl From<hort_domain::ports::composite_scan_observation::CompositeAssessment>
+    for CompositeAssessmentResult
+{
+    fn from(
+        assessment: hort_domain::ports::composite_scan_observation::CompositeAssessment,
+    ) -> Self {
+        use hort_domain::ports::composite_scan_observation::CompositeAssessment as A;
+        match assessment {
+            A::Assessed => Self::Assessed,
+            A::NothingToCompose => Self::NothingToCompose,
+            A::DeterministicRefusal => Self::DeterministicRefusal,
+            A::TransientRefusal => Self::TransientRefusal,
+        }
+    }
+}
+
+/// `authority` label value of `hort_scan_composite_assessment_total` —
+/// whether the policy governing this run had promoted the composed-image
+/// verdict to release authority (ADR 0064 D6).
+///
+/// Mirrors
+/// [`CompositeVerdictMode`](hort_domain::entities::scan_policy::CompositeVerdictMode)'s
+/// two wire strings, and for the same reason
+/// [`CompositeAssessmentResult`] mirrors `CompositeAssessment`: the
+/// metric vocabulary stays in this module, the `From` makes a third
+/// domain arm a compile error here, and the parity test makes a string
+/// drift a test failure.
+///
+/// What it is for: the four `result` arms say what the assessment
+/// *found*, and nothing about whether it *decided* anything. Under
+/// `observed` a `deterministic_refusal` is a coverage gap an operator is
+/// weighing before promoting; under `promoted` the same arm is a
+/// manifest held fail-closed. Separating them is what lets an operator
+/// see, from metrics alone, whether their promotion is gating and what
+/// it is gating on.
+///
+/// String values are normative — they appear verbatim in
+/// `docs/metrics-catalog.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeAuthority {
+    /// The composed verdict was recorded and decided nothing.
+    Observed,
+    /// The composed verdict was the manifest row's own.
+    Promoted,
+}
+
+impl CompositeAuthority {
+    /// Wire string. Catalog rule: must match `docs/metrics-catalog.md`
+    /// AND `CompositeVerdictMode::Display` (hence the
+    /// `policy_projections.composite_verdict_mode` CHECK) exactly.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Promoted => "promoted",
+        }
+    }
+}
+
+/// The policy's posture lifted into the emitting layer's vocabulary —
+/// same precedent as [`CompositeAssessmentResult`]'s `From`.
+impl From<hort_domain::entities::scan_policy::CompositeVerdictMode> for CompositeAuthority {
+    fn from(mode: hort_domain::entities::scan_policy::CompositeVerdictMode) -> Self {
+        use hort_domain::entities::scan_policy::CompositeVerdictMode as M;
+        match mode {
+            M::Observed => Self::Observed,
+            M::Promoted => Self::Promoted,
+        }
+    }
+}
+
+/// Emit `hort_scan_composite_assessment_total{result,authority}` once per
+/// composite assessment.
+///
+/// Exactly one increment per assessment, including the three arms that
+/// composed nothing: "how often is there nothing to assess?" is half of
+/// the coverage question, and a counter that only ticked on success
+/// could not answer it.
+pub fn emit_composite_assessment(result: CompositeAssessmentResult, authority: CompositeAuthority) {
+    metrics::counter!(
+        "hort_scan_composite_assessment_total",
+        labels::RESULT => result.as_str(),
+        labels::AUTHORITY => authority.as_str(),
+    )
+    .increment(1);
+}
+
+/// `result` label value of `hort_scan_composite_comparison_total`.
+///
+/// Closed taxonomy of 3: **whether promoting the composite verdict would
+/// change this artifact's outcome, and in which direction.** That is ADR
+/// 0064 D6's promotion criterion stated as a rate — "if the composite
+/// verdict carried authority, how many artifacts would change outcome,
+/// and which way?" — which the one-row-per-manifest projection answers
+/// only for the present instant.
+///
+/// Derived from the observation row's two gate decisions by
+/// [`Self::of`], so the counter and the row cannot disagree.
+///
+/// **No decision is a label here.** Neither side's `GateDecision` value
+/// reaches the series: `composite_stricter` says the composite blocks
+/// where the primary does not, without naming which blocking variant it
+/// is. The composite verdict carries no release authority (D6), and a
+/// dashboard series keyed on its value would be that verdict escaping
+/// into something acted on by exactly the back door this unit's
+/// structural guard closes on the code path.
+///
+/// String values are normative — they appear verbatim in
+/// `docs/metrics-catalog.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeComparisonResult {
+    /// The two sides hold the artifact the same way. Promoting the
+    /// composite verdict would change nothing for this artifact — which
+    /// is the value a promotion decision needs to be overwhelmingly the
+    /// common one.
+    Agree,
+    /// The composite findings block where the primary axis's do not.
+    /// Promoting would **add** a hold. This is the measured gap ADR 0064
+    /// exists for — packages a per-constituent scan never assessed — and
+    /// also where a false positive from the new analysis path would
+    /// show up first, which is why the verdict is readable before it is
+    /// enforcing.
+    CompositeStricter,
+    /// The primary axis's findings block where the composite's do not.
+    /// Promoting would **remove** a hold: the composed filesystem does
+    /// not carry what a constituent's isolated scan condemned it for —
+    /// a package a later layer deletes being the canonical shape.
+    CompositePermissive,
+}
+
+impl CompositeComparisonResult {
+    /// Compare the observation row's two gate decisions.
+    ///
+    /// The comparison is on **whether the gate holds the artifact**, not
+    /// on decision equality, because that is the question an operator
+    /// weighing promotion is asking: would this artifact's outcome
+    /// change? `FindingsRecorded` and `Reject` both mean "blocking
+    /// violations under the active policy" and differ only in the
+    /// policy's `enforcement` mode — and both sides of a row are judged
+    /// under **one** resolved policy, so a row holding one of each is
+    /// not reachable. Were it ever reachable, it would be an
+    /// enforcement-mode difference rather than a finding difference,
+    /// which is not what this counter measures; folding it onto
+    /// [`Self::Agree`] keeps the taxonomy total with no arm that cannot
+    /// be emitted.
+    #[must_use]
+    pub const fn of(composite: GateDecision, primary: GateDecision) -> Self {
+        // An exhaustive match rather than a wildcard: a fourth
+        // `GateDecision` has to state whether it holds the artifact.
+        const fn blocks(decision: GateDecision) -> bool {
+            match decision {
+                GateDecision::Clean => false,
+                GateDecision::FindingsRecorded | GateDecision::Reject => true,
+            }
+        }
+
+        match (blocks(composite), blocks(primary)) {
+            (true, false) => Self::CompositeStricter,
+            (false, true) => Self::CompositePermissive,
+            (true, true) | (false, false) => Self::Agree,
+        }
+    }
+
+    /// Wire string. Catalog rule: must match `docs/metrics-catalog.md`
+    /// exactly.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Agree => "agree",
+            Self::CompositeStricter => "composite_stricter",
+            Self::CompositePermissive => "composite_permissive",
+        }
+    }
+}
+
+/// Emit `hort_scan_composite_comparison_total{result}` once per
+/// **assessed** composition.
+///
+/// Only an assessed composition has a counterfactual to compare, so the
+/// three refusal arms of `hort_scan_composite_assessment_total` emit
+/// nothing here. The two counters are read together, and this one's
+/// total **tracks but does not equal** that one's `assessed` bucket:
+/// an assessment whose exclusion set could not be resolved is counted
+/// there and not here, because its two sides could not be judged by the
+/// same rules. A persistent gap between them is that read failing, not
+/// a miscount.
+pub fn emit_composite_comparison(result: CompositeComparisonResult) {
+    metrics::counter!(
+        "hort_scan_composite_comparison_total",
         labels::RESULT => result.as_str(),
     )
     .increment(1);
@@ -4487,6 +4861,99 @@ mod tests {
         UpstreamChecksumResult, UpstreamErrorKind, UpstreamFetchError, UpstreamTlsHandshakeResult,
     };
     use std::collections::HashSet;
+
+    // -------------------------------------------------------------------
+    // The upstream-error codec: `as_str` encodes, `from_domain_error`
+    // decodes, and both halves live here so a reader can check them
+    // against each other.
+    // -------------------------------------------------------------------
+
+    /// Every label round-trips through the sentinel the upstream adapter
+    /// writes. Driven over the exhaustive variant list, so a kind added
+    /// without a decode arm fails here rather than silently decoding as
+    /// "no classification".
+    #[test]
+    fn every_kind_round_trips_through_the_upstream_sentinel() {
+        use hort_domain::error::DomainError;
+        for kind in [
+            UpstreamErrorKind::Success,
+            UpstreamErrorKind::NotFound,
+            UpstreamErrorKind::Unauthorized,
+            UpstreamErrorKind::RateLimited,
+            UpstreamErrorKind::Upstream4xx,
+            UpstreamErrorKind::Upstream5xx,
+            UpstreamErrorKind::NetworkError,
+            UpstreamErrorKind::Timeout,
+            UpstreamErrorKind::ChecksumMismatch,
+            UpstreamErrorKind::ParseError,
+            UpstreamErrorKind::BodyTooLarge,
+            UpstreamErrorKind::MetadataTooLarge,
+            UpstreamErrorKind::ManifestTooLarge,
+            UpstreamErrorKind::VersionObjectTooLarge,
+            UpstreamErrorKind::PinMismatch,
+            UpstreamErrorKind::CaUnknown,
+        ] {
+            // The literal, not `into_domain_error`, is on this side on
+            // purpose: encoding with the codec and decoding with the codec
+            // would round-trip through any prefix at all. What a reader
+            // needs pinned is the **wire format**, so the test spells it.
+            let on_the_wire =
+                DomainError::Invariant(format!("upstream:{}:the detail", kind.as_str()));
+            assert_eq!(
+                UpstreamErrorKind::from_domain_error(&on_the_wire),
+                Some(kind),
+                "{} did not survive its own codec",
+                kind.as_str()
+            );
+            // And the encode half produces exactly that.
+            assert_eq!(
+                kind.into_domain_error("the detail").to_string(),
+                on_the_wire.to_string(),
+                "the two halves of the codec disagree for {}",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// The typed storage-backstop variant carries its own honest label,
+    /// not the retired generic `body_too_large` (ADR 0026).
+    #[test]
+    fn the_typed_body_cap_variant_decodes_per_fetch_class() {
+        use hort_domain::error::{DomainError, FetchClass};
+        for (fetch_class, expected) in [
+            (FetchClass::Metadata, UpstreamErrorKind::MetadataTooLarge),
+            (FetchClass::Manifest, UpstreamErrorKind::ManifestTooLarge),
+        ] {
+            let err = DomainError::UpstreamBodyTooLarge {
+                fetch_class,
+                bytes_read: 32,
+                cap: 16,
+            };
+            assert_eq!(UpstreamErrorKind::from_domain_error(&err), Some(expected));
+        }
+    }
+
+    /// An error that carries no classification decodes to `None` rather
+    /// than to a guess. The three shapes: a different `DomainError`
+    /// variant, an `Invariant` without the sentinel prefix, and a
+    /// sentinel naming a kind this decoder does not know.
+    #[test]
+    fn an_unclassified_error_decodes_to_nothing() {
+        use hort_domain::error::DomainError;
+        for err in [
+            DomainError::Validation("not from the upstream at all".to_string()),
+            DomainError::Invariant("something else entirely".to_string()),
+            DomainError::Invariant("upstream:no_such_kind:detail".to_string()),
+            // Prefix present, no second separator: not a classification.
+            DomainError::Invariant("upstream:truncated".to_string()),
+        ] {
+            assert_eq!(
+                UpstreamErrorKind::from_domain_error(&err),
+                None,
+                "{err} must not decode to a kind"
+            );
+        }
+    }
 
     // -------------------------------------------------------------------
     // Label-name constants match the catalog exactly.
@@ -6625,6 +7092,234 @@ mod tests {
         assert_eq!(labels.get("repository"), Some(&"_all"));
         assert_eq!(labels.get("severity"), Some(&"high"));
         assert_eq!(labels.get("ingest_source"), Some(&"direct"));
+    }
+
+    // -------------------------------------------------------------------
+    // Shadow composite scan (ADR 0064 D6)
+    // -------------------------------------------------------------------
+
+    /// The label values are the **column** values. A drift here would
+    /// make `GROUP BY assessment` over `composite_scan_observations`
+    /// and `sum by (result)` over this counter two different questions,
+    /// which is exactly what an operator watching D6's promotion
+    /// criteria would be combining.
+    #[test]
+    fn composite_assessment_result_mirrors_the_stored_column_value() {
+        use hort_domain::ports::composite_scan_observation::CompositeAssessment as A;
+        for (domain, label) in [
+            (A::Assessed, super::CompositeAssessmentResult::Assessed),
+            (
+                A::NothingToCompose,
+                super::CompositeAssessmentResult::NothingToCompose,
+            ),
+            (
+                A::DeterministicRefusal,
+                super::CompositeAssessmentResult::DeterministicRefusal,
+            ),
+            (
+                A::TransientRefusal,
+                super::CompositeAssessmentResult::TransientRefusal,
+            ),
+        ] {
+            assert_eq!(
+                super::CompositeAssessmentResult::from(domain),
+                label,
+                "the From impl must not cross the arms"
+            );
+            assert_eq!(
+                label.as_str(),
+                domain.as_str(),
+                "the metric label and the stored column value are one string"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_assessment_result_values_are_unique_and_snake_case() {
+        let variants = [
+            super::CompositeAssessmentResult::Assessed,
+            super::CompositeAssessmentResult::NothingToCompose,
+            super::CompositeAssessmentResult::DeterministicRefusal,
+            super::CompositeAssessmentResult::TransientRefusal,
+        ];
+        let set: HashSet<&'static str> = variants.iter().map(|v| v.as_str()).collect();
+        assert_eq!(set.len(), variants.len(), "label values must be unique");
+        for value in set {
+            assert!(
+                value.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{value} must be lowercase snake_case"
+            );
+        }
+    }
+
+    /// Each of the four outcomes ticks the counter exactly once under
+    /// each posture — the eight series the pair of label taxonomies
+    /// spans, and nothing else.
+    #[test]
+    fn emit_composite_assessment_ticks_once_per_outcome() {
+        for result in [
+            super::CompositeAssessmentResult::Assessed,
+            super::CompositeAssessmentResult::NothingToCompose,
+            super::CompositeAssessmentResult::DeterministicRefusal,
+            super::CompositeAssessmentResult::TransientRefusal,
+        ] {
+            for authority in [
+                super::CompositeAuthority::Observed,
+                super::CompositeAuthority::Promoted,
+            ] {
+                let snap = capture_metrics(|| super::emit_composite_assessment(result, authority));
+                let entries = snap.into_vec();
+                let ticks: Vec<_> = entries
+                    .iter()
+                    .filter(|(k, _, _, _)| k.key().name() == "hort_scan_composite_assessment_total")
+                    .collect();
+                assert_eq!(ticks.len(), 1, "exactly one series per assessment");
+                let (key, _, _, value) = ticks[0];
+                let labels: std::collections::HashMap<&str, &str> =
+                    key.key().labels().map(|l| (l.key(), l.value())).collect();
+                assert_eq!(labels.get("result"), Some(&result.as_str()));
+                assert_eq!(labels.get("authority"), Some(&authority.as_str()));
+                assert_eq!(labels.len(), 2, "no label but `result` and `authority`");
+                match value {
+                    metrics_util::debugging::DebugValue::Counter(v) => assert_eq!(*v, 1),
+                    other => panic!("expected Counter, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The `authority` label values are the **column** values of
+    /// `policy_projections.composite_verdict_mode`, for
+    /// [`CompositeAssessmentResult`]'s reason one label over: an
+    /// operator correlating "which policies are promoted?" (a SQL
+    /// question) with "what is promotion gating?" (a PromQL one) is
+    /// combining the two, and a drift would make them different
+    /// questions.
+    #[test]
+    fn composite_authority_mirrors_the_policy_column_value() {
+        use hort_domain::entities::scan_policy::CompositeVerdictMode as M;
+        for (domain, label) in [
+            (M::Observed, super::CompositeAuthority::Observed),
+            (M::Promoted, super::CompositeAuthority::Promoted),
+        ] {
+            assert_eq!(
+                super::CompositeAuthority::from(domain),
+                label,
+                "the From impl must not cross the arms"
+            );
+            assert_eq!(
+                label.as_str(),
+                domain.to_string(),
+                "the metric label and the policy column must spell the posture identically"
+            );
+        }
+    }
+
+    /// Both values are distinct, lowercase snake_case — the catalog's
+    /// own rule, asserted rather than reviewed.
+    #[test]
+    fn composite_authority_values_are_unique_and_snake_case() {
+        let values = [
+            super::CompositeAuthority::Observed.as_str(),
+            super::CompositeAuthority::Promoted.as_str(),
+        ];
+        let distinct: HashSet<&'static str> = values.iter().copied().collect();
+        assert_eq!(distinct.len(), values.len(), "label values collide");
+        for value in values {
+            assert!(
+                !value.is_empty() && value.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{value} must be lowercase snake_case"
+            );
+        }
+    }
+
+    /// **The comparison is over all nine decision pairs**, and every one
+    /// of them lands on a value: the taxonomy is total, with no arm that
+    /// cannot be reached from a row.
+    ///
+    /// The two pairs that fold onto `agree` without being equal
+    /// (`findings_recorded` against `reject`) are not reachable from a
+    /// real row — both sides are judged under one resolved policy, whose
+    /// `enforcement` mode selects the blocking variant — and if they
+    /// ever were, they would be an enforcement-mode difference rather
+    /// than a finding difference, which this counter does not measure.
+    #[test]
+    fn the_comparison_is_total_over_every_pair_of_gate_decisions() {
+        use super::CompositeComparisonResult as C;
+        use hort_domain::ports::composite_scan_observation::GateDecision as G;
+
+        // Identical decisions agree.
+        for decision in [G::Clean, G::FindingsRecorded, G::Reject] {
+            assert_eq!(C::of(decision, decision), C::Agree);
+        }
+        // The composite blocks and the primary does not: promoting adds
+        // a hold. Both blocking variants read the same way.
+        assert_eq!(C::of(G::Reject, G::Clean), C::CompositeStricter);
+        assert_eq!(C::of(G::FindingsRecorded, G::Clean), C::CompositeStricter);
+        // And the other direction: promoting removes a hold.
+        assert_eq!(C::of(G::Clean, G::Reject), C::CompositePermissive);
+        assert_eq!(C::of(G::Clean, G::FindingsRecorded), C::CompositePermissive);
+        // Both block, differing only in the enforcement mode the policy
+        // fixes for both sides. Folded onto `agree`: the artifact's
+        // outcome does not change either way, which is the question.
+        assert_eq!(C::of(G::Reject, G::FindingsRecorded), C::Agree);
+        assert_eq!(C::of(G::FindingsRecorded, G::Reject), C::Agree);
+    }
+
+    #[test]
+    fn composite_comparison_result_values_are_unique_and_snake_case() {
+        let variants = [
+            super::CompositeComparisonResult::Agree,
+            super::CompositeComparisonResult::CompositeStricter,
+            super::CompositeComparisonResult::CompositePermissive,
+        ];
+        let set: HashSet<&'static str> = variants.iter().map(|v| v.as_str()).collect();
+        assert_eq!(set.len(), variants.len(), "label values must be unique");
+        for value in set {
+            assert!(
+                value.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{value} must be lowercase snake_case"
+            );
+        }
+        assert_eq!(super::CompositeComparisonResult::Agree.as_str(), "agree");
+        assert_eq!(
+            super::CompositeComparisonResult::CompositeStricter.as_str(),
+            "composite_stricter"
+        );
+        assert_eq!(
+            super::CompositeComparisonResult::CompositePermissive.as_str(),
+            "composite_permissive"
+        );
+    }
+
+    #[test]
+    fn emit_composite_comparison_ticks_once_per_direction() {
+        for result in [
+            super::CompositeComparisonResult::Agree,
+            super::CompositeComparisonResult::CompositeStricter,
+            super::CompositeComparisonResult::CompositePermissive,
+        ] {
+            let snap = capture_metrics(|| super::emit_composite_comparison(result));
+            let entries = snap.into_vec();
+            let ticks: Vec<_> = entries
+                .iter()
+                .filter(|(k, _, _, _)| k.key().name() == "hort_scan_composite_comparison_total")
+                .collect();
+            assert_eq!(ticks.len(), 1);
+            let (key, _, _, value) = ticks[0];
+            let labels: std::collections::HashMap<&str, &str> =
+                key.key().labels().map(|l| (l.key(), l.value())).collect();
+            assert_eq!(labels.get("result"), Some(&result.as_str()));
+            assert_eq!(
+                labels.len(),
+                1,
+                "no label but `result`: no gate decision, no artifact id, nothing unbounded"
+            );
+            match value {
+                metrics_util::debugging::DebugValue::Counter(v) => assert_eq!(*v, 1),
+                other => panic!("expected Counter, got {other:?}"),
+            }
+        }
     }
 
     // -------------------------------------------------------------------

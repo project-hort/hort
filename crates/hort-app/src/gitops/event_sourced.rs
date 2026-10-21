@@ -63,8 +63,8 @@ use hort_config::exclusion::ExclusionSpec;
 use hort_config::scan_policy::{ScanPolicySpec, SignerIdentitySpec};
 use hort_config::scope::ScopeSpec;
 use hort_domain::entities::scan_policy::{
-    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-    SeverityThreshold, SignerIdentityPattern,
+    CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
+    ScanPolicyProjection, SeverityThreshold, SignerIdentityPattern,
 };
 use hort_domain::events::{
     DomainEvent, ExclusionAdded, ExclusionRemoved, PolicyCreated, PolicyField, PolicyScope,
@@ -204,6 +204,8 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
             parse_provenance_identities(&desired.spec.provenance_identities);
         let desired_negligible_action = parse_negligible_action(&desired.spec.negligible_action);
         let desired_enforcement = parse_scan_enforcement(&desired.spec.enforcement);
+        let desired_composite_verdict_mode =
+            parse_composite_verdict_mode(&desired.spec.composite_verdict_mode);
 
         match projection {
             None => {
@@ -227,6 +229,7 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
                     desired.spec.rescan_interval_hours,
                     &desired_negligible_action,
                     &desired_enforcement,
+                    &desired_composite_verdict_mode,
                 );
                 vec![DomainEvent::PolicyCreated(PolicyCreated {
                     policy_id,
@@ -405,6 +408,26 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
                         field: PolicyField::Enforcement,
                         previous_value: serde_json::Value::String(proj.enforcement.to_string()),
                         new_value: serde_json::Value::String(desired_enforcement.to_string()),
+                    }));
+                }
+
+                // -- CompositeVerdictMode (ADR 0064 D6) --
+                // Lowercase wire strings on the payload. Unlike
+                // `Enforcement`, neither direction is gate-affecting: a
+                // promoted composite verdict's findings come from
+                // scanning an assembled image, so re-deriving from
+                // *stored* findings would un-reject the population it
+                // rejected without assessing anything afresh.
+                if proj.composite_verdict_mode != desired_composite_verdict_mode {
+                    events.push(DomainEvent::PolicyUpdated(PolicyUpdated {
+                        policy_id: pid,
+                        field: PolicyField::CompositeVerdictMode,
+                        previous_value: serde_json::Value::String(
+                            proj.composite_verdict_mode.to_string(),
+                        ),
+                        new_value: serde_json::Value::String(
+                            desired_composite_verdict_mode.to_string(),
+                        ),
                     }));
                 }
 
@@ -674,6 +697,7 @@ fn build_config_snapshot(
     rescan_interval_hours: i32,
     negligible_action: &NegligibleAction,
     enforcement: &ScanEnforcement,
+    composite_verdict_mode: &CompositeVerdictMode,
 ) -> serde_json::Value {
     serde_json::json!({
         "name": name,
@@ -691,6 +715,7 @@ fn build_config_snapshot(
         "rescan_interval_hours": rescan_interval_hours,
         "negligible_action": negligible_action.to_string(),
         "enforcement": enforcement.to_string(),
+        "composite_verdict_mode": composite_verdict_mode.to_string(),
     })
 }
 
@@ -727,6 +752,19 @@ fn parse_scan_enforcement(s: &str) -> ScanEnforcement {
     ScanEnforcement::from_str(s).unwrap_or_else(|err| {
         panic!(
             "INVARIANT: scan enforcement '{s}' must have been validated by \
+             hort_config::scan_policy::validate_scan_policy before reaching the \
+             applier (parse error: {err})"
+        )
+    })
+}
+
+/// Map the validated `compositeVerdictMode` wire string into the domain
+/// enum. `hort-config`'s `validate_scan_policy` ran first, so a parse
+/// failure here is a bypassed-validator programming error.
+fn parse_composite_verdict_mode(s: &str) -> CompositeVerdictMode {
+    CompositeVerdictMode::from_str(s).unwrap_or_else(|err| {
+        panic!(
+            "INVARIANT: composite verdict mode '{s}' must have been validated by \
              hort_config::scan_policy::validate_scan_policy before reaching the \
              applier (parse error: {err})"
         )
@@ -841,6 +879,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: "ignore".into(),
             enforcement: "reject".into(),
+            composite_verdict_mode: "observed".into(),
         }
     }
 
@@ -866,6 +905,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 7,
             created_at: now,
             updated_at: now,
@@ -1032,6 +1072,16 @@ mod tests {
         let applier = ScanPolicyApplier::default();
         let mut spec = baseline_spec();
         spec.quarantine_duration = "12garbage".into();
+        let env = policy_envelope(spec);
+        let _ = applier.diff(&env, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "INVARIANT: composite verdict mode")]
+    fn scan_policy_malformed_composite_verdict_mode_panics_with_invariant_prefix() {
+        let applier = ScanPolicyApplier::default();
+        let mut spec = baseline_spec();
+        spec.composite_verdict_mode = "enforce".into();
         let env = policy_envelope(spec);
         let _ = applier.diff(&env, None);
     }
@@ -2322,6 +2372,7 @@ mod tests {
             48,
             &NegligibleAction::Block,
             &ScanEnforcement::Record,
+            &CompositeVerdictMode::Promoted,
         );
         for key in [
             "name",
@@ -2425,5 +2476,71 @@ mod tests {
             e,
             DomainEvent::PolicyUpdated(p) if p.field == PolicyField::Enforcement
         )));
+    }
+
+    #[test]
+    fn scan_policy_composite_verdict_mode_change_emits_one_event() {
+        let policy_id = Uuid::new_v4();
+        let applier = ScanPolicyApplier::new(HashMap::new());
+        let mut spec = baseline_spec();
+        spec.composite_verdict_mode = "promoted".into();
+        let events = applier.diff(
+            &policy_envelope(spec),
+            Some(&baseline_projection(policy_id)),
+        );
+        let updated: Vec<&PolicyUpdated> = events
+            .iter()
+            .filter_map(|e| match e {
+                DomainEvent::PolicyUpdated(p) if p.field == PolicyField::CompositeVerdictMode => {
+                    Some(p)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updated.len(), 1, "exactly one CompositeVerdictMode event");
+        assert_eq!(updated[0].previous_value, serde_json::json!("observed"));
+        assert_eq!(updated[0].new_value, serde_json::json!("promoted"));
+        // Deliberately NOT gate-affecting (ADR 0064 D6): the ADR 0041
+        // pass re-derives verdicts from stored findings, and a composite
+        // verdict's findings come from scanning an assembled image — so
+        // demoting that way would un-reject the population a promoted
+        // composite had correctly rejected with nothing fresh having
+        // looked at it.
+        assert!(!updated[0].field.is_gate_affecting());
+    }
+
+    #[test]
+    fn scan_policy_unchanged_composite_verdict_mode_emits_no_event() {
+        // Both the baseline projection and the baseline spec carry the
+        // default `observed`; an apply that does not touch the field
+        // must emit nothing, or every re-apply would write a policy
+        // event for a posture nobody changed.
+        let policy_id = Uuid::new_v4();
+        let applier = ScanPolicyApplier::new(HashMap::new());
+        let events = applier.diff(
+            &policy_envelope(baseline_spec()),
+            Some(&baseline_projection(policy_id)),
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            DomainEvent::PolicyUpdated(p) if p.field == PolicyField::CompositeVerdictMode
+        )));
+    }
+
+    /// The created-policy snapshot carries the posture, so the
+    /// operator-visible record of what was applied names it.
+    #[test]
+    fn scan_policy_created_snapshot_carries_the_composite_verdict_mode() {
+        let applier = ScanPolicyApplier::new(HashMap::new());
+        let mut spec = baseline_spec();
+        spec.composite_verdict_mode = "promoted".into();
+        let events = applier.diff(&policy_envelope(spec), None);
+        let DomainEvent::PolicyCreated(created) = &events[0] else {
+            panic!("expected PolicyCreated, got {:?}", events[0]);
+        };
+        assert_eq!(
+            created.config_snapshot["composite_verdict_mode"],
+            "promoted"
+        );
     }
 }

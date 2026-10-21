@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use hort_config::scan_policy::SignerIdentitySpec;
 use hort_domain::entities::scan_policy::{
-    NegligibleAction, ProvenanceMode, ScanEnforcement, SignerIdentityPattern,
+    CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, SignerIdentityPattern,
 };
 
 /// The Tier-1 set of formats with a registered `ProvenancePort` verifier.
@@ -47,6 +47,14 @@ pub(crate) fn negligible_action_from_spec(s: &str) -> NegligibleAction {
 /// failure is a bypassed-validator programming error.
 pub(crate) fn scan_enforcement_from_spec(s: &str) -> ScanEnforcement {
     ScanEnforcement::from_str(s).expect("INVARIANT: enforcement validated by hort-config")
+}
+
+/// Map the validated `compositeVerdictMode` wire string to the domain
+/// enum. `hort_config::scan_policy::validate_scan_policy` ran first, so a
+/// parse failure is a bypassed-validator programming error.
+pub(crate) fn composite_verdict_mode_from_spec(s: &str) -> CompositeVerdictMode {
+    CompositeVerdictMode::from_str(s)
+        .expect("INVARIANT: compositeVerdictMode validated by hort-config")
 }
 
 /// Map the validated `provenanceIdentities` wire specs to the
@@ -107,6 +115,28 @@ mod tests {
         // The mapper trusts `validate_scan_policy` — reaching it with an
         // unvalidated value is a programming error, not operator input.
         let _ = scan_enforcement_from_spec("audit");
+    }
+
+    #[test]
+    fn composite_verdict_mode_maps_each_validated_string() {
+        assert_eq!(
+            composite_verdict_mode_from_spec("observed"),
+            CompositeVerdictMode::Observed
+        );
+        assert_eq!(
+            composite_verdict_mode_from_spec("promoted"),
+            CompositeVerdictMode::Promoted
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "INVARIANT: compositeVerdictMode validated by hort-config")]
+    fn composite_verdict_mode_panics_on_bypassed_validator() {
+        // Same contract as the mapper above: a near-miss mode is
+        // `validate_scan_policy`'s typed reject, and silently defaulting
+        // one here would either un-promote a policy an operator promoted
+        // or grant release authority nobody granted.
+        let _ = composite_verdict_mode_from_spec("enforce");
     }
 
     #[test]

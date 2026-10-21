@@ -286,6 +286,102 @@ impl FromStr for ScanEnforcement {
 }
 
 // ---------------------------------------------------------------------------
+// CompositeVerdictMode (ADR 0064 D6)
+// ---------------------------------------------------------------------------
+
+/// Per-policy steering of **whether a composed OCI image's scan verdict
+/// decides its manifest's release** (ADR 0064 D6).
+///
+/// The unit of filesystem assessment for an OCI image is the image
+/// manifest, not a layer (ADR 0064 D1): the config and the ordered layers
+/// are materialised as one OCI layout and scanned as one image, because
+/// the package surface belongs to the composition — a layer carrying a
+/// complete package database and no OS marker reports *nothing* scanned on
+/// its own. That composition is assessed on every manifest scan whatever
+/// this field says. What the field decides is whether the resulting
+/// verdict reaches the artifact.
+///
+/// - [`Observed`](Self::Observed) — **the default**, and the behaviour of
+///   every policy that predates this field. The composition is resolved,
+///   acquired, scanned and recorded as a `composite_scan_observations` row
+///   carrying both the composite verdict and the counterfactual, and the
+///   manifest's own assessment is byte-for-byte what it would be with no
+///   composite path at all.
+/// - [`Promoted`](Self::Promoted) — the composite verdict carries release
+///   authority. Its findings join the manifest row's and reach the release
+///   gate under ADR 0007's existing predicate, exactly as a second
+///   backend's findings over the manifest's own bytes would; and a
+///   composition that could **not** be produced is the absent verdict
+///   ADR 0007 fails closed on, rather than a log line.
+///
+/// Why an operator grants it rather than a release shipping it: a
+/// composite verdict adds rejections across an existing estate, `Rejected`
+/// is terminal, and the periodic rescan never revisits it — so a wrong
+/// verdict from a new analysis path on its first production run leaves an
+/// estate only an explicit operator re-evaluation can recover. The
+/// observation row is what the promotion decision is made on, and it keeps
+/// being written under [`Promoted`](Self::Promoted) so an operator can
+/// confirm the promotion behaves as the measurement predicted.
+///
+/// **Per policy, not global**, because promoting on one repository and
+/// watching it is the whole shape of ADR 0064 D6's criteria. **Per policy
+/// rather than per manifest** because promotion is an enforcement posture,
+/// like [`ScanEnforcement`] and [`ProvenanceMode`] beside it, not a
+/// curation act about one artifact.
+///
+/// Lowercase wire-form on parse and display (mirrors [`SeverityThreshold`],
+/// [`ProvenanceMode`], [`NegligibleAction`] and [`ScanEnforcement`]) so the
+/// YAML, JSON and SQL surfaces share one spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum CompositeVerdictMode {
+    /// Default — the composed image is assessed and the assessment is
+    /// recorded as an observation, with no release authority.
+    #[default]
+    Observed,
+    /// The composed image's verdict is the manifest's: its findings gate
+    /// release, and a composition that could not be produced is an absent
+    /// verdict that holds the manifest fail-closed.
+    Promoted,
+}
+
+impl CompositeVerdictMode {
+    /// Whether a composed image's verdict decides its manifest's release.
+    ///
+    /// The one question every consumer asks, named once so a call site
+    /// reads as the decision rather than as an enum comparison.
+    #[must_use]
+    pub const fn carries_release_authority(&self) -> bool {
+        match self {
+            Self::Observed => false,
+            Self::Promoted => true,
+        }
+    }
+}
+
+impl fmt::Display for CompositeVerdictMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observed => f.write_str("observed"),
+            Self::Promoted => f.write_str("promoted"),
+        }
+    }
+}
+
+impl FromStr for CompositeVerdictMode {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "observed" => Ok(Self::Observed),
+            "promoted" => Ok(Self::Promoted),
+            _ => Err(DomainError::Validation(format!(
+                "unknown composite verdict mode: {s}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SignerIdentityPattern (ADR 0027)
 // ---------------------------------------------------------------------------
 
@@ -543,6 +639,24 @@ pub struct ScanPolicyProjection {
     /// re-evaluation decision point
     /// [`crate::policy::decide_rejected_transition`] (NOT inert).
     pub enforcement: ScanEnforcement,
+    /// Whether a composed OCI image's scan verdict decides its
+    /// manifest's release (ADR 0064 D6). Default
+    /// [`CompositeVerdictMode::Observed`] — the composition is assessed
+    /// and recorded as an observation with no release authority, which
+    /// is the behaviour of every policy that predates the field.
+    ///
+    /// Consumed by `ScanOrchestrationUseCase`'s composite path, which
+    /// folds a promoted composition's findings into the manifest row's
+    /// own and routes a promoted composition's *absence* through the
+    /// fail-closed no-verdict partition (NOT inert). An empty
+    /// [`scan_backends`] never reaches that path at all — the scan
+    /// returns before a composition is resolved — so
+    /// `Promoted` × `scan_backends: []` is an apply-time reject
+    /// (ADR 0015 / ADR 0016, the
+    /// `composite_verdict_promoted_requires_scan_backends` linter row).
+    ///
+    /// [`scan_backends`]: ScanPolicyProjection::scan_backends
+    pub composite_verdict_mode: CompositeVerdictMode,
     /// Last appended position on the per-policy event stream. Drives
     /// optimistic-concurrency on the next event append.
     pub stream_version: u64,
@@ -918,6 +1032,85 @@ mod tests {
         }
     }
 
+    // ---- CompositeVerdictMode (ADR 0064 D6) ----
+
+    /// The default is the posture every policy written before the field
+    /// existed behaves as: the composed-image verdict is measured and
+    /// decides nothing. Load-bearing — the SQL `DEFAULT 'observed'`
+    /// backfills every existing row to it, and a default of `Promoted`
+    /// would hand release authority to an analysis nobody promoted.
+    #[test]
+    fn composite_verdict_mode_default_is_observed() {
+        assert_eq!(
+            CompositeVerdictMode::default(),
+            CompositeVerdictMode::Observed
+        );
+        assert!(!CompositeVerdictMode::default().carries_release_authority());
+    }
+
+    /// The one question every consumer asks, and the two answers.
+    #[test]
+    fn only_the_promoted_mode_carries_release_authority() {
+        assert!(!CompositeVerdictMode::Observed.carries_release_authority());
+        assert!(CompositeVerdictMode::Promoted.carries_release_authority());
+    }
+
+    #[test]
+    fn composite_verdict_mode_round_trips_every_variant() {
+        for (mode, wire) in [
+            (CompositeVerdictMode::Observed, "observed"),
+            (CompositeVerdictMode::Promoted, "promoted"),
+        ] {
+            assert_eq!(mode.to_string(), wire);
+            assert_eq!(
+                CompositeVerdictMode::from_str(wire).expect("parse"),
+                mode,
+                "the YAML, the metric label and the SQL column all spell it `{wire}`"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_verdict_mode_parse_is_case_insensitive() {
+        assert_eq!(
+            CompositeVerdictMode::from_str("PROMOTED").expect("parse"),
+            CompositeVerdictMode::Promoted
+        );
+        assert_eq!(
+            CompositeVerdictMode::from_str("Observed").expect("parse"),
+            CompositeVerdictMode::Observed
+        );
+    }
+
+    /// A near-miss does not silently fall back to either posture:
+    /// defaulting to `observed` would tell an operator their promotion
+    /// is in effect when it is not, and defaulting to `promoted` would
+    /// grant authority nobody granted.
+    #[test]
+    fn composite_verdict_mode_parse_unknown_is_validation_error() {
+        for bad in ["promote", "enforced", "shadow", ""] {
+            let err = CompositeVerdictMode::from_str(bad)
+                .expect_err("an out-of-taxonomy mode must not parse");
+            assert!(
+                matches!(err, DomainError::Validation(ref m)
+                    if m.contains("composite verdict mode")),
+                "unexpected error for `{bad}`: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_verdict_mode_serde_round_trips() {
+        for mode in [
+            CompositeVerdictMode::Observed,
+            CompositeVerdictMode::Promoted,
+        ] {
+            let json = serde_json::to_string(&mode).expect("serialize");
+            let back: CompositeVerdictMode = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(mode, back);
+        }
+    }
+
     // ---- ScanPolicyProjection clone/eq/Serialize ----
 
     fn sample_projection() -> ScanPolicyProjection {
@@ -942,6 +1135,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 7,
             created_at: now,
             updated_at: now,
@@ -1083,6 +1277,29 @@ mod tests {
         let mut b = a.clone();
         b.enforcement = ScanEnforcement::Record;
         assert_ne!(a, b);
+    }
+
+    /// Load-bearing for the gitops diff exactly as `enforcement` is:
+    /// `update_policy` emits a `PolicyUpdated` only when the projection
+    /// value actually differs, so equality must see this field or a
+    /// promotion applies as a silent no-op.
+    #[test]
+    fn scan_policy_projection_composite_verdict_mode_change_breaks_equality() {
+        let a = sample_projection();
+        let mut b = a.clone();
+        b.composite_verdict_mode = CompositeVerdictMode::Promoted;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn scan_policy_projection_composite_verdict_mode_serialises_under_snake_case_key() {
+        let mut p = sample_projection();
+        p.composite_verdict_mode = CompositeVerdictMode::Promoted;
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(
+            json.contains("\"composite_verdict_mode\":\"Promoted\""),
+            "composite_verdict_mode must surface under its snake_case key: {json}"
+        );
     }
 
     #[test]

@@ -144,8 +144,8 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 // the shared `hort_app::provenance` module (single source for apply + the
 // offline validator), not duplicated here.
 use crate::provenance::{
-    negligible_action_from_spec, provenance_identities_from_spec, provenance_mode_from_spec,
-    scan_enforcement_from_spec,
+    composite_verdict_mode_from_spec, negligible_action_from_spec, provenance_identities_from_spec,
+    provenance_mode_from_spec, scan_enforcement_from_spec,
 };
 use hort_domain::entities::service_account::{
     backing_username, FallbackRotation, FederatedIdentity, SecretFormat, ServiceAccount,
@@ -773,6 +773,11 @@ const PRE_WRITE_REJECT_ROWS: &[(LinterRule, &str, RowAbort)] = &[
     (
         LinterRule::SaRotationTargetConflict,
         "gitops apply: rotation-target linter rejected ServiceAccount envelope(s) (two ServiceAccounts declare one fallbackRotation.targetSecret, so the reconciler's ownership barrier makes one of them collide every tick)",
+        RowAbort::EveryFinding,
+    ),
+    (
+        LinterRule::CompositeVerdictPromotedRequiresScanBackends,
+        "gitops apply: compositeVerdictMode × scanBackends:[] linter rejected ScanPolicy envelope(s) (a waived scan resolves no composed image, so the promoted verdict is never produced)",
         RowAbort::EveryFinding,
     ),
 ];
@@ -1855,6 +1860,12 @@ fn create_command_from_spec(
         // hort-config validated the wire value (parses to reject/record)
         // before this site.
         enforcement: scan_enforcement_from_spec(&env.spec.enforcement),
+        // `composite_verdict_mode` flows from YAML to the create
+        // command. hort-config validated the wire value (parses to
+        // observed/promoted) before this site, and the `promoted` ×
+        // empty-`scanBackends` combination is rejected by the linter row
+        // ahead of the first write.
+        composite_verdict_mode: composite_verdict_mode_from_spec(&env.spec.composite_verdict_mode),
     }
 }
 
@@ -1905,6 +1916,11 @@ fn update_command_from_diff(
         // Flow enforcement through. Same argument: per-field same-value
         // skip in `update_policy`.
         enforcement: FieldChange::Set(scan_enforcement_from_spec(&env.spec.enforcement)),
+        // Flow composite_verdict_mode through. Same argument: per-field
+        // same-value skip in `update_policy`.
+        composite_verdict_mode: FieldChange::Set(composite_verdict_mode_from_spec(
+            &env.spec.composite_verdict_mode,
+        )),
     }
 }
 
@@ -2039,7 +2055,9 @@ mod tests {
     // Test-only — the provenance mappers live in `crate::provenance`;
     // these types are referenced only by the fixtures.
     use hort_config::scan_policy::SignerIdentitySpec;
-    use hort_domain::entities::scan_policy::{NegligibleAction, ProvenanceMode, ScanEnforcement};
+    use hort_domain::entities::scan_policy::{
+        CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
+    };
 
     use crate::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
     use crate::use_cases::test_support::{MockCall, MockRepositoryRepository};
@@ -3002,6 +3020,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
+                composite_verdict_mode: "observed".into(),
             },
         }
     }
@@ -3114,6 +3133,7 @@ mod tests {
             default_repository_access_for_policy(),
             Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
             Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
+            HashMap::new(),
         ));
         // OidcIssuer / ServiceAccount gitops surface mocks.
         let oidc_issuers =
@@ -3218,6 +3238,7 @@ mod tests {
             default_repository_access_for_policy(),
             Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
             Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
+            HashMap::new(),
         ));
         let oidc_issuers =
             Arc::new(crate::use_cases::test_support::MockOidcIssuerRepository::new());
@@ -5942,6 +5963,7 @@ mod tests {
                 default_repository_access_for_policy(),
                 Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
                 Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
+                HashMap::new(),
             )),
             h.artifacts.clone(),
             h.lifecycle.clone(),
@@ -6011,6 +6033,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
+                composite_verdict_mode: "observed".into(),
             },
         }
     }
@@ -6045,6 +6068,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 3,
             created_at: now,
             updated_at: now,
@@ -7486,6 +7510,23 @@ mod tests {
                 expect_rule: LinterRule::SaRotationTargetConflict,
                 effective_backend: None,
             },
+            // Row 15 — a ScanPolicy promoting the composed-image verdict
+            // while waiving scanning outright. Global scope and no
+            // repositories, so row 7c has nothing to pair the (empty)
+            // backend list against and row 15 is the first error.
+            Case {
+                desired: DesiredState {
+                    scan_policies: vec![{
+                        let mut env = scan_policy_env("p-waived-but-promoted");
+                        env.spec.composite_verdict_mode = "promoted".into();
+                        env.spec.scan_backends = vec![];
+                        env
+                    }],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::CompositeVerdictPromotedRequiresScanBackends,
+                effective_backend: None,
+            },
         ];
 
         for case in cases {
@@ -7768,7 +7809,8 @@ mod tests {
                 | LinterRule::ExclusionScopeNotImplemented
                 | LinterRule::VirtualMemberFormatNotEnforced
                 | LinterRule::ScanPolicyMaxArtifactAgeNotImplemented
-                | LinterRule::SaRotationTargetConflict => Consumption::Table,
+                | LinterRule::SaRotationTargetConflict
+                | LinterRule::CompositeVerdictPromotedRequiresScanBackends => Consumption::Table,
                 // Row 2 — its own abort immediately before row 4, so the
                 // cross-kind FK keeps its distinct log line and its
                 // `"; "`-joined envelope.
@@ -7797,6 +7839,7 @@ mod tests {
             LinterRule::VirtualMemberFormatNotEnforced,
             LinterRule::ScanPolicyMaxArtifactAgeNotImplemented,
             LinterRule::SaRotationTargetConflict,
+            LinterRule::CompositeVerdictPromotedRequiresScanBackends,
         ];
 
         let in_table: HashSet<LinterRule> =
@@ -7840,7 +7883,7 @@ mod tests {
             .count();
         assert_eq!(
             (table, dedicated, advisory),
-            (13, 1, 1),
+            (14, 1, 1),
             "the LinterRule bucket counts changed — a silent reclassification \
              (or a variant missing from ALL_RULES) is exactly what this guard \
              exists to catch"
@@ -8544,6 +8587,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
+                composite_verdict_mode: "observed".into(),
             },
         }
     }
@@ -8577,6 +8621,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
+                composite_verdict_mode: "observed".into(),
             },
         }
     }
@@ -9029,6 +9074,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
+                composite_verdict_mode: "observed".into(),
             },
         }
     }

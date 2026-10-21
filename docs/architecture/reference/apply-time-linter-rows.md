@@ -54,6 +54,7 @@ treats as a hard block.
 | 12 | `VirtualMemberFormatNotEnforced` / `virtual_member_format_not_enforced` | `ArtifactRepository.virtualMembers[]` | a member whose `format` differs from the virtual's |
 | 13 | `ScanPolicyMaxArtifactAgeNotImplemented` / `scan_policy_max_artifact_age_not_implemented` | `ScanPolicy.maxArtifactAge` | any value — the inert state is the absent field |
 | 14 | `SaRotationTargetConflict` / — | `ServiceAccount.fallbackRotation.targetSecret` | two `ServiceAccount` envelopes declaring the same `(namespace, name)` target — the reconciler's ownership barrier refuses one of them on every tick, so its declared rotation never happens |
+| 15 | `CompositeVerdictPromotedRequiresScanBackends` / `composite_verdict_promoted_requires_scan_backends` | `ScanPolicy.compositeVerdictMode` + `scanBackends` | `compositeVerdictMode: promoted` paired with `scanBackends: []` — the waiver returns before a composed image is resolved, so the promotion grants release authority to a verdict no manifest in scope ever carries ([ADR 0064](../../adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md) D6 × [ADR 0016](../../adr/0016-cross-opt-in-interaction-matrix.md)) |
 
 Rows 0, 1 and 4 are not in this table because they are not lint rows:
 row 0 is `DesiredState::validate` (per-envelope + cross-document), row 1
@@ -67,8 +68,8 @@ for which of them the offline gate runs.
 Apply aborts on the **first** row with an error finding, so a row
 inserted ahead of an existing one changes which message an
 already-failing config is rejected with. New rows are therefore appended
-at the end — rows 9 through 14 all carry that note in their
-`LinterRule` doc comment, and rows 10–14 were appended in that order for
+at the end — rows 9 through 15 all carry that note in their
+`LinterRule` doc comment, and rows 10–15 were appended in that order for
 exactly this reason.
 
 ### Retirement triggers
@@ -89,7 +90,13 @@ trigger in the `validate_*` doc comment:
 The other rows are not on this list: they reject a configuration that is
 wrong, and no future work makes them obsolete. Row 14 is one of them —
 two ServiceAccounts cannot share a rotation target under any
-implementation, because the owner of a Secret is a single value.
+implementation, because the owner of a Secret is a single value. So is
+row 15: a waived scan has nothing to promote under any implementation of
+the composite path, so the combination stays wrong however that path
+develops. It is the second row whose subject is a **cross-opt-in
+collapse** rather than a missing control — row 5 is the first, and the
+two share the empty backend list as the half that cancels the other
+opt-in.
 
 ## Table 2 — surfaces with no named row, and where they are checked
 
@@ -104,6 +111,7 @@ implementation, because the owner of a Secret is a single value.
 | `proxy.credentials` | `ParseError::CredentialsFieldForbidden` — parse time | the field is forbidden outright, so it never reaches a `DesiredState` |
 | A declared name that already exists as a `managed_by=local` row; `HORT_AUTH_PROVIDER=disabled` with `ClaimMapping` envelopes declared | row 1 — `validate_against` | needs the current-state snapshot / the deployment env, which the pure validator cannot hold by construction |
 | `ScanPolicy.requireApproval`, `severityThreshold`, `negligibleAction`, `enforcement`, `quarantineDuration` | enforced at runtime (`policy::promotion`, `policy::scan`, `effective_quarantine_deadline`) | nothing to withdraw — these decide what they say they decide |
+| `ScanPolicy.compositeVerdictMode` on its own (any value, with a non-empty `scanBackends`) | enforced at runtime (`ScanOrchestrationUseCase`'s composite path — a promoted composition's findings join the manifest row's, and a promoted composition's absence routes through the fail-closed no-verdict partition) | nothing to withdraw — the consumer exists. The *combination* with `scanBackends: []` is **row 15** above, which is a cross-opt-in collapse rather than an inert field: each opt-in is load-bearing alone and they cancel together |
 | `UpstreamMapping.allowedRealmHosts` | `validate_allowed_realm_hosts` (per-envelope, `hort-config::upstream_mapping`) + the value-object constructor + two schema CHECKs | both rules are decidable from this one envelope — the auth type and the list are in the same spec — so per-spec validation is the earliest place the verdict exists and the only one provably before the bundle's first write, exactly as [`validate_tls_material`](../../../crates/hort-config/src/upstream_mapping.rs) argues beside it. The non-`bearer_challenge` rejection is an [ADR 0015](../../adr/0015-apply-time-linter-inert-fields-and-naming.md) inert-field rejection **without** a rule key, like `validate_virtual_type_shape` above. A mapping with no `secretRef` is deliberately **not** rejected: the consumer (the credentialed realm exchange) comes into being the moment a secret is added to the same mapping, so the field is conditional, not inert |
 | `ScanPolicy.maxArtifactAge` carrying a malformed duration | row 0 — `validate_scan_policy_env`'s humantime parse | a parse failure is a per-envelope fact. The *field itself* is **row 13** above, which refuses every well-formed duration too; the format check stays beside it, so a malformed value trips both and the row-0 message is what the operator sees first |
 

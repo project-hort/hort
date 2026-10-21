@@ -2048,8 +2048,8 @@ mod tests {
         repo_id: Uuid,
     ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-            SeverityThreshold,
+            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
+            ScanPolicyProjection, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
         let now = Utc::now();
@@ -2070,6 +2070,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: now,
             updated_at: now,

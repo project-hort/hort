@@ -75,6 +75,53 @@ pub enum ArtifactKind {
 }
 
 impl ArtifactKind {
+    /// Whether a row of this kind is a **constituent** of a composition
+    /// whose assessment, not its own, is the unit of filesystem
+    /// assessment (ADR 0064 D1).
+    ///
+    /// An OCI blob is a layer: its bytes are one step in building a root
+    /// filesystem, and the package set of the filesystem they end up in
+    /// is not a function of the package sets its layers report on their
+    /// own — a later layer adds packages an earlier one cannot be read
+    /// for, and removes packages it carries. So a statement about what is
+    /// *installed* in a layer's isolated tree is a statement about a tree
+    /// nothing runs, and ADR 0064 D2 places it with the composition.
+    ///
+    /// The composition itself is **not** a constituent:
+    /// [`Self::OciManifest`] is the row that carries the composite
+    /// verdict (D4), so answering `true` for it would move the verdict
+    /// off the only artifact that holds one.
+    ///
+    /// Every other kind answers `false`, and that is a scope statement
+    /// rather than a default: an installed npm or Python tree is also a
+    /// composition hort never assembles, but the analysis unit differs
+    /// per format and ADR 0064's measurement says nothing about them
+    /// ("Not decided here"). Exhaustive with no wildcard arm, so a new
+    /// kind has to state which side of that line it is on.
+    ///
+    /// The single definition of the question. Both consumers reach it:
+    /// [`Finding::may_condemn_artifact`](crate::types::Finding::may_condemn_artifact),
+    /// which decides whether a finding's filesystem claim is about this
+    /// row or about the composition above it, and
+    /// [`NotAnalysable::gates_release`](crate::ports::scanner::NotAnalysable::gates_release),
+    /// which decides whether an *absent* assessment of the same surface
+    /// holds the row. Two copies of it would let a finding and an
+    /// absence disagree about whether one row is a constituent.
+    #[must_use]
+    pub const fn is_composition_constituent(&self) -> bool {
+        match self {
+            Self::OciBlob => true,
+            Self::OciManifest
+            | Self::MavenJar
+            | Self::MavenPom
+            | Self::NpmTarball
+            | Self::CargoCrate
+            | Self::PyWheel
+            | Self::PySdist
+            | Self::Other => false,
+        }
+    }
+
     /// Stable lowercase identifier for logs and metric labels.
     ///
     /// Not a wire format: nothing persists an `ArtifactKind`, so these
@@ -126,6 +173,37 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), total, "identifiers must be unique: {seen:?}");
+    }
+
+    /// The OCI blob is the one kind whose filesystem belongs to something
+    /// else (ADR 0064 D1). Asserted over **every** variant rather than
+    /// over the two interesting ones: the predicate's whole job is to
+    /// scope ADR 0064 D2 to the format it was measured on, and a kind
+    /// silently joining the `true` side is how an npm tarball's findings
+    /// would stop gating.
+    ///
+    /// The manifest is explicitly on the `false` side — it is the row that
+    /// carries the composite verdict, so moving its filesystem verdict
+    /// away would leave no artifact holding one.
+    #[test]
+    fn only_an_oci_blob_is_a_composition_constituent() {
+        assert!(ArtifactKind::OciBlob.is_composition_constituent());
+        for kind in [
+            ArtifactKind::OciManifest,
+            ArtifactKind::MavenJar,
+            ArtifactKind::MavenPom,
+            ArtifactKind::NpmTarball,
+            ArtifactKind::CargoCrate,
+            ArtifactKind::PyWheel,
+            ArtifactKind::PySdist,
+            ArtifactKind::Other,
+        ] {
+            assert!(
+                !kind.is_composition_constituent(),
+                "{kind} is not a constituent of a composition hort assembles; \
+                 ADR 0064 decides the OCI image and nothing else"
+            );
+        }
     }
 
     #[test]
