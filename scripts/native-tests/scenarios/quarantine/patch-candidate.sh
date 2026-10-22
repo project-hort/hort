@@ -3,7 +3,11 @@
 # End-to-end smoke for the patch-candidate workflow.
 #
 #   1. Seed a transient npm proxy repo via psql.
-#   2. Seed pkg@1.0 (released) + one High-severity scan_findings row.
+#   2. Seed pkg@1.0 (released) + one High-severity scan_findings row,
+#      with `artifacts.last_scan_at` set to the SAME timestamp as the
+#      finding's `detected_at` — the read selects one scan's rows by
+#      `sf.detected_at = v.last_scan_at`, and production writes both from
+#      one value in one transaction.
 #   3. Seed pkg@1.1 (quarantined, quarantine_window_start anchored +71h
 #      so the computed release deadline stays in the future, no findings).
 #   4. `hort-cli admin quarantine list-patch-candidates --output json`
@@ -70,6 +74,22 @@ REPO_ID=""
 V_ID=""           # vulnerable artifact (pkg@1.0, released)
 Q_ID=""           # quarantined artifact (pkg@1.1)
 SCAN_ID=""        # scan_findings.scan_id — synthetic UUID
+
+# The one timestamp that stands for "the vulnerable artifact's last scan".
+#
+# It is substituted into BOTH `artifacts.last_scan_at` and the seeded
+# `scan_findings.detected_at`, because the patch-candidate read selects a
+# single scan's rows with `sf.detected_at = v.last_scan_at` (strict
+# equality). Production cannot disagree there — one writer sets the column
+# and inserts the rows in the same transaction from the same value — so a
+# fixture that seeds findings without the matching anchor builds a state
+# the system cannot reach, and the surface correctly reports no candidate.
+#
+# Computed ONCE here rather than as `now() - interval '1 hour'` in each
+# statement: two `now()` calls in two statements differ by microseconds,
+# which is enough to make the equality fail.
+SCAN_TS="$(date -u -d '1 hour ago' '+%Y-%m-%d %H:%M:%S+00' 2>/dev/null \
+    || date -u -v-1H '+%Y-%m-%d %H:%M:%S+00')"
 
 # -----------------------------------------------------------------------------
 # psql_count wrapper — empty result → "0", delegates to lib's psql_one
@@ -149,6 +169,7 @@ seed_vulnerable_artifact() {
             repository_id, path, name, version, size_bytes,
             checksum_sha256, content_type, storage_key, name_as_published,
             quarantine_status, quarantine_window_start,
+            last_scan_at,
             created_at, updated_at
         ) VALUES (
             '${REPO_ID}',
@@ -162,6 +183,7 @@ seed_vulnerable_artifact() {
             '${PKG_NAME}',
             'released',
             NULL,
+            '${SCAN_TS}',
             now() - interval '1 day',
             now() - interval '1 day'
         ) RETURNING id;")"
@@ -232,7 +254,7 @@ seed_finding() {
             7.5,
             '${SCANNER_NAME}',
             'smoke synthetic finding',
-            now() - interval '1 hour'
+            '${SCAN_TS}'
         );")"
     # Bounded: a single `psql -c INSERT`'s own status line.
     if ! printf '%s\n' "$out" | grep -q 'INSERT 0 1'; then
