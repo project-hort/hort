@@ -502,7 +502,7 @@ the result instead.
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
 | jsonwebtoken | 11.1.0 | MIT | https://github.com/Keats/jsonwebtoken |
 | aws-lc-sys | 0.46.0 | MIT | https://github.com/aws/aws-lc-rs |
-| webbrowser | 1.2.4 | MIT | https://github.com/amodm/webbrowser-rs |
+| webbrowser | 1.2.5 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | derive_more | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | hdrhistogram | 7.5.4 | MIT | https://github.com/HdrHistogram/HdrHistogram_rust.git |
@@ -18556,7 +18556,7 @@ SOFTWARE.
 
 ```
 
-### webbrowser 1.2.4 — MIT
+### webbrowser 1.2.5 — MIT
 
 Repository: https://github.com/amodm/webbrowser-rs
 
