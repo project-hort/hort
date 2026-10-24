@@ -306,7 +306,7 @@ the result instead.
 | system-configuration-sys | 0.6.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | system-configuration | 0.7.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | primefield | 0.14.0 | MIT | https://github.com/RustCrypto/elliptic-curves |
-| ctutils | 0.4.2 | MIT | https://github.com/RustCrypto/utils |
+| ctutils | 0.4.4 | MIT | https://github.com/RustCrypto/utils |
 | wnaf | 0.14.1 | MIT | https://github.com/RustCrypto/elliptic-curves |
 | annotate-snippets | 0.12.16 | MIT | https://github.com/rust-lang/annotate-snippets-rs |
 | anstream | 1.0.0 | MIT | https://github.com/rust-cli/anstyle.git |
@@ -12964,7 +12964,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### ctutils 0.4.2 — MIT
+### ctutils 0.4.4 — MIT
 
 Repository: https://github.com/RustCrypto/utils
 
