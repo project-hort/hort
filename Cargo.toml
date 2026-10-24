@@ -508,8 +508,7 @@ rand = "0.10"
 # overflow the oldest entry is evicted regardless of TTL. Pinned to
 # >= 0.16.3 (RUSTSEC-2026-0002's patched range — `IterMut` Stacked-Borrows
 # unsoundness; `pat_cache` never constructs an `IterMut` but the crate as a
-# whole must not carry the unsound version). 0.18.x is the latest clean
-# line as of 2026-Q3.
+# whole must not carry the unsound version).
 lru = "0.19"
 
 # Lock-free atomic pointer swap for RBAC live-refresh. `ArcSwap` wraps the
