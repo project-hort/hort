@@ -409,7 +409,7 @@ the result instead.
 | windows_x86_64_gnu | 0.53.1 | MIT | https://github.com/microsoft/windows-rs |
 | tokio-stream | 0.1.19 | MIT | https://github.com/tokio-rs/tokio |
 | tokio-util | 0.7.20 | MIT | https://github.com/tokio-rs/tokio |
-| tokio | 1.53.3 | MIT | https://github.com/tokio-rs/tokio |
+| tokio | 1.54.1 | MIT | https://github.com/tokio-rs/tokio |
 | simd-adler32 | 0.3.9 | MIT | https://github.com/mcountryman/simd-adler32 |
 | miniz_oxide | 0.9.1 | MIT | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
 | miniz_oxide | 0.9.1 | MIT | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
@@ -15796,7 +15796,7 @@ SOFTWARE.
 
 ```
 
-### tokio 1.53.3 — MIT
+### tokio 1.54.1 — MIT
 
 Repository: https://github.com/tokio-rs/tokio
 
