@@ -60,6 +60,18 @@ ignore = [
     # private-key timing leak is unreachable. No patched rsa exists. See
     # `.cargo/audit.toml` for the full rationale.
     "RUSTSEC-2023-0071",
+
+    # crypto-bigint 0.5.5 — timing variability in operations intended to be
+    # constant-time (RUSTSEC-2026-0387). Active-graph reachable via
+    # `sigstore 0.14 -> openidconnect 4.0 -> p256/p384 0.13 ->
+    # elliptic-curve 0.13.8`. No patched 0.5.x exists (the fix is >= 0.7.6,
+    # a different major line) and `openidconnect` is not droppable —
+    # sigstore routes `verify -> fulcio -> oauth -> dep:openidconnect`.
+    # hort only VERIFIES and holds no signing key, so no secret scalar
+    # passes through it. The graph's patched 0.7.5 instance was moved to
+    # 0.7.6 instead of being covered here. See `.cargo/audit.toml` for the
+    # full rationale and the re-evaluation trigger.
+    "RUSTSEC-2026-0387",
 ]
 
 # ===========================================================================

@@ -86,6 +86,44 @@ ignore = [
     # there too. Re-evaluate if a fixed rsa ships, or if any RSA signing
     # (private-key) path is ever added.
     "RUSTSEC-2023-0071",
+
+    # REGISTRY-EXEMPT: RUSTSEC-2026-0387 — build-side acceptance only, with no
+    # registry Exclusion: an Exclusion waives the finding for EVERY registry
+    # consumer (the nuclear option, issue #80). If hort's own crates-proxy
+    # scan ever rejects crypto-bigint for a CI dependency build, the remedy is
+    # moving off the version, not a registry mirror.
+    #
+    # crypto-bigint 0.5.5 — multiple timing variability issues in operations
+    # intended to be constant-time (RUSTSEC-2026-0387). Enters the ACTIVE
+    # build graph via `sigstore 0.14 -> openidconnect 4.0 -> p256/p384 0.13
+    # -> elliptic-curve 0.13.8 -> crypto-bigint 0.5.5`, reachable from
+    # hort-worker (`cargo tree -i crypto-bigint@0.5.5 -e normal`).
+    #
+    # Not fixable here, on three independent counts:
+    #   * The advisory's patched range is `>= 0.7.6`; there is NO patched
+    #     0.5.x release, so no lockfile move clears it. The graph's OTHER
+    #     instance — 0.7.5, via the keyed-cosign `p256 0.14` stack — IS
+    #     patched, and was moved to 0.7.6 rather than covered by this entry.
+    #   * sigstore 0.14.0 is its newest release.
+    #   * `openidconnect` is not droppable by feature selection: sigstore's
+    #     own feature graph routes `verify -> fulcio -> oauth ->
+    #     dep:openidconnect`, and `verify` is the whole reason the adapter
+    #     exists. It already builds `default-features = false` with only
+    #     verify / sigstore-trust-root / rustls-tls.
+    #
+    # Why the residual risk is accepted: timing variability in constant-time
+    # primitives is exploitable where a SECRET scalar passes through them.
+    # hort only ever VERIFIES — ECDSA verification consumes a public key, a
+    # signature and a message hash — and holds no signing key (sigstore's
+    # `sign` feature is deliberately off, see the adapter's Cargo.toml). This
+    # is the same argument the rsa / RUSTSEC-2023-0071 entry above records,
+    # for the same sigstore -> openidconnect chain.
+    #
+    # Known cost: both gates ignore by advisory ID, not by version, so this
+    # also masks a future UNPATCHED 0.7.x should one re-enter the graph.
+    # Re-evaluate when a sigstore release moves off the 0.13 elliptic-curve
+    # line, or if any ECDSA SIGNING path is ever added.
+    "RUSTSEC-2026-0387",
 ]
 
 # Yanked-crate posture — surfaced, but non-blocking. Mirrors `deny.toml`'s

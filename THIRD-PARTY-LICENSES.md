@@ -288,7 +288,7 @@ the result instead.
 | pem-rfc7468 | 1.0.0 | MIT | https://github.com/RustCrypto/formats |
 | crypto-common | 0.2.2 | MIT | https://github.com/RustCrypto/traits |
 | argon2 | 0.6.0 | MIT | https://github.com/RustCrypto/password-hashes |
-| crypto-bigint | 0.7.5 | MIT | https://github.com/RustCrypto/crypto-bigint |
+| crypto-bigint | 0.7.6 | MIT | https://github.com/RustCrypto/crypto-bigint |
 | phc | 0.6.1 | MIT | https://github.com/RustCrypto/formats |
 | scrypt | 0.12.0 | MIT | https://github.com/RustCrypto/password-hashes |
 | sec1 | 0.8.1 | MIT | https://github.com/RustCrypto/formats |
@@ -306,7 +306,7 @@ the result instead.
 | system-configuration-sys | 0.6.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | system-configuration | 0.7.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | primefield | 0.14.0 | MIT | https://github.com/RustCrypto/elliptic-curves |
-| ctutils | 0.4.4 | MIT | https://github.com/RustCrypto/utils |
+| ctutils | 0.4.5 | MIT | https://github.com/RustCrypto/utils |
 | wnaf | 0.14.1 | MIT | https://github.com/RustCrypto/elliptic-curves |
 | annotate-snippets | 0.12.16 | MIT | https://github.com/rust-lang/annotate-snippets-rs |
 | anstream | 1.0.0 | MIT | https://github.com/rust-cli/anstyle.git |
@@ -12392,7 +12392,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### crypto-bigint 0.7.5 — MIT
+### crypto-bigint 0.7.6 — MIT
 
 Repository: https://github.com/RustCrypto/crypto-bigint
 
@@ -12964,7 +12964,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### ctutils 0.4.4 — MIT
+### ctutils 0.4.5 — MIT
 
 Repository: https://github.com/RustCrypto/utils
 
