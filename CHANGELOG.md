@@ -52,10 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gitops apply drops every exclusion row it was told to drop, not only one per
   CVE and package pattern; and a worker whose job the abandoned-lease sweep
   handed on can no longer overwrite the worker now running it (#355).
-- **Four dependency security advisories cleared:** an outbound TLS
-  certificate path through the distrusted emSign intermediates
-  (RUSTSEC-2026-0381, -0382, -0383), and non-constant-time mask generation in
-  a transitive crypto helper (RUSTSEC-2026-0385) (#356).
+- **Dependency security advisories:** RUSTSEC-2026-0381, -0382, -0383 and
+  -0385 upgraded away, along with the patched instance of -0387; -0387's
+  remaining instance has no patched release and is accepted on hort's
+  verify-only path, where no signing key is held (#356).
 - **`hort-server verify-event-chain` no longer reports tampering on untouched
   rows**, and now detects a payload key that matches no event field. No stored
   `event_hash` changes (#272).
