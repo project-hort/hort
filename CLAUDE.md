@@ -497,8 +497,8 @@ where it stands. The domain has asserted "every live read filters
 it: the filter was stripped from three readers as inert on 2026-08-23 and real
 soft delete arrived under a *different* column name the next day, leaving the
 curation queue, both rescan sweeps and the patch-candidate listing unfiltered
-for over a year — a deleted artifact sat in the curator's worklist and spent
-rescan batch capacity. Carries a census counter-assertion per file, strips the
+from 2026-08-24 until the guard landed — a deleted artifact sat in the
+curator's worklist and spent rescan batch capacity. Carries a census counter-assertion per file, strips the
 predicate out of each corrected statement to prove the classifier can still
 fail, and asserts the column still exists; blind spots are a statement
 assembled from fragments or a predicate spelled around the column), and
