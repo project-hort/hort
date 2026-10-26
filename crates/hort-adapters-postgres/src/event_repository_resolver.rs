@@ -91,6 +91,13 @@ impl EventRepositoryResolver for PgEventRepositoryResolver {
                 wanted_groups AS (
                     SELECT unnest($2::uuid[]) AS id
                 )
+                -- DELETED-INCLUSIVE: identity, not liveness. ArtifactPurged
+                -- and ArtifactExpired are exactly the events whose reader
+                -- still has to be gated against the repository that owned
+                -- the artifact, so resolving a retired artifact to nothing
+                -- would send the consumer down its fail-closed path and
+                -- hide a repository's own retention history from its own
+                -- readers. See this module's docs for the full argument.
                 SELECT 'artifact' AS kind, a.id AS aggregate_id, a.repository_id
                   FROM artifacts a
                   JOIN wanted_artifacts w ON w.id = a.id

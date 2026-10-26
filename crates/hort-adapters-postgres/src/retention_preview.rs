@@ -91,6 +91,15 @@ impl RetentionPreview for PgRetentionPreview {
                       JOIN candidate_ids c
                         ON c.artifact_id = cr.source_artifact_id
                     UNION
+                    -- DELETED-INCLUSIVE: the caller names the exact
+                    -- artifact ids, and the question is what purge would
+                    -- reclaim for them. A soft-deleted artifact is
+                    -- precisely what purge collects — its worklist is
+                    -- driven by ArtifactDeleted / ArtifactExpired — so a
+                    -- liveness predicate here would under-report the
+                    -- reclaimable bytes for the rows most likely to be in
+                    -- the set, and the simulation must see what the thing
+                    -- it simulates sees.
                     SELECT a.checksum_sha256
                       FROM artifacts a
                       JOIN candidate_ids c ON c.artifact_id = a.id

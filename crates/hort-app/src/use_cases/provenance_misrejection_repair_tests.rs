@@ -374,6 +374,7 @@ async fn scan_asks_the_listing_for_rejected_rows_only() {
         f.uc.run(
             RepairRequest {
                 repository_id: Some(repo),
+                artifact_id: None,
                 limit: 5_000,
                 dry_run: true,
             },
@@ -389,6 +390,40 @@ async fn scan_asks_the_listing_for_rejected_rows_only() {
     assert_eq!(
         filters[0].limit, MAX_SCAN_LIMIT,
         "an over-large limit is clamped, never passed through"
+    );
+    assert_eq!(filters[0].artifact_id, None);
+}
+
+/// `artifact_id` reaches the listing. The scan has no cursor, so this is
+/// the only way an operator gets past the newest page at all — a field
+/// accepted here and dropped on the way to the listing would be the
+/// accepted-but-inert surface ADR 0015 forbids one layer up.
+#[tokio::test]
+async fn an_artifact_scoped_request_narrows_the_listing_to_that_artifact() {
+    let f = build();
+    let artifact = Uuid::new_v4();
+    let repo = Uuid::new_v4();
+    let _ =
+        f.uc.run(
+            RepairRequest {
+                repository_id: Some(repo),
+                artifact_id: Some(artifact),
+                limit: 100,
+                dry_run: true,
+            },
+            api_actor(),
+        )
+        .await
+        .expect("Ok");
+    let filters = f.queue.recorded_filters();
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0].artifact_id, Some(artifact));
+    assert_eq!(
+        filters[0].repository_id,
+        Some(repo),
+        "the two are a conjunction: naming an artifact does not drop the \
+         repository filter, so a mismatched pair returns empty rather \
+         than widening to either"
     );
 }
 
@@ -780,6 +815,7 @@ async fn a_full_listing_reports_the_scan_cap() {
         f.uc.run(
             RepairRequest {
                 repository_id: None,
+                artifact_id: None,
                 limit: 2,
                 dry_run: true,
             },
@@ -794,6 +830,7 @@ async fn a_full_listing_reports_the_scan_cap() {
         f.uc.run(
             RepairRequest {
                 repository_id: None,
+                artifact_id: None,
                 limit: 3,
                 dry_run: true,
             },
@@ -812,6 +849,7 @@ async fn a_zero_limit_is_clamped_to_one() {
         f.uc.run(
             RepairRequest {
                 repository_id: None,
+                artifact_id: None,
                 limit: 0,
                 dry_run: true,
             },

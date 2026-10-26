@@ -3038,6 +3038,7 @@ mod tests {
 
         let filter = CurationQueueFilter {
             repository_id: Some(Uuid::new_v4()),
+            artifact_id: None,
             status: Some(QuarantineStatus::Quarantined),
             rejection_reason_kind: None,
             limit: 50,

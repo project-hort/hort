@@ -698,3 +698,135 @@ async fn list_candidates_last_scan_subset_is_the_subset_not_the_union() {
 
     cleanup(&pool, repo_id).await;
 }
+
+// ---------------------------------------------------------------------------
+// Soft delete — both legs.
+//
+// The query lost its liveness predicate when the inert `is_deleted`
+// column was dropped, one day before real soft delete arrived under the
+// name `deleted_at`. The two legs are offered for different reasons, so
+// each is asserted on its own: a deleted `q` is work that cannot be done,
+// and a deleted `v` makes the whole proposition ("you are serving
+// something vulnerable") false.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_candidates_omits_a_pair_whose_quarantined_side_is_soft_deleted() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let t_released = Utc::now() - Duration::hours(2);
+    let t_quarantined = Utc::now() - Duration::hours(1);
+
+    let released = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
+    let quarantined = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.1",
+        Some("quarantined"),
+        t_quarantined,
+    )
+    .await;
+    seed_finding(&pool, released, "high").await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, quarantined).await;
+
+    let adapter = PgPatchCandidateRepository::new(pool.clone());
+    let rows = adapter
+        .list_candidates(PatchCandidateFilter::default())
+        .await
+        .expect("list_candidates");
+
+    assert!(
+        !rows
+            .iter()
+            .any(|c| c.quarantined_artifact_id == quarantined),
+        "the quarantined side is the work this surface proposes; a \
+         deleted one is out of the catalog, so proposing it displaces a \
+         real candidate from a LIMIT-bounded, severity-ranked worklist"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_candidates_omits_a_pair_whose_released_side_is_soft_deleted() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let t_released = Utc::now() - Duration::hours(2);
+    let t_quarantined = Utc::now() - Duration::hours(1);
+
+    let released = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
+    let quarantined = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.1",
+        Some("quarantined"),
+        t_quarantined,
+    )
+    .await;
+    seed_finding(&pool, released, "high").await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, released).await;
+
+    let adapter = PgPatchCandidateRepository::new(pool.clone());
+    let rows = adapter
+        .list_candidates(PatchCandidateFilter::default())
+        .await
+        .expect("list_candidates");
+
+    assert!(
+        !rows
+            .iter()
+            .any(|c| c.quarantined_artifact_id == quarantined),
+        "the released predecessor's findings are the reason to patch; a \
+         deleted one is not being served, so there is nothing to patch \
+         away from"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// The filter excludes deleted rows and nothing else: the same pair, with
+/// neither side deleted, still comes back.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_candidates_still_returns_a_pair_with_both_sides_live() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let t_released = Utc::now() - Duration::hours(2);
+    let t_quarantined = Utc::now() - Duration::hours(1);
+
+    let released = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
+    let quarantined = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.1",
+        Some("quarantined"),
+        t_quarantined,
+    )
+    .await;
+    seed_finding(&pool, released, "high").await;
+
+    let adapter = PgPatchCandidateRepository::new(pool.clone());
+    let rows = adapter
+        .list_candidates(PatchCandidateFilter::default())
+        .await
+        .expect("list_candidates");
+
+    let row = rows
+        .iter()
+        .find(|c| c.quarantined_artifact_id == quarantined)
+        .expect("the liveness predicates must not exclude a live pair");
+    assert_eq!(row.vulnerable_artifact_id, released);
+
+    cleanup(&pool, repo_id).await;
+}

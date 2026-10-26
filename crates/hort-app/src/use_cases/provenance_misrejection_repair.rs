@@ -171,6 +171,14 @@ pub struct RepairRequest {
     /// Narrow the scan to one repository. `None` scans every repository,
     /// newest-rejected first (the curation queue's own ordering).
     pub repository_id: Option<Uuid>,
+    /// Narrow the scan to one artifact — the way to reach a known
+    /// artifact directly rather than paging towards it, since the scan
+    /// has no cursor and `None` always returns the same newest rows.
+    ///
+    /// A **conjunction** with `repository_id`, not an alternative: a
+    /// mismatched pair returns empty. No precedence rule, no silent
+    /// widening.
+    pub artifact_id: Option<Uuid>,
     /// How many `Rejected` rows to examine. Clamped to
     /// [`MAX_SCAN_LIMIT`].
     pub limit: u32,
@@ -183,6 +191,7 @@ impl Default for RepairRequest {
     fn default() -> Self {
         Self {
             repository_id: None,
+            artifact_id: None,
             limit: DEFAULT_SCAN_LIMIT,
             dry_run: true,
         }
@@ -305,6 +314,7 @@ impl ProvenanceMisrejectionRepairUseCase {
             .curation_queue
             .list_queue(CurationQueueFilter {
                 repository_id: request.repository_id,
+                artifact_id: request.artifact_id,
                 status: Some(QuarantineStatus::Rejected),
                 // Deliberately unfiltered: the discriminator the queue
                 // projects is derived from the very `ArtifactRejected`
@@ -319,11 +329,17 @@ impl ProvenanceMisrejectionRepairUseCase {
 
         let scan_cap_hit = candidates.len() as u32 >= limit;
         if scan_cap_hit {
+            // Narrowing is what reaches the rest, not repetition. The
+            // listing is `ORDER BY created_at DESC LIMIT n` with no
+            // cursor, so an identical re-run returns the identical newest
+            // n rows for as long as the population is unchanged — and a
+            // dry run changes nothing by construction.
             tracing::warn!(
                 limit,
                 "provenance-misrejection repair filled its scan limit — there may be \
-                 further Rejected artifacts beyond it; re-run (optionally per repository) \
-                 until the scan returns fewer rows than the limit"
+                 further Rejected artifacts beyond it. The scan has no cursor, so \
+                 re-running the same request returns the same rows; narrow it by \
+                 repository or by artifact to reach the rest"
             );
         }
 

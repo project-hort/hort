@@ -1010,6 +1010,33 @@ pub async fn migrate_or_panic(pool: &PgPool) {
     }
 }
 
+/// Mark an artifact soft-deleted, the way `ArtifactRepository::delete`
+/// does: `deleted_at` set, every other column untouched.
+///
+/// Lives here rather than per test file because four suites need it to
+/// state the same property from different angles — that a reader of
+/// `artifacts` either excludes deleted rows or declares why it does not
+/// (`hort-app/tests/live_reads_exclude_deleted.rs`) — and a per-file copy
+/// is how one of them ends up marking the row some *other* way and
+/// asserting about a state production cannot reach.
+///
+/// Panics when no row matches: a test that soft-deletes nothing and then
+/// asserts an absence passes for the wrong reason.
+pub async fn soft_delete_artifact(pool: &PgPool, artifact_id: uuid::Uuid) {
+    let affected = sqlx::query("UPDATE public.artifacts SET deleted_at = now() WHERE id = $1")
+        .bind(artifact_id)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("soft-delete artifact {artifact_id}: {e}"))
+        .rows_affected();
+    assert_eq!(
+        affected, 1,
+        "soft_delete_artifact({artifact_id}) matched {affected} rows — the \
+         artifact must exist, or the absence a caller then asserts proves \
+         nothing"
+    );
+}
+
 /// True when `err` reflects a connection that was never acquired — the pool
 /// timed out waiting for one, or was closed out from under the wait — rather
 /// than a failure encountered while actually executing a migration.

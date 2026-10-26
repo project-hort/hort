@@ -261,6 +261,18 @@ impl CurationDecisionsRepository for PgCurationDecisionsRepository {
                     d.correlation_id                    AS correlation_id,
                     d.stored_at                         AS occurred_at
                 FROM decisions d
+                -- DELETED-INCLUSIVE: this is the curator decision audit
+                -- log, not a catalog read. A waive or block that happened
+                -- still happened after the artifact is deleted, and the
+                -- join exists only to resolve repository_id / name for
+                -- the --repository and --package filters. Adding a
+                -- liveness predicate to a LEFT JOIN would not hide the
+                -- artifact, it would NULL the alias — and the filters
+                -- below are `OR a.repository_id = $3` / `OR a.name = $4`,
+                -- so a filtered query would silently drop the decision
+                -- row entirely. An audit trail that under-reports when
+                -- narrowed is worse than one that shows a deleted
+                -- artifact's history.
                 LEFT JOIN artifacts a
                        ON d.event_type IN ('ArtifactReleased', 'ArtifactRejected')
                       AND d.payload_artifact_id IS NOT NULL

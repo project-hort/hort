@@ -233,10 +233,17 @@ curl -s -XPOST -H "Authorization: Bearer $ADMIN_TOKEN" \
 ```
 
 Optional body fields: `repository_id` (narrow the scan to one
-repository) and `limit` (how many `rejected` rows to examine; clamped to
-500). If the response has `"scan_cap_hit": true`, there may be more rows
-beyond the bound — re-run, optionally per repository, until it is
-`false`.
+repository), `artifact_id` (narrow it to one artifact) and `limit` (how
+many `rejected` rows to examine; clamped to 500). Supplied together,
+`repository_id` and `artifact_id` are a conjunction — a mismatched pair
+returns nothing rather than widening to either.
+
+If the response has `"scan_cap_hit": true`, there may be more rows beyond
+the bound. **Narrowing is what reaches them, not repetition:** the scan is
+ordered newest-first and has no cursor, so repeating the same request
+returns the same rows — and a dry run changes nothing, so it cannot
+produce its own next page. Narrow by `repository_id`, or by `artifact_id`
+for an artifact the queue listing above already named.
 
 **Requires `Permission::Admin`, not `Permission::Curate`.** This is not a
 curation decision — it withdraws a structurally invalid rejection — and

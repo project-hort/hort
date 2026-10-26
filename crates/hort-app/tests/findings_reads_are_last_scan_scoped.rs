@@ -73,11 +73,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 mod rust_scan;
+mod sql_scan;
 
-use rust_scan::{
-    blank_range, block_comment_end, char_literal_end, line_comment_end, line_of, quoted_string_end,
-    raw_string_end, walk_rust, workspace_root,
-};
+use rust_scan::{line_of, mark_literals, walk_rust, workspace_root, LITERAL_MARK};
+use sql_scan::preceding_keyword;
 
 /// The column a `scan_findings` read must name to be scoped to one scan.
 const ANCHOR_COLUMN: &str = "last_scan_at";
@@ -126,58 +125,6 @@ struct Read {
     sql: String,
 }
 
-/// Planted at the start of every string-literal span, where blanking
-/// would otherwise leave a space, so
-/// [`rust_scan::blank_cfg_test_items`] reports which literals a
-/// `#[cfg(test)]` item swallowed: the mark survives that pass only
-/// outside one.
-///
-/// The shared lexer blanks comments *and* literals, which is exactly what
-/// makes its brace matching sound — and exactly what this guard cannot
-/// use directly, because the SQL it has to read lives inside those
-/// literals. Planting one identifier byte per literal gives the lexer the
-/// blanked text it needs while leaving a mark that survives everything
-/// except the cfg-test blanking pass.
-const LITERAL_MARK: u8 = b'x';
-
-/// `(text_for_the_cfg_test_pass, literal_spans)`.
-///
-/// The text has every comment blanked and every string/char literal
-/// reduced to a single [`LITERAL_MARK`] followed by spaces — so braces,
-/// attributes and item delimiters read exactly as they do for the sibling
-/// guards. The spans are into the ORIGINAL source, where the SQL is
-/// still intact.
-fn mark_literals(source: &str) -> (String, Vec<(usize, usize)>) {
-    let src = source.as_bytes();
-    let mut out = src.to_vec();
-    let mut spans = Vec::new();
-    let mut i = 0usize;
-    while i < src.len() {
-        if let Some(end) = line_comment_end(src, i).or_else(|| block_comment_end(src, i)) {
-            blank_range(&mut out, i, end);
-            i = end;
-            continue;
-        }
-        if let Some(end) = raw_string_end(src, i).or_else(|| quoted_string_end(src, i)) {
-            blank_range(&mut out, i, end);
-            out[i] = LITERAL_MARK;
-            spans.push((i, end));
-            i = end;
-            continue;
-        }
-        if let Some(end) = char_literal_end(src, i) {
-            blank_range(&mut out, i, end);
-            i = end;
-            continue;
-        }
-        i += 1;
-    }
-    (
-        String::from_utf8(out).expect("blanking replaces whole tokens with ASCII"),
-        spans,
-    )
-}
-
 /// True when `sql` names `scan_findings` as a table being read — i.e.
 /// after `FROM` or `JOIN`, rather than after `INTO` (`INSERT INTO
 /// scan_findings`, the one production write, which is not in scope).
@@ -193,37 +140,6 @@ fn reads_the_table(sql: &str) -> bool {
             Some("from") | Some("join")
         )
     })
-}
-
-/// The SQL keyword introducing the table reference at `at`, lowercased —
-/// stepping over an optional `<schema>.` qualifier first.
-///
-/// `None` when nothing separates the identifier from what precedes it (a
-/// longer identifier that merely contains the table name, or a match at
-/// offset 0), which is not a table reference after a keyword.
-fn preceding_keyword(lower: &str, at: usize) -> Option<String> {
-    let raw_len = lower[..at].len();
-    let mut before = lower[..at].trim_end();
-    // Step over a `public.` / any `<schema>.` qualifier.
-    if before.ends_with('.') {
-        let without_dot = &before[..before.len() - 1];
-        let qualifier_start = without_dot
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .map_or(0, |found| found + 1);
-        if qualifier_start == without_dot.len() {
-            // A `.` with no identifier before it — not a qualifier.
-            return None;
-        }
-        before = without_dot[..qualifier_start].trim_end();
-    } else if before.len() == raw_len {
-        // No separator at all.
-        return None;
-    }
-    let word = before.rsplit(|c: char| c.is_whitespace()).next()?;
-    if word.is_empty() {
-        return None;
-    }
-    Some(word.to_string())
 }
 
 /// Every production SQL literal in the workspace's crates that reads
