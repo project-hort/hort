@@ -18,9 +18,9 @@
 //! soft delete under a *different* column name, `deleted_at`, and
 //! re-filtered some of the readers that had just lost their predicate. The
 //! rename severed the link between "reader that lost the filter" and
-//! "reader that must regain it", and three readers stayed unfiltered for
-//! over a year: the curator queue, the rescan sweeps, and the
-//! patch-candidate worklist. Each of those is a surface an operator acts
+//! "reader that must regain it", and three readers stayed unfiltered
+//! from 2026-08-24 until this guard landed: the curator queue, the
+//! rescan sweeps, and the patch-candidate worklist. Each of those is a surface an operator acts
 //! on, so each soft-deleted row showed up as live work — and, being
 //! `LIMIT`-bounded, consumed a slot that a real candidate then did not get.
 //!
