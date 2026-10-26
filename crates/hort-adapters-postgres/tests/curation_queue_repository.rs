@@ -308,6 +308,7 @@ async fn list_queue_returns_quarantined_artifact_with_findings() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             ..CurationQueueFilter::default()
         })
         .await
@@ -373,6 +374,7 @@ async fn list_queue_status_filter_isolates_rejected() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -415,6 +417,7 @@ async fn list_queue_scan_indeterminate_surfaces() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::ScanIndeterminate),
             ..CurationQueueFilter::default()
         })
@@ -458,6 +461,7 @@ async fn list_queue_limit_clamps_at_500() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             limit: 9999,
             ..CurationQueueFilter::default()
         })
@@ -571,6 +575,7 @@ async fn list_queue_lateral_extracts_rejection_reason_scanner() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -608,6 +613,7 @@ async fn list_queue_lateral_extracts_rejection_reason_curator() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -644,6 +650,7 @@ async fn list_queue_lateral_extracts_rejection_reason_curation_retroactive() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -684,6 +691,7 @@ async fn list_queue_lateral_extracts_rejection_reason_corruption() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -724,6 +732,7 @@ async fn list_queue_filter_by_rejection_reason_kind_corruption() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             rejection_reason_kind: Some("corruption".into()),
             ..CurationQueueFilter::default()
@@ -780,6 +789,7 @@ async fn list_queue_filter_by_rejection_reason_kind_curator() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             // Lowercase wire format — the spec-mandated value the HTTP
             // query param and hort-cli flag accept.
@@ -832,6 +842,7 @@ async fn list_queue_filter_by_rejection_reason_kind_scanner_excludes_curator() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             rejection_reason_kind: Some("scanner".into()),
             ..CurationQueueFilter::default()
@@ -883,6 +894,7 @@ async fn list_queue_filter_by_rejection_reason_kind_curation_retroactive() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             rejection_reason_kind: Some("curation_retroactive".into()),
             ..CurationQueueFilter::default()
@@ -924,6 +936,7 @@ async fn list_queue_rejected_without_event_has_none_rejection_reason_kind() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -1009,6 +1022,7 @@ async fn list_queue_finding_count_is_the_last_scan_not_the_union() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: None,
             rejection_reason_kind: None,
             limit: 100,
@@ -1076,6 +1090,7 @@ async fn list_queue_clean_last_scan_reads_as_clean() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: None,
             rejection_reason_kind: None,
             limit: 100,
@@ -1146,6 +1161,7 @@ async fn list_queue_last_scan_subset_is_the_subset_not_the_union() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: None,
             rejection_reason_kind: None,
             limit: 100,
@@ -1192,6 +1208,7 @@ async fn list_queue_never_scanned_artifact_reads_as_clean() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: None,
             rejection_reason_kind: None,
             limit: 100,
@@ -1207,4 +1224,284 @@ async fn list_queue_never_scanned_artifact_reads_as_clean() {
     assert_eq!(entry.max_severity, None);
 
     cleanup_repo(&pool, repo_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// Soft delete — a deleted artifact is not curator work, and takes no slot.
+//
+// The listing lost its liveness predicate when the inert `is_deleted`
+// column was dropped, one day before real soft delete arrived under the
+// name `deleted_at`. A curator acting on a row that is no longer in the
+// catalog is the visible half; the `LIMIT` slot it consumed is the half
+// absence alone cannot show, which is why the second test asserts on a
+// count.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_omits_a_soft_deleted_rejected_artifact() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    let deleted = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("rejected"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+    seed_finding(&pool, deleted, "critical").await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, deleted).await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    assert!(
+        !rows.iter().any(|e| e.artifact_id == deleted),
+        "a soft-deleted artifact is out of the served catalog, so it is \
+         not curator work — the queue must not offer it"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+/// The slot, not just the absence: `limit = 1` with one deleted and one
+/// live row must return the live one.
+///
+/// Deterministic because the predicate makes the deleted row a
+/// non-candidate, leaving one row for `LIMIT 1` — the `ORDER BY
+/// a.created_at DESC` would otherwise have put the deleted row first,
+/// which is exactly how it used to take the slot.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_spends_no_limit_slot_on_a_soft_deleted_artifact() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    // Newest, so `ORDER BY created_at DESC` ranks it first.
+    let deleted = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "2.0",
+        Some("rejected"),
+        now,
+        Some(now),
+    )
+    .await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, deleted).await;
+    let live = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("rejected"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: Some(QuarantineStatus::Rejected),
+            rejection_reason_kind: None,
+            limit: 1,
+        })
+        .await
+        .expect("list_queue");
+
+    assert_eq!(
+        rows.iter().map(|e| e.artifact_id).collect::<Vec<_>>(),
+        vec![live],
+        "the one slot must go to the live artifact, even though the \
+         deleted one sorts first"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+/// The filter excludes deleted rows and nothing else — including on the
+/// `effective_policy_duration` CTE, whose own predicate gained the same
+/// clause. A live artifact must still surface WITH its deadline, which is
+/// what proves the CTE still matched its repository.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_still_returns_a_live_artifact_with_its_deadline() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let _policy = seed_repo_scoped_policy(&pool, repo_id, 3_600).await;
+    let now = truncate_us(Utc::now());
+    let window_start = now - Duration::hours(1);
+    let live = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("quarantined"),
+        window_start,
+        Some(window_start),
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    let entry = rows
+        .iter()
+        .find(|e| e.artifact_id == live)
+        .expect("the liveness predicate must not exclude a live artifact");
+    assert_eq!(
+        entry.quarantine_deadline,
+        Some(window_start + Duration::seconds(3_600)),
+        "the CTE must still resolve this repository's duration — a \
+         liveness predicate that shadowed the whole CTE would leave the \
+         deadline NULL"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// `artifact_id` — the artifact-scoping filter.
+//
+// A conjunction with `repository_id`, not an alternative: the mismatched
+// pair returns empty rather than widening to either side.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_artifact_id_narrows_to_exactly_that_artifact() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    let wanted = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("rejected"),
+        now - Duration::hours(2),
+        Some(now - Duration::hours(2)),
+    )
+    .await;
+    let other = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "2.0",
+        Some("rejected"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let scoped = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: None,
+            artifact_id: Some(wanted),
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+    assert_eq!(
+        scoped.iter().map(|e| e.artifact_id).collect::<Vec<_>>(),
+        vec![wanted]
+    );
+
+    // `None` behaves as before: both rows, newest first.
+    let unscoped = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+    assert_eq!(
+        unscoped.iter().map(|e| e.artifact_id).collect::<Vec<_>>(),
+        vec![other, wanted],
+        "an absent artifact_id must not narrow anything"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_artifact_id_and_a_mismatched_repository_id_return_empty() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let other_repo = seed_repo(&pool, "pypi").await;
+    let now = truncate_us(Utc::now());
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("rejected"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(other_repo),
+            artifact_id: Some(artifact),
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    assert!(
+        rows.is_empty(),
+        "the two filters are a conjunction: a mismatched pair returns \
+         empty, with no precedence rule and no silent widening to either \
+         side"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+    cleanup_repo(&pool, other_repo).await;
 }

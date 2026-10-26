@@ -607,6 +607,15 @@ impl PurgeGcPort for PgPurgeGcPort {
                        {tag_targeted}      AS tag_targeted,
                        {keep_last_n_only}  AS expired_only_by_keep_last_n,
                        {user_deleted}      AS user_deleted
+                -- DELETED-INCLUSIVE: this IS the worklist that collects
+                -- deleted rows. The `EXISTS` below is the whole
+                -- membership rule — an ArtifactExpired or ArtifactDeleted
+                -- with no ArtifactPurged yet — and a liveness predicate
+                -- would drop exactly the ArtifactDeleted half of it, so a
+                -- user-deleted artifact's bytes would never be reclaimed.
+                -- The set is deliberately `deleted_at`-agnostic in the
+                -- other direction too: an expiry decision carries no
+                -- `deleted_at` until the purge itself writes one.
                   FROM artifacts a
                  WHERE EXISTS (
                          SELECT 1 FROM events e
@@ -706,6 +715,13 @@ impl PurgeGcPort for PgPurgeGcPort {
                        {tag_targeted}      AS tag_targeted,
                        {keep_last_n_only}  AS expired_only_by_keep_last_n,
                        {user_deleted}      AS user_deleted
+                -- DELETED-INCLUSIVE: the row lock a purge takes before
+                -- acting, on an artifact `list_pending_purge` just handed
+                -- it — and that set admits soft-deleted rows on purpose.
+                -- A liveness predicate here would report `NoArtifact` for
+                -- work the sweep had just selected, so every user-deleted
+                -- artifact would cycle through the worklist forever
+                -- without being purged.
                   FROM artifacts a
                  WHERE a.id = $1
                    FOR UPDATE

@@ -1,8 +1,9 @@
-//! Shared token-aware SQL scanning primitives for the `migrations/`
-//! structural guards (ADR 0030,
-//! `docs/adr/0030-sensitive-surface-structural-guards.md`).
+//! Shared token-aware SQL scanning primitives for the structural guards
+//! that read SQL — the `migrations/` pair (ADR 0030,
+//! `docs/adr/0030-sensitive-surface-structural-guards.md`) and the guards
+//! that read SQL out of the Rust string literals it is embedded in.
 //!
-//! Two guard targets scan the same tree for different destructive shapes —
+//! Two guard targets scan `migrations/` for different destructive shapes —
 //! `no_sensitive_drops.rs` (drops / de-constrains of a security-critical
 //! table) and `expand_contract_guard.rs` (contractions that would break the
 //! previous release's still-running binaries). Both need the identical
@@ -266,6 +267,56 @@ pub fn parse_table_name(tokens: &[Token], idx: usize) -> Option<(String, usize)>
         return Some((unqualified(first), idx + 1));
     }
     None
+}
+
+/// Everything in `lower` before the table name at `at`, with a trailing
+/// `<schema>.` qualifier and trailing whitespace removed — so the result
+/// ends with whatever keyword or punctuation introduced the reference.
+/// `lower` must already be lowercased.
+///
+/// `None` when nothing separates the identifier from what precedes it (a
+/// longer identifier that merely contains the table name, or a match at
+/// offset 0), and when a `.` has no identifier before it to be a
+/// qualifier.
+pub fn before_table_name(lower: &str, at: usize) -> Option<&str> {
+    let raw = &lower[..at];
+    let trimmed = raw.trim_end();
+    if let Some(without_dot) = trimmed.strip_suffix('.') {
+        let qualifier_start = without_dot
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |found| found + 1);
+        if qualifier_start == without_dot.len() {
+            // A `.` with no identifier before it — not a qualifier.
+            return None;
+        }
+        return Some(without_dot[..qualifier_start].trim_end());
+    }
+    if trimmed.len() == raw.len() {
+        // No separator at all.
+        return None;
+    }
+    Some(trimmed)
+}
+
+/// The SQL keyword introducing the table reference at `at`, lowercased —
+/// stepping over an optional `<schema>.` qualifier first. `lower` must
+/// already be lowercased.
+///
+/// This is what tells a table *reference* (`FROM artifacts`, `JOIN
+/// public.artifacts`) apart from the same identifier in some other
+/// position (`INSERT INTO artifacts`, a prose mention, a longer
+/// identifier that merely contains it).
+///
+/// `None` when nothing separates the identifier from what precedes it (a
+/// longer identifier that merely contains the table name, or a match at
+/// offset 0), which is not a table reference after a keyword.
+pub fn preceding_keyword(lower: &str, at: usize) -> Option<String> {
+    let before = before_table_name(lower, at)?;
+    let word = before.rsplit(|c: char| c.is_whitespace()).next()?;
+    if word.is_empty() {
+        return None;
+    }
+    Some(word.to_string())
 }
 
 /// Recover a 1-based line number for a byte offset in `source`.

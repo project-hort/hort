@@ -31,6 +31,19 @@
 //! join condition now means "the released predecessor's last scan still
 //! reports something", so a predecessor whose findings a later scan
 //! retracted stops being offered as the thing to patch towards.
+//!
+//! ## Both legs exclude soft-deleted rows
+//!
+//! `q.deleted_at IS NULL` and `v.deleted_at IS NULL` are separate
+//! predicates because the two legs are offered to the operator for
+//! different reasons and each has to be live on its own terms. `q` is the
+//! quarantined artifact this surface proposes as work: a deleted one is
+//! out of the catalog, so proposing it is work that cannot be done, and
+//! — the query being `LIMIT`-bounded and `ORDER BY`-ranked — it displaces
+//! a real candidate. `v` is the released predecessor whose findings are
+//! the whole reason to patch: the proposition is "you are serving
+//! something vulnerable, here is a newer version", and a deleted `v` is
+//! not being served, so the proposition is false.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -98,6 +111,7 @@ impl PatchCandidateRepository for PgPatchCandidateRepository {
                  AND v.name = q.name
                  AND v.id <> q.id
                  AND v.quarantine_status = 'released'
+                 AND v.deleted_at IS NULL
                  AND v.created_at < q.created_at
                 JOIN LATERAL (
                     SELECT COUNT(*)::bigint AS finding_count,
@@ -119,6 +133,7 @@ impl PatchCandidateRepository for PgPatchCandidateRepository {
                       AND sf.detected_at = v.last_scan_at
                 ) f ON f.finding_count > 0
                 WHERE q.quarantine_status = 'quarantined'
+                  AND q.deleted_at IS NULL
                   AND r.format::text <> 'oci'
                   AND ($1::uuid IS NULL OR q.repository_id = $1)
                 ORDER BY f.max_severity_rank DESC, q.created_at DESC

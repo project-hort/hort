@@ -190,6 +190,13 @@ impl RetentionScanReader for PgRetentionScanReader {
                        sf.source_scanner, sf.title, sf.fixed_versions,
                        sf.informational_class
                 FROM scan_findings sf
+                -- DELETED-INCLUSIVE: the artifact is already named by $1
+                -- and this join only reaches `a.last_scan_at` as the scan
+                -- anchor, so it selects no candidates. A liveness
+                -- predicate would make the findings list come back EMPTY
+                -- for a deleted artifact, which the evaluator reads as
+                -- "clean" — the permissive direction, from a join that
+                -- was never about liveness.
                 JOIN artifacts a ON a.id = sf.artifact_id
                 WHERE sf.artifact_id = $1
                   -- The last scan's rows and nothing else. See the module

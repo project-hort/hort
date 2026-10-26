@@ -485,7 +485,25 @@ that also names `http://` is an "is this absolute?" test and deliberately
 not a hit, which is what keeps cargo's `http://`-tolerant index `dl` field
 out of scope; blind spots are a comparison assembled through a macro or
 spelled on a parsed `Url::scheme()` instead of a string prefix, and a sixth
-copy landing in a crate outside the pipeline) are pure
+copy landing in a crate outside the pipeline), `live_reads_exclude_deleted`
+(ADR 0030's soft-delete half — every production SQL statement reading
+`artifacts` after `FROM`/`JOIN` must either carry `deleted_at IS NULL` in its
+own text or declare itself with `-- DELETED-INCLUSIVE: <reason>` in that same
+statement. The verdict is **per literal**, not per file, so a second statement
+added beside a declared one is not covered by its neighbour's reason, and
+there is **no allow-list** — a reader that should see deleted rows says so
+where it stands. The domain has asserted "every live read filters
+`deleted_at IS NULL`" since soft delete landed, and convention did not hold
+it: the filter was stripped from three readers as inert on 2026-08-23 and real
+soft delete arrived under a *different* column name the next day, leaving the
+curation queue, both rescan sweeps and the patch-candidate listing unfiltered
+for over a year — a deleted artifact sat in the curator's worklist and spent
+rescan batch capacity. Carries a census counter-assertion per file, strips the
+predicate out of each corrected statement to prove the classifier can still
+fail, and asserts the column still exists; blind spots are a statement
+assembled from fragments or a predicate spelled around the column), and
+`findings_reads_are_last_scan_scoped` (pins that a findings read is scoped to
+the artifact's last scan rather than every scan it ever had) are pure
 source-/fixture-scan guards — no database, sub-second — enforcing structural invariants that a
 rename or a stray `use` silently breaks. (A stale keyspace registry once shipped
 undetected because the gate then ran only `--lib`.) Because `cargo test --workspace`

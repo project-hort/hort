@@ -473,8 +473,24 @@ impl RepositoryRepository for PgRepositoryRepository {
     fn get_storage_usage(&self, repo_id: Uuid) -> BoxFuture<'_, DomainResult<u64>> {
         Box::pin(async move {
             tracing::debug!(entity = "Repository", %repo_id, "get_storage_usage");
+            // Live rows only. The sum is a catalog weight, not a
+            // measurement of bytes at rest: dedup means two artifacts
+            // sharing one blob are both counted, so this was never the
+            // figure that answers "how much disk does the repository
+            // hold" and cannot be defended as including soft-deleted rows
+            // on the grounds that their blobs survive until purge. What
+            // it can answer is "how much does the served catalog weigh",
+            // and a deleted artifact is not in it.
+            // `::bigint` is load-bearing, not tidiness: Postgres widens
+            // `SUM(bigint)` to `numeric` to keep the aggregate from
+            // overflowing, so the bare expression does not decode into
+            // `i64` and this method returned a decode error for every
+            // caller until the cast landed. The cast can itself overflow,
+            // on a repository holding more than 8 EiB of catalog — which
+            // Postgres raises rather than wrapping, so the failure is loud.
             let usage: Option<i64> = sqlx::query_scalar(
-                "SELECT COALESCE(SUM(size_bytes), 0) FROM artifacts WHERE repository_id = $1",
+                "SELECT COALESCE(SUM(size_bytes), 0)::bigint FROM artifacts \
+                 WHERE repository_id = $1 AND deleted_at IS NULL",
             )
             .bind(repo_id)
             .fetch_one(&self.pool)
@@ -1049,5 +1065,84 @@ mod tests {
             "cursor excludes the row it names"
         );
         assert!(after_ids.contains(&second_id));
+    }
+
+    // -- get_storage_usage -------------------------------------------------
+
+    /// The sum counts live artifacts only.
+    ///
+    /// It is a catalog weight, not a measurement of bytes at rest: dedup
+    /// means two artifacts sharing one blob are both counted, so this was
+    /// never the figure that answers "how much disk does the repository
+    /// hold" and cannot be defended as including soft-deleted rows on the
+    /// grounds that their blobs survive until purge.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn get_storage_usage_counts_live_artifacts_only() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = PgRepositoryRepository::new(pool.clone());
+        let key = format!("it-usage-{}", Uuid::new_v4().simple());
+        let repo = sample_repository(&key, IndexMode::ReleasedOnly);
+        adapter
+            .save_managed(&repo, &[0x47u8; 32])
+            .await
+            .expect("save_managed");
+
+        let live = seed_sized_artifact(&pool, repo.id, 1_000).await;
+        let deleted = seed_sized_artifact(&pool, repo.id, 9_000).await;
+
+        // Both rows present and live: the whole weight.
+        assert_eq!(
+            adapter
+                .get_storage_usage(repo.id)
+                .await
+                .expect("get_storage_usage"),
+            10_000,
+            "the baseline — without it the assertion below could pass \
+             because nothing was seeded"
+        );
+
+        crate::test_support::soft_delete_artifact(&pool, deleted).await;
+
+        assert_eq!(
+            adapter
+                .get_storage_usage(repo.id)
+                .await
+                .expect("get_storage_usage"),
+            1_000,
+            "a soft-deleted artifact is not in the served catalog, so it \
+             does not weigh in it"
+        );
+        let _ = live;
+    }
+
+    /// Seed an artifact of the requested `size_bytes` and return its id.
+    async fn seed_sized_artifact(pool: &PgPool, repo: Uuid, size_bytes: i64) -> Uuid {
+        let id = Uuid::new_v4();
+        let hex = id.simple().to_string();
+        let sha256 = format!("{hex}{hex}");
+        sqlx::query(
+            r#"INSERT INTO artifacts (
+                   id, repository_id, name, name_as_published, version, path,
+                   size_bytes, checksum_sha256, content_type, storage_key,
+                   quarantine_status
+               ) VALUES (
+                   $1, $2, 'usage-pkg', 'usage-pkg', $3, $4,
+                   $5, $6, 'application/octet-stream', $6,
+                   'released'
+               )"#,
+        )
+        .bind(id)
+        .bind(repo)
+        .bind(hex.clone())
+        .bind(format!("usage-pkg/{hex}.tgz"))
+        .bind(size_bytes)
+        .bind(&sha256)
+        .execute(pool)
+        .await
+        .expect("seed artifact row");
+        id
     }
 }

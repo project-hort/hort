@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Soft-deleted artifacts no longer appear as work.** A deleted artifact is
+  gone from the curation queue and the patch-candidate listing, and consumes
+  no rescan batch capacity; the provenance-misrejection repair additionally
+  accepts an `artifact_id` to scope a run to one artifact (#359).
 - **Three findings surfaces now report the artifact's last scan rather than
   every scan it ever had.** The curation queue's `finding_count` /
   `max_severity`, the patch-candidate listing (and the order it ranks by), and

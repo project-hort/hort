@@ -1,13 +1,16 @@
 //! Shared token-aware Rust scanning primitives for the `crates/`
 //! structural guards.
 //!
-//! Three guard targets read the same tree for different structural shapes
-//! — `db_tests_are_serialized.rs` (a test that reaches a real Postgres
-//! connection without the workspace serialization key),
+//! Several guard targets read the same tree for different structural
+//! shapes — `db_tests_are_serialized.rs` (a test that reaches a real
+//! Postgres connection without the workspace serialization key),
 //! `cas_reads_are_verified.rs` (a storage adapter whose `StoragePort::get`
-//! hands back an unverified stream) and
+//! hands back an unverified stream),
 //! `condemning_rule_is_single_sourced.rs` (a second reader of a finding's
-//! component relation re-deriving the release-authority rule). All three
+//! component relation re-deriving the release-authority rule), and the
+//! two that read SQL out of string literals via [`mark_literals`]
+//! (`findings_reads_are_last_scan_scoped.rs`,
+//! `live_reads_exclude_deleted.rs`). All of them
 //! need the identical lexical
 //! discipline, and a second verbatim copy of it would be the exact
 //! duplication that lets one copy drift into weakness while the other
@@ -292,6 +295,58 @@ pub fn blank_noncode(source: &str) -> String {
         }
     }
     String::from_utf8(out).expect("blanking replaces whole tokens with ASCII spaces")
+}
+
+/// Planted at the start of every string-literal span, where blanking
+/// would otherwise leave a space, so [`blank_cfg_test_items`] reports
+/// which literals a `#[cfg(test)]` item swallowed: the mark survives that
+/// pass only outside one.
+pub const LITERAL_MARK: u8 = b'x';
+
+/// `(text_for_the_cfg_test_pass, literal_spans)` — the primitive a guard
+/// uses when the thing it has to read lives *inside* a string literal.
+///
+/// [`blank_noncode`] blanks comments **and** literals, which is exactly
+/// what makes the brace matching below sound — and exactly what such a
+/// guard cannot use directly, because the SQL (or whatever else) it is
+/// about is in those literals. Planting one identifier byte per literal
+/// gives the lexer the blanked text it needs while leaving a mark that
+/// survives everything except the cfg-test blanking pass.
+///
+/// The returned text has every comment blanked and every string/char
+/// literal reduced to a single [`LITERAL_MARK`] followed by spaces — so
+/// braces, attributes and item delimiters read exactly as they do for the
+/// guards that only want code. The spans are into the ORIGINAL source,
+/// where the literal's contents are still intact.
+pub fn mark_literals(source: &str) -> (String, Vec<(usize, usize)>) {
+    let src = source.as_bytes();
+    let mut out = src.to_vec();
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    while i < src.len() {
+        if let Some(end) = line_comment_end(src, i).or_else(|| block_comment_end(src, i)) {
+            blank_range(&mut out, i, end);
+            i = end;
+            continue;
+        }
+        if let Some(end) = raw_string_end(src, i).or_else(|| quoted_string_end(src, i)) {
+            blank_range(&mut out, i, end);
+            out[i] = LITERAL_MARK;
+            spans.push((i, end));
+            i = end;
+            continue;
+        }
+        if let Some(end) = char_literal_end(src, i) {
+            blank_range(&mut out, i, end);
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    (
+        String::from_utf8(out).expect("blanking replaces whole tokens with ASCII"),
+        spans,
+    )
 }
 
 /// The offset of the `}` closing the block whose `{` sits at `open`, or

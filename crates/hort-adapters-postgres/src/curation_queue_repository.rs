@@ -167,7 +167,11 @@ impl PgCurationQueueRepository {
 /// - `LEFT JOIN` for findings + LATERAL so a row with no findings and no
 ///   rejection event still surfaces (e.g. `scan_indeterminate` rows).
 /// - `$1` = optional repository_id, `$2` = optional status text,
-///   `$3` = optional rejection_reason_kind, `$4` = limit i64.
+///   `$3` = optional rejection_reason_kind, `$4` = limit i64,
+///   `$5` = optional artifact_id.
+/// - `$1` and `$5` are a conjunction, not alternatives: a mismatched
+///   pair (an artifact that is not in the named repository) returns
+///   empty. There is no precedence rule and no silent widening.
 const QUEUE_SQL: &str = r#"
                 WITH effective_policy_duration AS (
                     -- Per-repo effective quarantine duration. Repo-scoped
@@ -189,7 +193,8 @@ const QUEUE_SQL: &str = r#"
                              LIMIT 1)
                         ) AS duration_secs
                     FROM (SELECT DISTINCT repository_id FROM artifacts
-                          WHERE quarantine_status IN ('quarantined','rejected','scan_indeterminate')) a
+                          WHERE quarantine_status IN ('quarantined','rejected','scan_indeterminate')
+                            AND deleted_at IS NULL) a
                 )
                 SELECT
                     a.id                        AS artifact_id,
@@ -289,7 +294,9 @@ const QUEUE_SQL: &str = r#"
                     LIMIT 1
                 ) e ON true
                 WHERE a.quarantine_status IN ('quarantined','rejected','scan_indeterminate')
+                  AND a.deleted_at IS NULL
                   AND ($1::uuid IS NULL OR a.repository_id = $1)
+                  AND ($5::uuid IS NULL OR a.id = $5)
                   AND ($2::text IS NULL OR a.quarantine_status = $2)
                   AND ($3::text IS NULL OR e.rejection_reason_kind = $3)
                 ORDER BY a.created_at DESC
@@ -317,6 +324,7 @@ impl CurationQueueRepository for PgCurationQueueRepository {
                 .bind(status_text.as_deref())
                 .bind(filter.rejection_reason_kind.as_deref())
                 .bind(i64::from(limit))
+                .bind(filter.artifact_id)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| DomainError::Invariant(format!("curation_queue_repo list: {e}")))?;

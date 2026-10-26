@@ -182,23 +182,30 @@ impl ArtifactRepository for PgArtifactRepository {
             // `idx_artifacts_checksum` equality range — no new index, no
             // stored projection to keep in step.
             //
-            // Also unfiltered by `deleted_at`, deliberately: a
-            // soft-deleted row is still genuine evidence of when hort
-            // first held this content, and deletion cannot un-observe
-            // that. Excluding deleted rows could only move the anchor
-            // later and so shorten an observation window — the unsafe
-            // direction. Keeping them anchors fail-safe.
+            // Deleted rows participate; the statement's own
+            // `DELETED-INCLUSIVE` comment carries the reason.
             //
             // `fetch_one` (not `fetch_optional`): an aggregate over an
             // empty range still returns exactly one row, carrying SQL
             // NULL, which maps to the `None` the caller reads as
             // "no evidence".
-            let (first_seen,): (Option<DateTime<Utc>>,) =
-                sqlx::query_as("SELECT MIN(created_at) FROM artifacts WHERE checksum_sha256 = $1")
-                    .bind(&sha256)
-                    .fetch_one(&self.pool)
-                    .await
-                    .map_err(|e| map_sqlx_error(&e, "Artifact", &sha256))?;
+            let (first_seen,): (Option<DateTime<Utc>>,) = sqlx::query_as(
+                r#"
+                    SELECT MIN(created_at)
+                    -- DELETED-INCLUSIVE: a soft-deleted row is still
+                    -- genuine evidence of when hort first held this
+                    -- content, and deletion cannot un-observe it.
+                    -- Excluding deleted rows could only move the anchor
+                    -- later and so shorten an observation window — the
+                    -- unsafe direction. Keeping them anchors fail-safe.
+                      FROM artifacts
+                     WHERE checksum_sha256 = $1
+                    "#,
+            )
+            .bind(&sha256)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Artifact", &sha256))?;
             Ok(first_seen)
         })
     }
@@ -586,15 +593,20 @@ impl ArtifactRepository for PgArtifactRepository {
             // lowercased) — the use case compares it against the new
             // crate's canonical name to decide collision.
             //
-            // Deleted rows deliberately still participate: this is a
-            // name-squatting guard, and letting a deletion free the
-            // folded name would let a later publish claim a name a
-            // consumer may still resolve from a lockfile. Fail closed.
+            // Deleted rows participate; the statement's own
+            // `DELETED-INCLUSIVE` comment carries the reason.
             let existing: Option<String> = sqlx::query_scalar(
-                "SELECT name FROM artifacts \
-                 WHERE repository_id = $1 \
-                   AND replace(lower(name), '_', '-') = $2 \
-                 LIMIT 1",
+                r#"
+                SELECT name
+                -- DELETED-INCLUSIVE: a name-squatting guard. Letting a
+                -- deletion free the folded name would let a later publish
+                -- claim a name a consumer may still resolve from a
+                -- lockfile. Fail closed.
+                  FROM artifacts
+                 WHERE repository_id = $1
+                   AND replace(lower(name), '_', '-') = $2
+                 LIMIT 1
+                "#,
             )
             .bind(repository_id)
             .bind(&key)
@@ -1074,9 +1086,15 @@ impl ArtifactRepository for PgArtifactRepository {
             // application pass walks pages until exhaustion. A stable
             // `ORDER BY id` makes the OFFSET/LIMIT window skip- and
             // duplicate-free across pages.
+            // Shared by the page query and its count twin so the two
+            // cannot disagree about which artifacts the policy scopes.
+            // The liveness filter is deliberately NOT in here: each
+            // consumer spells `a.deleted_at IS NULL` itself, because the
+            // `live_reads_exclude_deleted` guard reads the statement and
+            // not the fragments it interpolates — a predicate reachable
+            // only one indirection away is a predicate nothing checks.
             const SCOPE_PREDICATE: &str = r#"
                 a.quarantine_status IN ('quarantined', 'released')
-                AND a.deleted_at IS NULL
                 AND (
                   EXISTS (
                     SELECT 1 FROM policy_projections p
@@ -1104,7 +1122,7 @@ impl ArtifactRepository for PgArtifactRepository {
             "#;
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts a \
-                 WHERE {SCOPE_PREDICATE} \
+                 WHERE a.deleted_at IS NULL AND ({SCOPE_PREDICATE}) \
                  ORDER BY a.id \
                  OFFSET $2 LIMIT $3"
             );
@@ -1116,7 +1134,10 @@ impl ArtifactRepository for PgArtifactRepository {
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Artifact", "list_active_for_policy"))?;
 
-            let count_sql = format!("SELECT COUNT(*) FROM artifacts a WHERE {SCOPE_PREDICATE}");
+            let count_sql = format!(
+                "SELECT COUNT(*) FROM artifacts a \
+                 WHERE a.deleted_at IS NULL AND ({SCOPE_PREDICATE})"
+            );
             let total: Option<i64> = sqlx::query_scalar(AssertSqlSafe(count_sql))
                 .bind(policy_id)
                 .fetch_one(&self.pool)
@@ -1212,6 +1233,13 @@ impl PgArtifactRepository {
 
         let (existed, updated): (bool, bool) = sqlx::query_as(
             "WITH existing AS (
+                 -- DELETED-INCLUSIVE: this probe exists to tell `no such
+                 -- artifact` apart from `the status moved under us`, so it
+                 -- has to see exactly the rows the UPDATE beside it can
+                 -- touch. That UPDATE carries no liveness predicate; a
+                 -- filter on one side only would report a soft-deleted
+                 -- artifact as absent while the UPDATE could still match
+                 -- it, turning a lost race into a wrong error.
                  SELECT 1 FROM artifacts WHERE id = $3
              ),
              updated AS (

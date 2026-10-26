@@ -39,6 +39,14 @@
 //! - `select_stranded_skips_rejected_artifact_even_with_failed_scan`
 //! - `select_stranded_skips_artifact_with_newer_in_flight_job_despite_older_failed_job`
 //!
+//! Soft delete, which both predicates share (`a.deleted_at IS NULL`):
+//!
+//! - `select_eligible_skips_soft_deleted_artifact`
+//! - `select_eligible_spends_no_batch_slot_on_a_soft_deleted_artifact`
+//! - `select_stranded_skips_soft_deleted_artifact`
+//! - `select_stranded_spends_no_batch_slot_on_a_soft_deleted_artifact`
+//! - `both_sweeps_still_return_a_live_artifact`
+//!
 //! Every test here carries `#[serial(hort_pg_db)]`, the workspace-wide
 //! DB-test parallel-safety key (CLAUDE.md → Test Coverage Tiers →
 //! DB-backed test isolation), and that key is the file's **only**
@@ -885,5 +893,168 @@ async fn select_stranded_skips_artifact_with_newer_in_flight_job_despite_older_f
         "the most-recent job (pending) must gate eligibility, not the \
          older failed one — otherwise a fresh in-flight rescan would be \
          double-enqueued"
+    );
+}
+
+// =====================================================================
+// Soft delete — a deleted artifact is in NEITHER sweep, and consumes no
+// batch slot in either.
+//
+// Both queries lost their liveness predicate when the inert `is_deleted`
+// column was dropped, one day before real soft delete arrived under the
+// name `deleted_at`. `ArtifactDeleted` is terminal on the artifact's
+// stream, so a scan verdict appended afterwards would put a lifecycle
+// event past the terminal; and because both queries are `LIMIT`-bounded,
+// a deleted row does not merely appear — it takes a slot. The slot is
+// what the `batch_size = 1` pairs below assert, which absence alone
+// cannot show.
+// =====================================================================
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_eligible_skips_soft_deleted_artifact() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    // Eligible on every other count: released, never scanned, no job.
+    let artifact = seed_artifact(&pool, repo, Some("released"), None).await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, artifact).await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_eligible(1000, Utc::now())
+        .await
+        .expect("select_eligible Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "a soft-deleted artifact is out of the served catalog, so \
+         rescanning it buys no serving decision — and ArtifactDeleted is \
+         terminal, so the verdict would land past it"
+    );
+}
+
+/// The slot, not just the absence: with `batch_size = 1` and one deleted
+/// artifact alongside one live one, the sweep must return the live one.
+///
+/// Deterministic because the predicate makes the deleted row a
+/// non-candidate, leaving exactly one row the `LIMIT 1` can choose from —
+/// neither query carries an `ORDER BY`, so that is the whole of the
+/// guarantee. Before the fix both were candidates and either could fill
+/// the batch, which is how a backlog of deleted rows starves rescanning.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_eligible_spends_no_batch_slot_on_a_soft_deleted_artifact() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let deleted = seed_artifact(&pool, repo, Some("released"), None).await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, deleted).await;
+    let live = seed_artifact(&pool, repo, Some("released"), None).await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_eligible(1, Utc::now())
+        .await
+        .expect("select_eligible Ok");
+
+    assert_eq!(
+        filter_to(&rows, &[deleted, live])
+            .iter()
+            .map(|c| c.artifact_id)
+            .collect::<Vec<_>>(),
+        vec![live],
+        "the one batch slot must go to the live artifact"
+    );
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_soft_deleted_artifact() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    // Stranded on every other count: quarantined with no scan job at all.
+    let artifact = seed_artifact(&pool, repo, Some("quarantined"), None).await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, artifact).await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "a soft-deleted quarantined artifact is not stranded work — \
+         deletion already took it out of service"
+    );
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_spends_no_batch_slot_on_a_soft_deleted_artifact() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let deleted = seed_artifact(&pool, repo, Some("quarantined"), None).await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, deleted).await;
+    let live = seed_artifact(&pool, repo, Some("quarantined"), None).await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port.select_stranded(1).await.expect("select_stranded Ok");
+
+    assert_eq!(
+        filter_to(&rows, &[deleted, live])
+            .iter()
+            .map(|c| c.artifact_id)
+            .collect::<Vec<_>>(),
+        vec![live],
+        "the one batch slot must go to the live artifact"
+    );
+}
+
+/// The filter excludes deleted rows and nothing else. Both sweeps keep
+/// returning a live artifact that is otherwise identical to the deleted
+/// one above — the direction a too-broad predicate (`deleted_at IS NOT
+/// NULL`, a stray `AND`) would break silently.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn both_sweeps_still_return_a_live_artifact() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let eligible = seed_artifact(&pool, repo, Some("released"), None).await;
+    let stranded = seed_artifact(&pool, repo, Some("quarantined"), None).await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let eligible_rows = port
+        .select_eligible(1000, Utc::now())
+        .await
+        .expect("select_eligible Ok");
+    let stranded_rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert_eq!(
+        filter_to(&eligible_rows, &[eligible]).len(),
+        1,
+        "the liveness predicate must not exclude a live artifact"
+    );
+    assert_eq!(
+        filter_to(&stranded_rows, &[stranded]).len(),
+        1,
+        "the liveness predicate must not exclude a live artifact"
     );
 }
