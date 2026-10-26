@@ -112,7 +112,7 @@ the result instead.
 | regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
 | regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.28.0 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.29.0 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
@@ -469,7 +469,7 @@ the result instead.
 | thiserror-impl | 2.0.21 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 2.0.21 | MIT | https://github.com/dtolnay/thiserror |
-| typed-path | 0.12.3 | MIT | https://github.com/chipsenkbeil/typed-path |
+| typed-path | 0.13.0 | MIT | https://github.com/chipsenkbeil/typed-path |
 | unicode-ident | 1.0.24 | MIT | https://github.com/dtolnay/unicode-ident |
 | zmij | 1.0.21 | MIT | https://github.com/dtolnay/zmij |
 | allocator-api2 | 0.2.21 | MIT | https://github.com/zakarumych/allocator-api2 |
@@ -478,7 +478,7 @@ the result instead.
 | spin | 0.10.1 | MIT | https://github.com/mvdnes/spin-rs.git |
 | spin | 0.9.9 | MIT | https://github.com/mvdnes/spin-rs.git |
 | tracing-core | 0.1.36 | MIT | https://github.com/tokio-rs/tracing |
-| zip | 9.0.5 | MIT | https://github.com/zip-rs/zip2 |
+| zip | 9.1.1 | MIT | https://github.com/zip-rs/zip2 |
 | typenum | 1.20.0 | MIT | https://github.com/paholg/typenum |
 | endian-type | 0.1.2 | MIT | https://github.com/Lolirofle/endian-type.git |
 | base64 | 0.21.7 | MIT | https://github.com/marshallpierce/rust-base64 |
@@ -6686,7 +6686,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.28.0 — MIT
+### uuid 1.29.0 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
@@ -17610,7 +17610,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### typed-path 0.12.3 — MIT
+### typed-path 0.13.0 — MIT
 
 Repository: https://github.com/chipsenkbeil/typed-path
 
@@ -17858,7 +17858,7 @@ SOFTWARE.
 
 ```
 
-### zip 9.0.5 — MIT
+### zip 9.1.1 — MIT
 
 Repository: https://github.com/zip-rs/zip2
 
