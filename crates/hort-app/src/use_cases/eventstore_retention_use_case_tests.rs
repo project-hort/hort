@@ -32,6 +32,10 @@
 //! - a `DebuggingRecorder` assertion that
 //!   `hort_event_store_streams_archived_total{result=…}` fires with the
 //!   documented `{archived, deleted, skipped}` label values.
+//! - `sealed_stream_ids` names exactly the streams the chokepoint
+//!   sealed, in sweep order, for both retention modes, and is empty
+//!   when the pass sealed nothing — the caller anchors those seals
+//!   once per pass and has to be able to name them if that fails.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -965,6 +969,103 @@ async fn mixed_batch_tallies_every_outcome() {
     assert_eq!(s.skipped_unregistered_category, 1);
     assert_eq!(s.errors, 1, "blocked_sid chokepoint Err");
     assert!(!h.store.deleted_streams().contains(&meta));
+    assert_eq!(
+        s.sealed_stream_ids.len(),
+        (s.deleted + s.archived) as usize,
+        "sealed_stream_ids must name exactly the streams the chokepoint sealed \
+         — the caller anchors those and names them when the anchoring fails"
+    );
+    assert!(
+        !s.sealed_stream_ids.contains(&blocked_sid),
+        "a chokepoint Err seals nothing, so the stream must not appear among \
+         the ids the caller is about to anchor"
+    );
+    assert!(!s.sealed_stream_ids.contains(&meta));
+}
+
+// ---------------------------------------------------------------------------
+// The sweep names the streams it sealed (the caller has to anchor them)
+// ---------------------------------------------------------------------------
+
+/// A seal is tamper-evident only once a checkpoint post-dating it
+/// anchors its head, and that emission happens once per sweep in the
+/// caller. So the pass reports *which* streams it sealed, not just how
+/// many: a failed anchoring has to be able to name them.
+#[tokio::test]
+async fn sealed_stream_ids_name_the_sealed_streams_in_sweep_order() {
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let (sid_a, sid_b) = (artifact_stream(a), artifact_stream(b));
+    let h = build(
+        MockReader::new().with(vec![
+            candidate(
+                sid_a.clone(),
+                StreamCategory::Artifact,
+                ts(0),
+                "ArtifactPurged",
+            ),
+            candidate(
+                sid_b.clone(),
+                StreamCategory::Artifact,
+                ts(0),
+                "ArtifactPurged",
+            ),
+        ]),
+        MockEventStore::new()
+            .seed_stream(&sid_a, vec![purged_persisted(a, 1)])
+            .seed_stream(&sid_b, vec![purged_persisted(b, 1)]),
+        vec![artifact_rule(floor_secs(100))],
+        StreamRetentionModeRef::Delete,
+    );
+    let s = h.uc.archive_terminal_streams(ts(10_000)).await.unwrap();
+    assert_eq!(s.deleted, 2);
+    assert_eq!(s.sealed_stream_ids, vec![sid_a, sid_b]);
+}
+
+/// A sweep that sealed nothing reports no ids — which is what tells
+/// the caller there is nothing to anchor and no anchor write to spend.
+#[tokio::test]
+async fn sealed_stream_ids_is_empty_when_nothing_sealed() {
+    let aid = Uuid::new_v4();
+    let sid = artifact_stream(aid);
+    let h = build(
+        MockReader::new().with(vec![candidate(
+            sid.clone(),
+            StreamCategory::Artifact,
+            ts(9_999),
+            "ArtifactPurged",
+        )]),
+        MockEventStore::new().seed_stream(&sid, vec![purged_persisted(aid, 1)]),
+        vec![artifact_rule(floor_secs(100))],
+        StreamRetentionModeRef::Delete,
+    );
+    let s = h.uc.archive_terminal_streams(ts(10_000)).await.unwrap();
+    assert_eq!(s.skipped_floor_not_elapsed, 1);
+    assert!(s.sealed_stream_ids.is_empty());
+}
+
+/// `Archive` mode reports its sealed ids the same way `Delete` does —
+/// both route through the one chokepoint, so the caller's anchoring
+/// obligation does not depend on which verb ran.
+#[tokio::test]
+async fn archive_mode_also_names_the_sealed_streams() {
+    let aid = Uuid::new_v4();
+    let sid = artifact_stream(aid);
+    let h = build(
+        MockReader::new().with(vec![candidate(
+            sid.clone(),
+            StreamCategory::Artifact,
+            ts(0),
+            "ArtifactPurged",
+        )]),
+        MockEventStore::new().seed_stream(&sid, vec![purged_persisted(aid, 1)]),
+        vec![artifact_rule(floor_secs(100))],
+        StreamRetentionModeRef::Archive {
+            target_prefix: "cold".into(),
+        },
+    );
+    let s = h.uc.archive_terminal_streams(ts(10_000)).await.unwrap();
+    assert_eq!(s.archived, 1);
+    assert_eq!(s.sealed_stream_ids, vec![sid]);
 }
 
 // ---------------------------------------------------------------------------

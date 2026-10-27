@@ -29,20 +29,34 @@
 //! → `jobs` row → this handler) — **no in-process scheduler**. One
 //! checkpoint per tick.
 //!
-//! ## Pre-purge emission hook (DEFINED here, CALLED by the
-//! eventstore-retention purge handler)
+//! ## Post-sweep emission hook (DEFINED here, CALLED by
+//! `EventStoreArchiveHandler`)
 //!
-//! An *unconditional* checkpoint is required **before** any
-//! `delete_stream`/`archive_stream` retention purge, so a `StreamSealed`
-//! is always anchored by a checkpoint that post-dates it. This module
-//! **defines the contract** as the public, dependency-injected
-//! [`CheckpointEmissionHook`] trait below; the
-//! retention-purge handler **calls** `hook.emit_checkpoint_now()`
-//! immediately before it deletes any row (mirroring how the
-//! `StreamSealed` obligation is defined in one place and implemented
-//! by the retention path). This module does **not** implement that call
-//! site; it provides the seam + the always-available implementation
-//! ([`CheckpointEmitterHookAdapter`]) the retention handler wires.
+//! A `StreamSealed` tombstone is tamper-evident only once a checkpoint
+//! that post-dates it anchors its head; until then the offline verifier
+//! records `AnchorBreak::SealUnanchored`
+//! (`hort_domain::events::chain`). This module **defines the
+//! contract** as the public, dependency-injected
+//! [`CheckpointEmissionHook`] trait below and supplies the
+//! always-available implementation ([`CheckpointEmitterHookAdapter`]);
+//! the audit-retention sweep handler
+//! (`crates/hort-app/src/task_handlers/eventstore_archive.rs`)
+//! **calls** `hook.emit_checkpoint_now()` once per sweep, **after** the
+//! sweep's seals have committed. This module does **not** implement
+//! that call site.
+//!
+//! The emission follows the sweep rather than preceding each delete
+//! because **no instant between a seal and its delete is observable**:
+//! `PgEventStore::seal_and_remove` appends the `StreamSealed` tombstone
+//! and runs `DELETE FROM events` inside one transaction, whose
+//! atomicity is the point (ADR 0020), while the emitter reads a
+//! `REPEATABLE READ` snapshot on its own connection
+//! (`PgEventChainHeadReader`) and so can never see the tombstone before
+//! the delete commits. The residual window is therefore the sweep's own
+//! duration, after which every seal that sweep made is anchored. The
+//! sweep emits **once** for the whole pass — each emission is a sign
+//! plus an S3 Object-Lock write — and only when it actually sealed
+//! something.
 //!
 //! ## Observability
 //!
@@ -145,27 +159,45 @@ impl BackfillBaselineConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-purge emission hook (DEFINED here; the retention purge CALLS it)
+// Post-sweep emission hook (DEFINED here; EventStoreArchiveHandler CALLS it)
 // ---------------------------------------------------------------------------
 
 /// Contract for "anchor a checkpoint **now**, unconditionally".
-/// The `delete_stream`/`archive_stream`
-/// retention path MUST call [`CheckpointEmissionHook::emit_checkpoint_now`]
-/// **before** it deletes any row, so the just-appended `StreamSealed`
-/// tombstone is anchored by a checkpoint that post-dates it (otherwise
-/// the offline verifier reports `Broken`, not `SealedGap`).
 ///
-/// This module only **defines** the seam.
-/// The retention path injects an `Arc<dyn CheckpointEmissionHook>` into its
-/// purge handler and calls it; this module does **not** implement that
-/// call site. [`CheckpointEmitterHookAdapter`] is the always-available
-/// implementation the retention handler wires.
+/// The audit-retention stream sweep MUST call
+/// [`CheckpointEmissionHook::emit_checkpoint_now`] **once, after** the
+/// seals of that sweep have committed, so every `StreamSealed`
+/// tombstone it wrote is anchored by a checkpoint that post-dates it
+/// (otherwise the offline verifier records
+/// `AnchorBreak::SealUnanchored` for those seals).
+///
+/// **After the sweep, not before each delete.** The seal and the delete
+/// share one transaction (`PgEventStore::seal_and_remove`, whose
+/// atomicity ADR 0020 protects) and this emitter reads its own
+/// `REPEATABLE READ` snapshot, so there is no instant between them an
+/// independent reader could observe. The window in which the sweep's
+/// seals are unanchored is the sweep's own duration.
+///
+/// This module only **defines** the seam. The sweep handler
+/// (`crates/hort-app/src/task_handlers/eventstore_archive.rs`) takes an
+/// `Option<Arc<dyn CheckpointEmissionHook>>` and calls it;
+/// [`CheckpointEmitterHookAdapter`] is the always-available
+/// implementation the composition root wires there, and `None` is the
+/// correct wiring wherever checkpoint emission is off (ADR 0057 — where
+/// no anchor is expected, a missing checkpoint is not a failure).
 pub trait CheckpointEmissionHook: Send + Sync {
-    /// Assemble + sign + WORM-anchor one checkpoint immediately. `Ok`
-    /// ⇒ a checkpoint that post-dates every seal so far is durably
-    /// anchored; the caller (the retention purge) may then proceed to delete.
-    /// `Err` ⇒ the caller MUST abort the purge (deleting without an
-    /// anchoring checkpoint would make the chain `Broken`).
+    /// Assemble + sign + WORM-anchor one checkpoint immediately.
+    ///
+    /// `Ok` ⇒ a checkpoint that post-dates every seal so far is
+    /// durably anchored.
+    ///
+    /// `Err` ⇒ the anchoring did not happen. The caller cannot undo
+    /// anything in response — its seals are committed and the rows are
+    /// gone — so it must neither swallow this nor report a clean sweep:
+    /// it surfaces a non-success outcome naming the
+    /// sealed-but-unanchored streams. The next scheduled emission
+    /// anchors those seals regardless, which makes a failure here a
+    /// visibility and latency problem, not a durability one.
     fn emit_checkpoint_now(&self) -> BoxFuture<'_, DomainResult<()>>;
 }
 
@@ -173,7 +205,7 @@ pub trait CheckpointEmissionHook: Send + Sync {
 // Handler
 // ---------------------------------------------------------------------------
 
-/// [`TaskHandler`] for the periodic + pre-purge checkpoint emission.
+/// [`TaskHandler`] for the periodic + post-sweep checkpoint emission.
 /// Constructed at composition time with the three ports it composes +
 /// the operator-provisioned backfill baseline.
 pub struct EventstoreCheckpointHandler {
@@ -208,7 +240,7 @@ impl EventstoreCheckpointHandler {
     }
 
     /// The shared emission cycle, callable from both the
-    /// [`TaskHandler::run`] tick and the pre-purge
+    /// [`TaskHandler::run`] tick and the post-sweep
     /// [`CheckpointEmissionHook`]. Returns the assembled checkpoint on
     /// success (for logging/result-summary), or a typed error that the
     /// callers map to their own outcome shape (`TaskOutcome::Failed` /
@@ -367,24 +399,26 @@ impl TaskHandler for EventstoreCheckpointHandler {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-purge hook adapter (the always-available impl the retention purge wires)
+// Post-sweep hook adapter (the always-available impl the sweep wires)
 // ---------------------------------------------------------------------------
 
 /// The always-available [`CheckpointEmissionHook`] implementation.
-/// The eventstore-retention path injects this into its purge handler and
-/// calls [`CheckpointEmissionHook::emit_checkpoint_now`] before deleting
-/// any row. It runs the **same** emission cycle as the periodic tick
-/// (same metric / log / signature contract), so a pre-purge checkpoint
-/// is indistinguishable from a scheduled one to the verifier — exactly
-/// what is needed (a seal is always anchored by a checkpoint that
-/// post-dates it).
+/// The composition root injects this into the audit-retention sweep
+/// handler, which calls
+/// [`CheckpointEmissionHook::emit_checkpoint_now`] once after its seals
+/// have committed. It runs the **same** emission cycle as the periodic
+/// tick (same metric / log / signature contract), so a post-sweep
+/// checkpoint is indistinguishable from a scheduled one to the
+/// verifier — exactly what is needed (a seal is anchored by whichever
+/// checkpoint post-dates it, and nothing about the anchor records which
+/// trigger produced it).
 pub struct CheckpointEmitterHookAdapter {
     handler: Arc<EventstoreCheckpointHandler>,
 }
 
 impl CheckpointEmitterHookAdapter {
     /// Wrap a shared [`EventstoreCheckpointHandler`]. The same handler
-    /// instance backs both the periodic tick and the pre-purge hook so
+    /// instance backs both the periodic tick and the post-sweep hook so
     /// there is exactly one emission code path.
     pub fn new(handler: Arc<EventstoreCheckpointHandler>) -> Self {
         Self { handler }
@@ -403,7 +437,7 @@ impl CheckpointEmissionHook for CheckpointEmitterHookAdapter {
                         stream_count = cp.stream_heads.len(),
                         sealed_count = cp.sealed_streams.len(),
                         backfill_baseline = cp.backfill_baseline.is_some(),
-                        "pre-purge event-chain checkpoint emitted and WORM-anchored \
+                        "post-sweep event-chain checkpoint emitted and WORM-anchored \
                          (a seal must be anchored by a post-dating checkpoint)"
                     );
                     Ok(())
@@ -413,9 +447,11 @@ impl CheckpointEmissionHook for CheckpointEmitterHookAdapter {
                     let msg = e.message();
                     tracing::error!(
                         error = %msg,
-                        "pre-purge event-chain checkpoint emission failed — the \
-                         caller MUST abort the retention purge (deleting without \
-                         an anchoring checkpoint would make the chain Broken)"
+                        "post-sweep event-chain checkpoint emission failed — the \
+                         caller's seals are committed and cannot be undone, so it \
+                         must report a non-success outcome naming the \
+                         sealed-but-unanchored streams; the next scheduled emission \
+                         anchors them regardless"
                     );
                     Err(DomainError::Invariant(msg))
                 }
@@ -835,10 +871,10 @@ mod tests {
         ));
     }
 
-    // ---- pre-purge hook (DEFINED here; the retention purge CALLS it) ----
+    // ---- post-sweep hook (DEFINED here; the sweep handler CALLS it) ----
 
     #[test]
-    fn pre_purge_hook_emits_a_checkpoint_on_success() {
+    fn post_sweep_hook_emits_a_checkpoint_on_success() {
         let heads = Arc::new(MockHeads::ok(LiveChainSnapshot::new(
             vec![head("s", 0, 1)],
             7,
@@ -864,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_purge_hook_returns_err_so_caller_aborts_purge() {
+    fn post_sweep_hook_returns_err_so_the_caller_can_report_it() {
         let heads = Arc::new(MockHeads::ok(LiveChainSnapshot::new(
             vec![head("s", 0, 1)],
             1,
@@ -881,8 +917,10 @@ mod tests {
             let r = rt().block_on(hook.emit_checkpoint_now());
             assert!(
                 r.is_err(),
-                "a failed pre-purge emission MUST surface Err so the retention \
-                 purge aborts (deleting unanchored ⇒ Broken chain)"
+                "a failed emission MUST surface Err so the sweep handler can \
+                 report a non-success outcome naming the sealed-but-unanchored \
+                 streams — it cannot un-delete anything, and a swallowed error \
+                 here would read as a clean sweep"
             );
         });
         let e = snap.into_vec();

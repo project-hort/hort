@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The event-store retention sweep now anchors the seals it makes, so
+  `verify-event-chain` no longer reports them unanchored until the next
+  scheduled checkpoint. A sweep whose anchoring fails reports a failed job
+  naming the affected streams (#332).
+
 ## [0.16.0] - 2026-10-26
 
 ### Added

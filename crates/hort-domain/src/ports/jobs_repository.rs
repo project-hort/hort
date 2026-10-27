@@ -541,11 +541,14 @@ pub const REQUEUE_ON_LEASE_EXPIRY_KINDS: &[&str] = &[
 ///   that deliver that are the CronJob's `concurrencyPolicy: Forbid`, the
 ///   worker's per-kind semaphore, and the per-UTC-day idempotency key —
 ///   and the semaphore is per *process*. A requeue claimed by a sibling
-///   replica walks around all three. Relaxing this needs a security
-///   co-review, not a sweep (ADR 0020, ADR 0028).
-/// - `retention-purge` — destructive storage GC, and it fires the
-///   pre-purge checkpoint hook before deleting. Two concurrent walks race
-///   on refcounts and emit two checkpoints.
+///   replica walks around all three. It also anchors its seals by
+///   emitting one checkpoint after the sweep, which derives
+///   `max(existing) + 1` the same way the `eventstore-checkpoint` tick
+///   does, so two concurrent sweeps would additionally fork the anchor
+///   sequence. Relaxing this needs a security co-review, not a sweep
+///   (ADR 0020, ADR 0028).
+/// - `retention-purge` — destructive storage GC. Two concurrent walks
+///   race on refcounts and both advance the same purge worklist.
 /// - `retention-evaluate` — drives the two above.
 /// - `eventstore-checkpoint` — derives the next `checkpoint_seq` as
 ///   `max(existing) + 1` by reading then writing. Two concurrent

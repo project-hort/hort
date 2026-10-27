@@ -4949,7 +4949,9 @@ caveat), Ed25519-signs the shared `SignedBody` (the byte-identical
 verifier↔emitter contract pin), and writes it to the S3-Object-Lock-WORM
 anchor prefix. `hort_event_chain_checkpoint_total` is the emission
 evidence — emitted exactly once per emission cycle (a periodic tick
-**or** the pre-purge hook the retention purge calls).
+**or** the post-sweep hook the `eventstore-archive` audit-retention
+sweep calls once per sweep, after its seals have committed, to anchor
+them).
 
 | Metric | Type | Labels | Unit | Notes |
 |--------|------|--------|------|-------|
@@ -4967,7 +4969,7 @@ evidence — emitted exactly once per emission cycle (a periodic tick
 emitted **only** at the `hort-app` emission-task layer
 (`crates/hort-app/src/task_handlers/eventstore_checkpoint.rs::emit_metric`),
 once per emission cycle (both the periodic `TaskHandler::run` tick and
-the pre-purge `CheckpointEmissionHook` calls route
+the post-sweep `CheckpointEmissionHook` calls route
 through the same single `emit_metric`). The pure `hort-domain`
 checkpoint-build core and the `hort-adapters-checkpoint-anchor` write
 adapter emit nothing. `result` is a per-metric schema label holding
