@@ -224,6 +224,11 @@ pub async fn get_queue(
 
     let filter = CurationQueueFilter {
         repository_id,
+        // This endpoint exposes no artifact-scoping query parameter; the
+        // filter carries the field for the repair use case, which reaches
+        // a known artifact directly because its own listing has no
+        // cursor. The curator queue's surface is unchanged.
+        artifact_id: None,
         status,
         rejection_reason_kind,
         limit,

@@ -88,6 +88,10 @@ pub enum PolicyField {
     /// are the lowercase `ScanEnforcement` wire strings
     /// (`reject` / `record`).
     Enforcement,
+    /// `composite_verdict_mode` changed (ADR 0064 D6). The
+    /// `previous_value` / `new_value` payloads are the lowercase
+    /// `CompositeVerdictMode` wire strings (`observed` / `promoted`).
+    CompositeVerdictMode,
 }
 
 impl PolicyField {
@@ -142,7 +146,20 @@ impl PolicyField {
     ///   `scan_backends: []` waiver row has no findings → untouched,
     ///   ADR 0041 cross-opt-in matrix);
     /// - `RescanIntervalHours` — schedules the cron rescan cadence, not
-    ///   the verdict.
+    ///   the verdict;
+    /// - `CompositeVerdictMode` — `ScanBackends`' argument, on the
+    ///   composition axis (ADR 0064 D6). It decides whether the *next*
+    ///   scan's composed-image verdict reaches the manifest; it
+    ///   re-interprets no stored finding, because a composite verdict's
+    ///   findings are produced by a scan of an assembled image and a
+    ///   manifest that has never had one has nothing for this pass to
+    ///   re-derive. Making it gate-affecting would be worse than
+    ///   useless: the pass re-derives from stored findings, so
+    ///   `promoted → observed` would un-reject the population a promoted
+    ///   composite had correctly rejected with no fresh assessment —
+    ///   which is exactly why ADR 0064 D6 rules `ScanEnforcement::Record`
+    ///   out by name and leaves recovering the estate to the operator's
+    ///   own curation re-evaluation.
     ///
     /// Closed match (no `_` arm) so a future `PolicyField` variant fails
     /// to compile here, forcing a deliberate gate-affecting decision
@@ -163,7 +180,8 @@ impl PolicyField {
             | Self::ProvenanceIdentities
             | Self::MaxArtifactAge
             | Self::ScanBackends
-            | Self::RescanIntervalHours => false,
+            | Self::RescanIntervalHours
+            | Self::CompositeVerdictMode => false,
         }
     }
 }

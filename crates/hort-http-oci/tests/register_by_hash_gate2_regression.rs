@@ -44,7 +44,8 @@ use hort_app::use_cases::test_support::sample_repository;
 use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::entities::scan_policy::{
-    NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+    CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+    SeverityThreshold,
 };
 use hort_domain::events::PolicyScope;
 use hort_domain::types::ContentHash;
@@ -102,6 +103,7 @@ fn quarantining_policy(repo_id: Uuid) -> ScanPolicyProjection {
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
+        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: now,
         updated_at: now,

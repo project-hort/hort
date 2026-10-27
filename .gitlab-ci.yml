@@ -874,7 +874,12 @@ prefetch:warm:
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PREFETCH_ENABLED == "true"'
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
-    - apk add --no-cache bash curl jq
+    - apk add --no-cache bash curl jq ca-certificates
+    # Same ordering rule as the buildah jobs: the CA has to be in the trust
+    # store before *hort-auth-steps curls the internal-PKI endpoint. The
+    # explicit ca-certificates package supplies update-ca-certificates, which
+    # alpine's curl dependency (ca-certificates-bundle) does not.
+    - *platform-ca-deb
     - *hort-auth-steps
   # This job also doubles as the GitLab<->hort OIDC federation probe (backlog
   # 097 §4): the federation is declared in gitops but its applied state on
@@ -1397,7 +1402,9 @@ prefetch:verify:
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PREFETCH_ENABLED == "true"'
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
-    - apk add --no-cache bash curl jq findutils
+    - apk add --no-cache bash curl jq findutils ca-certificates
+    # See prefetch:warm — CA into the trust store before the exchange curls it.
+    - *platform-ca-deb
     - *hort-auth-steps
   script:
     - |
@@ -1929,8 +1936,14 @@ quality:site-build:
     HORT_OIDC_TOKEN:
       aud: hort-server
   before_script:
-    - *hort-auth-steps
+    # platform-ca-rhel FIRST: *hort-auth-steps runs a curl token exchange, and
+    # once the build source resolves to the internal instance that endpoint
+    # presents an internal-PKI certificate. Trusting the CA afterwards is too
+    # late — curl has already failed with "unable to get local issuer
+    # certificate". Against a public-CA endpoint the order was invisible,
+    # which is why this stood inverted for as long as it did.
     - *platform-ca-rhel
+    - *hort-auth-steps
     - mkdir -p ${CI_PROJECT_DIR}/build_info
     - *resolve-registry-creds
     - buildah login --username "$REGISTRY_USER" --password "$REGISTRY_PASSWORD" ${REGISTRY}

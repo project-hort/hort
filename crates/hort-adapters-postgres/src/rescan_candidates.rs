@@ -15,6 +15,16 @@
 //! terminal state. Excluding it would leave every out-of-the-box
 //! deployment's artifacts un-rescanned.
 //!
+//! **Both queries exclude soft-deleted rows** (`a.deleted_at IS NULL`).
+//! A deleted artifact is no longer part of the repository's served
+//! catalog, so scanning it buys no serving decision — and `ArtifactDeleted`
+//! is the terminal event on its stream, so a scan verdict appended
+//! afterwards would put a lifecycle event past the terminal and make a
+//! replay reconstruct a deleted artifact as live. Because both queries are
+//! bounded by `LIMIT`, a deleted row does not merely appear: it consumes a
+//! batch slot a real candidate then does not get, which is how a backlog
+//! of deleted rows can starve rescanning outright.
+//!
 //! Also implements `select_stranded` (issue #6; widened by issue #115
 //! defect (a) cure) — a companion eligibility query for
 //! `quarantine_status='quarantined'` artifacts whose scan either could
@@ -121,6 +131,7 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                     LIMIT 1
                 ) p ON TRUE
                 WHERE COALESCE(p.rescan_interval_hours, $3) > 0
+                  AND a.deleted_at IS NULL
                   AND (a.quarantine_status = 'released'
                        OR a.quarantine_status IS NULL)
                   AND (
@@ -254,6 +265,7 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                     LIMIT 1
                 ) p ON TRUE
                 WHERE a.quarantine_status = 'quarantined'
+                  AND a.deleted_at IS NULL
                   AND (last_job.status = 'failed' OR last_job.status IS NULL)
                   AND COALESCE(cardinality(p.scan_backends), $2) > 0
                   AND NOT EXISTS (

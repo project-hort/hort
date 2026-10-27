@@ -75,8 +75,11 @@ lifecycle. There is **no index-specific lifecycle** and no group-model overhaul.
 
 3. **Quarantine / scan / release / provenance: the generic manifest lifecycle,
    unchanged.** An index is a routing document; the scanner scans exactly one
-   CAS blob — the artifact's own (harmless) JSON — degenerate but consistent
-   with how single-image manifests are already scanned. Quarantine-on-ingest,
+   CAS blob — the artifact's own (harmless) JSON. That stays degenerate for an
+   index, which binds references and no runnable filesystem; a **single-image**
+   manifest is no longer scanned this way — **amended 2026-10-19 by
+   [ADR 0064](0064-a-filesystem-finding-is-about-the-composed-filesystem.md)**,
+   it is scanned as the composed image it describes. Quarantine-on-ingest,
    the degenerate scan, timer release, and (under `provenanceMode: required`)
    the issue-#13 hold + write-authorized-HEAD exemption + re-verify-on-signature
    + expiry backstop all apply automatically, because the index **is** a
@@ -89,8 +92,14 @@ resolves the index (routing) and then pulls the platform child manifest and its
 layers — **each a separate artifact, independently gated by its own
 quarantine**. A held child manifest → 503; a rejected layer blob → 404. So a
 released index sitting over a held or rejected child still serves no unscanned or
-blocked content: consumption safety is enforced **per-child and per-layer**, not
-at the index. The ADR 0007 fail-closed release predicate is satisfied **per
+blocked content: consumption safety is enforced **per-child and
+per-composition**, not at the index (**amended 2026-10-19 by
+[ADR 0064](0064-a-filesystem-finding-is-about-the-composed-filesystem.md)**;
+this argument read "per-child and per-layer" before, and the layer half moved
+up a level without changing the conclusion). Each platform child is itself a
+composed image and is gated as one; a layer keeps its own gate for findings
+about its bytes, and its filesystem findings are carried by the composition
+that contains them. The ADR 0007 fail-closed release predicate is satisfied **per
 artifact** — the index's own release still requires its own scan success /
 waiver (plus provenance clearance under `required`), exactly like any manifest.
 
@@ -199,8 +208,9 @@ path reaches `ingest_verified` like any other ingest and hands it no anchor.
 **What is unchanged.** [ADR 0007](0007-fail-closed-quarantine-release-predicate.md)'s
 fail-closed release predicate: every child still releases only on its own
 elapsed window AND its own `ScanSucceeded` / `ScanWaived`. D4 above: a released
-index still does not release a held child. The per-child and per-layer
-consumption gating that the layer-level-safety rationale rests on. And the
+index still does not release a held child. The per-child and per-composition
+consumption gating that the layer-level-safety rationale now rests on
+([ADR 0064](0064-a-filesystem-finding-is-about-the-composed-filesystem.md)). And the
 answer a client gets when it asks for a held child is the same answer it always
 got — a held child manifest is `503`, a rejected layer blob is `404`. Eager
 ingest changes the *timing* of a child's own lifecycle, and nothing about which

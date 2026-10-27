@@ -277,6 +277,7 @@ struct EffectiveScanPolicyDto {
     scan_backends: Vec<String>,
     enforcement: String,
     negligible_action: String,
+    composite_verdict_mode: String,
     quarantine_duration_secs: i64,
 }
 
@@ -289,6 +290,7 @@ impl EffectiveScanPolicyDto {
             scan_backends: v.scan_backends,
             enforcement: v.enforcement.to_string(),
             negligible_action: v.negligible_action.to_string(),
+            composite_verdict_mode: v.composite_verdict_mode.to_string(),
             quarantine_duration_secs: v.quarantine_duration_secs,
         }
     }

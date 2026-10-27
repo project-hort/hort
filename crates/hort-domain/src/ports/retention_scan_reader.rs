@@ -23,7 +23,12 @@
 //!   per-repo "most recent `ScanCompleted`" the freshness gate compares
 //!   against (`2 × resolved_rescan_interval`).
 //! - `list_findings_for_artifact` reads the per-finding `scan_findings`
-//!   projection.
+//!   projection, scoped to the artifact's **last** scan. That projection
+//!   is per-scan history — every run writes under a fresh `scan_id` and
+//!   nothing removes the previous run's rows — and this port's consumer
+//!   decides whether to delete the artifact, so the union of every scan
+//!   ever run is the wrong evidence: a vulnerability a later scan no
+//!   longer reports must drive no retention decision.
 //!
 //! ## Projection precision
 //!
@@ -49,15 +54,19 @@ use super::BoxFuture;
 /// adapter implements it against `scan_findings` + `repo_security_scores`;
 /// unit tests use an in-memory mock.
 pub trait RetentionScanReader: Send + Sync {
-    /// Every current `scan_findings` row for `artifact_id`, mapped to
-    /// the shipped [`Finding`] value type.
+    /// The `scan_findings` rows the artifact's **last scan** recorded,
+    /// mapped to the shipped [`Finding`] value type. Earlier scans' rows
+    /// stay in the projection and are not returned — see the module docs
+    /// for why that scoping is the port's contract and not an adapter
+    /// detail.
     ///
-    /// Returns an empty `Vec` for an artifact with no findings (a clean
-    /// scan, or one that has never been scanned — the caller
-    /// distinguishes "never scanned" via [`Self::repo_security_score`]'s
-    /// `last_scan_at`, not via an empty findings list). `fixed_versions`
-    /// is projected; `references` and `aliases` are empty on every
-    /// returned row. See the module-level precision note.
+    /// Returns an empty `Vec` for an artifact whose last scan found
+    /// nothing (whatever earlier scans reported), and for one that has
+    /// never been scanned. The caller distinguishes "never scanned" via
+    /// [`Self::repo_security_score`]'s `last_scan_at`, not via an empty
+    /// findings list. `fixed_versions` is projected; `references` and
+    /// `aliases` are empty on every returned row. See the module-level
+    /// precision note.
     fn list_findings_for_artifact(
         &self,
         artifact_id: Uuid,

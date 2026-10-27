@@ -28,9 +28,20 @@
 //!   shared [`super::quarantine::check_quarantine`] helper so operators
 //!   see quarantine pressure in the same counter as regular pulls.
 //!
-//! Rejected artifacts return `404 BLOB_UNKNOWN` so the blob's rejected
-//! state is invisible to clients. The spec does not have a separate
-//! "rejected blob" code; hiding it prevents supply-chain probing.
+//! A terminal verdict refuses with its own envelope rather than a `404
+//! BLOB_UNKNOWN`: `Rejected` answers `403 DENIED` naming the digest and
+//! the rejection axis, `ScanIndeterminate` answers `503 UNAVAILABLE`
+//! with no `Retry-After`. The caller has already passed the repository
+//! read gate, so they would have received the bytes; the reason they are
+//! withheld reveals strictly less, and a 404 byte-identical to "no such
+//! blob" removes the one fact that ends the search (ADR 0055).
+//!
+//! One request shape is not a download and answers `200` instead: a
+//! `HEAD` from a principal with *granted* Write authority, the pre-upload
+//! existence probe. It asks whether the bytes must still be sent, not for
+//! the bytes, so it reports existence across all three withholding states
+//! (ADR 0055's 2026-10-21 amendment). The content `GET` is refused on
+//! every one of them, for every caller.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -541,22 +552,37 @@ pub(super) async fn serve(
     // where the upstream-pull branch isn't taken.
     let _ = &repo;
 
-    // 4a-pre. ADR 0039 §10 write-authorized existence-probe exemption —
-    // evaluated BEFORE the #65 bounded-await below (backlog 094) so a
-    // HEAD that will be served via the exemption regardless does not pay
-    // the await first. Keyed on the artifact's PRE-await quarantine
-    // status: `maybe_bounded_await_release` only ever loops when that
-    // status is `Quarantined` to begin with (every other case is its own
-    // immediate-return), so the pre-await read is exactly the condition
-    // the await would otherwise have started from, and the flag stays
-    // correct whether or not the await below actually runs.
+    // 4a-pre. ADR 0055 write-authorized existence-probe exemption —
+    // evaluated BEFORE the bounded release-await below so a HEAD that
+    // will be served via the exemption regardless does not pay the await
+    // first. Keyed on the artifact's PRE-await quarantine status:
+    // `maybe_bounded_await_release` only ever loops when that status is
+    // `Quarantined` to begin with (every other case, the two terminal
+    // verdicts included, is its own immediate-return), so the pre-await
+    // read is exactly the condition the await would otherwise have
+    // started from, and the flag stays correct whether or not the await
+    // below actually runs.
     //
-    //    Push-dedup exception (ADR 0039 §10): a write-granted caller's
-    //    blob-EXISTENCE check (`HEAD`) must report 200 (exists) so an OCI
-    //    push can dedup and complete. The pre-flight HEAD every pusher
-    //    (skopeo, `docker push`) issues is a write-path precondition, NOT
-    //    a download — quarantine invariant #1 gates *downloads*, not the
-    //    existence probe.
+    //    Push-dedup exception: a write-granted caller's blob-EXISTENCE
+    //    check (`HEAD`) must report 200 (exists) so an OCI push can dedup
+    //    and complete. The pre-flight HEAD every pusher (skopeo, `docker
+    //    push`) issues is a write-path precondition, NOT a download —
+    //    quarantine invariant #1 gates *downloads*, not the existence
+    //    probe.
+    //
+    //    That reason does not depend on the hold being time-bounded, so
+    //    the probe answers existence across all three withholding states:
+    //    a terminal verdict answers "present" to a probe exactly as a
+    //    hold does. Resolution and deduplication are different questions
+    //    (ADR 0055's 2026-10-21 amendment D1): a resolution document that
+    //    lists a version promises it is installable, and a terminal
+    //    verdict stays absent from every such document for every caller;
+    //    a probe asks "must I still send these bytes?", which leads to no
+    //    download and advertises nothing. Refusing it protected no
+    //    invariant either: a client that does not probe uploads the bytes
+    //    blind, the upload deduplicates onto the existing row, and the
+    //    verdict on that row is untouched either way — so the refusal
+    //    only selected against the clients that ask first.
     //
     //    The predicate keys on GRANTED write authority
     //    (`resolve_granted_write`: the grants leg alone, cap ignored),
@@ -568,18 +594,23 @@ pub(super) async fn serve(
     //    held-visibility decision consults identity-level authority
     //    (bounded ADR 0036 exception, recorded in ADR 0039 §10).
     //
-    //    The 503 hold stays in force for: the content GET (every caller,
-    //    `head == false`), and pull/read HEADs (identities without the
-    //    Write grant). So the download block and the transparent-proxy
-    //    contract (invariant #5) are untouched; only the write-granted
-    //    existence probe is released. Fail closed: ONLY a definitive
-    //    granted-Write authorization skips the 503 — a denied or errored
-    //    resolve keeps it. The extra resolve fires solely on the narrow
-    //    quarantined-blob-HEAD path (the `matches!` short-circuits
-    //    first), so the hot read path is unaffected.
-    let write_authorized_existence_probe = head
-        && matches!(artifact.quarantine_status, QuarantineStatus::Quarantined)
-        && ctx
+    //    `head &&` is the first conjunct and that placement is
+    //    load-bearing twice: the refusal stays in force for the content
+    //    GET on every state and for every caller (a rejected blob's bytes
+    //    are never served, to anyone, publisher included), and the extra
+    //    `resolve_granted_write` fires solely on the narrow withheld-blob
+    //    HEAD path. Pull/read HEADs — identities without the Write grant —
+    //    are refused unchanged, so the transparent-proxy contract
+    //    (invariant #5) is untouched. Fail closed: ONLY a definitive
+    //    granted-Write authorization lifts the refusal; a denied or
+    //    errored resolve keeps it.
+    let write_authorized_existence_probe =
+        head && matches!(
+            artifact.quarantine_status,
+            QuarantineStatus::Quarantined
+                | QuarantineStatus::Rejected
+                | QuarantineStatus::ScanIndeterminate
+        ) && ctx
             .repository_access_use_case
             .resolve_granted_write(repo_key, actor)
             .await
@@ -622,69 +653,97 @@ pub(super) async fn serve(
             if !write_authorized_existence_probe {
                 return quarantine::check_quarantine(&artifact, repo_key);
             }
-            // else: ADR 0039 §10 write-authorized existence probe —
-            // fall through, but ONLY the HEAD branch below actually
-            // serves it (`write_authorized_existence_probe` requires
-            // `head`); a GET still cannot reach here with the flag set.
+            // else: the write-authorized existence probe — fall
+            // through, but ONLY the HEAD branch below actually serves it
+            // (`write_authorized_existence_probe` requires `head`); a GET
+            // still cannot reach here with the flag set.
         }
         QuarantineStatus::Rejected => {
-            // A caller who got this far passed the repository read gate,
-            // so the bytes themselves would have been served to them if
-            // the artifact were not withheld. Telling them WHY it is
-            // withheld reveals strictly less than the artifact would have
-            // (ADR 0055's 2026-10-12 clarification), and the alternative
-            // — the `BLOB_UNKNOWN` 404 that is byte-identical to "no such
-            // blob" — removes the one fact that ends the search. A caller
-            // the gate does NOT admit never reaches this arm: the
-            // repository challenge / `NAME_UNKNOWN` of ADR 0021 / 0045
-            // fires in step 2 above, unchanged.
-            //
-            // The axis is a plain field here. `ArtifactUseCase` derives
-            // it from the artifact's own `ArtifactRejected` event during
-            // the load (the `artifacts` projection has no such column),
-            // so the format crate reads a field and never a stream
-            // (ADR 0008).
-            let axis = artifact
-                .rejection_reason
-                .as_ref()
-                .map(RejectionReason::wire_kind);
-            if axis.is_none() {
-                // The answer stays a refusal naming the subject — a
-                // caller is never handed a reason that does not exist,
-                // and never an `unknown` token, which would dress an
-                // inconsistency up as a verdict. The operator is told,
-                // because `Rejected` with no rejection on the record is
-                // an illegal state (ADR 0039 D6: the status is a
-                // projection, the stream is the record).
+            if !write_authorized_existence_probe {
+                // A caller who got this far passed the repository read
+                // gate, so the bytes themselves would have been served to
+                // them if the artifact were not withheld. Telling them
+                // WHY it is withheld reveals strictly less than the
+                // artifact would have (ADR 0055's 2026-10-12
+                // clarification), and the alternative — the
+                // `BLOB_UNKNOWN` 404 that is byte-identical to "no such
+                // blob" — removes the one fact that ends the search. A
+                // caller the gate does NOT admit never reaches this arm:
+                // the repository challenge / `NAME_UNKNOWN` of ADR 0021 /
+                // 0045 fires in step 2 above, unchanged.
                 //
-                // Two causes reach here and the use-case layer tells them
-                // apart in its own log: it logs `error!` when it read the
-                // stream and found no `ArtifactRejected`, and `warn!`
-                // when the read itself failed or the port was unwired.
-                // That holds however the row arrived, including through
-                // the bounded-await poll loop's `get_by_id` re-read
-                // above, which hydrates like every other load path — so
-                // a status that flipped to `Rejected` inside the wait
-                // reaches this arm carrying its axis, and an axis-less
-                // row here always has a line upstream naming which of
-                // the two causes produced it.
-                tracing::error!(
-                    artifact_id = %artifact.id,
-                    digest = %format!("sha256:{}", hash.as_ref()),
-                    "refusing a Rejected blob with no rejection axis to report"
-                );
+                // The axis is a plain field here. `ArtifactUseCase`
+                // derives it from the artifact's own `ArtifactRejected`
+                // event during the load (the `artifacts` projection has
+                // no such column), so the format crate reads a field and
+                // never a stream (ADR 0008).
+                let axis = artifact
+                    .rejection_reason
+                    .as_ref()
+                    .map(RejectionReason::wire_kind);
+                if axis.is_none() {
+                    // The answer stays a refusal naming the subject — a
+                    // caller is never handed a reason that does not
+                    // exist, and never an `unknown` token, which would
+                    // dress an inconsistency up as a verdict. The
+                    // operator is told, because `Rejected` with no
+                    // rejection on the record is an illegal state (ADR
+                    // 0039 D6: the status is a projection, the stream is
+                    // the record).
+                    //
+                    // Two causes reach here and the use-case layer tells
+                    // them apart in its own log: it logs `error!` when it
+                    // read the stream and found no `ArtifactRejected`,
+                    // and `warn!` when the read itself failed or the port
+                    // was unwired. That holds however the row arrived,
+                    // including through the bounded-await poll loop's
+                    // `get_by_id` re-read above, which hydrates like
+                    // every other load path — so a status that flipped to
+                    // `Rejected` inside the wait reaches this arm
+                    // carrying its axis, and an axis-less row here always
+                    // has a line upstream naming which of the two causes
+                    // produced it.
+                    tracing::error!(
+                        artifact_id = %artifact.id,
+                        digest = %format!("sha256:{}", hash.as_ref()),
+                        "refusing a Rejected blob with no rejection axis to report"
+                    );
+                }
+                return OciError::ArtifactRejected {
+                    subject: format!("sha256:{}", hash.as_ref()),
+                    axis,
+                }
+                .into_response();
             }
-            return OciError::ArtifactRejected {
-                subject: format!("sha256:{}", hash.as_ref()),
-                axis,
-            }
-            .into_response();
+            // else: the write-authorized existence probe answers
+            // existence on a terminal verdict too (ADR 0055's 2026-10-21
+            // amendment D2) — the question a pusher asks is whether it
+            // must still send these bytes, and the bytes are here. The
+            // flag requires `head`, so the content GET below is
+            // unreachable with it set and a rejected blob's body is still
+            // served to nobody. The axis is deliberately NOT derived on
+            // this path: the probe's answer is "present", and a writer
+            // never learns the verdict from it.
+            //
+            // The exemption keys on the STATUS and on nothing else. A
+            // `Rejected` row with no `ArtifactRejected` behind it is the
+            // illegal state ADR 0039 D6 names, and it is exactly the
+            // population a pusher collides with — the shared empty
+            // descriptor every signature binds — so a predicate that
+            // required a recoverable axis would miss the rows this
+            // exemption exists for.
         }
-        // Fail closed for EVERY caller, including write-granted (no
-        // HEAD-only probe extension) — issue #92, backlog 057 item 2.
-        // No `Retry-After`: this hold has no self-resolving deadline.
         QuarantineStatus::ScanIndeterminate => {
-            return quarantine::check_scan_indeterminate();
+            if !write_authorized_existence_probe {
+                return quarantine::check_scan_indeterminate();
+            }
+            // else: same probe, same bound as the `Rejected` arm above.
+            // An indeterminate scan is a verdict already reached, so a
+            // probing client dies on it identically and the bytes it
+            // holds are equally already present. `head` is required, so
+            // the content GET stays refused for every caller — including
+            // the write-granted one — with no `Retry-After` (this hold
+            // has no self-resolving deadline).
         }
     }
 
@@ -2751,15 +2810,317 @@ mod tests {
         );
     }
 
-    // -- ScanIndeterminate (issue #92) -------------------------------------
+    // -- The existence probe on a terminal verdict -------------------------
     //
-    // Unlike Quarantined, ScanIndeterminate has NO ADR 0039 probe
-    // exemption: every caller — anonymous, pull-scoped, write-granted —
-    // gets the same 503, on GET and HEAD alike (not even the HEAD-only
-    // existence probe a pusher's pre-flight relies on for Quarantined),
-    // with NO Retry-After (no self-resolving deadline). The state ×
-    // {GET, HEAD} × {anonymous, pull-scoped, write-granted} matrix below
-    // pins that fail-closed-for-everyone shape (backlog 057 item 4).
+    // ADR 0055's 2026-10-21 amendment: a `HEAD` from a principal with
+    // GRANTED Write authority reports existence for `Rejected` and
+    // `ScanIndeterminate` exactly as it already does for `Quarantined`,
+    // because that request asks whether the bytes must still be sent and
+    // not for the bytes. The content `GET` is refused on all three
+    // states for every caller, and so is a `HEAD` without the grant —
+    // the arms below are that matrix, and the last one pins what the
+    // exemption keys on.
+
+    /// The content every arm in this section seeds. Fixed so the probe's
+    /// advertised `Content-Length` and `Docker-Content-Digest` can be
+    /// checked against known values rather than against themselves.
+    const TERMINAL_BLOB_CONTENT: &[u8] = b"terminal verdict bytes";
+
+    fn terminal_blob_hex() -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(TERMINAL_BLOB_CONTENT))
+    }
+
+    /// Drive `serve()` for a blob seeded in `status` and return the whole
+    /// response, so an arm can assert on headers and body rather than on
+    /// the status alone.
+    ///
+    /// `axis` seeds the artifact's **stream** with an `ArtifactRejected`
+    /// carrying that reason; `None` seeds an empty stream — ADR 0039 D6's
+    /// illegal state, and the population this exemption has to reach. The
+    /// fixture entity's `rejection_reason` is never set:
+    /// `MockArtifactRepository` clears it on read exactly as
+    /// `hort-adapters-postgres`'s one `row -> Artifact` mapper does, so
+    /// only `ArtifactUseCase`'s hydration can put it back — which is what
+    /// makes an axis assertion here about the production derivation.
+    ///
+    /// The repo is public (anonymous Read is free) so the `Write` grant is
+    /// the sole discriminator the state gate sees, matching the
+    /// `Quarantined` helpers above.
+    fn terminal_blob_response(
+        status: QuarantineStatus,
+        axis: Option<RejectionReason>,
+        head: bool,
+        actor_claim: Option<&str>,
+    ) -> Response {
+        let hex = terminal_blob_hex();
+        run(async move {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let artifact_id = seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                TERMINAL_BLOB_CONTENT,
+                status,
+            );
+            h.events.set_stream(
+                &hort_domain::events::StreamId::artifact(artifact_id),
+                axis.map(|reason| vec![persisted_artifact_rejected(artifact_id, reason, 1)])
+                    .unwrap_or_default(),
+            );
+            // A `ci-pusher` Write grant always exists in the system;
+            // whether the *caller* carries it is the variable under test.
+            // The hydration wrapper goes outside, so the axis is recovered
+            // through the production read path.
+            let ctx = with_provenance_hold_hydration(&write_grant_ctx(
+                &h.ctx,
+                h.repositories.clone(),
+                "ci-pusher",
+            ));
+            let principal = actor_claim.map(principal_with_claim);
+            serve(
+                ctx,
+                "myrepo",
+                "nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                principal.as_ref(),
+            )
+            .await
+        })
+    }
+
+    /// Common assertions for a probe that reports existence: `200`, the
+    /// normal blob header set, and an empty body.
+    ///
+    /// The header set is the assertion rather than decoration — a pusher
+    /// reads `Content-Length` and `Docker-Content-Digest` off this answer
+    /// to conclude the upload is unnecessary, so a `200` that omitted
+    /// them would satisfy a status-only test and still not answer the
+    /// client's question.
+    async fn assert_probe_reports_exists(resp: Response) {
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_LENGTH)
+                .expect("the probe advertises the size")
+                .to_str()
+                .unwrap(),
+            TERMINAL_BLOB_CONTENT.len().to_string(),
+        );
+        assert_eq!(
+            resp.headers()
+                .get("docker-content-digest")
+                .expect("the probe echoes the canonical digest")
+                .to_str()
+                .unwrap(),
+            format!("sha256:{}", terminal_blob_hex()),
+        );
+        let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+        assert!(
+            body.is_empty(),
+            "the probe reports existence and never bytes"
+        );
+    }
+
+    /// Split a refusal into `(status, parsed body)`.
+    async fn refusal_parts(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// The production breakage, inverted into a pin. An OCI client issues
+    /// `HEAD /v2/<name>/blobs/<digest>` before uploading, to decide
+    /// whether the upload is needed; a `403` is not "absent", so the
+    /// client treats it as a hard failure and the push dies. Against a
+    /// registry holding a rejected row for a content hash every signature
+    /// shares — the `application/vnd.oci.empty.v1+json` empty descriptor
+    /// — every signing run in every repository stops.
+    #[test]
+    fn head_blob_rejected_by_write_authorized_caller_reports_exists() {
+        let resp = terminal_blob_response(
+            QuarantineStatus::Rejected,
+            Some(RejectionReason::Scanner),
+            /* head = */ true,
+            Some("ci-pusher"),
+        );
+        run(assert_probe_reports_exists(resp));
+    }
+
+    /// The bound on the probe: a rejected blob's bytes are served to
+    /// nobody, the write-granted pusher included. `head &&` is the
+    /// predicate's first conjunct for exactly this reason, and the caller
+    /// is still told the axis.
+    #[test]
+    fn get_blob_rejected_by_write_authorized_caller_stays_403_with_the_axis() {
+        let resp = terminal_blob_response(
+            QuarantineStatus::Rejected,
+            Some(RejectionReason::Scanner),
+            /* head = */ false,
+            Some("ci-pusher"),
+        );
+        let (status, parsed) = run(refusal_parts(resp));
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "only the existence probe is released; the content GET stays refused"
+        );
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "scanner");
+    }
+
+    /// Fail closed. A caller whose claim carries no `Write` grant — the
+    /// `resolve_granted_write` denies — gets the unchanged refusal on the
+    /// probe itself: only a definitive granted-Write authorization lifts
+    /// it.
+    #[test]
+    fn head_blob_rejected_without_the_write_grant_stays_403_with_the_axis() {
+        let resp = terminal_blob_response(
+            QuarantineStatus::Rejected,
+            Some(RejectionReason::Scanner),
+            /* head = */ true,
+            Some("some-reader"),
+        );
+        let (status, parsed) = run(refusal_parts(resp));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "scanner");
+    }
+
+    /// Same, anonymous: the probe never leaks a rejected blob's existence
+    /// to a caller with no identity at all, so the transparent-proxy pull
+    /// path is untouched (quarantine invariant #5).
+    #[test]
+    fn head_blob_rejected_anonymous_stays_403_with_the_axis() {
+        let resp = terminal_blob_response(
+            QuarantineStatus::Rejected,
+            Some(RejectionReason::Scanner),
+            /* head = */ true,
+            /* anonymous */ None,
+        );
+        let (status, parsed) = run(refusal_parts(resp));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "scanner");
+    }
+
+    /// `ScanIndeterminate` is the second terminal verdict and answers the
+    /// probe identically — asserted through the same helper as `Rejected`
+    /// so the two cannot drift into different header sets.
+    #[test]
+    fn head_blob_scan_indeterminate_by_write_authorized_caller_reports_exists() {
+        let resp = terminal_blob_response(
+            QuarantineStatus::ScanIndeterminate,
+            /* no axis: this verdict has none */ None,
+            /* head = */ true,
+            Some("ci-pusher"),
+        );
+        run(assert_probe_reports_exists(resp));
+    }
+
+    /// The gate that fires before any of this: a caller the repository
+    /// read gate does not admit never reaches the arm. Now that the arm
+    /// can answer `200`, that ordering is what keeps the probe from
+    /// disclosing a private repository's contents — the answer stays the
+    /// `NAME_UNKNOWN` 404 of ADR 0021 / 0045, neither the probe's `200`
+    /// nor the axis-naming `403`.
+    #[test]
+    fn head_blob_rejected_in_a_repo_the_read_gate_refuses_is_name_unknown() {
+        let hex = terminal_blob_hex();
+        let (status, parsed) = run(async {
+            let h = harness();
+            let mut repo = oci_repo("private-repo");
+            repo.is_public = false;
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                TERMINAL_BLOB_CONTENT,
+                QuarantineStatus::Rejected,
+            );
+            let ctx = crate::test_authz::denied_ctx(&h.ctx, h.repositories.clone());
+            let principal = crate::test_authz::grantless_principal();
+            let resp = serve(
+                ctx,
+                "private-repo",
+                "nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                /* head = */ true,
+                Some(&principal),
+            )
+            .await;
+            refusal_parts(resp).await
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(parsed["errors"][0]["code"], "NAME_UNKNOWN");
+    }
+
+    /// **Counter-assertion.** The exemption keys on `QuarantineStatus`
+    /// and on nothing else — in particular not on a recoverable rejection
+    /// axis.
+    ///
+    /// A `Rejected` row with no `ArtifactRejected` behind it is ADR 0039
+    /// D6's illegal state, and it is not hypothetical: on an affected
+    /// instance the shared empty descriptor every signature binds is
+    /// exactly that row, so it is the population the exemption has to
+    /// reach. An axis-keyed implementation would miss precisely those
+    /// rows and still pass an axis-carrying test.
+    ///
+    /// The `GET` half is in the loop for the same reason, and the axis
+    /// assertion on it is what keeps the loop from being vacuous: it
+    /// proves the two iterations really do seed different streams, so a
+    /// helper that ignored `axis` could not make this test green.
+    #[test]
+    fn the_blob_probe_keys_on_the_status_not_on_a_recoverable_axis() {
+        for axis in [Some(RejectionReason::Scanner), None] {
+            let probe = terminal_blob_response(
+                QuarantineStatus::Rejected,
+                axis.clone(),
+                /* head = */ true,
+                Some("ci-pusher"),
+            );
+            run(assert_probe_reports_exists(probe));
+
+            let refused = terminal_blob_response(
+                QuarantineStatus::Rejected,
+                axis.clone(),
+                /* head = */ false,
+                Some("ci-pusher"),
+            );
+            let (status, parsed) = run(refusal_parts(refused));
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "the content GET stays refused whether or not the axis is recoverable"
+            );
+            assert_eq!(
+                parsed["errors"][0]["detail"].get("axis").is_some(),
+                axis.is_some(),
+                "the refusal's axis must vary with the seeded stream, or this loop \
+                 proves nothing: {parsed}"
+            );
+        }
+    }
+
+    // -- ScanIndeterminate --------------------------------------------------
+    //
+    // Every caller — anonymous, pull-scoped, write-granted — gets the
+    // same 503 on the content GET, with NO Retry-After (no self-resolving
+    // deadline). The one request shape that answers 200 is the
+    // write-authorized `HEAD` existence probe, which an indeterminate
+    // verdict releases exactly as `Quarantined` and `Rejected` do (ADR
+    // 0055's 2026-10-21 amendment). The state × {GET, HEAD} ×
+    // {anonymous, pull-scoped, write-granted} matrix below pins that
+    // shape.
 
     /// Common assertions for every `ScanIndeterminate` response in this
     /// section — mirrors `manifests.rs`'s
@@ -2804,8 +3165,8 @@ mod tests {
                 QuarantineStatus::ScanIndeterminate,
             );
             // `ci-pusher` Write grant wired the same as the Quarantined
-            // suite — a write-granted caller must NOT be exempted here,
-            // unlike Quarantined's HEAD-only existence probe.
+            // suite: the write-granted caller's HEAD is exempted here
+            // too, and the GET is not.
             let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
             serve(
                 ctx,
@@ -2841,12 +3202,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_indeterminate_blob_head_write_granted_still_returns_503() {
-        // The exact case Quarantined WOULD exempt (ADR 0039 §10
-        // write-authorized existence probe) — ScanIndeterminate must not.
+    fn scan_indeterminate_blob_head_write_granted_reports_exists() {
+        // The write-authorized existence probe reaches this verdict too:
+        // the bytes a pusher is about to send are already here, and the
+        // GET above still refuses them. Asserted on the status alone
+        // because the header set is pinned by
+        // `head_blob_scan_indeterminate_by_write_authorized_caller_reports_exists`,
+        // which drives the fixed-content helper.
         let principal = principal_with_claim("ci-pusher");
         let resp = scan_indeterminate_blob_response(/* head = */ true, Some(&principal));
-        run(assert_scan_indeterminate_response(resp));
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]
@@ -2888,11 +3253,12 @@ mod tests {
     }
 
     #[test]
-    fn scan_indeterminate_blob_pull_scoped_cap_with_write_grant_still_returns_503() {
-        // The exact cap-token shape that DOES exempt a Quarantined blob's
-        // HEAD existence probe
+    fn scan_indeterminate_blob_pull_scoped_cap_with_write_grant_reports_exists() {
+        // The cap-token shape that exempts a Quarantined blob's HEAD
+        // existence probe
         // (`head_blob_quarantined_pull_scoped_cap_with_write_grant_reports_exists`)
-        // must NOT exempt ScanIndeterminate.
+        // exempts this verdict's too: the exemption keys on the grants
+        // leg, and a read-only cap does not veto it.
         use hort_domain::entities::rbac::Permission;
         let uid = Uuid::from_u128(0xB5CA2);
         let content = b"scanning".to_vec();
@@ -2931,7 +3297,7 @@ mod tests {
             )
             .await
         });
-        run(assert_scan_indeterminate_response(resp));
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]
@@ -5216,8 +5582,8 @@ mod tests {
         repo_id: Uuid,
     ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-            SeverityThreshold,
+            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
+            ScanPolicyProjection, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
         let now = Utc::now();
@@ -5238,6 +5604,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: now,
             updated_at: now,

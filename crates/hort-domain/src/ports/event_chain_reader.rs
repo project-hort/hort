@@ -38,9 +38,14 @@ use super::BoxFuture;
 /// Outbound port: the reads the offline chain verifier performs.
 ///
 /// Read-only and side-effect-free. `Err` is an *operational* failure
-/// (store unreachable, a row that does not deserialize) — the subcommand
-/// maps it to exit code 1, distinct from a chain-break *verdict* (which
-/// is a value the pure core returns, never an `Err`).
+/// (store unreachable, a chain column of the wrong width) — the
+/// subcommand maps it to exit code 1, distinct from a chain-break
+/// *verdict* (which is a value the pure core returns, never an `Err`).
+///
+/// A payload today's `DomainEvent` can no longer decode is **not** such
+/// a failure: [`ChainRow`] carries `event_data` verbatim and the hash is
+/// recomputed from it, so the integrity question is answerable for every
+/// row the store holds, whatever the current types make of its contents.
 pub trait EventChainReaderPort: Send + Sync {
     /// The distinct stream ids to verify, ordered ascending.
     ///

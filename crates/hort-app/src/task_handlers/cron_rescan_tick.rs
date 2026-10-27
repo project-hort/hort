@@ -271,7 +271,8 @@ mod tests {
     use hort_domain::error::DomainError;
     use hort_domain::events::system_actor;
     use hort_domain::ports::jobs_repository::{
-        JobRow, JobStatus, JobsRepository, KindFields, ListJobsFilter, ListJobsPage, ScanJob,
+        JobRow, JobStatus, JobsRepository, KindFields, ListJobsFilter, ListJobsPage,
+        ResultWriteOutcome, ScanJob,
     };
     use hort_domain::ports::rescan_candidates::{RescanCandidate, RescanCandidatesRepository};
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
@@ -468,20 +469,27 @@ mod tests {
         fn mark_completed<'a>(
             &'a self,
             _id: Uuid,
+            _attempt: u32,
             _result_summary: serde_json::Value,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn reschedule<'a>(
             &'a self,
             _id: Uuid,
+            _attempt: u32,
             _b: std::time::Duration,
             _e: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
-        fn mark_failed<'a>(&'a self, _id: Uuid, _e: &'a str) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        fn mark_failed<'a>(
+            &'a self,
+            _id: Uuid,
+            _attempt: u32,
+            _e: &'a str,
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn enqueue_scan<'a>(
             &'a self,

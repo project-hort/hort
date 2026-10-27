@@ -124,7 +124,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 # ---------- Stage 2: Trivy CLI ----------
 # Digest-pinned (B10/INFRA-7).
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS trivy
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS trivy
 
 # TARGETARCH is auto-populated by buildx from the build `--platform`
 # (amd64 / arm64). Declared here so the RUN below can map it to the
@@ -167,7 +167,7 @@ RUN set -eu && \
 
 # ---------- Stage 3: osv-scanner CLI ----------
 # Digest-pinned (B10/INFRA-7).
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS osv
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS osv
 
 ARG TARGETARCH
 ARG OSV_SCANNER_VERSION
@@ -219,7 +219,7 @@ RUN set -eu && \
 # (the worker process). The worker's tokio runtime does not waitpid
 # on grandchildren; tini does.
 # Digest-pinned (B10/INFRA-7).
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS tini
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS tini
 RUN apt-get update && \
     apt-get install -y --no-install-recommends tini && \
     rm -rf /var/lib/apt/lists/*
@@ -245,7 +245,7 @@ RUN apt-get update && \
 # subprocesses pick up the same bundle via `SSL_CERT_FILE` at
 # spawn-time.
 # Digest-pinned (B10/INFRA-7).
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2 AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e AS runtime
 
 # OCI Image Spec v1.1 labels. The two below are static; CI passes the
 # rest (`source`, `revision`, `version`, `created`) via `--label` on

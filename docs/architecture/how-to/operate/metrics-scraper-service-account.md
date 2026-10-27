@@ -439,7 +439,7 @@ And confirm Prometheus itself is succeeding:
 | `403` with `aud_mismatch` / `AudienceDenied` | The projected token's `audience:` does not match `OidcIssuer.spec.audiences` (or the `aud` you pinned in the FI). |
 | Apply logs an under-constrained-FI `warn` | The FI pins a `repository`/`project_path` claim with no discriminating `ref`/`environment`/`workflow` claim alongside it — any workflow in that repo/project could assume the identity. Add a discriminating claim. Not applicable to the `sub` + `aud` shape in §3.2, which never triggers this warning. |
 | Apply rejected with `wildcard-repo-non-admin` | The grant used a `claims` subject with no `repository`. Use the `serviceAccount` subject form (§3.1). |
-| Rotation never happens (Model A) | The Secret's namespace is not in `worker.rotation.targetNamespaces`, or an existing Secret lacks the `project-hort.de/managed-by=hort-worker` label (ownership collision — hand off explicitly). |
+| Rotation never happens (Model A) | The Secret's namespace is not in `worker.rotation.targetNamespaces`, or the existing Secret is not this SA's to rotate (ownership collision — the worker's `collision_reason` field says which: a missing `project-hort.de/managed-by=hort-worker` label, a `project-hort.de/service-account` label naming another SA, or no owner label at all). |
 
 A `read_metrics` denial logs at `info!` (an audit line, not an
 error) and increments

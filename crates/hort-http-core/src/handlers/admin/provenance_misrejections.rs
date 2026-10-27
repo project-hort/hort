@@ -63,6 +63,10 @@ use crate::error::ApiError;
 pub struct RepairRequestDto {
     /// Narrow the scan to one repository.
     pub repository_id: Option<Uuid>,
+    /// Narrow the scan to one artifact. Supplied together with
+    /// `repository_id` the two are a conjunction, so a mismatched pair
+    /// returns nothing rather than widening to either.
+    pub artifact_id: Option<Uuid>,
     /// How many `Rejected` rows to examine. Clamped by the use case to
     /// its `MAX_SCAN_LIMIT`; the response's `scan_cap_hit` says whether
     /// the bound actually bit.
@@ -111,7 +115,11 @@ pub struct RepairReportDto {
     /// `Rejected` rows examined.
     pub scanned: usize,
     /// The scan filled its limit, so there may be more rows beyond it.
-    /// Re-run (optionally per repository) until this is `false`.
+    ///
+    /// The listing is ordered newest-first with no cursor, so repeating
+    /// the same request returns the same rows — narrow it by
+    /// `repository_id` or `artifact_id` to reach the rest. A dry run in
+    /// particular changes nothing, so it cannot make its own next page.
     pub scan_cap_hit: bool,
     pub affected: Vec<AffectedArtifactDto>,
     pub failed: Vec<RepairFailureDto>,
@@ -150,6 +158,7 @@ pub async fn post_repair_provenance_misrejections(
     let dto = body.map(|axum::Json(b)| b).unwrap_or_default();
     let request = RepairRequest {
         repository_id: dto.repository_id,
+        artifact_id: dto.artifact_id,
         limit: dto.limit.unwrap_or(DEFAULT_SCAN_LIMIT),
         // Absent means dry run — mutation is the explicit opt-in.
         dry_run: dto.dry_run.unwrap_or(true),
@@ -389,6 +398,41 @@ mod tests {
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].repository_id, Some(repo));
         assert_eq!(filters[0].status, Some(QuarantineStatus::Rejected));
+        assert_eq!(filters[0].artifact_id, None);
+    }
+
+    /// The artifact filter reaches the listing too, and alongside the
+    /// repository filter rather than instead of it.
+    ///
+    /// This is the field's whole point: the scan is ordered newest-first
+    /// with no cursor, so an operator who knows which artifact they want
+    /// cannot page towards it and a dry run cannot produce its own next
+    /// page. A field the DTO accepts and the handler drops would be the
+    /// accepted-but-inert operator surface ADR 0015 forbids.
+    #[tokio::test]
+    async fn artifact_id_is_threaded_into_the_listing_filter() {
+        let (router, mocks) = harness();
+        let repo = Uuid::new_v4();
+        let artifact = Uuid::new_v4();
+        let resp = router
+            .oneshot(repair_post(
+                Some(&format!(
+                    r#"{{"repository_id": "{repo}", "artifact_id": "{artifact}"}}"#
+                )),
+                Some(principal_with_claims(&["admin"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let filters = mocks.curation_queue.recorded_filters();
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].artifact_id, Some(artifact));
+        assert_eq!(
+            filters[0].repository_id,
+            Some(repo),
+            "the pair is a conjunction — a mismatched one returns empty \
+             rather than widening to either side"
+        );
     }
 
     /// **Authority.** A caller without `admin` is refused by the

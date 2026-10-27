@@ -59,6 +59,16 @@ use super::BoxFuture;
 ///
 /// The reconciler decides:
 /// - `managed_by != Some("hort-worker")` → collision, refuse to manage.
+/// - `service_account` naming a ServiceAccount other than the one being
+///   rotated → collision: `managed_by` names the *writer* and is
+///   identical on every Secret this deployment writes, so the owner
+///   label is the only thing that tells two ServiceAccounts pointed at
+///   one target Secret apart.
+/// - `service_account` absent while `managed_by` is ours → collision.
+///   [`ManagedSecretSpec::service_account_name`] is non-optional, so
+///   every Secret the reconciler writes carries the owner label; its
+///   absence means a Secret the reconciler did not write, and ownership
+///   cannot be established.
 /// - `last_rotated` older than `rotation_interval` → mint + upsert.
 /// - `last_rotated` absent → mint + upsert (stale by definition).
 /// - `token_id` is informational; carried for audit only.

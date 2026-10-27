@@ -930,6 +930,7 @@ mod tests {
     use hort_domain::ports::event_store::{
         AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
     };
+    use hort_domain::ports::jobs_repository::ResultWriteOutcome;
     use hort_domain::ports::retention_candidate_reader::RetentionCandidateRow;
     use hort_domain::ports::retention_preview::{
         ObservedCardinality, RetentionContentSimulation, SimulationBound,
@@ -2640,24 +2641,27 @@ mod tests {
         fn mark_completed<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _result_summary: serde_json::Value,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn reschedule<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _backoff: std::time::Duration,
             _last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn mark_failed<'a>(
             &'a self,
             _job_id: Uuid,
+            _attempt: u32,
             _last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+            Box::pin(async { Ok(ResultWriteOutcome::Applied) })
         }
         fn enqueue_scan<'a>(
             &'a self,

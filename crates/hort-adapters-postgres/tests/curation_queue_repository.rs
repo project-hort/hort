@@ -113,24 +113,66 @@ async fn seed_artifact(
     id
 }
 
-/// Seed one `scan_findings` row.
+/// Seed one scan: its `scan_findings` rows plus the
+/// `artifacts.last_scan_at` advance, in one transaction.
+///
+/// This is the pairing `PgArtifactLifecycle::commit_scan_result_with_score`
+/// makes in production — the per-finding rows and the `last_scan_at` write
+/// land in the same SQL transaction, bound from the same timestamp the rows
+/// carry as `detected_at`. The queue's findings LATERAL anchors on exactly
+/// that equality, so a seeder that wrote rows without advancing the anchor
+/// would be seeding a state no scan can produce.
+///
+/// `vulnerabilities` is one `(vulnerability_id, severity)` pair per finding.
+/// An empty slice is a **clean scan**: no row is written and the anchor still
+/// advances.
+async fn seed_scan(
+    pool: &PgPool,
+    artifact_id: Uuid,
+    detected_at: DateTime<Utc>,
+    vulnerabilities: &[(&str, &str)],
+) {
+    let scan_id = Uuid::new_v4();
+    let mut tx = pool.begin().await.expect("seed_scan begin");
+    for (vulnerability_id, severity) in vulnerabilities {
+        sqlx::query(
+            r#"INSERT INTO public.scan_findings
+                  (artifact_id, scan_id, purl, vulnerability_id, severity,
+                   source_scanner, title, detected_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+        )
+        .bind(artifact_id)
+        .bind(scan_id)
+        .bind(format!("pkg:test/{}@1.0", artifact_id.simple()))
+        .bind(*vulnerability_id)
+        .bind(*severity)
+        .bind("test-scanner")
+        .bind("integration-test finding")
+        .bind(detected_at)
+        .execute(&mut *tx)
+        .await
+        .expect("seed_scan finding row");
+    }
+    sqlx::query("UPDATE public.artifacts SET last_scan_at = $1 WHERE id = $2")
+        .bind(detected_at)
+        .bind(artifact_id)
+        .execute(&mut *tx)
+        .await
+        .expect("seed_scan last_scan_at");
+    tx.commit().await.expect("seed_scan commit");
+}
+
+/// One scan reporting one finding at `severity`, committed now. The shape
+/// most tests here want; multi-scan histories call [`seed_scan`] directly.
 async fn seed_finding(pool: &PgPool, artifact_id: Uuid, severity: &str) {
-    sqlx::query(
-        r#"INSERT INTO public.scan_findings
-              (artifact_id, scan_id, purl, vulnerability_id, severity,
-               source_scanner, title, detected_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, now())"#,
+    let vuln = format!("CVE-TEST-{}", artifact_id.simple());
+    seed_scan(
+        pool,
+        artifact_id,
+        truncate_us(Utc::now()),
+        &[(vuln.as_str(), severity)],
     )
-    .bind(artifact_id)
-    .bind(Uuid::new_v4())
-    .bind(format!("pkg:test/{}@1.0", artifact_id.simple()))
-    .bind(format!("CVE-TEST-{}", artifact_id.simple()))
-    .bind(severity)
-    .bind("test-scanner")
-    .bind("integration-test finding")
-    .execute(pool)
-    .await
-    .expect("seed_finding");
+    .await;
 }
 
 /// Seed a non-archived repo-scoped policy with the requested
@@ -266,6 +308,7 @@ async fn list_queue_returns_quarantined_artifact_with_findings() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             ..CurationQueueFilter::default()
         })
         .await
@@ -331,6 +374,7 @@ async fn list_queue_status_filter_isolates_rejected() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -373,6 +417,7 @@ async fn list_queue_scan_indeterminate_surfaces() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::ScanIndeterminate),
             ..CurationQueueFilter::default()
         })
@@ -416,6 +461,7 @@ async fn list_queue_limit_clamps_at_500() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             limit: 9999,
             ..CurationQueueFilter::default()
         })
@@ -529,6 +575,7 @@ async fn list_queue_lateral_extracts_rejection_reason_scanner() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -566,6 +613,7 @@ async fn list_queue_lateral_extracts_rejection_reason_curator() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -602,6 +650,7 @@ async fn list_queue_lateral_extracts_rejection_reason_curation_retroactive() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -642,6 +691,7 @@ async fn list_queue_lateral_extracts_rejection_reason_corruption() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -682,6 +732,7 @@ async fn list_queue_filter_by_rejection_reason_kind_corruption() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             rejection_reason_kind: Some("corruption".into()),
             ..CurationQueueFilter::default()
@@ -738,6 +789,7 @@ async fn list_queue_filter_by_rejection_reason_kind_curator() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             // Lowercase wire format — the spec-mandated value the HTTP
             // query param and hort-cli flag accept.
@@ -790,6 +842,7 @@ async fn list_queue_filter_by_rejection_reason_kind_scanner_excludes_curator() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             rejection_reason_kind: Some("scanner".into()),
             ..CurationQueueFilter::default()
@@ -841,6 +894,7 @@ async fn list_queue_filter_by_rejection_reason_kind_curation_retroactive() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             rejection_reason_kind: Some("curation_retroactive".into()),
             ..CurationQueueFilter::default()
@@ -882,6 +936,7 @@ async fn list_queue_rejected_without_event_has_none_rejection_reason_kind() {
     let rows = adapter
         .list_queue(CurationQueueFilter {
             repository_id: Some(repo_id),
+            artifact_id: None,
             status: Some(QuarantineStatus::Rejected),
             ..CurationQueueFilter::default()
         })
@@ -898,4 +953,555 @@ async fn list_queue_rejected_without_event_has_none_rejection_reason_kind() {
     );
 
     cleanup_repo(&pool, repo_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// The queue's finding summary answers about the artifact's LAST scan.
+//
+// `scan_findings` is per-scan history: every run writes under a fresh
+// `scan_id` and nothing removes the previous run's rows. The four tests
+// below pin that the summary is the last run's and not the union, including
+// the two cases that rule out the wrong anchors — a clean last scan (which
+// writes no row, so nothing inside the table can anchor on it) and a second
+// scan reporting a proper subset of the first (which a de-duplicating fix
+// would get wrong while looking right).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_finding_count_is_the_last_scan_not_the_union() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("quarantined"),
+        now - Duration::hours(10),
+        Some(now - Duration::hours(10)),
+    )
+    .await;
+
+    // Three scans. The first two report three findings between them; the
+    // last reports one. The union is four rows; the answer is one.
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(3),
+        &[("CVE-A", "critical"), ("CVE-B", "high")],
+    )
+    .await;
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(2),
+        &[("CVE-C", "high")],
+    )
+    .await;
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(1),
+        &[("CVE-D", "low")],
+    )
+    .await;
+
+    let total: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scan_findings WHERE artifact_id = $1")
+            .bind(artifact)
+            .fetch_one(&pool)
+            .await
+            .expect("count all rows");
+    assert_eq!(total, 4, "the history itself must be intact");
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    let entry = rows
+        .iter()
+        .find(|e| e.artifact_id == artifact)
+        .expect("artifact in queue");
+    assert_eq!(entry.finding_count, 1, "the last scan found one finding");
+    assert_eq!(
+        entry.max_severity,
+        Some(SeverityThreshold::Low),
+        "max_severity is the last scan's highest, not the artifact's \
+         all-time highest (Critical, from the first scan)"
+    );
+
+    // The read removed nothing.
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scan_findings WHERE artifact_id = $1")
+            .bind(artifact)
+            .fetch_one(&pool)
+            .await
+            .expect("count all rows after read");
+    assert_eq!(after, 4);
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_clean_last_scan_reads_as_clean() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("quarantined"),
+        now - Duration::hours(10),
+        Some(now - Duration::hours(10)),
+    )
+    .await;
+
+    // A dirty scan, then a clean one. The clean run writes no row at all,
+    // which is exactly why an anchor taken from inside `scan_findings`
+    // cannot satisfy this: the newest `scan_id` *present* is still the
+    // dirty run's.
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(2),
+        &[("CVE-A", "critical"), ("CVE-B", "high")],
+    )
+    .await;
+    seed_scan(&pool, artifact, now - Duration::hours(1), &[]).await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    let entry = rows
+        .iter()
+        .find(|e| e.artifact_id == artifact)
+        .expect("a clean-last-scan artifact still surfaces in the queue");
+    assert_eq!(entry.finding_count, 0);
+    assert_eq!(entry.max_severity, None);
+
+    // The earlier scan's rows are still there — this unit removes no
+    // history, it only stops reading it as current.
+    let total: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scan_findings WHERE artifact_id = $1")
+            .bind(artifact)
+            .fetch_one(&pool)
+            .await
+            .expect("count all rows");
+    assert_eq!(total, 2);
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_last_scan_subset_is_the_subset_not_the_union() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("quarantined"),
+        now - Duration::hours(10),
+        Some(now - Duration::hours(10)),
+    )
+    .await;
+
+    // The counter-assertion. The second scan reports a PROPER SUBSET of the
+    // first — same vulnerability ids, one of them dropped, and the dropped
+    // one is the severe one. Collapsing the history by de-duplicating
+    // `vulnerability_id` would answer `2` / Critical and look plausible;
+    // the last scan says `1` / High.
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(2),
+        &[("CVE-A", "critical"), ("CVE-B", "high")],
+    )
+    .await;
+    seed_scan(
+        &pool,
+        artifact,
+        now - Duration::hours(1),
+        &[("CVE-B", "high")],
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    let entry = rows
+        .iter()
+        .find(|e| e.artifact_id == artifact)
+        .expect("artifact in queue");
+    assert_eq!(
+        entry.finding_count, 1,
+        "a DISTINCT-shaped fix would answer 2 here"
+    );
+    assert_eq!(entry.max_severity, Some(SeverityThreshold::High));
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_never_scanned_artifact_reads_as_clean() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    // No scan at all: `last_scan_at` is NULL, the anchor matches nothing,
+    // and `COALESCE(f.finding_count, 0)` has to render that as a clean row
+    // rather than dropping the artifact out of the queue.
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("quarantined"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    let entry = rows
+        .iter()
+        .find(|e| e.artifact_id == artifact)
+        .expect("a never-scanned quarantined artifact still surfaces");
+    assert_eq!(entry.finding_count, 0);
+    assert_eq!(entry.max_severity, None);
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// Soft delete — a deleted artifact is not curator work, and takes no slot.
+//
+// The listing lost its liveness predicate when the inert `is_deleted`
+// column was dropped, one day before real soft delete arrived under the
+// name `deleted_at`. A curator acting on a row that is no longer in the
+// catalog is the visible half; the `LIMIT` slot it consumed is the half
+// absence alone cannot show, which is why the second test asserts on a
+// count.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_omits_a_soft_deleted_rejected_artifact() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    let deleted = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("rejected"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+    seed_finding(&pool, deleted, "critical").await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, deleted).await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    assert!(
+        !rows.iter().any(|e| e.artifact_id == deleted),
+        "a soft-deleted artifact is out of the served catalog, so it is \
+         not curator work — the queue must not offer it"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+/// The slot, not just the absence: `limit = 1` with one deleted and one
+/// live row must return the live one.
+///
+/// Deterministic because the predicate makes the deleted row a
+/// non-candidate, leaving one row for `LIMIT 1` — the `ORDER BY
+/// a.created_at DESC` would otherwise have put the deleted row first,
+/// which is exactly how it used to take the slot.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_spends_no_limit_slot_on_a_soft_deleted_artifact() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    // Newest, so `ORDER BY created_at DESC` ranks it first.
+    let deleted = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "2.0",
+        Some("rejected"),
+        now,
+        Some(now),
+    )
+    .await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, deleted).await;
+    let live = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("rejected"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: Some(QuarantineStatus::Rejected),
+            rejection_reason_kind: None,
+            limit: 1,
+        })
+        .await
+        .expect("list_queue");
+
+    assert_eq!(
+        rows.iter().map(|e| e.artifact_id).collect::<Vec<_>>(),
+        vec![live],
+        "the one slot must go to the live artifact, even though the \
+         deleted one sorts first"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+/// The filter excludes deleted rows and nothing else — including on the
+/// `effective_policy_duration` CTE, whose own predicate gained the same
+/// clause. A live artifact must still surface WITH its deadline, which is
+/// what proves the CTE still matched its repository.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_still_returns_a_live_artifact_with_its_deadline() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let _policy = seed_repo_scoped_policy(&pool, repo_id, 3_600).await;
+    let now = truncate_us(Utc::now());
+    let window_start = now - Duration::hours(1);
+    let live = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("quarantined"),
+        window_start,
+        Some(window_start),
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    let entry = rows
+        .iter()
+        .find(|e| e.artifact_id == live)
+        .expect("the liveness predicate must not exclude a live artifact");
+    assert_eq!(
+        entry.quarantine_deadline,
+        Some(window_start + Duration::seconds(3_600)),
+        "the CTE must still resolve this repository's duration — a \
+         liveness predicate that shadowed the whole CTE would leave the \
+         deadline NULL"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// `artifact_id` — the artifact-scoping filter.
+//
+// A conjunction with `repository_id`, not an alternative: the mismatched
+// pair returns empty rather than widening to either side.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_artifact_id_narrows_to_exactly_that_artifact() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = truncate_us(Utc::now());
+    let wanted = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("rejected"),
+        now - Duration::hours(2),
+        Some(now - Duration::hours(2)),
+    )
+    .await;
+    let other = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "2.0",
+        Some("rejected"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let scoped = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: None,
+            artifact_id: Some(wanted),
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+    assert_eq!(
+        scoped.iter().map(|e| e.artifact_id).collect::<Vec<_>>(),
+        vec![wanted]
+    );
+
+    // `None` behaves as before: both rows, newest first.
+    let unscoped = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            artifact_id: None,
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+    assert_eq!(
+        unscoped.iter().map(|e| e.artifact_id).collect::<Vec<_>>(),
+        vec![other, wanted],
+        "an absent artifact_id must not narrow anything"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_artifact_id_and_a_mismatched_repository_id_return_empty() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let other_repo = seed_repo(&pool, "pypi").await;
+    let now = truncate_us(Utc::now());
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.0",
+        Some("rejected"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(other_repo),
+            artifact_id: Some(artifact),
+            status: None,
+            rejection_reason_kind: None,
+            limit: 100,
+        })
+        .await
+        .expect("list_queue");
+
+    assert!(
+        rows.is_empty(),
+        "the two filters are a conjunction: a mismatched pair returns \
+         empty, with no precedence rule and no silent widening to either \
+         side"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+    cleanup_repo(&pool, other_repo).await;
 }

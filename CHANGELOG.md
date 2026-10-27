@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-26
+
+### Added
+
+- **An OCI image manifest is scanned as a composed image**, fetching layers a
+  pull-through repository does not already hold. Under
+  `compositeVerdictMode: promoted` the composition's verdict gates the
+  manifest, and an individual layer stops being withheld for its own package
+  findings or for a container hort cannot decode; worker scratch disk and
+  upstream egress rise either way (#353).
+
+### Fixed
+
+- **Soft-deleted artifacts no longer appear as work.** A deleted artifact is
+  gone from the curation queue and the patch-candidate listing, and consumes
+  no rescan batch capacity; the provenance-misrejection repair additionally
+  accepts an `artifact_id` to scope a run to one artifact (#359).
+- **Three findings surfaces now report the artifact's last scan rather than
+  every scan it ever had.** The curation queue's `finding_count` /
+  `max_severity`, the patch-candidate listing (and the order it ranks by), and
+  the retention evaluator's findings read all fall once an artifact has been
+  rescanned; a vulnerability a later scan no longer reports drives no
+  retention expiry, and a released predecessor whose last scan found nothing
+  stops being offered as a patch target. No scan history is removed (#360).
+- **The provenance-misrejection repair reaches a rejection no signature can
+  ever contradict.** `POST /api/v1/admin/quarantine/provenance-misrejections/repair`
+  now also returns an artifact whose only provenance verdict is an unsigned
+  rejection to the hold, which unblocks signature pushes that a stranded
+  `application/vnd.oci.empty.v1+json` descriptor was refusing; a repaired
+  artifact that nothing has verified holds rather than releasing, and a
+  present-but-invalid signature stays rejected (#359).
+- **The discovery versions endpoint admits a service-account caller.** A CI
+  job holding the `read` grant can classify a withheld version through
+  `GET /api/v1/repositories/{repo_key}/discovery/versions/{package}` instead
+  of being refused for its token kind; personal access tokens stay refused
+  (#358).
+- **An OCI push no longer fails against a rejected blob or manifest.** The
+  pre-upload `HEAD` a pusher issues reports existence to a caller with granted
+  Write; the content `GET` stays refused for everyone (#357).
+
+### Security
+
+- **The event-chain verifier judges a run against every anchored checkpoint,
+  not only the newest.** `hort-server verify-event-chain` can now exit `2`
+  where it previously exited `0` or `3` (#352).
+- **Three audit fixes on the gitops and job paths:** a service account can no
+  longer rotate over a Secret another one owns, and apply rejects two
+  `ServiceAccount` envelopes sharing one `fallbackRotation.targetSecret`; a
+  gitops apply drops every exclusion row it was told to drop, not only one per
+  CVE and package pattern; and a worker whose job the abandoned-lease sweep
+  handed on can no longer overwrite the worker now running it (#355).
+- **Dependency security advisories:** RUSTSEC-2026-0381, -0382, -0383 and
+  -0385 upgraded away, along with the patched instance of -0387; -0387's
+  remaining instance has no patched release and is accepted on hort's
+  verify-only path, where no signing key is held (#356).
+- **`hort-server verify-event-chain` no longer reports tampering on untouched
+  rows**, and now detects a payload key that matches no event field. No stored
+  `event_hash` changes (#272).
+
 ## [0.15.0] - 2026-10-18
 
 ### Added

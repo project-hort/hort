@@ -183,7 +183,10 @@ authorization decision keeps the two-leg AND.
 - **Terminal verdicts.** `Rejected` and `ScanIndeterminate` are decisions, not
   holds. `HeldVisibility::admits` matches exhaustively over `QuarantineStatus`
   with no wildcard arm, so a future variant is a compile error at the truth
-  table rather than a silent inheritance of either answer.
+  table rather than a silent inheritance of either answer. *(Amended
+  2026-10-21: this continues to govern every resolution document. The
+  pre-upload existence probe is not one — see the amendment at the end of this
+  ADR.)*
 - **Aggregated reads.** The rule says a writer may resolve held metadata
   *there* — in the repository it may write. A virtual repository holds no
   artifacts of its own (ADR 0031); its entries belong to members. A Write grant
@@ -284,3 +287,117 @@ the same registry.
   hand-written predicates. A third call site should reuse both rather than
   re-deriving the reasoning; a site that needs a *different* answer needs a new
   decision, not a new flag on this one.
+
+## Amendment, 2026-10-21 — the pre-upload existence probe is not a resolution
+
+**Status:** Accepted. Amends *The rule* qualifier 3 and the *Scope* bullet
+"Terminal verdicts". Everything else in this ADR stands unchanged.
+
+### Why an amendment and not a new ADR
+
+The *Consequences* above say a site that needs a *different* answer needs a
+new decision. This is not a different answer at a site; it is the same answer
+to a question this ADR did not separate out. The rule's direction is
+unchanged — held bytes never leave quarantine, and a terminal verdict stays
+unresolvable in every resolution document, for everyone. What changes is that
+one request shape is recognised as asking something other than resolution.
+
+### What went wrong, measured
+
+Since #342 a terminally rejected artifact answers `403 DENIED` with its axis
+on the OCI blob and manifest routes, replacing a `404 BLOB_UNKNOWN` that was
+indistinguishable from "no such blob". That is the right answer to a reader
+and is not in question.
+
+It is also the answer a **pusher** receives. An OCI client issues
+`HEAD /v2/<name>/blobs/<digest>` before uploading, to decide whether the
+upload is needed; `403` is not "absent", so the client treats it as a hard
+failure and the push dies. Against a registry whose instance holds a rejected
+row for a content hash every signature shares — the
+`application/vnd.oci.empty.v1+json` empty descriptor is the field case — every
+signing run in every repository stops. Before #342 the same probe answered
+`404`, the client uploaded, and the upload deduplicated onto the existing row.
+
+### D1 — resolution and deduplication are different questions
+
+Qualifier 3 ("held") governs **resolution**: *which version exists, and what
+do its bytes hash to?* A resolution document that answers it is a promise —
+cargo, npm and an OCI client treat a listed version as installable and will
+select it. A terminal verdict therefore stays absent from every such document,
+for every caller, the publisher included. Unchanged.
+
+A pre-upload existence probe asks the opposite: *must I still send these
+bytes?* The caller already holds them. The answer leads to no download, grants
+no resolution, and advertises nothing: the `GET` on the same route continues
+to refuse, with its axis, for every caller.
+
+### D2 — the probe answers existence on terminal verdicts too
+
+A `HEAD` from a principal with **granted** write authority on the repository
+(`resolve_granted_write`, the grants leg alone — qualifier 1 is unchanged)
+reports existence for `Rejected` and `ScanIndeterminate` exactly as it already
+does for `Quarantined`.
+
+Bounded to what the probe is:
+
+- `HEAD` only. On the manifest route the `Quarantined` exemption deliberately
+  also serves the `GET`; that extension is **not** carried to terminal
+  verdicts. A rejected artifact's body is never served to anyone.
+- The content `GET` is untouched on both routes, for every caller.
+- A caller without the Write grant, and a caller the repository read gate does
+  not admit, are untouched.
+- Fail closed: only a definitive `resolve_granted_write` lifts the refusal; a
+  denied or errored resolve keeps it.
+- Resolution documents are untouched. `HeldVisibility` continues to answer
+  `false` for both terminal statuses, with no wildcard arm.
+
+### D3 — the probe is not the control that protects the invariant
+
+**Corrected 2026-10-21, before this amendment shipped.** An earlier draft of
+this section argued that the refusal protected nothing, because a client that
+does not probe would upload blind and the manifest `PUT` would accept the
+reference anyway. That is false about the tree and the implementation found
+it: `resolve_referenced_blobs`
+(`crates/hort-http-oci/src/manifests_write.rs`) applies
+`quarantine_status.is_terminal()` to the row the port returns, counts the
+digest as missing, and the mint answers `400 MANIFEST_BLOB_UNKNOWN`. The port
+call is unfiltered; the caller is not. That filter arrived in the same change
+as the 403 (#342, `17f3c924`), and three green tests pin it.
+
+The corrected argument is narrower and holds:
+
+**The invariant has an owner, and it is not the probe.** "An edge must never
+name a blob the repository cannot deliver" is ADR 0062's decision, enforced at
+mint. It stays, and this amendment does not touch it. The probe's refusal is
+therefore not a second line of that defence — it is an answer to a question
+nobody asked, costing a writer its run without being the thing that keeps an
+undeliverable manifest out of the registry.
+
+So the probe is corrected because it answers wrongly, not because the registry
+needs it to answer differently in order to stay consistent.
+
+This is the same shape as the exemption's founding case, one status over. The
+*Context* above records it: *"Without an exemption the signature can never be
+produced and the artifact expires `Rejected{Unsigned}` — the hold makes its
+own precondition unreachable."* Here the rejection does what the hold did.
+
+### D4 — diagnosability is unchanged, and it was never the gap
+
+A reader is told why. The direct request names the axis (#342), the discovery
+surface carries a per-version status including `Rejected`
+(`DiscoveryVersionStatus`), and the event stream carries the verdict. The
+amendment adds no information to any of them and removes none: the writer
+learns "present", never "rejected".
+
+### D5 — what this amendment does not restore
+
+A push that probes no longer dies at the probe. It dies at the mint instead,
+on the ADR 0062 rule above, for as long as the referenced row stays terminal.
+
+That is the correct behaviour for a manifest that genuinely binds an
+undeliverable blob — and it is the wrong outcome for the field case that
+prompted this amendment, where the terminal row is a two-byte
+`application/vnd.oci.empty.v1+json` descriptor condemned as `Unsigned` by a
+policy timeout. ADR 0039 D1 already says such a rejection may never be
+terminal. **The repair therefore belongs on that row, not on this rule**, and
+nothing in this amendment should be read as relaxing the mint-time check.

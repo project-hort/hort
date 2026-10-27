@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use hort_adapters_scanner_trivy::{TrivyAdapter, TrivyConfig};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::{ScanTarget, ScannerPort};
+use hort_domain::ports::scanner::{ScanTarget, ScanUnit, ScannerPort};
 use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ByteRange, ContentHash};
@@ -131,7 +131,7 @@ async fn trivy_scan_timeout_kills_hung_child_within_configured_window() {
     let hash = placeholder_hash();
     let coords = jar_coords();
     let target = ScanTarget {
-        content_hash: &hash,
+        unit: ScanUnit::Blob(&hash),
         format: "maven",
         coords: &coords,
         kind: ArtifactKind::MavenJar,

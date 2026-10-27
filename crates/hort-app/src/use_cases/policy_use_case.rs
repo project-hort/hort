@@ -21,6 +21,7 @@
 //! successful projection write followed by a failing append would let a
 //! row claim a `stream_version` that was never persisted.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -30,8 +31,8 @@ use hort_domain::entities::artifact::{
     Artifact, CurationClearance, ProvenanceClearance, QuarantineStatus,
 };
 use hort_domain::entities::scan_policy::{
-    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-    SeverityThreshold, SignerIdentityPattern,
+    CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
+    ScanPolicyProjection, SeverityThreshold, SignerIdentityPattern,
 };
 use hort_domain::error::DomainError;
 use hort_domain::events::{
@@ -44,6 +45,7 @@ use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
+use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::storage::StoragePort;
@@ -60,6 +62,7 @@ use crate::metrics::{
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::release_clearance;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
+use crate::use_cases::scan_kind_resolution::scan_kind_of;
 use crate::use_cases::{rejected_reevaluation, scan_history, ArtifactAtVersion, OverCapStream};
 
 // ---------------------------------------------------------------------------
@@ -113,6 +116,13 @@ pub struct CreatePolicyCommand {
     /// pipeline validates the wire value via
     /// `hort_config::scan_policy::validate_scan_policy`.
     pub enforcement: ScanEnforcement,
+    /// Whether a composed OCI image's scan verdict decides its
+    /// manifest's release (ADR 0064 D6). Default
+    /// [`CompositeVerdictMode::Observed`]; enforced by the scan
+    /// orchestrator's composite path. `Promoted` with an empty
+    /// `scan_backends` is rejected at gitops apply, since a waived scan
+    /// resolves no composition for the promotion to act on.
+    pub composite_verdict_mode: CompositeVerdictMode,
 }
 
 /// A field-level update directive for [`PolicyUseCase::update_policy`].
@@ -172,6 +182,16 @@ pub struct UpdatePolicyCommand {
     /// `FieldChange::Unchanged`, and a change in EITHER direction is
     /// gate-affecting (it enqueues an ADR 0041 re-evaluation pass).
     pub enforcement: FieldChange<ScanEnforcement>,
+    /// Operator-driven promotion (or demotion) of the composed-image
+    /// verdict's release authority. Both variants are meaningful values
+    /// distinct from `FieldChange::Unchanged`, and — unlike
+    /// [`enforcement`](Self::enforcement) — a change in **neither**
+    /// direction is gate-affecting: the re-evaluation pass re-derives
+    /// from stored findings, so demoting would un-reject a population a
+    /// promoted composite had correctly rejected with no fresh
+    /// assessment. Recovering the estate either way is the operator's
+    /// own curation re-evaluation (ADR 0064 D6).
+    pub composite_verdict_mode: FieldChange<CompositeVerdictMode>,
 }
 
 impl UpdatePolicyCommand {
@@ -195,6 +215,7 @@ impl UpdatePolicyCommand {
             rescan_interval_hours: FieldChange::Unchanged,
             negligible_action: FieldChange::Unchanged,
             enforcement: FieldChange::Unchanged,
+            composite_verdict_mode: FieldChange::Unchanged,
         }
     }
 }
@@ -287,6 +308,23 @@ pub struct PolicyUseCase {
     /// re-enqueues; fail-safe in the loosen direction, and the operator's
     /// tighten is recoverable by re-applying).
     jobs: Arc<dyn JobsRepository>,
+    /// Compiled-in format handlers, keyed by format string — the same
+    /// registry the scan orchestrator holds, wired from the same
+    /// composition-root map.
+    ///
+    /// Both directions of the re-evaluation pass need the artifact's
+    /// [`ArtifactKind`](hort_domain::types::ArtifactKind), because it is
+    /// the role half of ADR 0064 D2's line
+    /// and therefore an input to the verdict they recompute
+    /// ([`hort_domain::types::Finding::may_condemn_artifact`]). A
+    /// *constructor* dependency and not an optional one: the kind decides
+    /// whether a stored filesystem finding gates the row it was found on,
+    /// so a registry a composition root could forget to supply would make
+    /// "no handler, therefore `Other`" a release-authority answer this
+    /// use case gave itself. The resolution goes through
+    /// [`scan_kind_of`] so this pass and the scan run cannot answer
+    /// differently about one row.
+    handlers: HashMap<String, Arc<dyn FormatHandler>>,
 }
 
 impl PolicyUseCase {
@@ -300,6 +338,7 @@ impl PolicyUseCase {
         repository_access: Arc<RepositoryAccessUseCase>,
         curation_rules: Arc<dyn CurationRuleRepository>,
         jobs: Arc<dyn JobsRepository>,
+        handlers: HashMap<String, Arc<dyn FormatHandler>>,
     ) -> Self {
         Self {
             events,
@@ -310,6 +349,7 @@ impl PolicyUseCase {
             repository_access,
             curation_rules,
             jobs,
+            handlers,
         }
     }
 
@@ -455,6 +495,7 @@ impl PolicyUseCase {
             rescan_interval_hours: cmd.rescan_interval_hours,
             negligible_action: cmd.negligible_action,
             enforcement: cmd.enforcement,
+            composite_verdict_mode: cmd.composite_verdict_mode,
             stream_version: result.stream_position,
             created_at: now,
             updated_at: now,
@@ -709,6 +750,29 @@ impl PolicyUseCase {
                     serde_json::Value::String(new_enforcement.to_string()),
                 ));
                 projection.enforcement = *new_enforcement;
+            }
+        }
+
+        // Same-value skip; the `previous_value` / `new_value` payloads are
+        // the lowercase `CompositeVerdictMode` wire strings (mirrors
+        // `ScanEnforcement`). Deliberately **not** gate-affecting in
+        // either direction (ADR 0064 D6): the re-evaluation pass
+        // re-derives verdicts from stored findings, so demoting a
+        // promoted policy that way would un-reject the population its
+        // composite verdicts had correctly rejected, with no fresh
+        // assessment — the hazard that disqualified shipping the
+        // composite verdict under `ScanEnforcement::Record` at all.
+        // Promoting changes which analysis the *next* scan's verdict
+        // comes from, and that analysis has to run.
+        if let FieldChange::Set(new_mode) = &cmd.composite_verdict_mode {
+            if *new_mode != projection.composite_verdict_mode {
+                events.push(field_event(
+                    policy_id,
+                    PolicyField::CompositeVerdictMode,
+                    serde_json::Value::String(projection.composite_verdict_mode.to_string()),
+                    serde_json::Value::String(new_mode.to_string()),
+                ));
+                projection.composite_verdict_mode = *new_mode;
             }
         }
 
@@ -1573,14 +1637,27 @@ impl PolicyUseCase {
             name_as_published: paired.artifact().name_as_published.clone(),
             version: paired.artifact().version.clone(),
             path: paired.artifact().path.clone(),
-            format,
+            format: format.clone(),
             metadata: serde_json::Value::Null,
         };
+        // The role half of ADR 0064 D2's line, off the format just
+        // resolved and through the registry the scan run uses — never
+        // re-derived from `artifact.path`, which would be a second copy of
+        // `FormatHandler::scan_kind` deciding which rows are constituents.
+        let kind = scan_kind_of(&self.handlers, &format.to_string(), paired.artifact());
 
         // Both directions read ONE verdict source: `evaluate_scan_result`
         // over the stored findings under the bumped policy (invariant #2 —
         // loosen and tighten cannot diverge).
-        let outcome = evaluate_scan_result(&coords, &findings, Some(policy), exclusions, now);
+        //
+        // The posture is **resolved** from the bumped policy, inside
+        // `evaluate_scan_result`, exactly as a fresh scan resolves it —
+        // and that is what closes ADR 0064 D2's trapdoor rather than
+        // merely tolerating it. Pinning `Observed` here (as the loosen
+        // direction does, for D6's reason) would re-reject every
+        // constituent a promoted policy had just let through, on the next
+        // threshold change, terminally.
+        let outcome = evaluate_scan_result(&coords, kind, &findings, Some(policy), exclusions, now);
         let previous_status = paired.artifact().quarantine_status;
 
         match paired
@@ -1770,11 +1847,48 @@ impl PolicyUseCase {
                 }
             };
 
+        // The role half of ADR 0064 D2's line. The loosen pass has no
+        // other reason to read the repository row, so this is a read the
+        // kind alone pays for — the alternative is handing the verdict
+        // function a value nobody resolved, which the pinned posture below
+        // would make *look* harmless right up until something unpinned it.
+        let format = match self
+            .repository_access
+            .repository_format(paired.artifact().repository_id)
+            .await
+        {
+            Ok(f) => f.unwrap_or(hort_domain::entities::repository::RepositoryFormat::Generic),
+            Err(e) => {
+                tracing::error!(
+                    artifact_id = %artifact_id,
+                    policy_id = %policy_id,
+                    trigger = ?trigger,
+                    error = %e,
+                    "re-evaluation (loosen): failed to resolve repository format; \
+                     skipping artifact",
+                );
+                return;
+            }
+        };
+        let kind = scan_kind_of(&self.handlers, &format.to_string(), paired.artifact());
+
         let derivation = match rejected_reevaluation::derive_rejected_outcome(
             &paired,
             &self.storage,
             Some(policy),
             updated_exclusions,
+            kind,
+            // **Pinned, not resolved** (ADR 0064 D6). This is the
+            // automatic pass: an exclusion added, a threshold raised, a
+            // policy archived. D6 reserves recovery of the
+            // already-rejected estate to the operator — "constituents
+            // already terminally rejected on filesystem findings are not
+            // un-rejected automatically" — and a resolved posture here
+            // would release exactly that population as a side effect of
+            // an unrelated loosening, with no fresh assessment behind it.
+            // The curator's explicit re-evaluation passes the resolved
+            // posture instead, which is the sanctioned recovery.
+            CompositeVerdictMode::Observed,
             now,
         )
         .await
@@ -2432,6 +2546,7 @@ fn build_config_snapshot(cmd: &CreatePolicyCommand) -> serde_json::Value {
         "rescan_interval_hours": cmd.rescan_interval_hours,
         "negligible_action": cmd.negligible_action.to_string(),
         "enforcement": cmd.enforcement.to_string(),
+        "composite_verdict_mode": cmd.composite_verdict_mode.to_string(),
     })
 }
 
@@ -2503,6 +2618,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
         }
     }
 
@@ -2527,6 +2643,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version,
             created_at: now,
             updated_at: now,
@@ -2550,7 +2667,7 @@ mod tests {
         /// `ScanCompleted` on the artifact stream before the pass
         /// reads it. Default is empty (existing tests do not
         /// `read_stream`).
-        seeded_streams: Mutex<std::collections::HashMap<StreamId, Vec<PersistedEvent>>>,
+        seeded_streams: Mutex<HashMap<StreamId, Vec<PersistedEvent>>>,
         /// When `Some`, the NEXT `read_stream` call returns this error
         /// (consumed on fire). Used to exercise the re-evaluation pass's
         /// infrastructure-error skip branches (ADR 0041).
@@ -2566,7 +2683,7 @@ mod tests {
         /// models a concurrent append landing immediately after the
         /// `ArtifactAtVersion` pairing read. Seeded via
         /// [`set_stream_after_next_read`](Self::set_stream_after_next_read).
-        stream_after_next_read: Mutex<std::collections::HashMap<StreamId, Vec<PersistedEvent>>>,
+        stream_after_next_read: Mutex<HashMap<StreamId, Vec<PersistedEvent>>>,
     }
 
     enum DomainResultAppend {
@@ -2770,14 +2887,14 @@ mod tests {
     // -- MockPolicyProjectionRepository --------------------------------------
 
     struct MockPolicyProjections {
-        by_id: Mutex<std::collections::HashMap<Uuid, ScanPolicyProjection>>,
-        by_name: Mutex<std::collections::HashMap<String, ScanPolicyProjection>>,
+        by_id: Mutex<HashMap<Uuid, ScanPolicyProjection>>,
+        by_name: Mutex<HashMap<String, ScanPolicyProjection>>,
         upserts: Mutex<Vec<ScanPolicyProjection>>,
         next_upsert_error: Mutex<Option<DomainError>>,
         // Exclusion-side state — inert by default so 14a-2 tests are
         // unaffected. Per-policy bucket lets one mock back tests for
         // multiple policies if needed.
-        exclusions: Mutex<std::collections::HashMap<Uuid, Vec<ExclusionProjection>>>,
+        exclusions: Mutex<HashMap<Uuid, Vec<ExclusionProjection>>>,
         exclusion_upserts: Mutex<Vec<ExclusionProjection>>,
         exclusion_deletes: Mutex<Vec<Uuid>>,
         next_upsert_exclusion_error: Mutex<Option<DomainError>>,
@@ -3041,6 +3158,7 @@ mod tests {
             repository_access,
             curation_rules,
             jobs,
+            HashMap::new(),
         );
         (uc, events, projections)
     }
@@ -3073,6 +3191,7 @@ mod tests {
             default_repository_access(),
             curation_rules,
             jobs.clone(),
+            HashMap::new(),
         );
         (uc, events, projections, jobs)
     }
@@ -3121,6 +3240,7 @@ mod tests {
             default_repository_access(),
             curation_rules,
             jobs,
+            HashMap::new(),
         );
         (uc, events, projections, artifacts, lifecycle)
     }
@@ -3166,6 +3286,7 @@ mod tests {
             repository_access,
             curation_rules.clone(),
             jobs,
+            HashMap::new(),
         );
         (
             uc,
@@ -3210,8 +3331,332 @@ mod tests {
             default_repository_access(),
             curation_rules,
             jobs,
+            HashMap::new(),
         );
         (uc, events, projections, artifacts, lifecycle, storage)
+    }
+
+    /// A [`FormatHandler`] that answers `scan_kind` with a fixed value, so
+    /// the re-evaluation pass can be shown resolving the row's role
+    /// through the registry it was wired with rather than assuming one.
+    /// Mirrors `FixedKindHandler` in the orchestrator's tests.
+    struct FixedKindHandler {
+        key: &'static str,
+        kind: hort_domain::types::ArtifactKind,
+    }
+
+    impl FormatHandler for FixedKindHandler {
+        fn format_key(&self) -> &str {
+            self.key
+        }
+        fn parse_download_path(
+            &self,
+            _path: &str,
+        ) -> hort_domain::error::DomainResult<ArtifactCoords> {
+            Err(DomainError::Validation("not used by these tests".into()))
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_string()
+        }
+        fn scan_kind(
+            &self,
+            _artifact: &hort_domain::entities::artifact::Artifact,
+        ) -> hort_domain::types::ArtifactKind {
+            self.kind
+        }
+    }
+
+    /// [`make_full_re_eval_harness`] with `repo_id` seeded as an **OCI**
+    /// repository and a registry whose `"oci"` handler reports
+    /// `ArtifactKind::OciBlob` — a composition constituent.
+    ///
+    /// This is the wiring the ADR 0064 D2 tests need end to end: the pass
+    /// resolves the repository's format, looks the handler up under
+    /// `RepositoryFormat::to_string()`, and asks it for the kind. A
+    /// harness that handed the kind in directly would prove the domain
+    /// rule and nothing about whether this use case can reach it.
+    #[allow(clippy::type_complexity)]
+    fn make_constituent_re_eval_harness(
+        repo_id: Uuid,
+    ) -> (
+        PolicyUseCase,
+        Arc<MockEventStore>,
+        Arc<MockPolicyProjections>,
+        Arc<crate::use_cases::test_support::MockArtifactRepository>,
+        Arc<crate::use_cases::test_support::MockArtifactLifecycle>,
+        Arc<crate::use_cases::test_support::MockStoragePort>,
+    ) {
+        use crate::use_cases::repository_access::RbacAccess;
+
+        let events = Arc::new(MockEventStore::new());
+        let projections = Arc::new(MockPolicyProjections::new());
+        let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
+        let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
+            artifacts.clone(),
+        ));
+        let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
+        let curation_rules =
+            Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new());
+        let jobs = Arc::new(crate::use_cases::test_support::MockJobsRepository::default());
+
+        let repos = Arc::new(crate::use_cases::test_support::MockRepositoryRepository::new());
+        let mut repo = crate::use_cases::test_support::sample_repository();
+        repo.id = repo_id;
+        repo.format = hort_domain::entities::repository::RepositoryFormat::Oci;
+        repos.insert(repo);
+        let repository_access = Arc::new(RepositoryAccessUseCase::new(
+            repos,
+            RbacAccess::Disabled,
+            true,
+        ));
+
+        let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+        handlers.insert(
+            "oci".to_string(),
+            Arc::new(FixedKindHandler {
+                key: "oci",
+                kind: hort_domain::types::ArtifactKind::OciBlob,
+            }),
+        );
+
+        let uc = PolicyUseCase::new(
+            crate::event_store_publisher::wrap_for_test(events.clone()),
+            projections.clone(),
+            artifacts.clone(),
+            lifecycle.clone(),
+            storage.clone(),
+            repository_access,
+            curation_rules,
+            jobs,
+            handlers,
+        );
+        (uc, events, projections, artifacts, lifecycle, storage)
+    }
+
+    /// A stored finding as the Trivy adapter produces it from a
+    /// `Vulnerabilities` entry — a claim about the filesystem the
+    /// materialised bytes compose into. It **persists**, so this is what
+    /// the pass reads back out of the findings blob.
+    fn sample_filesystem_finding(vuln: &str, sev: SeverityThreshold) -> Finding {
+        let mut f = sample_finding(vuln, sev);
+        f.statement = hort_domain::types::FindingStatement::Filesystem;
+        f
+    }
+
+    /// **The trapdoor, closed at the layer that fell through it.** A
+    /// constituent an operator's promoted policy released is not
+    /// re-rejected when that operator then *lowers* the threshold and the
+    /// tighten walk re-derives the verdict over its stored findings.
+    ///
+    /// Asserted through `run_policy_re_evaluation_pass` rather than over
+    /// the pure evaluator, because the defect was never in the rule — it
+    /// was that this pass could not see the statement. Everything the
+    /// close depends on is exercised here: the finding round-trips through
+    /// the blob `seed_active_with_findings` writes, the pass resolves the
+    /// repository's format and asks the registry for the row's kind, and
+    /// `evaluate_scan_result` resolves the posture from the bumped policy
+    /// instead of pinning it.
+    ///
+    /// `ScanPolicyRetroactive → Rejected` is revisited by no rescan, so a
+    /// re-hold here is terminal — which is why this is the test that has
+    /// to be unmissable.
+    #[tokio::test]
+    async fn run_pass_tighten_does_not_re_reject_a_promoted_constituent() {
+        let repo_id = Uuid::new_v4();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_constituent_re_eval_harness(repo_id);
+        let policy_id = Uuid::new_v4();
+
+        // The operator lowers the threshold to High under a promoted
+        // composite verdict — the mutation that used to spring the trap.
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        p.composite_verdict_mode = CompositeVerdictMode::Promoted;
+        projections.insert(p);
+
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+        let findings = vec![sample_filesystem_finding(
+            "CVE-2024-LAYER",
+            SeverityThreshold::Critical,
+        )];
+        seed_active_with_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            &findings,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "a layer the promoted policy released must not be terminally \
+             re-rejected by a threshold change over the same stored \
+             findings: {:?}",
+            lifecycle.committed_transitions(),
+        );
+    }
+
+    /// The counter-case that says the test above is not vacuous: the
+    /// identical pass, the identical stored findings, the identical
+    /// lowered threshold — and the **default** posture re-holds the row.
+    /// The tighten walk is doing real work; what changed is only that it
+    /// can now read what the finding is about.
+    #[tokio::test]
+    async fn run_pass_tighten_still_re_holds_an_unpromoted_constituent() {
+        let repo_id = Uuid::new_v4();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_constituent_re_eval_harness(repo_id);
+        let policy_id = Uuid::new_v4();
+
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        p.composite_verdict_mode = CompositeVerdictMode::Observed;
+        projections.insert(p);
+
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+        let findings = vec![sample_filesystem_finding(
+            "CVE-2024-LAYER",
+            SeverityThreshold::Critical,
+        )];
+        seed_active_with_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            &findings,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "an unpromoted constituent gates on its own filesystem findings \
+             exactly as it did before ADR 0064 D2"
+        );
+        assert_eq!(
+            transitions[0].0.quarantine_status,
+            QuarantineStatus::Rejected
+        );
+    }
+
+    /// Seed a `Rejected` artifact whose stored `ScanCompleted` references a
+    /// real per-finding blob in CAS, followed by the
+    /// `ArtifactRejected(Scanner)` the loosen direction's eligibility guard
+    /// re-derives its axis from. The loosen counterpart of
+    /// [`seed_active_with_findings`]; `seed_rejected_with_scan` seeds no
+    /// blob and so exercises the aggregate-summary fallback instead, which
+    /// cannot narrow anything.
+    fn seed_rejected_with_findings(
+        artifacts: &Arc<crate::use_cases::test_support::MockArtifactRepository>,
+        events: &Arc<MockEventStore>,
+        storage: &Arc<crate::use_cases::test_support::MockStoragePort>,
+        repo_id: Uuid,
+        findings: &[Finding],
+    ) -> Uuid {
+        let artifact = rejected_artifact_for_repo(repo_id, "oci-layer");
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+
+        let bytes = serde_json::to_vec(findings).unwrap();
+        let hash_hex = hex::encode(Sha256::digest(&bytes));
+        let blob_hash: ContentHash = hash_hex.parse().unwrap();
+        storage.insert_content(blob_hash.clone(), bytes);
+
+        let scan = PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: StreamId::artifact(artifact_id),
+            stream_position: 0,
+            global_position: 0,
+            event: DomainEvent::ScanCompleted(ScanCompleted {
+                artifact_id,
+                scanner: "trivy".into(),
+                finding_count: findings.len() as u32,
+                severity_summary: SeveritySummary {
+                    critical: findings
+                        .iter()
+                        .filter(|f| f.severity == SeverityThreshold::Critical)
+                        .count() as u32,
+                    high: 0,
+                    medium: 0,
+                    low: 0,
+                    negligible: 0,
+                },
+                findings_blob: Some(blob_hash),
+                assessment: ScanAssessment::Analysed,
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: api_actor(),
+            event_version: 1,
+            stored_at: Utc::now(),
+        };
+        events.seed_stream(
+            StreamId::artifact(artifact_id),
+            vec![
+                scan,
+                persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 1),
+            ],
+        );
+        artifact_id
+    }
+
+    /// **ADR 0064 D6's half of the asymmetry, at the layer that chooses
+    /// it.** A constituent already terminally rejected on its own
+    /// filesystem findings is *not* released by the automatic loosening
+    /// pass, even under a policy that has promoted the composite verdict.
+    ///
+    /// This pins the call site, not the rule: the finding now persists and
+    /// the kind resolves, so the predicate *would* withhold authority here
+    /// — what holds the row is that this pass passes
+    /// `CompositeVerdictMode::Observed` rather than the resolved posture.
+    /// Swap that literal for `composite_verdict_mode_of(…)` and the whole
+    /// already-rejected estate is released by the next unrelated exclusion
+    /// add, with no fresh assessment behind it; nothing else in the suite
+    /// would notice.
+    ///
+    /// Recovery of this row is the operator's, through the curation
+    /// re-evaluation, which passes the resolved posture — asserted in
+    /// `hort_domain::policy::re_evaluation`'s
+    /// `the_operators_curation_re_evaluation_can_recover_the_same_row`.
+    #[tokio::test]
+    async fn run_pass_loosen_does_not_release_a_rejected_constituent_under_promotion() {
+        let repo_id = Uuid::new_v4();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_constituent_re_eval_harness(repo_id);
+        let policy_id = Uuid::new_v4();
+
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        p.composite_verdict_mode = CompositeVerdictMode::Promoted;
+        projections.insert(p);
+
+        let findings = vec![sample_filesystem_finding(
+            "CVE-2024-LAYER",
+            SeverityThreshold::Critical,
+        )];
+        seed_rejected_with_findings(&artifacts, &events, &storage, repo_id, &findings);
+        artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+        artifacts.seed_active_for_policy(policy_id, vec![]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "promotion must not un-reject a terminal constituent by itself \
+             (ADR 0064 D6): {:?}",
+            lifecycle.committed_transitions(),
+        );
     }
 
     /// ADR 0041 Item 3: `add_exclusion` no longer runs the re-evaluation
@@ -3435,6 +3880,42 @@ mod tests {
             projection.negligible_action.to_string()
         );
         assert_eq!(snapshot["enforcement"], projection.enforcement.to_string());
+        assert_eq!(
+            snapshot["composite_verdict_mode"],
+            projection.composite_verdict_mode.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_policy_with_a_promoted_composite_verdict_projects_promoted() {
+        let (uc, _events, projections) = make_use_case();
+        let mut cmd = sample_create_command("promoted-policy");
+        cmd.composite_verdict_mode = CompositeVerdictMode::Promoted;
+
+        let policy_id = uc.create_policy(cmd, api_actor()).await.unwrap();
+
+        let projection = projections.find_by_id(policy_id).await.unwrap().unwrap();
+        assert_eq!(
+            projection.composite_verdict_mode,
+            CompositeVerdictMode::Promoted
+        );
+    }
+
+    #[tokio::test]
+    async fn create_policy_defaults_the_composite_verdict_to_observed() {
+        // The posture promotion is granted *from*. A created policy that
+        // says nothing about the composite verdict must not gate on it.
+        let (uc, _events, projections) = make_use_case();
+        let cmd = sample_create_command("default-policy");
+        assert_eq!(cmd.composite_verdict_mode, CompositeVerdictMode::Observed);
+
+        let policy_id = uc.create_policy(cmd, api_actor()).await.unwrap();
+
+        let projection = projections.find_by_id(policy_id).await.unwrap().unwrap();
+        assert_eq!(
+            projection.composite_verdict_mode,
+            CompositeVerdictMode::Observed
+        );
     }
 
     // -- update_policy -------------------------------------------------------
@@ -4032,6 +4513,7 @@ mod tests {
             default_repository_access(),
             curation_rules,
             jobs,
+            HashMap::new(),
         );
 
         let err = uc
@@ -5586,7 +6068,7 @@ mod tests {
             {
                 continue;
             }
-            let labels: std::collections::HashMap<&str, &str> =
+            let labels: HashMap<&str, &str> =
                 key.key().labels().map(|l| (l.key(), l.value())).collect();
             let decision = labels.get("decision").copied().unwrap_or("").to_string();
             let repository = labels.get("repository").copied().unwrap_or("").to_string();
@@ -5959,6 +6441,7 @@ mod tests {
             informational_class: None,
             severity_basis: hort_domain::types::SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
+            statement: hort_domain::types::FindingStatement::Unstated,
         }
     }
 
@@ -6746,6 +7229,87 @@ mod tests {
         );
     }
 
+    /// The `FieldChange::Set` branch emits exactly one
+    /// `PolicyField::CompositeVerdictMode` event carrying the lowercase
+    /// wire strings, mutates the upserted projection, and — unlike
+    /// `enforcement` — enqueues **no** re-evaluation pass in either
+    /// direction (ADR 0064 D6: that pass re-derives from stored
+    /// findings, so demoting that way would un-reject the population a
+    /// promoted composite had correctly rejected with nothing fresh
+    /// having looked at it).
+    #[tokio::test]
+    async fn update_policy_set_composite_verdict_mode_emits_one_event_and_enqueues_nothing() {
+        for (from, to) in [
+            (
+                CompositeVerdictMode::Observed,
+                CompositeVerdictMode::Promoted,
+            ),
+            (
+                CompositeVerdictMode::Promoted,
+                CompositeVerdictMode::Observed,
+            ),
+        ] {
+            let (uc, events, projections, jobs) = make_use_case_with_jobs();
+            let id = Uuid::new_v4();
+            let mut p = sample_projection(id, 3);
+            p.composite_verdict_mode = from;
+            projections.insert(p);
+
+            let mut cmd = UpdatePolicyCommand::new(id);
+            cmd.composite_verdict_mode = FieldChange::Set(to);
+            uc.update_policy(cmd, api_actor()).await.unwrap();
+
+            let batches = events.appended_batches();
+            assert_eq!(batches.len(), 1, "{from} -> {to}: single atomic batch");
+            assert_eq!(batches[0].events.len(), 1, "{from} -> {to}: one event");
+            match &batches[0].events[0].event {
+                DomainEvent::PolicyUpdated(u) => {
+                    assert_eq!(u.field, PolicyField::CompositeVerdictMode);
+                    assert_eq!(
+                        u.previous_value,
+                        serde_json::Value::String(from.to_string())
+                    );
+                    assert_eq!(u.new_value, serde_json::Value::String(to.to_string()));
+                }
+                other => panic!("expected PolicyUpdated, got {other:?}"),
+            }
+            assert_eq!(
+                projections.upserts().last().unwrap().composite_verdict_mode,
+                to,
+                "{from} -> {to}: the projection reflects the new posture"
+            );
+            assert!(
+                jobs.enqueue_calls()
+                    .iter()
+                    .all(|(kind, _, _)| kind != "policy-reevaluation"),
+                "{from} -> {to}: a composite-verdict change must enqueue no \
+                 re-evaluation pass",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_policy_set_composite_verdict_mode_to_same_value_yields_zero_events() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let p = sample_projection(id, 0);
+        assert_eq!(p.composite_verdict_mode, CompositeVerdictMode::Observed);
+        projections.insert(p);
+        let baseline_upserts = projections.upserts().len();
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.composite_verdict_mode = FieldChange::Set(CompositeVerdictMode::Observed);
+
+        uc.update_policy(cmd, api_actor()).await.unwrap();
+
+        assert!(events.appended_batches().is_empty(), "no event on no-op");
+        assert_eq!(
+            projections.upserts().len(),
+            baseline_upserts,
+            "no new upsert on no-op"
+        );
+    }
+
     /// A same-value (no-op) `update_policy` emits zero events AND enqueues
     /// no re-evaluation.
     #[tokio::test]
@@ -7154,6 +7718,7 @@ mod tests {
             default_repository_access(),
             curation_rules,
             jobs,
+            HashMap::new(),
         );
         (uc, events, projections, artifacts, lifecycle, storage)
     }

@@ -50,7 +50,7 @@ the result instead.
 | curve25519-dalek | 4.1.3 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek |
 | sha1_smol | 1.0.1 | BSD-3-Clause | https://github.com/mitsuhiko/sha1-smol |
 | encoding_rs | 0.8.35 | BSD-3-Clause | https://github.com/hsivonen/encoding_rs |
-| webpki-roots | 1.0.7 | CDLA-Permissive-2.0 | https://github.com/rustls/webpki-roots |
+| webpki-roots | 1.0.10 | CDLA-Permissive-2.0 | https://github.com/rustls/webpki-roots |
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
 | untrusted | 0.7.1 | ISC | https://github.com/briansmith/untrusted |
@@ -70,7 +70,7 @@ the result instead.
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
 | simple_asn1 | 0.6.4 | ISC | https://github.com/acw/simple_asn1 |
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
-| rustls-webpki | 0.103.15 | ISC | https://github.com/rustls/webpki |
+| rustls-webpki | 0.103.16 | ISC | https://github.com/rustls/webpki |
 | aws-lc-rs | 1.18.2 | ISC | https://github.com/aws/aws-lc-rs |
 | aws-lc-sys | 0.46.0 | ISC | https://github.com/aws/aws-lc-rs |
 | dotenvy | 0.15.7 | MIT | https://github.com/allan2/dotenvy |
@@ -112,7 +112,7 @@ the result instead.
 | regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
 | regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.28.0 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.29.0 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
@@ -184,7 +184,7 @@ the result instead.
 | fnv | 1.0.7 | MIT | https://github.com/servo/rust-fnv |
 | stable_deref_trait | 1.2.1 | MIT | https://github.com/storyyeller/stable_deref_trait |
 | stringprep | 0.1.5 | MIT | https://github.com/sfackler/rust-stringprep |
-| arc-swap | 1.9.2 | MIT | https://github.com/vorner/arc-swap |
+| arc-swap | 1.9.3 | MIT | https://github.com/vorner/arc-swap |
 | bytes-utils | 0.1.4 | MIT | https://github.com/vorner/bytes-utils |
 | h2 | 0.4.16 | MIT | https://github.com/hyperium/h2 |
 | http | 1.5.0 | MIT | https://github.com/hyperium/http |
@@ -288,7 +288,7 @@ the result instead.
 | pem-rfc7468 | 1.0.0 | MIT | https://github.com/RustCrypto/formats |
 | crypto-common | 0.2.2 | MIT | https://github.com/RustCrypto/traits |
 | argon2 | 0.6.0 | MIT | https://github.com/RustCrypto/password-hashes |
-| crypto-bigint | 0.7.5 | MIT | https://github.com/RustCrypto/crypto-bigint |
+| crypto-bigint | 0.7.6 | MIT | https://github.com/RustCrypto/crypto-bigint |
 | phc | 0.6.1 | MIT | https://github.com/RustCrypto/formats |
 | scrypt | 0.12.0 | MIT | https://github.com/RustCrypto/password-hashes |
 | sec1 | 0.8.1 | MIT | https://github.com/RustCrypto/formats |
@@ -306,7 +306,7 @@ the result instead.
 | system-configuration-sys | 0.6.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | system-configuration | 0.7.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | primefield | 0.14.0 | MIT | https://github.com/RustCrypto/elliptic-curves |
-| ctutils | 0.4.2 | MIT | https://github.com/RustCrypto/utils |
+| ctutils | 0.4.5 | MIT | https://github.com/RustCrypto/utils |
 | wnaf | 0.14.1 | MIT | https://github.com/RustCrypto/elliptic-curves |
 | annotate-snippets | 0.12.16 | MIT | https://github.com/rust-lang/annotate-snippets-rs |
 | anstream | 1.0.0 | MIT | https://github.com/rust-cli/anstyle.git |
@@ -353,7 +353,7 @@ the result instead.
 | crc-fast | 1.10.0 | MIT | https://github.com/awesomized/crc-fast-rust |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
-| lru | 0.18.5 | MIT | https://github.com/jeromefroe/lru-rs.git |
+| lru | 0.19.0 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | atoi | 2.0.0 | MIT | https://github.com/pacman82/atoi-rs |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
 | darling_core | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -409,7 +409,7 @@ the result instead.
 | windows_x86_64_gnu | 0.53.1 | MIT | https://github.com/microsoft/windows-rs |
 | tokio-stream | 0.1.19 | MIT | https://github.com/tokio-rs/tokio |
 | tokio-util | 0.7.20 | MIT | https://github.com/tokio-rs/tokio |
-| tokio | 1.53.3 | MIT | https://github.com/tokio-rs/tokio |
+| tokio | 1.54.1 | MIT | https://github.com/tokio-rs/tokio |
 | simd-adler32 | 0.3.9 | MIT | https://github.com/mcountryman/simd-adler32 |
 | miniz_oxide | 0.9.1 | MIT | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
 | miniz_oxide | 0.9.1 | MIT | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
@@ -469,7 +469,7 @@ the result instead.
 | thiserror-impl | 2.0.21 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 2.0.21 | MIT | https://github.com/dtolnay/thiserror |
-| typed-path | 0.12.3 | MIT | https://github.com/chipsenkbeil/typed-path |
+| typed-path | 0.13.0 | MIT | https://github.com/chipsenkbeil/typed-path |
 | unicode-ident | 1.0.24 | MIT | https://github.com/dtolnay/unicode-ident |
 | zmij | 1.0.21 | MIT | https://github.com/dtolnay/zmij |
 | allocator-api2 | 0.2.21 | MIT | https://github.com/zakarumych/allocator-api2 |
@@ -478,7 +478,7 @@ the result instead.
 | spin | 0.10.1 | MIT | https://github.com/mvdnes/spin-rs.git |
 | spin | 0.9.9 | MIT | https://github.com/mvdnes/spin-rs.git |
 | tracing-core | 0.1.36 | MIT | https://github.com/tokio-rs/tracing |
-| zip | 9.0.3 | MIT | https://github.com/zip-rs/zip2 |
+| zip | 9.1.1 | MIT | https://github.com/zip-rs/zip2 |
 | typenum | 1.20.0 | MIT | https://github.com/paholg/typenum |
 | endian-type | 0.1.2 | MIT | https://github.com/Lolirofle/endian-type.git |
 | base64 | 0.21.7 | MIT | https://github.com/marshallpierce/rust-base64 |
@@ -502,7 +502,7 @@ the result instead.
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
 | jsonwebtoken | 11.1.0 | MIT | https://github.com/Keats/jsonwebtoken |
 | aws-lc-sys | 0.46.0 | MIT | https://github.com/aws/aws-lc-rs |
-| webbrowser | 1.2.4 | MIT | https://github.com/amodm/webbrowser-rs |
+| webbrowser | 1.2.5 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | derive_more | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | hdrhistogram | 7.5.4 | MIT | https://github.com/HdrHistogram/HdrHistogram_rust.git |
@@ -4687,7 +4687,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
-### webpki-roots 1.0.7 — CDLA-Permissive-2.0
+### webpki-roots 1.0.10 — CDLA-Permissive-2.0
 
 Repository: https://github.com/rustls/webpki-roots
 
@@ -5339,7 +5339,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 ```
 
-### rustls-webpki 0.103.15 — ISC
+### rustls-webpki 0.103.16 — ISC
 
 Repository: https://github.com/rustls/webpki
 
@@ -6686,7 +6686,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.28.0 — MIT
+### uuid 1.29.0 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
@@ -9006,7 +9006,7 @@ SOFTWARE.
 
 ```
 
-### arc-swap 1.9.2 — MIT
+### arc-swap 1.9.3 — MIT
 
 Repository: https://github.com/vorner/arc-swap
 
@@ -12392,7 +12392,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### crypto-bigint 0.7.5 — MIT
+### crypto-bigint 0.7.6 — MIT
 
 Repository: https://github.com/RustCrypto/crypto-bigint
 
@@ -12964,7 +12964,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### ctutils 0.4.2 — MIT
+### ctutils 0.4.5 — MIT
 
 Repository: https://github.com/RustCrypto/utils
 
@@ -14265,7 +14265,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### lru 0.18.5 — MIT
+### lru 0.19.0 — MIT
 
 Repository: https://github.com/jeromefroe/lru-rs.git
 
@@ -15796,7 +15796,7 @@ SOFTWARE.
 
 ```
 
-### tokio 1.53.3 — MIT
+### tokio 1.54.1 — MIT
 
 Repository: https://github.com/tokio-rs/tokio
 
@@ -17610,7 +17610,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### typed-path 0.12.3 — MIT
+### typed-path 0.13.0 — MIT
 
 Repository: https://github.com/chipsenkbeil/typed-path
 
@@ -17858,7 +17858,7 @@ SOFTWARE.
 
 ```
 
-### zip 9.0.3 — MIT
+### zip 9.1.1 — MIT
 
 Repository: https://github.com/zip-rs/zip2
 
@@ -18556,7 +18556,7 @@ SOFTWARE.
 
 ```
 
-### webbrowser 1.2.4 — MIT
+### webbrowser 1.2.5 — MIT
 
 Repository: https://github.com/amodm/webbrowser-rs
 

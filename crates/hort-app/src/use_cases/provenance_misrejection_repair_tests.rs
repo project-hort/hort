@@ -15,7 +15,12 @@ use super::*;
 
 use chrono::{DateTime, Duration};
 use hort_domain::entities::artifact::Artifact;
+use hort_domain::entities::scan_policy::{
+    CompositeVerdictMode, NegligibleAction, ScanEnforcement, ScanPolicyProjection,
+    SeverityThreshold,
+};
 use hort_domain::error::DomainError;
+use hort_domain::events::PolicyScope;
 use hort_domain::events::{
     ArtifactQuarantined, PersistedEvent, ProvenanceRejected, ProvenanceVerified, RejectionReason,
     StreamId,
@@ -111,7 +116,15 @@ fn verified(artifact_id: Uuid, position: u64) -> PersistedEvent {
     )
 }
 
-fn provenance_rejected(artifact_id: Uuid, position: u64) -> PersistedEvent {
+/// A `ProvenanceRejected` carrying `reason`. The reason is a parameter
+/// because conjunct 3's second arm keys on exactly it: `Unsigned` is the
+/// one verdict ADR 0039 D1 forbids from being terminal, every other
+/// reason is a positive disproof that may be.
+fn provenance_rejected(
+    artifact_id: Uuid,
+    position: u64,
+    reason: ProvenanceRejectReason,
+) -> PersistedEvent {
     persisted(
         artifact_id,
         position,
@@ -119,7 +132,24 @@ fn provenance_rejected(artifact_id: Uuid, position: u64) -> PersistedEvent {
             artifact_id,
             content_hash: VALID_SHA256.parse::<ContentHash>().unwrap(),
             backend: "cosign".into(),
-            reason: ProvenanceRejectReason::UntrustedIdentity,
+            reason,
+        }),
+    )
+}
+
+/// The `backend = "(policy)"` shape the pre-D1 `Required`-mode policy
+/// mapping wrote: an `Unsigned` rejection that no verifier produced, with
+/// no `ArtifactRejected` companion because the provenance axis did not
+/// append one yet. This is the stranded population's actual stream.
+fn policy_unsigned_rejected(artifact_id: Uuid, position: u64) -> PersistedEvent {
+    persisted(
+        artifact_id,
+        position,
+        DomainEvent::ProvenanceRejected(ProvenanceRejected {
+            artifact_id,
+            content_hash: VALID_SHA256.parse::<ContentHash>().unwrap(),
+            backend: "(policy)".into(),
+            reason: ProvenanceRejectReason::Unsigned,
         }),
     )
 }
@@ -166,6 +196,62 @@ fn seed_stranded(f: &Fixture) -> (Artifact, CurationQueueEntry) {
             verified(id, 2),
         ]
     })
+}
+
+/// The **second** stranded population: `Rejected`, no `ArtifactRejected`
+/// on the stream, **no `ProvenanceVerified` and none ever coming**, and
+/// one `ProvenanceRejected{Unsigned}` from the removed policy mapping.
+/// The measured shape of the six rows a cosign signature's own
+/// `application/vnd.oci.empty.v1+json` config left behind.
+fn seed_never_terminal(f: &Fixture) -> (Artifact, CurationQueueEntry) {
+    seed(f, QuarantineStatus::Rejected, |id, anchor| {
+        vec![
+            quarantined(id, 0, anchor),
+            persisted_scan_completed(id, 0, 1),
+            policy_unsigned_rejected(id, 2),
+        ]
+    })
+}
+
+/// A policy projection repository holding one `provenance_mode:
+/// required` policy scoped to `repository_id`.
+///
+/// Needed wherever a test asserts what the **sweep** does with a
+/// repaired artifact: the sweep resolves the provenance leg from the
+/// live policy, and an empty projection repository resolves to the
+/// default `VerifyIfPresent` ⇒ `NotRequired`, which clears the timer arm
+/// for any artifact at all. Only a `Required` repository asks the
+/// question "is this artifact verified?", so only a `Required`
+/// repository can show the hold.
+///
+/// `quarantine_duration_secs: 0` keeps the observation window elapsed on
+/// the two-hour-old anchor [`seed`] uses, so the candidate is past its
+/// deadline exactly as the real sweep's candidacy filter requires.
+fn required_provenance_projections(repository_id: Uuid) -> Arc<MockPolicyProjectionRepository> {
+    let projections = Arc::new(MockPolicyProjectionRepository::new());
+    projections.insert(ScanPolicyProjection {
+        policy_id: Uuid::new_v4(),
+        name: format!("required-provenance-{}", Uuid::new_v4()),
+        scope: PolicyScope::Repository(repository_id),
+        severity_threshold: SeverityThreshold::Critical,
+        quarantine_duration_secs: 0,
+        require_approval: false,
+        provenance_mode: ProvenanceMode::Required,
+        provenance_backends: vec!["cosign".to_string()],
+        provenance_identities: Vec::new(),
+        max_artifact_age_secs: None,
+        license_policy: serde_json::Value::Null,
+        archived: false,
+        scan_backends: vec!["trivy".to_string()],
+        rescan_interval_hours: 24,
+        negligible_action: NegligibleAction::Ignore,
+        enforcement: ScanEnforcement::Reject,
+        composite_verdict_mode: CompositeVerdictMode::Observed,
+        stream_version: 0,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    projections
 }
 
 fn repair_request(dry_run: bool) -> RepairRequest {
@@ -244,12 +330,21 @@ async fn repairs_the_stranded_state_by_event_and_the_ordinary_sweep_then_release
     // stream already carries the `ProvenanceVerified` the release gate
     // resolves `Cleared` from, plus the clean scan that is the ADR 0007
     // release authority.
+    //
+    // The repository is seeded `provenance_mode: required` so the
+    // release genuinely comes from `Cleared`. Without the policy the
+    // sweep resolves the default `VerifyIfPresent` ⇒ `NotRequired`,
+    // which clears the timer arm for any artifact whatever its stream
+    // says — so the `ProvenanceVerified` would be doing no work here and
+    // this assertion would hold with it deleted. It is also what makes
+    // this the exact contrast to the never-terminal arm's hold: same
+    // repository mode, different provenance evidence, opposite outcome.
     let quarantine_uc = QuarantineUseCase::new(
         f.artifacts.clone(),
         crate::event_store_publisher::wrap_for_test(f.events.clone()),
         Arc::new(MockArtifactLifecycle::new(f.artifacts.clone())),
         Arc::new(MockRepositoryRepository::new()),
-        Arc::new(MockPolicyProjectionRepository::new()),
+        required_provenance_projections(artifact.repository_id),
         Arc::new(MockContentReferenceIndex::new()),
         Arc::new(MockStoragePort::new()),
         Arc::new(MockJobsRepository::new()),
@@ -279,6 +374,7 @@ async fn scan_asks_the_listing_for_rejected_rows_only() {
         f.uc.run(
             RepairRequest {
                 repository_id: Some(repo),
+                artifact_id: None,
                 limit: 5_000,
                 dry_run: true,
             },
@@ -294,6 +390,40 @@ async fn scan_asks_the_listing_for_rejected_rows_only() {
     assert_eq!(
         filters[0].limit, MAX_SCAN_LIMIT,
         "an over-large limit is clamped, never passed through"
+    );
+    assert_eq!(filters[0].artifact_id, None);
+}
+
+/// `artifact_id` reaches the listing. The scan has no cursor, so this is
+/// the only way an operator gets past the newest page at all — a field
+/// accepted here and dropped on the way to the listing would be the
+/// accepted-but-inert surface ADR 0015 forbids one layer up.
+#[tokio::test]
+async fn an_artifact_scoped_request_narrows_the_listing_to_that_artifact() {
+    let f = build();
+    let artifact = Uuid::new_v4();
+    let repo = Uuid::new_v4();
+    let _ =
+        f.uc.run(
+            RepairRequest {
+                repository_id: Some(repo),
+                artifact_id: Some(artifact),
+                limit: 100,
+                dry_run: true,
+            },
+            api_actor(),
+        )
+        .await
+        .expect("Ok");
+    let filters = f.queue.recorded_filters();
+    assert_eq!(filters.len(), 1);
+    assert_eq!(filters[0].artifact_id, Some(artifact));
+    assert_eq!(
+        filters[0].repository_id,
+        Some(repo),
+        "the two are a conjunction: naming an artifact does not drop the \
+         repository filter, so a mismatched pair returns empty rather \
+         than widening to either"
     );
 }
 
@@ -379,7 +509,7 @@ async fn leaves_a_disproof_rejected_artifact_untouched() {
     let (artifact, entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
         vec![
             quarantined(id, 0, anchor),
-            provenance_rejected(id, 1),
+            provenance_rejected(id, 1, ProvenanceRejectReason::UntrustedIdentity),
             persisted_artifact_rejected(id, RejectionReason::Provenance, 2),
         ]
     });
@@ -411,7 +541,7 @@ async fn leaves_a_disproof_rejected_artifact_untouched_even_with_a_verified_even
         vec![
             quarantined(id, 0, anchor),
             verified(id, 1),
-            provenance_rejected(id, 2),
+            provenance_rejected(id, 2, ProvenanceRejectReason::UntrustedIdentity),
             persisted_artifact_rejected(id, RejectionReason::Provenance, 3),
         ]
     });
@@ -567,10 +697,12 @@ async fn leaves_a_never_signed_held_artifact_untouched() {
     );
 }
 
-/// **A `Rejected` artifact with no terminal event and no
-/// `ProvenanceVerified`.** The shape that passes conjunct 2 but fails
-/// conjunct 3: nothing on its stream contradicts the rejection, so
-/// repairing it would release an artifact that really was never signed.
+/// **A `Rejected` artifact with no terminal event and no provenance
+/// verdict at all.** The shape that passes conjunct 2 but fails both
+/// arms of conjunct 3: no `ProvenanceVerified` contradicts the
+/// rejection, and no `ProvenanceRejected` is there to be classified
+/// never-terminal either — so nothing establishes that this rejection
+/// came from the provenance axis in the first place.
 #[tokio::test]
 async fn leaves_a_rejection_with_no_contradicting_evidence_untouched() {
     let f = build();
@@ -585,7 +717,7 @@ async fn leaves_a_rejection_with_no_contradicting_evidence_untouched() {
     let report = f.uc.run(repair_request(false), api_actor()).await.unwrap();
     assert!(
         report.affected.is_empty(),
-        "without a ProvenanceVerified there is no contradiction to act on"
+        "with no provenance evidence either way there is nothing to act on"
     );
     assert!(f.lifecycle.committed_transitions().is_empty());
     assert_eq!(
@@ -622,7 +754,7 @@ async fn a_mixed_batch_repairs_only_the_stranded_artifact() {
     let (_, disproof) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
         vec![
             quarantined(id, 0, anchor),
-            provenance_rejected(id, 1),
+            provenance_rejected(id, 1, ProvenanceRejectReason::UntrustedIdentity),
             persisted_artifact_rejected(id, RejectionReason::Provenance, 2),
         ]
     });
@@ -632,24 +764,34 @@ async fn a_mixed_batch_repairs_only_the_stranded_artifact() {
             persisted_artifact_rejected(id, RejectionReason::Scanner, 1),
         ]
     });
-    let (_, unsigned) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
+    // A `Rejected` row whose stream carries no provenance verdict at
+    // all — neither proof is present, so it is left alone.
+    let (_, no_verdict) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
         vec![quarantined(id, 0, anchor)]
     });
-    f.queue
-        .set_entries(vec![disproof, stranded_entry, scan, unsigned]);
+    // ...and the second repairable population, in the same batch.
+    let (never_terminal, never_terminal_entry) = seed_never_terminal(&f);
+    f.queue.set_entries(vec![
+        disproof,
+        stranded_entry,
+        scan,
+        no_verdict,
+        never_terminal_entry,
+    ]);
 
     let report = f.uc.run(repair_request(false), api_actor()).await.unwrap();
 
-    assert_eq!(report.scanned, 4);
+    assert_eq!(report.scanned, 5);
     assert_eq!(
         report
             .affected
             .iter()
             .map(|a| a.artifact_id)
             .collect::<Vec<_>>(),
-        vec![stranded.id]
+        vec![stranded.id, never_terminal.id],
+        "both arms of conjunct 3 are reached in one pass, and nothing else is"
     );
-    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
+    assert_eq!(f.lifecycle.committed_transitions().len(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -673,6 +815,7 @@ async fn a_full_listing_reports_the_scan_cap() {
         f.uc.run(
             RepairRequest {
                 repository_id: None,
+                artifact_id: None,
                 limit: 2,
                 dry_run: true,
             },
@@ -687,6 +830,7 @@ async fn a_full_listing_reports_the_scan_cap() {
         f.uc.run(
             RepairRequest {
                 repository_id: None,
+                artifact_id: None,
                 limit: 3,
                 dry_run: true,
             },
@@ -705,6 +849,7 @@ async fn a_zero_limit_is_clamped_to_one() {
         f.uc.run(
             RepairRequest {
                 repository_id: None,
+                artifact_id: None,
                 limit: 0,
                 dry_run: true,
             },
@@ -891,4 +1036,371 @@ fn the_request_default_is_a_dry_run() {
     assert!(r.dry_run);
     assert_eq!(r.limit, DEFAULT_SCAN_LIMIT);
     assert_eq!(r.repository_id, None);
+}
+
+// ---------------------------------------------------------------------------
+// Conjunct 3's second arm — a verdict that may never be terminal
+// ---------------------------------------------------------------------------
+
+/// **The second stranded population, end to end.** `Rejected` with no
+/// `ArtifactRejected`, no `ProvenanceVerified`, and one
+/// `ProvenanceRejected{Unsigned}`: repaired to `Quarantined` on its
+/// original anchor, on the strength of the reason alone.
+///
+/// And then — the half that makes the arm safe — **the ordinary sweep
+/// holds it.** It does not release (no `ProvenanceVerified`, so the
+/// provenance leg of a `Required` repository's release gate resolves
+/// `Pending`, which denies the timer arm) and it does not re-reject
+/// (`Unsigned` has no producer left, and an unsigned verify is
+/// `NoAttestation`, which `complete_provenance` answers with no events at
+/// all). That hold is ADR 0039 D1's prescribed treatment of an unsigned
+/// artifact, and it is what the repair hands the decision back to.
+#[tokio::test]
+async fn repairs_a_never_terminal_rejection_and_the_ordinary_sweep_then_holds_it() {
+    let f = build();
+    let (artifact, entry) = seed_never_terminal(&f);
+    let anchor = artifact.quarantine_window_start.unwrap();
+    f.queue.set_entries(vec![entry]);
+
+    let report = f.uc.run(repair_request(false), api_actor()).await.unwrap();
+
+    assert_eq!(report.scanned, 1);
+    assert_eq!(
+        report
+            .affected
+            .iter()
+            .map(|a| a.artifact_id)
+            .collect::<Vec<_>>(),
+        vec![artifact.id],
+        "an Unsigned rejection with no ArtifactRejected behind it is D6's illegal state"
+    );
+    assert!(report.failed.is_empty());
+
+    let transitions = f.lifecycle.committed_transitions();
+    assert_eq!(transitions.len(), 1);
+    let (committed, append, _) = &transitions[0];
+    assert_eq!(committed.quarantine_status, QuarantineStatus::Quarantined);
+    assert_eq!(committed.rejection_reason, None);
+    assert_eq!(append.events.len(), 2);
+    match &append.events[0].event {
+        DomainEvent::ArtifactReEvaluated(e) => {
+            assert_eq!(e.trigger, ReEvaluationTrigger::ProvenanceMisrejectionRepair);
+            assert_eq!(e.previous_status, QuarantineStatus::Rejected);
+            assert_eq!(e.new_status, QuarantineStatus::Quarantined);
+        }
+        other => panic!("expected ArtifactReEvaluated first, got {other:?}"),
+    }
+    match &append.events[1].event {
+        // Never `ArtifactReleased`, and never a restarted window.
+        DomainEvent::ArtifactQuarantined(e) => assert_eq!(e.quarantine_window_start, anchor),
+        other => panic!("expected ArtifactQuarantined second, got {other:?}"),
+    }
+
+    // --- and now the ordinary sweep takes over -------------------------
+    let quarantine_uc = QuarantineUseCase::new(
+        f.artifacts.clone(),
+        crate::event_store_publisher::wrap_for_test(f.events.clone()),
+        Arc::new(MockArtifactLifecycle::new(f.artifacts.clone())),
+        Arc::new(MockRepositoryRepository::new()),
+        required_provenance_projections(artifact.repository_id),
+        Arc::new(MockContentReferenceIndex::new()),
+        Arc::new(MockStoragePort::new()),
+        Arc::new(MockJobsRepository::new()),
+    );
+    let summary = quarantine_uc
+        .release_expired(vec![artifact.id])
+        .await
+        .expect("release_expired must not error");
+    assert_eq!(
+        summary.skipped_provenance_pending, 1,
+        "the hold is attributed to the provenance leg, which is what denies the timer arm"
+    );
+    assert!(
+        summary.released.is_empty(),
+        "an artifact nothing has verified must not be released by the repair's exit — \
+         the whole argument for the second arm is that the sweep holds it"
+    );
+    assert_eq!(
+        f.artifacts.get(artifact.id).unwrap().quarantine_status,
+        QuarantineStatus::Quarantined,
+        "held — neither released nor re-rejected"
+    );
+}
+
+/// The dry run reaches the second arm too, and still writes nothing: the
+/// report an operator reads before mutating must name the same set.
+#[tokio::test]
+async fn dry_run_lists_a_never_terminal_rejection_without_mutating() {
+    let f = build();
+    let (artifact, entry) = seed_never_terminal(&f);
+    f.queue.set_entries(vec![entry]);
+
+    let report = f.uc.run(repair_request(true), api_actor()).await.unwrap();
+
+    assert!(report.dry_run);
+    assert_eq!(
+        report
+            .affected
+            .iter()
+            .map(|a| a.artifact_id)
+            .collect::<Vec<_>>(),
+        vec![artifact.id]
+    );
+    assert!(f.lifecycle.committed_transitions().is_empty());
+    assert!(f.events.appended_batches().is_empty());
+    assert_eq!(
+        f.artifacts.get(artifact.id).unwrap().quarantine_status,
+        QuarantineStatus::Rejected
+    );
+}
+
+/// **The counter-assertion.** The second arm keys on the `reason`, not
+/// on a `ProvenanceRejected` merely being present.
+///
+/// Every reason other than `Unsigned` is a positive disproof — a
+/// signature that is present and wrong — and ADR 0039 D1/D4 permit
+/// exactly those to be terminal. The shape seeded here is the one that
+/// reaches conjunct 3: a disproof written **before** the D6 companion
+/// existed carries its `ProvenanceRejected` alone, so conjunct 2
+/// classifies it `Absent`.
+///
+/// Without this test the arm silently becomes a pass-through — a
+/// historical forged-signature rejection walked back into the release
+/// path — while every other test in this file stays green.
+#[tokio::test]
+async fn leaves_a_historical_disproof_with_no_companion_untouched() {
+    let f = build();
+    for reason in [
+        ProvenanceRejectReason::UntrustedIdentity,
+        ProvenanceRejectReason::RekorNotFound,
+        ProvenanceRejectReason::CertChainInvalid,
+        ProvenanceRejectReason::BundleMalformed,
+        ProvenanceRejectReason::DigestMismatch,
+    ] {
+        let (artifact, entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
+            vec![
+                quarantined(id, 0, anchor),
+                persisted_scan_completed(id, 0, 1),
+                provenance_rejected(id, 2, reason),
+            ]
+        });
+        f.queue.set_entries(vec![entry]);
+
+        let report = f.uc.run(repair_request(false), api_actor()).await.unwrap();
+
+        assert!(
+            report.affected.is_empty(),
+            "{reason:?} is a positive disproof and must stay terminal"
+        );
+        assert!(report.failed.is_empty(), "not matching is not a failure");
+        assert_eq!(
+            f.artifacts.get(artifact.id).unwrap().quarantine_status,
+            QuarantineStatus::Rejected
+        );
+    }
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "no disproof shape may be repaired"
+    );
+
+    // The discriminating half, in the same test so the two cannot drift.
+    // The stream is byte-for-byte the loop's shape with one field
+    // changed — same events, same positions, same backend, only
+    // `reason` differs — and it IS repaired. That single-dimension
+    // difference is what proves the refusals above come from the reason
+    // and not from some other property of the fixture.
+    let (unsigned, entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
+        vec![
+            quarantined(id, 0, anchor),
+            persisted_scan_completed(id, 0, 1),
+            provenance_rejected(id, 2, ProvenanceRejectReason::Unsigned),
+        ]
+    });
+    f.queue.set_entries(vec![entry]);
+    let report = f.uc.run(repair_request(false), api_actor()).await.unwrap();
+    assert_eq!(
+        report
+            .affected
+            .iter()
+            .map(|a| a.artifact_id)
+            .collect::<Vec<_>>(),
+        vec![unsigned.id],
+        "the only difference from the refused streams above is the reason"
+    );
+    assert_eq!(
+        f.artifacts.get(unsigned.id).unwrap().quarantine_status,
+        QuarantineStatus::Quarantined
+    );
+}
+
+/// **The "only provenance verdict" narrowing.** An `Unsigned` followed by
+/// a later disproof is a disproven artifact, not a misrejected one — the
+/// later verdict is a statement about the artifact and it stands.
+///
+/// Asserted in both orders: the scan returns on the first non-`Unsigned`
+/// reason it reads, so a disproof *before* the `Unsigned` must refuse
+/// too.
+#[tokio::test]
+async fn leaves_an_unsigned_followed_by_a_disproof_untouched() {
+    let f = build();
+
+    let (later, later_entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
+        vec![
+            quarantined(id, 0, anchor),
+            policy_unsigned_rejected(id, 1),
+            provenance_rejected(id, 2, ProvenanceRejectReason::DigestMismatch),
+        ]
+    });
+    let (earlier, earlier_entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
+        vec![
+            quarantined(id, 0, anchor),
+            provenance_rejected(id, 1, ProvenanceRejectReason::DigestMismatch),
+            policy_unsigned_rejected(id, 2),
+        ]
+    });
+    f.queue.set_entries(vec![later_entry, earlier_entry]);
+
+    let report = f.uc.run(repair_request(false), api_actor()).await.unwrap();
+
+    assert_eq!(report.scanned, 2);
+    assert!(
+        report.affected.is_empty(),
+        "a stream carrying a disproof is not this population, in either order"
+    );
+    assert!(f.lifecycle.committed_transitions().is_empty());
+    for id in [later.id, earlier.id] {
+        assert_eq!(
+            f.artifacts.get(id).unwrap().quarantine_status,
+            QuarantineStatus::Rejected
+        );
+    }
+}
+
+/// A `ProvenanceVerified` on the stream still classifies as the
+/// contradiction even when an `Unsigned` sits beside it — the first arm
+/// is tested first, exactly as the release gate reads `Cleared`. The
+/// outcome is the same either way (both are proofs); what this pins is
+/// that the two arms do not fight over a stream carrying both.
+#[tokio::test]
+async fn an_unsigned_rejection_contradicted_by_a_later_verification_is_repaired() {
+    let f = build();
+    let (artifact, entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
+        vec![
+            quarantined(id, 0, anchor),
+            persisted_scan_completed(id, 0, 1),
+            policy_unsigned_rejected(id, 2),
+            // The signature that landed 5.1 s later.
+            verified(id, 3),
+        ]
+    });
+    f.queue.set_entries(vec![entry]);
+
+    let report = f.uc.run(repair_request(false), api_actor()).await.unwrap();
+    assert_eq!(
+        report
+            .affected
+            .iter()
+            .map(|a| a.artifact_id)
+            .collect::<Vec<_>>(),
+        vec![artifact.id]
+    );
+    assert_eq!(
+        f.artifacts.get(artifact.id).unwrap().quarantine_status,
+        QuarantineStatus::Quarantined
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The conjunct-3 resolver, directly
+// ---------------------------------------------------------------------------
+
+/// Every arm of [`provenance_rejection_evidence`], over the streams the
+/// use-case tests above reach it through — so a refusal that is correct
+/// for the wrong reason cannot hide behind an identical report.
+#[test]
+fn provenance_rejection_evidence_classifies_every_shape() {
+    let id = Uuid::new_v4();
+    let anchor = Utc::now() - Duration::hours(2);
+
+    // A `ProvenanceVerified` anywhere ⇒ the contradiction, whatever else
+    // the stream carries.
+    for stream in [
+        vec![quarantined(id, 0, anchor), verified(id, 1)],
+        vec![
+            quarantined(id, 0, anchor),
+            policy_unsigned_rejected(id, 1),
+            verified(id, 2),
+        ],
+        vec![
+            quarantined(id, 0, anchor),
+            provenance_rejected(id, 1, ProvenanceRejectReason::DigestMismatch),
+            verified(id, 2),
+        ],
+    ] {
+        assert_eq!(
+            provenance_rejection_evidence(&stream),
+            ProvenanceRejectionEvidence::Contradicted
+        );
+    }
+
+    // `Unsigned` alone ⇒ never-terminal. More than one of them is still
+    // "only `Unsigned`".
+    assert_eq!(
+        provenance_rejection_evidence(&[
+            quarantined(id, 0, anchor),
+            policy_unsigned_rejected(id, 1)
+        ]),
+        ProvenanceRejectionEvidence::NeverTerminal
+    );
+    assert_eq!(
+        provenance_rejection_evidence(&[
+            quarantined(id, 0, anchor),
+            policy_unsigned_rejected(id, 1),
+            policy_unsigned_rejected(id, 2),
+        ]),
+        ProvenanceRejectionEvidence::NeverTerminal
+    );
+
+    // Any positive disproof ⇒ refused, carrying the reason it read.
+    for reason in [
+        ProvenanceRejectReason::UntrustedIdentity,
+        ProvenanceRejectReason::RekorNotFound,
+        ProvenanceRejectReason::CertChainInvalid,
+        ProvenanceRejectReason::BundleMalformed,
+        ProvenanceRejectReason::DigestMismatch,
+    ] {
+        assert_eq!(
+            provenance_rejection_evidence(&[
+                quarantined(id, 0, anchor),
+                provenance_rejected(id, 1, reason),
+            ]),
+            ProvenanceRejectionEvidence::Disproved(reason)
+        );
+        // Mixed with an `Unsigned`, in both orders: the disproof wins.
+        assert_eq!(
+            provenance_rejection_evidence(&[
+                policy_unsigned_rejected(id, 0),
+                provenance_rejected(id, 1, reason),
+            ]),
+            ProvenanceRejectionEvidence::Disproved(reason)
+        );
+        assert_eq!(
+            provenance_rejection_evidence(&[
+                provenance_rejected(id, 0, reason),
+                policy_unsigned_rejected(id, 1),
+            ]),
+            ProvenanceRejectionEvidence::Disproved(reason)
+        );
+    }
+
+    // No provenance event at all ⇒ no verdict, and an empty stream is the
+    // same answer rather than a panic.
+    assert_eq!(
+        provenance_rejection_evidence(&[quarantined(id, 0, anchor)]),
+        ProvenanceRejectionEvidence::NoVerdict
+    );
+    assert_eq!(
+        provenance_rejection_evidence(&[]),
+        ProvenanceRejectionEvidence::NoVerdict
+    );
 }

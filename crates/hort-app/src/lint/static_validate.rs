@@ -47,8 +47,8 @@ use hort_config::DesiredState;
 use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::rbac::{ClaimMapping, GrantSubject, Permission, PermissionGrant};
 use hort_domain::entities::scan_policy::{
-    NegligibleAction, ProvenanceConfigError, ProvenanceConfigWarning, ProvenanceMode,
-    ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+    CompositeVerdictMode, NegligibleAction, ProvenanceConfigError, ProvenanceConfigWarning,
+    ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use hort_domain::events::PolicyScope;
 use uuid::Uuid;
@@ -194,6 +194,25 @@ pub(crate) const RULE_VIRTUAL_MEMBER_FORMAT_NOT_ENFORCED: &str =
 pub(crate) const RULE_SCAN_POLICY_MAX_ARTIFACT_AGE_NOT_IMPLEMENTED: &str =
     "scan_policy_max_artifact_age_not_implemented";
 
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when a `ScanPolicy`
+/// envelope promotes the composed-image verdict to release authority
+/// (`compositeVerdictMode: promoted`) while declaring no scanner
+/// backends. The waiver wins: `run_scan` returns `SkippedNoBackends`
+/// before a composition is resolved, so the promotion grants authority
+/// to a verdict no manifest in scope ever carries (ADR 0064 D6 ×
+/// ADR 0016's cross-opt-in matrix, closed as the ADR 0015 inert-field
+/// block). The composition-axis sibling of
+/// [`RULE_TRUST_UPSTREAM_PUBLISH_TIME_REQUIRES_SCAN_BACKENDS`], whose
+/// other half is the same empty backend list. One increment per
+/// offending `ScanPolicy`. **Not** retired by a future implementation:
+/// a waived scan has nothing to promote under any of them.
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_COMPOSITE_VERDICT_PROMOTED_REQUIRES_SCAN_BACKENDS: &str =
+    "composite_verdict_promoted_requires_scan_backends";
+
 /// The snapshot-free apply-config lint rules.
 ///
 /// The discriminant is carried on every [`LintFinding`] so the apply
@@ -272,6 +291,21 @@ pub enum LinterRule {
     /// the age evaluator never applies (it has no production caller).
     /// Reject + metric. Appended after row 12, same reason.
     ScanPolicyMaxArtifactAgeNotImplemented,
+    /// Row 14 — two `ServiceAccount` envelopes declaring the same
+    /// `fallbackRotation.targetSecret` `(namespace, name)`. Reject (no
+    /// metric — see [`Self::metric_rule`]). Appended after row 13, same
+    /// reason: apply aborts on the first row with error findings, so
+    /// appending is the only placement that leaves every existing
+    /// config's reject message exactly as it was.
+    SaRotationTargetConflict,
+    /// Row 15 — a `ScanPolicy` promoting the composed-image verdict to
+    /// release authority (`compositeVerdictMode: promoted`) while
+    /// declaring no scanner backends, so the promotion has nothing to
+    /// act on (ADR 0064 D6 × ADR 0016). Reject + metric. Appended after
+    /// row 14, same reason: apply aborts on the first row with error
+    /// findings, so appending is the only placement that leaves every
+    /// existing config's reject message exactly as it was.
+    CompositeVerdictPromotedRequiresScanBackends,
 }
 
 impl LinterRule {
@@ -311,10 +345,19 @@ impl LinterRule {
             Self::ScanPolicyMaxArtifactAgeNotImplemented => {
                 Some(RULE_SCAN_POLICY_MAX_ARTIFACT_AGE_NOT_IMPLEMENTED)
             }
+            Self::CompositeVerdictPromotedRequiresScanBackends => {
+                Some(RULE_COMPOSITE_VERDICT_PROMOTED_REQUIRES_SCAN_BACKENDS)
+            }
             Self::SaIssuerFk
             | Self::UnderConstrainedFederatedIdentities
             | Self::ProvenanceConfig
             | Self::RepoStorageBackendMismatch
+            // Row 14 — follows its nearest sibling `SaIssuerFk`, which
+            // carries none. The rejection is the whole signal: the
+            // operator's two ServiceAccounts name one Secret, and a
+            // counter of how often an unchanged config was re-applied
+            // adds nothing they would act on.
+            | Self::SaRotationTargetConflict
             // Row 8 — the grant linter emits no metric from the validator.
             // `apply_permission_grants` keeps its own emission over the
             // port-built desired set, and the offline `validate-config`
@@ -636,6 +679,41 @@ impl StaticConfigValidator {
         {
             report.errors.push(LintFinding::error(
                 LinterRule::ScanPolicyMaxArtifactAgeNotImplemented,
+                err.to_string(),
+            ));
+        }
+
+        // Row 14 — two ServiceAccounts declaring one
+        // `fallbackRotation.targetSecret`. The reconciler's ownership
+        // barrier makes one of the two collide on every tick, so the
+        // configuration cannot do what it says (ADR 0015). Appended
+        // after row 13 for row 9's own reason — apply aborts on the
+        // first row with error findings, so appending is the only
+        // placement that leaves every existing config's reject message
+        // exactly as it was.
+        for message in validate_service_account_rotation_target_conflicts(desired) {
+            report.errors.push(LintFinding::error(
+                LinterRule::SaRotationTargetConflict,
+                message,
+            ));
+        }
+
+        // Row 15 — a `ScanPolicy` promoting the composed-image verdict
+        // to release authority while waiving scanning outright. The two
+        // opt-ins cancel: the waiver returns before a composition is
+        // resolved, so the promotion grants authority to a verdict no
+        // manifest in scope ever carries (ADR 0064 D6 × ADR 0016, closed
+        // as the ADR 0015 inert-field block). Appended after row 14 for
+        // row 9's own reason — apply aborts on the first row with error
+        // findings, so appending is the only placement that leaves every
+        // existing config's reject message exactly as it was.
+        for err in
+            hort_config::desired::validate_scan_policy_promoted_composite_requires_scan_backends(
+                desired,
+            )
+        {
+            report.errors.push(LintFinding::error(
+                LinterRule::CompositeVerdictPromotedRequiresScanBackends,
                 err.to_string(),
             ));
         }
@@ -1210,6 +1288,58 @@ fn validate_service_account_issuer_fk(desired: &DesiredState) -> Vec<String> {
     errors
 }
 
+/// Row 14 — two `ServiceAccount` envelopes must not declare the same
+/// `fallbackRotation.targetSecret`. Returns one rendered error string
+/// per conflicting envelope beyond the first declarer; the caller joins
+/// them into a single `DomainError::Validation`.
+///
+/// A target's identity is `(namespace, name)`: the same Secret *name* in
+/// two different namespaces is two Secrets and is fine.
+///
+/// Why this is a reject and not an advisory: the rotation reconciler's
+/// ownership barrier refuses to overwrite a Secret owned by another
+/// ServiceAccount, so every tick one of the two SAs collides and never
+/// rotates — the operator's declared rotation does not happen. The
+/// per-envelope validator cannot see this (it is handed one envelope at
+/// a time), which is why the rule lives here rather than in
+/// `hort_config::service_account::validate_target_secret`.
+///
+/// Each finding names the conflicting envelope **and** the first
+/// declarer, so three ServiceAccounts sharing one target produce two
+/// findings that between them name all three.
+///
+/// Desired-only, like [`validate_service_account_issuer_fk`]: a target
+/// held by a snapshot ServiceAccount being deleted by omission is not a
+/// conflict.
+fn validate_service_account_rotation_target_conflicts(desired: &DesiredState) -> Vec<String> {
+    let mut first_declarer: HashMap<(&str, &str), &str> = HashMap::new();
+    let mut errors = Vec::new();
+    for env in &desired.service_accounts {
+        let Some(rotation) = env.spec.fallback_rotation.as_ref() else {
+            continue;
+        };
+        let target = (
+            rotation.target_secret.namespace.as_str(),
+            rotation.target_secret.name.as_str(),
+        );
+        match first_declarer.get(&target) {
+            None => {
+                first_declarer.insert(target, env.metadata.name.as_str());
+            }
+            Some(first) => errors.push(format!(
+                "ServiceAccount `{}` declares the same \
+                 spec.fallbackRotation.targetSecret as ServiceAccount `{first}` \
+                 (namespace `{}`, name `{}`) — two ServiceAccounts rotating one Secret \
+                 overwrite each other's credential on every tick, so consumers end up \
+                 holding the wrong identity; give each ServiceAccount its own \
+                 targetSecret",
+                env.metadata.name, target.0, target.1
+            )),
+        }
+    }
+    errors
+}
+
 /// Row 8 — build one synthetic [`PermissionGrant`] for
 /// the offline linter. `id` / `created_at` / `managed_by_digest` are
 /// placeholders: the grant rules read only `subject`, `repository_id`'s
@@ -1271,6 +1401,7 @@ fn provenance_projection_for_lint(
         rescan_interval_hours: 0,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
+        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: now,
         updated_at: now,
@@ -1288,7 +1419,9 @@ mod tests {
     use hort_config::retention_policy::RetentionPolicySpec;
     use hort_config::scan_policy::SignerIdentitySpec;
     use hort_config::scope::RepositoryScope;
-    use hort_config::service_account::{FederatedIdentitySpec, ServiceAccountSpec};
+    use hort_config::service_account::{
+        FallbackRotationSpec, FederatedIdentitySpec, ServiceAccountSpec, TargetSecretSpec,
+    };
     use hort_config::upstream_mapping::UpstreamMappingSpec;
     use hort_domain::entities::repository::IndexMode;
     use std::collections::BTreeMap;
@@ -1455,6 +1588,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
+                composite_verdict_mode: "observed".into(),
             },
         }
     }
@@ -1880,6 +2014,7 @@ mod tests {
                     rescan_interval_hours: 24,
                     negligible_action: "ignore".into(),
                     enforcement: "reject".into(),
+                    composite_verdict_mode: "observed".into(),
                 },
             }],
             ..Default::default()
@@ -2531,6 +2666,297 @@ mod tests {
                 fallback_rotation: None,
             },
         }
+    }
+
+    /// A `fallbackRotation`-only `ServiceAccount` envelope pointed at a
+    /// given target Secret. No `federatedIdentities`, so row 2 stays
+    /// silent and a row-14 finding is the report's first error.
+    fn sa_env_with_rotation_target(
+        name: &str,
+        namespace: &str,
+        secret_name: &str,
+    ) -> Envelope<ServiceAccountSpec> {
+        Envelope {
+            api_version: ApiVersion::V1,
+            kind: Kind::ServiceAccount,
+            metadata: Metadata { name: name.into() },
+            spec: ServiceAccountSpec {
+                federated_identities: vec![],
+                fallback_rotation: Some(FallbackRotationSpec {
+                    target_secret: TargetSecretSpec {
+                        name: secret_name.into(),
+                        namespace: namespace.into(),
+                        format: "dockerconfigjson".into(),
+                    },
+                    rotation_interval: "6h".into(),
+                    validity: "24h".into(),
+                }),
+            },
+        }
+    }
+
+    fn rotation_conflict_findings(report: &StaticLintReport) -> Vec<&str> {
+        report
+            .errors
+            .iter()
+            .filter(|f| f.rule == LinterRule::SaRotationTargetConflict)
+            .map(|f| f.message.as_str())
+            .collect()
+    }
+
+    // ---- Row 14 — two ServiceAccounts, one rotation target ------------
+
+    /// Two ServiceAccounts sharing `(namespace, name)` reject, and the
+    /// message names both accounts and the target so the operator can fix
+    /// it without searching.
+    #[test]
+    fn row14_two_sas_sharing_a_rotation_target_reject() {
+        let desired = DesiredState {
+            service_accounts: vec![
+                sa_env_with_rotation_target("ci-a", "ci-system", "shared-secret"),
+                sa_env_with_rotation_target("ci-b", "ci-system", "shared-secret"),
+            ],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let findings = rotation_conflict_findings(&report);
+        assert_eq!(findings.len(), 1, "one finding per later declarer");
+        let message = findings[0];
+        for needle in ["`ci-b`", "`ci-a`", "`ci-system`", "`shared-secret`"] {
+            assert!(
+                message.contains(needle),
+                "row-14 message must name {needle}; got: {message}"
+            );
+        }
+        assert!(
+            report.warnings.is_empty(),
+            "row 14 is an error, not a warning"
+        );
+    }
+
+    /// The same Secret *name* in two different namespaces is two Secrets.
+    #[test]
+    fn row14_same_secret_name_in_two_namespaces_is_accepted() {
+        let desired = DesiredState {
+            service_accounts: vec![
+                sa_env_with_rotation_target("ci-a", "ci-system", "hort-pull-secret"),
+                sa_env_with_rotation_target("ci-b", "build-system", "hort-pull-secret"),
+            ],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(
+            rotation_conflict_findings(&report).is_empty(),
+            "target identity is (namespace, name), not name alone"
+        );
+    }
+
+    /// Same namespace, different Secret names — the ordinary two-SA shape.
+    #[test]
+    fn row14_distinct_targets_in_one_namespace_are_accepted() {
+        let desired = DesiredState {
+            service_accounts: vec![
+                sa_env_with_rotation_target("ci-a", "ci-system", "secret-a"),
+                sa_env_with_rotation_target("ci-b", "ci-system", "secret-b"),
+            ],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(rotation_conflict_findings(&report).is_empty());
+    }
+
+    /// Three ServiceAccounts on one target report *usefully*: two
+    /// findings, which between them name all three accounts — not one
+    /// finding that leaves the third invisible, and not a pairwise
+    /// explosion.
+    #[test]
+    fn row14_three_sas_sharing_one_target_name_all_three() {
+        let desired = DesiredState {
+            service_accounts: vec![
+                sa_env_with_rotation_target("ci-a", "ci-system", "shared-secret"),
+                sa_env_with_rotation_target("ci-b", "ci-system", "shared-secret"),
+                sa_env_with_rotation_target("ci-c", "ci-system", "shared-secret"),
+            ],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let findings = rotation_conflict_findings(&report);
+        assert_eq!(
+            findings.len(),
+            2,
+            "one finding per declarer beyond the first"
+        );
+        let joined = findings.join(" | ");
+        for needle in ["`ci-a`", "`ci-b`", "`ci-c`"] {
+            assert!(
+                joined.contains(needle),
+                "every conflicting ServiceAccount must be named across the findings; \
+                 {needle} is missing from: {joined}"
+            );
+        }
+    }
+
+    /// Two independent conflicts in one bundle are both reported — the
+    /// row collects, it does not stop at the first pair.
+    #[test]
+    fn row14_two_independent_conflicts_are_both_reported() {
+        let desired = DesiredState {
+            service_accounts: vec![
+                sa_env_with_rotation_target("ci-a", "ci-system", "secret-one"),
+                sa_env_with_rotation_target("ci-b", "ci-system", "secret-one"),
+                sa_env_with_rotation_target("ci-c", "build-system", "secret-two"),
+                sa_env_with_rotation_target("ci-d", "build-system", "secret-two"),
+            ],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let findings = rotation_conflict_findings(&report);
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().any(|m| m.contains("`ci-b`")));
+        assert!(findings.iter().any(|m| m.contains("`ci-d`")));
+    }
+
+    /// A ServiceAccount with no `fallbackRotation` declares no target and
+    /// cannot conflict — including with another one just like it.
+    #[test]
+    fn row14_service_accounts_without_rotation_never_conflict() {
+        let desired = DesiredState {
+            service_accounts: vec![sa_env("fed-only-a"), sa_env("fed-only-b")],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(rotation_conflict_findings(&report).is_empty());
+    }
+
+    /// One ServiceAccount with a rotation target is the common case and
+    /// is silent.
+    #[test]
+    fn row14_single_rotating_service_account_is_accepted() {
+        let desired = DesiredState {
+            service_accounts: vec![sa_env_with_rotation_target(
+                "ci-a",
+                "ci-system",
+                "hort-pull-secret",
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(rotation_conflict_findings(&report).is_empty());
+    }
+
+    /// Row 14 is appended: a bundle tripping an earlier row AND row 14
+    /// still rejects with the earlier row's message, because apply aborts
+    /// on the first row with error findings.
+    #[test]
+    fn row14_is_appended_after_the_existing_rows() {
+        let mut inert = repo_env("npm-inert", "npm");
+        inert.spec.prefetch_policy.max_age_days = Some(90);
+        let desired = DesiredState {
+            repositories: vec![inert],
+            service_accounts: vec![
+                sa_env_with_rotation_target("ci-a", "ci-system", "shared-secret"),
+                sa_env_with_rotation_target("ci-b", "ci-system", "shared-secret"),
+            ],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert_eq!(
+            report.errors.first().map(|f| f.rule),
+            Some(LinterRule::PrefetchMaxAgeDaysNotImplemented),
+            "row 6 must still be the first error — row 14 is appended last"
+        );
+        assert_eq!(rotation_conflict_findings(&report).len(), 1);
+    }
+
+    /// Row 14 carries no `hort_apply_config_linter_total` label, like its
+    /// nearest sibling row 2.
+    #[test]
+    fn row14_emits_no_linter_metric() {
+        assert_eq!(LinterRule::SaRotationTargetConflict.metric_rule(), None);
+    }
+
+    // ---- row 15: compositeVerdictMode x scanBackends -------------------
+
+    /// Every row-15 finding in a report, by message, so a test asserts
+    /// what the operator reads rather than a count.
+    fn promoted_composite_findings(report: &StaticLintReport) -> Vec<&str> {
+        report
+            .errors
+            .iter()
+            .filter(|f| f.rule == LinterRule::CompositeVerdictPromotedRequiresScanBackends)
+            .map(|f| f.message.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn row15_promoted_composite_with_no_backends_rejects() {
+        let mut env = scan_policy_global("p-waived-but-promoted", vec![]);
+        env.spec.composite_verdict_mode = "promoted".into();
+        let desired = DesiredState {
+            scan_policies: vec![env],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let findings = promoted_composite_findings(&report);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].contains("p-waived-but-promoted"),
+            "{findings:?}"
+        );
+    }
+
+    /// Each half alone is a supported posture — which is what makes this
+    /// a cross-opt-in collapse rather than an inert field.
+    #[test]
+    fn row15_either_half_alone_is_accepted() {
+        let mut promoted = scan_policy_global("p-promoted-scanning", vec!["trivy"]);
+        promoted.spec.composite_verdict_mode = "promoted".into();
+        let waived = scan_policy_global("p-waived", vec![]);
+        for env in [promoted, waived] {
+            let desired = DesiredState {
+                scan_policies: vec![env],
+                ..Default::default()
+            };
+            let report = oci_validator().validate(&desired);
+            assert!(
+                promoted_composite_findings(&report).is_empty(),
+                "{:?}",
+                report.errors
+            );
+        }
+    }
+
+    /// Row 15 is appended: a bundle tripping an earlier row AND row 15
+    /// still rejects with the earlier row's message, because apply
+    /// aborts on the first row with error findings.
+    #[test]
+    fn row15_is_appended_after_the_existing_rows() {
+        let mut inert = repo_env("npm-inert", "npm");
+        inert.spec.prefetch_policy.max_age_days = Some(90);
+        let mut promoted = scan_policy_global("p-waived-but-promoted", vec![]);
+        promoted.spec.composite_verdict_mode = "promoted".into();
+        let desired = DesiredState {
+            repositories: vec![inert],
+            scan_policies: vec![promoted],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert_eq!(
+            report.errors.first().map(|f| f.rule),
+            Some(LinterRule::PrefetchMaxAgeDaysNotImplemented),
+            "row 6 must still be the first error — row 15 is appended last"
+        );
+        assert_eq!(promoted_composite_findings(&report).len(), 1);
+    }
+
+    /// Row 15's metric key is the one the catalog and the apply's
+    /// emission site share.
+    #[test]
+    fn row15_emits_its_catalogued_linter_metric() {
+        assert_eq!(
+            LinterRule::CompositeVerdictPromotedRequiresScanBackends.metric_rule(),
+            Some("composite_verdict_promoted_requires_scan_backends"),
+        );
     }
 
     fn grant_findings(report: &StaticLintReport) -> usize {

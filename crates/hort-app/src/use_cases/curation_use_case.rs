@@ -30,6 +30,7 @@
 //! event the call emits, so oversize justification fails fast before
 //! any append.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -43,7 +44,7 @@ use hort_domain::events::{
     Actor, ApiActor, ArtifactReEvaluated, DomainEvent, ReEvaluationTrigger, ReleaseReason,
     StreamId, NO_POLICY,
 };
-use hort_domain::policy::ReEvaluationOutcome;
+use hort_domain::policy::{composite_verdict_mode_of, ReEvaluationOutcome};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::curation_decisions_repository::{
@@ -57,6 +58,7 @@ use hort_domain::ports::curation_queue_repository::{
 };
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend};
+use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInvalidator;
@@ -71,6 +73,7 @@ use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::release_clearance::resolve_curation_clearance;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
+use crate::use_cases::scan_kind_resolution::scan_kind_of;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use crate::use_cases::{
     rejected_reevaluation, scan_history, ArtifactAtVersion, CallerPrivileges, OverCapStream,
@@ -197,6 +200,18 @@ pub struct CurationUseCase {
     /// [`Self::reevaluate`] (shared with the policy-mutation pass via
     /// [`rejected_reevaluation::derive_rejected_outcome`]).
     storage: Arc<dyn StoragePort>,
+    /// Compiled-in format handlers, keyed by format string — the same
+    /// registry the scan orchestrator and the policy re-evaluation pass
+    /// hold, wired from the same composition-root map.
+    ///
+    /// [`Self::reevaluate`] needs the artifact's
+    /// [`ArtifactKind`](hort_domain::types::ArtifactKind) because it is
+    /// the role half of ADR 0064 D2's line and therefore an input to the
+    /// verdict it re-derives. A *constructor* dependency and not an
+    /// optional one, for the reason `PolicyUseCase`'s copy is: "no
+    /// handler, therefore `Other`" must be the registry's answer about a
+    /// format, never this use case's answer about a missing dependency.
+    handlers: HashMap<String, Arc<dyn FormatHandler>>,
     /// Optional invalidator for cached
     /// upstream packument / simple-index entries on `ArtifactRejected`.
     /// `None` keeps the use case constructable without the dependency
@@ -217,7 +232,7 @@ impl CurationUseCase {
     /// `QuarantineUseCase::new`'s port-only construction (no concrete
     /// adapters, no `sqlx::PgPool`, no `reqwest::Client`).
     ///
-    /// All 9 fields are wired at construction time.
+    /// All 11 fields are wired at construction time.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         events: Arc<EventStorePublisher>,
@@ -230,6 +245,7 @@ impl CurationUseCase {
         repository_access: Arc<RepositoryAccessUseCase>,
         curation_rules: Arc<dyn CurationRuleRepository>,
         storage: Arc<dyn StoragePort>,
+        handlers: HashMap<String, Arc<dyn FormatHandler>>,
     ) -> Self {
         Self {
             events,
@@ -242,6 +258,7 @@ impl CurationUseCase {
             repository_access,
             curation_rules,
             storage,
+            handlers,
             upstream_index_cache_invalidator: None,
         }
     }
@@ -915,12 +932,47 @@ impl CurationUseCase {
         };
 
         // 4) Load evidence + derive the verdict — shared path.
+        //
+        // The role half of ADR 0064 D2's line, resolved through the same
+        // registry the scan run uses. An absent repository row resolves to
+        // `Generic` (no handler, therefore `ArtifactKind::Other`), matching
+        // `resolve_curation_clearance`'s treatment of the same read.
         let now = Utc::now();
+        let kind = match self
+            .repository_access
+            .repository_format(repository_id)
+            .await
+        {
+            Ok(f) => {
+                let format =
+                    f.unwrap_or(hort_domain::entities::repository::RepositoryFormat::Generic);
+                scan_kind_of(&self.handlers, &format.to_string(), paired.artifact())
+            }
+            Err(e) => {
+                let result = classify_append_error(&e);
+                emit_curation_decision(
+                    CurationDecisionLabel::Reevaluate,
+                    Some(&repo_label),
+                    result,
+                );
+                return Err(e);
+            }
+        };
         let derivation = match rejected_reevaluation::derive_rejected_outcome(
             &paired,
             &self.storage,
             policy.as_ref(),
             &exclusions,
+            kind,
+            // **Resolved, not pinned** (ADR 0064 D6). A curator asked for
+            // this one artifact to be judged again, which is the
+            // operator-driven recovery D6 reserves the already-rejected
+            // estate to: "recovering the existing estate is
+            // operator-driven, through the curation re-evaluation". The
+            // automatic policy-mutation pass pins
+            // `CompositeVerdictMode::Observed` instead, so nothing
+            // releases that population without someone asking.
+            composite_verdict_mode_of(policy.as_ref()),
             now,
         )
         .await
@@ -1778,6 +1830,7 @@ mod tests {
             repository_access,
             Arc::new(MockCurationRuleRepository::new()),
             Arc::new(MockStoragePort::new()),
+            HashMap::new(),
         );
         (uc, artifacts, events, lifecycle)
     }
@@ -1804,6 +1857,7 @@ mod tests {
             default_repository_access(),
             Arc::new(MockCurationRuleRepository::new()),
             Arc::new(MockStoragePort::new()),
+            HashMap::new(),
         );
         (uc, queue_repo)
     }
@@ -1830,6 +1884,7 @@ mod tests {
             default_repository_access(),
             Arc::new(MockCurationRuleRepository::new()),
             Arc::new(MockStoragePort::new()),
+            HashMap::new(),
         );
         (uc, decisions_repo)
     }
@@ -1856,6 +1911,7 @@ mod tests {
             default_repository_access(),
             Arc::new(MockCurationRuleRepository::new()),
             Arc::new(MockStoragePort::new()),
+            HashMap::new(),
         );
         (uc, exclusions_repo)
     }
@@ -2982,6 +3038,7 @@ mod tests {
 
         let filter = CurationQueueFilter {
             repository_id: Some(Uuid::new_v4()),
+            artifact_id: None,
             status: Some(QuarantineStatus::Quarantined),
             rejection_reason_kind: None,
             limit: 50,
@@ -3355,6 +3412,7 @@ mod tests {
             default_repository_access(),
             Arc::new(MockCurationRuleRepository::new()),
             Arc::new(MockStoragePort::new()),
+            HashMap::new(),
         );
         (uc, artifacts, events)
     }
@@ -3591,7 +3649,7 @@ mod tests {
             {
                 continue;
             }
-            let labels: std::collections::HashMap<&str, &str> =
+            let labels: HashMap<&str, &str> =
                 key.key().labels().map(|l| (l.key(), l.value())).collect();
             let decision = labels.get("decision").copied().unwrap_or("").to_string();
             let repository = labels.get("repository").copied().unwrap_or("").to_string();
@@ -4115,8 +4173,8 @@ mod tests {
         use hort_domain::entities::curation_rule::{CurationRule, CurationRuleAction};
         use hort_domain::entities::managed_by::ManagedBy;
         use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-            SeverityThreshold,
+            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
+            ScanPolicyProjection, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
 
@@ -4144,6 +4202,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: NegligibleAction::Ignore,
                 enforcement: ScanEnforcement::Reject,
+                composite_verdict_mode: CompositeVerdictMode::Observed,
                 stream_version: 0,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -4178,6 +4237,7 @@ mod tests {
                 default_repository_access(),
                 curation_rules.clone(),
                 Arc::new(MockStoragePort::new()),
+                HashMap::new(),
             );
             (uc, artifacts, events, lifecycle, policies, curation_rules)
         }

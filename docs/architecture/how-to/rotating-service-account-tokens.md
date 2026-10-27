@@ -54,14 +54,28 @@ default), the worker:
 3. Decides:
    - Namespace not in `worker.rotation.targetNamespaces` →
      log + metric, skip.
-   - Existing Secret without `project-hort.de/managed-by=hort-worker` label
-     → log + metric, skip (collision; operator must hand off
-     ownership explicitly).
+   - Existing Secret that is not **this** SA's to rotate → log +
+     metric, skip (collision). Three shapes, each with its own
+     `collision_reason` log field:
+     - `not_hort_managed` — no `project-hort.de/managed-by=hort-worker`
+       label; another controller or an operator owns the Secret.
+     - `owned_by_another_service_account` —
+       `project-hort.de/service-account` names a different SA, i.e. two
+       `ServiceAccount` envelopes point at one Secret.
+     - `owner_unestablished` — the managed-by label is ours but
+       `project-hort.de/service-account` is absent, so no owner can be
+       established.
    - Existing Secret with `project-hort.de/last-rotated` annotation newer
      than `rotation_interval` ago → debug + metric, skip (fresh).
-   - Otherwise (missing or stale) → mint a fresh PAT via
-     `ApiTokenUseCase`, write the new Secret via
+   - Otherwise (missing or stale, and owned by this SA) → mint a
+     fresh PAT via `ApiTokenUseCase`, write the new Secret via
      `KubernetesSecretWriter`, emit `ServiceAccountTokenRotated`.
+
+The `managed-by` label names the **writer** and is identical on
+every Secret this deployment writes, so it cannot tell two SAs
+apart; `project-hort.de/service-account` is the owner, and it is what the
+barrier keys on. Two `ServiceAccount` envelopes declaring the same
+`targetSecret` is rejected at gitops apply — see §5.
 
 The previous PAT stays valid until its natural `expires_at` — the
 reconciler does NOT revoke. The `validity ≥ 2 × rotationInterval`
@@ -279,6 +293,13 @@ Validation rules the apply pipeline enforces (full list in
   `{dockerconfigjson, opaque}`.
 - `fallbackRotation.rotationInterval` ≥ `1h`.
 - `fallbackRotation.validity` ≥ 2 × `rotationInterval`.
+- **No two `ServiceAccount` envelopes may declare the same
+  `targetSecret`.** Identity of a target is `(namespace, name)` —
+  the same Secret name in two different namespaces is two Secrets
+  and is fine. Sharing one target means the reconciler's ownership
+  barrier refuses one of the two SAs on every tick, so its
+  declared rotation never happens; apply rejects the bundle and
+  names both ServiceAccounts and the target.
 - `targetSecret.namespace` is NOT validated against
   `worker.rotation.targetNamespaces` at apply time — the chart's
   allow-list is a runtime concern. A mismatch produces
@@ -437,18 +458,44 @@ deliberately refuses to write outside the operator-allowed set
 
 ### `collision` in worker logs
 
-The Secret already exists but lacks the
-`project-hort.de/managed-by=hort-worker` label — typically created
-out-of-band (kubectl, Sealed Secrets, another controller).
-Resolution: delete the Secret to let the reconciler take
-ownership.
+The target Secret exists but is not this ServiceAccount's to
+rotate. The `collision_reason` field on the warn line says which
+of the three rules fired, and `existing_managed_by` /
+`existing_service_account` carry the two labels as read.
 
-```bash
-kubectl delete secret <name> -n <ns>
-```
+- `collision_reason=not_hort_managed` — the Secret lacks the
+  `project-hort.de/managed-by=hort-worker` label; typically created
+  out-of-band (kubectl, Sealed Secrets, another controller).
+  Resolution: delete the Secret to let the reconciler take
+  ownership.
+
+  ```bash
+  kubectl delete secret <name> -n <ns>
+  ```
+
+- `collision_reason=owned_by_another_service_account` — two
+  `ServiceAccount` envelopes declare the same
+  `fallbackRotation.targetSecret`, and the Secret belongs to the
+  other one (`existing_service_account` names it). Whichever SA
+  has the shorter `rotationInterval` would otherwise overwrite the
+  other, leaving consumers holding the wrong identity.
+  Resolution: give each ServiceAccount its own `targetSecret`.
+  Gitops apply rejects this configuration, so an existing one was
+  applied before that gate shipped — fixing the config is the
+  same edit either way.
+
+- `collision_reason=owner_unestablished` — the Secret carries the
+  reconciler's managed-by label but no
+  `project-hort.de/service-account` label, so ownership cannot be
+  established. Every Secret the reconciler writes carries the
+  owner label, so this is a Secret it did not write (an older
+  version, or a hand-made Secret wearing the managed-by label).
+  Resolution: delete the Secret, as for `not_hort_managed`.
 
 The reconciler refuses to overwrite collision Secrets by design;
-silent overwrite would mask gitops-vs-imperative drift.
+silent overwrite would mask gitops-vs-imperative drift, and — for
+the two ownership reasons — would hand one SA's consumers the
+other SA's credential.
 
 ### Workload still using old PAT after rotation
 

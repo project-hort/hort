@@ -63,8 +63,8 @@ use hort_config::exclusion::ExclusionSpec;
 use hort_config::scan_policy::{ScanPolicySpec, SignerIdentitySpec};
 use hort_config::scope::ScopeSpec;
 use hort_domain::entities::scan_policy::{
-    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-    SeverityThreshold, SignerIdentityPattern,
+    CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
+    ScanPolicyProjection, SeverityThreshold, SignerIdentityPattern,
 };
 use hort_domain::events::{
     DomainEvent, ExclusionAdded, ExclusionRemoved, PolicyCreated, PolicyField, PolicyScope,
@@ -204,6 +204,8 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
             parse_provenance_identities(&desired.spec.provenance_identities);
         let desired_negligible_action = parse_negligible_action(&desired.spec.negligible_action);
         let desired_enforcement = parse_scan_enforcement(&desired.spec.enforcement);
+        let desired_composite_verdict_mode =
+            parse_composite_verdict_mode(&desired.spec.composite_verdict_mode);
 
         match projection {
             None => {
@@ -227,6 +229,7 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
                     desired.spec.rescan_interval_hours,
                     &desired_negligible_action,
                     &desired_enforcement,
+                    &desired_composite_verdict_mode,
                 );
                 vec![DomainEvent::PolicyCreated(PolicyCreated {
                     policy_id,
@@ -408,6 +411,26 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
                     }));
                 }
 
+                // -- CompositeVerdictMode (ADR 0064 D6) --
+                // Lowercase wire strings on the payload. Unlike
+                // `Enforcement`, neither direction is gate-affecting: a
+                // promoted composite verdict's findings come from
+                // scanning an assembled image, so re-deriving from
+                // *stored* findings would un-reject the population it
+                // rejected without assessing anything afresh.
+                if proj.composite_verdict_mode != desired_composite_verdict_mode {
+                    events.push(DomainEvent::PolicyUpdated(PolicyUpdated {
+                        policy_id: pid,
+                        field: PolicyField::CompositeVerdictMode,
+                        previous_value: serde_json::Value::String(
+                            proj.composite_verdict_mode.to_string(),
+                        ),
+                        new_value: serde_json::Value::String(
+                            desired_composite_verdict_mode.to_string(),
+                        ),
+                    }));
+                }
+
                 events
             }
         }
@@ -496,10 +519,63 @@ impl ExclusionsApplier {
     }
 }
 
+/// The identity of an exclusion: the pair a desired spec and a
+/// projection row are matched on. Everything else an exclusion carries
+/// is mutable in place (by remove-then-add) and so is not part of it.
+type Identity<'a> = (&'a str, Option<&'a str>);
+
+/// The identity a desired spec declares.
+fn spec_identity(spec: &ExclusionSpec) -> Identity<'_> {
+    (spec.cve_id.as_str(), spec.package_pattern.as_deref())
+}
+
+/// The identity a current projection row carries. Two rows may return
+/// the same value — see [`ExclusionsApplier::diff`].
+fn row_identity(row: &ExclusionProjection) -> Identity<'_> {
+    (row.cve_id.as_str(), row.package_pattern.as_deref())
+}
+
 impl ApplyEventSourcedKind for ExclusionsApplier {
     type Spec = Vec<ExclusionSpec>;
     type Projection = Vec<ExclusionProjection>;
 
+    /// ## The two sides do not have the same cardinality
+    ///
+    /// `desired` is operator-authored: one identity
+    /// (`cve_id`, `package_pattern`) is one intent, so a map keyed by
+    /// identity is the right shape for it. The map is what an identity
+    /// *means*; the spec list is read only for the order in which
+    /// identities were declared.
+    ///
+    /// `projection` is a set of **rows the system produced**, and two
+    /// rows may carry the same identity. The diff is correct when they
+    /// do, and it is correct without any uniqueness promise from the
+    /// projection, the repository or the schema — it never leans on a
+    /// rule enforced in another layer. Every branch that acts on the
+    /// current side therefore walks the **rows**: an identity that left
+    /// the desired set emits one `ExclusionRemoved` per row, each
+    /// carrying that row's own `exclusion_id`, and an identity whose
+    /// mutable fields changed replaces every row that carries a stale
+    /// value. Row count is preserved either way — the diff converges
+    /// field values and never answers how many rows an identity may
+    /// have.
+    ///
+    /// Grouping the current side into a map keyed by identity is the
+    /// specific thing not to do: a map keeps one row per identity, so a
+    /// reconcile told to drop an exclusion would drop one row, report
+    /// convergence, and leave the rest suppressing the findings they
+    /// were meant to stop suppressing.
+    ///
+    /// ## Order
+    ///
+    /// The batch is a pure function of the arguments: no branch
+    /// iterates a `HashMap` or `HashSet`, whose order varies per
+    /// process, so two runs over the same input produce the same batch.
+    /// Each branch walks its driving input in that input's own order —
+    /// removals and replacements in projection-row order, additions in
+    /// declaration order. Within a replacement the `ExclusionRemoved`
+    /// immediately precedes its `ExclusionAdded`, so the batch never
+    /// adds a row for an identity before dropping the row it replaces.
     fn diff(
         &self,
         desired: &Envelope<Vec<ExclusionSpec>>,
@@ -512,59 +588,50 @@ impl ApplyEventSourcedKind for ExclusionsApplier {
         let empty: Vec<ExclusionProjection> = Vec::new();
         let current = projection.unwrap_or(&empty);
 
-        // Build the desired identity → spec map and the current
-        // identity → projection map.
-        type Identity<'a> = (&'a str, Option<&'a str>);
+        let desired_by_id: HashMap<Identity<'_>, &ExclusionSpec> =
+            desired.spec.iter().map(|e| (spec_identity(e), e)).collect();
 
-        let desired_by_id: HashMap<Identity<'_>, &ExclusionSpec> = desired
-            .spec
-            .iter()
-            .map(|e| ((e.cve_id.as_str(), e.package_pattern.as_deref()), e))
-            .collect();
-
-        let current_by_id: HashMap<Identity<'_>, &ExclusionProjection> = current
-            .iter()
-            .map(|p| ((p.cve_id.as_str(), p.package_pattern.as_deref()), p))
-            .collect();
-
-        let desired_ids: HashSet<Identity<'_>> = desired_by_id.keys().copied().collect();
-        let current_ids: HashSet<Identity<'_>> = current_by_id.keys().copied().collect();
+        // Which identities the current side carries at all. A set is
+        // the honest shape for *this* question (the "added" branch asks
+        // whether any row carries the identity, not how many do); the
+        // per-row questions below read `current` itself.
+        let current_ids: HashSet<Identity<'_>> = current.iter().map(row_identity).collect();
 
         let mut events: Vec<DomainEvent> = Vec::new();
 
-        // -- Removed: in current but not in desired --
-        for id in current_ids.difference(&desired_ids) {
-            let proj = current_by_id[id];
-            events.push(DomainEvent::ExclusionRemoved(ExclusionRemoved {
-                policy_id: self.policy_id,
-                exclusion_id: proj.exclusion_id,
-                reason: REASON_REMOVED_BY_GITOPS.to_string(),
-            }));
-        }
-
-        // -- Added: in desired but not in current --
-        for id in desired_ids.difference(&current_ids) {
-            let spec = desired_by_id[id];
-            events.push(self.added_event(spec));
-        }
-
-        // -- Both present, mutable fields differ → Removed + Added --
-        for id in desired_ids.intersection(&current_ids) {
-            let spec = desired_by_id[id];
-            let proj = current_by_id[id];
-            let desired_scope = self.resolve_scope(&spec.scope);
-            let scope_changed = proj.scope != desired_scope;
-            let reason_changed = proj.reason != spec.reason;
-            let expires_changed = !optional_dt_eq(proj.expires_at, spec.expires_at);
-
-            if scope_changed || reason_changed || expires_changed {
-                events.push(DomainEvent::ExclusionRemoved(ExclusionRemoved {
-                    policy_id: self.policy_id,
-                    exclusion_id: proj.exclusion_id,
-                    reason: REASON_CHANGED_BY_GITOPS.to_string(),
-                }));
-                events.push(self.added_event(spec));
+        // -- Removed: every current row whose identity left the desired
+        //    set, one event per row --
+        for row in current {
+            if !desired_by_id.contains_key(&row_identity(row)) {
+                events.push(self.removed_event(row, REASON_REMOVED_BY_GITOPS));
             }
+        }
+
+        // -- Added: every desired identity no current row carries.
+        //    The slice supplies the order, the map supplies the value,
+        //    and `seen` keeps a repeated identity in the slice from
+        //    emitting twice — one identity is one intent. --
+        let mut seen: HashSet<Identity<'_>> = HashSet::new();
+        for spec in &desired.spec {
+            let id = spec_identity(spec);
+            if seen.insert(id) && !current_ids.contains(&id) {
+                events.push(self.added_event(desired_by_id[&id]));
+            }
+        }
+
+        // -- Changed: a current row whose identity is still desired but
+        //    whose mutable fields differ → replace that row. The
+        //    comparison is per row, so a duplicated identity with one
+        //    matching and one stale row replaces only the stale one. --
+        for row in current {
+            let Some(spec) = desired_by_id.get(&row_identity(row)) else {
+                continue;
+            };
+            if self.row_matches_spec(row, spec) {
+                continue;
+            }
+            events.push(self.removed_event(row, REASON_CHANGED_BY_GITOPS));
+            events.push(self.added_event(spec));
         }
 
         events
@@ -584,6 +651,26 @@ impl ExclusionsApplier {
             reason: spec.reason.clone(),
             expires_at: spec.expires_at,
         })
+    }
+
+    /// Wrap one current projection row in an `ExclusionRemoved` event.
+    /// The id on the event is **that row's** `exclusion_id`, which is
+    /// what makes a per-row removal reach the row it names.
+    fn removed_event(&self, row: &ExclusionProjection, reason: &str) -> DomainEvent {
+        DomainEvent::ExclusionRemoved(ExclusionRemoved {
+            policy_id: self.policy_id,
+            exclusion_id: row.exclusion_id,
+            reason: reason.to_string(),
+        })
+    }
+
+    /// Whether a current row already carries the spec's mutable field
+    /// values. Identity is the caller's business — this compares only
+    /// what an apply can change: scope, reason and expiry.
+    fn row_matches_spec(&self, row: &ExclusionProjection, spec: &ExclusionSpec) -> bool {
+        row.scope == self.resolve_scope(&spec.scope)
+            && row.reason == spec.reason
+            && optional_dt_eq(row.expires_at, spec.expires_at)
     }
 }
 
@@ -610,6 +697,7 @@ fn build_config_snapshot(
     rescan_interval_hours: i32,
     negligible_action: &NegligibleAction,
     enforcement: &ScanEnforcement,
+    composite_verdict_mode: &CompositeVerdictMode,
 ) -> serde_json::Value {
     serde_json::json!({
         "name": name,
@@ -627,6 +715,7 @@ fn build_config_snapshot(
         "rescan_interval_hours": rescan_interval_hours,
         "negligible_action": negligible_action.to_string(),
         "enforcement": enforcement.to_string(),
+        "composite_verdict_mode": composite_verdict_mode.to_string(),
     })
 }
 
@@ -663,6 +752,19 @@ fn parse_scan_enforcement(s: &str) -> ScanEnforcement {
     ScanEnforcement::from_str(s).unwrap_or_else(|err| {
         panic!(
             "INVARIANT: scan enforcement '{s}' must have been validated by \
+             hort_config::scan_policy::validate_scan_policy before reaching the \
+             applier (parse error: {err})"
+        )
+    })
+}
+
+/// Map the validated `compositeVerdictMode` wire string into the domain
+/// enum. `hort-config`'s `validate_scan_policy` ran first, so a parse
+/// failure here is a bypassed-validator programming error.
+fn parse_composite_verdict_mode(s: &str) -> CompositeVerdictMode {
+    CompositeVerdictMode::from_str(s).unwrap_or_else(|err| {
+        panic!(
+            "INVARIANT: composite verdict mode '{s}' must have been validated by \
              hort_config::scan_policy::validate_scan_policy before reaching the \
              applier (parse error: {err})"
         )
@@ -777,6 +879,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: "ignore".into(),
             enforcement: "reject".into(),
+            composite_verdict_mode: "observed".into(),
         }
     }
 
@@ -802,6 +905,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
+            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 7,
             created_at: now,
             updated_at: now,
@@ -968,6 +1072,16 @@ mod tests {
         let applier = ScanPolicyApplier::default();
         let mut spec = baseline_spec();
         spec.quarantine_duration = "12garbage".into();
+        let env = policy_envelope(spec);
+        let _ = applier.diff(&env, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "INVARIANT: composite verdict mode")]
+    fn scan_policy_malformed_composite_verdict_mode_panics_with_invariant_prefix() {
+        let applier = ScanPolicyApplier::default();
+        let mut spec = baseline_spec();
+        spec.composite_verdict_mode = "enforce".into();
         let env = policy_envelope(spec);
         let _ = applier.diff(&env, None);
     }
@@ -1786,6 +1900,388 @@ mod tests {
         );
     }
 
+    // ===================================================================
+    // ExclusionsApplier — the current side is rows, not identities
+    // ===================================================================
+
+    /// Compact, comparable description of an emitted exclusion event so
+    /// an order-pinned expectation is one `assert_eq!`. A removal is
+    /// identified by the row it names; an addition mints a fresh id, so
+    /// it is identified by what it carries.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Emitted {
+        Removed { exclusion_id: Uuid, reason: String },
+        Added { cve_id: String, reason: String },
+    }
+
+    fn emitted(events: &[DomainEvent], expected_policy_id: Uuid) -> Vec<Emitted> {
+        events
+            .iter()
+            .map(|e| match e {
+                DomainEvent::ExclusionRemoved(r) => {
+                    assert_eq!(r.policy_id, expected_policy_id);
+                    Emitted::Removed {
+                        exclusion_id: r.exclusion_id,
+                        reason: r.reason.clone(),
+                    }
+                }
+                DomainEvent::ExclusionAdded(a) => {
+                    assert_eq!(a.policy_id, expected_policy_id);
+                    assert_ne!(a.exclusion_id, Uuid::nil(), "Added must mint an id");
+                    Emitted::Added {
+                        cve_id: a.cve_id.clone(),
+                        reason: a.reason.clone(),
+                    }
+                }
+                other => panic!("unexpected event: {}", other.event_type()),
+            })
+            .collect()
+    }
+
+    fn removed(exclusion_id: u128) -> Emitted {
+        Emitted::Removed {
+            exclusion_id: Uuid::from_u128(exclusion_id),
+            reason: "removed by gitops apply".into(),
+        }
+    }
+
+    fn replaced(exclusion_id: u128) -> Emitted {
+        Emitted::Removed {
+            exclusion_id: Uuid::from_u128(exclusion_id),
+            reason: "changed by gitops apply".into(),
+        }
+    }
+
+    fn added(cve: &str, reason: &str) -> Emitted {
+        Emitted::Added {
+            cve_id: cve.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Two projection rows carrying ONE identity, gone from desired →
+    /// one `ExclusionRemoved` per row, each naming its own row.
+    ///
+    /// This is the test that fails against an identity-keyed current
+    /// side: a `HashMap<Identity, &row>` keeps one row per identity (the
+    /// last one in slice order — later inserts replace the value), so
+    /// the diff emitted a single removal and the surviving row kept
+    /// suppressing the finding the apply was told to stop suppressing —
+    /// a reconcile reporting convergence it had not reached.
+    #[test]
+    fn exclusions_duplicate_identity_absent_from_desired_emits_one_removed_per_row() {
+        let pid = Uuid::from_u128(1);
+        let applier = applier_for(pid);
+        let env = exclusion_envelope(vec![]);
+        let proj = vec![
+            baseline_exclusion_projection(Uuid::from_u128(10), pid, "CVE-2024-0001"),
+            baseline_exclusion_projection(Uuid::from_u128(11), pid, "CVE-2024-0001"),
+        ];
+
+        let events = applier.diff(&env, Some(&proj));
+
+        assert_eq!(emitted(&events, pid), vec![removed(10), removed(11)]);
+    }
+
+    /// Same identity on three rows, to pin that the removal branch is
+    /// per row rather than "the duplicate case gets two".
+    #[test]
+    fn exclusions_three_rows_one_identity_absent_from_desired_emits_three_removed() {
+        let pid = Uuid::from_u128(1);
+        let applier = applier_for(pid);
+        let env = exclusion_envelope(vec![]);
+        let proj = vec![
+            baseline_exclusion_projection(Uuid::from_u128(10), pid, "CVE-2024-0001"),
+            baseline_exclusion_projection(Uuid::from_u128(11), pid, "CVE-2024-0001"),
+            baseline_exclusion_projection(Uuid::from_u128(12), pid, "CVE-2024-0001"),
+        ];
+
+        let events = applier.diff(&env, Some(&proj));
+
+        assert_eq!(
+            emitted(&events, pid),
+            vec![removed(10), removed(11), removed(12)]
+        );
+    }
+
+    /// Two rows carrying one identity whose scope changed → every row
+    /// is brought to the desired state, neither left at the old scope.
+    /// Row count is preserved: the diff converges field values and does
+    /// not decide how many rows an identity may have.
+    #[test]
+    fn exclusions_duplicate_identity_scope_changed_replaces_every_row() {
+        let pid = Uuid::from_u128(1);
+        let repo_id = Uuid::from_u128(0xfeed);
+        let mut map = HashMap::new();
+        map.insert("npm-public".to_string(), repo_id);
+        let applier = ExclusionsApplier::new(pid, map);
+
+        let mut s = baseline_exclusion_spec("CVE-2024-0001");
+        s.scope = ScopeSpec::Repository(RepositoryScope {
+            repository: "npm-public".into(),
+        });
+        let env = exclusion_envelope(vec![s]);
+
+        // Both rows sit at the old (global) scope.
+        let proj = vec![
+            baseline_exclusion_projection(Uuid::from_u128(10), pid, "CVE-2024-0001"),
+            baseline_exclusion_projection(Uuid::from_u128(11), pid, "CVE-2024-0001"),
+        ];
+
+        let events = applier.diff(&env, Some(&proj));
+
+        assert_eq!(
+            emitted(&events, pid),
+            vec![
+                replaced(10),
+                added("CVE-2024-0001", "patched in container layer"),
+                replaced(11),
+                added("CVE-2024-0001", "patched in container layer"),
+            ]
+        );
+        // Every addition carries the resolved desired scope — no row is
+        // left behind at the old one.
+        for e in &events {
+            if let DomainEvent::ExclusionAdded(a) = e {
+                assert_eq!(a.scope, PolicyScope::Repository(repo_id));
+            }
+        }
+    }
+
+    /// Two rows carrying one identity whose reason changed, same shape
+    /// on a field the operator can actually reach today (the repository
+    /// scope above is refused before any apply writes).
+    #[test]
+    fn exclusions_duplicate_identity_reason_changed_replaces_every_row() {
+        let pid = Uuid::from_u128(1);
+        let applier = applier_for(pid);
+
+        let mut s = baseline_exclusion_spec("CVE-2024-0001");
+        s.reason = "revised rationale".into();
+        let env = exclusion_envelope(vec![s]);
+
+        let proj = vec![
+            baseline_exclusion_projection(Uuid::from_u128(10), pid, "CVE-2024-0001"),
+            baseline_exclusion_projection(Uuid::from_u128(11), pid, "CVE-2024-0001"),
+        ];
+
+        let events = applier.diff(&env, Some(&proj));
+
+        assert_eq!(
+            emitted(&events, pid),
+            vec![
+                replaced(10),
+                added("CVE-2024-0001", "revised rationale"),
+                replaced(11),
+                added("CVE-2024-0001", "revised rationale"),
+            ]
+        );
+    }
+
+    /// A duplicated identity that is also desired AND unchanged → no
+    /// events. The diff is not a de-duplicator: whether the projection
+    /// may hold two rows for one identity is a data-model question, and
+    /// converging field values is the only thing this diff answers.
+    #[test]
+    fn exclusions_duplicate_identity_unchanged_emits_no_events() {
+        let pid = Uuid::from_u128(1);
+        let applier = applier_for(pid);
+        let s = baseline_exclusion_spec("CVE-2024-0001");
+        let env = exclusion_envelope(vec![s]);
+        let proj = vec![
+            baseline_exclusion_projection(Uuid::from_u128(10), pid, "CVE-2024-0001"),
+            baseline_exclusion_projection(Uuid::from_u128(11), pid, "CVE-2024-0001"),
+        ];
+
+        let events = applier.diff(&env, Some(&proj));
+
+        assert!(
+            events.is_empty(),
+            "repeated identity already at the desired state → nothing to do, got {:?}",
+            emitted(&events, pid)
+        );
+    }
+
+    /// The field comparison is per row: one of two rows carrying an
+    /// identity is already at the desired state, the other is stale →
+    /// only the stale row is replaced.
+    #[test]
+    fn exclusions_duplicate_identity_replaces_only_the_stale_row() {
+        let pid = Uuid::from_u128(1);
+        let applier = applier_for(pid);
+
+        let s = baseline_exclusion_spec("CVE-2024-0001");
+        let env = exclusion_envelope(vec![s]);
+
+        let fresh = baseline_exclusion_projection(Uuid::from_u128(10), pid, "CVE-2024-0001");
+        let mut stale = baseline_exclusion_projection(Uuid::from_u128(11), pid, "CVE-2024-0001");
+        stale.reason = "stale rationale".into();
+        let proj = vec![fresh, stale];
+
+        let events = applier.diff(&env, Some(&proj));
+
+        assert_eq!(
+            emitted(&events, pid),
+            vec![
+                replaced(11),
+                added("CVE-2024-0001", "patched in container layer"),
+            ]
+        );
+    }
+
+    /// The same input with the two rows swapped produces the same
+    /// answer: which row is replaced follows the row's own fields, not
+    /// its position. An identity-keyed current side cannot do this —
+    /// the map keeps the LAST row for an identity, so with the fresh
+    /// row last it compares the fresh one, finds it already at the
+    /// desired state, and emits nothing while the stale row keeps
+    /// suppressing findings under the old reason.
+    #[test]
+    fn exclusions_duplicate_identity_row_order_does_not_decide_which_row_is_replaced() {
+        let pid = Uuid::from_u128(1);
+        let applier = applier_for(pid);
+
+        let s = baseline_exclusion_spec("CVE-2024-0001");
+        let env = exclusion_envelope(vec![s]);
+
+        let mut stale = baseline_exclusion_projection(Uuid::from_u128(11), pid, "CVE-2024-0001");
+        stale.reason = "stale rationale".into();
+        let fresh = baseline_exclusion_projection(Uuid::from_u128(10), pid, "CVE-2024-0001");
+        let proj = vec![stale, fresh];
+
+        let events = applier.diff(&env, Some(&proj));
+
+        assert_eq!(
+            emitted(&events, pid),
+            vec![
+                replaced(11),
+                added("CVE-2024-0001", "patched in container layer"),
+            ]
+        );
+    }
+
+    /// Re-running the diff over the projection the previous batch
+    /// converges to emits nothing — the per-row replacement keeps the
+    /// idempotency anchor for a duplicated identity too.
+    #[test]
+    fn exclusions_duplicate_identity_replacement_is_idempotent_on_rerun() {
+        let pid = Uuid::from_u128(1);
+        let applier = applier_for(pid);
+
+        let mut s = baseline_exclusion_spec("CVE-2024-0001");
+        s.reason = "revised rationale".into();
+        let env = exclusion_envelope(vec![s]);
+
+        // What the previous batch's two Removed + two Added converge to:
+        // two rows, both at the desired reason.
+        let mut row_a = baseline_exclusion_projection(Uuid::from_u128(20), pid, "CVE-2024-0001");
+        row_a.reason = "revised rationale".into();
+        let mut row_b = baseline_exclusion_projection(Uuid::from_u128(21), pid, "CVE-2024-0001");
+        row_b.reason = "revised rationale".into();
+
+        let events = applier.diff(&env, Some(&vec![row_a, row_b]));
+        assert!(events.is_empty(), "re-apply must be a no-op");
+    }
+
+    // ===================================================================
+    // ExclusionsApplier — emitted order
+    // ===================================================================
+
+    /// The emitted order is pinned: removals in projection-row order,
+    /// then additions in declaration order, then the replacements in
+    /// projection-row order with each row's Removed immediately before
+    /// its Added. No branch iterates a hash container, so the batch is
+    /// a pure function of the two inputs.
+    #[test]
+    fn exclusions_emitted_order_follows_projection_then_declaration_order() {
+        let pid = Uuid::from_u128(1);
+        let applier = applier_for(pid);
+
+        // Declaration order: new, unchanged, changed.
+        let s_new = baseline_exclusion_spec("CVE-NEW");
+        let s_same = baseline_exclusion_spec("CVE-SAME");
+        let mut s_changed = baseline_exclusion_spec("CVE-CHANGED");
+        s_changed.reason = "revised rationale".into();
+        let env = exclusion_envelope(vec![s_new, s_same, s_changed]);
+
+        // Row order interleaves the three categories, and the gone
+        // identity is carried by two rows.
+        let proj = vec![
+            baseline_exclusion_projection(Uuid::from_u128(30), pid, "CVE-GONE"),
+            baseline_exclusion_projection(Uuid::from_u128(31), pid, "CVE-CHANGED"),
+            baseline_exclusion_projection(Uuid::from_u128(32), pid, "CVE-SAME"),
+            baseline_exclusion_projection(Uuid::from_u128(33), pid, "CVE-GONE"),
+        ];
+
+        let events = applier.diff(&env, Some(&proj));
+
+        assert_eq!(
+            emitted(&events, pid),
+            vec![
+                removed(30),
+                removed(33),
+                added("CVE-NEW", "patched in container layer"),
+                replaced(31),
+                added("CVE-CHANGED", "revised rationale"),
+            ]
+        );
+    }
+
+    /// The ordinary case — one row per identity — emits exactly the
+    /// events the identity-keyed diff emitted for the same input, in
+    /// all three branches at once. The set is unchanged; what is new is
+    /// that the order no longer varies per process.
+    #[test]
+    fn exclusions_one_row_per_identity_emits_the_same_events_as_the_identity_keyed_diff() {
+        let pid = Uuid::from_u128(1);
+        let applier = applier_for(pid);
+
+        let s_new = baseline_exclusion_spec("CVE-NEW");
+        let s_same = baseline_exclusion_spec("CVE-SAME");
+        let mut s_changed = baseline_exclusion_spec("CVE-CHANGED");
+        s_changed.reason = "revised rationale".into();
+        let env = exclusion_envelope(vec![s_new, s_same, s_changed]);
+
+        let proj = vec![
+            baseline_exclusion_projection(Uuid::from_u128(40), pid, "CVE-GONE"),
+            baseline_exclusion_projection(Uuid::from_u128(41), pid, "CVE-SAME"),
+            baseline_exclusion_projection(Uuid::from_u128(42), pid, "CVE-CHANGED"),
+        ];
+
+        let events = applier.diff(&env, Some(&proj));
+
+        assert_eq!(
+            emitted(&events, pid),
+            vec![
+                removed(40),
+                added("CVE-NEW", "patched in container layer"),
+                replaced(42),
+                added("CVE-CHANGED", "revised rationale"),
+            ]
+        );
+    }
+
+    /// The desired side stays a set: one identity is one intent, so a
+    /// spec list that repeats an identity still yields one `Added`, and
+    /// the map decides what the identity means. The spec list supplies
+    /// only the order in which identities are visited.
+    #[test]
+    fn exclusions_repeated_desired_identity_yields_one_added() {
+        let pid = Uuid::from_u128(1);
+        let applier = applier_for(pid);
+
+        let first = baseline_exclusion_spec("CVE-2024-0001");
+        let mut second = baseline_exclusion_spec("CVE-2024-0001");
+        second.reason = "the later declaration".into();
+        let env = exclusion_envelope(vec![first, second]);
+
+        let events = applier.diff(&env, Some(&vec![]));
+
+        assert_eq!(
+            emitted(&events, pid),
+            vec![added("CVE-2024-0001", "the later declaration")]
+        );
+    }
     /// The resolver's panic branch, reached by constructing the applier
     /// directly. It is **not** reachable from operator config — the
     /// pre-write row `validate_exclusion_scope_not_implemented` refuses
@@ -1876,6 +2372,7 @@ mod tests {
             48,
             &NegligibleAction::Block,
             &ScanEnforcement::Record,
+            &CompositeVerdictMode::Promoted,
         );
         for key in [
             "name",
@@ -1979,5 +2476,71 @@ mod tests {
             e,
             DomainEvent::PolicyUpdated(p) if p.field == PolicyField::Enforcement
         )));
+    }
+
+    #[test]
+    fn scan_policy_composite_verdict_mode_change_emits_one_event() {
+        let policy_id = Uuid::new_v4();
+        let applier = ScanPolicyApplier::new(HashMap::new());
+        let mut spec = baseline_spec();
+        spec.composite_verdict_mode = "promoted".into();
+        let events = applier.diff(
+            &policy_envelope(spec),
+            Some(&baseline_projection(policy_id)),
+        );
+        let updated: Vec<&PolicyUpdated> = events
+            .iter()
+            .filter_map(|e| match e {
+                DomainEvent::PolicyUpdated(p) if p.field == PolicyField::CompositeVerdictMode => {
+                    Some(p)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updated.len(), 1, "exactly one CompositeVerdictMode event");
+        assert_eq!(updated[0].previous_value, serde_json::json!("observed"));
+        assert_eq!(updated[0].new_value, serde_json::json!("promoted"));
+        // Deliberately NOT gate-affecting (ADR 0064 D6): the ADR 0041
+        // pass re-derives verdicts from stored findings, and a composite
+        // verdict's findings come from scanning an assembled image — so
+        // demoting that way would un-reject the population a promoted
+        // composite had correctly rejected with nothing fresh having
+        // looked at it.
+        assert!(!updated[0].field.is_gate_affecting());
+    }
+
+    #[test]
+    fn scan_policy_unchanged_composite_verdict_mode_emits_no_event() {
+        // Both the baseline projection and the baseline spec carry the
+        // default `observed`; an apply that does not touch the field
+        // must emit nothing, or every re-apply would write a policy
+        // event for a posture nobody changed.
+        let policy_id = Uuid::new_v4();
+        let applier = ScanPolicyApplier::new(HashMap::new());
+        let events = applier.diff(
+            &policy_envelope(baseline_spec()),
+            Some(&baseline_projection(policy_id)),
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            DomainEvent::PolicyUpdated(p) if p.field == PolicyField::CompositeVerdictMode
+        )));
+    }
+
+    /// The created-policy snapshot carries the posture, so the
+    /// operator-visible record of what was applied names it.
+    #[test]
+    fn scan_policy_created_snapshot_carries_the_composite_verdict_mode() {
+        let applier = ScanPolicyApplier::new(HashMap::new());
+        let mut spec = baseline_spec();
+        spec.composite_verdict_mode = "promoted".into();
+        let events = applier.diff(&policy_envelope(spec), None);
+        let DomainEvent::PolicyCreated(created) = &events[0] else {
+            panic!("expected PolicyCreated, got {:?}", events[0]);
+        };
+        assert_eq!(
+            created.config_snapshot["composite_verdict_mode"],
+            "promoted"
+        );
     }
 }

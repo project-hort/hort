@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use hort_domain::entities::scan_policy::CompositeVerdictMode;
 use hort_domain::retention::PolicyPredicate;
 
 use crate::claim_mapping::{parse_claim_mapping, ClaimMappingSpec};
@@ -1437,6 +1438,75 @@ pub fn validate_scan_policy_max_artifact_age_not_implemented(
                  does not change this. (scan policy: `{name}`, declared cap: `{age}`)",
                 name = env.metadata.name,
                 age = age,
+            ),
+        });
+    }
+    errors
+}
+
+/// Row 15 — a `ScanPolicy` that promotes the composed-image verdict to
+/// release authority while declaring **no scanner backends**
+/// (ADR 0064 D6 × ADR 0016's cross-opt-in matrix, closed under ADR 0015).
+///
+/// Two operator opt-ins that each change which analysis decides the
+/// release gate, and together they cancel. `scanBackends: []` is the
+/// explicit scan waiver: `ScanOrchestrationUseCase::run_scan` returns
+/// `SkippedNoBackends` on it **before** a composition is resolved, so no
+/// manifest in the policy's scope ever carries a composite assessment —
+/// and `compositeVerdictMode: promoted` then grants release authority to
+/// a verdict that is never produced. The operator has declared a control
+/// and configured away the only thing that could exercise it, which is
+/// precisely the accepted-but-inert field ADR 0015 treats as a hard
+/// block, reached through a pair of fields rather than through one.
+///
+/// Decidable from a **single envelope** — both fields live on the same
+/// `ScanPolicy` spec, and policy resolution picks one whole policy
+/// (repo-scoped wins over global), so the mode and the backend list the
+/// orchestrator reads always come from the same row. That is why this is
+/// a per-envelope rule here rather than a cross-envelope one in
+/// `hort-app::lint::static_validate`, where its nearest sibling
+/// [`validate_trust_upstream_publish_time_requires_scan_backends`] has to
+/// live because the two halves of *that* collapse sit on an
+/// `UpstreamMapping` and a `ScanPolicy` respectively.
+///
+/// **Not a missing-control row**, so it has no retirement trigger: the
+/// composite verdict's consumer exists and is enforced the moment apply
+/// accepts `promoted`. The combination stays wrong under any future
+/// implementation, because a waived scan has nothing to promote.
+///
+/// **Fail-closed, never a runtime fallback.** The structural close is an
+/// apply-time rejection of the dangerous combination (ADR 0016), not a
+/// degraded-authority path that silently treats `promoted` as `observed`
+/// for a scope with no backends — an operator reading the policy back
+/// would see a promotion that is not in effect.
+///
+/// Pure function of `DesiredState`; one error per offending envelope.
+pub fn validate_scan_policy_promoted_composite_requires_scan_backends(
+    state: &DesiredState,
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for env in &state.scan_policies {
+        // Read off the parsed domain value, not the wire string: a
+        // mis-spelled mode is `validate_scan_policy`'s typed reject and
+        // must not be read here as either posture.
+        let promoted = CompositeVerdictMode::from_str(&env.spec.composite_verdict_mode)
+            .is_ok_and(|mode| mode.carries_release_authority());
+        if !promoted || !env.spec.scan_backends.is_empty() {
+            continue;
+        }
+        errors.push(ValidationError::Invalid {
+            kind: Kind::ScanPolicy,
+            name: env.metadata.name.clone(),
+            detail: format!(
+                "`compositeVerdictMode: promoted` with an empty `scanBackends` promotes a \
+                 verdict that is never produced: an empty backend list waives scanning for \
+                 every artifact this policy governs, and the scan returns before a composed \
+                 image is resolved — so no manifest ever carries a composite assessment for \
+                 the promotion to act on. Declare the backends that should assess the \
+                 composition (`scanBackends: [trivy]`), or leave \
+                 `compositeVerdictMode: observed` while the scan stays waived. (scan policy: \
+                 `{name}`)",
+                name = env.metadata.name,
             ),
         });
     }
@@ -4414,6 +4484,176 @@ spec:
             validate_scan_policy_max_artifact_age_not_implemented(&state).len(),
             1,
             "and the declared-cap rejection still applies to it"
+        );
+    }
+
+    // -- ScanPolicy.compositeVerdictMode x scanBackends (row 15) ----------
+
+    /// A `ScanPolicy` envelope with both halves of the cross-opt-in
+    /// stated. `backends` goes in verbatim, so a caller can write `[]`.
+    fn sp_yaml_with_composite(name: &str, mode: &str, backends: &str) -> Vec<u8> {
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: {name}
+spec:
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  compositeVerdictMode: {mode}
+  scanBackends: {backends}
+  licensePolicy: {{}}
+"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn promoting_the_composite_verdict_with_no_scan_backends_is_rejected() {
+        let state = DesiredState::parse_files(vec![(
+            p("sp.yaml"),
+            sp_yaml_with_composite("waived-but-promoted", "promoted", "[]"),
+        )])
+        .unwrap();
+        let errors = validate_scan_policy_promoted_composite_requires_scan_backends(&state);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        let rendered = errors[0].to_string();
+        assert!(
+            rendered.contains("waived-but-promoted"),
+            "must name the envelope: {rendered}"
+        );
+        assert!(
+            rendered.contains("compositeVerdictMode: promoted")
+                && rendered.contains("scanBackends"),
+            "must name BOTH halves of the collapse, not one: {rendered}"
+        );
+        assert!(
+            rendered.contains("never produced"),
+            "must say why the combination is inert rather than merely refusing it: {rendered}"
+        );
+        assert!(
+            rendered.contains("scanBackends: [trivy]")
+                && rendered.contains("compositeVerdictMode: observed"),
+            "must name both ways out — declare backends, or do not promote: {rendered}"
+        );
+    }
+
+    /// Each half is load-bearing on its own, which is what makes this a
+    /// cross-opt-in collapse rather than an inert field: neither value
+    /// alone is refused.
+    #[test]
+    fn either_half_of_the_collapse_alone_is_accepted() {
+        let promoted_with_backends = DesiredState::parse_files(vec![(
+            p("sp.yaml"),
+            sp_yaml_with_composite("promoted-scanning", "promoted", "[trivy]"),
+        )])
+        .unwrap();
+        assert!(
+            validate_scan_policy_promoted_composite_requires_scan_backends(&promoted_with_backends)
+                .is_empty(),
+            "a promotion with a backend to produce the verdict is the supported posture"
+        );
+
+        let waived_unpromoted = DesiredState::parse_files(vec![(
+            p("sp.yaml"),
+            sp_yaml_with_composite("waived", "observed", "[]"),
+        )])
+        .unwrap();
+        assert!(
+            validate_scan_policy_promoted_composite_requires_scan_backends(&waived_unpromoted)
+                .is_empty(),
+            "the scan waiver is an existing, supported posture and this row must not touch it"
+        );
+    }
+
+    /// The default posture is the accepted one, so no tree that predates
+    /// the field can be rejected by this row — including a tree that
+    /// waives scanning.
+    #[test]
+    fn an_omitted_composite_verdict_mode_is_accepted_even_with_no_backends() {
+        let state = DesiredState::parse_files(vec![
+            (p("a.yaml"), sp_yaml("defaults")),
+            (
+                p("b.yaml"),
+                "apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: legacy-waiver
+spec:
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  scanBackends: []
+  licensePolicy: {}
+"
+                .as_bytes()
+                .to_vec(),
+            ),
+        ])
+        .unwrap();
+        assert!(
+            validate_scan_policy_promoted_composite_requires_scan_backends(&state).is_empty(),
+            "the field's absence is the inert posture; a pre-existing tree applies unchanged"
+        );
+    }
+
+    /// One error per offending envelope, so an operator fixes every
+    /// offender in one pass rather than being sent round the loop.
+    #[test]
+    fn every_offending_policy_is_reported() {
+        let state = DesiredState::parse_files(vec![
+            (
+                p("a.yaml"),
+                sp_yaml_with_composite("alpha", "promoted", "[]"),
+            ),
+            (
+                p("b.yaml"),
+                sp_yaml_with_composite("beta", "promoted", "[]"),
+            ),
+            (
+                p("c.yaml"),
+                sp_yaml_with_composite("gamma", "promoted", "[trivy]"),
+            ),
+        ])
+        .unwrap();
+        let rendered: Vec<String> =
+            validate_scan_policy_promoted_composite_requires_scan_backends(&state)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+        assert_eq!(rendered.len(), 2, "one per offender: {rendered:?}");
+        assert!(rendered.iter().any(|e| e.contains("alpha")));
+        assert!(rendered.iter().any(|e| e.contains("beta")));
+        assert!(
+            !rendered.iter().any(|e| e.contains("gamma")),
+            "the compliant policy is untouched: {rendered:?}"
+        );
+    }
+
+    /// A mis-spelled mode is `validate_scan_policy`'s typed reject and
+    /// must not be read here as *either* posture: reading it as
+    /// `promoted` would reject a bundle on a second, confusing ground,
+    /// and the parse failure is the actionable message.
+    #[test]
+    fn a_malformed_mode_is_left_to_the_per_envelope_validator() {
+        let state = DesiredState::parse_files(vec![(
+            p("sp.yaml"),
+            sp_yaml_with_composite("typo", "promotd", "[]"),
+        )])
+        .unwrap();
+        assert!(
+            validate_scan_policy_promoted_composite_requires_scan_backends(&state).is_empty(),
+            "an unparseable mode is not a promotion"
+        );
+        let row_0 = state
+            .validate()
+            .expect_err("a malformed mode is still a row-0 error");
+        assert!(
+            row_0.to_string().contains("compositeVerdictMode"),
+            "and that is the message the operator gets: {row_0}"
         );
     }
 }

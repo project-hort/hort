@@ -57,6 +57,7 @@ use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 
 use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
+use crate::result_write_fence::surface_attempted_result_write;
 use crate::retry_backoff::compute_backoff;
 
 // ---------------------------------------------------------------------------
@@ -503,15 +504,11 @@ impl TaskDispatcher {
     /// to a sibling replica that does register the kind.
     async fn return_to_pending(&self, job: &JobRow, reason: &str) {
         let backoff = compute_backoff(job.attempts);
-        if let Err(e) = self.job_repo.reschedule(job.id, backoff, reason).await {
-            tracing::error!(
-                error = %e,
-                job_id = %job.id,
-                kind = %job.kind,
-                "TaskDispatcher: returning an undispatchable claimed row to pending failed; \
-                 the row stays 'running' and cannot be re-claimed",
-            );
-        }
+        let written = self
+            .job_repo
+            .reschedule(job.id, job.attempts, backoff, reason)
+            .await;
+        surface_attempted_result_write(written, "reschedule", job.id, &job.kind, job.attempts);
     }
 
     /// Starvation audit — makes a kind that stops being claimed loud
@@ -829,14 +826,17 @@ impl TaskDispatcher {
     async fn record_outcome_for_row(&self, job: &JobRow, kind: &str, outcome: TaskOutcome) {
         match outcome {
             TaskOutcome::Completed { result_summary } => {
-                if let Err(e) = self.job_repo.mark_completed(job.id, result_summary).await {
-                    tracing::error!(
-                        error = %e,
-                        job_id = %job.id,
-                        kind,
-                        "TaskDispatcher: mark_completed failed",
-                    );
-                }
+                let written = self
+                    .job_repo
+                    .mark_completed(job.id, job.attempts, result_summary)
+                    .await;
+                surface_attempted_result_write(
+                    written,
+                    "mark_completed",
+                    job.id,
+                    kind,
+                    job.attempts,
+                );
                 metrics::counter!(
                     METRIC_COMPLETED,
                     "kind" => kind.to_string(),
@@ -858,14 +858,17 @@ impl TaskDispatcher {
             TaskOutcome::Failed { reason, retry } => {
                 if retry && job.attempts < JOB_ATTEMPT_CAP {
                     let backoff = compute_backoff(job.attempts);
-                    if let Err(e) = self.job_repo.reschedule(job.id, backoff, &reason).await {
-                        tracing::error!(
-                            error = %e,
-                            job_id = %job.id,
-                            kind,
-                            "TaskDispatcher: reschedule failed",
-                        );
-                    }
+                    let written = self
+                        .job_repo
+                        .reschedule(job.id, job.attempts, backoff, &reason)
+                        .await;
+                    surface_attempted_result_write(
+                        written,
+                        "reschedule",
+                        job.id,
+                        kind,
+                        job.attempts,
+                    );
                     metrics::counter!(
                         METRIC_COMPLETED,
                         "kind" => kind.to_string(),
@@ -889,14 +892,17 @@ impl TaskDispatcher {
                              row keeps this error and will not be claimed again",
                         );
                     }
-                    if let Err(e) = self.job_repo.mark_failed(job.id, &reason).await {
-                        tracing::error!(
-                            error = %e,
-                            job_id = %job.id,
-                            kind,
-                            "TaskDispatcher: mark_failed failed",
-                        );
-                    }
+                    let written = self
+                        .job_repo
+                        .mark_failed(job.id, job.attempts, &reason)
+                        .await;
+                    surface_attempted_result_write(
+                        written,
+                        "mark_failed",
+                        job.id,
+                        kind,
+                        job.attempts,
+                    );
                     metrics::counter!(
                         METRIC_COMPLETED,
                         "kind" => kind.to_string(),
@@ -1034,7 +1040,7 @@ mod tests {
     use hort_domain::error::DomainResult;
     use hort_domain::events::DESTRUCTIVE_TASK_KINDS;
     use hort_domain::ports::jobs_repository::{
-        JobRow, JobStatus, JobsRepository, RequeuedJob, ScanJob,
+        JobRow, JobStatus, JobsRepository, RequeuedJob, ResultWriteOutcome, ScanJob,
     };
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
     use hort_domain::ports::BoxFuture;
@@ -1043,6 +1049,8 @@ mod tests {
     use metrics_util::{CompositeKey, MetricKind};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    use crate::use_cases::test_support::ResultWriteLog;
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -1115,6 +1123,9 @@ mod tests {
         renew_calls: Mutex<Vec<(Uuid, String)>>,
         /// What `renew_lease` answers: `Some(b)` → `Ok(b)`, `None` → `Err`.
         renew_answer: Mutex<Option<bool>>,
+        /// The fence every result write arrived with, and what they
+        /// answer. See [`ResultWriteLog`].
+        write_log: ResultWriteLog,
     }
 
     impl DispatcherMockRepo {
@@ -1134,6 +1145,7 @@ mod tests {
                 requeue_fails: Mutex::new(false),
                 renew_calls: Mutex::new(Vec::new()),
                 renew_answer: Mutex::new(Some(true)),
+                write_log: ResultWriteLog::default(),
             }
         }
 
@@ -1252,33 +1264,37 @@ mod tests {
         fn mark_completed<'a>(
             &'a self,
             job_id: Uuid,
+            attempt: u32,
             result_summary: serde_json::Value,
-        ) -> BoxFuture<'a, DomainResult<()>> {
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
             self.mark_completed_calls.lock().unwrap().push(job_id);
             self.mark_completed_summaries
                 .lock()
                 .unwrap()
                 .push(result_summary);
-            Box::pin(async { Ok(()) })
+            let outcome = self.write_log.record(attempt);
+            Box::pin(async move { Ok(outcome) })
         }
 
         fn reschedule<'a>(
             &'a self,
             job_id: Uuid,
+            attempt: u32,
             backoff: Duration,
             last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
             self.reschedule_calls
                 .lock()
                 .unwrap()
                 .push((job_id, last_error.to_string()));
             self.reschedule_backoffs.lock().unwrap().push(backoff);
             let fails = *self.reschedule_fails.lock().unwrap();
+            let outcome = self.write_log.record(attempt);
             Box::pin(async move {
                 if fails {
                     Err(DomainError::Invariant("boom".into()))
                 } else {
-                    Ok(())
+                    Ok(outcome)
                 }
             })
         }
@@ -1286,13 +1302,15 @@ mod tests {
         fn mark_failed<'a>(
             &'a self,
             job_id: Uuid,
+            attempt: u32,
             last_error: &'a str,
-        ) -> BoxFuture<'a, DomainResult<()>> {
+        ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
             self.mark_failed_calls
                 .lock()
                 .unwrap()
                 .push((job_id, last_error.to_string()));
-            Box::pin(async { Ok(()) })
+            let outcome = self.write_log.record(attempt);
+            Box::pin(async move { Ok(outcome) })
         }
 
         fn enqueue_scan<'a>(
@@ -2112,6 +2130,83 @@ mod tests {
         assert_eq!(counters.failed_terminal, 1);
     }
 
+    /// Every result write carries the attempt the claim charged the
+    /// row — the identity the adapter fences on.
+    ///
+    /// Not a detail of plumbing: a write carrying any other number is
+    /// a write no execution owns, and the fence would refuse it. The
+    /// three outcome paths reach three different methods, so each one
+    /// is checked rather than one standing in for the others.
+    #[test]
+    fn every_outcome_path_writes_under_the_rows_own_attempt() {
+        let completed_runs = Arc::new(AtomicUsize::new(0));
+        let cases: Vec<(&'static str, &'static str, u32, Arc<dyn TaskHandler>)> = vec![
+            (
+                "mark_completed",
+                "noop",
+                3,
+                Arc::new(NoopHandler::new("noop", completed_runs)),
+            ),
+            (
+                "reschedule",
+                "retry-kind",
+                JOB_ATTEMPT_CAP - 1,
+                Arc::new(RetryHandler("retry-kind")),
+            ),
+            (
+                "mark_failed",
+                "retry-kind",
+                JOB_ATTEMPT_CAP,
+                Arc::new(RetryHandler("retry-kind")),
+            ),
+        ];
+        for (write, kind, attempts, handler) in cases {
+            let (repo, _row_id, _counters) = dispatch_one_row(kind, attempts, handler);
+            assert_eq!(
+                repo.write_log.attempts(),
+                vec![attempts],
+                "{write} must write under the row's own attempt",
+            );
+        }
+    }
+
+    /// A refused write is surfaced and then let go.
+    ///
+    /// The handler's side effects are already done and this layer
+    /// cannot unwind them, so the only correct move is to stop: no
+    /// retry of the write, and no second write down another path. A
+    /// retry would be refused for the same reason, and a fallback
+    /// write is the clobber the fence exists to prevent.
+    #[test]
+    fn a_refused_result_write_is_not_retried_or_followed_by_another() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.write_log
+            .refuse(ResultWriteOutcome::Superseded { current_attempt: 9 });
+        let mut row = make_job_row("noop");
+        row.attempts = 3;
+        let row_id = row.id;
+        let dispatcher = Arc::new(make_dispatcher(repo.clone() as Arc<dyn JobsRepository>));
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(dispatcher.dispatch_one(row, Arc::new(NoopHandler::new("noop", runs))));
+
+        assert_eq!(
+            repo.mark_completed_calls(),
+            vec![row_id],
+            "the write is attempted exactly once"
+        );
+        assert_eq!(repo.write_log.attempts(), vec![3]);
+        assert!(
+            repo.reschedule_calls().is_empty() && repo.mark_failed_calls().is_empty(),
+            "a refusal must not be answered with a different write: the row belongs to \
+             whoever holds it now"
+        );
+    }
+
     /// The destructive kinds are the reason the cap is rated as it is,
     /// so one of them is pinned by name.
     ///
@@ -2438,6 +2533,12 @@ mod tests {
             calls[0].1.contains("unregistered kind"),
             "last_error must name the cause: {:?}",
             calls[0].1
+        );
+        assert_eq!(
+            repo.write_log.attempts(),
+            vec![orphan.attempts],
+            "the revert is a result write like any other: it carries the attempt the claim \
+             charged this row, so a sibling that took the row in between keeps it"
         );
     }
 

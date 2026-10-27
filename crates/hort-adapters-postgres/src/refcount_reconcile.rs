@@ -128,7 +128,18 @@ impl RefcountReconcilePort for PgRefcountReconcile {
             // Every repository that owns at least one artifact row.
             // Repos with zero artifacts have nothing to reconcile.
             let ids: Vec<Uuid> = sqlx::query_scalar(
-                "SELECT DISTINCT repository_id FROM artifacts ORDER BY repository_id",
+                r#"
+                SELECT DISTINCT repository_id
+                -- DELETED-INCLUSIVE: this enumerates reconciliation work,
+                -- and the category-3 sweep it feeds is itself
+                -- deleted-inclusive. Soft delete does not touch
+                -- content_references, so a repository whose rows are all
+                -- soft-deleted still holds refcount edges to sweep; a
+                -- liveness predicate here would make it invisible to
+                -- reconciliation entirely.
+                  FROM artifacts
+                 ORDER BY repository_id
+                "#,
             )
             .fetch_all(&self.pool)
             .await
@@ -244,6 +255,12 @@ impl RefcountReconcilePort for PgRefcountReconcile {
                        cr.source_artifact_id AS source_artifact_id,
                        cr.kind               AS kind
                   FROM content_references cr
+                -- DELETED-INCLUSIVE: the repair deletes refcount edges a
+                -- rejected source should not be holding. Soft delete
+                -- leaves those edges in place, so a deleted rejected
+                -- source holds them even less legitimately than a live
+                -- one — filtering here would leave exactly the stalest
+                -- edges behind and keep their blobs GC-protected forever.
                   JOIN artifacts a
                     ON a.id = cr.source_artifact_id
                  WHERE cr.repository_id = $1

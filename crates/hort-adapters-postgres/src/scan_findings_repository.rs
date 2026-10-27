@@ -338,6 +338,19 @@ mod tests {
             .insert_batch(&[fixed, without_fix])
             .await
             .expect("write projected findings");
+        // `insert_batch` is the standalone trait path and writes only the
+        // projection rows; the production write is
+        // `PgArtifactLifecycle::commit_scan_result_with_score`, which pairs
+        // those rows with an `artifacts.last_scan_at` carrying the same
+        // timestamp inside one transaction. The retention read below anchors
+        // on exactly that equality, so the pairing has to be reproduced here
+        // or the fixture would be asserting over a state no scan produces.
+        sqlx::query("UPDATE artifacts SET last_scan_at = $1 WHERE id = $2")
+            .bind(now)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .expect("pair the rows with the last-scan anchor");
 
         let reader = crate::retention_scan_reader::PgRetentionScanReader::new(pool.clone());
         let findings = reader

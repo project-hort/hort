@@ -23,6 +23,49 @@ default branch (`main`) — a final release's promotion MR closes every
 issue whose fix already rested in `ready-for-staging` or `in-uat`, often
 many at once. See [ADR 0048](adr/0048-release-branch-staging-strategy.md) D5.
 
+### Composed filesystem (of an OCI image)
+
+The filesystem an operator actually runs: the image's layers applied **in
+manifest order**, with each layer's additions overlaying what is below it and
+its whiteout markers removing entries from it. It is the subject of a
+filesystem finding, and it is not reconstructible from the layers assessed
+individually — a later layer both adds packages an earlier one cannot be read
+for and removes packages an earlier one carries. See
+[ADR 0064](adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
+and [Layer chain ID](#layer-chain-id-chainid).
+
+### Composite verdict mode (`compositeVerdictMode`)
+
+A `ScanPolicy` field (`compositeVerdictMode: observed | promoted`) deciding
+whether a composed OCI image's scan verdict decides its **manifest's**
+release. The composition is assessed on every manifest scan either way and
+every assessment is recorded as a `composite_scan_observations` row; the
+field is what grants the verdict release authority. Under `observed` — the
+default, and the posture of any policy that omits the field — the manifest's
+own assessment is byte-for-byte what it would be with no composite path at
+all. Under `promoted` the composition's findings **are** the manifest row's
+and reach the release gate under the ordinary predicate, and a composition
+that could not be produced is an absent verdict that holds the manifest
+`scan_indeterminate`; an image index and an artifact manifest stay
+non-gating, having no composition to gate on. `promoted` is also what
+moves the obligation **off** the layers: an OCI blob's own filesystem
+findings stop deciding its release and a layer hort has no decoder for
+stops being withheld for that, since the composition that binds it is
+what assesses the filesystem (ADR 0064 D2). The findings stay in the
+record, a claim about the layer's *bytes* still blocks it, non-OCI
+formats are untouched whatever the field says, and an already-rejected
+layer is recovered only by an explicit curation re-evaluation. Distinct
+from
+[enforcement mode](#enforcement-mode) on both axes: that decides what a
+blocking verdict *does*, this decides *whose analysis* produced it, and
+unlike `enforcement` a change re-judges no existing population in either
+direction (promotion takes effect on each manifest's next scan). `promoted`
+with an empty `scanBackends` is an apply-time rejection. See
+[ADR 0064](adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
+D6 and
+[declare-gitops-config.md](architecture/how-to/declare-gitops-config.md)
+`kind: ScanPolicy`.
+
 ### Curator (`Permission::Curate`)
 
 The domain's decision authority over held artifacts: waiving a hold,
@@ -60,11 +103,43 @@ explicit policy tightening. `record` un-gates the **scan** axis alone:
 provenance, curation and the observation window are unaffected, and a
 recorded verdict releases under its own `ScanRecorded` authority rather
 than a widened `ScanSucceeded`. Changing the field re-judges the
-existing population in both directions. See
+existing population in both directions. Orthogonal to
+[composite verdict mode](#composite-verdict-mode-compositeverdictmode),
+which decides *whose* analysis the blocking verdict came from — and which
+`record` does not fully disarm: `record` withholds a transition over a
+finding list, and a promoted composition's *absence* has no finding list,
+so it still holds the manifest. See
 [ADR 0007](adr/0007-fail-closed-quarantine-release-predicate.md) and
 [ADR 0041](adr/0041-continuous-scan-policy-enforcement.md), and
 [declare-gitops-config.md](architecture/how-to/declare-gitops-config.md)
 `kind: ScanPolicy`.
+
+### Filesystem finding (vs. byte finding)
+
+The line that decides **which artifact's verdict a scan finding feeds**. A
+*byte* finding is a statement that holds of the bytes however they are
+composed — a leaked key, malware — and keeps condemning the artifact it was
+found in. A *filesystem* finding is a statement about a composed tree — "this
+package is installed and vulnerable" — and is carried by the
+[composed filesystem](#composed-filesystem-of-an-oci-image), not by the layer
+it was observed in; on the layer it is **evidence**, with the constituent
+digest and path recorded as attribution. Today every finding class hort
+consumes is of the second kind.
+
+Each finding carries which kind it is, in memory only, assembled by the
+two layers that each know one half: the scanner adapter states which
+section of its report the finding came out of, and the application layer
+places that claim against the artifact's role (its format handler's
+artifact kind) — so a layer's filesystem claim is distinguishable from
+a composed image's. The claim loses its authority over a layer only
+where the policy's
+[composite verdict mode](#composite-verdict-mode-compositeverdictmode)
+has promoted the composition's verdict; a finding read back out of the
+stored findings blob states nothing and keeps the authority it has
+today, which is what keeps the loosening away from the already-rejected
+estate. See
+[ADR 0064](adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
+D2, D4 and D6.
 
 ### Global grant
 
@@ -109,6 +184,17 @@ other, and an artifact can be in one, both, or neither. The `held_` /
 two apart in an operator's dashboard; the shared word is an accident of
 English, not a shared concept.
 
+### Layer chain ID (`chainID`)
+
+The OCI image spec's identifier for a filesystem **state**, as distinct from a
+layer: `chainID(n) = sha256(chainID(n-1) + " " + diffID(n))`, with a single
+layer's chain ID being its own `diffID`. It exists because a filesystem state
+is identified by an **ordered prefix** of layers, not by a layer — which is
+the spec's own statement that a layer blob, although it exists independently
+and may appear at a different position in another image, does not *function*
+independently. Container runtimes key their local storage on it. Cited in
+[ADR 0064](adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md).
+
 ### Manual release
 
 An `ArtifactReleased` a human authorized — `released_by ∈ {Admin, Curator}` —
@@ -148,6 +234,22 @@ staging. See [ADR 0048](adr/0048-release-branch-staging-strategy.md) D3, D5.
 suffix. A single promotion can batch-close many issues that had been
 resting in `ready-for-staging` / `in-uat`. See
 [ADR 0048](adr/0048-release-branch-staging-strategy.md) D1, D5.
+
+### Scan unit
+
+The artifact a scan verdict is **about**, which is not always the artifact
+whose bytes were read. For an OCI image it is the **image manifest**: the
+config and ordered layers are materialised as an OCI layout and scanned as one
+image, and the verdict lands on the manifest. A layer is still scanned and
+still produces findings, but on the filesystem axis those are evidence rather
+than a verdict (see [Filesystem finding](#filesystem-finding-vs-byte-finding)).
+An image index is not a scan unit for package findings — it binds references
+and no runnable filesystem — and keeps its not-applicable assessment.
+Whether the composition's verdict decides the manifest's release is the
+policy's
+[composite verdict mode](#composite-verdict-mode-compositeverdictmode). See
+[ADR 0064](adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
+D1, D5 and D6.
 
 ### Scanner capability map
 

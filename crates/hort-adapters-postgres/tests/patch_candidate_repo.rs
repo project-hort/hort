@@ -109,24 +109,74 @@ async fn seed_artifact(
     id
 }
 
-/// Seed one `scan_findings` row for `artifact_id` at the given severity.
+/// Truncate a `DateTime<Utc>` to microsecond precision so Rust's
+/// nanosecond clock and Postgres' `timestamptz` column agree on the exact
+/// value the last-scan anchor is compared against.
+fn truncate_us(t: DateTime<Utc>) -> DateTime<Utc> {
+    let us = t.timestamp_micros();
+    DateTime::<Utc>::from_timestamp_micros(us).expect("microsecond round-trip")
+}
+
+/// Seed one scan: its `scan_findings` rows plus the
+/// `artifacts.last_scan_at` advance, in one transaction.
+///
+/// This is the pairing `PgArtifactLifecycle::commit_scan_result_with_score`
+/// makes in production — the per-finding rows and the `last_scan_at` write
+/// land in the same SQL transaction, bound from the same timestamp the rows
+/// carry as `detected_at`. The candidacy query's findings LATERAL anchors on
+/// exactly that equality, so a seeder that wrote rows without advancing the
+/// anchor would be seeding a state no scan can produce.
+///
+/// `vulnerabilities` is one `(vulnerability_id, severity)` pair per finding.
+/// An empty slice is a **clean scan**: no row is written and the anchor still
+/// advances.
+async fn seed_scan(
+    pool: &PgPool,
+    artifact_id: Uuid,
+    detected_at: DateTime<Utc>,
+    vulnerabilities: &[(&str, &str)],
+) {
+    let scan_id = Uuid::new_v4();
+    let mut tx = pool.begin().await.expect("seed_scan begin");
+    for (vulnerability_id, severity) in vulnerabilities {
+        sqlx::query(
+            r#"INSERT INTO public.scan_findings
+                  (artifact_id, scan_id, purl, vulnerability_id, severity,
+                   source_scanner, title, detected_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+        )
+        .bind(artifact_id)
+        .bind(scan_id)
+        .bind(format!("pkg:test/{}@1.0", artifact_id.simple()))
+        .bind(*vulnerability_id)
+        .bind(*severity)
+        .bind("test-scanner")
+        .bind("integration-test finding")
+        .bind(detected_at)
+        .execute(&mut *tx)
+        .await
+        .expect("seed_scan finding row");
+    }
+    sqlx::query("UPDATE public.artifacts SET last_scan_at = $1 WHERE id = $2")
+        .bind(detected_at)
+        .bind(artifact_id)
+        .execute(&mut *tx)
+        .await
+        .expect("seed_scan last_scan_at");
+    tx.commit().await.expect("seed_scan commit");
+}
+
+/// One scan reporting one finding at `severity`, committed now. The shape
+/// most tests here want; multi-scan histories call [`seed_scan`] directly.
 async fn seed_finding(pool: &PgPool, artifact_id: Uuid, severity: &str) {
-    sqlx::query(
-        r#"INSERT INTO public.scan_findings
-              (artifact_id, scan_id, purl, vulnerability_id, severity,
-               source_scanner, title, detected_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, now())"#,
+    let vuln = format!("CVE-TEST-{}", artifact_id.simple());
+    seed_scan(
+        pool,
+        artifact_id,
+        truncate_us(Utc::now()),
+        &[(vuln.as_str(), severity)],
     )
-    .bind(artifact_id)
-    .bind(Uuid::new_v4())
-    .bind(format!("pkg:test/{}@1.0", artifact_id.simple()))
-    .bind(format!("CVE-TEST-{}", artifact_id.simple()))
-    .bind(severity)
-    .bind("test-scanner")
-    .bind("integration-test finding")
-    .execute(pool)
-    .await
-    .expect("seed_finding");
+    .await;
 }
 
 /// Drop the repository, cascading through `artifacts` and
@@ -385,6 +435,398 @@ async fn list_candidates_orders_by_severity_descending() {
         rows[high_idx].vulnerable_max_severity,
         Some(SeverityThreshold::High)
     );
+
+    cleanup(&pool, repo_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// The candidacy summary — and the ORDER BY built on it — answer about the
+// released predecessor's LAST scan.
+//
+// `scan_findings` is per-scan history, so a summary filtered on
+// `artifact_id` alone grows with the rescan count. On this surface that
+// does not merely mis-report a number: the listing orders by
+// `max_severity_rank`, so a severity no later scan reports would outrank a
+// genuinely worse candidate, and a predecessor whose findings were all
+// retracted would keep being offered as the thing to patch towards.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_candidates_summary_is_the_last_scan_not_the_union() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let t_released = truncate_us(Utc::now() - Duration::hours(5));
+    let t_quarantined = truncate_us(Utc::now() - Duration::hours(4));
+
+    let pkg_v1_0 = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
+    let _pkg_v1_1 = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.1",
+        Some("quarantined"),
+        t_quarantined,
+    )
+    .await;
+
+    // Two scans on the released row: a critical pair, then a single low.
+    // The union is three rows / Critical; the last scan is one row / Low.
+    seed_scan(
+        &pool,
+        pkg_v1_0,
+        truncate_us(Utc::now() - Duration::hours(3)),
+        &[("CVE-A", "critical"), ("CVE-B", "high")],
+    )
+    .await;
+    seed_scan(
+        &pool,
+        pkg_v1_0,
+        truncate_us(Utc::now() - Duration::hours(2)),
+        &[("CVE-C", "low")],
+    )
+    .await;
+
+    let adapter = PgPatchCandidateRepository::new(pool.clone());
+    let rows = adapter
+        .list_candidates(PatchCandidateFilter {
+            repository_id: Some(repo_id),
+            ..PatchCandidateFilter::default()
+        })
+        .await
+        .expect("list_candidates");
+
+    assert_eq!(rows.len(), 1, "one quarantined/released pair");
+    assert_eq!(rows[0].vulnerable_finding_count, 1);
+    assert_eq!(
+        rows[0].vulnerable_max_severity,
+        Some(SeverityThreshold::Low),
+        "the ranked severity is the last scan's, not the all-time highest"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_candidates_clean_last_scan_drops_the_pair() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let t_released = truncate_us(Utc::now() - Duration::hours(5));
+    let t_quarantined = truncate_us(Utc::now() - Duration::hours(4));
+
+    let pkg_v1_0 = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
+    let _pkg_v1_1 = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.1",
+        Some("quarantined"),
+        t_quarantined,
+    )
+    .await;
+
+    // Dirty, then clean. The clean run writes no row, so the only thing
+    // that can tell this apart from "still dirty" is the anchor on
+    // `artifacts.last_scan_at`.
+    seed_scan(
+        &pool,
+        pkg_v1_0,
+        truncate_us(Utc::now() - Duration::hours(3)),
+        &[("CVE-A", "critical")],
+    )
+    .await;
+    seed_scan(
+        &pool,
+        pkg_v1_0,
+        truncate_us(Utc::now() - Duration::hours(2)),
+        &[],
+    )
+    .await;
+
+    let adapter = PgPatchCandidateRepository::new(pool.clone());
+    let rows = adapter
+        .list_candidates(PatchCandidateFilter {
+            repository_id: Some(repo_id),
+            ..PatchCandidateFilter::default()
+        })
+        .await
+        .expect("list_candidates");
+
+    assert!(
+        rows.is_empty(),
+        "the released predecessor's last scan reports nothing, so it is not \
+         a vulnerable row to patch away from; got {rows:?}"
+    );
+
+    // The history is intact — the pair dropped out of the listing, no row
+    // was removed.
+    let total: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scan_findings WHERE artifact_id = $1")
+            .bind(pkg_v1_0)
+            .fetch_one(&pool)
+            .await
+            .expect("count all rows");
+    assert_eq!(total, 1);
+
+    cleanup(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_candidates_order_follows_the_last_scan_severity() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let t_released = truncate_us(Utc::now() - Duration::hours(5));
+    let t_quarantined = truncate_us(Utc::now() - Duration::hours(4));
+    let t_first = truncate_us(Utc::now() - Duration::hours(3));
+    let t_last = truncate_us(Utc::now() - Duration::hours(2));
+
+    // `pkg`'s released row once carried a Critical and now carries a Low.
+    // `lib`'s released row has only ever carried a High. Ordered on the
+    // union, `pkg` leads; ordered on the last scan — which is what the
+    // verdicts are derived from — `lib` does.
+    let pkg_v1_0 = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
+    let _pkg_v1_1 = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.1",
+        Some("quarantined"),
+        t_quarantined,
+    )
+    .await;
+    seed_scan(&pool, pkg_v1_0, t_first, &[("CVE-A", "critical")]).await;
+    seed_scan(&pool, pkg_v1_0, t_last, &[("CVE-B", "low")]).await;
+
+    let lib_v1_0 = seed_artifact(&pool, repo_id, "lib", "1.0", Some("released"), t_released).await;
+    let _lib_v1_1 = seed_artifact(
+        &pool,
+        repo_id,
+        "lib",
+        "1.1",
+        Some("quarantined"),
+        t_quarantined,
+    )
+    .await;
+    seed_scan(&pool, lib_v1_0, t_last, &[("CVE-C", "high")]).await;
+
+    let adapter = PgPatchCandidateRepository::new(pool.clone());
+    let rows = adapter
+        .list_candidates(PatchCandidateFilter {
+            repository_id: Some(repo_id),
+            ..PatchCandidateFilter::default()
+        })
+        .await
+        .expect("list_candidates");
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].package_name, "lib");
+    assert_eq!(
+        rows[0].vulnerable_max_severity,
+        Some(SeverityThreshold::High)
+    );
+    assert_eq!(rows[1].package_name, "pkg");
+    assert_eq!(
+        rows[1].vulnerable_max_severity,
+        Some(SeverityThreshold::Low)
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_candidates_last_scan_subset_is_the_subset_not_the_union() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let t_released = truncate_us(Utc::now() - Duration::hours(5));
+    let t_quarantined = truncate_us(Utc::now() - Duration::hours(4));
+
+    let pkg_v1_0 = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
+    let _pkg_v1_1 = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.1",
+        Some("quarantined"),
+        t_quarantined,
+    )
+    .await;
+
+    // The counter-assertion: the second scan reports a proper subset of
+    // the first, dropping the severe one. A DISTINCT over
+    // `vulnerability_id` would answer 2 / Critical.
+    seed_scan(
+        &pool,
+        pkg_v1_0,
+        truncate_us(Utc::now() - Duration::hours(3)),
+        &[("CVE-A", "critical"), ("CVE-B", "medium")],
+    )
+    .await;
+    seed_scan(
+        &pool,
+        pkg_v1_0,
+        truncate_us(Utc::now() - Duration::hours(2)),
+        &[("CVE-B", "medium")],
+    )
+    .await;
+
+    let adapter = PgPatchCandidateRepository::new(pool.clone());
+    let rows = adapter
+        .list_candidates(PatchCandidateFilter {
+            repository_id: Some(repo_id),
+            ..PatchCandidateFilter::default()
+        })
+        .await
+        .expect("list_candidates");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].vulnerable_finding_count, 1);
+    assert_eq!(
+        rows[0].vulnerable_max_severity,
+        Some(SeverityThreshold::Medium)
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// Soft delete — both legs.
+//
+// The query lost its liveness predicate when the inert `is_deleted`
+// column was dropped, one day before real soft delete arrived under the
+// name `deleted_at`. The two legs are offered for different reasons, so
+// each is asserted on its own: a deleted `q` is work that cannot be done,
+// and a deleted `v` makes the whole proposition ("you are serving
+// something vulnerable") false.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_candidates_omits_a_pair_whose_quarantined_side_is_soft_deleted() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let t_released = Utc::now() - Duration::hours(2);
+    let t_quarantined = Utc::now() - Duration::hours(1);
+
+    let released = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
+    let quarantined = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.1",
+        Some("quarantined"),
+        t_quarantined,
+    )
+    .await;
+    seed_finding(&pool, released, "high").await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, quarantined).await;
+
+    let adapter = PgPatchCandidateRepository::new(pool.clone());
+    let rows = adapter
+        .list_candidates(PatchCandidateFilter::default())
+        .await
+        .expect("list_candidates");
+
+    assert!(
+        !rows
+            .iter()
+            .any(|c| c.quarantined_artifact_id == quarantined),
+        "the quarantined side is the work this surface proposes; a \
+         deleted one is out of the catalog, so proposing it displaces a \
+         real candidate from a LIMIT-bounded, severity-ranked worklist"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_candidates_omits_a_pair_whose_released_side_is_soft_deleted() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let t_released = Utc::now() - Duration::hours(2);
+    let t_quarantined = Utc::now() - Duration::hours(1);
+
+    let released = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
+    let quarantined = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.1",
+        Some("quarantined"),
+        t_quarantined,
+    )
+    .await;
+    seed_finding(&pool, released, "high").await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, released).await;
+
+    let adapter = PgPatchCandidateRepository::new(pool.clone());
+    let rows = adapter
+        .list_candidates(PatchCandidateFilter::default())
+        .await
+        .expect("list_candidates");
+
+    assert!(
+        !rows
+            .iter()
+            .any(|c| c.quarantined_artifact_id == quarantined),
+        "the released predecessor's findings are the reason to patch; a \
+         deleted one is not being served, so there is nothing to patch \
+         away from"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// The filter excludes deleted rows and nothing else: the same pair, with
+/// neither side deleted, still comes back.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_candidates_still_returns_a_pair_with_both_sides_live() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let t_released = Utc::now() - Duration::hours(2);
+    let t_quarantined = Utc::now() - Duration::hours(1);
+
+    let released = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
+    let quarantined = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "1.1",
+        Some("quarantined"),
+        t_quarantined,
+    )
+    .await;
+    seed_finding(&pool, released, "high").await;
+
+    let adapter = PgPatchCandidateRepository::new(pool.clone());
+    let rows = adapter
+        .list_candidates(PatchCandidateFilter::default())
+        .await
+        .expect("list_candidates");
+
+    let row = rows
+        .iter()
+        .find(|c| c.quarantined_artifact_id == quarantined)
+        .expect("the liveness predicates must not exclude a live pair");
+    assert_eq!(row.vulnerable_artifact_id, released);
 
     cleanup(&pool, repo_id).await;
 }

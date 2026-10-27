@@ -104,6 +104,7 @@ use hort_app::use_cases::provenance_orchestration::ProvenanceOrchestrationUseCas
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::scan_orchestration::{ScanOrchestrationConfig, ScanOrchestrationUseCase};
 use hort_app::use_cases::seed_import_use_case::SeedImportUseCase;
+use hort_app::use_cases::ShadowObservationSink;
 use hort_domain::ports::advisory::AdvisoryPort;
 use hort_domain::ports::advisory_sync_state::AdvisorySyncStateRepository;
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
@@ -131,6 +132,8 @@ use hort_domain::ports::replay_seen_prune::ReplaySeenPrunePort;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 // Port trait for the PrefetchTickHandler's mapping resolver dep +
 // the HttpUpstreamProxy adapter.
+use crate::config::{StorageConfig, WorkerConfig};
+use crate::pg_identity;
 use arc_swap::ArcSwap;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
 use hort_domain::ports::rescan_candidates::RescanCandidatesRepository;
@@ -145,14 +148,6 @@ use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::ports::user_repository::UserRepository;
-use hort_formats::cargo::CargoFormatHandler;
-use hort_formats::maven::MavenFormatHandler;
-use hort_formats::npm::NpmFormatHandler;
-use hort_formats::oci::OciFormatHandler;
-use hort_formats::pypi::PyPiFormatHandler;
-
-use crate::config::{StorageConfig, WorkerConfig};
-use crate::pg_identity;
 
 /// Output of [`build_app_context`] — the full set of handles the
 /// heartbeat task (and any future operator tasks) share via `Arc`.
@@ -198,24 +193,18 @@ pub struct BuildOutput {
 
 /// The compiled-in format-handler registry, keyed by handler key.
 ///
-/// Until the WASM module loader lands this is the canonical list, and
-/// it is the same one `hort-server` wires. Extracted from
-/// [`build_app_context`] so the scanner-capability parity guard can ask
-/// the *actual* registry which keys exist and what each handler
-/// declares — a second list maintained alongside this one would be free
-/// to drift, and a guard that drifts with the thing it guards proves
-/// nothing.
+/// Re-exported from [`hort_formats::compiled_in_format_handlers`] — the
+/// crate that owns the handlers now owns the one list of them, because
+/// `hort-server` wires the same registry and a second copy maintained
+/// here would be free to drift. Kept as a function on this module so the
+/// scanner-capability parity guard can ask the *actual* registry which
+/// keys exist and what each handler declares; a guard that drifts with
+/// the thing it guards proves nothing.
 ///
 /// Constructing it opens nothing: every handler is a unit struct.
 #[must_use]
 pub fn compiled_in_format_handlers() -> HashMap<String, Arc<dyn FormatHandler>> {
-    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
-    handlers.insert("pypi".into(), Arc::new(PyPiFormatHandler));
-    handlers.insert("cargo".into(), Arc::new(CargoFormatHandler));
-    handlers.insert("npm".into(), Arc::new(NpmFormatHandler));
-    handlers.insert("oci".into(), Arc::new(OciFormatHandler));
-    handlers.insert("maven".into(), Arc::new(MavenFormatHandler));
-    handlers
+    hort_formats::compiled_in_format_handlers()
 }
 
 /// Build the full worker context. Steps mirror `hort-server`'s
@@ -530,6 +519,66 @@ pub async fn build_app_context(
     ));
 
     // -----------------------------------------------------------------
+    // 8.bis The two upstream handles the composite scan path needs, built
+    //       HERE because `ScanOrchestrationUseCase` below takes them.
+    //
+    //       A composed OCI image is the scan unit of an image manifest
+    //       (ADR 0064 D1), and a pull-through manifest's layers are
+    //       routinely not local: its constituent edges are registered by
+    //       digest with no existence check, and the client pull that would
+    //       warm them starts with the manifest whose verdict is being
+    //       gated. So the scan job acquires them, for proxy repositories
+    //       only.
+    //
+    //       The secret port is the smallest env+file dispatch, the same
+    //       shape hort-server composes and the same instance the prefetch,
+    //       provenance and index-child legs below take — it is built here
+    //       rather than at its old site further down because it is now
+    //       needed earlier, and one instance is correct for all of them.
+    // -----------------------------------------------------------------
+    let secrets_file_root: Option<std::path::PathBuf> =
+        match std::env::var("HORT_SECRETS_FILE_ROOT") {
+            Ok(s) if !s.is_empty() => Some(std::path::PathBuf::from(s)),
+            _ => None,
+        };
+    let secret_port: Arc<dyn SecretPort> = Arc::new(hort_adapters_secrets::DispatchSecretPort {
+        env: Arc::new(hort_adapters_secrets::EnvVarSecretAdapter),
+        file: Arc::new(
+            hort_adapters_secrets::MountedFileSecretAdapter::new_with_root(secrets_file_root),
+        ),
+    });
+    // ONE resolver instance for every worker consumer that needs one —
+    // the scan orchestrator here, the provenance orchestrator and the
+    // eager index-child ingest further down. A second instance would
+    // carry a second refresh clock, so two consumers could disagree about
+    // which upstream serves a name for up to a refresh interval. Constructed
+    // empty; the boot prime from
+    // `RepositoryUpstreamMappingRepository::list_all` and the background
+    // refresh task are wired where the mapping repo exists (step 12.g).
+    let caching_resolver = Arc::new(hort_adapters_upstream_http::CachingResolver::new());
+    // Its own `HttpUpstreamProxy`, NOT a clone of another leg's:
+    // `format_label` is the metric label fired on every outbound fetch, so
+    // cloning one subsystem's proxy into another mis-attributes its
+    // `hort_upstream_fetch_*` series. Constituent acquisition is the one
+    // outbound leg an operator did not ask for by issuing a request, which
+    // makes keeping it separately attributable the point rather than a
+    // nicety.
+    let upstream_proxy_for_composite_scan: Arc<dyn UpstreamProxy> = {
+        let cfg_for_proxy = hort_adapters_upstream_http::HttpUpstreamProxyConfig {
+            extra_trust_anchors: extra_ca.cloned(),
+            // Same upstream User-Agent as hort-server and the worker's
+            // other outbound legs (HORT_UPSTREAM_USER_AGENT or the
+            // built-in default), so a custom value applies uniformly.
+            user_agent: hort_adapters_upstream_http::user_agent_from_env(),
+            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new("composite_scan")
+        };
+        Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(
+            cfg_for_proxy,
+            secret_port.clone(),
+        )?)
+    };
+
+    // -----------------------------------------------------------------
     // 9. ScanOrchestrationUseCase. Default backends come from the wired
     //    scanner names; moving the source onto `ScanPolicy.scan_backends`
     //    is tracked as a future change.
@@ -557,6 +606,9 @@ pub async fn build_app_context(
         // for artifacts in a hosted repository; every other scan never
         // touches it.
         storage.clone(),
+        // The composite path's constituent acquisition (ADR 0064 D1).
+        upstream_proxy_for_composite_scan,
+        caching_resolver.clone(),
         scanners_map,
         // Clone so the SeedImportUseCase below can consume the same
         // handler set. The `Arc<dyn FormatHandler>` values are cheap
@@ -568,6 +620,16 @@ pub async fn build_app_context(
         // QuarantineReleaseSweepHandler registration below (Arc clone
         // preserves single-instance semantics).
         quarantine.clone(),
+        // Where the composite path's shadow assessment leaves its
+        // durable evidence (ADR 0064 D6). The orchestrator is handed the
+        // sink, never the projection's repository: a shadow verdict's
+        // table must not be reachable from the code that commits the
+        // artifact's own scan result.
+        Arc::new(ShadowObservationSink::new(Arc::new(
+            hort_adapters_postgres::composite_scan_observations::PgCompositeScanObservationRepository::new(
+                pool.clone(),
+            ),
+        ))),
         orch_cfg,
     ));
 
@@ -714,25 +776,15 @@ pub async fn build_app_context(
     // proxy adapter mirrors hort-server's wiring; the worker assembles
     // its own instance because it runs in its own process.
     //
-    // Secret port: the smallest env+file dispatch (same shape as
-    // hort-server::composition) — Phase-1 prefetch only targets the
-    // Anonymous catch-all mapping (npm/cargo/pypi public registries)
-    // so the SecretPort is unused at the call site, but the adapter
-    // constructor requires it. HORT_SECRETS_FILE_ROOT is honoured the
-    // same way hort-server reads it; the worker's pod likely has no
-    // mounted-file secrets configured, in which case the file branch
-    // is never reached for Anonymous mappings.
-    let secrets_file_root: Option<std::path::PathBuf> =
-        match std::env::var("HORT_SECRETS_FILE_ROOT") {
-            Ok(s) if !s.is_empty() => Some(std::path::PathBuf::from(s)),
-            _ => None,
-        };
-    let secret_port: Arc<dyn SecretPort> = Arc::new(hort_adapters_secrets::DispatchSecretPort {
-        env: Arc::new(hort_adapters_secrets::EnvVarSecretAdapter),
-        file: Arc::new(
-            hort_adapters_secrets::MountedFileSecretAdapter::new_with_root(secrets_file_root),
-        ),
-    });
+    // Secret port: the shared `secret_port` built at step 8.bis (the
+    // smallest env+file dispatch, same shape as hort-server::composition).
+    // Phase-1 prefetch only targets the Anonymous catch-all mapping
+    // (npm/cargo/pypi public registries) so the SecretPort is unused at
+    // the call site, but the adapter constructor requires it.
+    // HORT_SECRETS_FILE_ROOT is honoured the same way hort-server reads
+    // it; the worker's pod likely has no mounted-file secrets configured,
+    // in which case the file branch is never reached for Anonymous
+    // mappings.
     let upstream_proxy_for_prefetch: Arc<dyn UpstreamProxy> = {
         let cfg_for_proxy = hort_adapters_upstream_http::HttpUpstreamProxyConfig {
             // `format_label` is the metric label fired on every
@@ -1138,6 +1190,12 @@ pub async fn build_app_context(
             repository_access_for_policy,
             curation_rules.clone(),
             jobs.clone(),
+            // The same compiled-in registry the scan orchestrator holds:
+            // both directions of the re-evaluation pass resolve an
+            // artifact's kind through it, so a verdict re-taken over
+            // stored findings reads the row's role the way the scan run
+            // read it (ADR 0064 D2).
+            handlers.clone(),
         ));
         dispatcher.register(
             Arc::new(hort_app::task_handlers::PolicyReEvaluationHandler::new(
@@ -1439,11 +1497,13 @@ pub async fn build_app_context(
     // for proxy-scoped repos; hosted-repo provenance is unaffected.
     //
     // This ONE instance serves every worker consumer that needs it — the
+    // scan orchestrator's composite-scan constituent acquisition (step
+    // 8.bis, where it is constructed, because that use case takes it), the
     // provenance orchestrator below and the eager index-child ingest handler
     // registered just after it. A second instance would carry a second
-    // refresh clock, so the two could disagree about which upstream serves a
-    // name for up to a refresh interval.
-    let caching_resolver = Arc::new(hort_adapters_upstream_http::CachingResolver::new());
+    // refresh clock, so the three could disagree about which upstream serves
+    // a name for up to a refresh interval.
+    //
     // Boot-prime from the same mapping repo the prefetch path uses. A
     // prime failure is logged but does NOT abort boot — an operator with
     // no upstream mappings configured (or a transient DB hiccup) sees an

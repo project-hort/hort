@@ -6,6 +6,44 @@
 //! LATERAL subquery is adapter-private — the trait surface returns
 //! `Option<SeverityThreshold>` and the integer never leaves this
 //! module.
+//!
+//! ## The finding summary answers about the released row's LAST scan
+//!
+//! `scan_findings` is per-scan history — every run writes its rows under a
+//! fresh `scan_id` and nothing removes the previous run's — so a summary
+//! filtered on `artifact_id` alone counts every scan the artifact ever had
+//! and grows with the rescan count. This surface **orders by** that
+//! summary, so the distortion does not just mis-report a number, it
+//! reorders the operator's worklist.
+//!
+//! The LATERAL therefore carries `sf.detected_at = v.last_scan_at`, which
+//! selects exactly one scan's rows: every row of one scan shares the one
+//! `detected_at` the run was committed with.
+//! `PgArtifactLifecycle::commit_scan_result_with_score` writes
+//! `artifacts.last_scan_at` and inserts the per-finding rows in the SAME
+//! transaction from that same value, so the anchor and the rows it selects
+//! cannot disagree. An anchor taken from inside `scan_findings` (the
+//! newest `scan_id` present, say) would instead hand back the previous,
+//! dirty run for an artifact whose latest scan found nothing — a clean
+//! scan writes no row.
+//!
+//! Scoping the summary also narrows candidacy: the `f.finding_count > 0`
+//! join condition now means "the released predecessor's last scan still
+//! reports something", so a predecessor whose findings a later scan
+//! retracted stops being offered as the thing to patch towards.
+//!
+//! ## Both legs exclude soft-deleted rows
+//!
+//! `q.deleted_at IS NULL` and `v.deleted_at IS NULL` are separate
+//! predicates because the two legs are offered to the operator for
+//! different reasons and each has to be live on its own terms. `q` is the
+//! quarantined artifact this surface proposes as work: a deleted one is
+//! out of the catalog, so proposing it is work that cannot be done, and
+//! — the query being `LIMIT`-bounded and `ORDER BY`-ranked — it displaces
+//! a real candidate. `v` is the released predecessor whose findings are
+//! the whole reason to patch: the proposition is "you are serving
+//! something vulnerable, here is a newer version", and a deleted `v` is
+//! not being served, so the proposition is false.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -73,6 +111,7 @@ impl PatchCandidateRepository for PgPatchCandidateRepository {
                  AND v.name = q.name
                  AND v.id <> q.id
                  AND v.quarantine_status = 'released'
+                 AND v.deleted_at IS NULL
                  AND v.created_at < q.created_at
                 JOIN LATERAL (
                     SELECT COUNT(*)::bigint AS finding_count,
@@ -85,8 +124,16 @@ impl PatchCandidateRepository for PgPatchCandidateRepository {
                                END)::int2 AS max_severity_rank
                     FROM scan_findings sf
                     WHERE sf.artifact_id = v.id
+                      -- The released predecessor's LAST scan and nothing
+                      -- else — `ORDER BY f.max_severity_rank DESC` below
+                      -- ranks on this, so a stale severity no later scan
+                      -- reports would reorder the operator's worklist. See
+                      -- the module docs for why the anchor is
+                      -- `artifacts.last_scan_at`.
+                      AND sf.detected_at = v.last_scan_at
                 ) f ON f.finding_count > 0
                 WHERE q.quarantine_status = 'quarantined'
+                  AND q.deleted_at IS NULL
                   AND r.format::text <> 'oci'
                   AND ($1::uuid IS NULL OR q.repository_id = $1)
                 ORDER BY f.max_severity_rank DESC, q.created_at DESC

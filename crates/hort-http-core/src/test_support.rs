@@ -874,7 +874,8 @@ pub struct MockPorts {
 pub fn seed_permissive_global_policy_for_tests(projections: &MockPolicyProjectionRepository) {
     use chrono::Utc;
     use hort_domain::entities::scan_policy::{
-        NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+        CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
+        ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::events::PolicyScope;
     let now = Utc::now();
@@ -895,6 +896,7 @@ pub fn seed_permissive_global_policy_for_tests(projections: &MockPolicyProjectio
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
+        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: now,
         updated_at: now,
@@ -1037,7 +1039,8 @@ fn repo_scoped_hold_policy(
 ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
     use chrono::Utc;
     use hort_domain::entities::scan_policy::{
-        NegligibleAction, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+        CompositeVerdictMode, NegligibleAction, ScanEnforcement, ScanPolicyProjection,
+        SeverityThreshold,
     };
     use hort_domain::events::PolicyScope;
     let now = Utc::now();
@@ -1058,6 +1061,7 @@ fn repo_scoped_hold_policy(
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
+        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: now,
         updated_at: now,
@@ -1530,6 +1534,7 @@ pub fn build_mock_ctx_with_label_flag(
         repository_access_use_case.clone(),
         curation_rules.clone(),
         storage.clone(),
+        HashMap::new(),
     ));
 
     // Admin-gated one-shot repair of the artifacts stranded `Rejected`
@@ -1568,6 +1573,7 @@ pub fn build_mock_ctx_with_label_flag(
         // async `policy-reevaluation` task; share the mock jobs repo so
         // tests can assert the enqueue.
         jobs.clone(),
+        HashMap::new(),
     ));
 
     // `WheelMetadataUseCase` composed over the

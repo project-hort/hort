@@ -262,7 +262,7 @@ mod tests {
     use uuid::Uuid;
 
     use hort_domain::events::system_actor;
-    use hort_domain::ports::jobs_repository::{JobRow, JobStatus, KindFields};
+    use hort_domain::ports::jobs_repository::{JobRow, JobStatus, KindFields, ResultWriteOutcome};
 
     use crate::use_cases::test_support::MockJobsRepository;
 
@@ -458,24 +458,27 @@ mod tests {
             fn mark_completed<'a>(
                 &'a self,
                 _id: Uuid,
+                _attempt: u32,
                 _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
+            ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+                Box::pin(async { Ok(ResultWriteOutcome::Applied) })
             }
             fn reschedule<'a>(
                 &'a self,
                 _id: Uuid,
+                _attempt: u32,
                 _b: Duration,
                 _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
+            ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+                Box::pin(async { Ok(ResultWriteOutcome::Applied) })
             }
             fn mark_failed<'a>(
                 &'a self,
                 _id: Uuid,
+                _attempt: u32,
                 _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
+            ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
+                Box::pin(async { Ok(ResultWriteOutcome::Applied) })
             }
             fn enqueue_scan<'a>(
                 &'a self,

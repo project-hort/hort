@@ -121,6 +121,13 @@ its own disqualifying findings is in `quarantine_status='rejected'`, not
 `'quarantined'`, and the patch-candidate listing surface shows you the
 findings (if any) before you act.
 
+`vulnerable_finding_count` and `vulnerable_max_severity` — and the order
+the listing comes back in — describe the released predecessor's **last**
+scan, the same scan its verdict was derived from. A vulnerability an
+earlier scan reported and a later one no longer does is neither counted
+nor ranked, and a predecessor whose last scan found nothing at all stops
+appearing as something to patch away from.
+
 ---
 
 ## 4. Command sequence

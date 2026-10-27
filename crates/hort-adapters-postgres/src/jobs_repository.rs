@@ -16,8 +16,8 @@ use uuid::Uuid;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::jobs_repository::{
     CompensatingDelete, EnqueueOutcome, JobRow, JobStatus, JobsRepository, KindFields,
-    ListJobsFilter, ListJobsPage, PendingKindBacklog, RequeueOutcome, RequeuedJob, ScanJob,
-    ScanKindFields, TriggerSource,
+    ListJobsFilter, ListJobsPage, PendingKindBacklog, RequeueOutcome, RequeuedJob,
+    ResultWriteOutcome, ScanJob, ScanKindFields, TriggerSource,
 };
 use hort_domain::types::{ContentHash, IdempotencyKey};
 use serde_json::Value as JsonValue;
@@ -240,6 +240,126 @@ const RENEW_LEASE_SQL: &str = "UPDATE public.jobs SET\n\
                    AND locked_by = $2\n\
                    AND status = 'running'";
 
+/// Build the statement behind one of the three result writes
+/// ([`JobsRepository::mark_completed`], [`JobsRepository::reschedule`],
+/// [`JobsRepository::mark_failed`]).
+///
+/// `set_clause` is the write's own `SET` body, with `$1` reserved for
+/// the job id and `$2` for the attempt that identifies the writing
+/// execution — so a write's own binds start at `$3`. `updated_at` is
+/// appended here rather than repeated per caller.
+///
+/// # The fence
+///
+/// `AND attempts = $2` is the predicate this whole statement exists
+/// for. The three writes carry the result of ONE execution of a row,
+/// and a row can be executed twice: the abandoned-lease sweep
+/// ([`REQUEUE_ABANDONED_SQL`]) returns a stalled row to `pending` and a
+/// sibling claims it. Without the predicate a worker the sweep gave up
+/// on writes `completed` / `failed` / `pending` over the sibling's
+/// running work — and `pending` is the worst of the three, because it
+/// invites a third concurrent execution and charges an attempt to the
+/// wrong run. `locked_by` cannot serve as the fence: the sweep NULLs it
+/// and the sibling's claim overwrites it. `attempts` can, because both
+/// claim statements increment it and nothing else writes it — see
+/// `hort_domain::ports::jobs_repository::ResultWriteOutcome` for the
+/// full derivation, including why an honest late result from an
+/// execution nobody superseded still lands.
+///
+/// # Why the outer `SELECT`
+///
+/// One round trip has to answer three outcomes, and `rows_affected`
+/// answers only two of them: a zero cannot tell a superseded execution
+/// from a row that no longer exists, and reporting a clobber that never
+/// happened is its own defect. All parts of a statement see the same
+/// snapshot — the main query cannot observe its own data-modifying
+/// CTE — so `j.attempts` here is exactly the value the fence compared
+/// against, not a re-read that could have moved in between. That it is
+/// also the post-update value holds because no result write touches the
+/// column.
+fn fenced_result_write_sql(set_clause: &str) -> String {
+    format!(
+        "WITH fenced AS (\n\
+             UPDATE public.jobs SET\n\
+                 {set_clause},\n\
+                 updated_at = now()\n\
+             WHERE id = $1\n\
+               AND attempts = $2\n\
+             RETURNING id\n\
+         )\n\
+         SELECT j.attempts AS current_attempt,\n\
+                EXISTS (SELECT 1 FROM fenced) AS applied\n\
+         FROM public.jobs j\n\
+         WHERE j.id = $1"
+    )
+}
+
+/// `SET` body of [`JobsRepository::mark_completed`], for
+/// [`fenced_result_write_sql`]. `$3` is the summary.
+const MARK_COMPLETED_SET: &str = "status = 'completed',\n\
+                 completed_at = now(),\n\
+                 result_summary = $3";
+
+/// `SET` body of [`JobsRepository::reschedule`], for
+/// [`fenced_result_write_sql`]. `$3` is the backoff, `$4` the error.
+const RESCHEDULE_SET: &str = "status = 'pending',\n\
+                 locked_by = NULL,\n\
+                 locked_until = now() + $3,\n\
+                 last_error = $4";
+
+/// `SET` body of [`JobsRepository::mark_failed`], for
+/// [`fenced_result_write_sql`]. `$3` is the error.
+const MARK_FAILED_SET: &str = "status = 'failed',\n\
+                 last_error = $3";
+
+/// Read the `(id, attempts)` pair that addresses a freshly-claimed row
+/// for a fenced result write.
+///
+/// Used only on the claim's unmappable-row path, where the generic row
+/// projection already failed and the adapter still has to resolve the
+/// row terminally. Returns a rendered reason rather than a
+/// `DomainError` because the caller logs it beside the projection error
+/// that brought it here.
+fn address_claimed_row(row: &sqlx::postgres::PgRow) -> Result<(Uuid, u32), String> {
+    let id: Uuid = row.try_get("id").map_err(|e| format!("id: {e}"))?;
+    let attempts: i32 = row
+        .try_get("attempts")
+        .map_err(|e| format!("attempts: {e}"))?;
+    let attempt =
+        u32::try_from(attempts).map_err(|_| format!("attempts {attempts} is negative"))?;
+    Ok((id, attempt))
+}
+
+/// Decode the one-row answer of a [`fenced_result_write_sql`] statement.
+///
+/// `None` is the row-does-not-exist case: the outer `SELECT` filters on
+/// the same id the `UPDATE` does, so no row back means no row at all.
+fn decode_result_write(
+    row: Option<sqlx::postgres::PgRow>,
+    job_id: Uuid,
+) -> DomainResult<ResultWriteOutcome> {
+    let Some(row) = row else {
+        return Ok(ResultWriteOutcome::RowGone);
+    };
+    let applied: bool = row.try_get("applied").map_err(|e| invariant(&e))?;
+    if applied {
+        return Ok(ResultWriteOutcome::Applied);
+    }
+    let current: i32 = row.try_get("current_attempt").map_err(|e| invariant(&e))?;
+    // `attempts` is `integer NOT NULL DEFAULT 0` and the two claim
+    // statements are its only writers, both `attempts + 1`, so a
+    // negative value is unreachable; surfacing it as `Invariant` rather
+    // than clamping keeps the same treatment the column gets in
+    // `row_to_job_row` and `row_to_scan_job`.
+    let current_attempt = u32::try_from(current).map_err(|_| {
+        DomainError::Invariant(format!(
+            "job {job_id}: attempts {current} is negative; only the claim writes the \
+             column and it only ever increments"
+        ))
+    })?;
+    Ok(ResultWriteOutcome::Superseded { current_attempt })
+}
+
 /// `UPDATE` behind [`JobsRepository::requeue_abandoned`] — the
 /// abandoned-lease sweep.
 ///
@@ -267,9 +387,17 @@ const RENEW_LEASE_SQL: &str = "UPDATE public.jobs SET\n\
 ///   newest scan job is exactly what `select_stranded` re-picks.
 /// - `attempts` is deliberately untouched: the next claim increments it,
 ///   so the budget is spent by execution attempts, not by sweeps.
-/// - The row is updated, never deleted. A late `mark_completed` from the
-///   original worker is `WHERE id = $1` with no status predicate, so it
-///   still lands on the surviving row rather than updating nothing.
+/// - The row is updated, never deleted, so a late result from the
+///   original worker still has somewhere to land. What makes it land is
+///   that this statement leaves `attempts` alone: the three result
+///   writes are fenced on `(id, attempts)` (see
+///   [`fenced_result_write_sql`]), and a requeued row still carries the
+///   number the original execution claimed under. The write is refused
+///   only once a sibling has claimed the row and moved `attempts` on —
+///   which is the one case where landing it would overwrite an
+///   execution that is still in flight. A status predicate would not do
+///   the same job: the surviving row is `pending` or `failed`, both of
+///   which an honest late result is entitled to write over.
 const REQUEUE_ABANDONED_SQL: &str = "WITH abandoned AS (\n\
                      SELECT id FROM public.jobs\n\
                      WHERE status = 'running'\n\
@@ -796,10 +924,11 @@ impl JobsRepository for PgJobsRepository {
     fn mark_completed<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         result_summary: serde_json::Value,
-    ) -> BoxFuture<'a, DomainResult<()>> {
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
         Box::pin(async move {
-            tracing::debug!(%job_id, "mark_completed");
+            tracing::debug!(%job_id, attempt, "mark_completed");
             // H17 — persist the handler's `result_summary`. A `Value::Null`
             // summary (the "no summary" sentinel, e.g. a handler that emits
             // its forensics elsewhere) is stored as SQL NULL, not a JSON
@@ -809,73 +938,60 @@ impl JobsRepository for PgJobsRepository {
             } else {
                 Some(result_summary)
             };
-            sqlx::query(
-                "UPDATE public.jobs SET\n\
-                     status = 'completed',\n\
-                     completed_at = now(),\n\
-                     result_summary = $2,\n\
-                     updated_at = now()\n\
-                 WHERE id = $1",
-            )
-            .bind(job_id)
-            .bind(summary)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| map_sqlx_error(&e, "ScanJob", &job_id.to_string()))?;
-            Ok(())
+            let sql = fenced_result_write_sql(MARK_COMPLETED_SET);
+            let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(job_id)
+                .bind(i64::from(attempt))
+                .bind(summary)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "ScanJob", &job_id.to_string()))?;
+            decode_result_write(row, job_id)
         })
     }
 
     fn reschedule<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         backoff: Duration,
         last_error: &'a str,
-    ) -> BoxFuture<'a, DomainResult<()>> {
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
         let interval = duration_to_pg_interval(backoff);
         let last_error = last_error.to_string();
         Box::pin(async move {
-            tracing::debug!(%job_id, "reschedule");
-            sqlx::query(
-                "UPDATE public.jobs SET\n\
-                     status = 'pending',\n\
-                     locked_by = NULL,\n\
-                     locked_until = now() + $2,\n\
-                     last_error = $3,\n\
-                     updated_at = now()\n\
-                 WHERE id = $1",
-            )
-            .bind(job_id)
-            .bind(interval)
-            .bind(&last_error)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| map_sqlx_error(&e, "ScanJob", &job_id.to_string()))?;
-            Ok(())
+            tracing::debug!(%job_id, attempt, "reschedule");
+            let sql = fenced_result_write_sql(RESCHEDULE_SET);
+            let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(job_id)
+                .bind(i64::from(attempt))
+                .bind(interval)
+                .bind(&last_error)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "ScanJob", &job_id.to_string()))?;
+            decode_result_write(row, job_id)
         })
     }
 
     fn mark_failed<'a>(
         &'a self,
         job_id: Uuid,
+        attempt: u32,
         last_error: &'a str,
-    ) -> BoxFuture<'a, DomainResult<()>> {
+    ) -> BoxFuture<'a, DomainResult<ResultWriteOutcome>> {
         let last_error = last_error.to_string();
         Box::pin(async move {
-            tracing::debug!(%job_id, "mark_failed");
-            sqlx::query(
-                "UPDATE public.jobs SET\n\
-                     status = 'failed',\n\
-                     last_error = $2,\n\
-                     updated_at = now()\n\
-                 WHERE id = $1",
-            )
-            .bind(job_id)
-            .bind(&last_error)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| map_sqlx_error(&e, "ScanJob", &job_id.to_string()))?;
-            Ok(())
+            tracing::debug!(%job_id, attempt, "mark_failed");
+            let sql = fenced_result_write_sql(MARK_FAILED_SET);
+            let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(job_id)
+                .bind(i64::from(attempt))
+                .bind(&last_error)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "ScanJob", &job_id.to_string()))?;
+            decode_result_write(row, job_id)
         })
     }
 
@@ -1323,30 +1439,38 @@ impl JobsRepository for PgJobsRepository {
             // re-queueing it would swap silent loss for a hot loop that
             // burns a batch slot every poll.
             let mut jobs: Vec<JobRow> = Vec::with_capacity(rows.len());
-            let mut unmappable: Vec<(Uuid, String)> = Vec::new();
+            let mut unmappable: Vec<(Uuid, u32, String)> = Vec::new();
             for row in &rows {
                 match row_to_job_row(row) {
                     Ok(job) => jobs.push(job),
-                    Err(e) => match row.try_get::<Uuid, _>("id") {
-                        Ok(id) => unmappable.push((id, e.to_string())),
-                        Err(id_err) => {
-                            // The `id` column itself is unreadable, so the
-                            // row cannot even be addressed for a terminal
-                            // transition. Pinned as unreachable by
+                    Err(e) => match address_claimed_row(row) {
+                        Ok((id, attempt)) => unmappable.push((id, attempt, e.to_string())),
+                        Err(address_err) => {
+                            // The terminal transition below is a fenced
+                            // result write, so addressing the row needs
+                            // both its `id` and the attempt this claim
+                            // just charged it, and one of the two did
+                            // not read. There is no write to make:
+                            // resolving the row on a guessed identity
+                            // is the clobber the fence exists to
+                            // prevent. Pinned as unreachable by
                             // `claim_pending_by_kinds_sql_*` (the
-                            // RETURNING clause always projects `id`);
-                            // logged rather than silently dropped.
+                            // RETURNING clause always projects both
+                            // columns); logged rather than silently
+                            // dropped. The row stays 'running' and
+                            // `requeue_abandoned` is its only recovery.
                             tracing::error!(
                                 error = %e,
-                                id_error = %id_err,
-                                "claim_pending_by_kinds: claimed row is unmappable AND its id is \
-                                 unreadable; the row stays 'running' and cannot be re-claimed"
+                                address_error = %address_err,
+                                "claim_pending_by_kinds: claimed row is unmappable AND cannot be \
+                                 addressed for a terminal write; the row stays 'running' and \
+                                 cannot be re-claimed"
                             );
                         }
                     },
                 }
             }
-            for (id, reason) in unmappable {
+            for (id, attempt, reason) in unmappable {
                 tracing::error!(
                     job_id = %id,
                     reason = %reason,
@@ -1354,12 +1478,31 @@ impl JobsRepository for PgJobsRepository {
                      it is not stranded in 'running' (the rest of the batch is dispatched)"
                 );
                 metrics::counter!(METRIC_CLAIM_UNMAPPABLE).increment(1);
-                if let Err(e) = JobsRepository::mark_failed(self, id, &reason).await {
-                    tracing::error!(
-                        job_id = %id,
-                        error = %e,
-                        "claim_pending_by_kinds: marking the unmappable row failed did not persist",
-                    );
+                match JobsRepository::mark_failed(self, id, attempt, &reason).await {
+                    Ok(ResultWriteOutcome::Applied) => {}
+                    Ok(other) => {
+                        // The fence refused a write for a row this
+                        // statement claimed microseconds ago, so the row
+                        // moved on under us. Nothing further to do — the
+                        // holder owns its state — but it is worth saying
+                        // out loud, because it is not a shape anything
+                        // here can produce.
+                        tracing::error!(
+                            job_id = %id,
+                            attempt,
+                            outcome = ?other,
+                            "claim_pending_by_kinds: the unmappable row was not resolved — it \
+                             is no longer on the attempt this claim charged it",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            job_id = %id,
+                            error = %e,
+                            "claim_pending_by_kinds: marking the unmappable row failed did not \
+                             persist",
+                        );
+                    }
                 }
             }
             sort_claimed_jobs(&mut jobs);
@@ -1769,7 +1912,8 @@ mod tests {
         assert!(
             !sql.contains("DELETE"),
             "an abandoned row is requeued, never deleted: it may be genuinely running, and \
-             its completion is an unconditional UPDATE by id that must still find a row"
+             its completion is a result write fenced on (id, attempts) that must still find \
+             a row carrying the attempt it claimed under"
         );
     }
 
@@ -1795,6 +1939,90 @@ mod tests {
         assert!(
             sql.contains("locked_by = NULL"),
             "the dead worker's claim must be released or the row reads as still held"
+        );
+    }
+
+    /// Every result write is fenced on the execution that produced it.
+    ///
+    /// `AND attempts = $2` is the predicate, and it has to be on all
+    /// three: a row the abandoned-lease sweep handed on can be running
+    /// under a sibling, and the loser's `completed` / `failed` /
+    /// `pending` would land on the sibling's work. The claim is the
+    /// only writer of `attempts`, so the number the claim returned is
+    /// the one identity a late execution can prove.
+    #[test]
+    fn every_result_write_is_fenced_on_the_claimed_attempt() {
+        for (name, set_clause) in [
+            ("mark_completed", MARK_COMPLETED_SET),
+            ("reschedule", RESCHEDULE_SET),
+            ("mark_failed", MARK_FAILED_SET),
+        ] {
+            let sql = fenced_result_write_sql(set_clause);
+            for token in [
+                "WHERE id = $1",
+                "AND attempts = $2",
+                "UPDATE public.jobs SET",
+                "updated_at = now()",
+            ] {
+                assert!(
+                    sql.contains(token),
+                    "{name} SQL is missing the token-separated fragment {token:?}; a bare \
+                     `\\` line continuation eats the newline AND the indent and mashes \
+                     adjacent tokens together"
+                );
+            }
+            assert!(
+                !set_clause.contains("attempts"),
+                "{name} must not write `attempts`: the claim charges the execution budget, \
+                 and a result write that moved the column would redefine the identity it is \
+                 being fenced on"
+            );
+            assert!(
+                !sql.contains("AND locked_by"),
+                "{name} must not fence on the lease holder: the sweep NULLs `locked_by` and \
+                 the next claim overwrites it, so that predicate would throw away the honest \
+                 late result the sweep's never-delete rule exists to keep"
+            );
+            assert!(
+                !sql.contains("AND status"),
+                "{name} must not fence on the status: the row an un-superseded late result \
+                 lands on is `pending` (requeued) or `failed` (at the cap), and both are \
+                 states that result is entitled to write over"
+            );
+        }
+    }
+
+    /// The statement answers all three outcomes in one round trip.
+    ///
+    /// `rows_affected` alone cannot tell "a later execution holds the
+    /// row" from "the row is gone", and reporting a clobber that never
+    /// happened is its own defect. The outer `SELECT` reads
+    /// `attempts` in the same snapshot the fence compared against, so
+    /// the attempt the refusal names is the one that refused it rather
+    /// than a re-read that could have moved.
+    #[test]
+    fn a_result_write_reports_whether_it_landed_and_what_holds_the_row() {
+        let sql = fenced_result_write_sql(MARK_FAILED_SET);
+        for token in [
+            "WITH fenced AS (",
+            "RETURNING id",
+            "SELECT j.attempts AS current_attempt,",
+            "EXISTS (SELECT 1 FROM fenced) AS applied",
+            "FROM public.jobs j",
+            "WHERE j.id = $1",
+        ] {
+            assert!(sql.contains(token), "result-write SQL missing {token:?}");
+        }
+        // The outer SELECT is the row-exists probe. Narrowing it with
+        // the fence would answer `RowGone` for a superseded row and
+        // lose the distinction the two outcomes exist to draw.
+        let (_fenced, outer) = sql
+            .split_once("FROM public.jobs j")
+            .expect("the statement ends in the row-exists probe");
+        assert!(
+            !outer.contains("attempts"),
+            "the outer SELECT must filter on the id alone: a row that exists under a later \
+             attempt is `Superseded`, not `RowGone`"
         );
     }
 
@@ -2225,6 +2453,12 @@ mod tests {
                  Full RETURNING clause:\nRETURNING{returning}"
             );
         }
+        assert!(
+            returning.contains("attempts"),
+            "claim_pending_by_kinds RETURNING must project `attempts`: it is the identity \
+             every result write for this execution is fenced on, and the budget the \
+             dispatcher spends. Full RETURNING clause:\nRETURNING{returning}"
+        );
     }
 
     /// `duration_to_pg_interval` of zero is zero microseconds.
@@ -3581,7 +3815,10 @@ mod tests {
             EnqueueOutcome::Enqueued { job_id } => job_id,
             other => panic!("expected Enqueued, got {other:?}"),
         };
-        repo.mark_completed(first_id, first_summary.clone())
+        // A freshly-enqueued row has never been claimed, so the
+        // attempt that identifies "whoever is writing for it" is 0 —
+        // the column's default. A claim would have charged it one.
+        repo.mark_completed(first_id, 0, first_summary.clone())
             .await
             .expect("mark_completed (first)");
 
@@ -3613,7 +3850,7 @@ mod tests {
             EnqueueOutcome::Enqueued { job_id } => job_id,
             other => panic!("expected Enqueued, got {other:?}"),
         };
-        repo.mark_completed(second_id, second_summary.clone())
+        repo.mark_completed(second_id, 0, second_summary.clone())
             .await
             .expect("mark_completed (second)");
 
@@ -3657,7 +3894,7 @@ mod tests {
             other => panic!("expected Enqueued, got {other:?}"),
         };
         let summary = serde_json::json!({ "scanned": 3, "ok": true });
-        repo.mark_completed(job_id, summary.clone())
+        repo.mark_completed(job_id, 0, summary.clone())
             .await
             .expect("mark_completed");
 

@@ -37,7 +37,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
-use hort_domain::ports::jobs_repository::{JobStatus, JobsRepository};
+use hort_domain::ports::jobs_repository::{JobStatus, JobsRepository, ResultWriteOutcome};
 use hort_domain::types::ContentHash;
 
 /// Connect as the migration superuser; run all migrations cleanly.
@@ -47,6 +47,21 @@ async fn admin_pool() -> Option<PgPool> {
     let pool = hort_adapters_postgres::test_support::isolated_db_from(&url).await?;
     hort_adapters_postgres::test_support::migrate_or_panic(&pool).await;
     Some(pool)
+}
+
+/// The `attempts` the row carries right now — the fence a result write
+/// has to arrive with to be the row's current execution.
+///
+/// Used by the handful of writes below that are housekeeping rather
+/// than the behaviour under test, and so do not otherwise track which
+/// execution they are speaking for.
+async fn current_attempt(pool: &PgPool, id: Uuid) -> u32 {
+    let attempts: i32 = sqlx::query_scalar("SELECT attempts FROM public.jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read attempts");
+    u32::try_from(attempts).expect("attempts is never negative")
 }
 
 fn test_hash() -> ContentHash {
@@ -203,14 +218,19 @@ async fn mark_completed_idempotent_on_already_completed_row() {
 
     let (job_id, _) = seed_scan_job(&pool, 0).await;
 
-    repo.mark_completed(job_id, serde_json::Value::Null)
-        .await
-        .expect("first mark_completed");
-    // Second call must not panic / error — the UPDATE just no-ops on
-    // the row that is already `completed`.
-    repo.mark_completed(job_id, serde_json::Value::Null)
-        .await
-        .expect("second mark_completed must be idempotent");
+    // Both writes carry the same attempt, which is what the scan path
+    // does (the orchestrator writes `completed`, then the dispatcher
+    // writes it again for the same claimed row). The fence is on the
+    // execution, not on the status, so the second write lands too.
+    for which in ["first", "second"] {
+        assert_eq!(
+            repo.mark_completed(job_id, 0, serde_json::Value::Null)
+                .await
+                .unwrap_or_else(|e| panic!("{which} mark_completed: {e}")),
+            ResultWriteOutcome::Applied,
+            "{which} mark_completed must land: one execution writing twice is idempotent",
+        );
+    }
 
     let status_str: String = sqlx::query_scalar("SELECT status FROM public.jobs WHERE id = $1")
         .bind(job_id)
@@ -237,7 +257,7 @@ async fn mark_completed_persists_result_summary() {
     // `TaskOutcome::Completed { result_summary }`) must land in the column,
     // not be discarded.
     let summary = serde_json::json!({ "result": "no_attestation" });
-    repo.mark_completed(job_id, summary.clone())
+    repo.mark_completed(job_id, 0, summary.clone())
         .await
         .expect("mark_completed with summary");
 
@@ -252,7 +272,7 @@ async fn mark_completed_persists_result_summary() {
     // A `Value::Null` summary is the "no summary" sentinel — it must store
     // as SQL NULL, not a JSON `'null'`, so `result_summary IS NULL` keeps
     // meaning "no summary recorded".
-    repo.mark_completed(job_id, serde_json::Value::Null)
+    repo.mark_completed(job_id, 0, serde_json::Value::Null)
         .await
         .expect("mark_completed with null summary");
     let cleared: Option<serde_json::Value> =
@@ -277,14 +297,26 @@ async fn reschedule_resets_lock_and_records_error() {
     let repo = PgJobsRepository::new(pool.clone());
 
     let (job_id, _) = seed_scan_job(&pool, 0).await;
-    let _claimed = repo
+    let claimed = repo
         .claim_scan_jobs("worker-a", 10, Duration::from_secs(900))
         .await
         .expect("initial claim");
+    // The claim charged the row an attempt and handed the number back;
+    // that number is what the execution writes under.
+    let attempt = claimed
+        .iter()
+        .find(|j| j.id == job_id)
+        .expect("the seeded row is in the claim")
+        .attempts;
 
-    repo.reschedule(job_id, Duration::from_secs(60), "transient backend failure")
-        .await
-        .expect("reschedule");
+    repo.reschedule(
+        job_id,
+        attempt,
+        Duration::from_secs(60),
+        "transient backend failure",
+    )
+    .await
+    .expect("reschedule");
 
     let row = sqlx::query(
         "SELECT status, locked_by, locked_until, last_error \
@@ -315,7 +347,7 @@ async fn mark_failed_terminal_status() {
     let repo = PgJobsRepository::new(pool.clone());
 
     let (job_id, _) = seed_scan_job(&pool, 0).await;
-    repo.mark_failed(job_id, "max attempts reached")
+    repo.mark_failed(job_id, 0, "max attempts reached")
         .await
         .expect("mark_failed");
 
@@ -388,9 +420,13 @@ async fn pending_scan_count_filters_by_kind_and_status() {
     // pending). We re-state row b's status directly via SQL because
     // mark_completed is the API exercised here only as a side
     // effect.
-    repo.mark_completed(b_id, serde_json::Value::Null)
-        .await
-        .expect("mark b completed");
+    repo.mark_completed(
+        b_id,
+        current_attempt(&pool, b_id).await,
+        serde_json::Value::Null,
+    )
+    .await
+    .expect("mark b completed");
 
     let after_transitions = repo
         .pending_scan_count()
@@ -412,9 +448,13 @@ async fn pending_scan_count_filters_by_kind_and_status() {
     // Tidy: avoid leaving 'running' rows around for downstream
     // tests. Mark a as completed too (idempotent via the API). c
     // stays pending — sibling tests cope via the serial lock.
-    repo.mark_completed(a_id, serde_json::Value::Null)
-        .await
-        .ok();
+    repo.mark_completed(
+        a_id,
+        current_attempt(&pool, a_id).await,
+        serde_json::Value::Null,
+    )
+    .await
+    .ok();
 }
 
 #[tokio::test]
@@ -838,9 +878,13 @@ async fn s4_backstop_guard_suppresses_reenqueue_then_rearms_after_completion() {
         .await
         .expect("find_active_provenance_for_artifact")
         .expect("the tick-1 row is still in-flight before completion");
-    jobs.mark_completed(existing, serde_json::Value::Null)
-        .await
-        .expect("mark_completed");
+    jobs.mark_completed(
+        existing,
+        current_attempt(&pool, existing).await,
+        serde_json::Value::Null,
+    )
+    .await
+    .expect("mark_completed");
 
     // Next tick: no in-flight row anymore — enqueues exactly one NEW row.
     s4_guarded_tick(&jobs, artifact_id).await;

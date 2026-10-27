@@ -110,7 +110,7 @@ use hort_app::use_cases::test_support::{
 use hort_app::use_cases::CallerPrivileges;
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
 use hort_domain::entities::scan_policy::{
-    NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
+    CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
 };
 use hort_domain::error::DomainResult;
 use hort_domain::events::Actor;
@@ -293,6 +293,7 @@ fn build_curation_use_case(
         default_repository_access(),
         Arc::new(MockCurationRuleRepository::new()),
         Arc::new(MockStoragePort::new()),
+        hort_formats::compiled_in_format_handlers(),
     )
 }
 
@@ -333,6 +334,7 @@ fn build_policy_use_case(
         default_repository_access(),
         curation_rules,
         jobs,
+        hort_formats::compiled_in_format_handlers(),
     )
 }
 
@@ -357,6 +359,7 @@ fn sample_create_policy_command() -> CreatePolicyCommand {
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
+        composite_verdict_mode: CompositeVerdictMode::Observed,
     }
 }
 
@@ -365,12 +368,19 @@ fn sample_create_policy_command() -> CreatePolicyCommand {
 // event_store.rs::read_back_owned_rows)
 // ---------------------------------------------------------------------------
 
-/// Owned per-row snapshot — the four envelope columns NOT carried by
-/// `PersistedEvent` (`stream_category`, the three actor columns) plus
-/// the two chain bytea columns. Borrowed into `StreamRow` by
-/// [`OwnedRow::as_stream_row`].
+/// Owned per-row snapshot — the envelope columns NOT carried by
+/// `PersistedEvent` (`event_data`, `stream_category`, the three actor
+/// columns) plus the two chain bytea columns. Borrowed into `StreamRow`
+/// by [`OwnedRow::as_stream_row`].
+///
+/// `event_data` is read even though `PersistedEvent` already carries the
+/// typed event decoded from it, because the chain hashes the payload as
+/// the column holds it. The typed event stays for this test's own
+/// assertions about *which* event landed on which stream, which is a
+/// different question from whether the row is intact.
 struct OwnedRow {
     persisted: PersistedEvent,
+    event_data: serde_json::Value,
     stream_id: String,
     stream_category: String,
     actor_type: String,
@@ -392,7 +402,7 @@ impl OwnedRow {
                 stream_position: self.persisted.stream_position,
                 event_type: self.persisted.event.event_type(),
                 event_version: self.persisted.event_version,
-                event: &self.persisted.event,
+                payload: &self.event_data,
                 correlation_id: self.persisted.correlation_id,
                 causation_id: self.persisted.causation_id,
                 actor: ActorCanonical {
@@ -425,11 +435,12 @@ fn to_event_hash(bytes: &[u8]) -> EventHash {
 /// same column).
 /// Tuple shape for the envelope + chain `SELECT` — extracted to a
 /// `type` alias to keep clippy's `type_complexity` happy. Field order
-/// matches the `SELECT` column order: `(stream_position, stream_category,
-/// actor_type, actor_id, actor_source_file, actor_spec_digest,
-/// prev_event_hash, event_hash)`.
+/// matches the `SELECT` column order: `(stream_position, event_data,
+/// stream_category, actor_type, actor_id, actor_source_file,
+/// actor_spec_digest, prev_event_hash, event_hash)`.
 type EnvelopeChainRow = (
     i64,
+    serde_json::Value,
     String,
     String,
     Option<Uuid>,
@@ -448,6 +459,7 @@ async fn read_stream_rows(pool: &PgPool, store: &PgEventStore, stream: &StreamId
     let cols: Vec<EnvelopeChainRow> = sqlx::query_as(
         r#"SELECT
                    stream_position,
+                   event_data,
                    stream_category,
                    actor_type,
                    actor_id,
@@ -470,7 +482,8 @@ async fn read_stream_rows(pool: &PgPool, store: &PgEventStore, stream: &StreamId
          (both ORDER BY stream_position ASC)"
     );
     let mut out = Vec::with_capacity(events.len());
-    for (persisted, (pos, cat, atype, aid, asrc, adig, prev, hash)) in events.into_iter().zip(cols)
+    for (persisted, (pos, event_data, cat, atype, aid, asrc, adig, prev, hash)) in
+        events.into_iter().zip(cols)
     {
         assert_eq!(
             persisted.stream_position as i64, pos,
@@ -478,6 +491,7 @@ async fn read_stream_rows(pool: &PgPool, store: &PgEventStore, stream: &StreamId
         );
         out.push(OwnedRow {
             persisted,
+            event_data,
             stream_id: stream_str.clone(),
             stream_category: cat,
             actor_type: atype,

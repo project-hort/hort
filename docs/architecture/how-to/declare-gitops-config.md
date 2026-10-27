@@ -590,6 +590,7 @@ spec:
   provenanceMode: verify_if_present   # optional; off | verify_if_present | required
   negligibleAction: ignore      # optional; ignore | warn | block — informational (unmaintained/unsound) advisory handling; default ignore
   enforcement: reject           # optional; reject | record — what a blocking verdict DOES; default reject
+  compositeVerdictMode: observed # optional; observed | promoted — whether a composed OCI image's verdict gates its manifest; default observed
   # maxArtifactAge: omit it — declaring any cap is an apply-time rejection (not evaluated)
   licensePolicy: {}             # optional; `{}` or omitted are the only accepted values
 ```
@@ -687,6 +688,144 @@ different decision and not a substitute. A projection stored before this
 rule shipped keeps its `max_artifact_age_secs` and keeps deciding
 nothing. `hort-server validate-config` catches the declaration
 offline.
+
+#### `compositeVerdictMode` — who decides an OCI image manifest's release
+
+The unit of filesystem assessment for an OCI image is the **image
+manifest**, not a layer: hort materialises the config and the ordered
+layers as one OCI layout and scans them as one image, because the package
+surface belongs to the composition. A layer carrying a complete package
+database and no OS marker reports *nothing* scanned on its own — the
+analyzers recognise no operating system and never run the package check
+([ADR 0064](../../adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
+D1).
+
+That composition is assessed on **every** manifest scan whatever this
+field says, and every assessment is recorded as a
+`composite_scan_observations` row carrying the composite verdict beside
+the counterfactual — what the release gate would have decided had that
+verdict carried authority. What the field decides is whether the verdict
+reaches the artifact:
+
+- **`observed`** (the default, and the behaviour of every policy that
+  predates the field) — the manifest's own assessment is byte-for-byte
+  what it would be with no composite path at all. Nothing an operator
+  has released becomes withheld, and nothing withheld becomes released.
+- **`promoted`** — the composition's findings **are** the manifest row's
+  findings: they reach the release gate under the same predicate a
+  backend's findings over the manifest's own bytes would, and the
+  policy's `enforcement` governs what a blocking verdict does. A
+  composition that could **not** be produced — a constituent missing or
+  unreadable, an unsupported layer media type, the whole-image budget
+  tripped, an upstream that stayed unreachable for the scan job's whole
+  attempt budget — is the absent verdict the scan axis fails closed on,
+  and holds the manifest `scan_indeterminate`.
+
+**`promoted` also moves the obligation off the layers.** Once the
+composition carries the filesystem verdict, an individual OCI blob's own
+filesystem findings stop deciding that blob's release, and a layer
+hort has no decoder for (`tar+zstd`, `xz`, `bzip2` — which the scanner
+composes without difficulty in image mode) stops being withheld for
+that reason. This is the half of the decision that *unblocks* images: a
+package an upper layer deletes no longer condemns the lower layer, and
+a clean image no longer has a withheld constituent underneath it.
+
+What stays put:
+
+- The findings stay in the record — the per-finding rows, the stored
+  findings blob and the scan's severity summary are unchanged. What
+  changes is only which findings the policy thresholds are walked
+  against.
+- A finding about the layer's **bytes** still blocks the layer. No
+  scanner hort ships produces one today (Trivy's vulnerability findings
+  are all claims about an installed package set); the distinction is in
+  place so a future secrets or malware backend is not silently disarmed.
+- Every **other** reason a layer's scan can produce no verdict still
+  withholds it — a tripped extraction bound, an entry that tried to
+  escape the workspace, an archive that could not be read, a backend
+  that found nothing to analyse.
+- Non-OCI repositories are untouched, whatever this field says. A
+  **global** policy with `compositeVerdictMode: promoted` does not
+  loosen anything for npm, PyPI, cargo or Maven: ADR 0064 decides the
+  OCI image and explicitly leaves the other formats open.
+- An already-**rejected** layer is not released. Recovering that estate
+  is an explicit curation re-evaluation
+  (`POST /api/v1/admin/curation/quarantine/{artifact_id}/reevaluate`),
+  for the same reason promotion drives no re-evaluation pass of its own.
+
+It also stops for a blob that is **not** part of an image — an OCI
+artifact's layer, or a blob nothing in the registry references — and
+there no composition takes the obligation over. That is intended rather
+than a gap. A package-vulnerability finding is a statement about an
+installed package tree that runs; a chart tarball or a pushed archive
+has none, so a finding read out of it is a statement about nothing.
+Under `observed` such a blob is assessed today only because every
+tar-shaped blob is materialised as a root filesystem — right for an
+image layer, incidental for anything else.
+
+Two things narrow this further, and both are worth knowing before you
+promote:
+
+- Blobs that are not archives are **unaffected either way**. A cosign
+  signature and an SBOM attachment are JSON, which carries no package
+  surface, so they neither gate today nor change under `promoted`.
+- The field is per **policy**, and a policy can be scoped to one
+  repository. If you keep images and other OCI artifacts in separate
+  repositories, promote on the image ones and the question does not
+  arise for the rest.
+
+**Promote deliberately, not by default.** A composite verdict adds
+rejections across an existing estate, `Rejected` is terminal, and the
+periodic rescan never revisits it — so a wrong verdict from a new
+analysis path on its first production run leaves an estate only an
+explicit curation re-evaluation can recover. The field is per **policy**
+so an operator can promote on one repository first and watch it; the
+observation rows and
+`hort_scan_composite_assessment_total{result,authority}` are what that
+watching reads.
+
+Two things promotion deliberately does **not** change:
+
+- **An image index, and an artifact manifest, are unaffected.** An index
+  binds references rather than a runnable filesystem (ADR 0064 D5) and a
+  cosign signature / SBOM attachment / Helm chart declares no layered
+  root filesystem; both resolve to "nothing to compose", which is a
+  legitimate population and not an unassessed image, so promotion must
+  not make either gate on a composition it does not have.
+- **No already-assessed artifact is re-evaluated, in either
+  direction.** Unlike `enforcement`, a change to this field enqueues no
+  continuous-enforcement pass: that pass re-derives verdicts from
+  *stored* findings, and a composite verdict's findings come from
+  scanning an assembled image. Demoting `promoted → observed` that way
+  would un-reject the population a promoted composite had correctly
+  rejected with no fresh assessment. Promotion takes effect on the next
+  scan of each manifest — its ordinary rescan, or an explicit one.
+
+##### `promoted` with `scanBackends: []` is an apply-time rejection
+
+The two opt-ins cancel. An empty backend list is the explicit scan
+waiver: the scan returns before a composed image is resolved, so no
+manifest the policy governs ever carries a composite assessment — and
+the promotion then grants release authority to a verdict that is never
+produced. Apply rejects the combination
+(`composite_verdict_promoted_requires_scan_backends`) rather than
+silently treating `promoted` as `observed`, because an operator reading
+the policy back would otherwise see a promotion that is not in effect:
+
+```text
+ScanPolicy `waived-but-promoted` is invalid: `compositeVerdictMode: promoted` with
+an empty `scanBackends` promotes a verdict that is never produced: an empty backend
+list waives scanning for every artifact this policy governs, and the scan returns
+before a composed image is resolved — so no manifest ever carries a composite
+assessment for the promotion to act on. Declare the backends that should assess the
+composition (`scanBackends: [trivy]`), or leave `compositeVerdictMode: observed`
+while the scan stays waived. (scan policy: `waived-but-promoted`)
+```
+
+`hort-server validate-config` catches it offline. Note that a policy
+governing an OCI repository cannot name `osv` *instead* of `trivy`
+either — `osv` reads only the payload SBOM and `oci` exposes none, so
+row 7c below rejects that pairing on its own.
 
 #### `scanBackends` — apply rejects a backend that cannot analyse the format
 
@@ -1407,6 +1546,14 @@ Apply-time validation rules:
 - `fallbackRotation.validity` ≥ 2 × `rotationInterval`. The
   factor-of-2 is the safety margin for consumer-side Secret
   reload latency.
+- `fallbackRotation.targetSecret` is **unique across
+  ServiceAccounts**. A target's identity is `(namespace, name)`, so
+  the same Secret name in two namespaces is fine. Two
+  ServiceAccounts on one target is a **hard reject** — the
+  reconciler's ownership barrier refuses one of them on every tick,
+  so its declared rotation never happens, and without the barrier
+  the two would overwrite each other's credential and leave
+  consumers holding the wrong identity.
 - `fallbackRotation.targetSecret.namespace` is **not** validated
   against `worker.rotation.targetNamespaces` at apply time — the
   chart's allow-list is a runtime concern. Mismatches surface as

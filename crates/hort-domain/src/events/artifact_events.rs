@@ -227,11 +227,15 @@ impl ScanRequested {
 /// clean verdict, and reporting the second as one would overstate what
 /// was actually checked.
 ///
-/// The code-level definition of "no package surface" is
-/// [`NotAnalysable::NotApplicable`](crate::ports::scanner::NotAnalysable::NotApplicable);
-/// the other `NotAnalysable` variants are an *expected* surface that
-/// could not be assessed and still fail closed, so they never reach this
-/// type.
+/// The code-level definition of "nothing for this artifact to be held
+/// for" is
+/// [`NotAnalysable::gates_release`](crate::ports::scanner::NotAnalysable::gates_release)
+/// answering `false`: always for
+/// [`NotAnalysable::NotApplicable`](crate::ports::scanner::NotAnalysable::NotApplicable),
+/// and for `UnsupportedContainer` on a constituent whose composition
+/// carries the filesystem verdict (ADR 0064 D2). Every other abstention
+/// is an *expected* surface that could not be assessed and still fails
+/// closed, so it never reaches this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanAssessment {
@@ -241,13 +245,22 @@ pub enum ScanAssessment {
     /// field existed reads back as what it was: an analysed scan.
     #[default]
     Analysed,
-    /// The artifact carries no package surface by construction — an OCI
-    /// manifest row, a non-tar OCI blob such as the image config — so
-    /// every configured backend abstained with
-    /// [`NotAnalysable::NotApplicable`](crate::ports::scanner::NotAnalysable::NotApplicable).
-    /// A completed assessment with nothing to assess: scan authority
+    /// Nothing this artifact could be held for went unassessed, and so
+    /// nothing was assessed either. Two populations reach it, and both
+    /// are a completed assessment with nothing to assess: scan authority
     /// exists, `finding_count` is necessarily zero, and the trail says
     /// "not applicable" rather than "analysed, clean".
+    ///
+    /// - **No package surface by construction** — an OCI manifest row, a
+    ///   non-tar OCI blob such as the image config — so every configured
+    ///   backend abstained with
+    ///   [`NotAnalysable::NotApplicable`](crate::ports::scanner::NotAnalysable::NotApplicable).
+    /// - **A surface that is not this artifact's to assess** — an OCI
+    ///   layer this adapter has no decoder for, under a policy that has
+    ///   promoted the composite verdict. The composition that binds the
+    ///   layer decodes it and carries its filesystem verdict
+    ///   (ADR 0064 D2), so there is nothing here for a hold to wait on
+    ///   either. The layer still releases only on its own time gate.
     NotApplicable,
 }
 

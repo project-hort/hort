@@ -41,7 +41,16 @@ pub struct CurationQueueEntry {
     /// Computed by the adapter from `(window_start, policy.duration)`
     /// (ADR 0007). Non-persisted.
     pub quarantine_deadline: Option<DateTime<Utc>>,
+    /// `COUNT(*)` over the artifact's **last** scan's `scan_findings`
+    /// rows. `scan_findings` is per-scan history, so this is deliberately
+    /// not the count over every scan the artifact ever had: that number
+    /// grows with the rescan count and contradicts the scan the release
+    /// verdict is derived from. `0` for an artifact whose last scan found
+    /// nothing, and for one never scanned.
     pub finding_count: u32,
+    /// Highest severity in the **last** scan's findings — not the highest
+    /// the artifact has ever carried. `None` when that scan reported
+    /// nothing.
     pub max_severity: Option<SeverityThreshold>,
     /// Discriminator from the latest `ArtifactRejected` event's
     /// `rejected_by` payload (`"scanner" | "curator" |
@@ -57,6 +66,14 @@ pub struct CurationQueueEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CurationQueueFilter {
     pub repository_id: Option<Uuid>,
+    /// Narrow the listing to one artifact.
+    ///
+    /// A **conjunction** with `repository_id`, not an alternative: a
+    /// mismatched pair (an artifact that is not in the named repository)
+    /// returns empty. There is no precedence rule and no silent widening
+    /// — a caller that supplies both is asking about their intersection
+    /// and gets it.
+    pub artifact_id: Option<Uuid>,
     pub status: Option<QuarantineStatus>,
     /// Filter on the LATERAL-joined rejection-reason kind. Applied
     /// post-join; meaningful only with `status = Rejected`.
@@ -68,6 +85,7 @@ impl Default for CurationQueueFilter {
     fn default() -> Self {
         Self {
             repository_id: None,
+            artifact_id: None,
             status: None,
             rejection_reason_kind: None,
             limit: 100,

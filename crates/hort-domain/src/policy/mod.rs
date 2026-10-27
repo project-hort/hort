@@ -57,8 +57,8 @@ pub use quarantine_anchor::{
 };
 pub use re_evaluation::{decide_rejected_transition, ReEvaluationOutcome};
 pub use scan::{
-    effective_quarantine_deadline, evaluate_scan_result, has_license_policy, DefaultPolicy,
-    ScanOutcome,
+    composite_verdict_mode_of, effective_quarantine_deadline, evaluate_scan_result,
+    has_license_policy, DefaultPolicy, ScanOutcome,
 };
 pub use scan_delta::compute_added_findings;
 pub use staging_sweep_liveness::{evaluate_staging_sweep_liveness, StagingSweepLiveness};
