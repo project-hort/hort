@@ -23,7 +23,8 @@ use crate::license::LicenseArgs;
 use crate::list_versions::ListVersionsArgs;
 use crate::prefetch::PrefetchArgs;
 
-/// Admin task subcommands (invoke, list, get).
+/// `admin` subcommand tree: `task`, `rescan`, `quarantine`,
+/// `cli-session`, `users`, `rbac`, `workers`, `retention`.
 pub mod admin;
 /// `attribution` subcommand — prints the embedded third-party
 /// attribution document (text/json). Sync, no config, no server call.

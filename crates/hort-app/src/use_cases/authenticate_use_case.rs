@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -947,11 +947,22 @@ impl AuthenticateUseCase {
     ///    possibly-revoked token (the AK-side immediate-revocation layer
     ///    is the whole point of the denylist; admitting on outage would
     ///    re-open the regression the denylist exists to close).
-    /// 2. **Live user re-resolution.** `find_by_id` so a deactivated
+    /// 2. **Subject cutoff check (fail-closed).** Consult
+    ///    `cli-session-cutoff:{sub}` on the same durable store. A
+    ///    present entry carries the instant every session of that
+    ///    subject is judged against: an `iat` at or before it ⇒ 401.
+    ///    A token carrying **no `iat`** while a cutoff is active is
+    ///    also denied — it cannot prove it postdates the cutoff, and
+    ///    admitting it would make the cutoff a no-op against exactly
+    ///    the pre-upgrade sessions an operator raised it to kill. An
+    ///    unparseable cutoff value and a read error are both denials,
+    ///    for the step-1 reason: a cutoff that cannot be evaluated is
+    ///    not a cutoff that does not exist.
+    /// 3. **Live user re-resolution.** `find_by_id` so a deactivated
     ///    user is rejected on the next request even though the JWT is
     ///    still cryptographically valid (mirrors the PAT path's live
     ///    re-resolution).
-    /// 3. **Principal build.** The principal's `claims` = the JWT's
+    /// 4. **Principal build.** The principal's `claims` = the JWT's
     ///    resolved claim set (a CliSession authorizes `GrantSubject::Claims`
     ///    grants), `token_kind =
     ///    Some(CliSession)`, `token_cap = None` (authority is claims +
@@ -1001,7 +1012,75 @@ impl AuthenticateUseCase {
             }
         }
 
-        // 2. Live user re-resolution (deactivation honored).
+        // 2. Subject-scoped revocation cutoff (fail-closed). Same
+        // store, sibling keyspace: `cli-session-revoked:` names one
+        // session, `cli-session-cutoff:` names every session of one
+        // subject issued at or before an instant. The second is the
+        // only one an operator can reach without the token in hand,
+        // because nothing persists a live CliSession.
+        let cutoff_key = format!("cli-session-cutoff:{}", claims.sub);
+        match denylist.get(&cutoff_key).await {
+            Ok(Some(raw)) => {
+                let Some(cutoff) = parse_cli_session_cutoff(&raw) else {
+                    // An unparseable cutoff is a cutoff we cannot
+                    // evaluate, which is not the same as no cutoff.
+                    tracing::warn!(
+                        token_kind = "cli_session",
+                        user_id = %claims.sub,
+                        "cli-session subject cutoff is unparseable — failing closed"
+                    );
+                    return Err(AppError::Unauthorized(
+                        "cli session revocation check unavailable".to_string(),
+                    ));
+                };
+                // `iat` at or before the cutoff is revoked. The
+                // boundary second is denied rather than admitted: the
+                // wire form is whole seconds, so a token minted in the
+                // same second the operator raised the cutoff cannot be
+                // ordered against it, and the safe reading of
+                // "everything issued before now" is to include it. A
+                // human re-logging in within that second retries one
+                // second later; the alternative leaves a session the
+                // operator believes is dead.
+                let revoked = match claims.iat {
+                    // No `iat` ⇒ unprovable. A pre-`iat` token is
+                    // exactly the session a cutoff is most likely
+                    // raised against, and it expires within the
+                    // CliSession cap regardless, so no such token
+                    // outlives one cap past the upgrade.
+                    None => true,
+                    Some(iat) => iat <= cutoff,
+                };
+                if revoked {
+                    tracing::info!(
+                        result = "invalid_token",
+                        token_kind = "cli_session",
+                        reason = "subject_cutoff",
+                        user_id = %claims.sub,
+                        jti = %claims.jti,
+                        has_iat = claims.iat.is_some(),
+                        "auth attempt: cli-session JWT predating the subject cutoff rejected"
+                    );
+                    return Err(AppError::Unauthorized(
+                        "cli session token revoked".to_string(),
+                    ));
+                }
+            }
+            Ok(None) => { /* no cutoff for this subject — proceed */ }
+            Err(e) => {
+                // Fail-closed, for the step-1 reason.
+                tracing::warn!(
+                    error = %e,
+                    token_kind = "cli_session",
+                    "cli-session subject cutoff unavailable — failing closed"
+                );
+                return Err(AppError::Unauthorized(
+                    "cli session revocation check unavailable".to_string(),
+                ));
+            }
+        }
+
+        // 3. Live user re-resolution (deactivation honored).
         let user = self.users.find_by_id(claims.sub).await?;
         if !user.is_active {
             tracing::info!(
@@ -1021,7 +1100,7 @@ impl AuthenticateUseCase {
             "user authenticated"
         );
 
-        // 3. Build the principal carrying the JWT's RESOLVED claims.
+        // 4. Build the principal carrying the JWT's RESOLVED claims.
         Ok(CallerPrincipal {
             user_id: user.id,
             external_id: user
@@ -1041,6 +1120,21 @@ impl AuthenticateUseCase {
             token_cap: None,
         })
     }
+}
+
+/// Decode a `cli-session-cutoff:{sub}` value into the instant it
+/// names.
+///
+/// The stored form is the cutoff's Unix-second timestamp as ASCII
+/// decimal (`ApiTokenUseCase::revoke_cli_sessions_for_user`). `None`
+/// means the bytes do not name an instant — not a UTF-8 string, not an
+/// `i64`, or an `i64` outside the representable range. Every such case
+/// is a denial at the call site rather than a default, because the
+/// permissive default here ("no cutoff") is precisely the answer a
+/// corrupt value must not be allowed to produce.
+fn parse_cli_session_cutoff(raw: &Bytes) -> Option<DateTime<Utc>> {
+    let secs: i64 = std::str::from_utf8(raw).ok()?.trim().parse().ok()?;
+    DateTime::<Utc>::from_timestamp(secs, 0)
 }
 
 /// Collapse [`PatValidationError`] variants
@@ -1203,8 +1297,8 @@ mod tests {
         (uc, signer, denylist, users)
     }
 
-    fn exp_in(secs: i64) -> chrono::DateTime<Utc> {
-        chrono::DateTime::<Utc>::from_timestamp(Utc::now().timestamp() + secs, 0).unwrap()
+    fn exp_in(secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(Utc::now().timestamp() + secs, 0).unwrap()
     }
 
     #[tokio::test]
@@ -1329,6 +1423,347 @@ mod tests {
             matches!(err, AppError::Unauthorized(_) | AppError::Domain(_)),
             "denylist outage must fail closed, got {err:?}"
         );
+    }
+
+    // -- CliSession subject-scoped revocation cutoff -------------------------
+
+    /// The validate-path rig for the subject cutoff: a use case wired
+    /// with the verifier + denylist, the denylist handle, and the
+    /// **raw signing key** so a test can mint a token carrying an
+    /// arbitrary `iat` — including none at all, the pre-`iat` token
+    /// shape that `CliSessionTokenSigner::mint` deliberately cannot
+    /// produce.
+    fn make_cli_session_cutoff_rig(
+        sub: Uuid,
+        denylist: Arc<dyn EphemeralStore>,
+    ) -> (AuthenticateUseCase, Arc<OciTokenSigningKey>) {
+        use ed25519_dalek::SigningKey;
+        use rand::rand_core::UnwrapErr;
+        use rand::rngs::SysRng;
+
+        let idp = Arc::new(MockIdentityProvider::new());
+        let users = Arc::new(MockUserRepository::new());
+        users.insert(User {
+            id: sub,
+            username: "dev-user".into(),
+            email: "dev@example.com".into(),
+            auth_provider: AuthProvider::Oidc,
+            external_id: Some("keycloak:dev".into()),
+            display_name: None,
+            is_active: true,
+            is_admin: false,
+            is_service_account: false,
+            last_login_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
+        let key = Arc::new(OciTokenSigningKey::new(sk, None));
+        let signer = Arc::new(CliSessionTokenSigner::new(
+            key.clone(),
+            "https://hort.test".to_string(),
+        ));
+        let uc = AuthenticateUseCase::new(
+            idp as Arc<dyn IdentityProvider>,
+            users as Arc<dyn UserRepository>,
+            admin_mapping(),
+        )
+        .with_cli_session_verification(signer, denylist);
+        (uc, key)
+    }
+
+    /// Mint a CliSession JWT with a caller-chosen `iat`. `None`
+    /// reproduces a token minted before the field existed (the field
+    /// is omitted from the payload, not serialised as `null`).
+    fn mint_cli_session_with_iat(
+        key: &OciTokenSigningKey,
+        sub: Uuid,
+        jti: Uuid,
+        iat: Option<DateTime<Utc>>,
+    ) -> String {
+        use crate::cli_session_signing::{
+            CliSessionClaims, CLI_SESSION_AUDIENCE, CLI_SESSION_TOKEN_KIND,
+        };
+        key.mint_claims(&CliSessionClaims {
+            iss: "https://hort.test".into(),
+            sub,
+            aud: CLI_SESSION_AUDIENCE.into(),
+            exp: exp_in(900),
+            iat,
+            jti,
+            token_kind: CLI_SESSION_TOKEN_KIND.into(),
+            claims: vec!["developer".into()],
+        })
+        .expect("mint")
+    }
+
+    /// Raise a subject cutoff at `at` directly on the store, the way
+    /// `ApiTokenUseCase::revoke_cli_sessions_for_user` writes it.
+    async fn seed_cutoff(store: &MockEphemeralStore, sub: Uuid, at: DateTime<Utc>) {
+        store
+            .put(
+                &format!("cli-session-cutoff:{sub}"),
+                Bytes::from(at.timestamp().to_string()),
+                Duration::from_secs(900),
+            )
+            .await
+            .expect("seed cutoff");
+    }
+
+    #[tokio::test]
+    async fn cli_session_cutoff_denies_a_token_issued_before_it() {
+        let sub = Uuid::from_u128(0xD15C);
+        let store = Arc::new(MockEphemeralStore::new());
+        let (uc, key) = make_cli_session_cutoff_rig(sub, store.clone() as Arc<dyn EphemeralStore>);
+        let jwt = mint_cli_session_with_iat(
+            &key,
+            sub,
+            Uuid::new_v4(),
+            Some(Utc::now() - chrono::Duration::seconds(60)),
+        );
+        // Pre-cutoff the same token authenticates.
+        assert!(uc.authenticate_bearer(&jwt).await.is_ok());
+
+        seed_cutoff(&store, sub, Utc::now()).await;
+
+        let err = uc.authenticate_bearer(&jwt).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::Unauthorized(_)),
+            "a session predating the cutoff must 401, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_session_cutoff_admits_a_token_issued_after_it() {
+        // The re-login case: the operator cuts the subject off, the
+        // human authenticates again, and the new session works. A
+        // cutoff that denied this would be an account lockout, not a
+        // session revocation.
+        let sub = Uuid::from_u128(0xD15C);
+        let store = Arc::new(MockEphemeralStore::new());
+        let (uc, key) = make_cli_session_cutoff_rig(sub, store.clone() as Arc<dyn EphemeralStore>);
+        let cutoff = Utc::now() - chrono::Duration::seconds(60);
+        seed_cutoff(&store, sub, cutoff).await;
+
+        let jwt = mint_cli_session_with_iat(
+            &key,
+            sub,
+            Uuid::new_v4(),
+            Some(cutoff + chrono::Duration::seconds(1)),
+        );
+        let principal = uc.authenticate_bearer(&jwt).await.expect("post-cutoff ok");
+        assert_eq!(principal.user_id, sub);
+    }
+
+    #[tokio::test]
+    async fn cli_session_cutoff_denies_a_token_issued_in_the_cutoff_second() {
+        // The wire form is whole seconds, so a token stamped with the
+        // cutoff's own second cannot be ordered against it. Denied,
+        // not admitted: the alternative leaves live a session the
+        // operator believes is dead.
+        let sub = Uuid::from_u128(0xD15C);
+        let store = Arc::new(MockEphemeralStore::new());
+        let (uc, key) = make_cli_session_cutoff_rig(sub, store.clone() as Arc<dyn EphemeralStore>);
+        let cutoff = Utc::now();
+        seed_cutoff(&store, sub, cutoff).await;
+
+        let jwt = mint_cli_session_with_iat(&key, sub, Uuid::new_v4(), Some(cutoff));
+        let err = uc.authenticate_bearer(&jwt).await.unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn cli_session_without_iat_is_denied_while_a_cutoff_is_active() {
+        // A pre-`iat` token cannot prove it postdates the cutoff.
+        // Admitting it would make the cutoff a no-op against exactly
+        // the sessions an operator upgrading mid-incident raised it
+        // to kill.
+        let sub = Uuid::from_u128(0xD15C);
+        let store = Arc::new(MockEphemeralStore::new());
+        let (uc, key) = make_cli_session_cutoff_rig(sub, store.clone() as Arc<dyn EphemeralStore>);
+        let jwt = mint_cli_session_with_iat(&key, sub, Uuid::new_v4(), None);
+        seed_cutoff(&store, sub, Utc::now()).await;
+
+        let err = uc.authenticate_bearer(&jwt).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::Unauthorized(_)),
+            "an iat-less token must 401 under an active cutoff, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_session_without_iat_is_admitted_when_no_cutoff_is_active() {
+        // The rollout half: every in-flight pre-upgrade session keeps
+        // working until it expires on its own. Only a cutoff denies
+        // one.
+        let sub = Uuid::from_u128(0xD15C);
+        let store = Arc::new(MockEphemeralStore::new());
+        let (uc, key) = make_cli_session_cutoff_rig(sub, store.clone() as Arc<dyn EphemeralStore>);
+        let jwt = mint_cli_session_with_iat(&key, sub, Uuid::new_v4(), None);
+
+        let principal = uc.authenticate_bearer(&jwt).await.expect("no cutoff ⇒ ok");
+        assert_eq!(principal.user_id, sub);
+        assert_eq!(principal.token_kind, Some(TokenKind::CliSession));
+    }
+
+    #[tokio::test]
+    async fn cli_session_cutoff_is_scoped_to_its_own_subject() {
+        // The cutoff is keyed on the subject, so another human's
+        // sessions are untouched — including one with an older `iat`
+        // than the cutoff instant.
+        let cut_subject = Uuid::from_u128(0xD15C);
+        let other_subject = Uuid::from_u128(0xD15D);
+        let store = Arc::new(MockEphemeralStore::new());
+        let (uc, key) =
+            make_cli_session_cutoff_rig(other_subject, store.clone() as Arc<dyn EphemeralStore>);
+        seed_cutoff(&store, cut_subject, Utc::now()).await;
+
+        let jwt = mint_cli_session_with_iat(
+            &key,
+            other_subject,
+            Uuid::new_v4(),
+            Some(Utc::now() - chrono::Duration::seconds(120)),
+        );
+        let principal = uc
+            .authenticate_bearer(&jwt)
+            .await
+            .expect("another subject's cutoff must not apply");
+        assert_eq!(principal.user_id, other_subject);
+    }
+
+    #[tokio::test]
+    async fn cli_session_cutoff_that_does_not_parse_fails_closed() {
+        // A corrupt cutoff value is a cutoff that cannot be
+        // evaluated, which is NOT the same as no cutoff. Denying is
+        // what keeps the permissive default out of reach of a bad
+        // byte sequence.
+        let sub = Uuid::from_u128(0xD15C);
+        // Not UTF-8; not an integer; empty; and an integer that is no
+        // instant — the last is the one a `from_timestamp` that
+        // substituted a default instead of `None` would wave through.
+        for corrupt in [
+            &b"not-a-number"[..],
+            &b""[..],
+            &[0xff, 0xfe][..],
+            &b"99999999999999999"[..],
+        ] {
+            let store = Arc::new(MockEphemeralStore::new());
+            let (uc, key) =
+                make_cli_session_cutoff_rig(sub, store.clone() as Arc<dyn EphemeralStore>);
+            store
+                .put(
+                    &format!("cli-session-cutoff:{sub}"),
+                    Bytes::copy_from_slice(corrupt),
+                    Duration::from_secs(900),
+                )
+                .await
+                .expect("seed");
+            let jwt = mint_cli_session_with_iat(&key, sub, Uuid::new_v4(), Some(Utc::now()));
+            let err = uc.authenticate_bearer(&jwt).await.unwrap_err();
+            assert!(
+                matches!(err, AppError::Unauthorized(_)),
+                "corrupt cutoff {corrupt:?} must fail closed, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_session_cutoff_read_error_fails_closed() {
+        // The jti read succeeds (nothing revoked) and the cutoff read
+        // fails. The request must still be denied: the second lookup
+        // carries the same fail-closed posture as the first, and a
+        // store that answers one key and not the other would
+        // otherwise slip through.
+        let sub = Uuid::from_u128(0xD15C);
+        let store = Arc::new(CutoffFailingEphemeralStore);
+        let (uc, key) = make_cli_session_cutoff_rig(sub, store as Arc<dyn EphemeralStore>);
+        let jwt = mint_cli_session_with_iat(&key, sub, Uuid::new_v4(), Some(Utc::now()));
+        let err = uc.authenticate_bearer(&jwt).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::Unauthorized(_)),
+            "cutoff outage must fail closed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_jti_leaves_the_subjects_other_sessions_alone() {
+        // The single-session half of the pair: denying one `jti` must
+        // not reach the same human's other live sessions. That is the
+        // whole reason the `jti` path survives alongside the subject
+        // cutoff — "cut exactly that session" instead of "cut the
+        // person".
+        let sub = Uuid::from_u128(0xD15C);
+        let store = Arc::new(MockEphemeralStore::new());
+        let (uc, key) = make_cli_session_cutoff_rig(sub, store.clone() as Arc<dyn EphemeralStore>);
+        let doomed_jti = Uuid::from_u128(0xBEEF);
+        let spared_jti = Uuid::from_u128(0xCAFE);
+        let iat = Some(Utc::now());
+        let doomed = mint_cli_session_with_iat(&key, sub, doomed_jti, iat);
+        let spared = mint_cli_session_with_iat(&key, sub, spared_jti, iat);
+
+        store
+            .put(
+                &format!("cli-session-revoked:{doomed_jti}"),
+                Bytes::from_static(b"1"),
+                Duration::from_secs(900),
+            )
+            .await
+            .expect("seed");
+
+        assert!(matches!(
+            uc.authenticate_bearer(&doomed).await.unwrap_err(),
+            AppError::Unauthorized(_)
+        ));
+        let principal = uc
+            .authenticate_bearer(&spared)
+            .await
+            .expect("the sibling session must survive");
+        assert_eq!(principal.user_id, sub);
+    }
+
+    /// An `EphemeralStore` that answers the `jti` denylist read
+    /// (nothing revoked) and fails the subject-cutoff read. Isolates
+    /// the second lookup's fail-closed branch, which
+    /// [`FailingEphemeralStore`] cannot reach because it denies at the
+    /// first read.
+    struct CutoffFailingEphemeralStore;
+    impl EphemeralStore for CutoffFailingEphemeralStore {
+        fn get(&self, key: &str) -> BoxFuture<'_, DomainResult<Option<Bytes>>> {
+            let fail = key.starts_with("cli-session-cutoff:");
+            Box::pin(async move {
+                if fail {
+                    Err(DomainError::Invariant("cutoff store down".into()))
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+        fn put(&self, _key: &str, _v: Bytes, _ttl: Duration) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn put_if_absent(
+            &self,
+            _key: &str,
+            _v: Bytes,
+            _ttl: Duration,
+        ) -> BoxFuture<'_, DomainResult<bool>> {
+            Box::pin(async { Ok(true) })
+        }
+        fn compare_and_swap(
+            &self,
+            _key: &str,
+            _ev: u64,
+            _nv: Bytes,
+            _ttl: Duration,
+        ) -> BoxFuture<'_, DomainResult<Option<u64>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn delete(&self, _key: &str) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn extend_ttl(&self, _key: &str, _ttl: Duration) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     /// An `EphemeralStore` whose every read fails — drives the

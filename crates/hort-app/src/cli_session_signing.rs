@@ -28,12 +28,26 @@
 //! # Revocation tradeoff (recorded, not free)
 //!
 //! A signed JWT is non-revocable until expiry by construction. The
-//! emergency-revocation path is a bounded `jti` denylist on the durable
-//! [`EphemeralStore`](hort_domain::ports::ephemeral_store::EphemeralStore)
-//! whose entries self-expire at the token's `exp`. The
-//! denylist *check* lives on the validate path
-//! (`AuthenticateUseCase`); the *write* is
-//! [`ApiTokenUseCase::revoke_cli_session`](crate::use_cases::api_token_use_case::ApiTokenUseCase::revoke_cli_session).
+//! emergency-revocation path is **two** bounded entries on the durable
+//! [`EphemeralStore`](hort_domain::ports::ephemeral_store::EphemeralStore),
+//! both consulted on the validate path (`AuthenticateUseCase`) and both
+//! fail-closed when the store cannot be read:
+//!
+//! - **`cli-session-revoked:{jti}`** — one session, self-expiring at
+//!   that token's `exp`. Written by
+//!   [`ApiTokenUseCase::revoke_cli_session`](crate::use_cases::api_token_use_case::ApiTokenUseCase::revoke_cli_session).
+//!   Usable when the token itself is in hand, because `jti` and `exp`
+//!   are readable out of it.
+//! - **`cli-session-cutoff:{sub}`** — every session of one subject
+//!   issued at or before the cutoff instant, self-expiring one
+//!   CliSession lifetime cap later (by then no token issued before the
+//!   cutoff can still be live). Written by
+//!   [`ApiTokenUseCase::revoke_cli_sessions_for_user`](crate::use_cases::api_token_use_case::ApiTokenUseCase::revoke_cli_sessions_for_user).
+//!   This is the one an operator can reach in the emergency the
+//!   denylist exists for — "the device is gone, cut this person off" —
+//!   because nothing persists a live CliSession, so there is no `jti`
+//!   to look up.
+//!
 //! Shipping the claims-carrying JWT without the denylist would forfeit
 //! registry-side immediate revocation — a security regression.
 //!
@@ -78,8 +92,9 @@ pub const CLI_SESSION_TOKEN_KIND: &str = "cli_session";
 /// CliSession access-token JWT payload (ADR 0013).
 ///
 /// Wire form: `iss`, `sub` (the resolved `user_id`), `aud`
-/// ([`CLI_SESSION_AUDIENCE`]), `exp` (Unix seconds), `jti` (denylist
-/// key), `token_kind` ([`CLI_SESSION_TOKEN_KIND`]), and `claims` (the
+/// ([`CLI_SESSION_AUDIENCE`]), `exp` (Unix seconds), `iat` (Unix
+/// seconds — the subject-cutoff comparand), `jti` (denylist key),
+/// `token_kind` ([`CLI_SESSION_TOKEN_KIND`]), and `claims` (the
 /// IdP-resolved claim set — the whole point of the JWT form).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliSessionClaims {
@@ -93,6 +108,26 @@ pub struct CliSessionClaims {
     /// memory via `exp_serde`).
     #[serde(with = "exp_serde")]
     pub exp: DateTime<Utc>,
+    /// `iat` — issued-at (Unix seconds on the wire; `DateTime<Utc>` in
+    /// memory via `iat_serde`). Set by
+    /// [`CliSessionTokenSigner::mint`]; the comparand the
+    /// subject-scoped revocation cutoff
+    /// (`cli-session-cutoff:{sub}`) is evaluated against on the
+    /// validate path.
+    ///
+    /// **`Option` on purpose, and it is the rollout story.** A token
+    /// minted before this field existed carries no `iat` at all, and
+    /// the field is absent rather than malformed — a non-`Option`
+    /// field would 401 every in-flight session the moment the new
+    /// binary starts serving. `None` therefore parses, and the
+    /// validate path denies it *only* while a cutoff for its subject
+    /// is active: such a token cannot prove it postdates the cutoff,
+    /// so admitting it would make the cutoff a no-op against exactly
+    /// the sessions it was raised to kill. Because every CliSession
+    /// token expires within the ≤15 min cap, no `iat`-less token
+    /// survives one cap-length past the upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "iat_serde")]
+    pub iat: Option<DateTime<Utc>>,
     /// `jti` — unique token id; the key the emergency-revocation
     /// denylist is built on.
     pub jti: Uuid,
@@ -121,6 +156,34 @@ mod exp_serde {
         Utc.timestamp_opt(secs, 0)
             .single()
             .ok_or_else(|| serde::de::Error::custom("exp out of range"))
+    }
+}
+
+/// `iat` claim serde — Unix-epoch seconds on the wire,
+/// `Option<DateTime<Utc>>` in memory. Separate from
+/// [`exp_serde`](mod@exp_serde) because the field is optional: a token
+/// minted before `iat` existed omits it, and `#[serde(default)]`
+/// resolves that absence to `None` without reaching this module's
+/// `deserialize`. A present-but-unrepresentable value is an error, not
+/// a silent `None` — an `iat` the registry cannot place on the
+/// timeline must not read as "this token carries no issued-at", which
+/// is the state the cutoff treats as unprovable.
+mod iat_serde {
+    use chrono::{DateTime, TimeZone, Utc};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(dt: &Option<DateTime<Utc>>, s: S) -> Result<S::Ok, S::Error> {
+        dt.map(|d| d.timestamp()).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<DateTime<Utc>>, D::Error> {
+        let Some(secs) = Option::<i64>::deserialize(d)? else {
+            return Ok(None);
+        };
+        Utc.timestamp_opt(secs, 0)
+            .single()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("iat out of range"))
     }
 }
 
@@ -153,9 +216,15 @@ impl CliSessionTokenSigner {
     }
 
     /// Mint a CliSession access-token JWT for `sub` carrying `claims`,
-    /// expiring at `exp`, identified by `jti`. The `aud` and
-    /// `token_kind` discriminators are set here so callers cannot
+    /// expiring at `exp`, identified by `jti`. The `aud`,
+    /// `token_kind` and `iat` fields are set here so callers cannot
     /// forget them.
+    ///
+    /// `iat` is the mint instant, truncated to whole seconds by the
+    /// wire form. It is not a caller parameter precisely because the
+    /// subject-scoped revocation cutoff compares against it: a mint
+    /// path that could choose its own issued-at could mint a token
+    /// that outlives a cutoff already raised against its subject.
     pub fn mint(
         &self,
         sub: Uuid,
@@ -168,6 +237,7 @@ impl CliSessionTokenSigner {
             sub,
             aud: CLI_SESSION_AUDIENCE.to_string(),
             exp,
+            iat: Some(Utc::now()),
             jti,
             token_kind: CLI_SESSION_TOKEN_KIND.to_string(),
             claims,
@@ -300,6 +370,143 @@ mod tests {
     }
 
     #[test]
+    fn mint_sets_iat_to_the_mint_instant() {
+        // `iat` is the cutoff comparand, so it must be present on every
+        // token the registry mints — a caller cannot omit it.
+        let signer = fresh_signer();
+        let before = Utc::now().timestamp();
+        let jwt = signer
+            .mint(
+                Uuid::from_u128(1),
+                vec!["developer".into()],
+                Uuid::new_v4(),
+                exp_in(900),
+            )
+            .expect("mint");
+        let after = Utc::now().timestamp();
+        match signer.verify(&jwt) {
+            CliSessionVerifyOutcome::Verified(c) => {
+                let iat = c.iat.expect("mint sets iat").timestamp();
+                assert!(
+                    iat >= before && iat <= after,
+                    "iat {iat} outside the mint window [{before}, {after}]"
+                );
+            }
+            other => panic!("expected Verified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_token_minted_without_iat_omits_the_field_and_parses_back_as_none() {
+        // The pre-`iat` token shape. The field is ABSENT from the
+        // payload (not `null`), and such a token still verifies —
+        // that is what keeps every in-flight session alive across the
+        // upgrade. Denying it is the cutoff's job, not the parser's.
+        let sk = SigningKey::generate(&mut UnwrapErr(SysRng));
+        let key = Arc::new(OciTokenSigningKey::new(sk, None));
+        let signer = CliSessionTokenSigner::new(key.clone(), "https://hort.example.com".into());
+        let legacy = CliSessionClaims {
+            iss: "https://hort.example.com".into(),
+            sub: Uuid::from_u128(1),
+            aud: CLI_SESSION_AUDIENCE.into(),
+            exp: exp_in(900),
+            iat: None,
+            jti: Uuid::new_v4(),
+            token_kind: CLI_SESSION_TOKEN_KIND.into(),
+            claims: vec!["developer".into()],
+        };
+        let jwt = key.mint_claims(&legacy).expect("mint");
+
+        // The serialised payload carries no `iat` key at all.
+        let payload_b64 = jwt.split('.').nth(1).expect("jwt has a payload segment");
+        let payload = base64_url_decode(payload_b64);
+        let json: serde_json::Value = serde_json::from_slice(&payload).expect("payload is json");
+        assert!(
+            json.get("iat").is_none(),
+            "an iat-less token must omit the field, got {json}"
+        );
+
+        match signer.verify(&jwt) {
+            CliSessionVerifyOutcome::Verified(c) => assert_eq!(c.iat, None),
+            other => panic!("expected Verified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claims_with_an_absent_iat_deserialize_to_none() {
+        // `#[serde(default)]` resolves the absence without reaching
+        // `iat_serde::deserialize`. Asserted directly on the payload
+        // shape so the contract is pinned independently of the signer.
+        let json = r#"{
+            "iss":"https://hort.example.com","sub":"00000000-0000-0000-0000-000000000001",
+            "aud":"urn:hort:cli-session","exp":4102444800,
+            "jti":"00000000-0000-0000-0000-000000000002",
+            "token_kind":"cli_session","claims":["developer"]
+        }"#;
+        let parsed: CliSessionClaims = serde_json::from_str(json).expect("parses");
+        assert_eq!(parsed.iat, None);
+    }
+
+    #[test]
+    fn claims_with_a_null_iat_deserialize_to_none() {
+        // An explicit `null` is the same unprovable state as an absent
+        // field: it reaches `iat_serde::deserialize`, which returns
+        // `None` rather than erroring.
+        let json = r#"{
+            "iss":"https://hort.example.com","sub":"00000000-0000-0000-0000-000000000001",
+            "aud":"urn:hort:cli-session","exp":4102444800,"iat":null,
+            "jti":"00000000-0000-0000-0000-000000000002",
+            "token_kind":"cli_session","claims":["developer"]
+        }"#;
+        let parsed: CliSessionClaims = serde_json::from_str(json).expect("parses");
+        assert_eq!(parsed.iat, None);
+    }
+
+    #[test]
+    fn claims_with_an_unrepresentable_iat_are_rejected() {
+        // A present `iat` the registry cannot place on the timeline is
+        // an error, NOT a silent `None` — `None` is the state the
+        // cutoff treats as unprovable, and conflating the two would let
+        // a forged out-of-range `iat` pick its own verdict.
+        let json = r#"{
+            "iss":"https://hort.example.com","sub":"00000000-0000-0000-0000-000000000001",
+            "aud":"urn:hort:cli-session","exp":4102444800,"iat":99999999999999999,
+            "jti":"00000000-0000-0000-0000-000000000002",
+            "token_kind":"cli_session","claims":["developer"]
+        }"#;
+        let err = serde_json::from_str::<CliSessionClaims>(json)
+            .expect_err("an out-of-range iat must not parse");
+        assert!(
+            err.to_string().contains("iat out of range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Minimal unpadded base64url decoder for reading a JWT payload
+    /// segment back out in a test. `hort-app` carries no base64
+    /// dependency and this is the only place a test needs one.
+    fn base64_url_decode(input: &str) -> Vec<u8> {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut acc: u32 = 0;
+        let mut bits = 0_u32;
+        let mut out = Vec::with_capacity(input.len() * 3 / 4);
+        for ch in input.bytes() {
+            let v = ALPHABET
+                .iter()
+                .position(|a| *a == ch)
+                .expect("jwt payload is base64url") as u32;
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push(((acc >> bits) & 0xff) as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
     fn verify_rejects_tampered_signature_as_not_our_token() {
         let signer = fresh_signer();
         let mut jwt = signer
@@ -397,6 +604,7 @@ mod tests {
             sub: Uuid::from_u128(1),
             aud: CLI_SESSION_AUDIENCE.into(),
             exp: exp_in(900),
+            iat: Some(Utc::now()),
             jti: Uuid::new_v4(),
             token_kind: "service_account".into(),
             claims: vec!["developer".into()],

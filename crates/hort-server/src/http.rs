@@ -843,11 +843,12 @@ mod tests {
     /// `DELETE /api/v1/admin/tokens/:id` admin-revoke) must ride
     /// the control listener with the rest of `/api/v1/admin/*`, while
     /// the PUBLIC self-service `/api/v1/users/me/tokens*` routes stay on
-    /// the public listener. If all five lived in
-    /// `api_token_routes()`, the two admin routes would answer on the
+    /// the public listener. If they lived in
+    /// `api_token_routes()`, the admin routes would answer on the
     /// public listener even with `HORT_CONTROL_BIND` set — contradicting
     /// the hardening-checklist tier-(iii) `/api/v1/admin/*`-is-control
-    /// claim.
+    /// claim. The CliSession revocation pair in the same tree has its
+    /// own test (`cli_session_revocation_routes_ride_the_control_listener`).
     ///
     /// Discriminates routed-vs-absent by `NOT_FOUND`, exactly like
     /// `build_control_router_carries_control_plane_only_and_main_drops_it`
@@ -995,6 +996,124 @@ mod tests {
             main_self_mint,
             StatusCode::NOT_FOUND,
             "self-service POST /api/v1/users/me/tokens must STAY on the public listener"
+        );
+    }
+
+    /// The two CliSession emergency-revocation routes
+    /// (`POST /api/v1/admin/cli-sessions/revoke`,
+    /// `POST /api/v1/admin/users/:user_id/cli-sessions/revoke`) ride
+    /// the control listener with the rest of `/api/v1/admin/*`.
+    ///
+    /// Worth its own test rather than trusting the sibling above:
+    /// these are the surfaces an operator reaches for when a session
+    /// must die *now*, and both failure directions are silent. A route
+    /// left on the public listener puts an identity kill switch on the
+    /// internet-facing tier; a route missing from the control listener
+    /// is discovered mid-incident, which is the worst possible moment.
+    ///
+    /// Same `NOT_FOUND`-discriminates-routing technique as
+    /// `control_split_moves_admin_token_routes_off_the_public_listener`
+    /// (mock ctx is `AuthContext::Disabled`, so the concrete non-404
+    /// status is not what is asserted).
+    #[test]
+    fn cli_session_revocation_routes_ride_the_control_listener() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let (control_jti, control_subject, main_jti, main_subject) =
+            metrics::with_local_recorder(&recorder, || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let ctx = build_mock_ctx(handle.clone());
+                        let target = Uuid::new_v4();
+                        let revoke_body = format!(
+                            r#"{{"jti":"{}","expires_at":"2030-01-01T00:00:00Z"}}"#,
+                            Uuid::new_v4()
+                        );
+
+                        let control = build_control_router(ctx.clone());
+                        let control_jti_res = control
+                            .clone()
+                            .oneshot(
+                                Request::post("/api/v1/admin/cli-sessions/revoke")
+                                    .header("content-type", "application/json")
+                                    .body(Body::from(revoke_body.clone()))
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        let control_subject_res = control
+                            .oneshot(
+                                Request::post(format!(
+                                    "/api/v1/admin/users/{target}/cli-sessions/revoke"
+                                ))
+                                .body(Body::empty())
+                                .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+
+                        let main = build_router_with_oci_config(
+                            ctx,
+                            &OciHttpConfig::default(),
+                            false,
+                            true,
+                        );
+                        let main_jti_res = main
+                            .clone()
+                            .oneshot(
+                                Request::post("/api/v1/admin/cli-sessions/revoke")
+                                    .header("content-type", "application/json")
+                                    .body(Body::from(revoke_body))
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        let main_subject_res = main
+                            .oneshot(
+                                Request::post(format!(
+                                    "/api/v1/admin/users/{target}/cli-sessions/revoke"
+                                ))
+                                .body(Body::empty())
+                                .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+
+                        (
+                            control_jti_res.status(),
+                            control_subject_res.status(),
+                            main_jti_res.status(),
+                            main_subject_res.status(),
+                        )
+                    })
+            });
+
+        assert_ne!(
+            control_jti,
+            StatusCode::NOT_FOUND,
+            "POST /api/v1/admin/cli-sessions/revoke must be routed on the control listener"
+        );
+        assert_ne!(
+            control_subject,
+            StatusCode::NOT_FOUND,
+            "POST /api/v1/admin/users/{{id}}/cli-sessions/revoke must be routed on the \
+             control listener"
+        );
+        assert_eq!(
+            main_jti,
+            StatusCode::NOT_FOUND,
+            "POST /api/v1/admin/cli-sessions/revoke must leave the public listener when the \
+             control split is ON"
+        );
+        assert_eq!(
+            main_subject,
+            StatusCode::NOT_FOUND,
+            "POST /api/v1/admin/users/{{id}}/cli-sessions/revoke must leave the public \
+             listener when the control split is ON"
         );
     }
 

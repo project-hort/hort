@@ -1418,7 +1418,11 @@ async fn build_auth_context(
             authenticate_builder = authenticate_builder.with_pat_validation(uc);
         }
         // Wire the CliSession JWT verifier (ADR 0013) +
-        // its `jti` revocation denylist (the durable EphemeralStore).
+        // its revocation denylist (the durable EphemeralStore, holding
+        // both the per-session `cli-session-revoked:{jti}` entries and
+        // the per-subject `cli-session-cutoff:{user_id}` ones — the
+        // SAME store `build_api_token_use_case` writes them to, which
+        // is what makes the write and the check meet).
         // Wired iff the signing key exists (native tokens on), which the
         // boot gate guarantees whenever token-exchange is on.
         if let Some(signer) = cli_session_signer {
@@ -1592,9 +1596,12 @@ fn build_api_token_use_case(
     // Attach the CliSession JWT signer (ADR 0013) +
     // its revocation denylist so `issue_cli_session` mints a signed
     // JWT (carrying the caller's resolved claims) instead of an
-    // opaque `hort_cli_*` row. The signer + denylist ship together
-    // (the denylist is the server-side immediate-revocation layer
-    // the signed JWT otherwise lacks).
+    // opaque `hort_cli_*` row, and so both revocation surfaces
+    // (`revoke_cli_session`, `revoke_cli_sessions_for_user`) have a
+    // store to write to. The signer + denylist ship together (the
+    // denylist is the server-side immediate-revocation layer the
+    // signed JWT otherwise lacks); it is the same durable store the
+    // validate path reads.
     let uc = match cli_session_signer {
         Some(signer) => uc.with_cli_session_signing(signer, ephemeral_durable),
         None => uc,
