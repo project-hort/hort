@@ -147,7 +147,11 @@ mod tests {
             };
             Box::pin(async move { Ok(v) })
         }
-        fn purge_artifact_refs(&self, _a: Uuid) -> BoxFuture<'_, DomainResult<PurgePreparation>> {
+        fn purge_artifact_refs(
+            &self,
+            _a: Uuid,
+            _retired_at: DateTime<Utc>,
+        ) -> BoxFuture<'_, DomainResult<PurgePreparation>> {
             Box::pin(async { Ok(PurgePreparation::Prepared(Vec::new())) })
         }
         fn begin_blob_reclaim(
@@ -303,6 +307,7 @@ mod tests {
             fn purge_artifact_refs(
                 &self,
                 _a: Uuid,
+                _retired_at: DateTime<Utc>,
             ) -> BoxFuture<'_, DomainResult<PurgePreparation>> {
                 Box::pin(async { Ok(PurgePreparation::Prepared(Vec::new())) })
             }

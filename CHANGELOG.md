@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The retention purge now takes an artifact out of service before it deletes
+  any of its bytes. A download attempted while the sweep is working through its
+  batch answers `404` instead of `500` (#364).
 - A policy whose projection row fell behind its event stream no longer refuses
   every later change: the write re-derives the row from the stream and retries,
   so one failed projection update stops wedging the whole gitops apply. Only a

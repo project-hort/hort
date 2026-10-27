@@ -1,11 +1,18 @@
 //! Outbound port the **storage-GC walk**
 //! (`PurgeUseCase::process_expired`) uses: read
 //! the pending-purge work set and, in one committed idempotent
-//! transaction, decrement the `content_references` projection and
+//! transaction, retire the artifact projection, decrement the
+//! `content_references` projection and
 //! persist and report the post-delete cross-`kind` remaining count per
 //! CAS hash. Storage completion is checkpointed per hash; only after
 //! every checkpoint exists may the adapter atomically append all
-//! terminal events and retire the artifact projection.
+//! terminal events.
+//!
+//! **The retirement is first, not last.** `artifacts.deleted_at` is
+//! written by [`PurgeGcPort::purge_artifact_refs`], in the same commit
+//! as the edge deletion and therefore before any byte is destroyed,
+//! rather than by the terminal transition at the end of the sweep —
+//! see that method's docs for the window this closes.
 //!
 //! # Why this exists
 //!
@@ -18,8 +25,8 @@
 //! decrement-and-GC algorithm (decrement `content_references`, delete the
 //! CAS blob iff nothing claims it any more — neither a cross-`kind`
 //! `content_references` row nor a GC-protected artifact holding the hash
-//! without one, see [`BlobReclaim::ProtectedClaim`] — append every
-//! `ArtifactPurged`, and retire the projection).
+//! without one, see [`BlobReclaim::ProtectedClaim`] — and append every
+//! `ArtifactPurged`).
 //! The `hort-app` `PurgeUseCase` is pure orchestration over this port plus
 //! the existing [`StoragePort`](super::storage::StoragePort) and the event
 //! store; the SQL (lock + `DELETE … RETURNING` + cross-`kind` count +
@@ -275,18 +282,27 @@ pub enum PurgePreparation {
     /// were released, with the post-delete claim count and the
     /// completion checkpoint per hash. Authoritative and idempotent —
     /// a retry gets the same rows back.
+    ///
+    /// The artifact is **retired** (`artifacts.deleted_at` set) in the
+    /// same commit — see
+    /// [`PurgeGcPort::purge_artifact_refs`]. This is the only outcome
+    /// that writes it.
     Prepared(Vec<PurgedRef>),
     /// There is no `artifacts` row with this id. Nothing was locked,
-    /// read or deleted. Not an error and not a protection refusal: the
-    /// row the page offered is gone, so there is no artifact left to
-    /// release bytes for, and it will not be offered again.
+    /// read, deleted or retired. Not an error and not a protection
+    /// refusal: the row the page offered is gone, so there is no
+    /// artifact left to release bytes for, and it will not be offered
+    /// again. The worklist is `ON DELETE CASCADE`-tied to the row, so a
+    /// vanished artifact takes its work with it.
     NoArtifact,
     /// The artifact is **GC-protected evidence** as of the read taken
     /// under the artifact lock, in the transaction that would have done
     /// the deleting ([`PendingPurge::is_gc_protected`]). Nothing was
     /// deleted: no `content_references` edge, no worklist row, no
-    /// event. The work item stays pending and the next sweep asks
-    /// again.
+    /// event, and no retirement — `deleted_at` is left exactly as it
+    /// was found, so a protection that declines to delete does not
+    /// take the artifact out of service. The work item stays pending
+    /// and the next sweep asks again.
     ///
     /// Reaching this is not routine. The page row the caller already
     /// checked said the artifact was collectable, so this is the
@@ -301,8 +317,9 @@ pub enum PurgePreparation {
     },
     /// The `KeepLastN` tag exemption applies as of the read taken under
     /// the artifact lock ([`PendingPurge::is_tag_exempt`]). Nothing was
-    /// deleted, exactly as for [`Self::Protected`], and the artifact is
-    /// purged on a later sweep once the tag moves.
+    /// deleted and nothing was retired, exactly as for
+    /// [`Self::Protected`], and the artifact is purged on a later sweep
+    /// once the tag moves.
     ///
     /// Same note as above: the caller's page row said otherwise, so
     /// this is a tag that landed on a `KeepLastN` target inside the
@@ -478,13 +495,56 @@ pub trait PurgeGcPort: Send + Sync {
 
     /// Prepare the durable worklist in **one committed, idempotent
     /// transaction**: lock the artifact row, re-read the protection
-    /// facts under that lock, delete every source edge, compute each
-    /// distinct target's cross-kind remaining count, and persist those
-    /// decisions before returning them.
+    /// facts under that lock, **retire the artifact
+    /// (`artifacts.deleted_at = retired_at`)**, delete every source
+    /// edge, compute each distinct target's cross-kind remaining count,
+    /// and persist those decisions before returning them.
     ///
     /// **Idempotent**: once present, the worklist is authoritative and
     /// returned unchanged on retry. This preserves OCI membership
     /// targets that no artifact column can reconstruct after deletion.
+    ///
+    /// # The retirement is here, not at the terminal transition
+    ///
+    /// `artifacts.deleted_at` is the one fact that takes the artifact
+    /// out of service: `Artifact::is_downloadable` is false once it is
+    /// set, and a read path that filters `deleted_at IS NULL` stops
+    /// resolving the row at all. It therefore MUST be durable **before
+    /// the first destructive step**, which is this transaction's own
+    /// edge deletion — and so, transitively, before any
+    /// [`StoragePort::delete`](super::storage::StoragePort::delete) the
+    /// caller goes on to issue.
+    ///
+    /// Writing it at the terminal transition instead leaves a window
+    /// that lasts as long as the whole sweep (the terminal transition
+    /// waits for *every* hash of the artifact, and the sweep walks many
+    /// artifacts before it): bytes already deleted, row still live, so
+    /// the artifact is downloadable to the domain and the CAS read
+    /// behind it fails. The reader gets an opaque `500` on something
+    /// the API still advertises, instead of the honest `404` the
+    /// retirement produces.
+    ///
+    /// `retired_at` is the caller's injected sweep clock so a retry is
+    /// coherent with the terminal `ArtifactPurged`'s `purged_at`.
+    /// Implementations MUST keep an **earlier** existing timestamp
+    /// (`COALESCE(deleted_at, retired_at)`): a caller-facing delete
+    /// already recorded the moment the artifact left service, and the
+    /// purge time must not overwrite that audit fact.
+    ///
+    /// **Every `Prepared` outcome carries the retirement; no refusal
+    /// does.** The two are one commit, so a reader never sees the edge
+    /// deletion without the retirement, and
+    /// [`PurgePreparation::Protected`] / [`PurgePreparation::TagExempt`]
+    /// / [`PurgePreparation::NoArtifact`] leave `deleted_at` exactly as
+    /// they found it — a protection that declines to delete must not
+    /// take the artifact out of service.
+    ///
+    /// An aborted run therefore leaves a retired artifact with intact
+    /// bytes, and that is the safe direction: the work item is
+    /// untouched (membership is the event rule — see
+    /// [`Self::list_pending_purge`] — not `deleted_at`), so the next
+    /// sweep resumes and finishes it. The reverse — live row, deleted
+    /// bytes — is the one state no retry can make correct.
     ///
     /// # The protection facts are re-read here, under the lock
     ///
@@ -519,10 +579,14 @@ pub trait PurgeGcPort: Send + Sync {
     /// are deleted and whose terminal event can never be appended.
     /// What protects the *bytes* from that point on is
     /// [`Self::begin_blob_reclaim`]'s claim check, which asks about the
-    /// hash rather than the artifact.
+    /// hash rather than the artifact. The retry re-asserts the
+    /// retirement rather than skipping it, so the invariant above holds
+    /// branch-independently: a `Prepared` answer always comes from a
+    /// transaction that also retired the row.
     fn purge_artifact_refs(
         &self,
         artifact_id: Uuid,
+        retired_at: DateTime<Utc>,
     ) -> BoxFuture<'_, DomainResult<PurgePreparation>>;
 
     /// Take the hash-scoped blob-reclamation lock and re-verify, under
@@ -577,17 +641,26 @@ pub trait PurgeGcPort: Send + Sync {
         completed_at: DateTime<Utc>,
     ) -> BoxFuture<'_, DomainResult<()>>;
 
-    /// Append every per-hash `ArtifactPurged` event and set
-    /// `artifacts.deleted_at` in one transaction. The adapter refuses
-    /// the transition while any worklist row is incomplete. `events`
-    /// is assembled by the application layer so attribution and event
-    /// vocabulary remain orchestration policy, not adapter policy.
+    /// Append every per-hash `ArtifactPurged` event, terminating the
+    /// work item, and re-assert `artifacts.deleted_at` in one
+    /// transaction. The adapter refuses the transition while any
+    /// worklist row is incomplete. `events` is assembled by the
+    /// application layer so attribution and event vocabulary remain
+    /// orchestration policy, not adapter policy.
     ///
     /// The retirement is idempotent in the *state*: the transition
     /// succeeds whenever the row ends up retired — including when the
     /// user-facing delete path retired it first, which keeps its
     /// earlier timestamp — and reports `NotFound` only when the row is
     /// genuinely absent.
+    ///
+    /// By the time this runs the row is **already** retired, by
+    /// [`Self::purge_artifact_refs`]. The write is kept because it is
+    /// the transition's row-presence check (zero rows affected is the
+    /// `NotFound`) and because the state, not the writer, is what the
+    /// idempotency is about — a worklist prepared by an earlier build
+    /// reaches here with `deleted_at` still unset and must still
+    /// retire.
     fn complete_artifact_purge(
         &self,
         artifact_id: Uuid,
@@ -634,6 +707,7 @@ mod tests {
         fn purge_artifact_refs(
             &self,
             _artifact_id: Uuid,
+            _retired_at: DateTime<Utc>,
         ) -> BoxFuture<'_, DomainResult<PurgePreparation>> {
             Box::pin(async { Ok(PurgePreparation::Prepared(Vec::new())) })
         }
@@ -660,7 +734,9 @@ mod tests {
         let p = EmptyPort;
         assert!(p.list_pending_purge(10, None).await.unwrap().is_empty());
         assert_eq!(
-            p.purge_artifact_refs(Uuid::nil()).await.unwrap(),
+            p.purge_artifact_refs(Uuid::nil(), Utc::now())
+                .await
+                .unwrap(),
             PurgePreparation::Prepared(Vec::new())
         );
         assert!(matches!(
@@ -713,6 +789,7 @@ mod tests {
             fn purge_artifact_refs(
                 &self,
                 _artifact_id: Uuid,
+                _retired_at: DateTime<Utc>,
             ) -> BoxFuture<'_, DomainResult<PurgePreparation>> {
                 Box::pin(async { Err(DomainError::Invariant("purge tx failed".into())) })
             }
@@ -745,7 +822,9 @@ mod tests {
             DomainError::Invariant(_)
         ));
         assert!(matches!(
-            p.purge_artifact_refs(Uuid::nil()).await.unwrap_err(),
+            p.purge_artifact_refs(Uuid::nil(), Utc::now())
+                .await
+                .unwrap_err(),
             DomainError::Invariant(_)
         ));
         assert!(matches!(

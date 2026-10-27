@@ -4580,9 +4580,15 @@ decision; an empty pending set emits nothing):
   names which claim held.
 - `storage_error` — `StoragePort::delete` failed transiently for a
   refcount-0 blob. **The `ArtifactExpired` decision is not lost**: no
-  `ArtifactPurged` is emitted, the `content_references` rows are not
-  removed (the deletion is rolled back with the failed transaction),
-  and the next sweep retries this artifact (two-stage idempotency).
+  `ArtifactPurged` is emitted, the durable purge worklist retains every
+  hash and its recorded count, and the next sweep retries this artifact
+  from it (two-stage idempotency). The artifact is already retired
+  (`artifacts.deleted_at`) and its `content_references` source edges are
+  already gone — both are written by the preparation transaction, which
+  commits before any storage delete is attempted, so neither is rolled
+  back by this failure. That order is deliberate: an artifact whose
+  bytes are partly gone must not still be servable, and the worklist is
+  what makes the half-finished state resumable.
 - `deferred` — the hash-scoped blob-reclamation lock was held by
   another session, so the refcount-0 decision could not be re-verified
   under it and **no delete was attempted**. Something is writing a
