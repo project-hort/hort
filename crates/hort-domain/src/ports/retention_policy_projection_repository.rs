@@ -17,13 +17,21 @@
 //! `RetentionPolicyUseCase` (the gitops-authored
 //! create/update/archive path) calls
 //! [`upsert`](RetentionPolicyProjectionRepository::upsert) immediately
-//! after each successful event append, in lockstep with the
-//! event-store append (append-then-upsert; `stream_version` on the
-//! supplied row is the post-append `AppendResult.stream_position` —
-//! the optimistic-concurrency anchor for the next mutation — the
-//! same trade-off as the scan-policy projection). All writes are
-//! gitops-authored; there is no
-//! imperative HTTP API.
+//! after each successful event append (append-then-upsert;
+//! `stream_version` on the supplied row is the post-append
+//! `AppendResult.stream_position` — the optimistic-concurrency anchor
+//! for the next mutation — the same trade-off as the scan-policy
+//! projection). The two writes are **not** transactionally bound: this
+//! port is backend-agnostic (ADR 0004) and takes no transaction handle,
+//! so a failed upsert after a committed append leaves the row one
+//! version behind its stream.
+//!
+//! The next mutation repairs that rather than deadlocking on it: on
+//! `Conflict` it re-derives the row from the stream through
+//! [`RetentionPolicy::project`](crate::retention::RetentionPolicy::project)
+//! + [`RetentionPolicyRow::from_policy`] and retries once (ADR 0060).
+//!
+//! All writes are gitops-authored; there is no imperative HTTP API.
 //!
 //! ## Dedicated type, deliberate divergence
 //!
@@ -75,6 +83,34 @@ pub struct RetentionPolicyRow {
 }
 
 impl RetentionPolicyRow {
+    /// The projection row a replayed [`RetentionPolicy`] states — the
+    /// exact inverse of [`Self::into_policy`].
+    ///
+    /// This is the retention half of the policy **fold**: `project` folds
+    /// the stream into the aggregate, and this turns that aggregate back
+    /// into the row to write. It is what lets a stale row be repaired from
+    /// its own stream rather than only ever written forward from a
+    /// command — the row carries `stream_version`, and the next append
+    /// uses that version as its expected version, so a row that disagrees
+    /// with its stream refuses every later write until something re-derives
+    /// it.
+    #[must_use]
+    pub fn from_policy(policy: RetentionPolicy) -> Self {
+        Self {
+            policy_id: policy.id,
+            name: policy.name,
+            predicate: policy.predicate,
+            scope: policy.scope,
+            archived: policy.archived,
+            stream_version: policy.stream_version,
+            last_evaluated_at: policy.last_evaluated_at,
+            last_matched_count: policy.last_matched_count,
+            last_expired_count: policy.last_expired_count,
+            created_at: policy.created_at,
+            updated_at: policy.updated_at,
+        }
+    }
+
     /// Reconstruct B1's replayed [`RetentionPolicy`] aggregate from the
     /// projection columns. Pure — the projection IS the materialised
     /// fold, so this is a direct field copy, NOT an event replay (the
@@ -187,6 +223,19 @@ mod tests {
         assert_eq!(policy.last_expired_count, row.last_expired_count);
         assert_eq!(policy.created_at, row.created_at);
         assert_eq!(policy.updated_at, row.updated_at);
+    }
+
+    /// `from_policy` is `into_policy`'s inverse, so a row re-derived from
+    /// a replayed aggregate is the row that aggregate came from. The
+    /// self-heal writes exactly this value, so a field the pair dropped
+    /// would be a field the repair silently reset.
+    #[test]
+    fn row_round_trips_through_the_policy_aggregate() {
+        let row = sample_row();
+        assert_eq!(
+            RetentionPolicyRow::from_policy(row.clone().into_policy()),
+            row
+        );
     }
 
     #[test]

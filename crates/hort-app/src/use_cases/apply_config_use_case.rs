@@ -2019,14 +2019,28 @@ fn gitops_actor_for_kind(kind: Kind) -> Actor {
     })
 }
 
-/// Translate `DomainError::Conflict` from an event-store append into
-/// the apply-pipeline-level `ConcurrentModification` error and emit a
+/// Translate a lost version race on a policy stream into the
+/// apply-pipeline-level `ConcurrentModification` error and emit a
 /// boundary-level `tracing::warn!`. The per-stream `warn!` already
 /// fired inside `PolicyUseCase`; this one is the apply-pipeline
 /// observability event.
+///
+/// Both error shapes a lost race can take map here, and for the apply
+/// they mean the same thing:
+///
+/// - `DomainError::Conflict` — a single-attempt append was refused. The
+///   only policy-stream append left on that shape is `create_policy`'s
+///   `ExpectedVersion::NoStream`.
+/// - `DomainError::Contended` — ADR 0060's retryable-busy outcome, raised
+///   when an expected-version mutation lost, re-derived its projection
+///   from the stream, and lost again. That second loss is a genuine
+///   concurrent writer, which is exactly what this abort is named for. It
+///   is deliberately NOT retried here: the apply is strict-atomic, so the
+///   operator re-applies the whole bundle rather than this pipeline
+///   racing a peer replica statement by statement.
 fn map_concurrent_modification(err: AppError) -> AppError {
     match err {
-        AppError::Domain(DomainError::Conflict(msg)) => {
+        AppError::Domain(DomainError::Conflict(msg) | DomainError::Contended(msg)) => {
             tracing::warn!(
                 conflict_message = %msg,
                 "strict-atomic abort: concurrent policy modification",

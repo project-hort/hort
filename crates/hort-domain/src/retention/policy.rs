@@ -212,7 +212,7 @@ impl RetentionPolicy {
         };
 
         for event in iter {
-            state.apply(event)?;
+            state.apply_appended(event)?;
         }
         Ok(state)
     }
@@ -222,7 +222,17 @@ impl RetentionPolicy {
     /// first event and is handled by [`Self::project`]; a second
     /// `Created` (or any event after `Archived`) is a replay-integrity
     /// failure.
-    fn apply(&mut self, event: &RetentionPolicyEvent) -> DomainResult<()> {
+    ///
+    /// Public because the **write** path uses it too: a mutation builds
+    /// its event and then applies it, instead of maintaining the event and
+    /// the projection edit side by side. That makes the forward and the
+    /// replay directions one mapping, so a row written by a command and a
+    /// row re-derived from the same stream cannot disagree. The caller
+    /// then overwrites `stream_version` with the append's
+    /// `AppendResult.stream_position` — this bumps it by one, which is
+    /// right for a contiguous replay but is not the authority on where an
+    /// append actually landed.
+    pub fn apply_appended(&mut self, event: &RetentionPolicyEvent) -> DomainResult<()> {
         if event.aggregate_id() != self.id {
             return Err(DomainError::Invariant(format!(
                 "RetentionPolicy stream mixes aggregate ids: stream is {}, event is {}",

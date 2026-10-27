@@ -8,16 +8,31 @@
 //! ## Write contract
 //!
 //! `PolicyUseCase` calls `upsert` immediately after each successful event
-//! append, in the same DB transaction as the event-store
-//! `append_to_stream` call. `stream_version` on the supplied projection is
-//! the post-append `AppendResult.stream_position` — that field then drives
-//! [`ExpectedVersion::Exact`](crate::ports::event_store::ExpectedVersion::Exact)
-//! on the next mutation. A concurrent imperative-API write between
-//! projection-read and event-append fails the apply with a clear
-//! `ConcurrentModification` error.
+//! append. **The two writes are NOT in one transaction, and cannot be**:
+//! this port is backend-agnostic (ADR 0004) and takes no transaction
+//! handle, and its Postgres implementation holds its own pool, separate
+//! from the event store's. So "append succeeded, upsert failed" is a
+//! reachable state and the projection is then one version behind its
+//! stream.
 //!
-//! Out-of-band rebuild from the event log is a future operational
-//! tool; this port only serves the synchronous-after-append path.
+//! `stream_version` on the supplied projection is the post-append
+//! `AppendResult.stream_position` — that field then drives
+//! [`ExpectedVersion::Exact`](crate::ports::event_store::ExpectedVersion::Exact)
+//! on the next mutation, which is why a one-version-behind row used to be
+//! terminal: every later append asked with the stale version, got
+//! `Conflict`, and never reached the `upsert` that would have repaired it.
+//!
+//! The next mutation now **re-derives the projection from the stream** on
+//! that `Conflict` and retries once
+//! ([`fold_scan_policy`](crate::entities::scan_policy_fold::fold_scan_policy),
+//! ADR 0060's read-decide-append contract), so a failed upsert costs one
+//! refused call rather than every call that follows it. A `Conflict` that
+//! survives the re-base is a genuine concurrent writer and reaches the
+//! apply as `ConcurrentModification`.
+//!
+//! An out-of-band operator rebuild from the event log is still future
+//! tooling; this port serves the synchronous-after-append path and the
+//! repair the next write performs on it.
 
 use uuid::Uuid;
 
@@ -85,10 +100,14 @@ pub trait PolicyProjectionRepository: Send + Sync {
         policy_id: Uuid,
     ) -> BoxFuture<'_, DomainResult<Vec<ExclusionProjection>>>;
 
-    /// INSERT-or-UPDATE the projection row in lockstep with the
+    /// INSERT-or-UPDATE the projection row immediately after the
     /// event-store append. `stream_version` on the supplied
-    /// projection is the post-append `AppendResult.stream_position`
-    /// — the use case writes both in the same DB transaction.
+    /// projection is the post-append `AppendResult.stream_position`.
+    ///
+    /// **Not transactionally bound to that append** — see this module's
+    /// write contract. A failure here leaves the row behind its stream;
+    /// the next mutation re-derives it from the stream rather than
+    /// deadlocking on the stale version.
     fn upsert(&self, projection: &ScanPolicyProjection) -> BoxFuture<'_, DomainResult<()>>;
 
     /// INSERT-or-UPDATE one exclusion row. Identity is `exclusion_id`

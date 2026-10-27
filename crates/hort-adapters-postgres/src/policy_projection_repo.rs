@@ -4,8 +4,16 @@
 //! 095). Reads are covered by the active-name + policy-id partial
 //! indexes; writes are `ON CONFLICT (...) DO UPDATE` upserts paired
 //! with `ExpectedVersion::Exact` on the event-store side so a
-//! concurrent imperative-API write between projection-read and
-//! event-append surfaces as `ConcurrentModification`.
+//! concurrent write between projection-read and event-append surfaces
+//! as `ConcurrentModification`.
+//!
+//! This pool is **not** the event store's, and `upsert` takes no
+//! transaction handle, so the append and the upsert are two writes in
+//! two stores. An upsert that fails after its append committed leaves
+//! the row one version behind its stream; the next mutation re-derives
+//! the row from the stream rather than refusing forever on the stale
+//! version (see
+//! [`PolicyProjectionRepository`](hort_domain::ports::policy_projection_repository)).
 //!
 //! `PolicyScope` round-trips through JSONB via serde — the column
 //! shape is `"Global"` for the unit variant and

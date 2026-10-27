@@ -10,16 +10,40 @@
 //! (`ApplyConfigUseCase::apply_scan_policies`). Authorization is enforced
 //! at the gitops apply boundary, not here.
 //!
-//! # Append-then-upsert trade-off
+//! # Append-then-upsert, and the repair that makes it survivable
 //!
 //! The mutation path is `events.append` first, then `projections.upsert`
 //! only on `Ok(_)`. The two writes are NOT transactionally bound across
-//! ports — a successful append followed by a failing upsert leaves the
-//! projection stale relative to the event stream. Subsequent reads will
-//! see the stale row until an out-of-band rebuild tool runs (deferred
-//! operational tooling). The reverse ordering would be worse: a
-//! successful projection write followed by a failing append would let a
-//! row claim a `stream_version` that was never persisted.
+//! ports and cannot be: `PolicyProjectionRepository` is backend-agnostic
+//! (ADR 0004), takes no transaction handle, and its Postgres
+//! implementation holds its own pool. The reverse ordering would be
+//! worse: a successful projection write followed by a failing append
+//! would let a row claim a `stream_version` that was never persisted.
+//!
+//! So "append committed, upsert failed" is reachable, and the row is then
+//! one version behind its stream. That used to be **terminal**, not
+//! merely stale: the projection carries the `stream_version` every later
+//! mutation passes as [`ExpectedVersion::Exact`], so every later mutation
+//! asked with the stale version, got `Conflict`, and returned before
+//! reaching the `upsert` that would have repaired the row. For the gitops
+//! apply — the only production writer — a `Conflict` is a strict-atomic
+//! abort, so one failed upsert stopped every subsequent apply of the
+//! whole bundle: no repository change, no new policy, no grant.
+//!
+//! Every expected-version mutation here now follows ADR 0060's
+//! read-decide-append contract through
+//! [`mutate_policy_stream`](PolicyUseCase::mutate_policy_stream): on
+//! `Conflict` it re-reads the stream, re-derives the projection from it
+//! with [`fold_scan_policy`], re-decides the mutation against that state,
+//! and appends once more. A projection that contradicts its stream is
+//! simply wrong, so the re-base never tries to work out *why* they
+//! disagreed. It is fail-closed: a stream that cannot be read, or cannot
+//! produce a projection, rewrites nothing and the call is refused.
+//!
+//! `create_policy` is deliberately not part of that: it appends with
+//! [`ExpectedVersion::NoStream`] onto a freshly minted `policy_id`, so a
+//! `Conflict` there is a stream-identity collision and there is no
+//! projection version to re-base onto. See its own doc comment.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,24 +58,30 @@ use hort_domain::entities::scan_policy::{
     CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
     ScanPolicyProjection, SeverityThreshold, SignerIdentityPattern,
 };
+use hort_domain::entities::scan_policy_fold::{
+    apply_policy_batch, diff_policy_fields, exclusion_projection, fold_scan_policy,
+    policy_config_snapshot, ScanPolicyReplay,
+};
 use hort_domain::error::DomainError;
 use hort_domain::events::{
     Actor, ArtifactReEvaluated, ArtifactRejected, DomainEvent, ExclusionAdded, ExclusionRemoved,
-    PolicyArchived, PolicyCreated, PolicyField, PolicyReactivated, PolicyScope, PolicyUpdated,
-    ReEvaluationTrigger, StreamId,
+    PolicyArchived, PolicyCreated, PolicyReactivated, PolicyScope, ReEvaluationTrigger, StreamId,
 };
 use hort_domain::policy::{evaluate_scan_result, ReEvaluationOutcome};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
+use hort_domain::ports::event_store::{
+    AppendEvents, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
+};
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::{ArtifactCoords, PageRequest};
 
-use crate::error::AppResult;
+use crate::append_conflict::{append_with_conflict_retry, ConflictCycleOutcome};
+use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{
     emit_curation_decision, emit_policy_evaluation, emit_policy_reevaluation_result, emit_release,
@@ -251,6 +281,64 @@ pub struct RemoveExclusionCommand {
 }
 
 // ---------------------------------------------------------------------------
+// Self-healing policy-stream mutations (ADR 0060)
+// ---------------------------------------------------------------------------
+
+/// How many read-decide-append attempts one policy mutation gets.
+///
+/// Two: the first stands on the projection the caller read, the second on
+/// the projection re-derived from the stream. A third would add nothing —
+/// the second attempt's expected version came from the stream itself, so
+/// losing it again is a genuine concurrent writer and not something a
+/// further re-base can resolve. ADR 0060 requires the bound to be small
+/// and explicit rather than a loop.
+const POLICY_APPEND_ATTEMPTS: u8 = 2;
+
+/// What a policy mutation wants, re-decided against a given state
+/// (ADR 0060 step (b)).
+///
+/// The decision is re-made per attempt because the expected version and
+/// the batch have to come from the same observation of the stream: a batch
+/// built against a version that was then refused describes a change from a
+/// state that never existed.
+enum PolicyIntent {
+    /// The state already says what the caller wanted — nothing to append.
+    /// The call succeeds and the projection is still written, which is
+    /// what repairs a row that had fallen behind its stream.
+    Satisfied,
+    /// Append these events against this state's `stream_version`.
+    Append(Vec<DomainEvent>),
+}
+
+/// A decided-but-not-yet-appended mutation: the state it was decided
+/// against and the events it decided on, kept together so the append's
+/// expected version and its batch cannot come from different observations.
+struct PendingMutation {
+    state: ScanPolicyReplay,
+    events: Vec<DomainEvent>,
+}
+
+/// What a self-healing policy mutation left behind.
+struct HealedMutation {
+    /// The projection to write: the fold of the appended batch onto the
+    /// state it was appended against, or — when the state already
+    /// satisfied the intent — that state itself. Writing it is what
+    /// repairs a row that had fallen behind.
+    projection: ScanPolicyProjection,
+    /// The batch that was actually appended — empty when nothing was.
+    /// It is the **re-decided** batch, not the caller's first attempt, so
+    /// a caller deciding something from what it emitted (the ADR 0041
+    /// gate-affecting enqueue) must read it from here.
+    events: Vec<DomainEvent>,
+    /// `false` when nothing was appended because the state already stated
+    /// the intent (ADR 0060's idempotent success).
+    appended: bool,
+    /// `true` when the caller's projection version was refused and the
+    /// projection was re-derived from the stream. Distinguishes the
+    /// stale-row repair from the ordinary first-attempt success in logs.
+    healed: bool,
+}
+// ---------------------------------------------------------------------------
 // PolicyUseCase
 // ---------------------------------------------------------------------------
 
@@ -422,6 +510,194 @@ impl PolicyUseCase {
         }
     }
 
+    /// Write the projection a mutation produced.
+    ///
+    /// A failure here is the defect this use case's repair exists for, and
+    /// the log says so: the row is left behind its stream, and the next
+    /// mutation re-derives it rather than refusing forever on the stale
+    /// version. One helper rather than a copy per site so the five
+    /// mutations cannot describe the same failure five ways.
+    async fn write_projection(
+        &self,
+        policy_id: Uuid,
+        projection: &ScanPolicyProjection,
+    ) -> AppResult<()> {
+        self.projections.upsert(projection).await.map_err(|e| {
+            tracing::error!(
+                policy_id = %policy_id,
+                error = %e,
+                "policy projection upsert failed after a successful event append \
+                 — the projection is behind its stream; the next mutation \
+                 re-derives it from the stream",
+            );
+            AppError::from(e)
+        })
+    }
+
+    /// Re-derive a policy's projection from its own event stream.
+    ///
+    /// The repair half of the append-then-upsert trade-off: the stream is
+    /// the source of truth (ADR 0002), so a projection that disagrees with
+    /// it is simply wrong and the stream's own answer replaces it. No
+    /// attempt is made to work out *why* they disagreed — a failed upsert
+    /// and a concurrent writer leave the same evidence, and the correct
+    /// response to both is the same.
+    ///
+    /// The read is unbounded (`u64::MAX`): a policy stream has no event
+    /// cap, and a budget that truncated it would hand back a projection
+    /// derived from the oldest N events while looking exactly like one
+    /// derived from the whole stream.
+    ///
+    /// **Fail-closed.** A read failure or a stream the fold refuses
+    /// propagates: the caller writes nothing rather than repairing a row
+    /// to a state the stream does not support.
+    async fn rebase_policy_from_stream(&self, policy_id: Uuid) -> AppResult<ScanPolicyReplay> {
+        let stream_id = StreamId::policy(policy_id);
+        let events = self
+            .events
+            .read_stream(&stream_id, ReadFrom::Start, u64::MAX)
+            .await?;
+        Ok(fold_scan_policy(&events)?)
+    }
+
+    /// Append one batch to a policy stream, repairing a stale projection
+    /// version on the way (ADR 0060's read-decide-append contract).
+    ///
+    /// `decide` is the mutation's intent, expressed against whatever state
+    /// the current attempt stands on. It runs on **every** attempt — on the
+    /// first against `base` (what the caller read), on the second against
+    /// the stream-derived replay — so the batch that is finally appended is
+    /// always the one the decision function produced for the version it was
+    /// appended at. The intent is a pure function of state here because the
+    /// fold is pure: re-deciding costs one stream read, not a second pass
+    /// over the ports.
+    ///
+    /// Returning [`PolicyIntent::Satisfied`] from a re-decide is ADR 0060
+    /// step (b): the stream already states what the caller wanted, so
+    /// nothing is appended and the call succeeds — writing the returned
+    /// projection still repairs the row.
+    ///
+    /// A `Conflict` that survives the re-base is a genuine concurrent
+    /// writer. It is logged as that and surfaces as
+    /// [`DomainError::Contended`] — retryable-busy, which ADR 0060 (d)
+    /// mandates and which the HTTP edge already answers with 503 +
+    /// `Retry-After`. Only the attempt-limit is spent on conflicts; every
+    /// other error propagates unretried.
+    async fn mutate_policy_stream(
+        &self,
+        policy_id: Uuid,
+        base: &ScanPolicyReplay,
+        actor: &Actor,
+        decide: impl Fn(&ScanPolicyReplay) -> AppResult<PolicyIntent>,
+    ) -> AppResult<HealedMutation> {
+        // Shared references, so the per-attempt future can capture them by
+        // copy: `append_with_conflict_retry` takes an `FnMut` and calls it
+        // once per attempt, so the future it returns must own what it
+        // touches and a `&_` is the only thing it can own twice.
+        let stream_id = &StreamId::policy(policy_id);
+        let decide = &decide;
+        append_with_conflict_retry(POLICY_APPEND_ATTEMPTS, |attempt| async move {
+            // Attempt 1 stands on what the caller read. Every later
+            // attempt re-derives the projection from the stream first —
+            // that re-derivation IS the repair, and it is also the only
+            // thing that can change the expected version the append is
+            // refused on.
+            let healed = attempt > 1;
+            let state = if healed {
+                let state = self.rebase_policy_from_stream(policy_id).await?;
+                tracing::info!(
+                    policy_id = %policy_id,
+                    projection_version = base.policy.stream_version,
+                    stream_version = state.policy.stream_version,
+                    "policy projection re-derived from its event stream after an \
+                     expected-version refusal; retrying the mutation against the \
+                     stream's state",
+                );
+                state
+            } else {
+                base.clone()
+            };
+
+            let mut pending = match decide(&state)? {
+                PolicyIntent::Satisfied => {
+                    return Ok(ConflictCycleOutcome::Satisfied(HealedMutation {
+                        projection: state.policy,
+                        events: Vec::new(),
+                        appended: false,
+                        healed,
+                    }));
+                }
+                PolicyIntent::Append(events) => PendingMutation { state, events },
+            };
+
+            let batch: Vec<EventToAppend> = pending
+                .events
+                .iter()
+                .cloned()
+                .map(EventToAppend::new)
+                .collect();
+            let result = match self
+                .events
+                .append(AppendEvents {
+                    stream_id: stream_id.clone(),
+                    expected_version: ExpectedVersion::Exact(pending.state.policy.stream_version),
+                    events: batch,
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: actor.clone(),
+                })
+                .await
+            {
+                Ok(result) => result,
+                Err(DomainError::Conflict(msg)) if healed => {
+                    // The expected version came from the stream itself a
+                    // moment ago, so this is not a stale row: somebody else
+                    // appended in between. "Concurrent modification" names
+                    // only this case.
+                    tracing::warn!(
+                        policy_id = %policy_id,
+                        expected = pending.state.policy.stream_version,
+                        conflict_message = %msg,
+                        "concurrent policy modification rejected",
+                    );
+                    return Ok(ConflictCycleOutcome::Retry);
+                }
+                Err(DomainError::Conflict(msg)) => {
+                    // The projection's version was refused. It is either
+                    // behind its stream (a failed upsert) or someone else
+                    // wrote; the next attempt re-derives from the stream
+                    // and finds out by succeeding or not.
+                    tracing::warn!(
+                        policy_id = %policy_id,
+                        expected = pending.state.policy.stream_version,
+                        conflict_message = %msg,
+                        "policy projection version refused by the event store — \
+                         re-deriving the projection from its stream",
+                    );
+                    return Ok(ConflictCycleOutcome::Retry);
+                }
+                Err(other) => return Err(other.into()),
+            };
+
+            // The projection to write is the fold of the batch that just
+            // landed — the same mapping that reads the stream back, so the
+            // row cannot drift from the events that produced it.
+            apply_policy_batch(
+                &mut pending.state,
+                &pending.events,
+                actor,
+                Utc::now(),
+                result.stream_position,
+            )?;
+            Ok(ConflictCycleOutcome::Satisfied(HealedMutation {
+                projection: pending.state.policy,
+                events: pending.events,
+                appended: true,
+                healed,
+            }))
+        })
+        .await
+    }
     /// Create a new scan policy.
     ///
     /// Mints a fresh `policy_id`, emits one `PolicyCreated` event with
@@ -433,6 +709,24 @@ impl PolicyUseCase {
     /// unique index on `name` for `archived = false` rows — migration
     /// 095). The check is performed before the append so a duplicate
     /// name cannot waste an event-stream position.
+    ///
+    /// # Why this one does not self-heal
+    ///
+    /// Every other mutation here re-derives the projection from the
+    /// stream when its expected version is refused. This one cannot, and
+    /// does not need to: the append is `ExpectedVersion::NoStream` against
+    /// a `policy_id` minted one statement earlier, so a `Conflict` means a
+    /// stream already exists at a fresh v4 UUID — an identity collision,
+    /// not a projection one version behind. There is no projection at all
+    /// yet to re-base onto.
+    ///
+    /// The failure mode this path *does* have is the mirror image and is
+    /// not a deadlock: if the append commits and the upsert then fails,
+    /// there is no row, so the next apply's name lookup misses, takes this
+    /// branch again, mints a *new* `policy_id` and succeeds — leaving the
+    /// first stream orphaned. Reclaiming an orphan stream needs a
+    /// name-to-stream index that does not exist; an operator rebuild
+    /// command is the right home for it.
     #[tracing::instrument(skip(self, cmd))]
     pub async fn create_policy(&self, cmd: CreatePolicyCommand, actor: Actor) -> AppResult<Uuid> {
         // Pre-check duplicate name. The projection has a partial unique
@@ -456,29 +750,14 @@ impl PolicyUseCase {
         let policy_id = Uuid::new_v4();
         let stream_id = StreamId::policy(policy_id);
         let correlation_id = Uuid::new_v4();
-        let config_snapshot = build_config_snapshot(&cmd);
-
-        let event = PolicyCreated {
-            policy_id,
-            name: cmd.name.clone(),
-            scope: cmd.scope.clone(),
-            config_snapshot,
-        };
-
-        let result = self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: ExpectedVersion::NoStream,
-                events: vec![EventToAppend::new(DomainEvent::PolicyCreated(event))],
-                correlation_id,
-                causation_id: None,
-                actor,
-            })
-            .await?;
-
         let now = Utc::now();
-        let projection = ScanPolicyProjection {
+
+        // The projection is built first and the event's `config_snapshot`
+        // is derived from it, rather than the two being spelled out side
+        // by side: `policy_config_snapshot` is the fold's own encoder, so
+        // what the event records and what the row holds cannot disagree,
+        // and a later fold of this stream reproduces this exact row.
+        let mut projection = ScanPolicyProjection {
             policy_id,
             name: cmd.name,
             scope: cmd.scope,
@@ -496,17 +775,39 @@ impl PolicyUseCase {
             negligible_action: cmd.negligible_action,
             enforcement: cmd.enforcement,
             composite_verdict_mode: cmd.composite_verdict_mode,
-            stream_version: result.stream_position,
+            stream_version: 0,
             created_at: now,
             updated_at: now,
         };
+
+        let event = PolicyCreated {
+            policy_id,
+            name: projection.name.clone(),
+            scope: projection.scope.clone(),
+            config_snapshot: policy_config_snapshot(&projection),
+        };
+
+        let result = self
+            .events
+            .append(AppendEvents {
+                stream_id,
+                expected_version: ExpectedVersion::NoStream,
+                events: vec![EventToAppend::new(DomainEvent::PolicyCreated(event))],
+                correlation_id,
+                causation_id: None,
+                actor,
+            })
+            .await?;
+
+        projection.stream_version = result.stream_position;
 
         if let Err(e) = self.projections.upsert(&projection).await {
             tracing::error!(
                 policy_id = %policy_id,
                 error = %e,
                 "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
+                 — no projection row exists for this stream; the next apply of \
+                 this name mints a fresh policy_id and orphans this stream",
             );
             return Err(e.into());
         }
@@ -522,21 +823,26 @@ impl PolicyUseCase {
 
     /// Apply a partial update to an existing policy.
     ///
-    /// Reads the projection, diffs each `FieldChange::Set(_)` against
-    /// the current value, emits one `PolicyUpdated` event per actually-
-    /// changed field in a single atomic append batch, then upserts the
-    /// new projection state.
+    /// Reads the projection, builds the state the command asks for,
+    /// diffs it field-by-field against the current state, emits one
+    /// `PolicyUpdated` event per actually-changed field in a single
+    /// atomic append batch, then writes the projection **folded from
+    /// those same events**.
     ///
     /// - Same-value updates yield zero events (idempotent — no append,
     ///   no upsert, returns `Ok(())`).
-    /// - Stale `ExpectedVersion::Exact` from a concurrent writer maps to
-    ///   [`DomainError::Conflict`].
+    /// - A refused `ExpectedVersion::Exact` re-derives the projection
+    ///   from the stream, re-diffs against it and appends once more; a
+    ///   second refusal is a concurrent writer and surfaces as
+    ///   [`DomainError::Contended`].
     /// - Updating an archived policy is rejected as
-    ///   [`DomainError::Validation`].
+    ///   [`DomainError::Validation`] — re-checked against the
+    ///   stream-derived state too, so a policy archived concurrently is
+    ///   not updated on the retry.
     #[tracing::instrument(skip(self, cmd))]
     pub async fn update_policy(&self, cmd: UpdatePolicyCommand, actor: Actor) -> AppResult<()> {
         let policy_id = cmd.policy_id;
-        let mut projection = self
+        let projection = self
             .projections
             .find_by_id(policy_id)
             .await?
@@ -558,226 +864,42 @@ impl PolicyUseCase {
             .into());
         }
 
-        // Build the diff. Each entry contributes one PolicyUpdated event
-        // AND mutates the projection-to-write so the post-append upsert
-        // reflects the new state.
-        let mut events: Vec<EventToAppend> = Vec::new();
+        let base = ScanPolicyReplay {
+            policy: projection,
+            // Exclusions are irrelevant to a field update and are not
+            // read; the re-base reads the real set when it runs.
+            exclusions: Vec::new(),
+        };
 
-        if let FieldChange::Set(new_name) = &cmd.name {
-            if *new_name != projection.name {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::Name,
-                    serde_json::Value::String(projection.name.clone()),
-                    serde_json::Value::String(new_name.clone()),
-                ));
-                projection.name = new_name.clone();
+        // The decision, as a pure function of state: build what the
+        // command asks for, diff it against what is there. Re-run
+        // verbatim against the stream-derived state on a refused version,
+        // so the batch and the expected version always describe the same
+        // observation.
+        let decide = |state: &ScanPolicyReplay| -> AppResult<PolicyIntent> {
+            if state.policy.archived {
+                return Err(DomainError::Validation(format!(
+                    "policy '{}' is archived",
+                    state.policy.name
+                ))
+                .into());
             }
-        }
-
-        if let FieldChange::Set(new_scope) = &cmd.scope {
-            if *new_scope != projection.scope {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::Scope,
-                    serde_json::to_value(&projection.scope)
-                        .expect("PolicyScope serialises to JSON"),
-                    serde_json::to_value(new_scope).expect("PolicyScope serialises to JSON"),
-                ));
-                projection.scope = new_scope.clone();
+            let desired = desired_projection(&cmd, &state.policy);
+            let updates = diff_policy_fields(policy_id, &state.policy, &desired);
+            if updates.is_empty() {
+                return Ok(PolicyIntent::Satisfied);
             }
-        }
+            Ok(PolicyIntent::Append(
+                updates
+                    .into_iter()
+                    .map(DomainEvent::PolicyUpdated)
+                    .collect(),
+            ))
+        };
 
-        if let FieldChange::Set(new_threshold) = &cmd.severity_threshold {
-            if *new_threshold != projection.severity_threshold {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::SeverityThreshold,
-                    serde_json::to_value(projection.severity_threshold)
-                        .expect("SeverityThreshold serialises to JSON"),
-                    serde_json::to_value(*new_threshold)
-                        .expect("SeverityThreshold serialises to JSON"),
-                ));
-                projection.severity_threshold = *new_threshold;
-            }
-        }
-
-        if let FieldChange::Set(new_quar) = &cmd.quarantine_duration_secs {
-            if *new_quar != projection.quarantine_duration_secs {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::QuarantineDuration,
-                    serde_json::Value::from(projection.quarantine_duration_secs),
-                    serde_json::Value::from(*new_quar),
-                ));
-                projection.quarantine_duration_secs = *new_quar;
-            }
-        }
-
-        if let FieldChange::Set(new_approval) = &cmd.require_approval {
-            if *new_approval != projection.require_approval {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::RequireApproval,
-                    serde_json::Value::Bool(projection.require_approval),
-                    serde_json::Value::Bool(*new_approval),
-                ));
-                projection.require_approval = *new_approval;
-            }
-        }
-
-        // The provenance trio replaces requireSignature (ADR 0027).
-        if let FieldChange::Set(new_mode) = &cmd.provenance_mode {
-            if *new_mode != projection.provenance_mode {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::ProvenanceMode,
-                    serde_json::Value::String(projection.provenance_mode.to_string()),
-                    serde_json::Value::String(new_mode.to_string()),
-                ));
-                projection.provenance_mode = *new_mode;
-            }
-        }
-
-        if let FieldChange::Set(new_backends) = &cmd.provenance_backends {
-            if *new_backends != projection.provenance_backends {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::ProvenanceBackends,
-                    serde_json::to_value(&projection.provenance_backends)
-                        .expect("INVARIANT: Vec<String> serialises to JSON"),
-                    serde_json::to_value(new_backends)
-                        .expect("INVARIANT: Vec<String> serialises to JSON"),
-                ));
-                projection.provenance_backends = new_backends.clone();
-            }
-        }
-
-        if let FieldChange::Set(new_identities) = &cmd.provenance_identities {
-            if *new_identities != projection.provenance_identities {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::ProvenanceIdentities,
-                    serde_json::to_value(&projection.provenance_identities)
-                        .expect("INVARIANT: SignerIdentityPattern serialises to JSON"),
-                    serde_json::to_value(new_identities)
-                        .expect("INVARIANT: SignerIdentityPattern serialises to JSON"),
-                ));
-                projection.provenance_identities = new_identities.clone();
-            }
-        }
-
-        if let FieldChange::Set(new_age) = &cmd.max_artifact_age_secs {
-            if *new_age != projection.max_artifact_age_secs {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::MaxArtifactAge,
-                    optional_i64_to_value(projection.max_artifact_age_secs),
-                    optional_i64_to_value(*new_age),
-                ));
-                projection.max_artifact_age_secs = *new_age;
-            }
-        }
-
-        if let FieldChange::Set(new_license) = &cmd.license_policy {
-            if *new_license != projection.license_policy {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::LicensePolicy,
-                    projection.license_policy.clone(),
-                    new_license.clone(),
-                ));
-                projection.license_policy = new_license.clone();
-            }
-        }
-
-        // Same-value skip applies: an explicit
-        // `FieldChange::Set` with a value equal to the current
-        // projection produces zero events.
-        if let FieldChange::Set(new_backends) = &cmd.scan_backends {
-            if *new_backends != projection.scan_backends {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::ScanBackends,
-                    serde_json::to_value(&projection.scan_backends)
-                        .expect("INVARIANT: Vec<String> serialises to JSON"),
-                    serde_json::to_value(new_backends)
-                        .expect("INVARIANT: Vec<String> serialises to JSON"),
-                ));
-                projection.scan_backends = new_backends.clone();
-            }
-        }
-
-        // Same-value skip; `Set(0)` is a meaningful
-        // operator-supplied value distinct from `Unchanged`.
-        if let FieldChange::Set(new_interval) = &cmd.rescan_interval_hours {
-            if *new_interval != projection.rescan_interval_hours {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::RescanIntervalHours,
-                    serde_json::Value::from(projection.rescan_interval_hours),
-                    serde_json::Value::from(*new_interval),
-                ));
-                projection.rescan_interval_hours = *new_interval;
-            }
-        }
-
-        // Same-value skip; the `previous_value` / `new_value` payloads
-        // are the lowercase `NegligibleAction` wire strings (mirrors
-        // `ProvenanceMode`).
-        if let FieldChange::Set(new_action) = &cmd.negligible_action {
-            if *new_action != projection.negligible_action {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::NegligibleAction,
-                    serde_json::Value::String(projection.negligible_action.to_string()),
-                    serde_json::Value::String(new_action.to_string()),
-                ));
-                projection.negligible_action = *new_action;
-            }
-        }
-
-        // Same-value skip; the `previous_value` / `new_value` payloads are
-        // the lowercase `ScanEnforcement` wire strings (mirrors
-        // `NegligibleAction`). A change in either direction is
-        // gate-affecting, so it drives the re-evaluation enqueue below.
-        if let FieldChange::Set(new_enforcement) = &cmd.enforcement {
-            if *new_enforcement != projection.enforcement {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::Enforcement,
-                    serde_json::Value::String(projection.enforcement.to_string()),
-                    serde_json::Value::String(new_enforcement.to_string()),
-                ));
-                projection.enforcement = *new_enforcement;
-            }
-        }
-
-        // Same-value skip; the `previous_value` / `new_value` payloads are
-        // the lowercase `CompositeVerdictMode` wire strings (mirrors
-        // `ScanEnforcement`). Deliberately **not** gate-affecting in
-        // either direction (ADR 0064 D6): the re-evaluation pass
-        // re-derives verdicts from stored findings, so demoting a
-        // promoted policy that way would un-reject the population its
-        // composite verdicts had correctly rejected, with no fresh
-        // assessment — the hazard that disqualified shipping the
-        // composite verdict under `ScanEnforcement::Record` at all.
-        // Promoting changes which analysis the *next* scan's verdict
-        // comes from, and that analysis has to run.
-        if let FieldChange::Set(new_mode) = &cmd.composite_verdict_mode {
-            if *new_mode != projection.composite_verdict_mode {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::CompositeVerdictMode,
-                    serde_json::Value::String(projection.composite_verdict_mode.to_string()),
-                    serde_json::Value::String(new_mode.to_string()),
-                ));
-                projection.composite_verdict_mode = *new_mode;
-            }
-        }
-
-        if events.is_empty() {
-            // Idempotent no-op — same-value updates yield zero writes.
+        // Short-circuit the idempotent case before any append: a
+        // same-value update writes nothing at all, as it always has.
+        if matches!(decide(&base)?, PolicyIntent::Satisfied) {
             tracing::debug!(
                 policy_id = %policy_id,
                 "update_policy: no field changes — skipping append",
@@ -785,66 +907,46 @@ impl PolicyUseCase {
             return Ok(());
         }
 
-        let event_count = events.len();
+        let outcome = self
+            .mutate_policy_stream(policy_id, &base, &actor, decide)
+            .await?;
+
         // ADR 0041 Item 3: a gate-affecting field change (severity
         // threshold / license-policy classes / negligible_action /
-        // enforcement) drives
-        // ONE async re-evaluation pass over the policy's population, even
-        // when several gate fields changed in this single `update_policy`
-        // — `update_policy` emits one `PolicyUpdated` per changed field, so
-        // coalescing to a single enqueue here is the enqueue-once-per-
-        // mutation contract (not one pass per field). Computed before
-        // `events` is moved into the append batch.
-        let gate_field_changed = events.iter().any(|e| {
+        // enforcement) drives ONE async re-evaluation pass over the
+        // policy's population, even when several gate fields changed in
+        // this single `update_policy` — `update_policy` emits one
+        // `PolicyUpdated` per changed field, so coalescing to a single
+        // enqueue is the enqueue-once-per-mutation contract (not one pass
+        // per field). Read off the batch that actually landed: a re-based
+        // retry re-diffs against the stream and may emit a different set.
+        let gate_field_changed = outcome.events.iter().any(|e| {
             matches!(
-                &e.event,
+                e,
                 DomainEvent::PolicyUpdated(u) if u.field.is_gate_affecting()
             )
         });
-        let stream_id = StreamId::policy(policy_id);
-        let correlation_id = Uuid::new_v4();
-        let expected_version = ExpectedVersion::Exact(projection.stream_version);
+        let event_count = outcome.events.len();
 
-        let result = match self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
-                events,
-                correlation_id,
-                causation_id: None,
-                actor,
-            })
-            .await
-        {
-            Ok(r) => r,
-            Err(DomainError::Conflict(msg)) => {
-                tracing::warn!(
-                    policy_id = %policy_id,
-                    expected = projection.stream_version,
-                    "concurrent policy modification rejected",
-                );
-                return Err(DomainError::Conflict(msg).into());
-            }
-            Err(other) => return Err(other.into()),
-        };
+        self.write_projection(policy_id, &outcome.projection)
+            .await?;
 
-        projection.stream_version = result.stream_position;
-        projection.updated_at = Utc::now();
-
-        if let Err(e) = self.projections.upsert(&projection).await {
-            tracing::error!(
+        if !outcome.appended {
+            // A re-base found the stream already states the update. The
+            // row was behind and has just been repaired; nothing was
+            // appended, so nothing is gate-affecting.
+            tracing::info!(
                 policy_id = %policy_id,
-                error = %e,
-                "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
+                "update_policy: the stream already states this update; the stale \
+                 projection has been re-derived from it",
             );
-            return Err(e.into());
+            return Ok(());
         }
 
         tracing::info!(
             policy_id = %policy_id,
             event_count,
+            healed = outcome.healed,
             "policy updated",
         );
 
@@ -863,13 +965,19 @@ impl PolicyUseCase {
     /// Archive an existing policy.
     ///
     /// Emits one `PolicyArchived` event on the policy stream and marks
-    /// the projection `archived = true`. Idempotent in the sense that
-    /// re-archival of an already-archived policy is rejected as
+    /// the projection `archived = true`. Re-archival of an
+    /// already-archived policy is rejected as
     /// [`DomainError::Validation`] — gitops apply absorbs the rejection
     /// at the diff layer (an archived policy is never re-emitted).
+    ///
+    /// A refused expected version re-derives the projection from the
+    /// stream and retries once. If the stream turns out to already say
+    /// archived, the intent is satisfied: the call succeeds and the stale
+    /// row is repaired rather than being answered with a `Validation`
+    /// error about a state the caller could not have seen.
     #[tracing::instrument(skip(self))]
     pub async fn archive_policy(&self, policy_id: Uuid, actor: Actor) -> AppResult<()> {
-        let mut projection = self
+        let projection = self
             .projections
             .find_by_id(policy_id)
             .await?
@@ -891,52 +999,30 @@ impl PolicyUseCase {
             .into());
         }
 
-        let stream_id = StreamId::policy(policy_id);
-        let correlation_id = Uuid::new_v4();
-        let expected_version = ExpectedVersion::Exact(projection.stream_version);
-        let event = PolicyArchived { policy_id };
-
-        let result = match self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
-                events: vec![EventToAppend::new(DomainEvent::PolicyArchived(event))],
-                correlation_id,
-                causation_id: None,
-                actor,
-            })
-            .await
-        {
-            Ok(r) => r,
-            Err(DomainError::Conflict(msg)) => {
-                tracing::warn!(
-                    policy_id = %policy_id,
-                    expected = projection.stream_version,
-                    "concurrent policy modification rejected",
-                );
-                return Err(DomainError::Conflict(msg).into());
-            }
-            Err(other) => return Err(other.into()),
+        let base = ScanPolicyReplay {
+            policy: projection,
+            exclusions: Vec::new(),
         };
 
-        projection.archived = true;
-        projection.stream_version = result.stream_position;
-        projection.updated_at = Utc::now();
+        let outcome = self
+            .mutate_policy_stream(policy_id, &base, &actor, |state| {
+                if state.policy.archived {
+                    return Ok(PolicyIntent::Satisfied);
+                }
+                Ok(PolicyIntent::Append(vec![DomainEvent::PolicyArchived(
+                    PolicyArchived { policy_id },
+                )]))
+            })
+            .await?;
 
-        if let Err(e) = self.projections.upsert(&projection).await {
-            tracing::error!(
-                policy_id = %policy_id,
-                error = %e,
-                "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
-            );
-            return Err(e.into());
-        }
+        self.write_projection(policy_id, &outcome.projection)
+            .await?;
 
         tracing::info!(
             policy_id = %policy_id,
             event_type = "PolicyArchived",
+            appended = outcome.appended,
+            healed = outcome.healed,
             "policy archived",
         );
 
@@ -957,10 +1043,14 @@ impl PolicyUseCase {
     ///   gitops apply pipeline's caller picks the reactivation branch
     ///   only when `archived = true`, so calling this on an active row
     ///   indicates a bug in the pipeline; rejecting here surfaces it
-    ///   loudly rather than silently no-op'ing).
+    ///   loudly rather than silently no-op'ing). As with
+    ///   [`Self::archive_policy`], a stream that *already* says active is
+    ///   an idempotent success rather than that rejection — the caller
+    ///   read an archived row and cannot be blamed for a state only the
+    ///   stream knew.
     #[tracing::instrument(skip(self))]
     pub async fn reactivate_policy(&self, policy_id: Uuid, actor: Actor) -> AppResult<()> {
-        let mut projection = self
+        let projection = self
             .projections
             .find_by_id(policy_id)
             .await?
@@ -982,52 +1072,30 @@ impl PolicyUseCase {
             .into());
         }
 
-        let stream_id = StreamId::policy(policy_id);
-        let correlation_id = Uuid::new_v4();
-        let expected_version = ExpectedVersion::Exact(projection.stream_version);
-        let event = PolicyReactivated { policy_id };
-
-        let result = match self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
-                events: vec![EventToAppend::new(DomainEvent::PolicyReactivated(event))],
-                correlation_id,
-                causation_id: None,
-                actor,
-            })
-            .await
-        {
-            Ok(r) => r,
-            Err(DomainError::Conflict(msg)) => {
-                tracing::warn!(
-                    policy_id = %policy_id,
-                    expected = projection.stream_version,
-                    "concurrent policy modification rejected",
-                );
-                return Err(DomainError::Conflict(msg).into());
-            }
-            Err(other) => return Err(other.into()),
+        let base = ScanPolicyReplay {
+            policy: projection,
+            exclusions: Vec::new(),
         };
 
-        projection.archived = false;
-        projection.stream_version = result.stream_position;
-        projection.updated_at = Utc::now();
+        let outcome = self
+            .mutate_policy_stream(policy_id, &base, &actor, |state| {
+                if !state.policy.archived {
+                    return Ok(PolicyIntent::Satisfied);
+                }
+                Ok(PolicyIntent::Append(vec![DomainEvent::PolicyReactivated(
+                    PolicyReactivated { policy_id },
+                )]))
+            })
+            .await?;
 
-        if let Err(e) = self.projections.upsert(&projection).await {
-            tracing::error!(
-                policy_id = %policy_id,
-                error = %e,
-                "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
-            );
-            return Err(e.into());
-        }
+        self.write_projection(policy_id, &outcome.projection)
+            .await?;
 
         tracing::info!(
             policy_id = %policy_id,
             event_type = "PolicyReactivated",
+            appended = outcome.appended,
+            healed = outcome.healed,
             "policy reactivated",
         );
 
@@ -1041,7 +1109,6 @@ impl PolicyUseCase {
 
         Ok(())
     }
-
     /// Attach a new exclusion to an existing policy.
     ///
     /// Mints a fresh `exclusion_id`, appends one
@@ -1159,9 +1226,6 @@ impl PolicyUseCase {
         }
 
         let exclusion_id = Uuid::new_v4();
-        let stream_id = StreamId::policy(policy_id);
-        let correlation_id = Uuid::new_v4();
-        let expected_version = ExpectedVersion::Exact(parent.stream_version);
 
         let event = ExclusionAdded {
             policy_id,
@@ -1173,63 +1237,51 @@ impl PolicyUseCase {
             expires_at: cmd.expires_at,
         };
 
-        // Envelope-side author attribution for the
-        // active-exclusions listing. `ExclusionAdded` payload carries
-        // NO actor field (envelope is canonical); we extract the
-        // `user_id` here from `Actor::Api` and thread it into the
-        // projection write below. Non-api envelopes (system, timer,
-        // gitops) leave the projection column NULL.
-        let added_by_actor_id = match &actor {
-            Actor::Api(api) => Some(api.user_id),
-            _ => None,
+        // The row to insert comes from the fold's own
+        // `ExclusionAdded -> ExclusionProjection` mapping, so what is
+        // written here and what a later fold of this stream derives are
+        // the same value. `added_by_actor_id` is envelope-sourced inside
+        // it: the payload carries no actor field, and non-api envelopes
+        // (system / timer / gitops) leave the column NULL.
+        let new_exclusion = exclusion_projection(&event, &actor);
+
+        // An exclusion event changes no policy *field*, but it takes a
+        // stream position, so the parent projection's `stream_version`
+        // moves with it — which makes this method both a producer and a
+        // victim of a stale version, and is why it self-heals like the
+        // field mutations do.
+        let base = ScanPolicyReplay {
+            policy: parent,
+            // Not read on this path: a freshly minted `exclusion_id`
+            // cannot already be on the stream, so the intent is never
+            // already-satisfied and the set is not consulted.
+            exclusions: Vec::new(),
         };
 
-        let result = match self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
-                events: vec![EventToAppend::new(DomainEvent::ExclusionAdded(event))],
-                correlation_id,
-                causation_id: None,
-                actor,
+        let outcome = match self
+            .mutate_policy_stream(policy_id, &base, &actor, |state| {
+                if state.policy.archived {
+                    return Err(DomainError::Validation(format!(
+                        "policy '{}' is archived",
+                        state.policy.name
+                    ))
+                    .into());
+                }
+                Ok(PolicyIntent::Append(vec![DomainEvent::ExclusionAdded(
+                    event.clone(),
+                )]))
             })
             .await
         {
-            Ok(r) => r,
-            Err(DomainError::Conflict(msg)) => {
-                tracing::warn!(
-                    policy_id = %policy_id,
-                    exclusion_id = %exclusion_id,
-                    expected = parent.stream_version,
-                    "concurrent policy modification rejected",
-                );
+            Ok(outcome) => outcome,
+            Err(e) => {
                 emit_curation_decision(
                     CurationDecisionLabel::ExcludeFinding,
                     repo_label_ref,
-                    CurationDecisionResult::Conflict,
+                    curation_result_for(&e),
                 );
-                return Err(DomainError::Conflict(msg).into());
+                return Err(e);
             }
-            Err(other) => {
-                emit_curation_decision(
-                    CurationDecisionLabel::ExcludeFinding,
-                    repo_label_ref,
-                    CurationDecisionResult::Error,
-                );
-                return Err(other.into());
-            }
-        };
-
-        let new_exclusion = ExclusionProjection {
-            exclusion_id,
-            policy_id,
-            cve_id: cmd.cve_id,
-            package_pattern: cmd.package_pattern,
-            scope: cmd.scope,
-            reason: cmd.reason,
-            added_by_actor_id,
-            expires_at: cmd.expires_at,
         };
 
         if let Err(e) = self.projections.upsert_exclusion(&new_exclusion).await {
@@ -1238,7 +1290,7 @@ impl PolicyUseCase {
                 exclusion_id = %exclusion_id,
                 error = %e,
                 "exclusion projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
+                 — the exclusion row is missing; the stream still states it",
             );
             emit_curation_decision(
                 CurationDecisionLabel::ExcludeFinding,
@@ -1248,32 +1300,20 @@ impl PolicyUseCase {
             return Err(e.into());
         }
 
-        let bumped_parent = ScanPolicyProjection {
-            stream_version: result.stream_position,
-            updated_at: Utc::now(),
-            ..parent
-        };
-
-        if let Err(e) = self.projections.upsert(&bumped_parent).await {
-            tracing::error!(
-                policy_id = %policy_id,
-                exclusion_id = %exclusion_id,
-                error = %e,
-                "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
-            );
+        if let Err(e) = self.write_projection(policy_id, &outcome.projection).await {
             emit_curation_decision(
                 CurationDecisionLabel::ExcludeFinding,
                 repo_label_ref,
                 CurationDecisionResult::Error,
             );
-            return Err(e.into());
+            return Err(e);
         }
 
         tracing::info!(
             policy_id = %policy_id,
             exclusion_id = %exclusion_id,
             event_type = "ExclusionAdded",
+            healed = outcome.healed,
             "exclusion added",
         );
         emit_curation_decision(
@@ -2321,9 +2361,12 @@ impl PolicyUseCase {
             .list_exclusions_for_policy(policy_id)
             .await?;
 
+        // Keep the list: it is the base state the removal's intent is
+        // re-decided against if the first append's version is refused.
         let Some(found) = exclusions
-            .into_iter()
+            .iter()
             .find(|e| e.exclusion_id == exclusion_id)
+            .cloned()
         else {
             tracing::info!(
                 policy_id = %policy_id,
@@ -2378,60 +2421,66 @@ impl PolicyUseCase {
             .into());
         }
 
-        let stream_id = StreamId::policy(policy_id);
-        let correlation_id = Uuid::new_v4();
-        let expected_version = ExpectedVersion::Exact(parent.stream_version);
-
         let event = ExclusionRemoved {
             policy_id,
             exclusion_id,
             reason: cmd.reason,
         };
 
-        let result = match self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
-                events: vec![EventToAppend::new(DomainEvent::ExclusionRemoved(event))],
-                correlation_id,
-                causation_id: None,
-                actor,
+        let base = ScanPolicyReplay {
+            policy: parent,
+            exclusions,
+        };
+
+        let outcome = match self
+            .mutate_policy_stream(policy_id, &base, &actor, |state| {
+                if state.policy.archived {
+                    return Err(DomainError::Validation(format!(
+                        "policy '{}' is archived",
+                        state.policy.name
+                    ))
+                    .into());
+                }
+                if !state
+                    .exclusions
+                    .iter()
+                    .any(|e| e.exclusion_id == exclusion_id)
+                {
+                    // The stream says this exclusion is already gone. The
+                    // caller's intent is achieved, so appending a second
+                    // `ExclusionRemoved` would record a removal that did
+                    // not happen (ADR 0060 step (b)). The `delete` below
+                    // still runs and clears the row the stream contradicts.
+                    return Ok(PolicyIntent::Satisfied);
+                }
+                Ok(PolicyIntent::Append(vec![DomainEvent::ExclusionRemoved(
+                    event.clone(),
+                )]))
             })
             .await
         {
-            Ok(r) => r,
-            Err(DomainError::Conflict(msg)) => {
-                tracing::warn!(
-                    policy_id = %policy_id,
-                    exclusion_id = %exclusion_id,
-                    expected = parent.stream_version,
-                    "concurrent policy modification rejected",
-                );
+            Ok(outcome) => outcome,
+            Err(e) => {
                 emit_curation_decision(
                     CurationDecisionLabel::UnexcludeFinding,
                     repo_label_ref,
-                    CurationDecisionResult::Conflict,
+                    curation_result_for(&e),
                 );
-                return Err(DomainError::Conflict(msg).into());
-            }
-            Err(other) => {
-                emit_curation_decision(
-                    CurationDecisionLabel::UnexcludeFinding,
-                    repo_label_ref,
-                    CurationDecisionResult::Error,
-                );
-                return Err(other.into());
+                return Err(e);
             }
         };
 
+        // Unconditional, and idempotent by identity: on the appended path
+        // it drops the row the event retired, and on the already-removed
+        // path it drops a row the stream says should not exist.
         if let Err(e) = self.projections.delete_exclusion(exclusion_id).await {
             tracing::error!(
                 policy_id = %policy_id,
                 exclusion_id = %exclusion_id,
                 error = %e,
                 "exclusion projection delete failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
+                 — the exclusion row outlives its removal; the stream no longer \
+                 states it",
             );
             emit_curation_decision(
                 CurationDecisionLabel::UnexcludeFinding,
@@ -2441,32 +2490,21 @@ impl PolicyUseCase {
             return Err(e.into());
         }
 
-        let bumped_parent = ScanPolicyProjection {
-            stream_version: result.stream_position,
-            updated_at: Utc::now(),
-            ..parent
-        };
-
-        if let Err(e) = self.projections.upsert(&bumped_parent).await {
-            tracing::error!(
-                policy_id = %policy_id,
-                exclusion_id = %exclusion_id,
-                error = %e,
-                "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
-            );
+        if let Err(e) = self.write_projection(policy_id, &outcome.projection).await {
             emit_curation_decision(
                 CurationDecisionLabel::UnexcludeFinding,
                 repo_label_ref,
                 CurationDecisionResult::Error,
             );
-            return Err(e.into());
+            return Err(e);
         }
 
         tracing::info!(
             policy_id = %policy_id,
             exclusion_id = %exclusion_id,
             event_type = "ExclusionRemoved",
+            appended = outcome.appended,
+            healed = outcome.healed,
             "exclusion removed",
         );
         emit_curation_decision(
@@ -2524,53 +2562,87 @@ struct TightenTallies {
     unchanged: u64,
 }
 
-/// Build the `config_snapshot` JSON payload embedded in `PolicyCreated`.
+/// The curation-decision metric label an error from a self-healing
+/// policy-stream mutation earns.
 ///
-/// The shape mirrors the projection fields one-for-one — gitops apply
-/// (14b) and the future audit-log replay tool both read from this
-/// snapshot, so any rename here is a wire change.
-fn build_config_snapshot(cmd: &CreatePolicyCommand) -> serde_json::Value {
-    serde_json::json!({
-        "name": cmd.name,
-        "scope": cmd.scope,
-        "severity_threshold": cmd.severity_threshold,
-        "quarantine_duration_secs": cmd.quarantine_duration_secs,
-        "require_approval": cmd.require_approval,
-        // The provenance trio replaces requireSignature (ADR 0027).
-        "provenance_mode": cmd.provenance_mode.to_string(),
-        "provenance_backends": cmd.provenance_backends,
-        "provenance_identities": cmd.provenance_identities,
-        "max_artifact_age_secs": cmd.max_artifact_age_secs,
-        "license_policy": cmd.license_policy,
-        "scan_backends": cmd.scan_backends,
-        "rescan_interval_hours": cmd.rescan_interval_hours,
-        "negligible_action": cmd.negligible_action.to_string(),
-        "enforcement": cmd.enforcement.to_string(),
-        "composite_verdict_mode": cmd.composite_verdict_mode.to_string(),
-    })
-}
-
-/// Build one `PolicyUpdated` event wrapped as `EventToAppend`.
-fn field_event(
-    policy_id: Uuid,
-    field: PolicyField,
-    previous_value: serde_json::Value,
-    new_value: serde_json::Value,
-) -> EventToAppend {
-    EventToAppend::new(DomainEvent::PolicyUpdated(PolicyUpdated {
-        policy_id,
-        field,
-        previous_value,
-        new_value,
-    }))
-}
-
-/// Encode `Option<i64>` as JSON: `Some(n)` → number, `None` → null.
-fn optional_i64_to_value(v: Option<i64>) -> serde_json::Value {
-    match v {
-        Some(n) => serde_json::Value::from(n),
-        None => serde_json::Value::Null,
+/// A lost version race is a `Conflict` on the first attempt and
+/// [`DomainError::Contended`] once the re-base has also lost it — both are
+/// the same thing to a curator watching
+/// `hort_curation_decisions_total{result="conflict"}`, and neither is the
+/// `error` bucket an infrastructure failure belongs in.
+fn curation_result_for(err: &AppError) -> CurationDecisionResult {
+    match err {
+        AppError::Domain(DomainError::Conflict(_) | DomainError::Contended(_)) => {
+            CurationDecisionResult::Conflict
+        }
+        _ => CurationDecisionResult::Error,
     }
+}
+
+/// Apply an [`UpdatePolicyCommand`]'s `Set` values to a projection,
+/// producing the state the caller is asking for.
+///
+/// One line per field, and **no comparison**: deciding what changed is
+/// [`diff_policy_fields`]'s job, and it compares the two projections
+/// through the same per-field encoding the `PolicyUpdated` events carry.
+///
+/// This is the half that used to be written twice — once to build the
+/// event, once to mutate the projection to be written — with nothing but
+/// adjacency holding the two spellings together. A field whose event said
+/// one thing and whose projection edit said another would have been
+/// invisible until a fold disagreed with the row, which is exactly the
+/// drift the single mapping removes.
+fn desired_projection(
+    cmd: &UpdatePolicyCommand,
+    current: &ScanPolicyProjection,
+) -> ScanPolicyProjection {
+    let mut desired = current.clone();
+    if let FieldChange::Set(v) = &cmd.name {
+        desired.name = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.scope {
+        desired.scope = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.severity_threshold {
+        desired.severity_threshold = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.quarantine_duration_secs {
+        desired.quarantine_duration_secs = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.require_approval {
+        desired.require_approval = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.provenance_mode {
+        desired.provenance_mode = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.provenance_backends {
+        desired.provenance_backends = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.provenance_identities {
+        desired.provenance_identities = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.max_artifact_age_secs {
+        desired.max_artifact_age_secs = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.license_policy {
+        desired.license_policy = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.scan_backends {
+        desired.scan_backends = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.rescan_interval_hours {
+        desired.rescan_interval_hours = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.negligible_action {
+        desired.negligible_action = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.enforcement {
+        desired.enforcement = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.composite_verdict_mode {
+        desired.composite_verdict_mode = *v;
+    }
+    desired
 }
 
 // ---------------------------------------------------------------------------
@@ -2580,6 +2652,11 @@ fn optional_i64_to_value(v: Option<i64>) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+
+    // The field vocabulary is only asserted on, never written by the
+    // production path here any more: the one place that maps a
+    // `PolicyField` to a projection field is the domain fold.
+    use hort_domain::events::PolicyField;
 
     use hort_domain::events::{ApiActor, PersistedEvent, RejectionReason};
     use hort_domain::ports::event_store::{AppendResult, ReadFrom, SubscribeFrom};
@@ -3113,6 +3190,56 @@ mod tests {
             RbacAccess::Disabled,
             include_label,
         ))
+    }
+
+    /// Seed `events` with the policy stream a real producer would have
+    /// written for `projection`, plus `extra` events after the opening
+    /// `PolicyCreated`. Returns the tail `stream_position`.
+    ///
+    /// The `PolicyCreated` payload is encoded by the same
+    /// `policy_config_snapshot` the create path uses, so the seeded corpus
+    /// is something this system could actually have appended — a corpus
+    /// the fold would refuse is a premise production cannot show. Every
+    /// event is run through `DomainEvent::validate` for the same reason:
+    /// the production event store validates on append, so an event this
+    /// seeding accepted and the adapter would reject is an event no
+    /// producer can write.
+    fn seed_policy_stream(
+        events: &MockEventStore,
+        projection: &ScanPolicyProjection,
+        extra: Vec<DomainEvent>,
+    ) -> u64 {
+        let created = DomainEvent::PolicyCreated(PolicyCreated {
+            policy_id: projection.policy_id,
+            name: projection.name.clone(),
+            scope: projection.scope.clone(),
+            config_snapshot: policy_config_snapshot(projection),
+        });
+        let stream_id = StreamId::policy(projection.policy_id);
+        let persisted: Vec<PersistedEvent> = std::iter::once(created)
+            .chain(extra)
+            .enumerate()
+            .map(|(i, event)| {
+                event
+                    .validate()
+                    .expect("seeded events must be ones a producer could append");
+                PersistedEvent {
+                    event_id: Uuid::new_v4(),
+                    stream_id: stream_id.clone(),
+                    stream_position: i as u64,
+                    global_position: i as u64,
+                    event,
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: api_actor(),
+                    event_version: 1,
+                    stored_at: DateTime::from_timestamp(1_000 + i as i64, 0).expect("in range"),
+                }
+            })
+            .collect();
+        let tail = persisted.len() as u64 - 1;
+        events.seed_stream(stream_id, persisted);
+        tail
     }
 
     fn make_use_case() -> (
@@ -3817,72 +3944,87 @@ mod tests {
         assert_eq!(projection.enforcement, ScanEnforcement::Reject);
     }
 
-    /// Parity: every field `build_config_snapshot` records for the
-    /// `PolicyCreated` event must match what `create_policy` wrote into
-    /// the projection — the snapshot's `to_string()`-rendered enums
-    /// (`provenance_mode`, `negligible_action`, `enforcement`) are
-    /// compared against the same `Display` rendering on the projection
-    /// side, and the remaining fields are compared as JSON so a future
-    /// field added to `CreatePolicyCommand` but left out of the
-    /// projection literal fails here instead of shipping.
+    /// Parity: every field of `CreatePolicyCommand` reaches the
+    /// projection `create_policy` writes, **and** the `PolicyCreated`
+    /// event's `config_snapshot` is that projection's encoding.
+    ///
+    /// The two halves answer different questions, and this test used to
+    /// answer only one of them. Comparing the snapshot to the projection
+    /// is now tautological — the snapshot is *derived* from the
+    /// projection through the fold's encoder, which is the point: event
+    /// and row cannot disagree. What that derivation does NOT catch is a
+    /// command field the projection literal forgot to copy, because the
+    /// snapshot would faithfully record the default. So the command is
+    /// what the projection is checked against here, field by field, with
+    /// every value differing from its type's default so a dropped copy
+    /// cannot pass by coincidence.
     #[tokio::test]
-    async fn create_policy_projection_matches_config_snapshot_field_by_field() {
-        let (uc, _events, projections) = make_use_case();
+    async fn create_policy_projection_carries_every_command_field() {
+        let (uc, events, projections) = make_use_case();
         let mut cmd = sample_create_command("parity-check");
+        // Every field away from its default, so a forgotten copy shows
+        // up as a mismatch rather than as an accidental agreement.
+        cmd.scope = PolicyScope::Repository(Uuid::from_u128(0xFEED));
+        cmd.severity_threshold = SeverityThreshold::Low;
+        cmd.quarantine_duration_secs = 61;
+        cmd.require_approval = false;
+        cmd.provenance_mode = ProvenanceMode::Required;
+        cmd.provenance_backends = vec!["cosign".into(), "cosign-key".into()];
+        cmd.provenance_identities =
+            vec![SignerIdentityPattern::new("iss", "san").expect("valid pattern")];
+        cmd.max_artifact_age_secs = Some(999);
+        cmd.license_policy = serde_json::json!({"denied": ["GPL-2.0"]});
+        cmd.scan_backends = vec!["osv".into()];
+        cmd.rescan_interval_hours = 7;
+        cmd.negligible_action = NegligibleAction::Block;
         cmd.enforcement = ScanEnforcement::Record;
-        let snapshot = build_config_snapshot(&cmd);
+        cmd.composite_verdict_mode = CompositeVerdictMode::Promoted;
+        let expected = cmd.clone();
 
         let policy_id = uc.create_policy(cmd, api_actor()).await.unwrap();
-
         let projection = projections.find_by_id(policy_id).await.unwrap().unwrap();
 
-        assert_eq!(snapshot["name"], serde_json::json!(projection.name));
-        assert_eq!(snapshot["scope"], serde_json::json!(projection.scope));
+        assert_eq!(projection.name, expected.name);
+        assert_eq!(projection.scope, expected.scope);
+        assert_eq!(projection.severity_threshold, expected.severity_threshold);
         assert_eq!(
-            snapshot["severity_threshold"],
-            serde_json::json!(projection.severity_threshold)
+            projection.quarantine_duration_secs,
+            expected.quarantine_duration_secs
+        );
+        assert_eq!(projection.require_approval, expected.require_approval);
+        assert_eq!(projection.provenance_mode, expected.provenance_mode);
+        assert_eq!(projection.provenance_backends, expected.provenance_backends);
+        assert_eq!(
+            projection.provenance_identities,
+            expected.provenance_identities
         );
         assert_eq!(
-            snapshot["quarantine_duration_secs"],
-            serde_json::json!(projection.quarantine_duration_secs)
+            projection.max_artifact_age_secs,
+            expected.max_artifact_age_secs
         );
+        assert_eq!(projection.license_policy, expected.license_policy);
+        assert_eq!(projection.scan_backends, expected.scan_backends);
         assert_eq!(
-            snapshot["require_approval"],
-            serde_json::json!(projection.require_approval)
+            projection.rescan_interval_hours,
+            expected.rescan_interval_hours
         );
+        assert_eq!(projection.negligible_action, expected.negligible_action);
+        assert_eq!(projection.enforcement, expected.enforcement);
         assert_eq!(
-            snapshot["provenance_mode"],
-            projection.provenance_mode.to_string()
+            projection.composite_verdict_mode,
+            expected.composite_verdict_mode
         );
+        assert!(!projection.archived);
+
+        // The event records the row, encoded once.
+        let batches = events.appended_batches();
+        let DomainEvent::PolicyCreated(created) = &batches[0].events[0].event else {
+            panic!("create_policy appends PolicyCreated");
+        };
         assert_eq!(
-            snapshot["provenance_backends"],
-            serde_json::json!(projection.provenance_backends)
-        );
-        assert_eq!(
-            snapshot["provenance_identities"],
-            serde_json::json!(projection.provenance_identities)
-        );
-        assert_eq!(
-            snapshot["max_artifact_age_secs"],
-            serde_json::json!(projection.max_artifact_age_secs)
-        );
-        assert_eq!(snapshot["license_policy"], projection.license_policy);
-        assert_eq!(
-            snapshot["scan_backends"],
-            serde_json::json!(projection.scan_backends)
-        );
-        assert_eq!(
-            snapshot["rescan_interval_hours"],
-            serde_json::json!(projection.rescan_interval_hours)
-        );
-        assert_eq!(
-            snapshot["negligible_action"],
-            projection.negligible_action.to_string()
-        );
-        assert_eq!(snapshot["enforcement"], projection.enforcement.to_string());
-        assert_eq!(
-            snapshot["composite_verdict_mode"],
-            projection.composite_verdict_mode.to_string()
+            created.config_snapshot,
+            policy_config_snapshot(&projection),
+            "the event's snapshot must be the projection's own encoding"
         );
     }
 
@@ -4201,8 +4343,195 @@ mod tests {
         );
     }
 
+    /// The stale-projection repair, at the `update_policy` site: the row
+    /// is one version behind its stream (a failed upsert), the first
+    /// append is refused, and the retry appends at the version the stream
+    /// actually reports.
     #[tokio::test]
-    async fn update_policy_stale_version_maps_conflict_to_domain_conflict() {
+    async fn update_policy_heals_a_stale_projection_and_appends_at_the_stream_version() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        // The stream is at 2; the row claims 0 — exactly what a committed
+        // append followed by a failed upsert leaves behind.
+        let mut stale = sample_projection(id, 0);
+        stale.name = "prod-default".into();
+        let tail = seed_policy_stream(
+            &events,
+            &stale,
+            vec![
+                DomainEvent::PolicyArchived(PolicyArchived { policy_id: id }),
+                DomainEvent::PolicyReactivated(PolicyReactivated { policy_id: id }),
+            ],
+        );
+        assert_eq!(tail, 2);
+        projections.insert(stale);
+        // LIFO: the result for the SECOND append is pushed first.
+        events.push_append_result(AppendResult {
+            stream_position: 3,
+            global_positions: vec![3],
+        });
+        events.push_append_error(DomainError::Conflict("expected version 0, found 2".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        uc.update_policy(cmd, api_actor()).await.expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2, "one refused attempt, one that lands");
+        assert_eq!(batches[0].expected_version, ExpectedVersion::Exact(0));
+        assert_eq!(
+            batches[1].expected_version,
+            ExpectedVersion::Exact(tail),
+            "the retry must ask with the version the stream reports"
+        );
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(last.name, "renamed");
+        assert_eq!(last.stream_version, 3);
+        assert!(
+            !last.archived,
+            "the re-based row must carry the stream's archived state, not the \
+             stale row's"
+        );
+    }
+
+    /// A conflict whose stream says the update already happened is an
+    /// idempotent success (ADR 0060 step (b)) — and the stale row is
+    /// repaired on the way out.
+    #[tokio::test]
+    async fn update_policy_whose_stream_already_states_it_succeeds_and_repairs_the_row() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        let mut renamed = stale.clone();
+        renamed.name = "renamed".into();
+        let rename = diff_policy_fields(id, &stale, &renamed)
+            .pop()
+            .expect("one changed field");
+        let tail = seed_policy_stream(&events, &stale, vec![DomainEvent::PolicyUpdated(rename)]);
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        uc.update_policy(cmd, api_actor())
+            .await
+            .expect("idempotent");
+
+        assert_eq!(
+            events.appended_batches().len(),
+            1,
+            "the re-decide found the intent already satisfied — nothing more is \
+             appended"
+        );
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(last.name, "renamed");
+        assert_eq!(
+            last.stream_version, tail,
+            "the repaired row carries the stream's version"
+        );
+    }
+
+    /// A second refusal is a genuine concurrent writer, not a stale row —
+    /// the second attempt's expected version came from the stream itself.
+    /// It surfaces as retryable-busy (ADR 0060 (d)), which the HTTP edge
+    /// already answers with 503 + `Retry-After`.
+    #[tokio::test]
+    async fn update_policy_reports_a_genuine_concurrent_writer_as_contention() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 4".into()));
+        events.push_append_error(DomainError::Conflict("expected version 0, found 7".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        let err = uc.update_policy(cmd, api_actor()).await.unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Contended(_))),
+            "a conflict surviving the re-base is contention, got {err:?}"
+        );
+        assert_eq!(
+            events.appended_batches().len(),
+            2,
+            "bounded at two attempts"
+        );
+        assert!(
+            projections.upserts().is_empty(),
+            "nothing is written when the mutation never landed"
+        );
+    }
+
+    /// A concurrent archival the caller could not have seen: the row says
+    /// active, the stream says archived. The re-decide re-checks the
+    /// precondition against the stream and refuses, rather than appending
+    /// a `PolicyUpdated` to an archived policy.
+    #[tokio::test]
+    async fn update_policy_refuses_when_the_stream_says_the_policy_was_archived() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        seed_policy_stream(
+            &events,
+            &stale,
+            vec![DomainEvent::PolicyArchived(PolicyArchived {
+                policy_id: id,
+            })],
+        );
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        let err = uc.update_policy(cmd, api_actor()).await.unwrap_err();
+
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(msg.contains("archived"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert_eq!(
+            events.appended_batches().len(),
+            1,
+            "the re-decide refused before appending"
+        );
+        assert!(projections.upserts().is_empty(), "nothing is rewritten");
+    }
+
+    /// Fail-closed: a stream that cannot be READ rewrites nothing. The
+    /// refusal is the read's own error, not a `Conflict` the caller might
+    /// retry into.
+    #[tokio::test]
+    async fn update_policy_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 2".into()));
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        let err = uc.update_policy(cmd, api_actor()).await.unwrap_err();
+
+        assert!(err.to_string().contains("event store down"), "got: {err}");
+        assert_eq!(
+            events.appended_batches().len(),
+            1,
+            "the re-base failed before it could decide, so nothing is appended"
+        );
+        assert!(projections.upserts().is_empty(), "nothing is rewritten");
+    }
+
+    /// Fail-closed: a stream that cannot produce a projection rewrites
+    /// nothing either. Here the stream is empty — the shape a conflict on
+    /// a policy whose events are gone would take.
+    #[tokio::test]
+    async fn update_policy_refuses_and_rewrites_nothing_when_the_stream_cannot_be_folded() {
         let (uc, events, projections) = make_use_case();
         let id = Uuid::new_v4();
         projections.insert(sample_projection(id, 5));
@@ -4210,9 +4539,13 @@ mod tests {
 
         let mut cmd = UpdatePolicyCommand::new(id);
         cmd.name = FieldChange::Set("changed".into());
-
         let err = uc.update_policy(cmd, api_actor()).await.unwrap_err();
-        assert!(err.to_string().contains("conflict"), "got: {err}");
+
+        assert!(
+            matches!(err, AppError::Domain(DomainError::NotFound { .. })),
+            "an unfoldable stream refuses, got {err:?}"
+        );
+        assert!(projections.upserts().is_empty(), "nothing is rewritten");
     }
 
     #[tokio::test]
@@ -4300,15 +4633,101 @@ mod tests {
         assert_eq!(last.stream_version, 5);
     }
 
+    /// The stale-projection repair at the `archive_policy` site.
     #[tokio::test]
-    async fn archive_policy_stale_version_maps_conflict_to_domain_conflict() {
+    async fn archive_policy_heals_a_stale_projection() {
         let (uc, events, projections) = make_use_case();
         let id = Uuid::new_v4();
-        projections.insert(sample_projection(id, 9));
-        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        let stale = sample_projection(id, 0);
+        let mut renamed = stale.clone();
+        renamed.rescan_interval_hours = 48;
+        let bump = diff_policy_fields(id, &stale, &renamed)
+            .pop()
+            .expect("one changed field");
+        let tail = seed_policy_stream(&events, &stale, vec![DomainEvent::PolicyUpdated(bump)]);
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        uc.archive_policy(id, api_actor()).await.expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].expected_version, ExpectedVersion::Exact(tail));
+        assert!(matches!(
+            batches[1].events[0].event,
+            DomainEvent::PolicyArchived(_)
+        ));
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert!(last.archived);
+        assert_eq!(
+            last.rescan_interval_hours, 48,
+            "the repaired row carries the field the stale row had missed"
+        );
+    }
+
+    /// A stream that already says archived satisfies the intent: the call
+    /// succeeds and the stale row is repaired, rather than being answered
+    /// with a `Validation` error about a state the caller could not see.
+    #[tokio::test]
+    async fn archive_policy_whose_stream_already_says_archived_succeeds_and_repairs_the_row() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        let tail = seed_policy_stream(
+            &events,
+            &stale,
+            vec![DomainEvent::PolicyArchived(PolicyArchived {
+                policy_id: id,
+            })],
+        );
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        uc.archive_policy(id, api_actor())
+            .await
+            .expect("idempotent");
+
+        assert_eq!(
+            events.appended_batches().len(),
+            1,
+            "a second PolicyArchived would record an archival that did not happen"
+        );
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert!(last.archived);
+        assert_eq!(last.stream_version, tail);
+    }
+
+    #[tokio::test]
+    async fn archive_policy_reports_a_genuine_concurrent_writer_as_contention() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected 0, found 4".into()));
+        events.push_append_error(DomainError::Conflict("expected 0, found 7".into()));
 
         let err = uc.archive_policy(id, api_actor()).await.unwrap_err();
-        assert!(err.to_string().contains("conflict"), "got: {err}");
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Contended(_))),
+            "got {err:?}"
+        );
+        assert!(projections.upserts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn archive_policy_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 9);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+        let err = uc.archive_policy(id, api_actor()).await.unwrap_err();
+        assert!(err.to_string().contains("event store down"), "got: {err}");
+        assert!(projections.upserts().is_empty(), "nothing is rewritten");
     }
 
     #[tokio::test]
@@ -4393,7 +4812,7 @@ mod tests {
         let err = uc.reactivate_policy(id, api_actor()).await.unwrap_err();
         assert!(matches!(
             err,
-            crate::error::AppError::Domain(DomainError::NotFound {
+            AppError::Domain(DomainError::NotFound {
                 entity: "ScanPolicy",
                 ..
             })
@@ -4401,17 +4820,84 @@ mod tests {
         assert!(events.appended_batches().is_empty());
     }
 
+    /// The stale-projection repair at the `reactivate_policy` site — the
+    /// seventh expected-version site on this stream, and the one the
+    /// directive's census of six did not name. Its conflict handling was
+    /// byte-identical to `archive_policy`'s, so leaving it out would have
+    /// left the same deadlock reachable through the gitops
+    /// reactivation branch.
     #[tokio::test]
-    async fn reactivate_policy_stale_version_maps_conflict_to_domain_conflict() {
+    async fn reactivate_policy_heals_a_stale_projection() {
         let (uc, events, projections) = make_use_case();
         let id = Uuid::new_v4();
-        let mut p = sample_projection(id, 9);
-        p.archived = true;
-        projections.insert(p);
+        let mut stale = sample_projection(id, 0);
+        stale.archived = true;
+        // The stream opens active and is archived at position 1; the row
+        // is archived but claims version 0.
+        let mut active = stale.clone();
+        active.archived = false;
+        let tail = seed_policy_stream(
+            &events,
+            &active,
+            vec![DomainEvent::PolicyArchived(PolicyArchived {
+                policy_id: id,
+            })],
+        );
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        uc.reactivate_policy(id, api_actor()).await.expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].expected_version, ExpectedVersion::Exact(tail));
+        assert!(matches!(
+            batches[1].events[0].event,
+            DomainEvent::PolicyReactivated(_)
+        ));
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert!(!last.archived);
+    }
+
+    /// A stream that already says active satisfies the intent.
+    #[tokio::test]
+    async fn reactivate_policy_whose_stream_already_says_active_succeeds_and_repairs_the_row() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let mut stale = sample_projection(id, 0);
+        stale.archived = true;
+        let mut active = stale.clone();
+        active.archived = false;
+        let tail = seed_policy_stream(&events, &active, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 0".into()));
+
+        uc.reactivate_policy(id, api_actor())
+            .await
+            .expect("idempotent");
+
+        assert_eq!(events.appended_batches().len(), 1);
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert!(!last.archived);
+        assert_eq!(last.stream_version, tail);
+    }
+
+    #[tokio::test]
+    async fn reactivate_policy_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let mut stale = sample_projection(id, 9);
+        stale.archived = true;
+        let mut active = stale.clone();
+        active.archived = false;
+        seed_policy_stream(&events, &active, Vec::new());
+        projections.insert(stale);
         events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
 
         let err = uc.reactivate_policy(id, api_actor()).await.unwrap_err();
-        assert!(err.to_string().contains("conflict"), "got: {err}");
+        assert!(err.to_string().contains("event store down"), "got: {err}");
+        assert!(projections.upserts().is_empty(), "nothing is rewritten");
     }
 
     #[tokio::test]
@@ -4653,20 +5139,126 @@ mod tests {
         assert_eq!(upserts[0].stream_version, 5);
     }
 
+    /// The stale-projection repair at the `add_exclusion` site.
+    ///
+    /// An exclusion event changes no policy *field*, but it takes a stream
+    /// position and the parent row's `stream_version` moves with it — so
+    /// this method is both a producer of the stale version and a victim of
+    /// it, and the gitops exclusions stage reaches it with no field diff
+    /// to heal the row first.
     #[tokio::test]
-    async fn add_exclusion_stale_version_maps_conflict_to_domain_conflict() {
+    async fn add_exclusion_heals_a_stale_projection() {
         let (uc, events, projections) = make_use_case();
         let policy_id = Uuid::new_v4();
-        projections.insert(sample_projection(policy_id, 9));
-        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        let stale = sample_projection(policy_id, 0);
+        let existing = Uuid::new_v4();
+        let tail = seed_policy_stream(
+            &events,
+            &stale,
+            vec![DomainEvent::ExclusionAdded(ExclusionAdded {
+                policy_id,
+                exclusion_id: existing,
+                cve_id: "CVE-2026-1111".into(),
+                package_pattern: None,
+                scope: PolicyScope::Global,
+                reason: "already waived".into(),
+                expires_at: None,
+            })],
+        );
+        projections.insert(stale);
+        events.push_append_result(AppendResult {
+            stream_position: 2,
+            global_positions: vec![2],
+        });
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let new_id = uc
+            .add_exclusion(sample_add_exclusion_command(policy_id), api_actor())
+            .await
+            .expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].expected_version, ExpectedVersion::Exact(tail));
+        match &batches[1].events[0].event {
+            DomainEvent::ExclusionAdded(a) => assert_eq!(a.exclusion_id, new_id),
+            other => panic!("expected ExclusionAdded, got {other:?}"),
+        }
+        assert_eq!(projections.exclusion_upserts().len(), 1);
+        let parent = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(parent.stream_version, 2);
+    }
+
+    /// A conflict surviving the re-base is contention, and nothing is
+    /// written — neither the exclusion row nor the parent.
+    #[tokio::test]
+    async fn add_exclusion_reports_a_genuine_concurrent_writer_as_contention() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 0);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected 0, found 4".into()));
+        events.push_append_error(DomainError::Conflict("expected 0, found 7".into()));
 
         let err = uc
             .add_exclusion(sample_add_exclusion_command(policy_id), api_actor())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("conflict"), "got: {err}");
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Contended(_))),
+            "got {err:?}"
+        );
+        assert!(projections.exclusion_upserts().is_empty());
+        assert!(projections.upserts().is_empty());
+    }
 
-        // No projection writes after a conflict.
+    /// A concurrent archival the caller could not have seen, at the
+    /// `add_exclusion` site: an exclusion must not be attached to a
+    /// policy the stream says is archived.
+    #[tokio::test]
+    async fn add_exclusion_refuses_when_the_stream_says_the_policy_was_archived() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 0);
+        seed_policy_stream(
+            &events,
+            &stale,
+            vec![DomainEvent::PolicyArchived(PolicyArchived { policy_id })],
+        );
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let err = uc
+            .add_exclusion(sample_add_exclusion_command(policy_id), api_actor())
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(msg.contains("archived"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert!(projections.exclusion_upserts().is_empty());
+        assert!(projections.upserts().is_empty());
+    }
+
+    /// Fail-closed: an unreadable stream refuses and writes nothing.
+    #[tokio::test]
+    async fn add_exclusion_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 9);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+        let err = uc
+            .add_exclusion(sample_add_exclusion_command(policy_id), api_actor())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("event store down"), "got: {err}");
         assert!(projections.exclusion_upserts().is_empty());
         assert!(projections.upserts().is_empty());
     }
@@ -5821,14 +6413,129 @@ mod tests {
         assert_eq!(upserts[0].stream_version, 5);
     }
 
+    /// The stale-projection repair at the `remove_exclusion` site.
     #[tokio::test]
-    async fn remove_exclusion_stale_version_maps_conflict_to_domain_conflict() {
+    async fn remove_exclusion_heals_a_stale_projection() {
         let (uc, events, projections) = make_use_case();
         let policy_id = Uuid::new_v4();
         let exclusion_id = Uuid::new_v4();
-        projections.insert(sample_projection(policy_id, 9));
+        let stale = sample_projection(policy_id, 0);
+        let tail = seed_policy_stream(
+            &events,
+            &stale,
+            vec![DomainEvent::ExclusionAdded(ExclusionAdded {
+                policy_id,
+                exclusion_id,
+                cve_id: "CVE-2024-3094".into(),
+                package_pattern: Some("xz-utils@<5.6.2".into()),
+                scope: PolicyScope::Global,
+                reason: "patched in container layer".into(),
+                expires_at: None,
+            })],
+        );
+        projections.insert(stale);
         projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
-        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        events.push_append_result(AppendResult {
+            stream_position: 2,
+            global_positions: vec![2],
+        });
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        uc.remove_exclusion(
+            sample_remove_exclusion_command(policy_id, exclusion_id),
+            api_actor(),
+        )
+        .await
+        .expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].expected_version, ExpectedVersion::Exact(tail));
+        assert_eq!(projections.exclusion_deletes(), vec![exclusion_id]);
+        let parent = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(parent.stream_version, 2);
+    }
+
+    /// A stream that no longer carries the exclusion satisfies the intent:
+    /// appending a second `ExclusionRemoved` would record a removal that
+    /// did not happen. The orphaned row is still deleted and the stale
+    /// parent repaired.
+    #[tokio::test]
+    async fn remove_exclusion_whose_stream_already_removed_it_succeeds_and_repairs_the_row() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let exclusion_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 0);
+        let tail = seed_policy_stream(
+            &events,
+            &stale,
+            vec![
+                DomainEvent::ExclusionAdded(ExclusionAdded {
+                    policy_id,
+                    exclusion_id,
+                    cve_id: "CVE-2024-3094".into(),
+                    package_pattern: None,
+                    scope: PolicyScope::Global,
+                    reason: "patched in container layer".into(),
+                    expires_at: None,
+                }),
+                DomainEvent::ExclusionRemoved(ExclusionRemoved {
+                    policy_id,
+                    exclusion_id,
+                    reason: "re-triaged".into(),
+                }),
+            ],
+        );
+        projections.insert(stale);
+        projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
+        events.push_append_error(DomainError::Conflict("expected version 0, found 2".into()));
+
+        uc.remove_exclusion(
+            sample_remove_exclusion_command(policy_id, exclusion_id),
+            api_actor(),
+        )
+        .await
+        .expect("idempotent");
+
+        assert_eq!(events.appended_batches().len(), 1);
+        assert_eq!(
+            projections.exclusion_deletes(),
+            vec![exclusion_id],
+            "the row the stream contradicts is still dropped"
+        );
+        let parent = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(parent.stream_version, tail);
+    }
+
+    /// A concurrent archival the caller could not have seen, at the
+    /// `remove_exclusion` site. The archived check runs before the
+    /// already-removed check, so an archived parent refuses rather than
+    /// silently draining the row.
+    #[tokio::test]
+    async fn remove_exclusion_refuses_when_the_stream_says_the_policy_was_archived() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let exclusion_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 0);
+        seed_policy_stream(
+            &events,
+            &stale,
+            vec![
+                DomainEvent::ExclusionAdded(ExclusionAdded {
+                    policy_id,
+                    exclusion_id,
+                    cve_id: "CVE-2024-3094".into(),
+                    package_pattern: None,
+                    scope: PolicyScope::Global,
+                    reason: "patched in container layer".into(),
+                    expires_at: None,
+                }),
+                DomainEvent::PolicyArchived(PolicyArchived { policy_id }),
+            ],
+        );
+        projections.insert(stale);
+        projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
+        events.push_append_error(DomainError::Conflict("expected version 0, found 2".into()));
 
         let err = uc
             .remove_exclusion(
@@ -5837,9 +6544,38 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("conflict"), "got: {err}");
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(msg.contains("archived"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert!(projections.exclusion_deletes().is_empty());
+        assert!(projections.upserts().is_empty());
+    }
 
-        // No projection writes after a conflict.
+    /// Fail-closed: an unreadable stream refuses and writes nothing — not
+    /// the delete, not the parent.
+    #[tokio::test]
+    async fn remove_exclusion_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let exclusion_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 9);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
+        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+        let err = uc
+            .remove_exclusion(
+                sample_remove_exclusion_command(policy_id, exclusion_id),
+                api_actor(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("event store down"), "got: {err}");
         assert!(projections.exclusion_deletes().is_empty());
         assert!(projections.upserts().is_empty());
     }
@@ -6027,16 +6763,6 @@ mod tests {
     }
 
     #[test]
-    fn optional_i64_to_value_some_returns_number() {
-        assert_eq!(optional_i64_to_value(Some(42)), serde_json::Value::from(42));
-    }
-
-    #[test]
-    fn optional_i64_to_value_none_returns_null() {
-        assert_eq!(optional_i64_to_value(None), serde_json::Value::Null);
-    }
-
-    #[test]
     fn create_policy_command_clone_preserves_fields() {
         let cmd = sample_create_command("x");
         let cloned = cmd.clone();
@@ -6144,7 +6870,7 @@ mod tests {
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let mut captured: Option<crate::error::AppError> = None;
+        let mut captured: Option<AppError> = None;
         metrics::with_local_recorder(&recorder, || {
             captured = Some(
                 tokio::runtime::Builder::new_current_thread()
@@ -6157,7 +6883,7 @@ mod tests {
         });
 
         match captured.expect("add_exclusion must have errored") {
-            crate::error::AppError::Domain(DomainError::Validation(msg)) => assert!(
+            AppError::Domain(DomainError::Validation(msg)) => assert!(
                 msg.contains("not enforced") && msg.contains(&repo_id.to_string()),
                 "the refusal must state why the scope cannot be honoured and name the \
                  requested repository, got: {msg}"
@@ -6248,14 +6974,24 @@ mod tests {
 
     /// `add_exclusion` event-store conflict emits `result=conflict`.
     /// The 4xx-like signal operators alert on for contention.
+    ///
+    /// Both appends lose: the first on the row's version, the second on
+    /// the version read straight off the stream. That second loss is a
+    /// genuine concurrent writer, which `curation_result_for` must still
+    /// label `conflict` even though it now arrives as
+    /// `DomainError::Contended` (ADR 0060's retryable-busy outcome)
+    /// rather than as `Conflict`.
     #[test]
     fn add_exclusion_event_store_conflict_emits_conflict_metric() {
         use metrics_util::debugging::DebuggingRecorder;
 
         let (uc, events, projections) = make_use_case();
         let policy_id = Uuid::new_v4();
-        projections.insert(sample_projection(policy_id, 9));
+        let projection = sample_projection(policy_id, 9);
+        seed_policy_stream(&events, &projection, Vec::new());
+        projections.insert(projection);
         events.push_append_error(DomainError::Conflict("expected 9, found 10".into()));
+        events.push_append_error(DomainError::Conflict("expected 0, found 10".into()));
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -6366,9 +7102,27 @@ mod tests {
         let (uc, events, projections) = make_use_case();
         let policy_id = Uuid::new_v4();
         let exclusion_id = Uuid::new_v4();
-        projections.insert(sample_projection(policy_id, 9));
+        let projection = sample_projection(policy_id, 9);
+        // The exclusion is on the stream too, so the re-decide still
+        // wants to remove it and the second append is a real race rather
+        // than an already-satisfied intent.
+        seed_policy_stream(
+            &events,
+            &projection,
+            vec![DomainEvent::ExclusionAdded(ExclusionAdded {
+                policy_id,
+                exclusion_id,
+                cve_id: "CVE-2024-3094".into(),
+                package_pattern: Some("xz-utils@<5.6.2".into()),
+                scope: PolicyScope::Global,
+                reason: "patched in container layer".into(),
+                expires_at: None,
+            })],
+        );
+        projections.insert(projection);
         projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
         events.push_append_error(DomainError::Conflict("stale".into()));
+        events.push_append_error(DomainError::Conflict("raced".into()));
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -6381,7 +7135,7 @@ mod tests {
                     sample_remove_exclusion_command(policy_id, exclusion_id),
                     api_actor(),
                 ))
-                .expect_err("conflict must propagate");
+                .expect_err("a conflict surviving the re-base must propagate");
         });
 
         let hits = read_curation_decisions(snapshotter.snapshot());

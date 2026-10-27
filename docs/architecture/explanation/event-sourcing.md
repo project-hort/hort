@@ -384,19 +384,19 @@ worth naming.
 
 `PolicyUseCase` appends an event and, on `Ok(_)`, immediately upserts
 the corresponding row in `policy_projections` from inside the same use
-case call. The two writes are NOT in one transaction: the event
-append commits first, then the projection upsert runs. The trade-off
-is a narrow stale-read window — if the projection upsert fails after
-the append succeeds, subsequent `find_policy_by_name` calls return
-the previous state until an out-of-band rebuild-from-stream tool runs.
-The alternative (an async projector polling `read_category` like the
-artifact projection) was rejected because the gitops apply path needs
-the projection up-to-date the instant the next stream applies, and
-no production caller other than the apply pipeline reads the
-projection at all. `PolicyUseCase` is the canonical implementation
-of this pattern.
+case call. The two writes are NOT in one transaction, and cannot be:
+`PolicyProjectionRepository` is backend-agnostic (ADR 0004), takes no
+transaction handle, and its Postgres implementation holds its own
+pool. The event append commits first, then the projection upsert runs.
+If the upsert fails after the append succeeded, the row is one version
+behind its stream. The alternative (an async projector polling
+`read_category` like the artifact projection) was rejected because the
+gitops apply path needs the projection up-to-date the instant the next
+stream applies, and no production caller other than the apply pipeline
+reads the projection at all. `PolicyUseCase` is the canonical
+implementation of this pattern.
 
-### Optimistic concurrency for gitops applies
+### Optimistic concurrency for gitops applies, and the repair behind it
 
 Each `ApplyEventSourcedKind::diff` call computes events against a
 snapshot of the projection; the subsequent `EventStore::append` uses
@@ -404,21 +404,60 @@ snapshot of the projection; the subsequent `EventStore::append` uses
 mismatch surfaces as `DomainError::Conflict`, which
 `ApplyConfigUseCase` translates into `ConcurrentModification` and
 aborts the strict-atomic boot. Under the gitops-only stance there is
-no imperative HTTP API to race against, so the realistic conflict
-sources are multi-replica boot races (two hort-server pods applying
-the same `$HORT_CONFIG_DIR` simultaneously) and stale in-memory
-projection caches in long-lived processes that re-read after a
-restart elsewhere.
+no imperative HTTP API to race against, so the conflict sources are
+multi-replica boot races (two hort-server pods applying the same
+`$HORT_CONFIG_DIR` simultaneously), stale in-memory projection caches
+in long-lived processes that re-read after a restart elsewhere — and
+the one the synchronous-projection-write pattern above produces by
+itself: a **row that fell behind its own stream**.
+
+That last one used to be terminal rather than transient. The expected
+version comes *from the projection*, so a row one version behind asked
+with a version the stream had already passed, got `Conflict`, and
+returned before reaching the `upsert` that would have corrected it.
+Every later mutation of that policy failed the same way, and since the
+apply is strict-atomic, one failed projection write stopped every
+subsequent apply of the whole bundle.
+
+The reaction is now ADR 0060's read-decide-append contract. On
+`Conflict` the mutation re-reads the stream, **re-derives the
+projection from it** — `fold_scan_policy` for scan policies,
+`RetentionPolicy::project` for retention ones — re-decides its intent
+against that state, and appends once more. A projection contradicting
+its stream is simply wrong, so the re-base never asks *why* they
+disagreed; a failed upsert and a concurrent writer leave the same
+evidence and want the same answer. A `Conflict` that survives the
+re-base is the genuine concurrent writer, reported as such and
+surfaced as `DomainError::Contended` (503 + `Retry-After` at an HTTP
+edge, `ConcurrentModification` at the apply boundary).
+
+It is fail-closed: a stream that cannot be read, or that the fold
+refuses, rewrites nothing and the call is refused. A policy whose
+`PolicyCreated` snapshot predates a config field is exactly that case
+— the refusal names the missing key rather than healing the row to a
+default nobody declared.
+
+`create_policy` is outside this, by construction: it appends with
+`ExpectedVersion::NoStream` against a `policy_id` minted one statement
+earlier, so a `Conflict` there is a stream-identity collision and
+there is no projection version to re-base onto.
 
 ### Projection-as-O(1)-cache
 
 `find_policy_by_name` and `list_exclusions_for_policy` read the
 `policy_projections` table directly — they never replay the stream.
 The projection is treated as authoritative for reads precisely
-because the synchronous-write pattern keeps it tight to the stream.
-Rebuild-from-stream is a deferred operational tool:
-correctness in normal operation does not depend on the rebuild path
-existing.
+because the synchronous-write pattern keeps it tight to the stream,
+and because the next *write* re-derives it from the stream whenever
+the two have drifted (above).
+
+An operator-facing rebuild command is still deferred tooling, but the
+function it would be built on is no longer missing: `fold_scan_policy`
+is the whole `events -> projection` direction, and an admin route over
+it is the same call the self-heal makes. What the rebuild path would
+add is reaching a policy *nothing is currently writing to* — including
+a stream whose projection row never landed at all, which the
+name-keyed read cannot find.
 
 The operator-facing how-to is at
 [../how-to/declare-gitops-config.md](../how-to/declare-gitops-config.md).
