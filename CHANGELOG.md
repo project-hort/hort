@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- An admin can cut a CLI session off before it expires — `hort-cli admin
+  cli-session revoke` with the token in hand, or `revoke-user <user_id>` for
+  every session a user holds when the device is gone. Not a lockout: the user
+  can log in again immediately, and it needs an admin session rather than a
+  service account (#363).
+
 ### Fixed
 
 - A policy whose projection row fell behind its event stream no longer refuses

@@ -117,7 +117,8 @@ otherwise act:
 | Data | Subject access | Erasure |
 |---|---|---|
 | Live `users` row (display name, email, IdP subject claim) | yes — admin tooling | yes — admin tooling, on request |
-| Active sessions / API tokens | yes — `GET /api/v1/users/me/tokens` | yes — `DELETE /api/v1/users/me/tokens/:id`, immediate |
+| API tokens (`Pat`, `ServiceAccount`) | yes — `GET /api/v1/users/me/tokens` | yes — `DELETE /api/v1/users/me/tokens/:id`, immediate |
+| Interactive CLI sessions (`CliSession`) | not applicable — none is persisted (no row, no hash; the claims ride in the signed token), so there is no record to disclose | yes — `POST /api/v1/admin/users/{user_id}/cli-sessions/revoke` refuses every session issued before now, immediate; each expires within 15 min regardless |
 | Event log entries referencing the user's UUID | yes — read-only export | **no** — Art 17(3)(b) exemption applies |
 | Operational metrics (`hort_*`) | not applicable — no PII | not applicable |
 

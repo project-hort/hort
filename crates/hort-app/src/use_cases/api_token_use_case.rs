@@ -443,6 +443,34 @@ pub struct IssuedToken {
 }
 
 // ---------------------------------------------------------------------------
+// CliSessionCutoff
+// ---------------------------------------------------------------------------
+
+/// The success result of
+/// [`ApiTokenUseCase::revoke_cli_sessions_for_user`].
+///
+/// Carries what the caller did not supply: the instant the cutoff was
+/// taken at, and the instant it lapses. Both matter to an operator
+/// mid-emergency — the first is the line sessions are judged against,
+/// the second is when the subject can hold a session issued before the
+/// cutoff again (by construction there is none left by then, because
+/// the window is one CliSession lifetime cap).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliSessionCutoff {
+    /// The subject every CliSession token is now judged against.
+    /// Echoed back from the request so a caller can see which subject
+    /// it actually cut off (the use case does not read the user row —
+    /// see the method's doc).
+    pub user_id: Uuid,
+    /// Tokens with `iat` at or before this instant are rejected, as is
+    /// a token carrying no `iat` at all.
+    pub cutoff: DateTime<Utc>,
+    /// When the cutoff entry self-expires
+    /// (`cutoff + max_cli_session_lifetime()`).
+    pub expires_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
 // Authority helpers
 // ---------------------------------------------------------------------------
 
@@ -484,6 +512,42 @@ pub fn clamp_lifetime(secs: u64, has_admin: bool) -> Result<u64, ApiTokenError> 
         MAX_NON_ADMIN_CLI_SESSION_LIFETIME_SECS
     };
     Ok(secs.min(max))
+}
+
+/// The longest lifetime any CliSession token can be minted with — the
+/// upper bound [`clamp_lifetime`] enforces, whichever cap shape the
+/// request lands on.
+///
+/// **Derived, never a literal**, and the maximum is taken over BOTH
+/// per-cap-shape ceilings rather than either one, because
+/// `clamp_lifetime` picks between them per request: reading only
+/// [`MAX_NON_ADMIN_CLI_SESSION_LIFETIME_SECS`] would under-state the
+/// bound for every admin session the day the two constants diverge.
+/// They are equal (900 s) today; this function is what keeps both
+/// consumers below correct if they stop being.
+///
+/// Two revocation-side consumers, and the bound means something
+/// slightly different to each:
+///
+/// - [`ApiTokenUseCase::revoke_cli_sessions_for_user`] uses it as the
+///   subject cutoff's **TTL**. The cutoff denies every token issued at
+///   or before instant `T`; the longest-lived such token expires at
+///   `T +` this bound, so once that long has passed the cutoff has
+///   nothing left to deny and must lapse — otherwise the set would not
+///   be bounded the way the `jti` denylist is. A cutoff that lapsed
+///   *before* the sessions it cut off would be a revocation that
+///   silently un-revokes, which is why the derivation takes the max.
+/// - [`ApiTokenUseCase::revoke_cli_session`] uses it as a **ceiling**
+///   on the `jti` entry's TTL. That TTL is remaining-until-`exp` from
+///   an `exp` the *caller* supplies, and no legitimately-minted
+///   CliSession has an `exp` beyond `now +` this bound — so a value
+///   past it is a mistake (an `exp` pasted in milliseconds is the
+///   obvious one) or an abuse, and honouring it would park an entry on
+///   the durable store for geological time.
+pub fn max_cli_session_lifetime() -> StdDuration {
+    StdDuration::from_secs(
+        MAX_ADMIN_CLI_SESSION_LIFETIME_SECS.max(MAX_NON_ADMIN_CLI_SESSION_LIFETIME_SECS),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1836,6 +1900,18 @@ impl ApiTokenUseCase {
     /// expired, so revoking it is a no-op (the entry would expire
     /// instantly). We still write with a 1 s floor so an in-flight
     /// clock-skew race cannot leave a just-expired token un-denied.
+    ///
+    /// The TTL is also **capped at [`max_cli_session_lifetime`]**.
+    /// `exp` comes from the caller — it is read out of the token the
+    /// operator is holding — and no legitimately-minted CliSession has
+    /// an `exp` beyond `now +` that bound, because `clamp_lifetime`
+    /// will not mint one. Without the cap, an `exp` pasted in
+    /// milliseconds instead of seconds (the obvious fat-finger on this
+    /// surface) writes a durable entry with a TTL of tens of thousands
+    /// of years, and the bounded-set property this keyspace claims
+    /// stops holding. Capping costs nothing: past the cap the token is
+    /// refused by `exp` validation anyway, so there is nothing left for
+    /// the entry to deny.
     #[tracing::instrument(skip(self))]
     pub async fn revoke_cli_session(
         &self,
@@ -1855,7 +1931,8 @@ impl ApiTokenUseCase {
                 "cli session revocation denylist not configured".to_string(),
             )));
         };
-        let remaining = (exp - Utc::now()).num_seconds().max(1) as u64;
+        let remaining = ((exp - Utc::now()).num_seconds().max(1) as u64)
+            .min(max_cli_session_lifetime().as_secs());
         // `let key = format!(...)` THEN `.put(&key, ...)` so the
         // keyspace-exhaustiveness walker statically resolves the
         // `cli-session-revoked:` prefix via its let-binding resolver
@@ -1875,6 +1952,88 @@ impl ApiTokenUseCase {
             "cli session revoked (jti added to denylist)"
         );
         Ok(())
+    }
+
+    /// Emergency-revoke **every** CliSession access token of one
+    /// subject that was issued at or before now.
+    ///
+    /// This is the operator surface the `jti` denylist alone cannot
+    /// be: nothing persists a live CliSession (no row, no hash — the
+    /// claims ride in the signed token), so an operator who does not
+    /// hold the token has no `jti` to deny, and the emergency this
+    /// exists for is "the device is gone, cut this person off now".
+    ///
+    /// Writes `cli-session-cutoff:{user_id}` to the durable denylist
+    /// with the cutoff instant as the value and TTL =
+    /// [`max_cli_session_lifetime`], so the entry lapses once no token
+    /// issued before it can still be live. The validate path
+    /// (`AuthenticateUseCase`) rejects (401) any CliSession JWT for
+    /// that subject whose `iat` is at or before the cutoff — and any
+    /// carrying no `iat`, which cannot prove it postdates the cutoff.
+    ///
+    /// **The cutoff is `now`, not a caller-supplied instant.** A
+    /// future cutoff would outlive the entry's own TTL and silently
+    /// stop applying; a past one would be a weaker revocation than the
+    /// operator asked for. A second call simply moves the cutoff
+    /// forward and restarts the TTL, which is why the write is an
+    /// unconditional `put`.
+    ///
+    /// **It deliberately does not read the user row.** The subject is
+    /// an opaque key here, so a cutoff lands even when the identity
+    /// store is unreachable — the kill switch must not inherit the
+    /// availability of a backend it does not need. The cost is that a
+    /// mistyped id writes a cutoff nothing will ever match; it lapses
+    /// on its own within one lifetime cap, and the returned
+    /// [`CliSessionCutoff`] echoes the subject back so the caller can
+    /// see what it actually cut off.
+    #[tracing::instrument(skip(self))]
+    pub async fn revoke_cli_sessions_for_user(
+        &self,
+        actor: ApiActor,
+        user_id: Uuid,
+    ) -> Result<CliSessionCutoff, ApiTokenError> {
+        // `ephemeral_*` local name so the keyspace-exhaustiveness
+        // walker (`ephemeral_keyspace_exhaustive` guard) recognises
+        // this `.put` as an `EphemeralStore` write site (its receiver
+        // heuristic matches the "ephemeral" substring).
+        let Some(ephemeral_denylist) = self.cli_session_revocation_denylist.as_ref() else {
+            tracing::error!(
+                "revoke_cli_sessions_for_user reached with no denylist wired — \
+                 composition bug; failing closed"
+            );
+            return Err(ApiTokenError::Infrastructure(DomainError::Invariant(
+                "cli session revocation denylist not configured".to_string(),
+            )));
+        };
+        let ttl = max_cli_session_lifetime();
+        let cutoff = Utc::now();
+        // `let key = format!(...)` THEN `.put(&key, ...)` so the
+        // keyspace-exhaustiveness walker statically resolves the
+        // `cli-session-cutoff:` prefix via its let-binding resolver.
+        // The prefix is spelled here and at the validate-path read in
+        // `authenticate_use_case.rs` rather than shared through a
+        // const: the walker only resolves same-file bindings, and a
+        // cross-file const would make this write site "dynamic" and
+        // cost the gate its sharpest check on exactly the keyspace
+        // being added. Same shape as `cli-session-revoked:`.
+        let key = format!("cli-session-cutoff:{user_id}");
+        ephemeral_denylist
+            .put(&key, Bytes::from(cutoff.timestamp().to_string()), ttl)
+            .await
+            .map_err(ApiTokenError::Infrastructure)?;
+        // Security-relevant state change — `info!` (audit), never `err`.
+        tracing::info!(
+            actor_user_id = %actor.user_id,
+            subject_user_id = %user_id,
+            cutoff = %cutoff,
+            ttl_secs = ttl.as_secs(),
+            "cli sessions revoked (subject cutoff raised)"
+        );
+        Ok(CliSessionCutoff {
+            user_id,
+            cutoff,
+            expires_at: cutoff + Duration::seconds(ttl.as_secs() as i64),
+        })
     }
 
     /// Shared issuance pipeline for both self-mint and admin-mint.
@@ -6450,7 +6609,11 @@ mod tests {
     /// behaviour; the rest are inert.
     #[derive(Default)]
     struct DenylistMockStore {
-        map: Mutex<HashMap<String, Bytes>>,
+        /// Key → (value, the TTL the writer asked for). The TTL is
+        /// recorded rather than applied: the cutoff tests assert the
+        /// *derivation* of the window, which a mock that expired its
+        /// own entries would hide behind a sleep.
+        map: Mutex<HashMap<String, (Bytes, StdDuration)>>,
     }
 
     impl DenylistMockStore {
@@ -6460,20 +6623,29 @@ mod tests {
         fn contains(&self, key: &str) -> bool {
             self.map.lock().unwrap().contains_key(key)
         }
+        fn value_of(&self, key: &str) -> Option<Bytes> {
+            self.map.lock().unwrap().get(key).map(|(v, _)| v.clone())
+        }
+        fn ttl_of(&self, key: &str) -> Option<StdDuration> {
+            self.map.lock().unwrap().get(key).map(|(_, t)| *t)
+        }
     }
 
     impl EphemeralStore for DenylistMockStore {
         fn get(&self, key: &str) -> BoxFuture<'_, hort_domain::error::DomainResult<Option<Bytes>>> {
-            let v = self.map.lock().unwrap().get(key).cloned();
+            let v = self.map.lock().unwrap().get(key).map(|(v, _)| v.clone());
             Box::pin(async move { Ok(v) })
         }
         fn put(
             &self,
             key: &str,
             value: Bytes,
-            _ttl: StdDuration,
+            ttl: StdDuration,
         ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
-            self.map.lock().unwrap().insert(key.to_string(), value);
+            self.map
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), (value, ttl));
             Box::pin(async { Ok(()) })
         }
         fn put_if_absent(
@@ -6526,7 +6698,7 @@ mod tests {
             // which `issue_cli_session_inner` resolves to the
             // [Read, Write, Delete] default. `None` for
             // lifetime resolves to DEFAULT_CLI_SESSION_LIFETIME_SECS
-            // (1 h). Tests asking for a specific scope or lifetime
+            // (900 s). Tests asking for a specific scope or lifetime
             // construct IssueCliSessionRequest directly rather than
             // going through this helper.
             requested_scope: Vec::new(),
@@ -6712,6 +6884,291 @@ mod tests {
             signer.verify(&issued.plaintext),
             CliSessionVerifyOutcome::Verified(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn revoke_cli_session_ttl_tracks_exp_but_never_exceeds_the_lifetime_cap() {
+        // `exp` is caller-supplied (read out of the token the operator
+        // holds), so the TTL has to be bounded independently of it.
+        // Three inputs, one assertion each: a normal remaining window
+        // passes through, an `exp` beyond anything `clamp_lifetime`
+        // can mint is capped, and an already-expired token still gets
+        // the 1 s floor rather than a zero/negative TTL.
+        let cap = max_cli_session_lifetime().as_secs();
+        let (uc, _tokens, users, _events, _signer, denylist, _caller) = make_cli_session_use_case();
+        users.insert(user(false));
+
+        let normal = Uuid::from_u128(1);
+        uc.revoke_cli_session(normal, Utc::now() + Duration::seconds(120))
+            .await
+            .expect("revoke");
+        let ttl = denylist
+            .ttl_of(&format!("cli-session-revoked:{normal}"))
+            .expect("ttl");
+        assert!(ttl.as_secs() <= 120 && ttl.as_secs() >= 110, "{ttl:?}");
+
+        // An `exp` pasted in milliseconds instead of seconds is the
+        // obvious fat-finger on this surface; unclamped it parks a
+        // durable entry for tens of thousands of years.
+        let fat_finger = Uuid::from_u128(2);
+        uc.revoke_cli_session(fat_finger, Utc::now() + Duration::days(365 * 1000))
+            .await
+            .expect("revoke");
+        assert_eq!(
+            denylist
+                .ttl_of(&format!("cli-session-revoked:{fat_finger}"))
+                .expect("ttl")
+                .as_secs(),
+            cap,
+            "a caller-supplied exp beyond the mint cap must not set the TTL"
+        );
+
+        let already_expired = Uuid::from_u128(3);
+        uc.revoke_cli_session(already_expired, Utc::now() - Duration::seconds(60))
+            .await
+            .expect("revoke");
+        assert_eq!(
+            denylist
+                .ttl_of(&format!("cli-session-revoked:{already_expired}"))
+                .expect("ttl")
+                .as_secs(),
+            1,
+            "an already-expired token keeps the 1 s clock-skew floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_cli_session_without_denylist_fails_closed() {
+        // A `None` denylist reached on the revocation path is a
+        // composition bug. Fail — never report a revocation that
+        // nothing recorded.
+        let (caller, rbac) = full_grants_principal();
+        let (uc, _tokens, users, _events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(false));
+        let _ = caller;
+        let err = uc
+            .revoke_cli_session(Uuid::new_v4(), Utc::now() + Duration::seconds(900))
+            .await
+            .expect_err("must fail without a denylist");
+        assert!(matches!(err, ApiTokenError::Infrastructure(_)));
+    }
+
+    // -- subject-scoped revocation cutoff ----------------------------------
+
+    #[tokio::test]
+    async fn revoke_cli_sessions_for_user_writes_the_cutoff_keyed_on_the_subject() {
+        let (uc, _tokens, users, _events, _signer, denylist, caller) = make_cli_session_use_case();
+        users.insert(user(false));
+        let subject = Uuid::from_u128(0xD15C);
+
+        let before = Utc::now();
+        let cutoff = uc
+            .revoke_cli_sessions_for_user(
+                ApiActor {
+                    user_id: caller.user_id,
+                },
+                subject,
+            )
+            .await
+            .expect("revoke");
+        let after = Utc::now();
+
+        assert_eq!(cutoff.user_id, subject);
+        assert!(cutoff.cutoff >= before && cutoff.cutoff <= after);
+        // The entry is keyed on the SUBJECT, not on the admin running
+        // the revocation.
+        let key = format!("cli-session-cutoff:{subject}");
+        assert!(denylist.contains(&key), "cutoff must be on the denylist");
+        assert!(
+            !denylist.contains(&format!("cli-session-cutoff:{}", caller.user_id)),
+            "the actor must not be cut off by their own action"
+        );
+        // Stored form: the cutoff's Unix seconds as ASCII decimal —
+        // the shape the validate path parses.
+        let raw = denylist.value_of(&key).expect("value");
+        assert_eq!(
+            std::str::from_utf8(&raw).expect("utf8"),
+            cutoff.cutoff.timestamp().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_cli_sessions_for_user_ttl_is_derived_from_the_lifetime_cap() {
+        // The window must be DERIVED from the CliSession lifetime
+        // ceilings, not typed as a literal: a cutoff that lapses
+        // before the sessions it cut off is a revocation that
+        // silently un-revokes. Asserted against the constants, and
+        // against the max of BOTH per-cap-shape ceilings so the
+        // derivation stays correct the day they diverge.
+        let (uc, _tokens, users, _events, _signer, denylist, caller) = make_cli_session_use_case();
+        users.insert(user(false));
+        let subject = Uuid::from_u128(0xD15C);
+
+        let cutoff = uc
+            .revoke_cli_sessions_for_user(
+                ApiActor {
+                    user_id: caller.user_id,
+                },
+                subject,
+            )
+            .await
+            .expect("revoke");
+
+        let written = denylist
+            .ttl_of(&format!("cli-session-cutoff:{subject}"))
+            .expect("ttl recorded");
+        assert_eq!(written, max_cli_session_lifetime());
+        assert_eq!(
+            written.as_secs(),
+            MAX_ADMIN_CLI_SESSION_LIFETIME_SECS.max(MAX_NON_ADMIN_CLI_SESSION_LIFETIME_SECS),
+        );
+        // No token can outlive the window the cutoff covers.
+        assert!(written.as_secs() >= MAX_ADMIN_CLI_SESSION_LIFETIME_SECS);
+        assert!(written.as_secs() >= MAX_NON_ADMIN_CLI_SESSION_LIFETIME_SECS);
+        // The reported lapse instant is the cutoff plus that window.
+        assert_eq!(
+            (cutoff.expires_at - cutoff.cutoff).num_seconds() as u64,
+            written.as_secs()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_cli_sessions_for_user_moves_the_cutoff_forward_on_a_second_call() {
+        // Idempotent in the direction that matters: a second call
+        // re-raises the line and restarts the window. It must never
+        // move backwards — that would weaken a revocation already
+        // taken.
+        let (uc, _tokens, users, _events, _signer, _denylist, caller) = make_cli_session_use_case();
+        users.insert(user(false));
+        let subject = Uuid::from_u128(0xD15C);
+        let actor = ApiActor {
+            user_id: caller.user_id,
+        };
+
+        let first = uc
+            .revoke_cli_sessions_for_user(actor.clone(), subject)
+            .await
+            .expect("first");
+        let second = uc
+            .revoke_cli_sessions_for_user(actor, subject)
+            .await
+            .expect("second");
+        assert!(second.cutoff >= first.cutoff);
+    }
+
+    #[tokio::test]
+    async fn revoke_cli_sessions_for_user_without_denylist_fails_closed() {
+        // Same posture as the `jti` path: a `None` denylist is a
+        // composition bug, and reporting success would tell an
+        // operator mid-emergency that sessions are dead when nothing
+        // recorded the cutoff.
+        let (caller, rbac) = full_grants_principal();
+        let (uc, _tokens, users, _events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(false));
+        let err = uc
+            .revoke_cli_sessions_for_user(
+                ApiActor {
+                    user_id: caller.user_id,
+                },
+                Uuid::from_u128(0xD15C),
+            )
+            .await
+            .expect_err("must fail without a denylist");
+        assert!(matches!(err, ApiTokenError::Infrastructure(_)));
+    }
+
+    #[tokio::test]
+    async fn revoke_cli_sessions_for_user_propagates_a_store_write_failure() {
+        // The write is the revocation. A store that refuses it must
+        // surface as an error, not a success the operator acts on.
+        let (caller, rbac) = full_grants_principal();
+        let (uc, _tokens, users, _events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(false));
+        let (signer, _denylist) = cli_session_rig();
+        let uc = uc.with_cli_session_signing(
+            signer,
+            Arc::new(RefusingEphemeralStore) as Arc<dyn EphemeralStore>,
+        );
+        let err = uc
+            .revoke_cli_sessions_for_user(
+                ApiActor {
+                    user_id: caller.user_id,
+                },
+                Uuid::from_u128(0xD15C),
+            )
+            .await
+            .expect_err("a refused write must not report success");
+        assert!(matches!(err, ApiTokenError::Infrastructure(_)));
+    }
+
+    #[tokio::test]
+    async fn revoke_cli_session_propagates_a_store_write_failure() {
+        let (caller, rbac) = full_grants_principal();
+        let (uc, _tokens, users, _events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(user(false));
+        let _ = caller;
+        let (signer, _denylist) = cli_session_rig();
+        let uc = uc.with_cli_session_signing(
+            signer,
+            Arc::new(RefusingEphemeralStore) as Arc<dyn EphemeralStore>,
+        );
+        let err = uc
+            .revoke_cli_session(Uuid::new_v4(), Utc::now() + Duration::seconds(900))
+            .await
+            .expect_err("a refused write must not report success");
+        assert!(matches!(err, ApiTokenError::Infrastructure(_)));
+    }
+
+    /// An `EphemeralStore` whose every write fails. Both revocation
+    /// surfaces must surface that rather than reporting a revocation
+    /// nothing recorded.
+    struct RefusingEphemeralStore;
+    impl EphemeralStore for RefusingEphemeralStore {
+        fn get(
+            &self,
+            _key: &str,
+        ) -> BoxFuture<'_, hort_domain::error::DomainResult<Option<Bytes>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn put(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: StdDuration,
+        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
+            Box::pin(async { Err(DomainError::Invariant("denylist write refused".into())) })
+        }
+        fn put_if_absent(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: StdDuration,
+        ) -> BoxFuture<'_, hort_domain::error::DomainResult<bool>> {
+            Box::pin(async { Err(DomainError::Invariant("denylist write refused".into())) })
+        }
+        fn compare_and_swap(
+            &self,
+            _key: &str,
+            _expected_version: u64,
+            _new_value: Bytes,
+            _ttl: StdDuration,
+        ) -> BoxFuture<'_, hort_domain::error::DomainResult<Option<u64>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn delete(&self, _key: &str) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn extend_ttl(
+            &self,
+            _key: &str,
+            _ttl: StdDuration,
+        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     #[tokio::test]
