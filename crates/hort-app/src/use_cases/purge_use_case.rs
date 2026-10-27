@@ -8,11 +8,12 @@
 //! to the artifact stream and deletes nothing. **This** use case is
 //! stage two: for every pending **byte-release work item** with no
 //! following [`ArtifactPurged`](hort_domain::events::ArtifactPurged) it
-//! runs the GC algorithm (decrement `content_references`, delete the CAS
+//! runs the GC algorithm (retire the projection, decrement
+//! `content_references`, delete the CAS
 //! blob iff nothing claims it any more — no cross-`kind`
 //! `content_references` row and no GC-protected artifact holding the
 //! hash without one — then append all
-//! `ArtifactPurged` events and retire the projection atomically). It is
+//! `ArtifactPurged` events atomically). It is
 //! NOT a scheduler — that is the `RetentionPurgeHandler`
 //! `TaskHandler`; this is the pure orchestration the handler calls.
 //!
@@ -81,10 +82,14 @@
 //!    [`PendingPurge::is_tag_exempt`]). Either one holding stops the
 //!    item here with nothing deleted — see *The page is a snapshot*
 //!    below.
-//! 2. Delete every `content_references` source edge for the artifact,
-//!    returning each distinct target hash.
+//! 2. **Retire the artifact** — write `artifacts.deleted_at` — and
+//!    delete every `content_references` source edge for the artifact,
+//!    returning each distinct target hash. One transaction, the
+//!    retirement first: see *The retirement leads the destruction*
+//!    below.
 //! 3. Persist each returned hash and its post-delete count in the purge
-//!    worklist, in the same transaction as the edge deletion.
+//!    worklist, in the same transaction as the retirement and the edge
+//!    deletion.
 //! 4. For each hash `H` the worklist recorded at count `0`, take the
 //!    **hash-scoped reclamation lock** and re-ask, under it, whether
 //!    anything claims `H`: the cross-kind `content_references` count
@@ -110,10 +115,53 @@
 //!    same keep for a claim the count structurally cannot show (see
 //!    *Evidence is never purged* below).
 //! 5. Once every hash is checkpointed, append one `ArtifactPurged` per
-//!    hash and set `artifacts.deleted_at` in one adapter transaction.
+//!    hash in one adapter transaction, terminating the work item. The
+//!    retirement already happened in step 2; the terminal transition
+//!    re-asserts it idempotently and is otherwise only about the
+//!    events.
 //!
 //! Walks **both** `artifact.sha256_checksum` (`primary_content`) AND
 //! `artifact_metadata.metadata_blob` (`metadata_blob`).
+//!
+//! ## The retirement leads the destruction
+//!
+//! `artifacts.deleted_at` is the single fact that takes an artifact out
+//! of service: [`Artifact::is_downloadable`] is false once it is set,
+//! and the read paths filter `deleted_at IS NULL` before the row is
+//! ever handed to that gate. So it is written in
+//! **step 2**, in the transaction that performs the first destructive
+//! statement, and therefore strictly before any `StoragePort::delete`
+//! this sweep issues.
+//!
+//! It used to be written by step 5, and step 5 waits for **every** hash
+//! of the artifact while the sweep walks every artifact before it — so
+//! the window was the sweep's own length, not one blob's. Inside it the
+//! bytes were already gone and the row was still live, which means the
+//! artifact was downloadable to the domain with nothing behind it: the
+//! read resolved the row, passed the downloadable gate, and failed in
+//! CAS. Measured, that is an opaque `500` on something the API still
+//! advertises — a storage-fault answer to a routine, expected race.
+//! Retiring first makes it the honest `404`.
+//!
+//! The order is the inverse of what the obvious objection suggests, and
+//! the objection does not survive it. An aborted run leaves a **retired
+//! artifact with intact bytes**, which is recoverable: work-item
+//! membership is the event rule (an `ArtifactExpired` or
+//! `ArtifactDeleted` with no `ArtifactPurged`) and never `deleted_at`,
+//! the pending-purge query is declared `DELETED-INCLUSIVE` for exactly
+//! that reason, and the worklist is idempotent — so the next sweep
+//! resumes the item and finishes it, with no operator step. The reverse
+//! state — live row, deleted bytes — is the one no retry can make
+//! correct, because the bytes are not coming back.
+//!
+//! Only a `Prepared` preparation retires. The three refusals
+//! ([`PurgePreparation::Protected`], [`PurgePreparation::TagExempt`],
+//! [`PurgePreparation::NoArtifact`]) delete nothing and retire nothing,
+//! so a protection that declines to collect an artifact's bytes does
+//! not take the artifact out of service as a side effect.
+//!
+//! [`Artifact::is_downloadable`]:
+//!     hort_domain::entities::artifact::Artifact::is_downloadable
 //!
 //! ## Two-stage idempotency
 //!
@@ -121,10 +169,11 @@
 //! item; `ArtifactPurged` terminates it. The adapter's worklist is written atomically with the
 //! reference deletion, so every hash remains discoverable after its
 //! source edge is gone. A transient `StoragePort::delete` failure emits
-//! no terminal event and leaves the artifact live; the next sweep reads
+//! no terminal event and leaves the artifact retired but still pending;
+//! the next sweep reads
 //! the same worklist and retries. Re-running `StoragePort::delete` on an
 //! already-absent blob is a clean no-op (`delete` is
-//! success-on-missing). The terminal event batch and retirement happen
+//! success-on-missing). The terminal event batch happens
 //! only after every hash is complete.
 //!
 //! ## The page is a snapshot; the lock is where the rules decide
@@ -520,7 +569,7 @@ impl PurgeUseCase {
         // refusal arrives as its own outcome rather than as an empty
         // worklist — the three non-`Prepared` answers mean different
         // things and are counted and logged apart.
-        let prepared = match self.gc.purge_artifact_refs(item.artifact_id).await {
+        let prepared = match self.gc.purge_artifact_refs(item.artifact_id, now).await {
             Ok(r) => r,
             Err(e) => {
                 summary.errors += 1;
