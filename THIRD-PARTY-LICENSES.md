@@ -25,7 +25,7 @@ the result instead.
 | prost-types | 0.14.3 | Apache-2.0 | https://github.com/tokio-rs/prost |
 | prost | 0.14.3 | Apache-2.0 | https://github.com/tokio-rs/prost |
 | ring | 0.17.14 | Apache-2.0 | https://github.com/briansmith/ring |
-| async-nats | 0.50.0 | Apache-2.0 | https://github.com/nats-io/nats.rs |
+| async-nats | 0.51.0 | Apache-2.0 | https://github.com/nats-io/nats.rs |
 | aws-lc-sys | 0.46.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
 | blake3 | 1.8.7 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
 | constant_time_eq | 0.4.2 | Apache-2.0 | https://github.com/cesarb/constant_time_eq |
@@ -3136,7 +3136,7 @@ limitations under the License.
 
 ```
 
-### async-nats 0.50.0 — Apache-2.0
+### async-nats 0.51.0 — Apache-2.0
 
 Repository: https://github.com/nats-io/nats.rs
 
