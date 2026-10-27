@@ -66,6 +66,7 @@ use hort_domain::entities::scan_policy::{
     CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
     ScanPolicyProjection, SeverityThreshold, SignerIdentityPattern,
 };
+use hort_domain::entities::scan_policy_fold::policy_config_snapshot;
 use hort_domain::events::{
     DomainEvent, ExclusionAdded, ExclusionRemoved, PolicyCreated, PolicyField, PolicyScope,
     PolicyUpdated,
@@ -214,23 +215,35 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
                 // it back from the event payload to construct the
                 // stream id for the append.
                 let policy_id = Uuid::new_v4();
-                let config_snapshot = build_config_snapshot(
-                    &desired.metadata.name,
-                    &desired_scope,
-                    desired_threshold,
-                    desired_quarantine,
-                    desired.spec.require_approval,
-                    &desired_provenance_mode,
-                    &desired.spec.provenance_backends,
-                    &desired_provenance_identities,
-                    desired_max_age,
-                    &desired.spec.license_policy,
-                    &desired.spec.scan_backends,
-                    desired.spec.rescan_interval_hours,
-                    &desired_negligible_action,
-                    &desired_enforcement,
-                    &desired_composite_verdict_mode,
-                );
+                // The snapshot is encoded from the projection this create
+                // would produce, through the fold's own encoder — the same
+                // one `PolicyUseCase::create_policy` uses. The two paths
+                // used to carry a copy each, held together by a comment
+                // asking the next editor to keep them in lockstep.
+                let config_snapshot = policy_config_snapshot(&ScanPolicyProjection {
+                    policy_id,
+                    name: desired.metadata.name.clone(),
+                    scope: desired_scope.clone(),
+                    severity_threshold: desired_threshold,
+                    quarantine_duration_secs: desired_quarantine,
+                    require_approval: desired.spec.require_approval,
+                    provenance_mode: desired_provenance_mode,
+                    provenance_backends: desired.spec.provenance_backends.clone(),
+                    provenance_identities: desired_provenance_identities,
+                    max_artifact_age_secs: desired_max_age,
+                    license_policy: desired.spec.license_policy.clone(),
+                    archived: false,
+                    scan_backends: desired.spec.scan_backends.clone(),
+                    rescan_interval_hours: desired.spec.rescan_interval_hours,
+                    negligible_action: desired_negligible_action,
+                    enforcement: desired_enforcement,
+                    composite_verdict_mode: desired_composite_verdict_mode,
+                    // Not part of the config surface the snapshot
+                    // records; this projection exists only to be encoded.
+                    stream_version: 0,
+                    created_at: DateTime::<Utc>::UNIX_EPOCH,
+                    updated_at: DateTime::<Utc>::UNIX_EPOCH,
+                });
                 vec![DomainEvent::PolicyCreated(PolicyCreated {
                     policy_id,
                     name: desired.metadata.name.clone(),
@@ -677,47 +690,6 @@ impl ExclusionsApplier {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Mirror of `policy_use_case::build_config_snapshot` so the gitops
-/// `PolicyCreated` payload is wire-compatible with the imperative path.
-/// Any rename here is a wire change — keep the field names in lockstep.
-#[allow(clippy::too_many_arguments)]
-fn build_config_snapshot(
-    name: &str,
-    scope: &PolicyScope,
-    severity_threshold: SeverityThreshold,
-    quarantine_duration_secs: i64,
-    require_approval: bool,
-    provenance_mode: &ProvenanceMode,
-    provenance_backends: &[String],
-    provenance_identities: &[SignerIdentityPattern],
-    max_artifact_age_secs: Option<i64>,
-    license_policy: &serde_json::Value,
-    scan_backends: &[String],
-    rescan_interval_hours: i32,
-    negligible_action: &NegligibleAction,
-    enforcement: &ScanEnforcement,
-    composite_verdict_mode: &CompositeVerdictMode,
-) -> serde_json::Value {
-    serde_json::json!({
-        "name": name,
-        "scope": scope,
-        "severity_threshold": severity_threshold,
-        "quarantine_duration_secs": quarantine_duration_secs,
-        "require_approval": require_approval,
-        // The provenance trio replaces requireSignature.
-        "provenance_mode": provenance_mode.to_string(),
-        "provenance_backends": provenance_backends,
-        "provenance_identities": provenance_identities,
-        "max_artifact_age_secs": max_artifact_age_secs,
-        "license_policy": license_policy,
-        "scan_backends": scan_backends,
-        "rescan_interval_hours": rescan_interval_hours,
-        "negligible_action": negligible_action.to_string(),
-        "enforcement": enforcement.to_string(),
-        "composite_verdict_mode": composite_verdict_mode.to_string(),
-    })
-}
 
 /// Parse the validated `provenanceMode` wire string into
 /// the domain enum. `hort_config::scan_policy::validate_scan_policy` ran
@@ -2355,25 +2327,43 @@ mod tests {
         assert_eq!(parse_threshold("low"), SeverityThreshold::Low);
     }
 
+    /// The applier's `PolicyCreated` payload carries every config field
+    /// under its snake_case key, in the one wire spelling the fold
+    /// decodes.
+    ///
+    /// Asserted through `diff(.., None)` rather than against a
+    /// snapshot builder local to this module, because there is no longer
+    /// one: both create paths encode through
+    /// `hort_domain::entities::scan_policy_fold::policy_config_snapshot`,
+    /// which is also what reads the snapshot back. What this test still
+    /// owns is that the applier hands that encoder a projection carrying
+    /// every spec field — a field left out of the literal would surface
+    /// here as a default.
     #[test]
-    fn build_config_snapshot_carries_every_field_under_snake_case_keys() {
-        let snap = build_config_snapshot(
-            "p",
-            &PolicyScope::Global,
-            SeverityThreshold::Low,
-            60,
-            true,
-            &ProvenanceMode::Required,
-            &["cosign".to_string()],
-            &[SignerIdentityPattern::new("iss", "san").expect("valid pattern")],
-            Some(120),
-            &serde_json::json!({"x": 1}),
-            &["trivy".to_string(), "osv".to_string()],
-            48,
-            &NegligibleAction::Block,
-            &ScanEnforcement::Record,
-            &CompositeVerdictMode::Promoted,
-        );
+    fn applier_create_snapshot_carries_every_field_under_snake_case_keys() {
+        let applier = ScanPolicyApplier::default();
+        let mut spec = baseline_spec();
+        spec.severity_threshold = "low".into();
+        spec.quarantine_duration = "60s".into();
+        spec.provenance_mode = "required".into();
+        spec.provenance_identities = vec![SignerIdentitySpec {
+            issuer: "iss".into(),
+            san: "san".into(),
+        }];
+        spec.max_artifact_age = Some("120s".into());
+        spec.license_policy = serde_json::json!({"x": 1});
+        spec.scan_backends = vec!["trivy".to_string(), "osv".to_string()];
+        spec.rescan_interval_hours = 48;
+        spec.negligible_action = "block".into();
+        spec.enforcement = "record".into();
+        spec.composite_verdict_mode = "promoted".into();
+
+        let DomainEvent::PolicyCreated(payload) = &applier.diff(&policy_envelope(spec), None)[0]
+        else {
+            panic!("a missing projection must emit PolicyCreated");
+        };
+        let snap = &payload.config_snapshot;
+
         for key in [
             "name",
             "scope",
@@ -2389,13 +2379,18 @@ mod tests {
             "rescan_interval_hours",
             "negligible_action",
             "enforcement",
+            "composite_verdict_mode",
         ] {
             assert!(snap.get(key).is_some(), "missing key {key}");
         }
+        assert_eq!(snap["name"], "prod-default");
+        assert_eq!(snap["severity_threshold"], "Low");
+        assert_eq!(snap["quarantine_duration_secs"], 60);
+        assert_eq!(snap["require_approval"], true);
+        assert_eq!(snap["max_artifact_age_secs"], 120);
+        assert_eq!(snap["license_policy"], serde_json::json!({"x": 1}));
         // scan_backends preserves order.
         assert_eq!(snap["scan_backends"], serde_json::json!(["trivy", "osv"]));
-        // rescan_interval_hours surfaces as the
-        // supplied integer.
         assert_eq!(snap["rescan_interval_hours"], serde_json::json!(48));
         // The provenance trio under snake_case keys.
         assert_eq!(snap["provenance_mode"], "required");
@@ -2404,11 +2399,10 @@ mod tests {
             snap["provenance_identities"],
             serde_json::json!([{"issuer": "iss", "san": "san"}])
         );
-        // negligible_action surfaces as the lowercase wire string.
+        // The lowercase wire strings the YAML and SQL surfaces share.
         assert_eq!(snap["negligible_action"], "block");
-        // enforcement likewise — the snapshot is the operator-visible
-        // record of what the policy said at creation time.
         assert_eq!(snap["enforcement"], "record");
+        assert_eq!(snap["composite_verdict_mode"], "promoted");
     }
 
     #[test]

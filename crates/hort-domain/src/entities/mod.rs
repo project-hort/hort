@@ -11,6 +11,7 @@ pub mod quarantine_transitions;
 pub mod rbac;
 pub mod repository;
 pub mod scan_policy;
+pub mod scan_policy_fold;
 pub mod service_account;
 pub mod subscription;
 pub mod user;

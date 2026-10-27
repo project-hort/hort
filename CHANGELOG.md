@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A policy whose projection row fell behind its event stream no longer refuses
+  every later change: the write re-derives the row from the stream and retries,
+  so one failed projection update stops wedging the whole gitops apply. Only a
+  real concurrent writer is refused, as `503` with `Retry-After` (#362).
+
 ### Security
 
 - The event-store retention sweep now anchors the seals it makes, so

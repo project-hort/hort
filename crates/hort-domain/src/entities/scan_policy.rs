@@ -9,8 +9,10 @@
 //! event family. The projection is updated synchronously by
 //! `PolicyUseCase` after each successful event append so
 //! `find_by_name` and `list_exclusions_for_policy` are O(1) reads
-//! rather than stream replays. Out-of-band rebuild from the event
-//! log is a future operational tool (see
+//! rather than stream replays. The reverse direction —
+//! `events -> projection` — lives in
+//! [`super::scan_policy_fold`]; an operator-facing rebuild command on
+//! top of it is a future operational tool (see
 //! `docs/architecture/explanation/event-sourcing.md`).
 //!
 //! `ScanPolicyProjection` derives [`Serialize`] but **not**
@@ -552,11 +554,18 @@ pub enum ProvenanceConfigError {
 ///
 /// `stream_version` is the post-append `AppendResult.stream_position`
 /// that produced this row — `PolicyUseCase` writes the projection +
-/// the event in lockstep so this version drives
+/// the event in lockstep (but not in one transaction — see
+/// [`PolicyProjectionRepository`](crate::ports::policy_projection_repository))
+/// so this version drives
 /// [`ExpectedVersion::Exact`](crate::ports::event_store::ExpectedVersion::Exact)
 /// on the next mutation. The gitops diff-and-emit machinery
 /// reads `stream_version` to detect a concurrent imperative append
 /// between projection-read and event-append.
+///
+/// Because the version is read from this row and enforced against the
+/// stream, a row that falls behind its stream refuses every later
+/// mutation. [`fold_scan_policy`](super::scan_policy_fold::fold_scan_policy)
+/// is what the refused mutation re-derives this value from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScanPolicyProjection {
     pub policy_id: Uuid,
