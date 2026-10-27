@@ -609,8 +609,12 @@ Images are built and published **only on `v*` release tags** (and manual
   internal pre-release (see *Releases* below and
   [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md)) is
   build/published only to the internal registry via the GitLab pipeline,
-  never to ghcr. `-beta`/`-rc` are unaffected (reserved for a possible
-  future public pre-release track, not currently used).
+  never to ghcr. **`-beta` tags are not excluded and do publish**: the
+  guard is `!contains(github.ref, '-alpha.')`, so a beta builds ghcr images
+  at `:X.Y.Z-beta.N` and `release.yml` cuts a GitHub Release auto-marked
+  pre-release (`prerelease: contains(version, '-')`). `:latest` still does
+  not move — a separate `!contains(github.ref, '-')` guard holds it back.
+  `-rc` is unused naming today and would behave exactly like `-beta`.
 
 ### Releases
 
@@ -634,9 +638,11 @@ step-by-step. In short:
   `develop`'s line, so `git describe` from `develop` won't find them — fine
   for internal builds. Alpha artifacts (images + Helm chart) build and
   publish to the **internal registry only** — see *Docker image tags* above
-  and [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) D4;
-  `beta`/`rc` naming stays reserved for a possible future *public*
-  pre-release track (not in use today).
+  and [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) D4.
+  **A `beta` is the public pre-release track and is in routine use** — it
+  is pushed to `github-public` as well, which publishes ghcr images and a
+  pre-release GitHub Release; `RELEASING.md` carries the exact two-command
+  sequence. `rc` naming is unused today and would follow the same shape.
 - **Staging deploys from published artifacts only**: `test/*` alpha tags and
   `main` — never from bare `develop` merges, since `develop` publishes no
   image or chart. It is not gated on a `main` cut, but it is gated on the
