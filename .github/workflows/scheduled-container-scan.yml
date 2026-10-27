@@ -111,21 +111,26 @@ jobs:
             console.log(`Total findings: ${totalFindings}`);
             console.log(summaries.join('\n'));
 
+            // The scanner's tracker issue, listed once because both branches
+            // below need it: one to avoid opening a duplicate, the other to
+            // retire it. `listForRepo` returns pull requests as issues too,
+            // so they are filtered out — the close path must never touch one.
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'security',
+              per_page: 100
+            });
+
+            const tracked = existing.data.filter(i =>
+              !i.pull_request && i.title.includes('Container scan findings')
+            );
+
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
             if (totalFindings > 0) {
-              // Check if there's already an open issue for container findings
-              const existing = await github.rest.issues.listForRepo({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                state: 'open',
-                labels: 'security',
-                per_page: 100
-              });
-
-              const hasExisting = existing.data.some(i =>
-                i.title.includes('Container scan findings')
-              );
-
-              if (!hasExisting) {
+              if (tracked.length === 0) {
                 await github.rest.issues.create({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -137,11 +142,38 @@ jobs:
                     '',
                     ...summaries,
                     '',
-                    `[View scan run](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+                    `[View scan run](${runUrl})`,
                     '',
                     'SARIF reports have been uploaded to the Security tab and as workflow artifacts.',
                   ].join('\n'),
                   labels: ['security']
+                });
+              }
+            } else {
+              // Zero findings retires the tracker, and this close is
+              // load-bearing rather than tidiness: the duplicate check above
+              // keys on an OPEN tracker, so one left behind suppresses every
+              // later notification. The scan keeps running green and writing
+              // its summary while being structurally unable to report.
+              for (const issue of tracked) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: [
+                    'Cleared: this scan found **0** CRITICAL/HIGH finding(s) with available fixes.',
+                    '',
+                    ...summaries,
+                    '',
+                    `[View scan run](${runUrl})`,
+                  ].join('\n')
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                  state_reason: 'completed'
                 });
               }
             }
