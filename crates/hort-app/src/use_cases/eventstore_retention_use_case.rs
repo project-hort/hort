@@ -92,6 +92,21 @@
 //! `purge_use_case.rs` per-artifact handling). A `list_*` enumeration
 //! error aborts the whole sweep (`Err`) — distinct from per-stream
 //! continuation.
+//!
+//! # The seals this sweep made still have to be anchored
+//!
+//! A `StreamSealed` tombstone is only tamper-evident once a checkpoint
+//! that post-dates it anchors its head; until then the offline verifier
+//! records `AnchorBreak::SealUnanchored`
+//! (`hort_domain::events::chain`). Anchoring is **not** this use case's
+//! job: it is one emission for the whole pass, not one per stream, and
+//! it has to happen after the seals are committed (the adapter's
+//! `seal_and_remove` appends the tombstone and deletes the rows in one
+//! transaction per ADR 0020, so there is no instant in between that an
+//! independent reader could observe). This pass therefore reports
+//! **which** streams it sealed in
+//! [`RetentionArchiveSummary::sealed_stream_ids`] and leaves the single
+//! post-pass emission to its caller, `EventStoreArchiveHandler`.
 
 use std::sync::Arc;
 
@@ -313,6 +328,22 @@ pub struct RetentionArchiveSummary {
     /// Per-stream failures (terminal-proof read / seal chokepoint). The
     /// stream is NOT sealed; the next sweep retries it (fail-safe).
     pub errors: u64,
+    /// The stream ids this pass actually sealed, in sweep order — one
+    /// entry per chokepoint call that answered
+    /// [`SealOutcome::Sealed`], so `len()` always equals
+    /// `archived + deleted`.
+    ///
+    /// Ids rather than only a count because the caller has to be able
+    /// to **name** them. A `StreamSealed` tombstone is only
+    /// tamper-evident once a checkpoint that post-dates it anchors its
+    /// head; until then the offline verifier records
+    /// `AnchorBreak::SealUnanchored`
+    /// (`hort_domain::events::chain`). The caller anchors this pass's
+    /// seals once the pass is done
+    /// (`EventStoreArchiveHandler`), and when that anchoring fails the
+    /// operator needs to know *which* streams are sealed-but-unanchored,
+    /// not just how many.
+    pub sealed_stream_ids: Vec<String>,
 }
 
 /// The audit-retention stream sweep. Pure orchestration
@@ -612,6 +643,7 @@ impl EventStoreRetentionUseCase {
                 match self.events.delete_stream(stream_id, authority).await {
                     Ok(SealOutcome::Sealed) => {
                         summary.deleted += 1;
+                        summary.sealed_stream_ids.push(candidate.stream_id.clone());
                         emit_streams_archived(StreamsArchivedResult::Deleted);
                         tracing::info!(
                             stream_id = %candidate.stream_id,
@@ -655,6 +687,7 @@ impl EventStoreRetentionUseCase {
                 {
                     Ok(SealOutcome::Sealed) => {
                         summary.archived += 1;
+                        summary.sealed_stream_ids.push(candidate.stream_id.clone());
                         emit_streams_archived(StreamsArchivedResult::Archived);
                         tracing::info!(
                             stream_id = %candidate.stream_id,

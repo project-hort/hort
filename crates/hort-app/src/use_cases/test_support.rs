@@ -2385,6 +2385,14 @@ pub struct MockEventStore {
     /// (issue #87: `ExpectedVersion::Any` appends need no
     /// client-side expected-version read at all).
     read_stream_calls: AtomicUsize,
+    /// `(stream_id, authority.final_stream_position)` per
+    /// `delete_stream` call, in call order. The position is recorded
+    /// and not just the id so a test can pin *which* proof authorized
+    /// the seal.
+    deleted_streams: Mutex<Vec<(String, u64)>>,
+    /// `(stream_id, target, authority.final_stream_position)` per
+    /// `archive_stream` call, in call order.
+    archived_streams: Mutex<Vec<(String, String, u64)>>,
 }
 
 impl MockEventStore {
@@ -2400,6 +2408,8 @@ impl MockEventStore {
             fail_next_read_stream: Mutex::new(None),
             fail_read_stream_at: Mutex::new(None),
             read_stream_calls: AtomicUsize::new(0),
+            deleted_streams: Mutex::new(Vec::new()),
+            archived_streams: Mutex::new(Vec::new()),
         }
     }
 
@@ -2512,6 +2522,23 @@ impl MockEventStore {
             .lock()
             .unwrap()
             .push(trigger_after_global_position);
+    }
+
+    /// `(stream_id, seal authority position)` per `delete_stream` call,
+    /// in call order.
+    ///
+    /// Reading this from inside a collaborator — e.g. a
+    /// `CheckpointEmissionHook` double — is how a test pins
+    /// *ordering* rather than just counts: a hook that observes one
+    /// recorded delete was called after the seal committed, not before.
+    pub fn deleted_streams(&self) -> Vec<(String, u64)> {
+        self.deleted_streams.lock().unwrap().clone()
+    }
+
+    /// `(stream_id, target, seal authority position)` per
+    /// `archive_stream` call, in call order.
+    pub fn archived_streams(&self) -> Vec<(String, String, u64)> {
+        self.archived_streams.lock().unwrap().clone()
     }
 }
 
@@ -2673,24 +2700,43 @@ impl EventStore for MockEventStore {
         Box::pin(async move { Ok(truncated) })
     }
 
-    // Retention stubs: this is the workhorse mock for hort-app tests. No
-    // current test reaches the retention paths, so a panic flags
-    // accidental misuse rather than silently masking a coverage hole.
+    // Retention chokepoints: record the call and answer `Sealed`. The
+    // `eventstore-archive` handler tests reach these — a sweep has to
+    // actually seal a stream for the post-sweep checkpoint emission to
+    // have anything to anchor — and read them back through
+    // [`Self::deleted_streams`] / [`Self::archived_streams`].
+    //
+    // Deliberately no failure or `NotAtProvenVersion` injection here:
+    // the tests that pin *which* chokepoint fired with which target,
+    // and the fail-safe and stream-moved answers, drive the use case
+    // directly through the file-local mock in
+    // `eventstore_retention_use_case_tests.rs`, which already carries
+    // that injection surface. Adding a second copy here would let the
+    // two drift.
     fn delete_stream(
         &self,
-        _stream_id: StreamId,
-        _authority: SealAuthority,
+        stream_id: StreamId,
+        authority: SealAuthority,
     ) -> BoxFut<'_, DomainResult<SealOutcome>> {
-        Box::pin(async { unimplemented!("retention path not exercised by these tests") })
+        self.deleted_streams
+            .lock()
+            .unwrap()
+            .push((stream_id.to_string(), authority.final_stream_position));
+        Box::pin(async { Ok(SealOutcome::Sealed) })
     }
 
     fn archive_stream(
         &self,
-        _stream_id: StreamId,
-        _target: &str,
-        _authority: SealAuthority,
+        stream_id: StreamId,
+        target: &str,
+        authority: SealAuthority,
     ) -> BoxFut<'_, DomainResult<SealOutcome>> {
-        Box::pin(async { unimplemented!("retention path not exercised by these tests") })
+        self.archived_streams.lock().unwrap().push((
+            stream_id.to_string(),
+            target.to_owned(),
+            authority.final_stream_position,
+        ));
+        Box::pin(async { Ok(SealOutcome::Sealed) })
     }
 }
 
