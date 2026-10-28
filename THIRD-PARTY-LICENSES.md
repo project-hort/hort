@@ -478,7 +478,7 @@ the result instead.
 | spin | 0.10.1 | MIT | https://github.com/mvdnes/spin-rs.git |
 | spin | 0.9.9 | MIT | https://github.com/mvdnes/spin-rs.git |
 | tracing-core | 0.1.36 | MIT | https://github.com/tokio-rs/tracing |
-| zip | 9.1.2 | MIT | https://github.com/zip-rs/zip2 |
+| zip | 9.1.3 | MIT | https://github.com/zip-rs/zip2 |
 | typenum | 1.20.0 | MIT | https://github.com/paholg/typenum |
 | endian-type | 0.1.2 | MIT | https://github.com/Lolirofle/endian-type.git |
 | base64 | 0.21.7 | MIT | https://github.com/marshallpierce/rust-base64 |
@@ -17858,7 +17858,7 @@ SOFTWARE.
 
 ```
 
-### zip 9.1.2 — MIT
+### zip 9.1.3 — MIT
 
 Repository: https://github.com/zip-rs/zip2
 
