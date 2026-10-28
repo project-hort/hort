@@ -4174,16 +4174,34 @@ with the per-kind reason.
   that attempt (`hort_app::retry_backoff::compute_backoff` — 1, 5, 30,
   then 60 minutes, the scan pipeline's own schedule). A five-attempt
   budget therefore spans **96 minutes** from the first failure to the
-  terminal row.
+  terminal row. A **destructive** row whose requester's authority could
+  not be *read* at execution time also lands here with no handler run at
+  all (see below).
 - `result="failed_terminal"` — `mark_failed` was called, so the row is
-  a terminal `failed` row carrying its last error. Two triggers reach
-  it: the handler returned `TaskOutcome::Failed { retry: false }`, or
-  it asked to be retried on a row whose `attempts` had reached the
+  a terminal `failed` row carrying its last error. Three triggers reach
+  it: the handler returned `TaskOutcome::Failed { retry: false }`; it
+  asked to be retried on a row whose `attempts` had reached the
   dispatcher's attempt cap (`JOB_ATTEMPT_CAP`, 5 — the same number the
-  abandoned-lease sweep spends). The label reports what the dispatcher
-  did to the row, not what the handler asked for: a job that keeps
-  failing the same way counts `failed_retry` four times and
-  `failed_terminal` once, then stops being claimed.
+  abandoned-lease sweep spends); or the row is a **destructive**
+  invocation whose requester's authority no longer holds, which the
+  dispatcher refuses before calling the handler (below). The label
+  reports what the dispatcher did to the row, not what the handler asked
+  for: a job that keeps failing the same way counts `failed_retry` four
+  times and `failed_terminal` once, then stops being claimed.
+
+**Destructive-task execution-time authority.** Before invoking a
+handler, the dispatcher re-checks the requester named by `jobs.actor_id`
+for the invocations that destroy something (`retention-purge`,
+`eventstore-archive`, `retention-evaluate` in execute mode). The refusal
+and the could-not-read cases are counted on the two labels above rather
+than on a metric of their own, and are told apart by the `last_error`
+text on the row: `destructive task refused at execution: …`
+(`failed_terminal`, never retried) versus `destructive task authority
+could not be re-checked: …` (`failed_retry` while budget remains). In
+both cases `TaskHandler::run` is never entered, so the row contributes
+**no** `hort_admin_tasks_duration_seconds` sample and never moves
+`hort_admin_tasks_in_flight` — those two describe handler execution, and
+there was none. Non-destructive kinds are unaffected.
 
 Note: for `kind="scan"`, `ScanTaskHandler::run` also calls
 `ScanOrchestrationUseCase::record_outcome` internally, which emits the

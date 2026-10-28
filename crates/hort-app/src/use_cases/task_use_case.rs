@@ -148,6 +148,16 @@ impl TaskUseCase {
     /// param-validate / idempotency lookup) **and** internally by
     /// [`Self::enqueue`] (defense-in-depth — a direct use-case caller is
     /// still gated).
+    ///
+    /// **This gate decides acceptance, not execution.** A destructive
+    /// invocation it admits becomes a queued `jobs` row, and the worker
+    /// re-checks the requester named on that row against the live
+    /// authority state before calling the handler
+    /// ([`crate::destructive_task_reauthorization`]) — so authority
+    /// revoked while the row waited stops it. The two are deliberately
+    /// separate decisions over the same two factors: this one has a
+    /// caller to answer with a 403, the other has only the row and the
+    /// log.
     #[tracing::instrument(skip(self))]
     pub fn authorize_kind(
         &self,

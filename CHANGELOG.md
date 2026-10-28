@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A queued destructive admin task re-checks its requester's authority before
+  it runs** and fails, naming the cause, if it no longer holds — so revoking an
+  identity also stops the destructive work it already queued. Destructive tasks
+  now require an `admin` user: a non-admin holding a `task:destructive` claim
+  mapping can still submit one, but it is refused at execution (#367).
 - The event-store retention sweep now anchors the seals it makes, so
   `verify-event-chain` no longer reports them unanchored until the next
   scheduled checkpoint. A sweep whose anchoring fails reports a failed job

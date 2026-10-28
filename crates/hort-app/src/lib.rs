@@ -35,6 +35,11 @@ pub mod cli_session_signing;
 // near-real-time cache invalidation. See
 // `docs/architecture/explanation/event-notifications.md`.
 pub mod dispatcher;
+// Execution-time re-authorization of a destructive admin task. The
+// enqueue gate decides whether a request may be *accepted*; this decides
+// whether the accepted row may still *run*, because authority revoked
+// while a row waited in the queue must stop it.
+pub mod destructive_task_reauthorization;
 pub mod ephemeral_keyspace;
 pub mod error;
 // The one shared predicate deciding whether an event-chain checkpoint

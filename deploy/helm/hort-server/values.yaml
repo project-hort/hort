@@ -1890,10 +1890,12 @@ scheduledTasks:
   #
   # DESTRUCTIVE_TASK_KINDS caveat: this task needs a fresh IdP-backed admin
   # session (the `task:destructive` claim) — the bootstrap `cronjob-tasks`
-  # svc-token is claimless and cannot run it. Run by hand with
-  # `hort-cli admin task invoke retention-evaluate`, or see the CronJob
-  # template's docstring for the opt-in override. Leaving `enabled: false`
-  # (default) is safe.
+  # svc-token is claimless and cannot run it, and no token can be made to
+  # carry the claim. Run by hand with
+  # `hort-cli admin task invoke retention-evaluate`. The admin's authority is
+  # re-checked again when the worker runs the job, so revoking it stops
+  # jobs already queued; see the CronJob template's docstring. Leaving
+  # `enabled: false` (default) is safe.
   retentionEvaluate:
     executionPath: admin-task
     enabled: false
@@ -1906,10 +1908,12 @@ scheduledTasks:
   #
   # DESTRUCTIVE_TASK_KINDS caveat: this task needs a fresh IdP-backed admin
   # session (the `task:destructive` claim) — the bootstrap `cronjob-tasks`
-  # svc-token is claimless and cannot run it. Run by hand with
-  # `hort-cli admin task invoke retention-purge`, or see the CronJob
-  # template's docstring for the opt-in override. Leaving `enabled: false`
-  # (default) is safe.
+  # svc-token is claimless and cannot run it, and no token can be made to
+  # carry the claim. Run by hand with
+  # `hort-cli admin task invoke retention-purge`. The admin's authority is
+  # re-checked again when the worker runs the job, so revoking it stops
+  # jobs already queued; see the CronJob template's docstring. Leaving
+  # `enabled: false` (default) is safe.
   retentionPurge:
     executionPath: admin-task
     enabled: false
@@ -1920,10 +1924,12 @@ scheduledTasks:
   #
   # DESTRUCTIVE_TASK_KINDS caveat: this task needs a fresh IdP-backed admin
   # session (the `task:destructive` claim) — the bootstrap `cronjob-tasks`
-  # svc-token is claimless and cannot run it. Run by hand with
-  # `hort-cli admin task invoke eventstore-archive`, or see the CronJob
-  # template's docstring for the opt-in override. Leaving `enabled: false`
-  # (default) is safe.
+  # svc-token is claimless and cannot run it, and no token can be made to
+  # carry the claim. Run by hand with
+  # `hort-cli admin task invoke eventstore-archive`. The admin's authority is
+  # re-checked again when the worker runs the job, so revoking it stops
+  # jobs already queued; see the CronJob template's docstring. Leaving
+  # `enabled: false` (default) is safe.
   eventstoreArchive:
     executionPath: admin-task
     enabled: false

@@ -70,6 +70,7 @@ use hort_adapters_scanner_trivy::{TrivyAdapter, TrivyConfig};
 use hort_adapters_storage::builders::{build_s3_object_store, build_s3_storage, S3StorageOpts};
 use hort_adapters_storage::filesystem_stateful_upload_staging::FilesystemStatefulUploadStaging;
 use hort_adapters_storage::FilesystemStorage;
+use hort_app::destructive_task_reauthorization::DestructiveTaskReauthorizer;
 // The ONE shared event-chain anchoring predicate. The worker (writer)
 // and `hort-server verify-event-chain` (reader) both derive their gate
 // from it, so the two sides cannot disagree about whether this
@@ -650,9 +651,23 @@ pub async fn build_app_context(
     // parallelism within a single worker instance is controlled by the
     // number of replicas, not by intra-process concurrency.
     // -----------------------------------------------------------------
+    // Execution-time authority for the destructive kinds. The two
+    // reads are the worker's live RBAC view: the composition-root
+    // `RbacEvaluator` this crate builds elsewhere is deliberately empty,
+    // so a destructive invocation's requester is re-checked against a
+    // per-call evaluator built from the grant table — the same shape
+    // `ServiceAccountRotationHandler` uses for its per-tick cap
+    // derivation. Required by the constructor so no worker can dispatch
+    // destructive work without it.
+    let reauthorizer = Arc::new(DestructiveTaskReauthorizer::new(
+        Arc::new(PgUserRepository::new(pool.clone())) as Arc<dyn UserRepository>,
+        Arc::new(PgPermissionGrantRepository::new(pool.clone()))
+            as Arc<dyn PermissionGrantRepository>,
+    ));
     let mut dispatcher = TaskDispatcher::new(
         jobs.clone(),
         event_publisher.clone(),
+        reauthorizer,
         cfg.worker_id.clone(),
         cfg.lock_duration,
         cfg.poll_interval.as_secs(),
