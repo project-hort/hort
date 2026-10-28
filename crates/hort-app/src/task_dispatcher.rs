@@ -10,6 +10,17 @@
 //! registration time. Graceful shutdown is driven by a
 //! [`tokio_util::sync::CancellationToken`].
 //!
+//! # Execution-time authority
+//!
+//! Before any handler is invoked, a claimed row goes through
+//! [`DestructiveTaskReauthorizer`], which re-checks the authority of the
+//! requester named by `jobs.actor_id` — but only for the invocations
+//! that destroy something. A revoked claim therefore stops a queued
+//! `retention-purge` instead of being spent on it. Ordinary kinds pay
+//! one pure classifier call and no I/O. See
+//! [`crate::destructive_task_reauthorization`] for the decision and why
+//! a refusal is terminal while an unreadable authority store is not.
+//!
 //! # Metrics emitted
 //!
 //! See metrics-catalog.md (`hort_admin_tasks_*`):
@@ -55,6 +66,9 @@ use hort_domain::ports::jobs_repository::{
 };
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 
+use crate::destructive_task_reauthorization::{
+    DestructiveTaskReauthorizer, ReauthorizationVerdict,
+};
 use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::result_write_fence::surface_attempted_result_write;
@@ -266,6 +280,16 @@ pub struct TaskDispatcher {
     /// `ScanTaskHandler::run` via `ScanOrchestrationUseCase::record_outcome`.
     #[allow(dead_code)]
     event_store: Arc<EventStorePublisher>,
+    /// Re-checks a destructive invocation's requester against the live
+    /// authority state before its handler is invoked.
+    ///
+    /// **Not optional, deliberately.** A dispatcher that could be built
+    /// without one would run a `retention-purge` on authority nobody
+    /// re-checked, and the composition root that forgot to wire it would
+    /// look exactly like the one that did. Making it a constructor
+    /// argument turns "a worker executes destructive work unchecked"
+    /// into a compile error instead of a review finding.
+    reauthorizer: Arc<DestructiveTaskReauthorizer>,
     worker_id: String,
     lock_duration: Duration,
     poll_interval_secs: u64,
@@ -280,6 +304,7 @@ impl TaskDispatcher {
     pub fn new(
         job_repo: Arc<dyn JobsRepository>,
         event_store: Arc<EventStorePublisher>,
+        reauthorizer: Arc<DestructiveTaskReauthorizer>,
         worker_id: impl Into<String>,
         lock_duration: Duration,
         poll_interval_secs: u64,
@@ -290,6 +315,7 @@ impl TaskDispatcher {
             semaphores: HashMap::new(),
             job_repo,
             event_store,
+            reauthorizer,
             worker_id: worker_id.into(),
             lock_duration,
             poll_interval_secs,
@@ -339,7 +365,9 @@ impl TaskDispatcher {
     /// 1. Waits for `poll_interval_secs` (or cancellation — whichever first).
     /// 2. Claims up to `batch_size` pending rows across all registered kinds.
     /// 3. Dispatches each row to its handler in a `tokio::spawn` task,
-    ///    gated by the kind's semaphore.
+    ///    gated by the kind's semaphore and — for the destructive
+    ///    invocations only — by a live re-check of the requester's
+    ///    authority (see the module docs).
     /// 4. Each spawned task records the outcome via `record_outcome_for_row`.
     /// 5. Every [`STARVATION_AUDIT_INTERVAL`], runs the starvation audit
     ///    (see [`detect_starvation`]) over the WHOLE eligible-pending
@@ -732,9 +760,82 @@ impl TaskDispatcher {
         LeaseRenewalGuard { handle, lost }
     }
 
+    /// Re-check a destructive invocation's requester against the live
+    /// authority state, and return the outcome to record when the
+    /// handler must not run.
+    ///
+    /// `None` means proceed — which is every non-destructive row, at the
+    /// cost of one pure classifier call and no I/O.
+    ///
+    /// The two refusing verdicts are deliberately not the same outcome.
+    /// A [`ReauthorizationVerdict::Refused`] is an authority answer, so
+    /// it is `retry: false`: a revoked claim does not become valid by
+    /// being tried again, and re-driving the row would spend four more
+    /// attempts restating the same refusal before the budget made it
+    /// terminal anyway. A [`ReauthorizationVerdict::Unavailable`] is the
+    /// *absence* of an answer, so it keeps the row's budget — the next
+    /// claim re-asks, and a database that never recovers still ends as
+    /// a terminal row once the budget is spent.
+    async fn refuse_unauthorized_execution(
+        &self,
+        job: &JobRow,
+        kind: &str,
+        params: &serde_json::Value,
+    ) -> Option<TaskOutcome> {
+        match self.reauthorizer.authorize_execution(job, params).await {
+            ReauthorizationVerdict::Authorized => None,
+            ReauthorizationVerdict::Refused { reason } => {
+                // `error!`, not `info!`: unlike the enqueue-time denial
+                // — where the caller is on the other end of a 403 and
+                // learns immediately — nobody is waiting on this one.
+                // The terminal row and this line are the only places it
+                // surfaces.
+                tracing::error!(
+                    job_id = %job.id,
+                    kind,
+                    actor_id = ?job.actor_id,
+                    reason = %reason,
+                    "TaskDispatcher: refusing to execute a destructive task — the authority its \
+                     requester held at enqueue does not hold now; the handler was not called and \
+                     the row is failed terminally",
+                );
+                Some(TaskOutcome::fail(reason, false))
+            }
+            ReauthorizationVerdict::Unavailable { reason } => {
+                tracing::warn!(
+                    job_id = %job.id,
+                    kind,
+                    actor_id = ?job.actor_id,
+                    reason = %reason,
+                    "TaskDispatcher: could not re-check a destructive task's requester — the \
+                     handler was not called; the row keeps its attempt budget and the next claim \
+                     re-asks",
+                );
+                Some(TaskOutcome::fail(reason, true))
+            }
+        }
+    }
+
     /// Invoke the handler for a single job row and record the outcome.
     async fn dispatch_one(self: &Arc<Self>, job: JobRow, handler: Arc<dyn TaskHandler>) {
         let kind = handler.kind();
+
+        let params = job.params.clone().unwrap_or(serde_json::Value::Null);
+
+        // Authority must still hold when the job executes; acceptance
+        // does not confer it. This runs before the in-flight gauge, the
+        // duration timer and the lease renewal because none of them
+        // describe a refusal: a row whose handler was never called did
+        // not take time in that handler, and counting it would put a
+        // two-read authority check into the kind's execution-latency
+        // distribution.
+        if let Some(outcome) = self
+            .refuse_unauthorized_execution(&job, kind, &params)
+            .await
+        {
+            self.record_outcome_for_row(&job, kind, outcome).await;
+            return;
+        }
 
         // Build a TaskContext from the job row.
         let ctx = TaskContext {
@@ -743,8 +844,6 @@ impl TaskDispatcher {
             correlation_id: Uuid::new_v4(),
             job_row: job.clone(),
         };
-
-        let params = job.params.clone().unwrap_or(serde_json::Value::Null);
 
         // Emit in-flight gauge +1.
         metrics::gauge!(METRIC_IN_FLIGHT, "kind" => kind.to_string()).increment(1.0);
@@ -1050,11 +1149,64 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
-    use crate::use_cases::test_support::ResultWriteLog;
+    use crate::destructive_task_reauthorization::{REFUSAL_PREFIX, UNAVAILABLE_PREFIX};
+    use crate::use_cases::test_support::{
+        MockPermissionGrantRepository, MockUserRepository, ResultWriteLog,
+    };
 
     // -----------------------------------------------------------------------
     // Test helpers
     // -----------------------------------------------------------------------
+
+    /// The requester every fixture row names.
+    ///
+    /// Fixed rather than random so [`make_dispatcher`] can seed the
+    /// matching user: a destructive-kind row has to reach its handler in
+    /// the tests that are about the handler, and it only does that if
+    /// its requester still holds the authority.
+    const FIXTURE_REQUESTER: Uuid = Uuid::from_u128(0x3671);
+
+    /// A still-authorized requester for [`FIXTURE_REQUESTER`].
+    ///
+    /// Admin, because `users.is_admin` is the only destructive authority
+    /// the registry persists — see
+    /// [`crate::destructive_task_reauthorization`].
+    fn fixture_admin() -> hort_domain::entities::user::User {
+        hort_domain::entities::user::User {
+            id: FIXTURE_REQUESTER,
+            username: "fixture-admin".into(),
+            email: "fixture-admin@example.test".into(),
+            auth_provider: hort_domain::entities::user::AuthProvider::Oidc,
+            external_id: Some("oidc:fixture-admin".into()),
+            display_name: None,
+            is_active: true,
+            is_admin: true,
+            is_service_account: false,
+            last_login_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// A reauthorizer that authorizes [`FIXTURE_REQUESTER`] — the
+    /// default for every test that is not about the re-check itself.
+    fn authorizing_reauthorizer() -> Arc<DestructiveTaskReauthorizer> {
+        let users = Arc::new(MockUserRepository::new());
+        users.insert(fixture_admin());
+        Arc::new(DestructiveTaskReauthorizer::new(
+            users,
+            Arc::new(MockPermissionGrantRepository::new()),
+        ))
+    }
+
+    /// A reauthorizer that knows no users, so a destructive row's
+    /// requester does not resolve and the invocation is refused.
+    fn refusing_reauthorizer() -> Arc<DestructiveTaskReauthorizer> {
+        Arc::new(DestructiveTaskReauthorizer::new(
+            Arc::new(MockUserRepository::new()),
+            Arc::new(MockPermissionGrantRepository::new()),
+        ))
+    }
 
     fn make_job_row(kind: &str) -> JobRow {
         use hort_domain::ports::jobs_repository::KindFields;
@@ -1064,7 +1216,7 @@ mod tests {
             kind: kind.to_string(),
             status: JobStatus::Running,
             params: Some(serde_json::json!({})),
-            actor_id: None,
+            actor_id: Some(FIXTURE_REQUESTER),
             priority: 0,
             trigger_source: "test".to_string(),
             attempts: 1,
@@ -1568,9 +1720,17 @@ mod tests {
     }
 
     fn make_dispatcher(repo: Arc<dyn JobsRepository>) -> TaskDispatcher {
+        make_dispatcher_with(repo, authorizing_reauthorizer())
+    }
+
+    fn make_dispatcher_with(
+        repo: Arc<dyn JobsRepository>,
+        reauthorizer: Arc<DestructiveTaskReauthorizer>,
+    ) -> TaskDispatcher {
         TaskDispatcher::new(
             repo,
             crate::event_store_publisher::wrap_for_test(Arc::new(NoopEventStore)),
+            reauthorizer,
             "test-worker",
             Duration::from_secs(60),
             999_999, // very long poll interval — we drive ticks manually via seeded batches
@@ -1969,6 +2129,15 @@ mod tests {
         attempts: u32,
         handler: Arc<dyn TaskHandler>,
     ) -> (Arc<DispatcherMockRepo>, Uuid, OutcomeCounters) {
+        dispatch_one_row_with(kind, attempts, handler, authorizing_reauthorizer())
+    }
+
+    fn dispatch_one_row_with(
+        kind: &'static str,
+        attempts: u32,
+        handler: Arc<dyn TaskHandler>,
+        reauthorizer: Arc<DestructiveTaskReauthorizer>,
+    ) -> (Arc<DispatcherMockRepo>, Uuid, OutcomeCounters) {
         assert_eq!(
             handler.kind(),
             kind,
@@ -1982,7 +2151,10 @@ mod tests {
         let mut row = make_job_row(kind);
         row.attempts = attempts;
         let row_id = row.id;
-        let dispatcher = Arc::new(make_dispatcher(repo.clone() as Arc<dyn JobsRepository>));
+        let dispatcher = Arc::new(make_dispatcher_with(
+            repo.clone() as Arc<dyn JobsRepository>,
+            reauthorizer,
+        ));
 
         metrics::with_local_recorder(&recorder, || {
             tokio::runtime::Builder::new_current_thread()
@@ -2240,6 +2412,190 @@ mod tests {
             "a destructive row at the cap must not be handed back to the queue"
         );
         assert_eq!(counters.failed_terminal, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Execution-time authority
+    // -----------------------------------------------------------------------
+
+    /// A `PermissionGrantRepository` whose snapshot read fails, so the
+    /// re-check reaches no answer at all. Local to this module because
+    /// the shared mock cannot be made to fail, and what it proves here
+    /// is the *dispatcher's* mapping of an absent answer — a different
+    /// fact from the verdict itself.
+    struct UnreadableGrants;
+
+    impl hort_domain::ports::permission_grant_repository::PermissionGrantRepository
+        for UnreadableGrants
+    {
+        fn list_all(
+            &self,
+        ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::entities::rbac::PermissionGrant>>>
+        {
+            Box::pin(async { Err(DomainError::Invariant("database error: unreachable".into())) })
+        }
+        fn list_managed_by_gitops(
+            &self,
+        ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::entities::rbac::PermissionGrant>>>
+        {
+            unreachable!("the re-check reads the full snapshot")
+        }
+    }
+
+    /// The gap this check exists for: the row was accepted, the
+    /// requester's authority then went away, and the handler must never
+    /// be called. Nothing destroyed.
+    #[test]
+    fn a_destructive_row_whose_requester_lost_authority_never_reaches_its_handler() {
+        let kind = "retention-purge";
+        assert!(
+            DESTRUCTIVE_TASK_KINDS.contains(&kind),
+            "this test is only about what it claims while {kind:?} is destructive"
+        );
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        // One attempt spent out of five, so a retry is still available
+        // — nothing but the refusal's own `retry: false` can make this
+        // terminal.
+        let (repo, row_id, counters) = dispatch_one_row_with(
+            kind,
+            1,
+            Arc::new(NoopHandler::new(kind, runs.clone())),
+            refusing_reauthorizer(),
+        );
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "the handler must not run: a destructive handler that is entered has already begun \
+             destroying"
+        );
+        assert!(
+            repo.mark_completed_calls().is_empty(),
+            "nothing completed — the work never started"
+        );
+        assert!(
+            repo.reschedule_calls().is_empty(),
+            "a revoked claim does not become valid by being tried again, so the row must not go \
+             back to the queue even with budget left"
+        );
+        let failed = repo.mark_failed_calls();
+        assert_eq!(failed.len(), 1, "exactly one terminal write: {failed:?}");
+        assert_eq!(failed[0].0, row_id);
+        assert!(
+            failed[0].1.starts_with(REFUSAL_PREFIX),
+            "the durable row must carry a reason naming the cause, not a generic failure: {:?}",
+            failed[0].1
+        );
+        assert_eq!(counters.failed_terminal, 1);
+        assert_eq!(counters.failed_retry, 0);
+    }
+
+    /// The normal case: authority unchanged, so the job runs exactly as
+    /// it did before this check existed.
+    #[test]
+    fn a_destructive_row_whose_requester_still_holds_authority_runs() {
+        let kind = "retention-purge";
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let (repo, row_id, _counters) =
+            dispatch_one_row(kind, 1, Arc::new(NoopHandler::new(kind, runs.clone())));
+
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the handler must still run");
+        assert_eq!(repo.mark_completed_calls(), vec![row_id]);
+        assert!(repo.mark_failed_calls().is_empty());
+    }
+
+    /// A non-destructive kind is untouched by any of this — the same
+    /// reauthorizer that refuses a purge waves a `noop` straight
+    /// through, because the classifier answers before either port is
+    /// consulted.
+    #[test]
+    fn a_non_destructive_row_is_unaffected_by_a_refusing_reauthorizer() {
+        let kind = "noop";
+        assert!(
+            !DESTRUCTIVE_TASK_KINDS.contains(&kind),
+            "this test is only about what it claims while {kind:?} is NOT destructive"
+        );
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let (repo, row_id, _counters) = dispatch_one_row_with(
+            kind,
+            1,
+            Arc::new(NoopHandler::new(kind, runs.clone())),
+            refusing_reauthorizer(),
+        );
+
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(repo.mark_completed_calls(), vec![row_id]);
+        assert!(repo.mark_failed_calls().is_empty());
+    }
+
+    /// An authority store that cannot be read is fail-closed but not a
+    /// verdict: the handler still does not run, and the row keeps its
+    /// budget so the next claim re-asks. The distinction matters — a
+    /// database flap must not permanently kill a destructive job the
+    /// operator is entitled to, and must not run it either.
+    #[test]
+    fn an_unreadable_authority_store_holds_the_row_without_condemning_it() {
+        let kind = "retention-purge";
+        let runs = Arc::new(AtomicUsize::new(0));
+        let users = Arc::new(MockUserRepository::new());
+        users.insert(fixture_admin());
+        let reauthorizer = Arc::new(DestructiveTaskReauthorizer::new(
+            users,
+            Arc::new(UnreadableGrants),
+        ));
+
+        let (repo, row_id, counters) = dispatch_one_row_with(
+            kind,
+            1,
+            Arc::new(NoopHandler::new(kind, runs.clone())),
+            reauthorizer,
+        );
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "an unanswerable authority check must not let the handler run"
+        );
+        let rescheduled = repo.reschedule_calls();
+        assert_eq!(rescheduled.len(), 1, "the row keeps its budget");
+        assert_eq!(rescheduled[0].0, row_id);
+        assert!(
+            rescheduled[0].1.starts_with(UNAVAILABLE_PREFIX),
+            "the two cases are told apart by this prefix on the row, so pin it: {:?}",
+            rescheduled[0].1
+        );
+        assert!(
+            repo.mark_failed_calls().is_empty(),
+            "an absent answer is not a refusal"
+        );
+        assert_eq!(counters.failed_retry, 1);
+        assert_eq!(counters.failed_terminal, 0);
+    }
+
+    /// Every destructive kind goes through the same gate — pinned by
+    /// iterating the closed domain set rather than naming one kind, so a
+    /// fourth member (which `DESTRUCTIVE_TASK_KINDS` forbids, but a
+    /// future reader may still add) cannot land unchecked.
+    #[test]
+    fn every_destructive_kind_is_gated() {
+        for &kind in DESTRUCTIVE_TASK_KINDS {
+            let runs = Arc::new(AtomicUsize::new(0));
+            let (repo, _row_id, _counters) = dispatch_one_row_with(
+                kind,
+                1,
+                Arc::new(NoopHandler::new(kind, runs.clone())),
+                refusing_reauthorizer(),
+            );
+            assert_eq!(
+                runs.load(Ordering::SeqCst),
+                0,
+                "{kind:?} reached its handler with no live authority behind it"
+            );
+            assert_eq!(repo.mark_failed_calls().len(), 1, "{kind} was not refused");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3307,6 +3663,7 @@ mod tests {
         let dispatcher = Arc::new(TaskDispatcher::new(
             repo.clone() as Arc<dyn JobsRepository>,
             crate::event_store_publisher::wrap_for_test(Arc::new(NoopEventStore)),
+            authorizing_reauthorizer(),
             "test-worker",
             Duration::ZERO,
             999_999,
