@@ -2,10 +2,12 @@ apiVersion: v2
 name: hort-server
 description: hort — secure pull-through artifact registry
 type: application
-# Chart version. `hort-server migrate` re-asserts the events-role
-# hardening after every schema apply, so an operator or reconcile loop
-# running a bulk `GRANT … ON ALL TABLES … TO hort_app_role` cannot
-# leave `events` in a state the runtime probe refuses to boot against.
+# Chart version. `hort-server migrate` re-asserts the events-role and
+# migrations-ledger role hardening after every schema apply, so an
+# operator or reconcile loop running a bulk
+# `GRANT … ON ALL TABLES … TO hort_app_role` cannot leave `events` in a
+# state the runtime probe refuses to boot against, nor leave the runtime
+# role able to rewrite `_sqlx_migrations`.
 version: 0.16.1-dev
 # Application (binary) version. Chart and binary are versioned together.
 appVersion: "0.16.1-dev"

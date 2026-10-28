@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The runtime role can no longer write the applied-migration ledger:
+  `hort-server migrate` revokes every write privilege on `_sqlx_migrations`
+  from `hort_app_role` on every run, leaving `SELECT` for the boot gate.
+  Operators who retrofit grants with `GRANT … ON ALL TABLES IN SCHEMA public`
+  must re-run the migrate Job (#366).
 - **A queued destructive admin task re-checks its requester's authority before
   it runs** and fails, naming the cause, if it no longer holds — so revoking an
   identity also stops the destructive work it already queued. Destructive tasks
