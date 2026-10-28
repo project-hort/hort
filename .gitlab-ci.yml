@@ -1701,7 +1701,7 @@ quality:sonar:
 # upload produced — nothing in the pipeline otherwise looks at them. Same
 # rules shape as quality:sonar (MR pipelines skipped; token-gated; tag vs
 # branch split) since it depends on that job's artifact; runs even when
-# quality:sonar itself failed (it is allow_failure: true), which is when a
+# quality:sonar itself failed (which fails the pipeline), which is when a
 # scanner error is most worth explaining.
 quality:sonar-findings:
   stage: quality
