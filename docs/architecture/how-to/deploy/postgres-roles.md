@@ -33,7 +33,7 @@ mechanisms must produce.
 | Role | Provisioned by | Used by | DDL? | DML on `public` tables | `CREATE` on `public`? |
 |---|---|---|---|---|---|
 | `hort_admin` | **operator** (this recipe) | `helm` pre-install/-upgrade migrations Job (`args: ["migrate"]`) | yes — owns `public`; runs `sqlx::migrate!()` | yes (as owner) | yes (as owner) |
-| `hort_app_role` | **operator** (this recipe) | runtime Deployment (`args: ["serve"]`) and the runtime CLI subcommands (`admin issue-svc-token`, `reconcile-groups`) | **no** | yes | **no** — deliberately revoked |
+| `hort_app_role` | **operator** (this recipe) | the runtime Deployment (`args: ["serve"]`), the scanner worker, and **every** CLI subcommand other than `migrate` (`scrub`, `admin issue-svc-token`, `admin bootstrap-session`, `reconcile-groups`, `verify-event-chain`, `seed-import`, the `enqueue-*` CronJobs) | **no** | yes, **except**: `INSERT, SELECT` only on `events`, `SELECT` only on `_sqlx_migrations` — see [the two re-hardening steps](#defense-in-depth-the-chart-re-hardens-events-and-the-ledger-automatically) | **no** — deliberately revoked |
 | `hort_retention_role` | **a migration** (`migrations/004_events.sql`, `CREATE ROLE hort_retention_role NOLOGIN;`) — **not** this recipe; do **not** pre-create it | the sanctioned retention sweep's transaction-scoped `SET LOCAL ROLE` (the worker assumes it for the whole-stream `DELETE FROM events`). `NOLOGIN` — never connected to directly. | n/a | **`SELECT, DELETE` on `events` only** (NO `INSERT`/`UPDATE`/`TRUNCATE`) | **no** |
 
 > **`hort_retention_role` is migration-created — leave it to the migration.**
@@ -88,9 +88,13 @@ runtime never creates roles; only the migrating role does.)
 
 The deferred upshot: the serve binary calls
 `migrate::assert_current` (read-only `SELECT` on `_sqlx_migrations`),
-not `migrate::run`. A runtime role with `INSERT, SELECT, UPDATE,
-DELETE` on the bookkeeping table is enough; **no DDL is ever attempted
-on the runtime DSN**.
+not `migrate::run`. `SELECT` on the bookkeeping table is all the
+runtime needs, and `SELECT` is all it is left with — `hort-server
+migrate` revokes every write privilege on `_sqlx_migrations` from
+`hort_app_role` on every run (see
+["What about `_sqlx_migrations`?"](#what-about-sqlxmigrations)).
+**No DDL is ever attempted on the runtime DSN**, and no write to the
+applied-migration ledger is possible from it.
 
 ---
 
@@ -112,6 +116,17 @@ accidental future `migrate::run` regression on the serve path will
 fail loud at boot rather than silently work in a permissive
 environment and break only when an operator finally provisions a
 properly-scoped role.
+
+That protection is about DDL, and a regression does not need DDL to
+corrupt the schema's own account of itself. A serve-path write that
+only inserted, rewrote or deleted a row in `_sqlx_migrations` would
+have succeeded — the table is created by `hort_admin` and so inherited
+the recipe's `INSERT, UPDATE, DELETE` grant along with its `SELECT`.
+`migrate` therefore takes those three away from `hort_app_role` as
+well, for the same reason: the runtime role is kept **unable**, not
+merely expected not to. `migrate::assert_current`, the expand/contract
+version arithmetic (ADR 0030) and `sqlx`'s own checksum-drift
+detection all decide on what that table says.
 
 ---
 
@@ -193,11 +208,16 @@ no further operator action.
 
 Do **not** add a bulk
 `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO hort_app_role`
-to retrofit a running DB. That bulk grant lands on the append-only
-`events` table and re-grants `UPDATE`/`DELETE`, which breaks the
-audit invariant; `PgEventStore::new`'s startup probe then refuses
-to boot the runtime. If you need to grant on an already-populated DB,
-do it table-by-table and explicitly skip `events`.
+to retrofit a running DB. That bulk grant lands on two tables that must
+not have it: the append-only `events` table, where it re-grants
+`UPDATE`/`DELETE` and breaks the audit invariant (`PgEventStore::new`'s
+startup probe then refuses to boot the runtime), and
+`_sqlx_migrations`, where it re-opens write access to the
+applied-migration ledger. If you need to grant on an already-populated
+DB, do it table-by-table and explicitly skip both. If you have already
+run it, the next migrate Job re-revokes both — but until it does the
+runtime refuses to boot (the `events` probe) and the runtime role can
+rewrite the ledger.
 
 ### What about `_sqlx_migrations`?
 
@@ -206,17 +226,61 @@ run, so it inherits the `ALTER DEFAULT PRIVILEGES` grant
 automatically. No separate `GRANT SELECT ON _sqlx_migrations` is
 needed.
 
-### Defense-in-depth: the chart re-hardens `events` automatically
+**The runtime role ends up with `SELECT` only, and that is deliberate.**
+Because the grant is inherited rather than chosen, the runtime role also
+picks up `INSERT, UPDATE, DELETE` on the ledger — write access to the
+applied-migration history that nothing on the serve path asks for.
+`hort-server migrate` takes it back:
+
+```sql
+-- Re-asserted by the binary on every migrate run. Do not undo it.
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+    ON _sqlx_migrations FROM hort_app_role;
+```
+
+`SELECT` stays — `migrate::assert_current` is the serve and worker boot
+gate against a stale schema and reads the applied version set through
+it.
+
+Why the binary bothers, when the serve path only ever reads the table:
+[ADR 0009](../../../adr/0009-least-privilege-runtime-migrate-subcommand.md)'s
+guarantee is that the runtime role is kept *unable* to change the
+schema, not merely expected not to — that is why the role is
+permanently DDL-less rather than simply pointed at code that issues no
+DDL. A regression that attempted no DDL but wrote the ledger — forged a
+row, rewrote a checksum, deleted a row — would have met no such wall
+and succeeded in silence, and `migrate::assert_current`, the
+expand/contract version arithmetic (ADR 0030) and `sqlx`'s own
+checksum-drift detection all decide on what the ledger says. The
+`REVOKE` makes that regression fail loud, the same way the missing
+`CREATE` makes a stray `migrate::run` fail loud.
+
+This does not touch the migrating role: `hort_admin` **owns**
+`_sqlx_migrations`, and an owner's privileges are implicit and cannot
+be revoked, so `migrate` still records a row per applied migration.
+A single-role dev database is likewise unaffected — the role it
+connects as owns the table.
+
+### Defense-in-depth: the chart re-hardens `events` and the ledger automatically
 
 Even on a correctly-provisioned DB, an operator (or a reconcile
 loop, or an out-of-band fix-up) running a future bulk
 `GRANT … ON ALL TABLES … TO hort_app_role` would silently re-grant
-`UPDATE`/`DELETE` on `events`. The chart's migrate Job runs
+`UPDATE`/`DELETE` on `events` and the write privileges on
+`_sqlx_migrations`. The chart's migrate Job runs
 `hort-server migrate`, which (in addition to applying any pending
-schema migrations) re-asserts
-`REVOKE UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON events
-FROM hort_app_role` idempotently as `hort_admin`. Operators do not need
-to wire this into their own provisioning — the binary owns it.
+schema migrations) re-asserts both of these idempotently as
+`hort_admin`:
+
+```sql
+REVOKE UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON events FROM hort_app_role;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+    ON _sqlx_migrations                            FROM hort_app_role;
+```
+
+Operators do not need to wire either into their own provisioning — the
+binary owns them. Each is re-asserted separately and reports its own
+skip, so a half-provisioned database says which hardening it skipped.
 
 ---
 
@@ -250,11 +314,16 @@ a defect.
 -- Expected after migrate Job: every table shows
 --   `hort_admin=arwdDxt/hort_admin` (owner)
 --   `hort_app_role=arwd/hort_admin`  (DML granted)
+-- with two deliberate exceptions, both re-asserted by `hort-server migrate`:
+--   events            → `hort_app_role=ar/hort_admin`  (append-only)
+--   _sqlx_migrations  → `hort_app_role=r/hort_admin`   (read-only)
 ```
 
 (`a`=INSERT, `r`=SELECT, `w`=UPDATE, `d`=DELETE, `D`=TRUNCATE,
 `x`=REFERENCES, `t`=TRIGGER. The runtime role gets `arwd`; lack of
-`D`/`x`/`t` is intentional.)
+`D`/`x`/`t` is intentional. Anything beyond `ar` on `events`, or beyond
+`r` on `_sqlx_migrations`, means a bulk `GRANT` has re-opened it — run
+the migrate Job again, which re-revokes both.)
 
 **Default privileges (the gotcha):**
 
@@ -289,6 +358,21 @@ on _sqlx_migrations to the runtime role`. Cause: the recipe was run
 objects) didn't reach the bookkeeping table. Fix: run an explicit
 `GRANT SELECT ON _sqlx_migrations TO hort_app_role;` as `hort_admin`
 (or a superuser) — the table now exists, so the grant lands.
+
+**Runtime cannot write `_sqlx_migrations` (the other half of that
+invariant):**
+
+```bash
+psql "postgres://hort_app_role:${HORT_APP_PASSWORD}@<host>:5432/hort" \
+    -c "DELETE FROM _sqlx_migrations WHERE false;"
+# Expected: ERROR: permission denied for table _sqlx_migrations
+```
+
+`WHERE false` matches no row, so the check is non-destructive whichever
+way it goes. If it succeeds, the runtime role can rewrite the
+applied-migration history the boot gate and the expand/contract
+arithmetic read — a bulk `GRANT … ON ALL TABLES` is the usual cause.
+Re-run the migrate Job; it re-revokes the write privileges.
 
 **Runtime cannot create tables (the security property):**
 
@@ -372,7 +456,10 @@ ALTER DEFAULT PRIVILEGES FOR ROLE hort_admin IN SCHEMA public
 ```
 
 The first line fixes the immediate boot; the second prevents the
-same gap from recurring on the next migration.
+same gap from recurring on the next migration. `SELECT` is the whole
+of what the ledger needs — do not widen the first line to
+`SELECT, INSERT, UPDATE, DELETE`; the next migrate run would revoke
+the writes again anyway.
 
 ### 3. `permission denied for table <new_table>` (after a release)
 
@@ -382,17 +469,24 @@ migration. Cause: same as failure mode 2 — `ALTER DEFAULT PRIVILEGES`
 was never set, so the new migration's tables shipped without a
 runtime grant.
 
-Fix: connect as `hort_admin` and run:
+Fix: connect as `hort_admin` and grant on the table the error names,
+then set the default privileges so no future migration repeats it:
 
 ```sql
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public
-    TO hort_app_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON <new_table> TO hort_app_role;
 ALTER DEFAULT PRIVILEGES FOR ROLE hort_admin IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO hort_app_role;
 ```
 
-The first line covers the new table; the second covers all future
-migrations.
+The first line covers the table named in the error; the second covers
+all future migrations. **Name the table — do not reach for
+`ON ALL TABLES IN SCHEMA public`.** The bulk form re-grants
+`UPDATE`/`DELETE` on `events` and write access on `_sqlx_migrations`
+(see ["Run this recipe against a fresh database
+only"](#run-this-recipe-against-a-fresh-database-only)) — the first of
+those leaves the runtime refusing to boot until the next migrate Job
+re-revokes it. If several tables are affected, repeat the first line
+per table.
 
 ---
 

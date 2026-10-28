@@ -11,7 +11,9 @@
 //!
 //! Requires a live PostgreSQL connection (the user must be a superuser:
 //! each test creates a throwaway database to isolate `_sqlx_migrations`
-//! state). Set `DATABASE_URL` to opt in:
+//! state, and the write-less-ledger test additionally mints a throwaway
+//! login role to observe the runtime role's privileges from a
+//! non-superuser vantage point). Set `DATABASE_URL` to opt in:
 //!
 //! ```bash
 //! DATABASE_URL=postgresql://registry:registry@localhost:30432/artifact_registry \
@@ -29,6 +31,7 @@ use std::time::Duration;
 
 use hort_worker::composition::assert_schema_current;
 use serial_test::serial;
+use sqlx::postgres::PgConnectOptions;
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
@@ -340,5 +343,120 @@ async fn fresh_db_bails_with_table_missing() {
         "the worker keeps its own wording: {msg}"
     );
 
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+/// The worker binds with the *same* `hort_app_role` the server does, and
+/// `hort-server migrate` now revokes `INSERT, UPDATE, DELETE` on the
+/// bookkeeping ledger from that role (ADR 0009 — the runtime role is
+/// kept unable to rewrite the applied-migration history, not merely
+/// expected not to). So the worker's boot gate has to be read-only in
+/// fact and not only by inspection: this drives it under a role in
+/// exactly that state and asserts each write is refused.
+///
+/// The role-hardening statement is spelled out here rather than called
+/// across crates: the worker must not depend on `hort-server` (it embeds
+/// its own copy of the migration set for the same reason), and what this
+/// test needs is the privilege *state*, not the function that produces
+/// it.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn boot_gate_runs_without_write_privileges_on_the_ledger() {
+    let Some(admin) = admin_pool().await else {
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("migrations apply cleanly to fresh DB");
+
+    // The canonical operator recipe's runtime grant set, then the
+    // ledger hardening the migrate run re-asserts on top of it. A
+    // privilege inherited from `template1` would answer for
+    // `hort_app_role` here, so `PUBLIC` is stripped from the ledger
+    // first — the recipe's `hort_admin`-owned table never carries one.
+    pool.execute("REVOKE ALL ON _sqlx_migrations FROM PUBLIC")
+        .await
+        .expect("REVOKE ALL on the ledger from PUBLIC");
+    pool.execute(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO hort_app_role",
+    )
+    .await
+    .expect("GRANT the operator recipe's table DML to hort_app_role");
+    pool.execute("REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON _sqlx_migrations FROM hort_app_role")
+        .await
+        .expect("revoke the ledger writes from the runtime role");
+
+    // A throwaway non-superuser member of `hort_app_role` — Postgres
+    // puts superusers outside the privilege system, so the runtime
+    // role's grants are only observable from here. Nothing is granted
+    // to the role directly: membership carries its whole authority, and
+    // a direct grant would also make it undroppable at teardown.
+    let suffix = Uuid::new_v4().simple().to_string();
+    let role = format!("hort_test_worker_role_{suffix}");
+    let password = format!("pw_{suffix}");
+    pool.execute(sqlx::AssertSqlSafe(format!(
+        "CREATE USER \"{role}\" WITH NOSUPERUSER LOGIN PASSWORD '{password}'"
+    )))
+    .await
+    .expect("CREATE USER (runtime-role member)");
+    pool.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT hort_app_role TO \"{role}\""
+    )))
+    .await
+    .expect("GRANT hort_app_role to the throwaway member");
+
+    let base: PgConnectOptions = env::var("DATABASE_URL")
+        .expect("DATABASE_URL is set in this branch")
+        .parse()
+        .expect("DATABASE_URL parses as Postgres connection options");
+    let runtime_pool =
+        PgPool::connect_with(base.username(&role).password(&password).database(&db_name))
+            .await
+            .expect("connect as the throwaway runtime role");
+
+    for (label, statement) in [
+        (
+            "INSERT",
+            "INSERT INTO _sqlx_migrations \
+             (version, description, installed_on, success, checksum, execution_time) \
+             VALUES (-1, 'forged', now(), true, decode('00', 'hex'), 0)",
+        ),
+        (
+            "UPDATE",
+            "UPDATE _sqlx_migrations SET checksum = decode('00', 'hex')",
+        ),
+        ("DELETE", "DELETE FROM _sqlx_migrations"),
+    ] {
+        let err = sqlx::query(statement)
+            .execute(&runtime_pool)
+            .await
+            .expect_err("a write on the ledger must be refused");
+        let code = match &err {
+            sqlx::Error::Database(db) => db.code().map(std::borrow::Cow::into_owned),
+            _ => None,
+        };
+        assert_eq!(
+            code.as_deref(),
+            Some("42501"),
+            "{label} must be refused as insufficient_privilege, got: {err}"
+        );
+    }
+
+    assert_schema_current(&runtime_pool)
+        .await
+        .expect("the worker's boot gate must run read-only");
+
+    runtime_pool.close().await;
+    if let Err(e) = pool
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP USER IF EXISTS \"{role}\""
+        )))
+        .await
+    {
+        eprintln!("warning: failed to drop throwaway role {role}: {e}");
+    }
     drop_temp_db(&admin, &db_name, pool).await;
 }
