@@ -762,6 +762,7 @@ When reviewing a new initiative's design doc + backlog (Planning Mode output):
 When reviewing an implementation (Step 5):
 
 - [ ] All anti-patterns from the checklist above are absent
+- [ ] **A change that destroys state or forecloses a decision names its evidence and its authority.** Classify by whether the *outcome* is recoverable, not by whether the operation can be undone: a revocation, a gitops reconcile delete and a prune of terminal job rows are all restorable and out of scope. Where nothing can restore the state — a stream seal, an artifact purge, a terminal verdict — the review asks two questions the type system cannot: what positive evidence does it act on, and whose explicit, fresh authority does it act under. **A default, a fallback or a swallowed error substituted for missing evidence is not evidence**, and is at its most dangerous when it happens to be the permissive value — the three-rung age ladder whose last rung was `artifact.created_at` read "we have no date" as "the oldest possible date" inside a predicate that deletes. Where both directions look restrictive, recoverability picks the safe one; fail-closed does not. (see ADR 0065)
 - [ ] Domain layer has zero I/O imports
 - [ ] Every new public function has at least one test
 - [ ] **`hort-domain` and `hort-app` have 100% test coverage** — every match arm, error path, and boundary condition. These crates are pure Rust with zero I/O; there is no excuse for untested branches.
