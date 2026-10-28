@@ -49,7 +49,7 @@ Every entry in §3 carries exactly these fields:
 | **Protection** | at rest · in transit · blast-radius bound |
 | **Allowed call paths / surfaces** | which routers/tiers may accept it; public-by-requirement marked |
 | **Enforcement owner** | `Hort-enforced` · `Operator-obligation` · `Shared` |
-| **Status** | `Active` · `Partial` · `Planned` · `Deprecated` (the entry names its replacement) · `Forbidden-in-release` |
+| **Status** | `Active` · `Partial` · `Planned` · `Deprecated` (the entry names its replacement) · `Retired` (catalogued, considered, deliberately **not** built — the entry is kept so the decision and its reasoning stay findable) · `Forbidden-in-release` |
 | **Mandatory guardrails** | enforced rules, each clause-tagged per §6; "ship gate (not yet met)" called out |
 
 **Enforcement owner values.** `Hort-enforced` = code / dep-graph /
@@ -91,7 +91,7 @@ Part II(3) effectiveness into the catalog's done-criteria.
 ### Entry 3 — Native token — CliSession
 
 - **Credential form:** **Hort-signed Ed25519 JWT** (minted and verified in `crates/hort-app/src/cli_session_signing.rs`; session model: ADR 0013). Carries the human's IdP-resolved claim set + `sub` + a CliSession-specific `aud` (`urn:hort:cli-session`) + `token_kind="cli_session"` + `exp` + `iat` + `jti`. `iat` is set at mint (never a caller parameter) and is the comparand the subject-scoped revocation cutoff is evaluated against; it is `Option` on the parse side only so pre-`iat` tokens survive the upgrade, and such a token is denied while a cutoff is active (see *Revocability*). Signed with the SAME Ed25519 key as the OCI `/v2/auth` token (Entry 7) — the two families are separated by `aud` + `token_kind`, never by issuer/signature. **Claims ride in the token, never in a DB column** (the "no `api_tokens.claims`/`users.claims`" hard-block of ADR 0012 is untouched — there is no CliSession `api_tokens` row at all).
-- **Purpose / allowed use:** short-lived interactive CLI session, optionally admin-capable. **The only native-token kind that carries non-admin claims** (ADR 0012's claimless invariant scopes to long-lived static tokens; CliSession is ≤15 min and IdP-backed — ADR 0013); PAT/SA/Refresh stay claimless. This is what lets a `GrantSubject::Claims` grant authorize the discovery endpoint below for a human, where a service-account caller on the same endpoint has to be authorized by a `GrantSubject::User` grant instead.
+- **Purpose / allowed use:** short-lived interactive CLI session, optionally admin-capable. **The only native-token kind that carries non-admin claims** (ADR 0012's claimless invariant scopes to long-lived static tokens; CliSession is ≤15 min and IdP-backed — ADR 0013); PAT and SA principals stay claimless (there is no Refresh kind — Entry 5 was retired, not built). This is what lets a `GrantSubject::Claims` grant authorize the discovery endpoint below for a human, where a service-account caller on the same endpoint has to be authorized by a `GrantSubject::User` grant instead.
 - **Restrictions & caps:** default **15 min (900 s)**; admin-capable bounded by the SAME **≤15 min (900 s)** hard cap (`crates/hort-app/src/use_cases/api_token_use_case.rs` clamp + `cli_session_signing.rs`) — a signed JWT is non-revocable-until-`exp` by construction, so the TTL is the revocation floor. Minted via PKCE-S256 mediated login (RFC 8252 loopback redirect + RFC 7636 S256 — `crates/hort-cli/src/auth/loopback.rs`). Endpoint `GET /api/v1/repositories/{repo_key}/discovery/versions/{package}` accepts CliSession, but is **not** CliSession-exclusive: it admits `TokenKind::ServiceAccount` too (token-kind gate in `crates/hort-app/src/use_cases/discovery_use_case.rs`), as does `POST /api/v1/repositories/{repo_key}/prefetch` — see Entry 4's discovery + prefetch note (issue #80 for the POST, issue #358 for the GET; `docs/ci/hort-quarantine-integration.md` designs one non-admin `ServiceAccount` as the caller of both).
 - **Protection:** at rest — **none persisted** (the JWT is stateless; no row, no hash — claims live in the signed token); in transit — TLS — the auth middleware refuses a CliSession-family JWT over plaintext HTTP with `426 Upgrade Required` under the secure-default `HORT_BEARER_ALLOW_OVER_HTTP=false` (the transport gate covers *any* bearer — PAT-shaped tokens AND CliSession JWTs — hence the bearer-scoped knob name; `crates/hort-http-core/src/middleware/auth.rs`). Setting `HORT_BEARER_ALLOW_OVER_HTTP=true` together with an `https://` `HORT_PUBLIC_BASE_URL` is a **boot hard-fail** (`ConfigError::BearerOverHttpContradictsTls`, INFRA-13): a TLS-terminated deploy that also relaxes the bearer transport guard is self-contradictory and almost certainly a misconfiguration; only a plaintext (`http://...` or unset) public base URL keeps the relaxation as a boot WARN. Blast-radius — ≤15 min cap **+ Hort-side emergency-revocation denylist, per-session and per-subject** (see Revocability below).
 - **Revocability:** **two bounded denylist entries, both operator-reachable, both fail-closed.** A signed JWT is non-revocable-until-`exp` by construction, so emergency revocation is a durable `EphemeralStore` write the validate path consults on every CliSession-JWT request (keyspaces registered in `crates/hort-app/src/ephemeral_keyspace.rs`; both `Durable` — loss re-permits a revoked-but-unexpired session). Either lookup being unreadable is a **denial**, not an admission: a revocation check that cannot be made is not a revocation that does not exist.
@@ -117,16 +117,38 @@ Part II(3) effectiveness into the catalog's done-criteria.
 - **`issue-svc-token` conformance note:** the `hort-server admin issue-svc-token` CLI now conforms to this entry — it rejects `--permission=admin` and requires a **pre-existing** gitops `ServiceAccount` (it no longer fabricates an `is_admin` user when the SA is absent). Service accounts are strictly non-admin (ADR 0038); scoped authority flows through the audited gitops apply path as `serviceAccount`-subject grants (ADR 0037 / ADR 0012). The one admin-identity creation moved to the `bootstrap-session` note below.
 - **Discovery + self-service prefetch note (issues #80, #358):** `POST /api/v1/repositories/{repo_key}/prefetch` and `GET /api/v1/repositories/{repo_key}/discovery/versions/{package}` (Entry 3's amplification surfaces) admit a ServiceAccount bearer — not previously true of either — **iff** its resolved grants include `Permission::Read ∧ Permission::Prefetch` (prefetch) or `Permission::Read` (discovery) on the target repository (Gate 1 + Gate 2 of `crates/hort-app/src/use_cases/self_service_prefetch_use_case.rs` and `discovery_use_case.rs`). This corrects an implementation-drift bug on both: `docs/ci/hort-quarantine-integration.md` designs ONE caller for both halves of the CI job — a read+prefetch-only, non-admin ServiceAccount bearer, its cap ADR-0044-snapshotted at federation exchange (Entry 6), prefetching through the POST and classifying the result through the GET's `DiscoveryVersionStatus` — but each endpoint's token-kind gate rejected every non-CliSession caller regardless of grants, a spec/implementation mismatch (prod evidence: issue #80, `self-service prefetch denied: token kind is not CliSession` on every same-repo CI run). The GET was left behind when #80 corrected the POST, so the triage job was refused *with* the grants the same document prescribes (issue #358). PATs stay rejected on both — widening them is a question about ADR 0013's token-kind hierarchy that has to be answered for both routes at once; no other endpoint's token-kind gate changed.
 
-### Entry 5 — Native token — Refresh
+### Entry 5 — Native token — Refresh — **RETIRED, not built**
 
-- **Credential form:** refresh token (unbuilt — the refresh half of the ADR 0013 session model).
-- **Purpose / allowed use:** renew a `CliSession` access token without re-running mediated login.
-- **Restrictions & caps:** never sent to API endpoints; never persisted to disk; replay detection required.
-- **Protection:** at rest — must never be on disk; in transit — TLS to the refresh endpoint only; blast-radius — replay-detected, single-use.
-- **Allowed call paths / surfaces:** the refresh endpoint only.
-- **Enforcement owner:** `Hort-enforced`.
-- **Status:** `Planned` (unbuilt). Catalogued now so it cannot ship without the three guardrails above.
-- **Mandatory guardrails (ship gate — must hold before Status may become `Active`):** [OWASP A07 · NIS2 21(2)(i),(j) · CRA I(2)(a)] replay detection; never on disk; never sent to API endpoints.
+- **Status:** `Retired` (2026-10-28). This entry described a credential hort
+  decided **not** to issue. It is kept rather than deleted so the decision is
+  findable from the catalogue, and so a future proposal starts from the
+  reasoning instead of re-deriving it. Authorised by the maintainer; recorded
+  in the ADR 0013 amendment of the same date.
+- **Credential form:** would have been a hort-signed refresh token, the second
+  half of the ADR 0013 session model. Never shipped — no endpoint, no token
+  kind, nothing on disk.
+- **Why it is not built.** The usability problem it existed to solve is
+  largely absent: the mediated login's authorize request sends no `prompt`
+  parameter, so where the IdP session is live a repeat login is
+  credential-silent and costs a browser round-trip, not a password. The
+  mechanism a browser-based OIDC client uses for silent renewal leans on the
+  **IdP's own session**, held by the user agent — the relying party issues no
+  second long-lived credential, and that is exactly why it has no
+  reconciliation lag.
+- **What issuing one would have cost.** A rotation re-mints from a claim set
+  frozen at login: claims resolve from IdP groups and `idp_groups` is
+  persisted nowhere, so a withdrawn group membership would have survived the
+  whole refresh window. The 15-minute access cap had been doubling as the
+  IdP-reconciliation interval; refresh would have widened it to the session's
+  absolute deadline. Plus a long-lived credential at rest on the client, and a
+  rotation path on which a cleared `users.is_admin` would not have taken
+  effect until the window expired.
+- **The remaining gap, stated rather than hidden.** A human over SSH with no
+  browser keeps the RFC 8628 device-code flow at each re-login. Accepted. If
+  that cost becomes real, the answer is renewal **re-authorized against the
+  IdP** — claims re-resolved each time, no reconciliation interval — not a
+  registry-held refresh token. Re-proposing one re-opens the ADR 0013
+  amendment.
 
 ### Entry 6 — OIDC federation exchange
 
@@ -391,8 +413,9 @@ convention.
 ## §5 — Consolidation state
 
 The auth-means consolidation this catalog once scoped is **complete**:
-no entry carries a `Deprecated` status, and no catalogued ship gate is
-open except Entry 5's (which gates a `Planned`, unbuilt mechanism). The
+no entry carries a `Deprecated` status, and **no catalogued ship gate is
+open at all** — Entry 5's was the last one, and it closed by the mechanism
+being retired rather than shipped (2026-10-28). The
 formerly-open remediation scope — removing Basic username+password as
 an identity source (Entry 8), unifying the OCI `/v2/auth` verifier and
 its `service=`-vs-`aud` gate (Entry 7), the three federation ship gates
@@ -422,7 +445,7 @@ OOS = out of scope of this catalog):
 |---|---|---|
 | OWASP A01 Broken Access Control | Partial | Entries 2/4/8 cap+grant model ✔; Entry 6 federation ship-gates met (anti-replay, audience binding, empty-claims) ✔; cross-cutting read-authz remains review-enforced, not structural (ADR 0021) |
 | OWASP A02 Cryptographic Failures | Partial | Entry 12 JWKS ✔; Entry 11 `HORT_EXTRA_CA_BUNDLE` IdP-impersonation residual (accepted posture) |
-| OWASP A07 Identification & Auth Failures | Partial | Entries 1–4 ✔; Entry 6 ship-gates met (anti-replay, audience binding, empty-claims) ✔; Entry 5 Planned (not yet implemented) |
+| OWASP A07 Identification & Auth Failures | Partial | Entries 1–4 ✔; Entry 6 ship-gates met (anti-replay, audience binding, empty-claims) ✔; Entry 5 retired, not built (2026-10-28) — no refresh credential exists to protect |
 | NIS2 21(2)(h) Cryptography | Partial | Entries 11/12; CA-bundle impersonation residual (Entry 11) |
 | NIS2 21(2)(i) Access control | Partial | Entries 1–4/9 ✔; Entry 6 federation ship-gates met ✔; cross-cutting read-authz remains review-enforced (ADR 0021) |
 | NIS2 21(2)(j) MFA / secured comms | Operator-obligation | MFA delegated to IdP (Entry 1); Hort must not provide an MFA end-run beyond catalogued PAT rules |
