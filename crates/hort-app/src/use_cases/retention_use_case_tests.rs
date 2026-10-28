@@ -6,8 +6,9 @@
 //! the scan-data freshness gate (fresh / stale / no-row / no-last-scan /
 //! score-read-error / disabled-rescan),
 //! idempotency (already-expired no-op), the `HasFindingDetectedFor`
-//! anchor ladder (ABV → earliest ScanCompleted → created_at cold-data
-//! fallback), the archived-policy skip, the per-pair port-error path,
+//! anchor (advisory publication date → our own first observation → no
+//! anchor and therefore no match), the archived-policy skip, the
+//! per-pair port-error path,
 //! and a `DebuggingRecorder` assertion that
 //! `hort_retention_evaluations_total{result="skipped_stale_scan"}` (and
 //! the matched / no_match / expired counters) fire with the documented
@@ -28,11 +29,11 @@ use hort_domain::events::{
 };
 use hort_domain::ports::event_store::{EventStore, ReadFrom};
 use hort_domain::ports::repo_security_score_repository::RepoSecurityScore;
-use hort_domain::ports::retention_scan_reader::RetentionScanReader;
+use hort_domain::ports::retention_scan_reader::{FirstObservations, RetentionScanReader};
 use hort_domain::ports::BoxFuture;
 use hort_domain::retention::{
-    BooleanOp, ExpirationReason, PolicyPredicate, RetentionEvaluationMode, RetentionPolicy,
-    RetentionPolicyEvent, RetentionScope,
+    BooleanOp, ExpirationReason, FindingAgeAnchorSource, PolicyPredicate, RetentionEvaluationMode,
+    RetentionPolicy, RetentionPolicyEvent, RetentionScope,
 };
 use hort_domain::types::{ComponentRelation, Finding};
 
@@ -54,6 +55,15 @@ struct MockRetentionScanReader {
     findings_err: Mutex<bool>,
     score: Mutex<Option<RepoSecurityScore>>,
     score_err: Mutex<bool>,
+    /// Our own first observation of each vulnerability, as the Postgres
+    /// reader's `MIN(scan_findings.detected_at)` per pair would answer:
+    /// lowercased id → date, and **absent means never observed**.
+    first_observed: Mutex<FirstObservations>,
+    first_observed_err: Mutex<bool>,
+    /// The ids the use case actually asked about, so a test can pin that
+    /// the history-wide read is keyed on the LAST scan's vulnerabilities
+    /// rather than on the artifact alone.
+    first_observed_asked: Mutex<Vec<Vec<String>>>,
 }
 
 impl MockRetentionScanReader {
@@ -75,6 +85,20 @@ impl MockRetentionScanReader {
     fn with_score_err(self) -> Self {
         *self.score_err.lock().unwrap() = true;
         self
+    }
+    fn with_first_observed(self, observed: Vec<(&str, DateTime<Utc>)>) -> Self {
+        *self.first_observed.lock().unwrap() = observed
+            .into_iter()
+            .map(|(id, at)| (id.to_ascii_lowercase(), at))
+            .collect();
+        self
+    }
+    fn with_first_observed_err(self) -> Self {
+        *self.first_observed_err.lock().unwrap() = true;
+        self
+    }
+    fn asked_about(&self) -> Vec<Vec<String>> {
+        self.first_observed_asked.lock().unwrap().clone()
     }
 }
 
@@ -107,6 +131,34 @@ impl RetentionScanReader for MockRetentionScanReader {
             }
         })
     }
+    fn first_observed_at<'a>(
+        &'a self,
+        _artifact_id: Uuid,
+        vulnerability_ids: &'a [String],
+    ) -> BoxFuture<'a, DomainResult<FirstObservations>> {
+        self.first_observed_asked
+            .lock()
+            .unwrap()
+            .push(vulnerability_ids.to_vec());
+        let err = *self.first_observed_err.lock().unwrap();
+        // Mirror the adapter's contract: only the ids asked about come
+        // back, and an id with no row is absent rather than defaulted.
+        let rows: FirstObservations = self
+            .first_observed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| vulnerability_ids.iter().any(|q| q == id))
+            .cloned()
+            .collect();
+        Box::pin(async move {
+            if err {
+                Err(DomainError::Invariant("first-observed read failed".into()))
+            } else {
+                Ok(rows)
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +180,7 @@ fn finding(sev: SeverityThreshold, cvss: Option<f32>, fixed: Vec<&str>) -> Findi
         severity_basis: hort_domain::types::SeverityBasis::Assessed,
         component_relation: ComponentRelation::NotEstablished,
         statement: hort_domain::types::FindingStatement::Unstated,
+        advisory_published_at: None,
     }
 }
 
@@ -1199,57 +1252,42 @@ async fn idempotency_is_scoped_per_policy_id() {
 }
 
 // ===========================================================================
-// HasFindingDetectedFor anchor ladder
+// HasFindingDetectedFor anchor — how long the VULNERABILITY has been known
 // ===========================================================================
 
-#[tokio::test]
-async fn detected_for_uses_artifact_became_vulnerable_anchor_o1() {
-    let repo_id = Uuid::new_v4();
-    let reader = MockRetentionScanReader::new().with_findings(vec![finding(
-        SeverityThreshold::High,
-        Some(7.0),
-        vec![],
-    )]);
-    let (uc, store) = build(reader);
-    let mut c = candidate(QuarantineStatus::Released, ts(990_000));
-    c.artifact.repository_id = repo_id;
-    // ABV says "previously clean at" ts(0) — well past the 7d grace.
-    // The anchor ladder prefers ABV (step 1) over the fresh
-    // ScanCompleted the per-artifact freshness gate requires (step 2),
-    // so the fresh scan satisfies the per-artifact freshness gate without moving the anchor.
-    let abv = DomainEvent::ArtifactBecameVulnerable(ArtifactBecameVulnerable {
-        artifact_id: c.artifact.id,
-        new_findings: vec![finding(SeverityThreshold::High, Some(7.0), vec![])],
-        previously_clean_at: ts(0),
-    });
-    seed_fresh_scanned_stream(&store, &c, ts(1_000_000), vec![abv]);
+const SEVEN_DAYS: u64 = 7 * 24 * 3600;
 
-    let p = policy(
-        PolicyPredicate::HasFindingDetectedFor(7 * 24 * 3600),
-        RetentionScope::AllRepos,
-    );
-    let s = uc
-        .evaluate_policies(ts(1_000_000), &[p], &[c])
-        .await
-        .unwrap();
-    assert_eq!(s.expired, 1, "ABV anchor at ts(0) → > 7d → match");
+/// The [`ExpirationReason`] of the single `ArtifactExpired` the store
+/// received. Panics on anything else, because every caller has already
+/// asserted exactly one expiry.
+fn expired_reason(store: &MockEventStore) -> ExpirationReason {
+    let batches = store.appended_batches();
+    assert_eq!(batches.len(), 1, "expected exactly one append");
+    match &batches[0].events[0].event {
+        DomainEvent::ArtifactExpired(e) => e.reason.clone(),
+        other => panic!("expected ArtifactExpired, got {other:?}"),
+    }
 }
 
+/// The defect, pinned. An artifact scanned cleanly for a long time
+/// acquires a finding yesterday. Nothing published a date for it, so the
+/// anchor is our own first observation — yesterday. The old ladder
+/// anchored on the earliest `ScanCompleted` instead, which dates when we
+/// started looking, so a seven-day grace period was satisfied
+/// immediately and the artifact was deleted on the next pass.
 #[tokio::test]
-async fn detected_for_uses_earliest_scan_completed_when_no_abv() {
-    let repo_id = Uuid::new_v4();
+async fn a_fresh_finding_on_a_long_scanned_artifact_does_not_match() {
+    let now = ts(1_000_000);
     let reader = MockRetentionScanReader::new()
         .with_findings(vec![finding(SeverityThreshold::High, Some(7.0), vec![])])
-        .with_score(score(repo_id, Some(ts(1_000_000) - Duration::hours(1))));
+        .with_first_observed(vec![("cve-1", now - Duration::days(1))]);
     let (uc, store) = build(reader);
     let mut c = candidate(QuarantineStatus::Released, ts(0));
-    c.artifact.repository_id = repo_id;
+    c.artifact.repository_id = Uuid::new_v4();
     let stream_id = StreamId::artifact(c.artifact.id);
-    // Genesis at created_at, then the earliest (only) ScanCompleted
-    // very recent → NOT past the 7d grace. The anchor ladder step 2
-    // still resolves to this ScanCompleted (genesis is
-    // ArtifactIngested, not a scan event).
-    let sc = scan_completed(c.artifact.id);
+    // Scanned since the epoch; the newest scan is fresh enough for the
+    // freshness gate. Under the old ladder the earliest of these is the
+    // anchor and the artifact expires.
     store.set_stream(
         &stream_id,
         vec![
@@ -1259,53 +1297,339 @@ async fn detected_for_uses_earliest_scan_completed_when_no_abv() {
                 c.artifact.created_at,
                 ingested(c.artifact.id, IngestSource::Proxied),
             ),
-            persisted(&stream_id, 1, ts(1_000_000) - Duration::hours(1), sc),
+            persisted(&stream_id, 1, ts(0), scan_completed(c.artifact.id)),
+            persisted(
+                &stream_id,
+                2,
+                now - Duration::hours(1),
+                scan_completed(c.artifact.id),
+            ),
         ],
     );
     let p = policy(
-        PolicyPredicate::HasFindingDetectedFor(7 * 24 * 3600),
+        PolicyPredicate::HasFindingDetectedFor(SEVEN_DAYS),
         RetentionScope::AllRepos,
     );
-    let s = uc
-        .evaluate_policies(ts(1_000_000), &[p], &[c])
-        .await
-        .unwrap();
+    let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
     assert_eq!(
         s.expired, 0,
-        "earliest ScanCompleted 1h ago → within grace → no match"
+        "the vulnerability has been known for a day, not for the age of \
+         the artifact's scan history"
+    );
+    assert!(store.appended_batches().is_empty());
+}
+
+/// An `ArtifactBecameVulnerable` on the stream must not move the anchor
+/// either: `previously_clean_at` dates when WE last saw the artifact
+/// clean, which is a fact about our scanning and not about the
+/// vulnerability. The old ladder preferred it over everything.
+#[tokio::test]
+async fn artifact_became_vulnerable_no_longer_anchors_the_grace_period() {
+    let now = ts(1_000_000);
+    let reader = MockRetentionScanReader::new()
+        .with_findings(vec![finding(SeverityThreshold::High, Some(7.0), vec![])])
+        .with_first_observed(vec![("cve-1", now - Duration::days(1))]);
+    let (uc, store) = build(reader);
+    let mut c = candidate(QuarantineStatus::Released, ts(990_000));
+    c.artifact.repository_id = Uuid::new_v4();
+    let abv = DomainEvent::ArtifactBecameVulnerable(ArtifactBecameVulnerable {
+        artifact_id: c.artifact.id,
+        new_findings: vec![finding(SeverityThreshold::High, Some(7.0), vec![])],
+        previously_clean_at: ts(0),
+    });
+    seed_fresh_scanned_stream(&store, &c, now, vec![abv]);
+    let p = policy(
+        PolicyPredicate::HasFindingDetectedFor(SEVEN_DAYS),
+        RetentionScope::AllRepos,
+    );
+    let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
+    assert_eq!(
+        s.expired, 0,
+        "`previously_clean_at` at the epoch is not a seven-day-old \
+         vulnerability"
     );
 }
 
+/// With a long-standing observation the predicate does fire — the fix is
+/// about anchoring on the right evidence, not about never expiring.
+#[tokio::test]
+async fn a_long_observed_vulnerability_matches() {
+    let now = ts(1_000_000);
+    let reader = MockRetentionScanReader::new()
+        .with_findings(vec![finding(SeverityThreshold::High, Some(7.0), vec![])])
+        .with_first_observed(vec![("cve-1", now - Duration::days(30))]);
+    let (uc, store) = build(reader);
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.artifact.repository_id = Uuid::new_v4();
+    seed_fresh_scanned_stream(&store, &c, now, vec![]);
+    let p = policy(
+        PolicyPredicate::HasFindingDetectedFor(SEVEN_DAYS),
+        RetentionScope::AllRepos,
+    );
+    let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
+    assert_eq!(s.expired, 1, "observed 30 days ago → past the grace period");
+}
+
+/// Rung 3: nothing dated the vulnerability. No anchor ⇒ no match, no
+/// `ArtifactExpired` — the rule `scan_is_fresh` already applies to
+/// unprovable scan freshness, applied to an unprovable age.
+#[tokio::test]
+async fn no_anchor_from_any_source_means_no_match_and_no_event() {
+    let now = ts(1_000_000);
+    let reader = MockRetentionScanReader::new().with_findings(vec![finding(
+        SeverityThreshold::High,
+        Some(7.0),
+        vec![],
+    )]);
+    let (uc, store) = build(reader);
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.artifact.repository_id = Uuid::new_v4();
+    seed_fresh_scanned_stream(&store, &c, now, vec![]);
+    let p = policy(
+        PolicyPredicate::HasFindingDetectedFor(SEVEN_DAYS),
+        RetentionScope::AllRepos,
+    );
+    let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
+    assert_eq!(s.expired, 0);
+    assert_eq!(s.evaluated, 1);
+    assert!(
+        store.appended_batches().is_empty(),
+        "no anchor must append no ArtifactExpired"
+    );
+}
+
+/// The advisory's publication date is the primary anchor, and it beats a
+/// much later first observation.
+#[tokio::test]
+async fn the_advisory_publication_date_anchors_the_grace_period() {
+    let now = ts(1_000_000);
+    let mut f = finding(SeverityThreshold::High, Some(7.0), vec![]);
+    f.advisory_published_at = Some(now - Duration::days(30));
+    let reader = MockRetentionScanReader::new()
+        .with_findings(vec![f])
+        .with_first_observed(vec![("cve-1", now - Duration::hours(2))]);
+    let (uc, store) = build(reader);
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.artifact.repository_id = Uuid::new_v4();
+    seed_fresh_scanned_stream(&store, &c, now, vec![]);
+    let p = policy(
+        PolicyPredicate::HasFindingDetectedFor(SEVEN_DAYS),
+        RetentionScope::AllRepos,
+    );
+    let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
+    assert_eq!(
+        s.expired, 1,
+        "published 30 days ago → known for 30 days, whenever we first saw it"
+    );
+}
+
+/// Two backends disagree on the same vulnerability: the earliest date
+/// wins and the persisted reason names the source it came from.
+#[tokio::test]
+async fn disagreeing_sources_take_the_earliest_and_record_its_provenance() {
+    let now = ts(1_000_000);
+    let mut early = finding(SeverityThreshold::High, Some(7.0), vec![]);
+    early.source_scanner = "osv".into();
+    early.purl = "pkg:npm/a@1".into();
+    early.advisory_published_at = Some(now - Duration::days(40));
+    let mut late = finding(SeverityThreshold::High, Some(7.0), vec![]);
+    late.source_scanner = "trivy".into();
+    late.purl = "pkg:npm/b@1".into();
+    late.advisory_published_at = Some(now - Duration::days(2));
+    let reader = MockRetentionScanReader::new().with_findings(vec![late, early]);
+    let (uc, store) = build(reader);
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.artifact.repository_id = Uuid::new_v4();
+    seed_fresh_scanned_stream(&store, &c, now, vec![]);
+    let p = policy(
+        PolicyPredicate::HasFindingDetectedFor(SEVEN_DAYS),
+        RetentionScope::AllRepos,
+    );
+    let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
+    assert_eq!(s.expired, 1);
+    let reason = expired_reason(&store);
+    match reason {
+        ExpirationReason::SecurityFinding {
+            known_since,
+            known_since_source,
+            ..
+        } => {
+            assert_eq!(known_since, Some(now - Duration::days(40)));
+            assert_eq!(
+                known_since_source,
+                Some(FindingAgeAnchorSource::AdvisoryPublication("osv".into())),
+                "a feed dating systematically early has to be \
+                 diagnosable from the expiry record"
+            );
+        }
+        other => panic!("expected SecurityFinding, got {other:?}"),
+    }
+}
+
+/// The same CVE on two different artifacts yields the same age, because
+/// the anchor is a fact about the advisory rather than about either
+/// artifact's scan history. Their first observations differ by weeks.
+#[tokio::test]
+async fn the_same_cve_in_two_artifacts_yields_the_same_age() {
+    let now = ts(1_000_000);
+    let published = now - Duration::days(10);
+    let mut anchors = Vec::new();
+    for observed_days_ago in [1_i64, 60] {
+        let mut f = finding(SeverityThreshold::High, Some(7.0), vec![]);
+        f.advisory_published_at = Some(published);
+        let reader = MockRetentionScanReader::new()
+            .with_findings(vec![f])
+            .with_first_observed(vec![("cve-1", now - Duration::days(observed_days_ago))]);
+        let (uc, store) = build(reader);
+        let mut c = candidate(QuarantineStatus::Released, ts(0));
+        c.artifact.repository_id = Uuid::new_v4();
+        seed_fresh_scanned_stream(&store, &c, now, vec![]);
+        let p = policy(
+            PolicyPredicate::HasFindingDetectedFor(SEVEN_DAYS),
+            RetentionScope::AllRepos,
+        );
+        let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
+        assert_eq!(s.expired, 1, "observed {observed_days_ago}d ago");
+        match expired_reason(&store) {
+            ExpirationReason::SecurityFinding { known_since, .. } => anchors.push(known_since),
+            other => panic!("expected SecurityFinding, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        anchors[0], anchors[1],
+        "one advisory, one known-since date, whatever each artifact's \
+         own scan history says"
+    );
+    assert_eq!(anchors[0], Some(published));
+}
+
+/// The history-wide first-observation read is keyed on the vulnerability
+/// ids the LAST scan reported, lowercased. That keying is what keeps a
+/// retracted vulnerability's history out of a deletion decision.
+#[tokio::test]
+async fn the_first_observed_read_is_keyed_on_the_last_scans_vulnerabilities() {
+    let now = ts(1_000_000);
+    let mut a = finding(SeverityThreshold::High, Some(7.0), vec![]);
+    a.vulnerability_id = "GHSA-Abc".into();
+    a.purl = "pkg:npm/a@1".into();
+    let mut b = finding(SeverityThreshold::High, Some(7.0), vec![]);
+    b.vulnerability_id = "ghsa-abc".into();
+    b.purl = "pkg:npm/b@1".into();
+    let mut c_f = finding(SeverityThreshold::High, Some(7.0), vec![]);
+    c_f.vulnerability_id = "CVE-9".into();
+    c_f.purl = "pkg:npm/c@1".into();
+    let reader = Arc::new(
+        MockRetentionScanReader::new()
+            .with_findings(vec![a, b, c_f])
+            .with_first_observed(vec![("ghsa-abc", now - Duration::days(30))]),
+    );
+    let store = Arc::new(MockEventStore::new());
+    let uc = RetentionUseCase::new(wrap_for_test(store.clone()), reader.clone());
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.artifact.repository_id = Uuid::new_v4();
+    seed_fresh_scanned_stream(&store, &c, now, vec![]);
+    let p = policy(
+        PolicyPredicate::HasFindingDetectedFor(SEVEN_DAYS),
+        RetentionScope::AllRepos,
+    );
+    let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
+    assert_eq!(s.expired, 1);
+    assert_eq!(
+        reader.asked_about(),
+        vec![vec!["ghsa-abc".to_string(), "cve-9".to_string()]],
+        "one query, lowercased and de-duplicated — two spellings of one \
+         advisory are one vulnerability"
+    );
+}
+
+/// An age-driven policy pays nothing for the anchor: no security arm
+/// can read it, so the projection read is not made. Once per candidate
+/// per sweep is not a rounding error on a repository of any size.
+#[tokio::test]
+async fn a_non_security_predicate_asks_nothing_about_first_observation() {
+    let now = ts(1_000_000);
+    let reader = Arc::new(
+        MockRetentionScanReader::new()
+            .with_findings(vec![finding(SeverityThreshold::High, Some(7.0), vec![])])
+            .with_first_observed(vec![("cve-1", ts(0))]),
+    );
+    let store = Arc::new(MockEventStore::new());
+    let uc = RetentionUseCase::new(wrap_for_test(store.clone()), reader.clone());
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.artifact.repository_id = Uuid::new_v4();
+    seed_fresh_scanned_stream(&store, &c, now, vec![]);
+    let p = policy(PolicyPredicate::AgeExceeds(1), RetentionScope::AllRepos);
+    let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
+    assert_eq!(s.expired, 1, "the age predicate still fires");
+    assert!(
+        reader.asked_about().is_empty(),
+        "an age-driven policy must not pay for an anchor nothing reads"
+    );
+}
+
+/// No findings ⇒ no vulnerability to date ⇒ no port read at all.
+#[tokio::test]
+async fn no_findings_asks_nothing_about_first_observation() {
+    let now = ts(1_000_000);
+    let reader = Arc::new(MockRetentionScanReader::new());
+    let store = Arc::new(MockEventStore::new());
+    let uc = RetentionUseCase::new(wrap_for_test(store.clone()), reader.clone());
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.artifact.repository_id = Uuid::new_v4();
+    seed_fresh_scanned_stream(&store, &c, now, vec![]);
+    let p = policy(
+        PolicyPredicate::HasFindingDetectedFor(SEVEN_DAYS),
+        RetentionScope::AllRepos,
+    );
+    let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
+    assert_eq!(s.expired, 0);
+    assert!(reader.asked_about().is_empty());
+}
+
+/// A failed first-observation read is an error, not "no anchor". "We
+/// have no record of this vulnerability" and "we could not look" are
+/// different statements, and only the first is evidence.
+#[tokio::test]
+async fn a_failed_first_observed_read_errors_rather_than_deciding() {
+    let now = ts(1_000_000);
+    let reader = MockRetentionScanReader::new()
+        .with_findings(vec![finding(SeverityThreshold::High, Some(7.0), vec![])])
+        .with_first_observed_err();
+    let (uc, store) = build(reader);
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.artifact.repository_id = Uuid::new_v4();
+    seed_fresh_scanned_stream(&store, &c, now, vec![]);
+    let p = policy(
+        PolicyPredicate::HasFindingDetectedFor(SEVEN_DAYS),
+        RetentionScope::AllRepos,
+    );
+    let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
+    assert_eq!(s.errors, 1);
+    assert_eq!(s.expired, 0);
+    assert!(store.appended_batches().is_empty());
+}
+
+/// A never-scanned artifact is stopped by the per-artifact freshness
+/// gate before the anchor is reached, so a security-driven predicate
+/// cannot expire it however its vulnerabilities are dated (inv 7).
 #[tokio::test]
 async fn detected_for_never_scanned_artifact_is_skipped_per_inv7() {
-    // Was `detected_for_falls_back_to_created_at_cold_data`: under the
-    // weaker per-repo freshness reading a never-scanned artifact with a
-    // fresh repo-score MAX would reach the `resolve_first_detected_at`
-    // step-3 created_at fallback and EXPIRE. The per-artifact freshness
-    // gate correctly blocks first: an artifact with NO ScanCompleted on
-    // its own stream cannot prove freshness for a security-driven
-    // predicate, so it is skipped_stale_scan (fail-safe — never expire
-    // on an unprovable security predicate). The
-    // `resolve_first_detected_at` cold-data fallback stays in the code
-    // as defense-in-depth but is no longer reachable for a
-    // security-driven predicate on a never-scanned artifact.
+    let now = ts(1_000_000);
     let repo_id = Uuid::new_v4();
     let reader = MockRetentionScanReader::new()
         .with_findings(vec![finding(SeverityThreshold::High, Some(7.0), vec![])])
-        .with_score(score(repo_id, Some(ts(1_000_000) - Duration::hours(1))));
+        .with_first_observed(vec![("cve-1", ts(0))])
+        .with_score(score(repo_id, Some(now - Duration::hours(1))));
     let (uc, store) = build(reader);
     // Only the genesis on the stream — no scan event at all.
     let mut c = candidate(QuarantineStatus::Released, ts(0));
     c.artifact.repository_id = repo_id;
     seed_stream(&store, &c, IngestSource::Proxied, vec![]);
     let p = policy(
-        PolicyPredicate::HasFindingDetectedFor(7 * 24 * 3600),
+        PolicyPredicate::HasFindingDetectedFor(SEVEN_DAYS),
         RetentionScope::AllRepos,
     );
-    let s = uc
-        .evaluate_policies(ts(1_000_000), &[p], &[c])
-        .await
-        .unwrap();
+    let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
     assert_eq!(
         s.skipped_stale_scan, 1,
         "never-scanned artifact: per-artifact freshness gate fail-safe skip \
@@ -1417,19 +1741,21 @@ async fn variant_canonical_composite_and_pattern() {
         ],
     );
     let repo_id = Uuid::new_v4();
-    let reader = MockRetentionScanReader::new().with_findings(vec![finding(
-        SeverityThreshold::High,
-        Some(8.0),
-        vec!["2.0"],
-    )]);
+    let reader = MockRetentionScanReader::new()
+        .with_findings(vec![finding(
+            SeverityThreshold::High,
+            Some(8.0),
+            vec!["2.0"],
+        )])
+        .with_first_observed(vec![("cve-1", ts(1_000_000) - Duration::days(30))]);
     let (uc, store) = build(reader);
     let mut c = candidate(QuarantineStatus::Released, ts(0)); // created long ago → > 7d
     c.artifact.repository_id = repo_id;
     // Genesis (Proxied → IngestSource(Proxied) scope matches), then an
-    // OLD ScanCompleted (> 7d ago → HasFindingDetectedFor anchor is
-    // past the 7d grace) AND a FRESH ScanCompleted (1h ago → per-artifact
-    // freshness gate passes). `latest_scan_at` = the fresh one;
-    // the `HasFindingDetectedFor` anchor = the earliest (old) one.
+    // OLD ScanCompleted and a FRESH one (1h ago → per-artifact freshness
+    // gate passes). `latest_scan_at` = the fresh one. Neither scan
+    // anchors the grace period — the vulnerability's known-since date
+    // does, and the reader supplies it.
     let stream_id = StreamId::artifact(c.artifact.id);
     store.set_stream(
         &stream_id,

@@ -37,8 +37,8 @@
 
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::types::{
-    collapse_alias_groups, is_informational_class, ComponentRelation, Finding, FindingStatement,
-    SeverityBasis,
+    collapse_alias_groups, is_informational_class, parse_advisory_published_at, ComponentRelation,
+    Finding, FindingStatement, SeverityBasis,
 };
 use serde::Deserialize;
 
@@ -114,6 +114,20 @@ pub(crate) struct OsvVulnerability {
     pub(crate) affected: Vec<OsvAffected>,
     #[serde(default)]
     pub(crate) references: Vec<OsvReference>,
+    /// OSV `published` — RFC 3339, when the OSV **entry** was created in
+    /// the advisory database. osv-scanner forwards the upstream record
+    /// verbatim, so it arrives whenever the source database set it.
+    ///
+    /// Kept as the raw string and interpreted by the domain's single
+    /// `parse_advisory_published_at` rather than by a serde
+    /// `DateTime<Utc>`: a record whose date is malformed must still
+    /// produce a usable finding (the retention anchor then falls back to
+    /// our own later observation), whereas a typed field would fail the
+    /// whole document's deserialisation — and on this adapter's
+    /// fail-closed parse path that turns one bad timestamp into an
+    /// indeterminate scan.
+    #[serde(default)]
+    pub(crate) published: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -531,6 +545,13 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
         // reading of an unstated side and the only one available to a
         // producer that looked at no filesystem.
         statement: FindingStatement::Unstated,
+        // The OSV entry's own publication date — the only value here
+        // that dates the VULNERABILITY rather than this scan, which is
+        // what the retention grace-period anchor asks for.
+        advisory_published_at: vuln
+            .published
+            .as_deref()
+            .and_then(parse_advisory_published_at),
     }
 }
 

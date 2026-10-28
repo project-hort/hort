@@ -935,6 +935,7 @@ mod tests {
     use hort_domain::ports::retention_preview::{
         ObservedCardinality, RetentionContentSimulation, SimulationBound,
     };
+    use hort_domain::ports::retention_scan_reader::FirstObservations;
     use hort_domain::ports::retention_scan_reader::RetentionScanReader;
     use hort_domain::ports::storage::PutResult;
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
@@ -1147,6 +1148,13 @@ mod tests {
             >,
         > {
             Box::pin(async { Ok(None) })
+        }
+        fn first_observed_at<'a>(
+            &'a self,
+            _a: Uuid,
+            _ids: &'a [String],
+        ) -> BoxFuture<'a, DomainResult<FirstObservations>> {
+            Box::pin(async { Ok(Vec::new()) })
         }
     }
 

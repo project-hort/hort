@@ -411,6 +411,7 @@ fn finding(purl: &str, vuln: &str, sev: SeverityThreshold) -> Finding {
         severity_basis: SeverityBasis::Assessed,
         component_relation: ComponentRelation::NotEstablished,
         statement: FindingStatement::Unstated,
+        advisory_published_at: None,
     }
 }
 

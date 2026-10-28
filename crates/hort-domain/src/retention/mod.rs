@@ -37,8 +37,13 @@
 //!   producing the [`ExpirationReason`] snapshot. Zero I/O — the
 //!   `hort-app` `RetentionUseCase` owns the projection reads, the
 //!   scan-freshness gate, the `(policy_id, artifact_id)` idempotency check,
-//!   the quarantine/rejected filter, the `HasFindingDetectedFor`
-//!   stream anchor, and event append + metrics.
+//!   the quarantine/rejected filter, and event append + metrics.
+//! - [`resolve_finding_age_anchor`] / [`FindingAgeAnchor`] /
+//!   [`FindingAgeAnchorSource`] — the pure `HasFindingDetectedFor`
+//!   anchor: how long the *vulnerability* has been known, from the
+//!   advisory's publication date where a backend reported one and our own
+//!   first observation of it otherwise. No anchor means the predicate
+//!   does not match. The app layer supplies the two reads it folds.
 //!
 //! ## Domain-only scope
 //!
@@ -47,6 +52,7 @@
 //! *wire-stable*; persisting them through the real Postgres event store
 //! is the adapter layer's job.
 
+mod anchor;
 mod evaluate;
 mod mode;
 mod policy;
@@ -54,6 +60,10 @@ mod predicate;
 mod reason;
 mod scope;
 
+pub use anchor::{
+    distinct_vulnerability_ids, resolve_finding_age_anchor, FindingAgeAnchor,
+    FindingAgeAnchorSource,
+};
 pub use evaluate::{
     evaluate, matches_bool, severity_at_or_above, EvaluationInputs, EvaluationOutcome,
 };

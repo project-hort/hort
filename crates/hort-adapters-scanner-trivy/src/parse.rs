@@ -16,7 +16,9 @@
 
 use std::collections::BTreeMap;
 
-use hort_domain::types::{ComponentRelation, Finding, FindingStatement};
+use hort_domain::types::{
+    parse_advisory_published_at, ComponentRelation, Finding, FindingStatement,
+};
 use serde::Deserialize;
 
 use crate::purl::build_purl;
@@ -107,6 +109,23 @@ pub(crate) struct TrivyVulnerability {
     /// not attach a score (legitimate case for many advisories).
     #[serde(rename = "CVSS", default)]
     pub(crate) cvss: BTreeMap<String, TrivyCvss>,
+    /// Trivy `PublishedDate` — RFC 3339. trivy-db's own field comment
+    /// reads *"Take from NVD or GHSA"*, so which event this dates
+    /// depends on which source supplied the advisory, and it is not in
+    /// general the same event OSV's `published` dates (see
+    /// `Finding::advisory_published_at`). The key is absent, not null,
+    /// when the source carried no date — `*time.Time` with
+    /// `json:",omitempty"` — and the field reaches the vulnerability
+    /// level of the report because `DetectedVulnerability` embeds
+    /// `types.Vulnerability`. `None` is therefore an ordinary outcome
+    /// here, not a parse failure.
+    ///
+    /// Raw string, interpreted by the domain's single
+    /// `parse_advisory_published_at`, for the same reason the OSV
+    /// adapter keeps it unparsed: one malformed timestamp must cost that
+    /// finding its publication date, not cost the run its whole report.
+    #[serde(rename = "PublishedDate", default)]
+    pub(crate) published_date: Option<String>,
 }
 
 /// One scorer's CVSS entry inside the per-finding `CVSS` map. We only
@@ -314,6 +333,15 @@ fn vuln_to_finding(trivy_type: &str, vuln: &TrivyVulnerability) -> Finding {
         // site's, so a second deserialised section cannot pick its own
         // answer here.
         statement: statement_of(ReportSection::Vulnerabilities),
+        // Trivy's `PublishedDate`. It dates the VULNERABILITY rather
+        // than this scan, which is what the retention grace-period
+        // anchor asks for. Where it disagrees with an OSV entry date
+        // for the same advisory, the anchor resolver takes the earlier
+        // and records which feed it came from.
+        advisory_published_at: vuln
+            .published_date
+            .as_deref()
+            .and_then(parse_advisory_published_at),
     }
 }
 
@@ -359,6 +387,7 @@ mod tests {
             references: Vec::new(),
             vendor_ids: Vec::new(),
             cvss: BTreeMap::new(),
+            published_date: None,
         }
     }
 
@@ -467,6 +496,59 @@ mod tests {
                 f.vulnerability_id
             );
         }
+    }
+
+    // ----- PublishedDate ----------------------------------------------------
+
+    /// Trivy's `PublishedDate` reaches the finding. For a CVE-primary
+    /// entry this is usually the NVD publication date, which is a fact
+    /// about the vulnerability and so what the retention grace-period
+    /// anchor asks for.
+    #[test]
+    fn trivy_published_date_reaches_the_finding() {
+        let doc = br#"{"Results":[{"Target":"image","Class":"os-pkgs","Type":"debian",
+            "Vulnerabilities":[
+              {"VulnerabilityID":"CVE-2021-23337","PkgName":"lodash",
+               "InstalledVersion":"4.17.20","Severity":"HIGH",
+               "PublishedDate":"2021-02-15T11:15:00Z",
+               "LastModifiedDate":"2023-11-07T03:30:00Z"}
+            ]}]}"#;
+        let report = parse_trivy_report(doc).expect("parse");
+        let findings = aggregate_findings(&report);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].advisory_published_at,
+            parse_advisory_published_at("2021-02-15T11:15:00Z")
+        );
+    }
+
+    /// Trivy omits the key for advisories its sources carry no date for,
+    /// which is common for vendor and language-ecosystem advisories.
+    /// That is an ordinary outcome, not a parse failure: the anchor falls
+    /// back to our own later observation of the vulnerability.
+    #[test]
+    fn a_trivy_entry_without_a_published_date_yields_none() {
+        let doc = br#"{"Results":[{"Target":"Cargo.lock","Class":"lang-pkgs","Type":"cargo",
+            "Vulnerabilities":[
+              {"VulnerabilityID":"RUSTSEC-2023-0033","PkgName":"openssl-src",
+               "InstalledVersion":"111.18.0","Severity":"MEDIUM"}
+            ]}]}"#;
+        let report = parse_trivy_report(doc).expect("parse");
+        let findings = aggregate_findings(&report);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].advisory_published_at, None);
+    }
+
+    /// A malformed date costs that finding its publication date and
+    /// nothing else — the report still parses and the finding is still
+    /// produced with its severity intact.
+    #[test]
+    fn a_malformed_trivy_published_date_costs_only_that_findings_date() {
+        let mut v = vuln_skeleton();
+        v.published_date = Some("2021-02-15".into());
+        let f = vuln_to_finding("npm", &v);
+        assert_eq!(f.advisory_published_at, None);
+        assert_eq!(f.severity, SeverityThreshold::High);
     }
 
     // ----- vuln_to_finding lowering -----------------------------------------
@@ -607,6 +689,7 @@ mod tests {
                         references: Vec::new(),
                         vendor_ids: Vec::new(),
                         cvss: BTreeMap::new(),
+                        published_date: None,
                     },
                     TrivyVulnerability {
                         vulnerability_id: "CVE-2".into(),
@@ -619,6 +702,7 @@ mod tests {
                         references: Vec::new(),
                         vendor_ids: Vec::new(),
                         cvss: BTreeMap::new(),
+                        published_date: None,
                     },
                 ]),
             }],

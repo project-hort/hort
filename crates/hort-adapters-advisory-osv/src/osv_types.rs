@@ -87,6 +87,25 @@ pub(crate) struct OsvVuln {
     #[serde(default)]
     pub modified: Option<String>,
 
+    /// RFC 3339 timestamp of when OSV **published** this entry — the
+    /// advisory-database creation date, not the last modification.
+    ///
+    /// **`querybatch` does not return it.** That response carries `id`
+    /// and `modified` and nothing else, so a finding built straight off
+    /// an abbreviated record has no publication date; the hydration step
+    /// in [`crate::hydrate`] replaces each record with the full
+    /// `/v1/vulns/{id}` one, which does carry it. An unhydrated advisory
+    /// therefore falls back to the retention anchor's own
+    /// first-observation rung — later than publication, and so the
+    /// non-deleting direction, matching hydration's existing fail-soft
+    /// posture.
+    ///
+    /// Raw string, interpreted by the domain's single
+    /// `parse_advisory_published_at`: a malformed date must cost this
+    /// finding its publication date, not fail the query.
+    #[serde(default)]
+    pub published: Option<String>,
+
     /// One-line summary (often present on `querybatch` responses).
     #[serde(default)]
     pub summary: Option<String>,

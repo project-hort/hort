@@ -11,8 +11,9 @@
 //! The app layer ([`hort-app`'s `RetentionUseCase`]) owns the I/O:
 //! reading the projection rows, the scan-freshness gate, the
 //! `(policy_id, artifact_id)` idempotency check, the quarantine/rejected
-//! filter, the `HasFindingDetectedFor` stream anchor, and event append +
-//! metrics. It calls [`evaluate`] with the already-resolved inputs.
+//! filter, the two reads the `HasFindingDetectedFor` anchor folds, and
+//! event append + metrics. It calls [`evaluate`] with the
+//! already-resolved inputs.
 //!
 //! ## `HasFixAvailable` precision note
 //!
@@ -27,6 +28,7 @@ use chrono::{DateTime, Utc};
 use crate::entities::scan_policy::SeverityThreshold;
 use crate::types::Finding;
 
+use super::anchor::FindingAgeAnchor;
 use super::predicate::{BooleanOp, PolicyPredicate};
 use super::reason::ExpirationReason;
 
@@ -37,8 +39,7 @@ use super::reason::ExpirationReason;
 pub struct EvaluationInputs<'a> {
     /// Evaluation wall-clock (the sweep's pinned `now`).
     pub now: DateTime<Utc>,
-    /// `Artifact.created_at` — the `AgeExceeds` anchor (also the
-    /// cold-data fallback anchor for `HasFindingDetectedFor`).
+    /// `Artifact.created_at` — the `AgeExceeds` anchor.
     pub created_at: DateTime<Utc>,
     /// Most recent download wall-clock, `None` if never downloaded —
     /// the `UnusedFor` anchor.
@@ -102,13 +103,18 @@ pub struct EvaluationInputs<'a> {
     /// Current scan findings for the artifact (the `scan_findings`
     /// projection rows mapped to [`Finding`]).
     pub findings: &'a [Finding],
-    /// The `(purl, vulnerability_id)`-anchored "first detected at" for
-    /// the matched security findings, resolved by the app layer from
-    /// the artifact stream (earliest `ScanCompleted` carrying the
-    /// matched pair, or `ArtifactBecameVulnerable.previously_clean_at`,
-    /// or `created_at` cold-data fallback). Only consulted when a
-    /// security predicate matches.
-    pub first_detected_at: DateTime<Utc>,
+    /// How long the **vulnerability** has been known, and from which
+    /// source — the [`HasFindingDetectedFor`](PolicyPredicate::HasFindingDetectedFor)
+    /// anchor, resolved by the app layer via
+    /// [`resolve_finding_age_anchor`](super::resolve_finding_age_anchor)
+    /// over the last scan's findings and our own first observation of
+    /// each of their vulnerabilities.
+    ///
+    /// `None` means no source dated any of them. The predicate then does
+    /// **not** match: an unprovable age is answered the way an
+    /// unprovable scan freshness is, and never by assuming the largest
+    /// value available. See the anchor module docs.
+    pub finding_age_anchor: Option<FindingAgeAnchor>,
     /// Wall-clock of the most recent `ScanCompleted` for the artifact
     /// (the freshness-gate timestamp). Carried into the
     /// `SecurityFinding` reason snapshot as `latest_scan_at`.
@@ -158,7 +164,8 @@ fn matched_via_security(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> bo
 
 /// Pure boolean match for one predicate against the inputs. The
 /// security-driven anchor (`HasFindingDetectedFor`) compares against
-/// the app-resolved [`EvaluationInputs::first_detected_at`].
+/// the app-resolved [`EvaluationInputs::finding_age_anchor`], and does
+/// not match when there is none.
 pub fn matches_bool(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> bool {
     match pred {
         PolicyPredicate::AgeExceeds(secs) => elapsed_at_least(inputs.created_at, inputs.now, *secs),
@@ -191,13 +198,18 @@ pub fn matches_bool(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> bool {
         PolicyPredicate::HasFixAvailable => {
             inputs.findings.iter().any(|f| !f.fixed_versions.is_empty())
         }
-        PolicyPredicate::HasFindingDetectedFor(secs) => {
-            // Only meaningful when there is at least one finding; the
-            // anchor was resolved by the app layer for the matched
-            // pair (or the cold-data fallback).
-            !inputs.findings.is_empty()
-                && elapsed_at_least(inputs.first_detected_at, inputs.now, *secs)
-        }
+        PolicyPredicate::HasFindingDetectedFor(secs) => match &inputs.finding_age_anchor {
+            // Nothing dated any of the artifact's vulnerabilities, so
+            // how long they have been known is unknown. A predicate
+            // that deletes does not fire on an unprovable age.
+            None => false,
+            // Only meaningful when there is at least one finding — an
+            // anchor without findings cannot describe one.
+            Some(anchor) => {
+                !inputs.findings.is_empty()
+                    && elapsed_at_least(anchor.known_since, inputs.now, *secs)
+            }
+        },
         PolicyPredicate::Composite(op, kids) => match op {
             BooleanOp::And => kids.iter().all(|k| matches_bool(k, inputs)),
             BooleanOp::Or => kids.iter().any(|k| matches_bool(k, inputs)),
@@ -221,7 +233,9 @@ fn elapsed_at_least(anchor: DateTime<Utc>, now: DateTime<Utc>, secs: u64) -> boo
 /// [`ExpirationReason::SecurityFinding`] payload. `max_severity`
 /// is the strongest tier present; `max_cvss` the highest non-null
 /// score (or `None`); `fix_available` whether any finding has a
-/// non-empty `fixed_versions`.
+/// non-empty `fixed_versions`; `known_since` + `known_since_source` the
+/// resolved finding-age anchor and the source that supplied its date,
+/// both absent when nothing dated the artifact's vulnerabilities.
 fn security_reason(inputs: &EvaluationInputs) -> ExpirationReason {
     let mut max_sev = SeverityThreshold::Low;
     for f in inputs.findings {
@@ -240,7 +254,8 @@ fn security_reason(inputs: &EvaluationInputs) -> ExpirationReason {
         max_cvss,
         finding_count: u32::try_from(inputs.findings.len()).unwrap_or(u32::MAX),
         fix_available,
-        first_detected_at: inputs.first_detected_at,
+        known_since: inputs.finding_age_anchor.as_ref().map(|a| a.known_since),
+        known_since_source: inputs.finding_age_anchor.as_ref().map(|a| a.source.clone()),
         latest_scan_at: inputs.latest_scan_at,
     }
 }
@@ -321,6 +336,7 @@ fn non_security_reason(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> Exp
 
 #[cfg(test)]
 mod tests {
+    use super::super::anchor::FindingAgeAnchorSource;
     use super::*;
     use crate::types::ComponentRelation;
 
@@ -343,6 +359,17 @@ mod tests {
             severity_basis: crate::types::SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
             statement: crate::types::FindingStatement::Unstated,
+            advisory_published_at: None,
+        }
+    }
+
+    /// An observation-sourced anchor at `at` — the shape most of these
+    /// tests want, since they are about the elapsed-time comparison and
+    /// not about where the date came from.
+    fn anchor(at: DateTime<Utc>) -> FindingAgeAnchor {
+        FindingAgeAnchor {
+            known_since: at,
+            source: FindingAgeAnchorSource::FirstObservation,
         }
     }
 
@@ -354,7 +381,10 @@ mod tests {
             keep_rank: None,
             tag_targeted: false,
             findings,
-            first_detected_at: ts(0),
+            finding_age_anchor: Some(FindingAgeAnchor {
+                known_since: ts(0),
+                source: FindingAgeAnchorSource::FirstObservation,
+            }),
             latest_scan_at: ts(900_000),
         }
     }
@@ -671,11 +701,95 @@ mod tests {
         assert_eq!(evaluate(&p, &i), EvaluationOutcome::NoMatch);
     }
 
+    /// The anchor is the predicate's whole evidence. Without one the
+    /// age is unprovable, and a predicate that deletes does not fire on
+    /// unprovable evidence — however old the artifact or its scans are.
+    #[test]
+    fn detected_for_without_an_anchor_does_not_match() {
+        let f = vec![finding(SeverityThreshold::High, Some(7.0), vec![])];
+        let mut i = inputs(&f);
+        i.finding_age_anchor = None;
+        i.created_at = ts(0);
+        i.now = ts(1_000_000);
+        let p = PolicyPredicate::HasFindingDetectedFor(1);
+        assert_eq!(evaluate(&p, &i), EvaluationOutcome::NoMatch);
+    }
+
+    /// And an `And` composite the anchorless leg sits in cannot match
+    /// either, so the canonical operator policy stops deleting rather
+    /// than falling back to its other two legs.
+    #[test]
+    fn canonical_composite_without_an_anchor_does_not_match() {
+        let f = vec![finding(SeverityThreshold::High, Some(9.0), vec!["2.0"])];
+        let mut i = inputs(&f);
+        i.finding_age_anchor = None;
+        i.now = ts(1_000_000);
+        let p = PolicyPredicate::Composite(
+            BooleanOp::And,
+            vec![
+                PolicyPredicate::HasFindingAboveSeverity(SeverityThreshold::High),
+                PolicyPredicate::HasFixAvailable,
+                PolicyPredicate::HasFindingDetectedFor(7 * 24 * 3600),
+            ],
+        );
+        assert_eq!(evaluate(&p, &i), EvaluationOutcome::NoMatch);
+    }
+
+    /// A security-driven predicate that does not read the anchor still
+    /// matches without one, and the reason it snapshots says there was
+    /// no known-since date rather than inventing one.
+    #[test]
+    fn security_reason_without_an_anchor_carries_no_known_since() {
+        let f = vec![finding(SeverityThreshold::High, Some(7.0), vec![])];
+        let mut i = inputs(&f);
+        i.finding_age_anchor = None;
+        let p = PolicyPredicate::HasFindingAboveSeverity(SeverityThreshold::High);
+        match evaluate(&p, &i) {
+            EvaluationOutcome::Matched(ExpirationReason::SecurityFinding {
+                known_since,
+                known_since_source,
+                ..
+            }) => {
+                assert_eq!(known_since, None);
+                assert_eq!(known_since_source, None);
+            }
+            other => panic!("expected SecurityFinding, got {other:?}"),
+        }
+    }
+
+    /// The resolved anchor and its provenance reach the persisted
+    /// reason verbatim — that record is the only place a skewed feed
+    /// stays diagnosable once the projection rows have moved on.
+    #[test]
+    fn security_reason_carries_the_anchor_and_its_provenance() {
+        let f = vec![finding(SeverityThreshold::High, Some(7.0), vec![])];
+        let mut i = inputs(&f);
+        i.finding_age_anchor = Some(FindingAgeAnchor {
+            known_since: ts(1234),
+            source: FindingAgeAnchorSource::AdvisoryPublication("osv".into()),
+        });
+        let p = PolicyPredicate::HasFindingAboveSeverity(SeverityThreshold::High);
+        match evaluate(&p, &i) {
+            EvaluationOutcome::Matched(ExpirationReason::SecurityFinding {
+                known_since,
+                known_since_source,
+                ..
+            }) => {
+                assert_eq!(known_since, Some(ts(1234)));
+                assert_eq!(
+                    known_since_source,
+                    Some(FindingAgeAnchorSource::AdvisoryPublication("osv".into()))
+                );
+            }
+            other => panic!("expected SecurityFinding, got {other:?}"),
+        }
+    }
+
     #[test]
     fn detected_for_just_below_grace_no_match() {
         let f = vec![finding(SeverityThreshold::High, Some(7.0), vec![])];
         let mut i = inputs(&f);
-        i.first_detected_at = ts(900);
+        i.finding_age_anchor = Some(anchor(ts(900)));
         i.now = ts(1000); // detected 100s ago
         let p = PolicyPredicate::HasFindingDetectedFor(101);
         assert_eq!(evaluate(&p, &i), EvaluationOutcome::NoMatch);
@@ -685,7 +799,7 @@ mod tests {
     fn detected_for_just_above_grace_matches() {
         let f = vec![finding(SeverityThreshold::High, Some(7.0), vec![])];
         let mut i = inputs(&f);
-        i.first_detected_at = ts(0);
+        i.finding_age_anchor = Some(anchor(ts(0)));
         i.now = ts(1000);
         let p = PolicyPredicate::HasFindingDetectedFor(1000);
         assert!(matches!(
@@ -700,7 +814,7 @@ mod tests {
     fn composite_and_all_must_match() {
         let f = vec![finding(SeverityThreshold::High, Some(7.0), vec!["1.2.4"])];
         let mut i = inputs(&f);
-        i.first_detected_at = ts(0);
+        i.finding_age_anchor = Some(anchor(ts(0)));
         i.now = ts(700_000); // 7d+ since detection
                              // Canonical operator pattern.
         let p = PolicyPredicate::Composite(
@@ -728,7 +842,7 @@ mod tests {
     fn composite_and_one_child_fails_no_match() {
         let f = vec![finding(SeverityThreshold::High, Some(7.0), vec![])]; // no fix
         let mut i = inputs(&f);
-        i.first_detected_at = ts(0);
+        i.finding_age_anchor = Some(anchor(ts(0)));
         i.now = ts(700_000);
         let p = PolicyPredicate::Composite(
             BooleanOp::And,
@@ -785,7 +899,7 @@ mod tests {
     fn composite_nested_and_inside_or() {
         let f = vec![finding(SeverityThreshold::High, Some(8.0), vec!["2.0"])];
         let mut i = inputs(&f);
-        i.first_detected_at = ts(0);
+        i.finding_age_anchor = Some(anchor(ts(0)));
         i.now = ts(1_000_000);
         let inner = PolicyPredicate::Composite(
             BooleanOp::And,

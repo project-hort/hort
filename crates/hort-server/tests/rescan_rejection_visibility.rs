@@ -218,6 +218,7 @@ fn single_critical_finding() -> Vec<Finding> {
         severity_basis: hort_domain::types::SeverityBasis::Assessed,
         component_relation: hort_domain::types::ComponentRelation::NotEstablished,
         statement: hort_domain::types::FindingStatement::Unstated,
+        advisory_published_at: None,
     };
     // Sanity-check the validator against our hand-built fixture so a
     // future field-cap change surfaces against this test, not a

@@ -48,12 +48,20 @@
 //!
 //! ## `HasFindingDetectedFor` anchor
 //!
-//! The grace-period anchor is the **earliest** `ScanCompleted` on the
-//! artifact stream that carries a finding the policy matched, OR the
-//! O(1) `ArtifactBecameVulnerable.previously_clean_at` when that event
-//! exists, falling back to the artifact's `created_at` (cold data) with
-//! a `tracing::warn!`. The evaluator resolves this anchor and feeds it
-//! into the pure [`hort_domain::retention::evaluate`].
+//! The grace-period anchor measures **how long the vulnerability has
+//! been known** — the advisory's publication date where a backend
+//! reported one, else our own earliest observation of that vulnerability
+//! on this artifact, else nothing, in which case the predicate does not
+//! match. The rules live in
+//! [`hort_domain::retention::resolve_finding_age_anchor`]; this use case
+//! supplies the port read the second rung needs and feeds the resolved
+//! anchor into the pure [`hort_domain::retention::evaluate`].
+//!
+//! Nothing in the artifact's own scan history is consulted, because
+//! nothing in it answers the question: an anchor taken from the first
+//! `ScanCompleted` on the stream dates when we started looking, so a
+//! finding that appeared yesterday on a long-scanned artifact satisfies
+//! a seven-day grace period immediately.
 //!
 //! ## Deliberately not here
 //!
@@ -62,10 +70,16 @@
 //!   zero-`tracing`; the warning lives where the YAML is applied).
 //! - `RetentionPurgeHandler` / `TaskHandler` registration → the worker
 //!   composition root.
-//! - Per-finding first-seen refinement: this use case retains the
-//!   projection's existing across-scans read contract. Fix availability
-//!   is already projected; see
-//!   [`hort_domain::ports::retention_scan_reader`] module docs.
+//! - Per-finding anchoring. The anchor is **one scalar per artifact**,
+//!   the earliest known-since date across the vulnerabilities its last
+//!   scan reported. Each finding predicate still quantifies
+//!   independently over the whole findings set, so
+//!   `Composite(And, [HasFindingAboveSeverity, HasFixAvailable,
+//!   HasFindingDetectedFor])` means "some finding is severe" AND "some
+//!   finding has a fix" AND "the anchor is old enough" — not "one
+//!   finding is all three". Binding the `And` across findings would
+//!   change what already-deployed policies mean and needs its own
+//!   decision.
 
 use std::sync::Arc;
 
@@ -78,7 +92,8 @@ use hort_domain::events::{retention_scheduler_actor, DomainEvent, StreamId};
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
 use hort_domain::retention::{
-    evaluate, EvaluationInputs, EvaluationOutcome, ExpirationReason, RetentionEvaluationMode,
+    distinct_vulnerability_ids, evaluate, resolve_finding_age_anchor, EvaluationInputs,
+    EvaluationOutcome, ExpirationReason, FindingAgeAnchor, RetentionEvaluationMode,
     RetentionPolicy,
 };
 use hort_domain::types::Finding;
@@ -454,9 +469,22 @@ impl RetentionUseCase {
 
         // -- resolve the HasFindingDetectedFor anchor + latest scan -------
         let latest_scan_at = latest_scan_at_opt.unwrap_or(artifact.created_at);
-        let first_detected_at = self
-            .resolve_first_detected_at(&stream, artifact, &findings)
-            .await;
+        // Only a security-driven predicate can read the anchor: the
+        // `HasFindingDetectedFor` arm is the one consumer, and the
+        // `SecurityFinding` reason that snapshots it is only built when
+        // a security-driven arm fired. An age- or usage-driven policy
+        // would pay a projection read for a value nothing looks at —
+        // once per candidate, every sweep.
+        let finding_age_anchor = if policy.predicate.is_security_driven() {
+            match self.resolve_finding_age_anchor(artifact, &findings).await {
+                Ok(a) => a,
+                Err(e) => {
+                    return self.errored(policy_id_label, policy, artifact, "first_observed", e)
+                }
+            }
+        } else {
+            None
+        };
 
         // -- pure evaluate ------------------------------------------------
         let inputs = EvaluationInputs {
@@ -478,7 +506,7 @@ impl RetentionUseCase {
             keep_rank: candidate.keep_rank,
             tag_targeted: candidate.tag_targeted,
             findings: &findings,
-            first_detected_at,
+            finding_age_anchor,
             latest_scan_at,
         };
 
@@ -574,47 +602,52 @@ impl RetentionUseCase {
         age <= window && age >= chrono::Duration::zero()
     }
 
-    /// Earliest `ScanCompleted.stored_at` on the stream is the
-    /// most-conservative "finding present since" anchor for
-    /// `HasFindingDetectedFor`. The resolution ladder:
-    /// 1. `ArtifactBecameVulnerable.previously_clean_at` (O(1), exact)
-    ///    if such an event exists for the matched findings;
-    /// 2. else the earliest `ScanCompleted` on the stream;
-    /// 3. else (cold data — no scan event at all) the artifact's
-    ///    `created_at`, with a `warn!`.
-    async fn resolve_first_detected_at(
+    /// Resolve the `HasFindingDetectedFor` anchor — **how long the
+    /// vulnerability has been known**, not how long we have been
+    /// scanning this artifact.
+    ///
+    /// The I/O half of
+    /// [`hort_domain::retention::resolve_finding_age_anchor`], which owns
+    /// the rules and the reasoning. This method supplies the second of
+    /// the two inputs that fold into one scalar: our own earliest
+    /// observation of each of the last scan's vulnerabilities
+    /// (`MIN(scan_findings.detected_at)` per pair). The first — the
+    /// advisory publication date — already travels on the findings the
+    /// caller read.
+    ///
+    /// It lives here rather than in the domain because it needs a port
+    /// read, and in the use case rather than behind the findings read
+    /// because the ids it asks about come *from* that read: keying the
+    /// history-wide `MIN` on the last scan's vulnerability ids is what
+    /// keeps a retracted vulnerability's history out of a deletion
+    /// decision.
+    ///
+    /// No findings ⇒ no anchor, with no port read: there is no
+    /// vulnerability to date, and `HasFindingDetectedFor` cannot match
+    /// without one anyway.
+    ///
+    /// A failed read is an **error**, not a `None`. `None` means "no
+    /// source dated this artifact's vulnerabilities", which is a
+    /// statement about the evidence; a read that did not happen says
+    /// nothing at all, and the sweep folds the error into
+    /// `EvalStep::Errored` and moves to the next pair.
+    async fn resolve_finding_age_anchor(
         &self,
-        stream: &[hort_domain::events::PersistedEvent],
         artifact: &Artifact,
         findings: &[Finding],
-    ) -> DateTime<Utc> {
+    ) -> AppResult<Option<FindingAgeAnchor>> {
         if findings.is_empty() {
-            // No findings → `HasFindingDetectedFor` cannot match
-            // anyway; the anchor value is irrelevant. Use created_at.
-            return artifact.created_at;
+            return Ok(None);
         }
-        // 1. O(1) ArtifactBecameVulnerable anchor.
-        if let Some(pcv) = stream.iter().find_map(|ev| match &ev.event {
-            DomainEvent::ArtifactBecameVulnerable(v) => Some(v.previously_clean_at),
-            _ => None,
-        }) {
-            return pcv;
-        }
-        // 2. Earliest ScanCompleted on the stream.
-        if let Some(first_scan) = stream.iter().find_map(|ev| match &ev.event {
-            DomainEvent::ScanCompleted(_) => Some(ev.stored_at),
-            _ => None,
-        }) {
-            return first_scan;
-        }
-        // 3. Cold-data fallback.
-        tracing::warn!(
-            artifact_id = %artifact.id,
-            "HasFindingDetectedFor anchor: no prior ScanCompleted nor \
-             ArtifactBecameVulnerable on the stream — falling back to \
-             artifact.created_at (cold data)"
-        );
-        artifact.created_at
+        // The domain's own definition of "one vulnerability", so the
+        // ids this query is keyed on cannot drift from the ids the fold
+        // below looks them up by.
+        let vulnerability_ids = distinct_vulnerability_ids(findings);
+        let first_observed = self
+            .scan_reader
+            .first_observed_at(artifact.id, &vulnerability_ids)
+            .await?;
+        Ok(resolve_finding_age_anchor(findings, &first_observed))
     }
 
     /// Most recent `ScanCompleted.stored_at` on the stream (the

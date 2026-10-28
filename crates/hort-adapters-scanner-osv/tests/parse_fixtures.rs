@@ -9,6 +9,7 @@
 use hort_adapters_scanner_osv::parse_findings_from_json;
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::types::finding::severity_summary_from_findings;
+use hort_domain::types::parse_advisory_published_at;
 
 const CLEAN: &[u8] = include_bytes!("fixtures/clean_scan.json");
 const MIXED: &[u8] = include_bytes!("fixtures/mixed_severities.json");
@@ -313,4 +314,60 @@ fn records_linked_only_by_the_scanner_group_still_collapse() {
 fn unrelated_advisories_are_not_collapsed() {
     let findings = parse_findings_from_json(MIXED).expect("parse");
     assert_eq!(findings.len(), 3);
+}
+
+/// The OSV entry's `published` date reaches the finding. The fixture is
+/// a real-shape record — osv-scanner forwards the upstream OSV document
+/// verbatim, so the field is already on the wire; the adapter simply did
+/// not model it until the retention anchor needed to date the
+/// vulnerability rather than our scanning of it.
+#[test]
+fn osv_published_date_reaches_the_finding() {
+    let findings = parse_findings_from_json(INFORMATIONAL).expect("parse");
+    assert_eq!(findings.len(), 1, "got {findings:#?}");
+    assert_eq!(
+        findings[0].advisory_published_at,
+        parse_advisory_published_at("2026-06-07T12:00:00Z"),
+        "the OSV entry's own publication date, read through the domain's \
+         single definition of that wire form"
+    );
+}
+
+/// A record with no `published` key yields `None` rather than a parse
+/// failure — the retention anchor then falls back to our own later
+/// observation of the vulnerability.
+#[test]
+fn an_osv_record_without_a_published_date_yields_none() {
+    let findings = parse_findings_from_json(MIXED).expect("parse");
+    assert_eq!(findings.len(), 3);
+    assert!(
+        findings.iter().all(|f| f.advisory_published_at.is_none()),
+        "got {findings:#?}"
+    );
+}
+
+/// A malformed `published` costs that finding its publication date and
+/// nothing else. The whole document still parses: this adapter's parse
+/// path is fail-closed (an unparseable report is an *indeterminate*
+/// scan), so letting one bad timestamp reject the document would turn a
+/// cosmetic upstream defect into a scan that cannot complete.
+#[test]
+fn a_malformed_published_date_costs_only_that_findings_date() {
+    let raw = br#"{
+      "results": [{
+        "packages": [{
+          "package": {"name": "lodash", "ecosystem": "npm", "version": "4.17.20"},
+          "vulnerabilities": [{
+            "id": "GHSA-35jh-r3h4-6jhm",
+            "summary": "command injection",
+            "published": "yesterday, probably"
+          }],
+          "groups": [{"ids": ["GHSA-35jh-r3h4-6jhm"], "max_severity": "7.2"}]
+        }]
+      }]
+    }"#;
+    let findings = parse_findings_from_json(raw).expect("parse");
+    assert_eq!(findings.len(), 1, "got {findings:#?}");
+    assert_eq!(findings[0].advisory_published_at, None);
+    assert_eq!(findings[0].severity, SeverityThreshold::High);
 }

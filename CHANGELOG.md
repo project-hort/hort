@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`HasFindingDetectedFor` now measures how long the vulnerability has been
+  known, not how long the artifact has been scanned** — the advisory's
+  publication date where a scanner reports one, else our own first observation
+  of that vulnerability, and no match at all where neither exists. A retention
+  policy using this predicate previously expired an artifact as soon as a
+  finding appeared, if the artifact had been scanned for longer than the grace
+  period; it now waits out the grace period. Migration 034 adds a nullable
+  `scan_findings.advisory_published_at`, populated on rescan (#369).
 - The runtime role can no longer write the applied-migration ledger:
   `hort-server migrate` revokes every write privilege on `_sqlx_migrations`
   from `hort_app_role` on every run, leaving `SELECT` for the boot gate.

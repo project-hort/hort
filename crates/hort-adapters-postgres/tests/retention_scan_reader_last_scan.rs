@@ -37,7 +37,9 @@ use uuid::Uuid;
 use hort_adapters_postgres::retention_scan_reader::PgRetentionScanReader;
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
-use hort_domain::retention::{matches_bool, EvaluationInputs, PolicyPredicate};
+use hort_domain::retention::{
+    matches_bool, EvaluationInputs, FindingAgeAnchor, FindingAgeAnchorSource, PolicyPredicate,
+};
 
 /// Per-test isolated database, migrated. `None` when `DATABASE_URL` is unset.
 async fn maybe_pool() -> Option<PgPool> {
@@ -246,7 +248,10 @@ async fn a_clean_last_scan_reads_as_no_findings() {
         keep_rank: None,
         tag_targeted: false,
         findings: &findings,
-        first_detected_at: now - Duration::hours(10),
+        finding_age_anchor: Some(FindingAgeAnchor {
+            known_since: now - Duration::hours(10),
+            source: FindingAgeAnchorSource::FirstObservation,
+        }),
         latest_scan_at: now - Duration::hours(1),
     };
     assert!(!matches_bool(&PolicyPredicate::HasFixAvailable, &inputs));
@@ -304,7 +309,10 @@ async fn a_retracted_fix_availability_stops_matching() {
         keep_rank: None,
         tag_targeted: false,
         findings: &findings,
-        first_detected_at: now - Duration::hours(10),
+        finding_age_anchor: Some(FindingAgeAnchor {
+            known_since: now - Duration::hours(10),
+            source: FindingAgeAnchorSource::FirstObservation,
+        }),
         latest_scan_at: now - Duration::hours(1),
     };
     assert!(!matches_bool(&PolicyPredicate::HasFixAvailable, &inputs));
@@ -361,7 +369,10 @@ async fn the_last_scans_proper_subset_is_the_answer() {
         keep_rank: None,
         tag_targeted: false,
         findings: &findings,
-        first_detected_at: now - Duration::hours(10),
+        finding_age_anchor: Some(FindingAgeAnchor {
+            known_since: now - Duration::hours(10),
+            source: FindingAgeAnchorSource::FirstObservation,
+        }),
         latest_scan_at: now - Duration::hours(1),
     };
     assert!(!matches_bool(

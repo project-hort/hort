@@ -18,8 +18,9 @@ pub use alias_group::collapse_alias_groups;
 pub use artifact_kind::ArtifactKind;
 pub use checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 pub use finding::{
-    component_relation_label, highest_severity, is_informational_class, severity_label,
-    severity_summary_from_findings, ComponentRelation, Finding, FindingStatement, SeverityBasis,
+    component_relation_label, highest_severity, is_informational_class,
+    parse_advisory_published_at, severity_label, severity_summary_from_findings, ComponentRelation,
+    Finding, FindingStatement, SeverityBasis,
 };
 pub use idempotency_key::IdempotencyKey;
 pub use sbom::{Ecosystem, PayloadAccess, Sbom, SbomComponent};
