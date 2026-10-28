@@ -327,6 +327,7 @@ fn build_scan_findings_rows(
             detected_at,
             fixed_versions: f.fixed_versions.clone(),
             informational_class: f.informational_class.clone(),
+            advisory_published_at: f.advisory_published_at,
         })
         .collect()
 }
@@ -2666,6 +2667,7 @@ mod tests {
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: hort_domain::types::FindingStatement::Unstated,
+                advisory_published_at: None,
             });
         }
         for i in 0..severity.high {
@@ -2683,6 +2685,7 @@ mod tests {
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: hort_domain::types::FindingStatement::Unstated,
+                advisory_published_at: None,
             });
         }
         for i in 0..severity.medium {
@@ -2700,6 +2703,7 @@ mod tests {
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: hort_domain::types::FindingStatement::Unstated,
+                advisory_published_at: None,
             });
         }
         for i in 0..severity.low {
@@ -2717,9 +2721,36 @@ mod tests {
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: hort_domain::types::FindingStatement::Unstated,
+                advisory_published_at: None,
             });
         }
         out
+    }
+
+    /// The advisory publication date has to reach the projection row or
+    /// it never reaches the persisted column, and the retention
+    /// finding-age anchor loses the only source that dates the
+    /// vulnerability rather than our own scanning of it.
+    #[test]
+    fn scan_findings_rows_preserve_the_advisory_publication_date() {
+        let mut findings = findings_from_summary(&SeveritySummary {
+            critical: 0,
+            high: 2,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        });
+        let published = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("ts");
+        findings[0].advisory_published_at = Some(published);
+        findings[1].advisory_published_at = None;
+        let rows = build_scan_findings_rows(&findings, Uuid::new_v4(), Uuid::new_v4(), Utc::now());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].advisory_published_at, Some(published));
+        assert_eq!(
+            rows[1].advisory_published_at, None,
+            "an undated finding must not inherit a sibling's date, nor the \
+             scan's own `detected_at`"
+        );
     }
 
     #[test]
@@ -4883,6 +4914,7 @@ mod tests {
             severity_basis: hort_domain::types::SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
             statement: hort_domain::types::FindingStatement::Unstated,
+            advisory_published_at: None,
         }];
         uc.record_scan_result(
             artifact_id,
@@ -10404,6 +10436,7 @@ spec:
                 severity_basis: hort_domain::types::SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: hort_domain::types::FindingStatement::Unstated,
+                advisory_published_at: None,
             });
         }
         // Sanity: confirm we cleared the cap before invoking the use case.

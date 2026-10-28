@@ -46,8 +46,8 @@ use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::advisory::{AdvisoryDiffResult, AdvisoryPort};
 use hort_domain::ports::ephemeral_store::EphemeralStore;
 use hort_domain::types::{
-    collapse_alias_groups, is_informational_class, ComponentRelation, Ecosystem, Finding,
-    FindingStatement, SbomComponent, SeverityBasis,
+    collapse_alias_groups, is_informational_class, parse_advisory_published_at, ComponentRelation,
+    Ecosystem, Finding, FindingStatement, SbomComponent, SeverityBasis,
 };
 
 use crate::bulk::{osv_label_to_ecosystem, pull_one_ecosystem, BulkFetchErrorKind};
@@ -575,6 +575,17 @@ impl OsvAdvisoryAdapter {
             // queried one carry the same value and the posture cannot
             // depend on cache state.
             statement: FindingStatement::Unstated,
+            // The OSV entry's publication date, which dates the
+            // VULNERABILITY rather than this query — the retention
+            // grace-period anchor's primary source. Present only on a
+            // hydrated record: `querybatch` returns `id` + `modified`
+            // alone, so an advisory whose hydration failed carries no
+            // date and the anchor falls back to our own later
+            // observation of it.
+            advisory_published_at: vuln
+                .published
+                .as_deref()
+                .and_then(parse_advisory_published_at),
         }
     }
 }
@@ -1032,6 +1043,56 @@ mod tests {
         let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, querybatch_record);
         assert_eq!(finding.cvss_score, None);
         assert_eq!(finding.severity, SeverityThreshold::Critical);
+    }
+
+    /// A hydrated `/v1/vulns/{id}` record carries `published`, and it
+    /// reaches the finding — the retention grace-period anchor's primary
+    /// source.
+    #[test]
+    fn a_hydrated_record_carries_its_publication_date_onto_the_finding() {
+        let prepared = PreparedComponent {
+            name: "rsa",
+            version: Some("0.9.6"),
+            osv_eco: "crates.io",
+            purl: "pkg:cargo/rsa@0.9.6",
+        };
+        let hydrated = OsvVuln {
+            id: "RUSTSEC-2023-0071".to_string(),
+            modified: Some("2026-04-25T06:45:06.122559Z".to_string()),
+            published: Some("2023-11-22T12:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, hydrated);
+        assert_eq!(
+            finding.advisory_published_at,
+            parse_advisory_published_at("2023-11-22T12:00:00Z")
+        );
+    }
+
+    /// `querybatch` returns `id` + `modified` and nothing else, so an
+    /// advisory whose hydration failed has no publication date. The
+    /// retention anchor then falls back to our own later observation of
+    /// it — the non-deleting direction, matching hydration's existing
+    /// fail-soft posture.
+    #[test]
+    fn a_querybatch_shaped_record_carries_no_publication_date() {
+        let prepared = PreparedComponent {
+            name: "rsa",
+            version: Some("0.9.6"),
+            osv_eco: "crates.io",
+            purl: "pkg:cargo/rsa@0.9.6",
+        };
+        let querybatch_record = OsvVuln {
+            id: "RUSTSEC-2023-0071".to_string(),
+            modified: Some("2026-04-25T06:45:06.122559Z".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            querybatch_record.published.is_none(),
+            "the querybatch wire shape carries no publication date"
+        );
+        let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, querybatch_record);
+        assert_eq!(finding.advisory_published_at, None);
     }
 
     #[test]

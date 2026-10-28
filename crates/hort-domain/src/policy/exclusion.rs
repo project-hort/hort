@@ -409,6 +409,7 @@ mod tests {
             severity_basis: crate::types::SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
             statement: crate::types::FindingStatement::Unstated,
+            advisory_published_at: None,
         }
     }
 
@@ -431,6 +432,7 @@ mod tests {
             severity_basis: crate::types::SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
             statement: crate::types::FindingStatement::Unstated,
+            advisory_published_at: None,
         }
     }
 

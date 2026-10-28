@@ -19,6 +19,7 @@
 //!
 //! See `docs/architecture/explanation/scanning-pipeline.md`.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::entities::scan_policy::{CompositeVerdictMode, SeverityThreshold};
@@ -206,6 +207,48 @@ pub struct Finding {
     /// which condemns.
     #[serde(default, skip_serializing_if = "FindingStatement::is_unstated")]
     pub statement: FindingStatement,
+    /// When the advisory this finding names was **published** — the
+    /// upstream fact about the vulnerability, not about any scan of ours.
+    /// `None` when the producing backend carried no publication date.
+    ///
+    /// This is the primary anchor for the retention predicate
+    /// `HasFindingDetectedFor`,
+    /// whose question is *how long has this vulnerability been known* —
+    /// the longer a vulnerability is public, the likelier it is
+    /// exploited. Nothing about this artifact's own scan history answers
+    /// that question, so the date has to travel with the finding from the
+    /// backend that read it. The fallback when it is absent is our own
+    /// earliest observation of the vulnerability, which is a strictly
+    /// later and therefore non-deleting reading; see
+    /// [`crate::retention::resolve_finding_age_anchor`].
+    ///
+    /// **Two wire forms, two meanings.** OSV publishes `published` —
+    /// when the OSV *entry* was created in the advisory database. Trivy
+    /// publishes `PublishedDate`, which trivy-db's own field comment
+    /// takes *"from NVD or GHSA"*. The two therefore date related but
+    /// distinct events, and the disagreement is not a rounding error: in
+    /// a 10-advisory sample of GHSA-primary npm records, 7 agreed within
+    /// a day while one GHSA entry postdated NVD by 325 days and another
+    /// predated it by 15 — in **both** directions, so neither feed is
+    /// systematically the earlier one.
+    ///
+    /// The anchor resolver takes the earliest across sources and records
+    /// which source supplied it, because a feed that dates
+    /// systematically early would otherwise drag every anchor forward
+    /// undiagnosably. [`Self::source_scanner`] is that provenance — note
+    /// that it names the **feed**, not the adapter: the osv-scanner
+    /// backend and the OSV advisory-enrichment path both report
+    /// `"osv"`.
+    ///
+    /// `#[serde(default, skip_serializing_if = …)]` rather than a bare
+    /// `#[serde(default)]`, for the reason spelled out on
+    /// [`Self::statement`]: a finding without a publication date must
+    /// serialise to exactly the bytes it did before the field existed, or
+    /// every `ArtifactBecameVulnerable` and CAS findings blob already
+    /// written re-serialises with a key it never had. Same
+    /// no-re-validation posture as every other shape-evolution here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_published_at: Option<DateTime<Utc>>,
 }
 
 /// Whether a finding's `severity` is a real reading or the fail-closed
@@ -484,6 +527,34 @@ pub fn is_informational_class(s: &str) -> bool {
         s.trim().to_ascii_lowercase().as_str(),
         "unmaintained" | "unsound" | "notice"
     )
+}
+
+/// Parse an upstream advisory publication timestamp into
+/// [`Finding::advisory_published_at`].
+///
+/// One definition, three producers. OSV spells the value `published`,
+/// Trivy spells it `PublishedDate`, and both emit RFC 3339 — but a
+/// per-adapter copy of this parse is a per-adapter opportunity to accept a
+/// shape the others reject, and the field feeds a predicate that deletes.
+/// The adapters call this; nothing else interprets the wire form.
+///
+/// An unparseable value yields `None` rather than an error. The field is
+/// an optional refinement: without it the anchor falls back to our own
+/// first observation of the vulnerability, which is strictly later and so
+/// strictly less likely to expire anything. Failing the whole scan run
+/// over a malformed date on one advisory would trade a harmless loss of
+/// precision for a lost scan.
+///
+/// A future-dated value is returned verbatim, not clamped. The anchor it
+/// becomes is then in the future, and the elapsed-time comparison in the
+/// retention evaluator reads a future anchor as "not elapsed" — the
+/// non-deleting answer. Clamping it to `now` would instead assert the
+/// vulnerability became known this instant, which is a claim nothing
+/// supports.
+pub fn parse_advisory_published_at(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw.trim())
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Per-tier count over `findings` — single source of truth
@@ -825,6 +896,7 @@ mod tests {
             severity_basis: SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
             statement: FindingStatement::Unstated,
+            advisory_published_at: None,
         }
     }
 
@@ -882,6 +954,7 @@ mod tests {
             severity_basis: SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
             statement: FindingStatement::Unstated,
+            advisory_published_at: None,
         };
         let json = serde_json::to_string(&f).unwrap();
         let back: Finding = serde_json::from_str(&json).unwrap();
@@ -1234,6 +1307,7 @@ mod tests {
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: FindingStatement::Unstated,
+                advisory_published_at: None,
             },
             Finding {
                 purl: "pkg:npm/b@1".into(),
@@ -1249,6 +1323,7 @@ mod tests {
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: FindingStatement::Unstated,
+                advisory_published_at: None,
             },
             Finding {
                 purl: "pkg:npm/c@1".into(),
@@ -1264,6 +1339,7 @@ mod tests {
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: FindingStatement::Unstated,
+                advisory_published_at: None,
             },
             Finding {
                 purl: "pkg:npm/d@1".into(),
@@ -1279,6 +1355,7 @@ mod tests {
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: FindingStatement::Unstated,
+                advisory_published_at: None,
             },
             Finding {
                 purl: "pkg:npm/e@1".into(),
@@ -1294,6 +1371,7 @@ mod tests {
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: FindingStatement::Unstated,
+                advisory_published_at: None,
             },
         ];
         let s = severity_summary_from_findings(&findings);
@@ -1409,6 +1487,105 @@ mod tests {
         assert!(!back.is_informational());
     }
 
+    /// `advisory_published_at` is `#[serde(default, skip_serializing_if)]`
+    /// for the reason `statement` is: a finding with no publication date
+    /// must serialise to exactly the bytes it did before the field
+    /// existed, or every `ArtifactBecameVulnerable` and CAS findings
+    /// blob already written re-serialises with a key it never carried.
+    #[test]
+    fn finding_without_a_publication_date_serialises_to_its_legacy_bytes() {
+        let legacy_json = r#"{
+            "purl": "pkg:cargo/proc-macro-error2@2.0.1",
+            "vulnerability_id": "RUSTSEC-2026-0173",
+            "severity": "Critical",
+            "cvss_score": null,
+            "title": "unmaintained",
+            "fixed_versions": [],
+            "source_scanner": "osv",
+            "references": [],
+            "aliases": []
+        }"#;
+        let back: Finding = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(back.advisory_published_at, None);
+        let re_encoded = serde_json::to_value(&back).unwrap();
+        assert!(
+            re_encoded.get("advisory_published_at").is_none(),
+            "an absent publication date must add no key: {re_encoded}"
+        );
+    }
+
+    /// A present date round-trips, and costs the key — the price of the
+    /// field being readable at all.
+    #[test]
+    fn finding_publication_date_round_trips() {
+        let mut f = valid_finding();
+        f.advisory_published_at = Some(
+            DateTime::parse_from_rfc3339("2021-08-25T20:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        let json = serde_json::to_value(&f).unwrap();
+        assert!(json.get("advisory_published_at").is_some());
+        let back: Finding = serde_json::from_value(json).unwrap();
+        assert_eq!(back.advisory_published_at, f.advisory_published_at);
+    }
+
+    // -- parse_advisory_published_at ----------------------------------------
+
+    /// The RFC 3339 spellings the three producers actually emit: OSV's
+    /// `published` (`Z`), and offset / fractional-second forms a feed is
+    /// free to use.
+    #[test]
+    fn parse_advisory_published_at_accepts_the_rfc3339_forms() {
+        let expected = DateTime::parse_from_rfc3339("2021-08-25T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            parse_advisory_published_at("2021-08-25T20:00:00Z"),
+            Some(expected)
+        );
+        assert_eq!(
+            parse_advisory_published_at("2021-08-25T22:00:00+02:00"),
+            Some(expected)
+        );
+        assert_eq!(
+            parse_advisory_published_at("2021-08-25T20:00:00.000Z"),
+            Some(expected)
+        );
+        // Leading / trailing whitespace from a hand-edited feed.
+        assert_eq!(
+            parse_advisory_published_at("  2021-08-25T20:00:00Z  "),
+            Some(expected)
+        );
+    }
+
+    /// An unparseable value yields `None` — the field is an optional
+    /// refinement, and the anchor falls back to our own later
+    /// observation rather than the scan run failing.
+    #[test]
+    fn parse_advisory_published_at_rejects_what_it_cannot_read() {
+        for raw in [
+            "",
+            "   ",
+            "2021-08-25",
+            "25/08/2021",
+            "not a date",
+            "2021-13-45T99:99:99Z",
+        ] {
+            assert_eq!(parse_advisory_published_at(raw), None, "raw: {raw:?}");
+        }
+    }
+
+    /// A future-dated value is returned verbatim. The retention
+    /// evaluator reads a future anchor as "not elapsed" — the
+    /// non-deleting answer — whereas clamping to `now` would assert the
+    /// vulnerability became known this instant.
+    #[test]
+    fn parse_advisory_published_at_does_not_clamp_a_future_date() {
+        let parsed = parse_advisory_published_at("2999-01-01T00:00:00Z").expect("parsed");
+        assert!(parsed > Utc::now());
+    }
+
     #[test]
     fn is_informational_class_recognises_the_three_classes_and_rejects_others() {
         // The canonical recognizer: case-insensitive `unmaintained` /
@@ -1476,6 +1653,7 @@ mod tests {
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: FindingStatement::Unstated,
+                advisory_published_at: None,
             },
             Finding {
                 purl: "pkg:npm/b@1".into(),
@@ -1491,6 +1669,7 @@ mod tests {
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: FindingStatement::Unstated,
+                advisory_published_at: None,
             },
             Finding {
                 purl: "pkg:npm/c@1".into(),
@@ -1506,6 +1685,7 @@ mod tests {
                 severity_basis: SeverityBasis::Assessed,
                 component_relation: ComponentRelation::NotEstablished,
                 statement: FindingStatement::Unstated,
+                advisory_published_at: None,
             },
         ];
         assert_eq!(highest_severity(&findings), Some(SeverityThreshold::High));

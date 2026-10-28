@@ -489,6 +489,7 @@ mod tests {
             severity_basis: hort_domain::types::SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
             statement: hort_domain::types::FindingStatement::Unstated,
+            advisory_published_at: None,
         }
     }
 
