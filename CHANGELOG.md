@@ -22,8 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   batch answers `404` instead of `500` (#364).
 - A policy whose projection row fell behind its event stream no longer refuses
   every later change: the write re-derives the row from the stream and retries,
-  so one failed projection update stops wedging the whole gitops apply. Only a
-  real concurrent writer is refused, as `503` with `Retry-After` (#362).
+  so one failed projection update stops wedging the whole gitops apply. The
+  retry also schedules the policy re-evaluation pass a dropped gate change
+  never got, so the population stops being judged under the superseded gate.
+  Only a real concurrent writer is refused, as `503` with `Retry-After` (#362).
 
 ### Security
 

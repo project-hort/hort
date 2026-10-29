@@ -835,6 +835,12 @@ impl PolicyUseCase {
     ///   from the stream, re-diffs against it and appends once more; a
     ///   second refusal is a concurrent writer and surfaces as
     ///   [`DomainError::Contended`].
+    /// - A re-base that finds the stream already stating the update
+    ///   appends nothing and repairs the row — and enqueues the ADR 0041
+    ///   re-evaluation pass when the row it replaced was behind on a
+    ///   gate-affecting field, because the append that landed may have
+    ///   come from a call that failed its projection write and so never
+    ///   reached its own enqueue.
     /// - Updating an archived policy is rejected as
     ///   [`DomainError::Validation`] — re-checked against the
     ///   stream-derived state too, so a policy archived concurrently is
@@ -931,30 +937,67 @@ impl PolicyUseCase {
         self.write_projection(policy_id, &outcome.projection)
             .await?;
 
-        if !outcome.appended {
-            // A re-base found the stream already states the update. The
-            // row was behind and has just been repaired; nothing was
-            // appended, so nothing is gate-affecting.
+        // Is a re-evaluation pass owed? The appended path and the repair
+        // path are two readings of that one question, and exactly one of
+        // them applies per call.
+        let re_evaluation_owed = if outcome.appended {
             tracing::info!(
                 policy_id = %policy_id,
+                event_count,
+                healed = outcome.healed,
+                "policy updated",
+            );
+            // This call's own batch. A name/scope/timer-only update emits
+            // events but owes nothing — those fields do not change a
+            // stored-findings verdict (see
+            // `PolicyField::is_gate_affecting`).
+            gate_field_changed
+        } else {
+            // A re-base found the stream already states the update, so
+            // the row was behind its stream and has just been repaired.
+            // `outcome.events` is empty here, but the question is not
+            // whether THIS call appended something gate-affecting — it is
+            // whether the append that did happen ever had its pass
+            // scheduled. It may well not have: the append and the enqueue
+            // are not atomic and the projection write sits between them,
+            // so an earlier call whose write failed returned at that
+            // write, one statement short of its enqueue. Nothing else
+            // recovers it — the repaired row no longer diffs, so no later
+            // gitops apply re-appends, and there is no sweep over policy
+            // streams. This is the only code positioned to notice.
+            //
+            // So ask the two rows instead: the stale projection the caller
+            // read against the one re-derived from the stream, through the
+            // same differ `decide` uses, so there is one rule for what
+            // counts as gate-affecting. A difference on a gate field is
+            // exactly "enforcement has been running on a stale gate", and
+            // `!appended` guarantees at least one field differs — the one
+            // the command asked for, which the stream already states and
+            // the row did not.
+            //
+            // This can schedule a second pass for an append that already
+            // had one (the repairing call cannot tell a failed write from
+            // a concurrent writer, and must not try — see
+            // `rebase_policy_from_stream`). That is safe: the pass is
+            // verdict-idempotent, re-deriving each verdict from the same
+            // stored findings and appending nothing where the verdict is
+            // unchanged, which is also why `policy-reevaluation` is
+            // requeued on lease expiry. A second walk costs one pass over
+            // the population, off the request path.
+            let behind_on_gate_field =
+                diff_policy_fields(policy_id, &base.policy, &outcome.projection)
+                    .iter()
+                    .any(|u| u.field.is_gate_affecting());
+            tracing::info!(
+                policy_id = %policy_id,
+                behind_on_gate_field,
                 "update_policy: the stream already states this update; the stale \
                  projection has been re-derived from it",
             );
-            return Ok(());
-        }
+            behind_on_gate_field
+        };
 
-        tracing::info!(
-            policy_id = %policy_id,
-            event_count,
-            healed = outcome.healed,
-            "policy updated",
-        );
-
-        // Enqueue ONE async re-evaluation pass iff a gate-affecting field
-        // changed (ADR 0041 Item 3). A name/scope/timer-only update emits
-        // events but enqueues nothing — those fields do not change a
-        // stored-findings verdict (see `PolicyField::is_gate_affecting`).
-        if gate_field_changed {
+        if re_evaluation_owed {
             self.enqueue_re_evaluation(policy_id, ReEvaluationTrigger::PolicyUpdated { policy_id })
                 .await;
         }
@@ -7863,6 +7906,222 @@ mod tests {
                 "{from} -> {to}"
             );
         }
+    }
+
+    /// How many `policy-reevaluation` tasks have been enqueued so far.
+    /// The repair tests count across TWO `update_policy` calls, where
+    /// [`assert_one_reeval_enqueue`]'s single-call assertion is the wrong
+    /// shape — "none yet" and "exactly one by the end" are two readings of
+    /// the same counter.
+    fn reeval_enqueue_count(jobs: &crate::use_cases::test_support::MockJobsRepository) -> usize {
+        jobs.enqueue_calls()
+            .iter()
+            .filter(|(kind, _, _)| kind == "policy-reevaluation")
+            .count()
+    }
+
+    /// Re-seed the stream the mock serves from the batches it has already
+    /// accepted, as a store that kept what it was given would.
+    ///
+    /// The mock records appends but answers `read_stream` only from
+    /// `seed_stream`, so a test driving two calls over one store has to
+    /// carry the first call's committed batch forward itself — otherwise
+    /// the second call's re-base folds a stream that forgot the append the
+    /// test is about. The events come out of `appended_batches()` rather
+    /// than a hand-written copy, so the stream the re-base reads is the one
+    /// the first call actually produced. `created_from` is the projection
+    /// as it was BEFORE those appends, because `PolicyCreated`'s snapshot
+    /// is the stream's starting state.
+    fn reseed_stream_from_committed_appends(
+        events: &MockEventStore,
+        created_from: &ScanPolicyProjection,
+    ) -> u64 {
+        let committed: Vec<DomainEvent> = events
+            .appended_batches()
+            .iter()
+            .flat_map(|batch| batch.events.iter().map(|e| e.event.clone()))
+            .collect();
+        seed_policy_stream(events, created_from, committed)
+    }
+
+    /// **The pass a failed projection write drops.** A gate-affecting
+    /// update commits its append and then fails its projection write, so
+    /// `update_policy` returns at the write — before the enqueue. The
+    /// retry's re-base finds the stream already stating the update and
+    /// appends nothing, which makes the repair the only code in the system
+    /// still positioned to notice that the committed change never had its
+    /// re-evaluation pass scheduled. Exactly ONE pass across the two
+    /// calls: none from the first (it never reached its enqueue), one from
+    /// the repair.
+    #[tokio::test]
+    async fn update_policy_repair_enqueues_the_pass_the_failed_projection_write_dropped() {
+        let (uc, events, projections, jobs) = make_use_case_with_jobs();
+        let id = Uuid::new_v4();
+        let original = sample_projection(id, 0);
+        seed_policy_stream(&events, &original, Vec::new());
+        projections.insert(original.clone());
+
+        // Call 1: the append lands at version 1; the projection write
+        // fails, leaving the row at version 0 with the old threshold.
+        events.push_append_result(AppendResult {
+            stream_position: 1,
+            global_positions: vec![1],
+        });
+        projections.fail_next_upsert(DomainError::Invariant("projection write failed".into()));
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.severity_threshold = FieldChange::Set(SeverityThreshold::Critical);
+        uc.update_policy(cmd, api_actor())
+            .await
+            .expect_err("the projection write fails, so the call fails");
+        assert_eq!(
+            reeval_enqueue_count(&jobs),
+            0,
+            "the first call returns at the failed projection write, before its \
+             enqueue — this is the pass that goes missing",
+        );
+
+        let tail = reseed_stream_from_committed_appends(&events, &original);
+        assert_eq!(tail, 1, "PolicyCreated plus the committed PolicyUpdated");
+
+        // Call 2 (the retry): the stale row's version is refused, the
+        // re-base finds the stream already states the update, so nothing
+        // is appended — and the owed pass is enqueued anyway.
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.severity_threshold = FieldChange::Set(SeverityThreshold::Critical);
+        uc.update_policy(cmd, api_actor()).await.expect("repairs");
+
+        let repaired = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(
+            repaired.severity_threshold,
+            SeverityThreshold::Critical,
+            "the row is repaired from the stream",
+        );
+        assert_eq!(repaired.stream_version, tail);
+        let (policy_id, trigger) = assert_one_reeval_enqueue(&jobs);
+        assert_eq!(policy_id, id);
+        assert_eq!(
+            trigger,
+            ReEvaluationTrigger::PolicyUpdated { policy_id: id }
+        );
+    }
+
+    /// The same failed-write-then-retry shape with a **name-only** update:
+    /// the repair writes the row and enqueues nothing. The repair's
+    /// question is "was the row behind on a gate-affecting value", not
+    /// "was the row behind" — otherwise every repair becomes a population
+    /// pass.
+    #[tokio::test]
+    async fn update_policy_repair_of_a_name_only_update_enqueues_nothing() {
+        let (uc, events, projections, jobs) = make_use_case_with_jobs();
+        let id = Uuid::new_v4();
+        let original = sample_projection(id, 0);
+        seed_policy_stream(&events, &original, Vec::new());
+        projections.insert(original.clone());
+
+        events.push_append_result(AppendResult {
+            stream_position: 1,
+            global_positions: vec![1],
+        });
+        projections.fail_next_upsert(DomainError::Invariant("projection write failed".into()));
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        uc.update_policy(cmd, api_actor())
+            .await
+            .expect_err("the projection write fails, so the call fails");
+
+        let tail = reseed_stream_from_committed_appends(&events, &original);
+        assert_eq!(tail, 1);
+
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        uc.update_policy(cmd, api_actor()).await.expect("repairs");
+
+        let repaired = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(repaired.name, "renamed", "the row is still repaired");
+        assert_eq!(
+            reeval_enqueue_count(&jobs),
+            0,
+            "a name-only repair alters no stored-findings verdict — no pass",
+        );
+    }
+
+    /// A repair whose stale row was behind only on a **non-gate** field
+    /// enqueues nothing. Reached without a second call: the row sat one
+    /// version behind its stream already, and the update it is asked for
+    /// is the one the stream states.
+    #[tokio::test]
+    async fn update_policy_repair_not_behind_on_a_gate_field_enqueues_nothing() {
+        let (uc, events, projections, jobs) = make_use_case_with_jobs();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        let mut rescanned = stale.clone();
+        rescanned.rescan_interval_hours = 48;
+        let bump = diff_policy_fields(id, &stale, &rescanned)
+            .pop()
+            .expect("one changed field");
+        assert!(
+            !bump.field.is_gate_affecting(),
+            "the premise: rescan interval is not a gate field",
+        );
+        let tail = seed_policy_stream(&events, &stale, vec![DomainEvent::PolicyUpdated(bump)]);
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.rescan_interval_hours = FieldChange::Set(48);
+        uc.update_policy(cmd, api_actor()).await.expect("repairs");
+
+        let repaired = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(repaired.rescan_interval_hours, 48);
+        assert_eq!(repaired.stream_version, tail);
+        assert_eq!(
+            reeval_enqueue_count(&jobs),
+            0,
+            "the row was behind, but not on a gate-affecting value",
+        );
+    }
+
+    /// A re-base that DOES append a gate-affecting field enqueues once,
+    /// not twice. The appended path reads the batch that landed and the
+    /// repair path reads the two rows; they are two answers to one
+    /// question and never both fire for one call.
+    #[tokio::test]
+    async fn update_policy_healed_append_of_a_gate_field_enqueues_exactly_once() {
+        let (uc, events, projections, jobs) = make_use_case_with_jobs();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        // The stream is one event ahead of the row on a non-gate field,
+        // so the first append is refused and the re-base appends the
+        // gate change the command asks for.
+        let mut rescanned = stale.clone();
+        rescanned.rescan_interval_hours = 48;
+        let bump = diff_policy_fields(id, &stale, &rescanned)
+            .pop()
+            .expect("one changed field");
+        let tail = seed_policy_stream(&events, &stale, vec![DomainEvent::PolicyUpdated(bump)]);
+        projections.insert(stale);
+        // LIFO: the result for the SECOND append is pushed first.
+        events.push_append_result(AppendResult {
+            stream_position: 2,
+            global_positions: vec![2],
+        });
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.severity_threshold = FieldChange::Set(SeverityThreshold::Critical);
+        uc.update_policy(cmd, api_actor()).await.expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2, "one refused attempt, one that lands");
+        assert_eq!(batches[1].expected_version, ExpectedVersion::Exact(tail));
+        let (policy_id, trigger) = assert_one_reeval_enqueue(&jobs);
+        assert_eq!(policy_id, id);
+        assert_eq!(
+            trigger,
+            ReEvaluationTrigger::PolicyUpdated { policy_id: id }
+        );
     }
 
     /// The `FieldChange::Set` branch emits exactly one
