@@ -62,6 +62,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cp target/release/hort-server /usr/local/bin/hort-server
 
 # ---------- Stage 2: runtime ----------
+# A digest bumped inside the last quarantine window is not servable to
+# this build: CI resolves base images through the dogfood proxy and a
+# freshly ingested artifact answers `503 artifact is quarantined`. See
+# RELEASING.md, "Base images: warm the pinned digests before tagging".
 # Digest-pinned (B10/INFRA-8).
 FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS runtime
 
