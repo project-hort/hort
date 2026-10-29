@@ -139,6 +139,55 @@ pub fn mint_authenticated_principal_for_format_middleware(
 }
 
 // ---------------------------------------------------------------------------
+// ReadAuthFailed — the read path's failure signal for the rate limiter
+// ---------------------------------------------------------------------------
+
+/// Marker inserted into the **response** extensions by
+/// [`extract_optional_principal`] when a credential WAS presented on a
+/// read and failed validation.
+///
+/// The read path answers `200` with `Option<AuthenticatedPrincipal> =
+/// None` on every failure mode — that is its wire contract (ADR 0021) —
+/// so the response status cannot tell the auth-scope rate limiter that a
+/// credential was spent. Without this marker a flood of bad tokens on a
+/// `GET` is invisible to both of the controls that bound credential
+/// cost: it never reaches the PAT per-IP lockout (deliberately — see
+/// `AuthenticateUseCase::authenticate_bearer_read_path_without_ip_lockout`)
+/// and it never reaches the failure bucket either, while still buying
+/// one Argon2id verify per cache miss.
+///
+/// Carried on the response rather than the request because the verdict
+/// does not exist until the validator has run, and the only consumer
+/// (`auth_rate_limit_middleware_impl`) sits outside this layer and reads
+/// the response on the way out.
+///
+/// `pub(crate)`: that consumer is in this crate, and a format crate
+/// adding its own optional-principal middleware is a plausible future
+/// caller rather than a named one. Widen it together with that caller,
+/// not ahead of it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReadAuthFailed;
+
+/// Whether this request presents a credential the bearer validators will
+/// spend work on.
+///
+/// Defined in terms of the same two extractors [`resolve_token`]
+/// composes, so "presents a credential" cannot drift between the auth
+/// layer and the rate limiter — `presents_credential_agrees_with_resolve_token`
+/// pins the agreement over a corpus. A malformed `Basic` header is NOT a
+/// presentation: it collapses to `TokenSource::Absent`, so no validator
+/// runs and no Argon2 cost is paid. Calling [`resolve_token`] directly
+/// from the rate limiter would work too, but it emits a `warn!` on that
+/// malformed shape and would double-log it once per request.
+pub(crate) fn presents_credential(req: &Request) -> bool {
+    extract_bearer(req).is_some()
+        || matches!(
+            extract_basic_credentials(req),
+            BasicCredentialsResult::Ok { .. }
+        )
+}
+
+// ---------------------------------------------------------------------------
 // Result-label constants for hort_auth_attempts_total
 // ---------------------------------------------------------------------------
 
@@ -303,7 +352,15 @@ pub async fn require_principal(
         }
     }
 
-    match authenticate.authenticate_bearer(&token).await {
+    // `client_ip_raw` is the proxy-trust-resolved caller, and threading
+    // it is what ARMS the PAT validator's per-IP brute-force lockout:
+    // `validate_pat` keys the lockout on the bucketed client IP and a
+    // `None` disables it outright. A write path is a deliberate
+    // credential presentation, so the failure budget belongs here.
+    match authenticate
+        .authenticate_bearer_with_client_ip(&token, client_ip_raw)
+        .await
+    {
         Ok(principal) => {
             emit_attempt_metric(RESULT_SUCCESS);
             // Success stays at debug — every authenticated request
@@ -427,7 +484,9 @@ pub async fn extract_optional_principal(
 
     // Same validation as require_principal, but never produce a
     // response — always pass through with `Option<CallerPrincipal>`
-    // populated.
+    // populated. `credential_failed` records the one outcome the `200`
+    // response cannot express: a credential was presented and rejected.
+    let mut credential_failed = false;
     let principal = match resolve_token(&req) {
         TokenSource::Absent => {
             emit_attempt_metric(RESULT_MISSING_HEADER);
@@ -447,7 +506,16 @@ pub async fn extract_optional_principal(
             None
         }
         TokenSource::Bearer(tok) | TokenSource::Basic { password: tok, .. } => {
-            match authenticate.authenticate_bearer(&tok).await {
+            // The read path deliberately does NOT thread `client_ip_raw`
+            // into the validator: see the entry point's own doc for why a
+            // per-IP lockout here trades one amplification for another.
+            // The cost exposure a bad token on a read does carry is
+            // bounded by the auth-scope rate-limit bucket, which counts
+            // this failure via `ReadAuthFailed` below.
+            match authenticate
+                .authenticate_bearer_read_path_without_ip_lockout(&tok)
+                .await
+            {
                 Ok(principal) => {
                     emit_attempt_metric(RESULT_SUCCESS);
                     // Success stays at debug to keep the info-level log
@@ -467,6 +535,12 @@ pub async fn extract_optional_principal(
                 Err(err) => {
                     let label = classify_auth_error(&err);
                     emit_attempt_metric(label);
+                    // A credential was presented and rejected: the one
+                    // read-path outcome that costs an Argon2id verify
+                    // and buys the caller nothing. Stamped onto the
+                    // response below so the auth-scope bucket can count
+                    // it; see `ReadAuthFailed`.
+                    credential_failed = true;
                     // Failure goes to info — same level as the write
                     // path. The wire status is still 200; the audit
                     // signal is the metric + this log line, NOT a 401.
@@ -490,7 +564,11 @@ pub async fn extract_optional_principal(
     let principal = principal.map(AuthenticatedPrincipal::from_validated);
     req.extensions_mut()
         .insert::<Option<AuthenticatedPrincipal>>(principal);
-    next.run(req).await
+    let mut response = next.run(req).await;
+    if credential_failed {
+        response.extensions_mut().insert(ReadAuthFailed);
+    }
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -1292,7 +1370,6 @@ mod tests {
     ) {
         use hort_app::use_cases::test_support::MockEventStore;
         use hort_domain::ports::ephemeral_store::EphemeralStore;
-
         let idp = Arc::new(MockIdentityProvider::new());
         let users = Arc::new(MockUserRepository::new());
         let event_store: Arc<MockEventStore> = Arc::new(MockEventStore::new());
@@ -1924,6 +2001,128 @@ mod tests {
             });
         assert_eq!(status, StatusCode::OK);
         assert_eq!(String::from_utf8(body).unwrap(), "none");
+    }
+
+    // -- Read-path credential-failure marker ---------
+    //
+    // The read path answers `200` with an anonymous principal on every
+    // failure mode, so the auth-scope rate limiter cannot tell a
+    // rejected credential from an anonymous read by status alone. The
+    // `ReadAuthFailed` response marker is that signal, and the pair of
+    // tests below pins both directions — a marker on a failure, and NO
+    // marker on an anonymous read or a successful one. Without the
+    // second direction a layer that stamped unconditionally would
+    // count every read and 429 legitimate traffic.
+
+    #[test]
+    fn read_path_marks_a_rejected_credential_on_the_response() {
+        let marked = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (ctx, _idp) = enabled_ctx(prom_handle());
+                let router = router_with_optional(ctx);
+                let resp = router
+                    .oneshot(
+                        HttpRequest::get("/read")
+                            .header(header::AUTHORIZATION, "Bearer nope")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::OK,
+                    "the marker must not change the wire contract"
+                );
+                resp.extensions().get::<ReadAuthFailed>().is_some()
+            });
+        assert!(
+            marked,
+            "a presented-and-rejected credential on a read must be marked so \
+             the auth-scope bucket can count its Argon2id cost"
+        );
+    }
+
+    #[test]
+    fn read_path_does_not_mark_an_anonymous_or_valid_read() {
+        let (anonymous, valid) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (ctx, idp) = enabled_ctx(prom_handle());
+                idp.register_token("good", sample_claims("kc:read"));
+                let router = router_with_optional(ctx);
+                let anonymous = router
+                    .clone()
+                    .oneshot(HttpRequest::get("/read").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .extensions()
+                    .get::<ReadAuthFailed>()
+                    .is_some();
+                let valid = router
+                    .oneshot(
+                        HttpRequest::get("/read")
+                            .header(header::AUTHORIZATION, "Bearer good")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .extensions()
+                    .get::<ReadAuthFailed>()
+                    .is_some();
+                (anonymous, valid)
+            });
+        assert!(
+            !anonymous,
+            "an anonymous read presents no credential and spends no \
+             validation work: marking it would 429 public read traffic"
+        );
+        assert!(
+            !valid,
+            "a valid credential on a read must consume no failure budget, \
+             exactly like a valid credential on a write"
+        );
+    }
+
+    // -- presents_credential: one definition, two consumers ---------
+
+    #[test]
+    fn presents_credential_agrees_with_resolve_token() {
+        // `presents_credential` exists so the rate limiter does not
+        // re-type "carries a credential" and does not double-log the
+        // malformed-Basic `warn!`. Its answer must be exactly
+        // `resolve_token(..).as_bearer_token().is_some()` — pin the
+        // agreement over every header shape that matters, including the
+        // malformed ones, which are NOT presentations (they collapse to
+        // Absent, so no validator runs and no Argon2 cost is paid).
+        let shapes: [Option<&str>; 8] = [
+            None,
+            Some(""),
+            Some("Bearer"),
+            Some("Bearer "),
+            Some("Bearer tok"),
+            Some("Basic !!!not-base64!!!"),
+            Some("Basic dXNlcg=="),
+            Some("Basic X190b2tlbl9fOmhvcnRfcGF0X3h4"),
+        ];
+        for shape in shapes {
+            let mut builder = HttpRequest::get("/read");
+            if let Some(value) = shape {
+                builder = builder.header(header::AUTHORIZATION, value);
+            }
+            let req = builder.body(Body::empty()).unwrap();
+            assert_eq!(
+                presents_credential(&req),
+                resolve_token(&req).as_bearer_token().is_some(),
+                "presents_credential disagrees with resolve_token on {shape:?}"
+            );
+        }
     }
 
     // -- Read-path observability ---------
@@ -2869,6 +3068,153 @@ mod tests {
             StatusCode::OK,
             "carrier path must validate the password-field token \
              regardless of the (ignored) username half"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Write-path per-IP lockout: the IP must reach the PAT validator
+    // ---------------------------------------------------------------
+    //
+    // `require_principal` is a deliberate credential presentation, so a
+    // failed one must count against the caller's own lockout bucket.
+    // The bucket key is the only observable: every `PatValidationError`
+    // arm collapses to the same generic `401`, lockout included.
+    //
+    // The IP under test is carried in `RequestTrust`, and the request
+    // ALSO carries a different `ConnectInfo` — so a middleware that
+    // reached for the socket peer instead of the trust extension, or
+    // that threaded `None`, writes a different key (or no key) and
+    // fails here.
+
+    /// `enabled_ctx` plus a wired `PatValidationUseCase`. Returns the
+    /// durable ephemeral store the lockout keys into.
+    fn enabled_ctx_with_pat(
+        handle: metrics_exporter_prometheus::PrometheusHandle,
+        lockout: hort_app::use_cases::pat_validation_use_case::PatLockoutConfig,
+    ) -> (
+        Arc<AppContext>,
+        Arc<dyn hort_domain::ports::ephemeral_store::EphemeralStore>,
+    ) {
+        use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
+        use hort_app::use_cases::pat_validation_use_case::PatValidationUseCase;
+        use hort_app::use_cases::test_support::MockApiTokenRepository;
+        use hort_domain::ports::api_token_repository::ApiTokenRepository;
+
+        let idp = Arc::new(MockIdentityProvider::new());
+        let users = Arc::new(MockUserRepository::new());
+        let (base, mocks) = build_mock_ctx(handle);
+        // `MockApiTokenRepository::find_by_prefix` answers `None`, which
+        // is exactly the prefix-not-found path: the validator still runs
+        // its sentinel Argon2id verify and still books the failure.
+        let pat = Arc::new(PatValidationUseCase::new(
+            Arc::new(MockApiTokenRepository::new()) as Arc<dyn ApiTokenRepository>,
+            users.clone() as Arc<dyn UserRepository>,
+            mocks.ephemeral_durable.clone(),
+            Arc::new(PatCache::new(16, std::time::Duration::from_secs(300))),
+            Arc::new(SystemClock),
+            lockout,
+        ));
+        let authenticate = Arc::new(
+            AuthenticateUseCase::new(
+                idp as Arc<dyn IdentityProvider>,
+                users as Arc<dyn UserRepository>,
+                claim_mappings(),
+            )
+            .with_pat_validation(pat),
+        );
+        let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(
+            Vec::new(),
+        )));
+        let ctx = with_auth(
+            &base,
+            AuthContext::Enabled {
+                authenticate,
+                rbac,
+                issuer_url: None,
+            },
+        );
+        // The plaintext-bearer gate runs BEFORE the validator and would
+        // answer 426 for a PAT on a test request with no TLS evidence,
+        // so the credential would never reach the lockout this harness
+        // exists to observe. Allowing it here is the same opt-in the
+        // `pat_over_http` tests in this module use.
+        let ctx = crate::test_support::with_pat_over_http_allowed(&ctx, true);
+        (ctx, mocks.ephemeral_durable.clone())
+    }
+
+    /// A PAT-shaped plaintext that parses and matches no row.
+    const UNKNOWN_PAT: &str = "hort_pat_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+
+    #[test]
+    fn write_path_failure_counts_against_the_trust_resolved_client() {
+        use hort_app::metrics::client_ip_bucket;
+        use hort_app::use_cases::pat_validation_use_case::{
+            PatLockoutConfig, PAT_LOCKOUT_BY_IP_COUNTER_PREFIX, PAT_LOCKOUT_BY_IP_FLAG_PREFIX,
+        };
+
+        let client: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let peer: std::net::SocketAddr = "10.0.0.5:4444".parse().unwrap();
+        let (counter, flag, proxy_counter) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (ctx, store) = enabled_ctx_with_pat(
+                    prom_handle(),
+                    PatLockoutConfig {
+                        threshold: 2,
+                        ..PatLockoutConfig::DEFAULT
+                    },
+                );
+                let router = router_with_require_and_trust(ctx, client);
+                for _ in 0..2 {
+                    let resp = router
+                        .clone()
+                        .oneshot(
+                            HttpRequest::post("/protected")
+                                .header(header::AUTHORIZATION, format!("Bearer {UNKNOWN_PAT}"))
+                                .extension(axum::extract::ConnectInfo(peer))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        resp.status(),
+                        StatusCode::UNAUTHORIZED,
+                        "an unknown PAT must 401 regardless of attribution"
+                    );
+                }
+                let bucket = client_ip_bucket(client);
+                let counter = store
+                    .get(&format!("{PAT_LOCKOUT_BY_IP_COUNTER_PREFIX}{bucket}"))
+                    .await
+                    .unwrap();
+                let flag = store
+                    .get(&format!("{PAT_LOCKOUT_BY_IP_FLAG_PREFIX}{bucket}"))
+                    .await
+                    .unwrap();
+                let proxy_bucket = client_ip_bucket(peer.ip());
+                let proxy_counter = store
+                    .get(&format!("{PAT_LOCKOUT_BY_IP_COUNTER_PREFIX}{proxy_bucket}"))
+                    .await
+                    .unwrap();
+                (counter, flag, proxy_counter)
+            });
+        assert!(
+            counter.is_some(),
+            "a failed write-path credential must count against the caller's \
+             bucket; absent means the middleware threaded None and the \
+             lockout is disarmed"
+        );
+        assert!(
+            flag.is_some(),
+            "two failures at threshold 2 must trip the lockout flag"
+        );
+        assert!(
+            proxy_counter.is_none(),
+            "nothing may be attributed to the socket peer: behind a proxy that \
+             is one address for every caller"
         );
     }
 

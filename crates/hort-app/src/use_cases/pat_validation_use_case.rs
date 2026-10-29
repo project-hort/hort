@@ -152,12 +152,24 @@ struct ApiTokenUsedGate {
 
 /// Brute-force lockout policy for the PAT validator.
 ///
-/// Defaults: **30 misses / 5 min triggers a 15-min
-/// lockout**. Argon2id at OWASP-2024 cost is ~50–80 ms per verify, so
-/// an attacker botnet of N IPs × 60/min through the per-IP rate limiter
-/// would otherwise pin N×80 CPU-cores at no auth cost — this
-/// gate caps the verify rate per IP-bucket regardless of where the
-/// global rate-limiter is.
+/// Defaults: **30 misses / 5 min triggers a 15-min lockout**. One
+/// Argon2id verify at this workspace's parameters
+/// (`m=19456, t=2, p=1` — see `crate::argon2_hash`) costs **~9 ms and
+/// 19 MiB** of resident memory, measured in release mode on one
+/// shared-core sandbox (8.7–9.3 ms across runs; a debug build is ~25×
+/// slower and is not the figure to reason from). Treat it as an order
+/// of magnitude, not a constant: it moves with core speed.
+///
+/// Memory, not CPU, is what makes a flood expensive here — 19 MiB per
+/// concurrent verify. An attacker botnet of N IPs × 60/min through the
+/// per-IP rate limiter costs N×9 ms of CPU and N×19 MiB at no auth
+/// cost; this gate caps the verify rate per IP-bucket regardless of
+/// where the global rate-limiter is.
+///
+/// Any capacity arithmetic that quotes a per-verify cost must quote a
+/// measured one: an earlier version of this comment said "~50–80 ms",
+/// 6–9× high, in the direction that makes a flood look more expensive
+/// than it is.
 ///
 /// Window-anchored at first failure (no TTL extension on subsequent
 /// failures, mirroring the password-login `LockoutConfig`); a paced

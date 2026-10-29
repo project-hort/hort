@@ -283,6 +283,18 @@ services:
       # Production behind nginx/Caddy/traefik leaves this UNSET and
       # relies on the proxy's X-Forwarded-Proto header.
       HORT_PUBLIC_BASE_URL: "http://hort-server:8080"
+      # Clients in this stack reach hort-server directly on the compose
+      # network — no proxy, ingress or LB in between — so the TCP peer
+      # IS the client and the per-IP controls (PAT lockout,
+      # auth-failure bucket, per-IP concurrency cap) key on the right
+      # address. Declaring it is required whenever
+      # HORT_TRUSTED_PROXY_CIDRS is empty: the server refuses to start
+      # rather than guess, because behind an edge the same
+      # configuration attributes every caller on earth to one bucket.
+      # A production stack behind nginx/Caddy/traefik sets
+      # HORT_TRUSTED_PROXY_CIDRS to the proxy's source ranges instead
+      # and leaves this unset.
+      HORT_CLIENT_IP_FROM_SOCKET_PEER: "true"
       RUST_LOG: "hort_server=info,hort_app=info,hort_http_core=info,hort_http_cargo=info,hort_http_npm=info,hort_http_pypi=info,hort_http_oci=info,hort_adapters_postgres=info,hort_adapters_storage=info,hort_adapters_oidc=debug,hort_http_core::middleware::auth=debug"
       # HORT_OIDC_ISSUER_URL uses the compose network alias so hort-server
       # can fetch JWKS without leaving the network. The realm is imported

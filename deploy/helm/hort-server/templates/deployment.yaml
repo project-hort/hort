@@ -110,6 +110,16 @@ spec:
             {{- if .Values.trustedProxyCidrs }}
             - name: HORT_TRUSTED_PROXY_CIDRS
               value: {{ join "," .Values.trustedProxyCidrs | quote }}
+            {{- else }}
+            {{- /*
+              With no trusted-proxy allowlist the server attributes every
+              request to its TCP peer, which is only the real client when
+              nothing sits in front of it. The binary refuses to start
+              undeclared, so render the operator's declaration (default
+              false → refuse) rather than omitting the variable.
+            */}}
+            - name: HORT_CLIENT_IP_FROM_SOCKET_PEER
+              value: {{ .Values.clientIpFromSocketPeer | quote }}
             {{- end }}
             {{- if .Values.rateLimitExemptCidrs }}
             - name: HORT_RATELIMIT_EXEMPT_CIDRS

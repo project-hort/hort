@@ -16,9 +16,11 @@
 //!   /api/v1/auth/exchange`, which is anonymous — see below). Backed by
 //!   [`AuthFailureWindow`], a bespoke per-IP fixed-window **failure**
 //!   counter — NOT `governor` (see "Why not `governor` for the auth
-//!   scope?" below). Counts only authentication **failures** (`401`
-//!   responses), never successful writes by a valid principal. Cap via
-//!   `HORT_RATELIMIT_AUTH_PER_MIN` (default 60 failures/minute/IP).
+//!   scope?" below). Counts only authentication **failures** (a `401`,
+//!   or a read whose presented credential was rejected — see "Reads
+//!   that present a credential" below), never successful writes by a
+//!   valid principal. Cap via `HORT_RATELIMIT_AUTH_PER_MIN` (default 60
+//!   failures/minute/IP).
 //!
 //! # Why not `governor` for the auth scope?
 //!
@@ -97,6 +99,32 @@
 //! count, for the same reason a downstream `403` never counts elsewhere:
 //! the credential itself was accepted.
 //!
+//! # Reads that present a credential
+//!
+//! The method filter engages on every write, and on a read **only when
+//! the request presents a credential**. An anonymous read stays out of
+//! the bucket entirely: reads are public by design (ADR 0021) and a
+//! credential-less `GET` costs no validation work. A read that carries
+//! a token is different — on a PAT-cache miss it buys one Argon2id
+//! verify at `m=19456, t=2, p=1`, the same work a write's credential
+//! buys — and the read path deliberately arms no per-IP lockout behind
+//! it, because a lockout there would let an unauthenticated caller deny
+//! its whole /24's *writes* for fifteen minutes. This bucket is
+//! therefore the only bound on read-path credential cost, and it is the
+//! right one: a 60-second window that counts only failures and
+//! recovers on its own.
+//!
+//! Counting it needs the `ReadAuthFailed` response marker, because the
+//! read path answers `200` on a rejected credential by contract — the
+//! status alone cannot distinguish a bad token from an anonymous read.
+//!
+//! The trade this accepts: a credential-stuffing flood of bad tokens on
+//! reads from one /24 can now exhaust that /24's shared failure budget
+//! and 429 its writes for the rest of the minute. That is the same
+//! exposure a flood of bad tokens on *writes* already had, bounded by
+//! the same window; the alternative — leaving the Argon2id cost
+//! unbounded on the larger, anonymous-by-default surface — is worse.
+//!
 //! # CIDR exemption
 //!
 //! Traffic whose resolved `client_ip` is in `HORT_RATELIMIT_EXEMPT_CIDRS`
@@ -144,6 +172,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use ipnet::IpNet;
 
+use crate::middleware::auth::{presents_credential, ReadAuthFailed};
 use crate::middleware::trust::{cidr_contains, RequestTrust};
 
 // ---------------------------------------------------------------------------
@@ -563,8 +592,19 @@ async fn auth_rate_limit_middleware_impl(
     req: Request,
     next: Next,
 ) -> Response {
-    // (a) Method filter.
-    if !write_methods().contains(req.method()) {
+    // (a) Method filter: every write, plus any read that PRESENTS a
+    // credential.
+    //
+    // A read that presents no credential is out of scope and stays
+    // untouched — reads are public by design (ADR 0021) and an
+    // anonymous `GET` costs no validation work. A read that DOES
+    // present one is not free: on a cache miss it buys an Argon2id
+    // verify at `m=19456, t=2, p=1` — the same work a write's
+    // credential buys — and the read path deliberately has no per-IP
+    // lockout behind it
+    // (`AuthenticateUseCase::authenticate_bearer_read_path_without_ip_lockout`),
+    // so this bucket is the only bound on that cost.
+    if !write_methods().contains(req.method()) && !presents_credential(&req) {
         return next.run(req).await;
     }
 
@@ -600,13 +640,23 @@ async fn auth_rate_limit_middleware_impl(
         return rate_limit_response(state.failures.retry_after_secs(client_ip));
     }
 
-    // (e) Run downstream, then consume ONLY on a 401. A 403 (valid
-    // principal, insufficient authorization for THIS write) can only be
-    // reached after require_principal already accepted the credential —
-    // counting it here would penalize authenticated clients for
-    // authorization outcomes, not credential validity (invariant 3).
+    // (e) Run downstream, then consume ONLY on a credential failure. A
+    // 403 (valid principal, insufficient authorization for THIS write)
+    // can only be reached after require_principal already accepted the
+    // credential — counting it here would penalize authenticated
+    // clients for authorization outcomes, not credential validity
+    // (invariant 3).
+    //
+    // Two shapes of failure, because the read path answers `200` on a
+    // rejected credential by contract: a `401` from anything that
+    // rejects on the wire, and the `ReadAuthFailed` response marker
+    // `extract_optional_principal` stamps when a presented credential
+    // failed. A successful credentialed read carries neither and
+    // consumes nothing, exactly like a successful write.
     let response = next.run(req).await;
-    if response.status() == StatusCode::UNAUTHORIZED {
+    let credential_failed = response.status() == StatusCode::UNAUTHORIZED
+        || response.extensions().get::<ReadAuthFailed>().is_some();
+    if credential_failed {
         state.failures.record_failure(client_ip);
     }
     response
@@ -664,8 +714,10 @@ pub type AuthRateLimitLayer = axum::middleware::FromFnLayer<
 /// still a credential-stuffing target (see the module doc). Counts only
 /// authentication FAILURES (`401` responses); a valid principal's
 /// writes never touch this bucket. The middleware's own method filter
-/// skips GET/HEAD/OPTIONS — a GET is never a credential-presentation
-/// attempt.
+/// engages on every write, and on a read only when the request presents
+/// a credential: a credential-less read costs no validation work, but a
+/// read carrying a bad token buys an Argon2id verify on every cache
+/// miss and has no per-IP lockout behind it.
 pub fn auth_rate_limit_layer(config: &RateLimitConfig) -> AuthRateLimitLayer {
     let state = AuthRateLimitState {
         failures: Arc::new(AuthFailureWindow::new(
@@ -810,6 +862,27 @@ mod tests {
         let mut r = HttpRequest::post(uri).body(Body::empty()).unwrap();
         r.extensions_mut().insert(t);
         r
+    }
+
+    /// A read that PRESENTS a credential — the shape the method filter
+    /// now admits. The token value is irrelevant here: this layer never
+    /// validates it, it only observes that one was spent.
+    fn credentialed_get_with_trust(uri: &str, t: RequestTrust) -> HttpRequest<Body> {
+        let mut r = HttpRequest::get(uri)
+            .header(header::AUTHORIZATION, "Bearer some-token")
+            .body(Body::empty())
+            .unwrap();
+        r.extensions_mut().insert(t);
+        r
+    }
+
+    /// Stand-in for `extract_optional_principal` rejecting a presented
+    /// credential: `200` on the wire (its contract) plus the
+    /// `ReadAuthFailed` response marker.
+    async fn read_auth_failed_handler() -> Response {
+        let mut response = (StatusCode::OK, "ok").into_response();
+        response.extensions_mut().insert(ReadAuthFailed);
+        response
     }
 
     /// Locate a counter by name and exact label set. Returns the
@@ -1206,11 +1279,12 @@ mod tests {
         );
     }
 
-    // Auth layer bypasses GET/HEAD/OPTIONS: `require_principal` is only
-    // attached on write methods (see `method_based_auth_dispatch`), so the
-    // auth-rate-limit filter mirrors that split.
+    // Auth layer bypasses a read that presents NO credential: an
+    // anonymous `GET` costs no validation work and reads are public by
+    // design (ADR 0021). A read that DOES present a credential is in
+    // scope — see the two tests after this one.
     #[test]
-    fn auth_layer_skips_get_requests_regardless_of_burst() {
+    fn auth_layer_skips_credential_less_get_requests_regardless_of_burst() {
         let cfg = RateLimitConfig::new(1, 10, vec![]);
         let statuses = rt(async {
             let router = Router::new()
@@ -1231,7 +1305,79 @@ mod tests {
         });
         assert!(
             statuses.iter().all(|s| *s == StatusCode::OK),
-            "GETs tripped the auth-rate-limit filter despite method carve-out: {statuses:?}"
+            "credential-less GETs tripped the auth-rate-limit filter despite the \
+             carve-out: {statuses:?}"
+        );
+    }
+
+    /// A read that presents a credential and has it REJECTED costs one
+    /// Argon2id verify per PAT-cache miss, and the read path
+    /// deliberately arms no per-IP lockout behind it — this bucket is
+    /// the only bound on that cost. The read path answers `200` by
+    /// contract, so the failure arrives as the `ReadAuthFailed`
+    /// response marker rather than as a status.
+    #[test]
+    fn auth_layer_counts_a_read_whose_presented_credential_failed() {
+        let cfg = RateLimitConfig::new(1, 1000, vec![]);
+        let (s1, s2) = rt(async {
+            let router = Router::new()
+                .route("/read", get(read_auth_failed_handler))
+                .layer(auth_rate_limit_layer(&cfg));
+            let s1 = router
+                .clone()
+                .oneshot(credentialed_get_with_trust("/read", trust("10.0.0.21")))
+                .await
+                .unwrap()
+                .status();
+            let s2 = router
+                .oneshot(credentialed_get_with_trust("/read", trust("10.0.0.21")))
+                .await
+                .unwrap()
+                .status();
+            (s1, s2)
+        });
+        assert_eq!(
+            s1,
+            StatusCode::OK,
+            "the read path's wire contract is unchanged: 200 with an \
+             anonymous principal, not a 401"
+        );
+        assert_eq!(
+            s2,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first failed credential must have drawn the bucket down; \
+             without the ReadAuthFailed marker a bad-token flood on reads is \
+             free of every per-IP control"
+        );
+    }
+
+    /// The other half: a credentialed read that SUCCEEDS consumes
+    /// nothing, exactly like a successful write. Otherwise every
+    /// authenticated client's own read traffic would exhaust the
+    /// failure budget it shares with its writes.
+    #[test]
+    fn auth_layer_does_not_count_a_read_whose_credential_succeeded() {
+        let cfg = RateLimitConfig::new(2, 1000, vec![]);
+        let statuses = rt(async {
+            let router = Router::new()
+                .route("/read", get(ok_handler))
+                .layer(auth_rate_limit_layer(&cfg));
+            let mut statuses = Vec::new();
+            for _ in 0..10 {
+                let s = router
+                    .clone()
+                    .oneshot(credentialed_get_with_trust("/read", trust("10.0.0.22")))
+                    .await
+                    .unwrap()
+                    .status();
+                statuses.push(s);
+            }
+            statuses
+        });
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::OK),
+            "valid credentialed reads must never be auth-429'd regardless of \
+             volume: {statuses:?}"
         );
     }
 

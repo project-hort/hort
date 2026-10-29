@@ -85,8 +85,28 @@ requireHttps: true
 # HORT_TRUSTED_PROXY_CIDRS — list of CIDRs the binary trusts
 # X-Forwarded-* headers from (gates the requireHttps + HSTS path).
 # Set to your edge's pod / service / LB CIDRs. Empty = no trust,
-# X-Forwarded-* ignored. Example: ["10.244.0.0/16", "::1/128"]
+# X-Forwarded-* ignored, and every request is attributed to its TCP
+# peer. Example: ["10.244.0.0/16", "::1/128"]
+# SECURITY: in a Kubernetes install there is essentially always an
+# ingress or LB in front, so leaving this empty makes the per-IP
+# controls (PAT brute-force lockout, auth-failure rate limit, per-IP
+# concurrency cap) key on the edge's address — one bucket for every
+# caller in the world. Set it, or declare the direct-connection shape
+# below; the binary refuses to start if neither is done.
+# Do NOT use 0.0.0.0/0: that trusts X-Forwarded-For from everyone,
+# which lets any caller choose its own attribution.
 trustedProxyCidrs: []
+
+# HORT_CLIENT_IP_FROM_SOCKET_PEER — declares that clients connect to
+# this server DIRECTLY, with no proxy, ingress or load balancer in
+# between, so the TCP peer address IS the client. Required (true) only
+# when `trustedProxyCidrs` is empty; ignored when it is set, because
+# the allowlist already declares where the edge is.
+# SECURITY: setting this on a proxied deployment is what it looks like
+# to disable the per-IP controls deployment-wide. There is no default
+# that guesses: with neither value supplied the binary refuses to start
+# (ConfigError::ClientIpAttributionUnconfigured).
+clientIpFromSocketPeer: false
 
 # HORT_RATELIMIT_EXEMPT_CIDRS — list of source CIDRs whose resolved
 # client IP bypasses BOTH the auth and write rate-limit buckets. The

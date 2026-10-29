@@ -532,8 +532,24 @@ async fn run_async() -> anyhow::Result<()> {
         (true, true) => "BOTH",
         (false, false) => unreachable!("Config::from_env rejects this combination"),
     };
+    // `trust_mode` describes where the PUBLIC URL comes from;
+    // `client_ip_source` describes who the per-IP controls (PAT
+    // lockout, auth-failure bucket, per-IP concurrency cap) think the
+    // caller is. They are independent — `public_base_url` has no
+    // bearing on attribution — and reporting only the first is how a
+    // deployment attributing every caller to its ingress looked
+    // correctly configured at boot.
+    let client_ip_source = if trust_config.trusted_proxy_cidrs.is_empty() {
+        // Reachable only because the operator declared it via
+        // `HORT_CLIENT_IP_FROM_SOCKET_PEER` — `Config::from_env`
+        // refuses the undeclared case.
+        "socket_peer"
+    } else {
+        "forwarded_for_behind_trusted_proxy"
+    };
     info!(
         trust_mode,
+        client_ip_source,
         trusted_proxy_cidr_count = trust_config.trusted_proxy_cidrs.len(),
         "trust configuration loaded"
     );
