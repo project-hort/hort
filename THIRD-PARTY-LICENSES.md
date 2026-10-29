@@ -26,7 +26,7 @@ the result instead.
 | prost | 0.14.3 | Apache-2.0 | https://github.com/tokio-rs/prost |
 | ring | 0.17.14 | Apache-2.0 | https://github.com/briansmith/ring |
 | async-nats | 0.51.0 | Apache-2.0 | https://github.com/nats-io/nats.rs |
-| aws-lc-sys | 0.46.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
+| aws-lc-sys | 0.47.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
 | blake3 | 1.8.7 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
 | constant_time_eq | 0.4.2 | Apache-2.0 | https://github.com/cesarb/constant_time_eq |
 | kube-client | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
@@ -46,7 +46,7 @@ the result instead.
 | curve25519-dalek | 5.0.0 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek |
 | ed25519-dalek | 2.2.0 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek |
 | ed25519-dalek | 3.0.0 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek |
-| aws-lc-sys | 0.46.0 | BSD-3-Clause | https://github.com/aws/aws-lc-rs |
+| aws-lc-sys | 0.47.0 | BSD-3-Clause | https://github.com/aws/aws-lc-rs |
 | curve25519-dalek | 4.1.3 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek |
 | sha1_smol | 1.0.1 | BSD-3-Clause | https://github.com/mitsuhiko/sha1-smol |
 | encoding_rs | 0.8.35 | BSD-3-Clause | https://github.com/hsivonen/encoding_rs |
@@ -71,8 +71,8 @@ the result instead.
 | simple_asn1 | 0.6.4 | ISC | https://github.com/acw/simple_asn1 |
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
 | rustls-webpki | 0.103.16 | ISC | https://github.com/rustls/webpki |
-| aws-lc-rs | 1.18.2 | ISC | https://github.com/aws/aws-lc-rs |
-| aws-lc-sys | 0.46.0 | ISC | https://github.com/aws/aws-lc-rs |
+| aws-lc-rs | 1.19.0 | ISC | https://github.com/aws/aws-lc-rs |
+| aws-lc-sys | 0.47.0 | ISC | https://github.com/aws/aws-lc-rs |
 | dotenvy | 0.15.7 | MIT | https://github.com/allan2/dotenvy |
 | quanta | 0.12.6 | MIT | https://github.com/metrics-rs/quanta |
 | atomic-waker | 1.1.2 | MIT | https://github.com/smol-rs/atomic-waker |
@@ -501,7 +501,7 @@ the result instead.
 | security-framework | 3.7.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
 | jsonwebtoken | 11.1.0 | MIT | https://github.com/Keats/jsonwebtoken |
-| aws-lc-sys | 0.46.0 | MIT | https://github.com/aws/aws-lc-rs |
+| aws-lc-sys | 0.47.0 | MIT | https://github.com/aws/aws-lc-rs |
 | webbrowser | 1.2.5 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | derive_more | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
@@ -3217,7 +3217,7 @@ limitations under the License.
 
 ```
 
-### aws-lc-sys 0.46.0 — Apache-2.0
+### aws-lc-sys 0.47.0 — Apache-2.0
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -4596,7 +4596,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
-### aws-lc-sys 0.46.0 — BSD-3-Clause
+### aws-lc-sys 0.47.0 — BSD-3-Clause
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -5366,7 +5366,7 @@ third-party/chromium/LICENSE.
 
 ```
 
-### aws-lc-rs 1.18.2 — ISC
+### aws-lc-rs 1.19.0 — ISC
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -5382,7 +5382,7 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot; AND ISC DISCLAIMS ALL WARRANTIES WITH
 
 ```
 
-### aws-lc-sys 0.46.0 — ISC
+### aws-lc-sys 0.47.0 — ISC
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -18526,7 +18526,7 @@ SOFTWARE.
 
 ```
 
-### aws-lc-sys 0.46.0 — MIT
+### aws-lc-sys 0.47.0 — MIT
 
 Repository: https://github.com/aws/aws-lc-rs
 
