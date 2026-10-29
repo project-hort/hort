@@ -173,13 +173,15 @@ where
 // ---------------------------------------------------------------------------
 
 /// Parse a `trivy <fs|rootfs|image> --format json` document and return the
-/// lowered [`Finding`] list, applying the same per-finding cap filter
+/// lowered [`Finding`] list, applying the same per-field bounds
 /// [`TrivyAdapter::scan`] applies.
 ///
 /// Exposed publicly for fixture-based testing (the adapter's own
 /// integration tests in `tests/` consume this) and for any future
 /// caller that needs to re-parse a Trivy report archived elsewhere.
-/// `Err(DomainError::Validation)` on malformed JSON.
+/// `Err(DomainError::Validation)` on malformed JSON, and on a reported
+/// finding whose identity fields exceed the domain caps — the lowering
+/// never returns a shorter finding list than the report held.
 ///
 /// Each returned finding carries the side of ADR 0064 D2's line its
 /// report section put it on; which artifact's filesystem that claim is
@@ -189,7 +191,7 @@ where
 pub fn parse_findings_from_json(stdout: &[u8]) -> DomainResult<Vec<Finding>> {
     let report = parse_trivy_report(stdout)
         .map_err(|e| DomainError::Validation(format!("trivy adapter: malformed JSON: {e}")))?;
-    Ok(aggregate_findings(&report))
+    aggregate_findings(&report)
 }
 
 // ---------------------------------------------------------------------------
@@ -643,7 +645,25 @@ impl ScannerPort for TrivyAdapter {
                     // keeping for an operator who doubts that fact, so it
                     // moves to `debug!` instead of dropping out of the log
                     // entirely.
-                    ScanMode::Rootfs => {
+                    //
+                    // **That reading is only available over a tree that
+                    // was materialised whole.** The extractor never
+                    // creates a symlink or hardlink entry, so a tree
+                    // whose `skipped_links` is nonzero is missing paths
+                    // the archive declared — and Trivy selects analyzers
+                    // by *path*, so an analyzer-visible package path that
+                    // existed only as a link (`var/lib/dpkg/status` ->
+                    // elsewhere in the same layer) is absent from what
+                    // the analyzers walked. "Every analyzer agreed there
+                    // is no package surface" is then a statement about a
+                    // tree that is not the artifact, so the narrowing is
+                    // withdrawn and the empty report means what it means
+                    // everywhere else: a surface that went unassessed,
+                    // which fails closed (ADR 0007). The link skip
+                    // itself stays — a link carries no bytes of its own
+                    // and materialising one is the escape-through-a-
+                    // symlink hazard the extractor exists to refuse.
+                    ScanMode::Rootfs if ws.skipped_links() == 0 => {
                         tracing::debug!(
                             scanner = "trivy",
                             kind = target.kind.as_str(),
@@ -656,11 +676,28 @@ impl ScannerPort for TrivyAdapter {
                             format = target.format,
                             subcommand = mode.subcommand(),
                             stderr_tail = stderr_tail(&stderr),
-                            skipped_links = ws.skipped_links(),
+                            skipped_links = 0,
                             "trivy adapter: root filesystem walked, no package surface — nothing to assess"
                         );
                         return Ok(ScanAnalysis::NothingAnalysable(
                             NotAnalysable::NotApplicable,
+                        ));
+                    }
+                    ScanMode::Rootfs => {
+                        tracing::warn!(
+                            scanner = "trivy",
+                            kind = target.kind.as_str(),
+                            format = target.format,
+                            subcommand = mode.subcommand(),
+                            stderr_tail = stderr_tail(&stderr),
+                            materialised,
+                            skipped_links = ws.skipped_links(),
+                            "trivy adapter: root filesystem walked and nothing was analysed, \
+                             but link entries were not materialised — the tree the analyzers \
+                             saw is not the whole archive, so this is no verdict",
+                        );
+                        return Ok(ScanAnalysis::NothingAnalysable(
+                            NotAnalysable::NoAnalyzerMatched,
                         ));
                     }
                     // `fs` targets one artifact whose analyzer either
@@ -685,10 +722,13 @@ impl ScannerPort for TrivyAdapter {
                 }
             }
 
-            // 4. Lower into Vec<Finding>. Findings that fail
-            //    Finding::validate are dropped with tracing::warn!
-            //    inside aggregate_findings.
-            let findings = aggregate_findings(&report);
+            // 4. Lower into Vec<Finding>. A finding this adapter
+            //    cannot represent refuses the whole report rather than
+            //    being dropped from it (see `aggregate_findings`), so
+            //    the `?` here is the fail-closed path — never a
+            //    shorter finding list than the scanner produced, and
+            //    never the empty one that would read as clean.
+            let findings = aggregate_findings(&report)?;
 
             tracing::info!(
                 scanner = "trivy",
@@ -926,6 +966,61 @@ mod tests {
             coords,
             kind: hort_domain::types::ArtifactKind::MavenPom,
         }
+    }
+
+    fn oci_blob_coords() -> hort_domain::types::ArtifactCoords {
+        hort_domain::types::ArtifactCoords {
+            name: "library/nginx".to_string(),
+            name_as_published: "library/nginx".to_string(),
+            version: None,
+            path: "blobs/sha256:aaaa".to_string(),
+            format: hort_domain::entities::repository::RepositoryFormat::Oci,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    /// An OCI-layer scan target: the `Rootfs`-mode kind whose
+    /// materialisation *extracts*, which is what makes the materialised
+    /// tree's completeness observable to a test.
+    fn oci_blob_target<'a>(
+        hash: &'a Ch,
+        coords: &'a hort_domain::types::ArtifactCoords,
+    ) -> ScanTarget<'a> {
+        ScanTarget {
+            unit: ScanUnit::Blob(hash),
+            format: "oci",
+            coords,
+            kind: hort_domain::types::ArtifactKind::OciBlob,
+        }
+    }
+
+    /// Build a gzip-tar from `(path, entry_type, body_or_link_target)`
+    /// triples; a link entry carries its target in the third element and
+    /// no body. Mirrors the builder in [`crate::workspace`]'s own tests —
+    /// each is private to its module's `#[cfg(test)]` tree.
+    fn gzip_tar_typed(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, kind, body) in entries {
+            let mut header = tar::Header::new_ustar();
+            header.set_entry_type(*kind);
+            header.set_mode(0o644);
+            let is_link = *kind == tar::EntryType::Symlink || *kind == tar::EntryType::Link;
+            let payload: &[u8] = if is_link { &[] } else { body };
+            header.set_size(payload.len() as u64);
+            if is_link {
+                header
+                    .set_link_name(std::str::from_utf8(body).expect("link name is utf-8"))
+                    .expect("set_link_name");
+            }
+            header.set_path(path).expect("set_path");
+            header.set_cksum();
+            builder.append(&header, payload).expect("append");
+        }
+        let tar = builder.into_inner().expect("finish tar");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&tar).expect("gz write");
+        enc.finish().expect("gz finish")
     }
 
     fn cfg() -> TrivyConfig {
@@ -1320,6 +1415,19 @@ mod tests {
         stdout_json: &str,
         target: &ScanTarget<'_>,
     ) -> DomainResult<ScanAnalysis> {
+        scan_against_fake_trivy_with_payload(stdout_json, target, b"PK\x03\x04fake payload").await
+    }
+
+    /// [`scan_against_fake_trivy_target`] with the stored payload under
+    /// the adapter's control, for the targets whose materialisation
+    /// *extracts* — where what the workspace ends up holding is part of
+    /// what the test is asserting.
+    #[cfg(unix)]
+    async fn scan_against_fake_trivy_with_payload(
+        stdout_json: &str,
+        target: &ScanTarget<'_>,
+        payload: &[u8],
+    ) -> DomainResult<ScanAnalysis> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -1347,7 +1455,7 @@ mod tests {
             trivy_bin: script,
             ..TrivyConfig::default()
         };
-        let a = TrivyAdapter::new(c, StubStorage::bytes(b"PK\x03\x04fake payload"));
+        let a = TrivyAdapter::new(c, StubStorage::bytes(payload));
         a.scan(target, None).await
     }
 
@@ -1381,6 +1489,86 @@ mod tests {
                 "report {report} over a rootfs target must read as nothing to assess, not a hold"
             );
         }
+    }
+
+    /// **The S9b-2 regression.** The `rootfs` narrowing above rests on
+    /// the analyzers having walked the whole archive. The extractor
+    /// never materialises a link entry, so a layer whose only
+    /// analyzer-visible package path is a symlink is handed to Trivy
+    /// *without that path*: the report comes back empty and the
+    /// narrowing would read it as "the artifact has no package surface".
+    ///
+    /// The fixture is the shape that makes it concrete — a package
+    /// database reachable only as `var/lib/dpkg/status`, a symlink to a
+    /// regular file in the same layer. Before the fix this scan returned
+    /// `NotApplicable`, which does not gate, so the layer released under
+    /// `ScanSucceeded` without its package database ever being read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rootfs_report_with_no_results_over_a_tree_missing_link_entries_is_a_hold() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let h = sample_hash();
+        let coords = oci_blob_coords();
+        let payload = gzip_tar_typed(&[
+            (
+                "usr/share/dpkg-status",
+                tar::EntryType::Regular,
+                b"Package: zlib1g\n",
+            ),
+            (
+                "var/lib/dpkg/status",
+                tar::EntryType::Symlink,
+                b"../../../usr/share/dpkg-status",
+            ),
+        ]);
+        let analysis = scan_against_fake_trivy_with_payload(
+            r#"{"Results":[]}"#,
+            &oci_blob_target(&h, &coords),
+            &payload,
+        )
+        .await
+        .expect("the child exited 0, so the scan itself succeeded");
+        assert_eq!(
+            analysis,
+            ScanAnalysis::NothingAnalysable(NotAnalysable::NoAnalyzerMatched),
+            "an empty report over a tree whose link entries were skipped is a surface that \
+             went unassessed, not a completed fact about the artifact"
+        );
+        assert_ne!(
+            analysis,
+            ScanAnalysis::NothingAnalysable(NotAnalysable::NotApplicable),
+            "the `rootfs` no-package-surface narrowing must not apply to a partial tree"
+        );
+    }
+
+    /// The other half of the same claim, so the fix is a narrowing and
+    /// not a blanket: an extracted layer with **no** link entries and an
+    /// empty report keeps reading as a completed "no package surface"
+    /// fact. Asserted over the same extracting target as the test above,
+    /// because the single-file `jar` target cannot tell the two apart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rootfs_report_with_no_results_over_a_whole_tree_is_still_not_applicable() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let h = sample_hash();
+        let coords = oci_blob_coords();
+        let payload = gzip_tar_typed(&[("srv/app/readme.txt", tar::EntryType::Regular, b"hi")]);
+        let analysis = scan_against_fake_trivy_with_payload(
+            r#"{"Results":[]}"#,
+            &oci_blob_target(&h, &coords),
+            &payload,
+        )
+        .await
+        .expect("the child exited 0, so the scan itself succeeded");
+        assert_eq!(
+            analysis,
+            ScanAnalysis::NothingAnalysable(NotAnalysable::NotApplicable),
+            "every entry was materialised, so the analyzers really did walk the archive"
+        );
     }
 
     /// The `Fs`-mode counterpart: one artifact's analyzer either engages

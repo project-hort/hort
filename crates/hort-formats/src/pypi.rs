@@ -731,13 +731,7 @@ impl FormatHandler for PyPiFormatHandler {
         format_metadata: &serde_json::Value,
         _payload: PayloadAccess<'_>,
     ) -> DomainResult<Option<Sbom>> {
-        // Locate `requires_dist` under either the `info` wrapper or the
-        // top level. Either way it must be an array of strings.
-        let requires_dist = format_metadata
-            .get("info")
-            .and_then(|info| info.get("requires_dist"))
-            .or_else(|| format_metadata.get("requires_dist"))
-            .and_then(|v| v.as_array());
+        let requires_dist = pypi_requires_dist(format_metadata);
 
         let licenses = extract_pypi_license_list(format_metadata);
 
@@ -762,10 +756,7 @@ impl FormatHandler for PyPiFormatHandler {
         };
 
         let mut components = Vec::new();
-        for raw in reqs {
-            let Some(req_str) = raw.as_str() else {
-                continue;
-            };
+        for req_str in reqs {
             let Some((name, version)) = parse_pep_508_requirement(req_str) else {
                 continue;
             };
@@ -1510,6 +1501,48 @@ fn parse_pep_508_requirement(line: &str) -> Option<(String, Option<String>)> {
     });
 
     Some((name_part, version))
+}
+
+/// The `Requires-Dist` strings in a stored PyPI metadata document, from
+/// whichever of its three shapes this artifact has.
+///
+/// The shapes are not variants of one document; they are **different
+/// documents**, one per ingest path, and a reader that knows only some of
+/// them silently reports an artifact's dependencies as absent:
+///
+/// - `info.requires_dist` — the per-version PyPI JSON API body, which is
+///   what a pull-through fetch parses.
+/// - `requires_dist` at the top level — the same body sliced to a single
+///   version.
+/// - `pkg_info.requires_dist` — a **direct upload**. `twine` sends the
+///   distribution's `METADATA` fields as multipart form fields and the
+///   publish handler stores the harvest under `pkg_info`, so a hosted
+///   repository's declared dependencies live only here. This was the
+///   one shape missing, and the consequence was not a thinner BOM: on a
+///   policy whose backend adjudicates the BOM, every hosted PyPI
+///   distribution was assessed as though it declared no dependencies at
+///   all.
+///
+/// A repeated multipart field arrives as a JSON array and a
+/// single-occurrence one as a bare string, so both are accepted — a
+/// distribution with exactly one requirement is an ordinary shape, not a
+/// malformed one. Non-string array elements are skipped rather than
+/// failing the document: the array is publisher-supplied.
+fn pypi_requires_dist(metadata: &serde_json::Value) -> Option<Vec<&str>> {
+    let raw = metadata
+        .get("info")
+        .and_then(|info| info.get("requires_dist"))
+        .or_else(|| metadata.get("requires_dist"))
+        .or_else(|| {
+            metadata
+                .get("pkg_info")
+                .and_then(|pkg_info| pkg_info.get("requires_dist"))
+        })?;
+    match raw {
+        serde_json::Value::Array(items) => Some(items.iter().filter_map(|v| v.as_str()).collect()),
+        serde_json::Value::String(one) => Some(vec![one.as_str()]),
+        _ => None,
+    }
 }
 
 /// Extract a license list from a PyPI per-release metadata JSON.
@@ -3013,6 +3046,95 @@ mod tests {
             .expect("Some")
             .expect("Some");
         assert!(sbom.components.is_empty());
+    }
+
+    /// **The F11-3 regression.** A direct upload's `METADATA` fields are
+    /// stored under `pkg_info` (the publish handler's multipart
+    /// harvest), and the SBOM reader looked only at `info.requires_dist`
+    /// and the top level — so every hosted PyPI distribution produced a
+    /// subject-only BOM, and a BOM-adjudicating backend assessed it as
+    /// declaring no dependencies at all.
+    #[test]
+    fn extract_sbom_pypi_reads_a_hosted_uploads_pkg_info_requires_dist() {
+        let metadata = serde_json::json!({
+            "pkg_info": {
+                "metadata_version": "2.1",
+                "requires_python": ">=3.8",
+                "requires_dist": [
+                    "requests (==2.31.0)",
+                    "click >=8.0",
+                ],
+            },
+        });
+        let coords = sbom_coords("myapp", "1.0.0");
+
+        let sbom = PyPiFormatHandler
+            .extract_sbom(&coords, &metadata, PayloadAccess::Bytes(b""))
+            .expect("Some")
+            .expect("Some");
+
+        let mut names: Vec<&str> = sbom.components.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["click", "requests"],
+            "a hosted publish's declared dependencies must reach the scan subject"
+        );
+        let requests = sbom
+            .components
+            .iter()
+            .find(|c| c.name == "requests")
+            .expect("requests present");
+        assert_eq!(requests.purl, "pkg:pypi/requests@2.31.0");
+        assert!(requests.direct_dependency);
+    }
+
+    /// A distribution with exactly one requirement: the legacy upload
+    /// API has no list type, so a field that occurs once is a bare
+    /// string. Reading only the array shape would report that single
+    /// dependency as absent.
+    #[test]
+    fn extract_sbom_pypi_reads_a_single_occurrence_requires_dist_string() {
+        let metadata = serde_json::json!({
+            "pkg_info": { "requires_dist": "requests (==2.31.0)" },
+        });
+        let coords = sbom_coords("myapp", "1.0.0");
+
+        let sbom = PyPiFormatHandler
+            .extract_sbom(&coords, &metadata, PayloadAccess::Bytes(b""))
+            .expect("Some")
+            .expect("Some");
+        assert_eq!(
+            sbom.components
+                .iter()
+                .map(|c| c.purl.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pkg:pypi/requests@2.31.0"]
+        );
+    }
+
+    /// The proxied shapes keep precedence, so an artifact that carries
+    /// both documents is read from the registry body rather than from a
+    /// client-supplied harvest.
+    #[test]
+    fn extract_sbom_pypi_prefers_the_registry_body_over_the_upload_harvest() {
+        let metadata = serde_json::json!({
+            "info": { "requires_dist": ["requests (==2.31.0)"] },
+            "pkg_info": { "requires_dist": ["attrs (==1.0)"] },
+        });
+        let coords = sbom_coords("myapp", "1.0.0");
+
+        let sbom = PyPiFormatHandler
+            .extract_sbom(&coords, &metadata, PayloadAccess::Bytes(b""))
+            .expect("Some")
+            .expect("Some");
+        assert_eq!(
+            sbom.components
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["requests"]
+        );
     }
 
     #[test]
