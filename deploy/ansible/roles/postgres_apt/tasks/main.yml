@@ -10,16 +10,17 @@
 #   hort_retention_role — NOLOGIN; created by migration 004_events.sql (NOT here).
 #
 # IMPORTANT: do NOT add GRANT … ON ALL TABLES … TO hort_app_role anywhere in
-# this role.  That bulk grant lands on two tables that must not carry it: the
-# append-only `events` table, where it re-grants UPDATE/DELETE and breaks the
-# audit invariant — PgEventStore::new() then refuses to boot — and
-# `_sqlx_migrations`, where it re-opens write access to the applied-migration
-# ledger the boot gate reads (postgres-roles.md "Run this recipe against a
-# fresh database only").  `hort-server migrate` re-revokes both on every run,
-# so a bulk grant run by hand is undone at the next migrate rather than
-# permanent — but the runtime refuses to boot until then.  The only grants
-# this role sets are the DEFAULT PRIVILEGES that forward from hort_admin to
-# hort_app_role for future objects.
+# this role.  That bulk grant lands on three tables that must not carry it:
+# the append-only `events` table, where it re-grants UPDATE/DELETE and breaks
+# the audit invariant — PgEventStore::new() then refuses to boot — and the two
+# migration-bookkeeping tables `_sqlx_migrations` and `schema_compat_register`,
+# where it re-opens write access to the applied-migration ledger and to the
+# rollback floor the boot gate reads (postgres-roles.md "Run this recipe
+# against a fresh database only").  `hort-server migrate` re-revokes all three
+# on every run, so a bulk grant run by hand is undone at the next migrate
+# rather than permanent — but the runtime refuses to boot until then.  The only
+# grants this role sets are the DEFAULT PRIVILEGES that forward from hort_admin
+# to hort_app_role for future objects.
 #
 # Debian 13 ships PostgreSQL 17; hort requires >= PG 16.  PG 17 satisfies it.
 # The role is idempotent: psql DO $$ blocks guard against duplicate creation.
