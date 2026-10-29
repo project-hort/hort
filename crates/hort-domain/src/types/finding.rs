@@ -557,6 +557,52 @@ pub fn parse_advisory_published_at(raw: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+/// Bound a lowered finding's `title` to the byte cap
+/// [`Finding::validate`] enforces, truncating on a character boundary.
+///
+/// One definition, two producers — the same shape as
+/// [`parse_advisory_published_at`] above it and
+/// [`collapse_alias_groups`](crate::types::collapse_alias_groups)
+/// beside it. Both scanner adapters build `title` out of upstream prose
+/// that carries no bound of its own — OSV from `summary`, falling back
+/// to the long-form `details`; Trivy from `Title` — so both have to
+/// apply the cap where the value is built. A per-adapter copy is
+/// also a per-adapter copy of the cap *value*, which the copies cannot
+/// see and so cannot be narrowed in step with: narrow the cap here and
+/// an adapter holding a stale copy starts refusing titles it believes it
+/// already bounded.
+///
+/// # Truncate the description, never the identity
+///
+/// A title is **descriptive** — nothing keys on it, and the cap is
+/// routinely reached by real records, so losing the tail of a
+/// description costs a reader some prose and nothing else. The identity
+/// fields (`purl`, `vulnerability_id`, an alias element) are the
+/// opposite case and deliberately have no counterpart here: truncating
+/// one names a *different* package or a *different* advisory, and would
+/// silently void an operator exclusion keyed on the real id. So a
+/// finding that still fails `validate` after this cap has been applied
+/// is holding an identity this system cannot represent, which is a
+/// refusal of the whole report — never a finding to drop out of it,
+/// because a report lowered to a shorter finding list is a verdict the
+/// scanner did not reach, and a report lowered to an *empty* one is a
+/// clean verdict carrying release authority.
+///
+/// A marker is appended so a reader can tell a truncated description
+/// from one the publisher wrote that short, and the marker is counted
+/// inside the cap rather than added past it.
+pub fn cap_finding_title(title: String) -> String {
+    if title.len() <= MAX_TITLE_LEN {
+        return title;
+    }
+    const MARKER: &str = "…";
+    let cut = title.floor_char_boundary(MAX_TITLE_LEN - MARKER.len());
+    let mut out = String::with_capacity(cut + MARKER.len());
+    out.push_str(&title[..cut]);
+    out.push_str(MARKER);
+    out
+}
+
 /// Per-tier count over `findings` — single source of truth
 /// for the `ScanCompleted.severity_summary` aggregate. Lifted from
 /// previously-duplicated copies in `hort-app::scan_orchestration` and
@@ -1235,6 +1281,53 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("title"), "{msg}");
         assert!(msg.contains("1025"), "{msg}");
+    }
+
+    // ----- cap_finding_title ------------------------------------------------
+
+    /// A title the publisher wrote inside the cap — including one
+    /// exactly at it — is returned untouched. Without this the cap
+    /// could mark every title and a reader could no longer tell a
+    /// truncated description from a short one.
+    #[test]
+    fn cap_finding_title_leaves_a_title_within_the_cap_alone() {
+        for n in [0, 1, MAX_TITLE_LEN - 1, MAX_TITLE_LEN] {
+            let title = "a".repeat(n);
+            assert_eq!(cap_finding_title(title.clone()), title, "{n} bytes");
+        }
+    }
+
+    /// Over the cap the value is truncated, marked, and — the point of
+    /// the whole exercise — passes `validate`, so the finding carrying
+    /// it survives instead of being refused or dropped.
+    #[test]
+    fn cap_finding_title_bounds_an_over_cap_title_and_marks_it() {
+        let capped = cap_finding_title("x".repeat(MAX_TITLE_LEN * 5));
+        assert!(capped.len() <= MAX_TITLE_LEN, "{} bytes", capped.len());
+        assert!(capped.ends_with('…'), "a truncated title is marked");
+        let mut f = valid_finding();
+        f.title = capped;
+        f.validate().expect("the bounded title is representable");
+    }
+
+    /// Truncation lands on a character boundary: a multi-byte character
+    /// straddling the cap must not produce invalid UTF-8 — a naive byte
+    /// slice panics here — and the kept prefix must still be a prefix of
+    /// what the publisher wrote.
+    #[test]
+    fn cap_finding_title_truncates_on_a_character_boundary() {
+        // 'é' is two bytes, so for one of these lengths the cut falls
+        // mid-character whichever way the arithmetic rounds.
+        for n in [600, 601] {
+            let title = "é".repeat(n);
+            let capped = cap_finding_title(title.clone());
+            assert!(capped.len() <= MAX_TITLE_LEN, "{} bytes", capped.len());
+            assert!(capped.ends_with('…'));
+            assert!(
+                title.starts_with(capped.trim_end_matches('…')),
+                "the kept prefix is what the publisher wrote"
+            );
+        }
     }
 
     #[test]

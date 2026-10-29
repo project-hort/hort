@@ -3319,6 +3319,229 @@ async fn payload_scan_survives_an_unreadable_stored_payload() {
     );
 }
 
+// ----- S9-1: an unreadable BOM is not an absent surface ---------------------
+
+/// Run a cargo payload scan whose policy names exactly `backends`, with
+/// an SBOM-driven backend (`osv`) that abstains the way the real adapter
+/// does when it is handed no component list, and — when `backends`
+/// includes it — a payload-reading backend (`trivy`) that assesses the
+/// artifact and finds nothing.
+///
+/// `payload` drives which [`SbomAbsence`] the extraction reaches:
+/// `b"BOOM"` is a handler error, `b"NOSBOM"` a declared absence,
+/// `b"RESOLVED:…"` a real BOM. Passing `unreadable_payload` fails the
+/// CAS read instead, which is the transient arm.
+async fn run_sbom_driven_scan(
+    backends: &[&str],
+    payload: &[u8],
+    unreadable_payload: bool,
+) -> ScanRunOutcome {
+    let handler = Arc::new(PayloadShapedSbomHandler::default());
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert("cargo".into(), handler.clone());
+
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert(
+        "osv".into(),
+        Arc::new(
+            MockScanner::with_analysis(
+                "osv",
+                Ok(ScanAnalysis::NothingAnalysable(
+                    NotAnalysable::NotApplicable,
+                )),
+            )
+            .sbom_driven(),
+        ),
+    );
+    scanners.insert(
+        "trivy".into(),
+        Arc::new(MockScanner::new("trivy", Ok(vec![]))),
+    );
+
+    let (uc, _jobs, _events, storage, artifacts, repositories, _policy, metadata_repo) =
+        make_uc_full(
+            backends.iter().map(|b| (*b).to_string()).collect(),
+            scanners,
+            Arc::new(MockAdvisory::ok(vec![])),
+            handlers,
+        );
+    let artifact_id = seed_cargo_artifact_with_payload(
+        &artifacts,
+        &repositories,
+        &metadata_repo,
+        &storage,
+        payload,
+        serde_json::Value::Null,
+    )
+    .await;
+    if unreadable_payload {
+        let artifact = artifacts.find_by_id(artifact_id).await.expect("artifact");
+        storage.fail_get_persistent(artifact.sha256_checksum.clone());
+    }
+    let mut job = sample_scan_job(artifact_id, 1);
+    job.format = "cargo".into();
+    uc.run_scan(&job).await.expect("run_scan must not fail")
+}
+
+/// **The S9-1 regression.** Under a policy whose only backend consumes
+/// the supplied BOM, that BOM *is* the subject — so a dependency
+/// declaration that could not be read out of the payload leaves the
+/// artifact unassessed. It used to record `ScanCompleted(0,
+/// not_applicable)`, which is `ScanStanding::Clears { findings_present:
+/// false }` and releases under `ScanSucceeded`: an artifact nothing ever
+/// examined, holding a clean scan's release authority (ADR 0007's second
+/// impossible failure mode).
+#[tokio::test]
+async fn an_unreadable_sbom_under_an_sbom_only_policy_does_not_authorize_release() {
+    let outcome = run_sbom_driven_scan(&["osv"], b"BOOM", false).await;
+    match &outcome {
+        ScanRunOutcome::NothingAnalysable { scanner, reason } => {
+            assert_eq!(scanner, "osv");
+            assert!(
+                reason.contains("unusable_archive"),
+                "the abstention must name the unread declaration: {reason}"
+            );
+        }
+        other => panic!("expected a fail-closed no-verdict, got {other:?}"),
+    }
+    assert!(
+        !matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "a declaration that could not be read is not an absence of package surface"
+    );
+}
+
+/// The narrowing's other half: an absence the handler **declared** is
+/// still a completed fact about the artifact, and still records a
+/// not-applicable assessment. Without this, the fix above would hold
+/// every opaque artifact under an SBOM-only policy forever — a hold with
+/// nothing to wait on.
+#[tokio::test]
+async fn a_declared_absence_of_dependencies_still_records_a_not_applicable_assessment() {
+    let outcome = run_sbom_driven_scan(&["osv"], b"NOSBOM", false).await;
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "the handler reached the payload and declares it carries no dependency \
+         information — nothing for a hold to wait on: {outcome:?}"
+    );
+}
+
+/// A payload that could not be *reached* is a statement about the
+/// machine, so it earns the scan job's existing attempt budget rather
+/// than a terminal no-verdict. Routed through `Failed`, which is the
+/// path this orchestrator already uses for a retryable scan failure.
+#[tokio::test]
+async fn an_unreachable_payload_under_an_sbom_only_policy_is_retryable_not_terminal() {
+    let outcome = run_sbom_driven_scan(&["osv"], b"RESOLVED:serde@1.0.200", true).await;
+    match &outcome {
+        ScanRunOutcome::Failed(msg) => assert!(
+            msg.contains("scan backends failed"),
+            "the retryable path's own wording: {msg}"
+        ),
+        other => panic!("expected the retryable path, got {other:?}"),
+    }
+}
+
+/// The fail-soft posture survives where it was right: an unreadable BOM
+/// must not take away a verdict a *payload-reading* backend on the same
+/// policy actually produced. The BOM was enrichment on this run, and
+/// enrichment is not authority.
+#[tokio::test]
+async fn an_unreadable_sbom_does_not_discard_a_payload_reading_backends_verdict() {
+    let outcome = run_sbom_driven_scan(&["trivy", "osv"], b"BOOM", false).await;
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::Analysed,
+                ..
+            }
+        ),
+        "trivy assessed the artifact, so the run has a verdict: {outcome:?}"
+    );
+}
+
+/// The case an apply-time rule over backend *lists* could not have seen,
+/// and the reason the fix lives in the consuming use case instead.
+///
+/// The policy names **two** backends, so it is not an "SBOM-only"
+/// configuration by any list-shaped test — but on this artifact the
+/// payload-reading backend legitimately has no surface to look at (the
+/// shape an OCI config blob takes) and the SBOM-driven one was denied
+/// its input. Every abstention is individually non-gating, so the run
+/// used to reach `Completed{NotApplicable}` over an artifact neither
+/// backend assessed.
+#[tokio::test]
+async fn an_unreadable_sbom_gates_even_when_the_policy_names_a_second_backend() {
+    let handler = Arc::new(PayloadShapedSbomHandler::default());
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert("cargo".into(), handler.clone());
+
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    // The payload-reading backend abstains with the arm that does not
+    // gate — "these bytes carry no package surface".
+    scanners.insert(
+        "trivy".into(),
+        Arc::new(MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        )),
+    );
+    scanners.insert(
+        "osv".into(),
+        Arc::new(
+            MockScanner::with_analysis(
+                "osv",
+                Ok(ScanAnalysis::NothingAnalysable(
+                    NotAnalysable::NotApplicable,
+                )),
+            )
+            .sbom_driven(),
+        ),
+    );
+
+    let (uc, _jobs, _events, storage, artifacts, repositories, _policy, metadata_repo) =
+        make_uc_full(
+            vec!["trivy".into(), "osv".into()],
+            scanners,
+            Arc::new(MockAdvisory::ok(vec![])),
+            handlers,
+        );
+    let artifact_id = seed_cargo_artifact_with_payload(
+        &artifacts,
+        &repositories,
+        &metadata_repo,
+        &storage,
+        b"BOOM",
+        serde_json::Value::Null,
+    )
+    .await;
+    let mut job = sample_scan_job(artifact_id, 1);
+    job.format = "cargo".into();
+    let outcome = uc.run_scan(&job).await.expect("run_scan must not fail");
+
+    match &outcome {
+        ScanRunOutcome::NothingAnalysable { reason, .. } => assert!(
+            reason.contains("osv=unusable_archive"),
+            "the SBOM-driven backend's abstention is what holds the artifact: {reason}"
+        ),
+        other => panic!("expected a fail-closed no-verdict, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn payload_scan_in_a_proxy_repo_reads_the_stored_payload() {
     // ADR 0056's amendment: the repository class no longer decides
@@ -3580,7 +3803,12 @@ async fn payload_extraction_degrades_when_the_capability_is_not_declared() {
         .extract_sbom_from_stored_payload(handler.clone(), &artifact, &coords, "cargo")
         .await;
 
-    assert!(sbom.is_none(), "no SBOM, no panic");
+    assert_eq!(
+        sbom.absence(),
+        Some(SbomAbsence::Unreadable),
+        "no SBOM, no panic — and a state the code calls impossible is an unread declaration, \
+         which is the fail-closed side"
+    );
     assert!(
         handler.seen_payload.lock().unwrap().is_none(),
         "the extraction is never attempted without the capability"

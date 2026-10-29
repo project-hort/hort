@@ -260,6 +260,16 @@ pub enum NotAnalysable {
     /// agreeing the tree has no package surface at all — a completed
     /// fact about the artifact, not an unassessed pairing.
     ///
+    /// **Both halves of that are load-bearing, and the second one is
+    /// the adapter's to establish.** "No package surface" has to be a
+    /// positive finding about the bytes, never the residue of a sniffer
+    /// that failed to place them; and "over the whole materialised
+    /// tree" has to be true of the tree the analyzers actually walked,
+    /// which it is not when entries were skipped on the way in (a link
+    /// entry is never materialised, and Trivy selects analyzers by
+    /// path). Where either does not hold, the empty report is an
+    /// expected surface left unassessed and belongs on a gating arm.
+    ///
     /// Does not gate: see the type-level docs.
     NotApplicable,
     /// The payload is an archive the adapter refused to materialise for
@@ -275,6 +285,17 @@ pub enum NotAnalysable {
     /// to open its input cannot tell a container it has no decoder for
     /// from a corrupt archive of a container it does decode, and
     /// fail-closed is which way an undecidable case goes.
+    ///
+    /// A **scanner adapter** is the usual producer, and not the only
+    /// one. The application layer reaches the same value for a backend
+    /// whose entire input is the supplied BOM
+    /// ([`EvidenceBasis::SuppliedSbom`]) when the artifact's dependency
+    /// declaration was expected and could not be read out of the
+    /// payload: that is the identical statement — a surface in the
+    /// payload's own bytes went unassessed — reached one layer up,
+    /// because the backend is handed an `Option` and cannot tell a
+    /// format that declares no dependencies from a declaration it was
+    /// denied.
     ///
     /// Gates (fail-closed): a surface was expected and went unassessed.
     UnusableArchive,

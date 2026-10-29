@@ -47,7 +47,8 @@
 //! | `PySdist`                     | gzip-tar extracted into the workspace    | `rootfs`   | an sdist's `*.egg-info/PKG-INFO` is a post-build egg: Image and Rootfs targets only |
 //! | `PyWheel`                     | ZIP extracted into the workspace         | `rootfs`   | a wheel's `*.dist-info/METADATA` is post-build: Image and Rootfs targets only |
 //! | `OciBlob` (a tar layer)       | tar/gzip-tar extracted as a root filesystem | `rootfs` | a layer *is* a root filesystem; only that target reads its OS package database |
-//! | `OciBlob` (anything else)     | nothing — no scanner invocation          | —          | an image config carries no package surface |
+//! | `OciBlob` (JSON, or no bytes) | nothing — no scanner invocation          | —          | an image config carries no package surface |
+//! | `OciBlob` (unidentifiable)    | nothing — the blob is refused            | —          | unknown bytes are not an absence of package surface; see *Fail-closed* below |
 //! | `OciManifest`                 | nothing — no scanner invocation          | —          | a manifest carries no package surface |
 //! | `Other`                       | nothing — no scanner invocation          | —          | no handler claims these bytes |
 //!
@@ -88,7 +89,9 @@
 //!   surface at all. They are not materialised and no scanner is spawned:
 //!   spawning one would produce an empty report that the caller could
 //!   only read as "nothing analysed" anyway, at the cost of a process and
-//!   a CAS read.
+//!   a CAS read. For an OCI blob that reading has to be *earned* — the
+//!   blob is recognised as a JSON document or as empty, never inferred
+//!   from "it did not look like an archive" ([`sniff_container`]).
 //!
 //! # Fail-closed, not best-effort
 //!
@@ -553,8 +556,31 @@ enum Container {
     /// a layer it *could* have scanned is a gap worth naming in the log,
     /// whereas an image config is simply not layer content.
     UnsupportedCompression(&'static str),
-    /// Not an archive — for an OCI blob, this is the image config JSON.
-    NotAnArchive,
+    /// Positively identified as carrying no package surface: an OCI
+    /// blob that is a JSON document (the image config, and every
+    /// JSON-media-type OCI artifact blob), or a blob with no bytes at
+    /// all. Carries the shape for the log line.
+    ///
+    /// Distinct from [`Self::Unidentified`] because only this arm is a
+    /// *completed fact about the artifact*. A JSON document and a blob
+    /// of no bytes both exclude a package surface by construction —
+    /// there is no tar header, no archive, nothing an analyzer could
+    /// have claimed — so there is nothing for a hold to wait on.
+    NoPackageSurface(&'static str),
+    /// The leading bytes match no container this adapter decodes and no
+    /// shape it recognises as carrying nothing. What is inside is
+    /// unknown, which is the one answer that must not be read as "no
+    /// package surface": a tar without the POSIX magic (a pre-POSIX v7
+    /// archive, or one whose header was truncated) is a filesystem this
+    /// blob would have been scanned as.
+    ///
+    /// A statement about the payload's own bytes, not about this
+    /// adapter's decoder inventory — the inventory can only be named
+    /// for a container that was positively identified, which this one
+    /// was not (ADR 0064 D2 draws the line there). So it fails closed
+    /// through [`ExtractError::Malformed`] →
+    /// [`NotAnalysable::UnusableArchive`].
+    Unidentified,
 }
 
 /// Classify a blob's container from its leading bytes.
@@ -562,8 +588,18 @@ enum Container {
 /// Sniffing rather than trusting a declared media type is not a shortcut
 /// here: an OCI blob row carries `application/octet-stream` whatever role
 /// the manifest assigns it, so there is no media type to trust. The
-/// `ustar` magic at offset 257 is the POSIX tar identifier; pre-POSIX v7
-/// tars have no magic and land on `NotAnArchive`, which fails closed.
+/// `ustar` magic at offset 257 is the POSIX tar identifier.
+///
+/// **Every arm but the last is a positive identification, and the last
+/// one fails closed.** A sniffer's residue is "I do not know what these
+/// bytes are", and for an OCI blob the two candidate readings of that —
+/// "this is the image config, there is nothing to scan" and "this is a
+/// layer in a shape I did not recognise" — have opposite consequences
+/// for the release gate. So the non-archive shapes are recognised
+/// *positively* (a JSON document, an empty blob) and everything left
+/// over is [`Container::Unidentified`]: a pre-POSIX v7 tar carries no
+/// magic, and reading it as "no package surface" would release an
+/// unassessed root filesystem.
 fn sniff_container(head: &[u8]) -> Container {
     const TAR_MAGIC_OFFSET: usize = 257;
     if head.starts_with(&[0x1f, 0x8b]) {
@@ -583,7 +619,24 @@ fn sniff_container(head: &[u8]) -> Container {
     {
         return Container::Tar;
     }
-    Container::NotAnArchive
+    // Zero bytes hold no package surface, and that is provable rather
+    // than assumed: there is nothing in them for any analyzer to claim.
+    if head.is_empty() {
+        return Container::NoPackageSurface("empty");
+    }
+    // A JSON document — the OCI image config, and the shape every
+    // JSON-media-type OCI artifact blob (attestations, SBOM
+    // attachments, signature payloads) takes. Leading ASCII whitespace
+    // is skipped because JSON permits it; a document behind a byte-order
+    // mark is left unidentified, which is the fail-closed side.
+    if head
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'{' || *b == b'[')
+    {
+        return Container::NoPackageSurface("json");
+    }
+    Container::Unidentified
 }
 
 /// Materialise `target`'s bytes into a fresh workspace.
@@ -889,8 +942,10 @@ fn refusal_of(error: &ExtractError) -> NotAnalysable {
 /// The blocking half of extraction.
 ///
 /// `Ok(Some((mode, stats)))` — a tree was produced, scan it in `mode`.
-/// `Ok(None)` — the payload is not layer content (an OCI config); no
-/// scan applies. `Err` — the archive was refused.
+/// `Ok(None)` — the payload was positively identified as holding no
+/// package surface (an OCI config, an empty blob); no scan applies.
+/// `Err` — the archive was refused, which an unidentifiable blob is one
+/// case of.
 fn extract_blocking(
     plan: &Plan,
     download: &Path,
@@ -949,9 +1004,33 @@ fn extract_blocking(
                 Container::UnsupportedCompression(container) => {
                     Err(ExtractError::UnsupportedContainer { container })
                 }
-                // The image config JSON (or any other non-archive blob):
-                // genuinely no package surface, not a refusal.
-                Container::NotAnArchive => Ok(None),
+                // A shape that was positively identified as holding no
+                // package surface — the image config JSON, or a blob
+                // with no bytes. Genuinely nothing to assess, not a
+                // refusal. The shape is on the line because it is what
+                // distinguishes this from the refusal below for whoever
+                // is triaging a blob that got no verdict.
+                Container::NoPackageSurface(shape) => {
+                    tracing::debug!(
+                        scanner = "trivy",
+                        shape,
+                        "trivy adapter: blob carries no package surface by construction"
+                    );
+                    Ok(None)
+                }
+                // Bytes this adapter could not identify at all. The one
+                // reading that is NOT available here is "no package
+                // surface": these bytes may be a root filesystem whose
+                // tar header carried no magic, and a scan that never ran
+                // over one must not read as a completed fact about the
+                // artifact. Refused as a statement about the payload's
+                // own bytes, which is the gating side of ADR 0064 D2's
+                // line.
+                Container::Unidentified => Err(ExtractError::Malformed(
+                    "unrecognised blob container: the leading bytes match no archive this \
+                     adapter decodes and no shape that excludes a package surface"
+                        .to_string(),
+                )),
             }
         }
         Plan::SingleFile { .. } | Plan::NotApplicable => {
@@ -1329,6 +1408,40 @@ mod tests {
         builder.into_inner().expect("finish tar")
     }
 
+    /// Build a **pre-POSIX v7** tar: a well-formed tar whose header
+    /// carries no `ustar` magic, which is what a v7 archive looks like
+    /// and what GNU tar still emits under `--format=v7`. The `tar` crate
+    /// has no v7 writer, so the magic/version field (offset 257, 8
+    /// bytes) is zeroed and the header checksum recomputed over the
+    /// result — the archive stays readable by any tar reader.
+    fn v7_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = plain_tar(entries);
+        let mut offset = 0usize;
+        while offset + 512 <= out.len() {
+            // A header block whose name field is all-NUL is the
+            // end-of-archive padding, not a header.
+            if out[offset..offset + 100].iter().all(|b| *b == 0) {
+                break;
+            }
+            out[offset + 257..offset + 265].fill(0);
+            // The checksum field (offset 148, 8 bytes) is the octal sum
+            // of every header byte with the field itself read as spaces.
+            out[offset + 148..offset + 156].fill(b' ');
+            let sum: u32 = out[offset..offset + 512]
+                .iter()
+                .map(|b| u32::from(*b))
+                .sum();
+            let encoded = format!("{sum:06o}\0 ");
+            out[offset + 148..offset + 156].copy_from_slice(encoded.as_bytes());
+            let size = entries
+                .iter()
+                .find(|(name, _)| out[offset..offset + 100].starts_with(name.as_bytes()))
+                .map_or(0, |(_, body)| body.len());
+            offset += 512 + size.div_ceil(512) * 512;
+        }
+        out
+    }
+
     fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
         {
@@ -1644,14 +1757,43 @@ mod tests {
         assert_eq!(sniff_container(&tar), Container::Tar);
     }
 
+    /// The two shapes a blob may be read as holding no package surface,
+    /// and the fact that both are *positive* identifications.
     #[test]
-    fn sniff_treats_json_and_short_input_as_not_an_archive() {
+    fn sniff_recognises_the_no_package_surface_shapes_positively() {
         assert_eq!(
             sniff_container(br#"{"architecture":"amd64"}"#),
-            Container::NotAnArchive
+            Container::NoPackageSurface("json")
         );
-        assert_eq!(sniff_container(&[]), Container::NotAnArchive);
-        assert_eq!(sniff_container(&[0x1f]), Container::NotAnArchive);
+        assert_eq!(
+            sniff_container(b"  \n[{\"mediaType\":\"x\"}]"),
+            Container::NoPackageSurface("json"),
+            "JSON permits leading whitespace, and an array is a JSON document too"
+        );
+        assert_eq!(sniff_container(&[]), Container::NoPackageSurface("empty"));
+    }
+
+    /// **The S9b-1 regression.** Anything the sniffer cannot place is
+    /// `Unidentified`, never "no package surface": a truncated gzip
+    /// header and a tar whose POSIX magic is absent are both bytes that
+    /// may be a root filesystem, and reading them as an absence of
+    /// surface hands an unassessed filesystem a release-authorizing
+    /// scan.
+    #[test]
+    fn sniff_leaves_unplaceable_bytes_unidentified() {
+        // A one-byte truncated gzip magic.
+        assert_eq!(sniff_container(&[0x1f]), Container::Unidentified);
+        // A pre-POSIX v7 tar: a well-formed tar header with the `ustar`
+        // magic field zeroed, which is how v7 archives are written.
+        assert_eq!(
+            sniff_container(&v7_tar(&[("etc/hostname", b"host")])),
+            Container::Unidentified
+        );
+        // Arbitrary binary.
+        assert_eq!(
+            sniff_container(&[0x00, 0x61, 0x73, 0x6d]),
+            Container::Unidentified
+        );
     }
 
     // -- materialisation: single file ----------------------------------
@@ -2068,6 +2210,59 @@ mod tests {
         .await
         .expect("materialise");
         assert_eq!(expect_nothing(&m), NotAnalysable::NotApplicable);
+    }
+
+    /// An empty blob holds no package surface, and that is provable
+    /// rather than assumed — there is nothing in zero bytes for an
+    /// analyzer to claim.
+    #[tokio::test]
+    async fn an_empty_oci_blob_is_not_applicable() {
+        let c = coords("library/nginx", None, "blobs/sha256:aa");
+        let m = materialise_kind(ArtifactKind::OciBlob, &c, Vec::new())
+            .await
+            .expect("materialise");
+        assert_eq!(expect_nothing(&m), NotAnalysable::NotApplicable);
+    }
+
+    /// **The S9b-1 regression, end to end.** An OCI blob whose bytes are
+    /// a pre-POSIX v7 tar — a real root filesystem with no `ustar`
+    /// magic — must not produce a release-authorizing scan. It used to
+    /// reach `NotApplicable`, which does not gate, so a layer nothing
+    /// ever looked at recorded `ScanCompleted(0, not_applicable)` and
+    /// released under `ScanSucceeded`.
+    #[tokio::test]
+    async fn an_oci_blob_whose_tar_carries_no_posix_magic_is_refused_not_waved_through() {
+        let c = coords("library/nginx", None, "blobs/sha256:aa");
+        let bytes = v7_tar(&[("var/lib/dpkg/status", b"Package: zlib1g\n")]);
+        // The fixture really is a readable tar — otherwise the test
+        // would pass for the wrong reason (unreadable bytes rather than
+        // an unrecognised container).
+        assert!(
+            tar::Archive::new(Cursor::new(&bytes))
+                .entries()
+                .expect("v7 entries")
+                .next()
+                .expect("one entry")
+                .is_ok(),
+            "the v7 fixture must be a tar a reader accepts"
+        );
+        let m = materialise_kind(ArtifactKind::OciBlob, &c, bytes)
+            .await
+            .expect("an unidentifiable blob is a no-verdict, not an error");
+        assert_eq!(
+            expect_nothing(&m),
+            NotAnalysable::UnusableArchive,
+            "an unidentifiable blob is a statement about the payload's own bytes, so it gates \
+             (ADR 0064 D2) — `NotApplicable` would release an unassessed root filesystem"
+        );
+        assert!(
+            expect_nothing(&m).gates_release(
+                ArtifactKind::OciBlob,
+                hort_domain::entities::scan_policy::CompositeVerdictMode::Promoted
+            ),
+            "and it gates even under a promoted composite verdict: the decoder-inventory \
+             exemption needs a container that was positively identified"
+        );
     }
 
     /// **The mapping table, by value.** Every `ExtractError` variant

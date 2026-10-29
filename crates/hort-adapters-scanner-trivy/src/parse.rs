@@ -9,15 +9,19 @@
 //! `TrivyCvss`). A `CVSS` map captured here. Field
 //! renames stay aligned with Trivy's `JSON.Name` capitalisation.
 //!
-//! Findings that fail [`Finding::validate`] (over-cap purl, title,
-//! references, etc.) are dropped with a `tracing::warn!` and the rest
-//! are returned. The orchestrator never sees a malformed finding;
-//! caps are an adapter-side hygiene gate.
+//! The domain's per-field caps are honoured where each field is built —
+//! `fixed_versions`, `references` and `aliases` are truncated as they are
+//! collected and the title by
+//! [`cap_finding_title`](hort_domain::types::cap_finding_title) — and a
+//! finding that still fails [`Finding::validate`] after that refuses the
+//! whole report rather than being dropped from it. See
+//! [`aggregate_findings`] for why a dropped finding is not a safe answer.
 
 use std::collections::BTreeMap;
 
+use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::types::{
-    parse_advisory_published_at, ComponentRelation, Finding, FindingStatement,
+    cap_finding_title, parse_advisory_published_at, ComponentRelation, Finding, FindingStatement,
 };
 use serde::Deserialize;
 
@@ -215,13 +219,42 @@ pub(crate) fn parse_trivy_report(stdout: &[u8]) -> Result<TrivyReport, serde_jso
     serde_json::from_slice(stdout)
 }
 
-/// Lower a parsed [`TrivyReport`] into a deduplicated `Vec<Finding>`.
+/// Lower a parsed [`TrivyReport`] into a `Vec<Finding>`.
 ///
-/// Every `TrivyVulnerability` becomes one [`Finding`]; findings whose
-/// shape exceeds the per-finding caps in [`Finding::validate`] are
-/// dropped with a `tracing::warn!`. The output preserves the
-/// scanner-given order so fixture-driven tests remain stable.
-pub(crate) fn aggregate_findings(report: &TrivyReport) -> Vec<Finding> {
+/// Every `TrivyVulnerability` becomes one [`Finding`], and the output
+/// preserves the scanner-given order so fixture-driven tests remain
+/// stable.
+///
+/// # A finding this adapter cannot represent is not a finding it may drop
+///
+/// `Err` when any lowered finding fails
+/// [`Finding::validate`](hort_domain::types::Finding::validate), which
+/// the caller surfaces the same way it surfaces malformed JSON: as a
+/// backend error, which fails closed to an indeterminate scan once the
+/// job's attempt budget is spent. Dropping the finding and returning the
+/// rest is fail-open, and in two degrees: a dropped `Critical` beside
+/// four surviving `Low`s records a *wrong verdict* rather than a missing
+/// one, and a report whose findings are *all* over-cap lowers to an
+/// empty finding list — `ScanAnalysis::Analysed([])`, a clean result
+/// carrying release authority over a package Trivy had just reported a
+/// vulnerability for.
+///
+/// The field whose cap a real Trivy entry reaches is **descriptive**,
+/// and the lowering bounds it where it is built rather than refusing the
+/// entry over it: `fixed_versions`, `references` and `aliases` are
+/// truncated as [`vuln_to_finding`] collects them, and the title —
+/// `Title` verbatim off the wire, a string the Trivy schema bounds
+/// nowhere — by
+/// [`cap_finding_title`](hort_domain::types::cap_finding_title). What is
+/// left is **identity**: `purl`, `vulnerability_id`, an alias element.
+/// Those cannot be truncated without naming a different package or a
+/// different advisory, and truncating one would also silently void an
+/// operator exclusion keyed on the real id. So identity over-cap refuses
+/// the report, and nothing in it is quietly repaired.
+///
+/// The rule in one line: **the adapter never returns a shorter finding
+/// list than the report held.**
+pub(crate) fn aggregate_findings(report: &TrivyReport) -> DomainResult<Vec<Finding>> {
     let mut out: Vec<Finding> = Vec::new();
     for result in &report.results {
         let Some(vulns) = result.vulnerabilities.as_deref() else {
@@ -229,32 +262,47 @@ pub(crate) fn aggregate_findings(report: &TrivyReport) -> Vec<Finding> {
         };
         for vuln in vulns {
             let finding = vuln_to_finding(&result.result_type, vuln);
-            match finding.validate() {
-                Ok(()) => out.push(finding),
-                Err(e) => {
-                    tracing::warn!(
-                        scanner = "trivy",
-                        vulnerability_id = %vuln.vulnerability_id,
-                        error = %e,
-                        "trivy adapter: dropping over-cap finding"
-                    );
-                }
-            }
+            finding.validate().map_err(|e| {
+                tracing::warn!(
+                    scanner = "trivy",
+                    vulnerability_id = %vuln.vulnerability_id,
+                    error = %e,
+                    "trivy adapter: a reported finding cannot be represented; refusing the whole \
+                     report rather than returning a finding list the scanner did not produce"
+                );
+                DomainError::Validation(format!(
+                    "trivy adapter: finding {} cannot be represented: {e}",
+                    vuln.vulnerability_id
+                ))
+            })?;
+            out.push(finding);
         }
     }
-    out
+    Ok(out)
 }
 
-/// Convert one [`TrivyVulnerability`] into a [`Finding`]. Pure; no
-/// validation — the caller filters via [`Finding::validate`].
+/// Convert one [`TrivyVulnerability`] into a [`Finding`]. Pure; the
+/// per-field caps are applied here so that a finding reaching
+/// [`Finding::validate`] still invalid is one whose *identity* cannot be
+/// represented — which [`aggregate_findings`] refuses rather than
+/// drops.
 fn vuln_to_finding(trivy_type: &str, vuln: &TrivyVulnerability) -> Finding {
     let purl = build_purl(trivy_type, &vuln.pkg_name, &vuln.installed_version);
     let (severity, severity_basis) = trivy_severity_to_threshold(&vuln.severity);
     let cvss_score = extract_cvss(vuln);
-    let title = vuln
-        .title
-        .clone()
-        .unwrap_or_else(|| vuln.vulnerability_id.clone());
+    // `Title` is upstream prose the Trivy schema bounds nowhere, and
+    // the only cap-bearing field of this lowering that is not already
+    // truncated where it is collected — so it is the one an entry can
+    // overflow. Bounded here rather than refused, because nothing keys
+    // on a title, unlike the identity fields below, which
+    // `aggregate_findings` refuses when they do not fit. The
+    // `vulnerability_id` fallback cannot overflow: its own cap is
+    // smaller, so an over-cap title always came from `Title`.
+    let title = cap_finding_title(
+        vuln.title
+            .clone()
+            .unwrap_or_else(|| vuln.vulnerability_id.clone()),
+    );
 
     // fixed_versions: Trivy reports a single string; some advisories
     // pack multiple comma-separated versions. Split on `,` and trim
@@ -486,7 +534,7 @@ mod tests {
               {"VulnerabilityID":"CVE-2024-2","PkgName":"b","InstalledVersion":"2","Severity":"LOW"}
             ]}]}"#;
         let report = parse_trivy_report(doc).expect("parse");
-        let findings = aggregate_findings(&report);
+        let findings = aggregate_findings(&report).expect("lower");
         assert_eq!(findings.len(), 2);
         for f in &findings {
             assert_eq!(
@@ -514,7 +562,7 @@ mod tests {
                "LastModifiedDate":"2023-11-07T03:30:00Z"}
             ]}]}"#;
         let report = parse_trivy_report(doc).expect("parse");
-        let findings = aggregate_findings(&report);
+        let findings = aggregate_findings(&report).expect("lower");
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].advisory_published_at,
@@ -534,7 +582,7 @@ mod tests {
                "InstalledVersion":"111.18.0","Severity":"MEDIUM"}
             ]}]}"#;
         let report = parse_trivy_report(doc).expect("parse");
-        let findings = aggregate_findings(&report);
+        let findings = aggregate_findings(&report).expect("lower");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].advisory_published_at, None);
     }
@@ -665,51 +713,104 @@ mod tests {
         assert_eq!(f.cvss_score, Some(6.5));
     }
 
-    // ----- aggregate_findings — drops over-cap entries -----------------------
+    // ----- aggregate_findings: no finding is ever dropped -------------------
 
-    #[test]
-    fn aggregate_drops_over_cap_findings_and_keeps_valid_ones() {
-        // First vuln: well-formed. Second vuln: title 1100 bytes,
-        // exceeds the 1024 cap. Aggregator should keep #1, drop #2.
-        let big_title = "x".repeat(1100);
-        let report = TrivyReport {
+    /// Build a one-target report out of `(vulnerability_id, pkg_name,
+    /// title)` triples.
+    fn report_of(vulns: &[(&str, &str, String)]) -> TrivyReport {
+        TrivyReport {
             results: vec![TrivyResult {
                 target: "Cargo.lock".into(),
                 class: "lang-pkgs".into(),
                 result_type: "cargo".into(),
-                vulnerabilities: Some(vec![
-                    TrivyVulnerability {
-                        vulnerability_id: "CVE-1".into(),
-                        pkg_name: "ok".into(),
-                        installed_version: "1".into(),
-                        fixed_version: None,
-                        severity: "LOW".into(),
-                        title: Some("ok".into()),
-                        primary_url: None,
-                        references: Vec::new(),
-                        vendor_ids: Vec::new(),
-                        cvss: BTreeMap::new(),
-                        published_date: None,
-                    },
-                    TrivyVulnerability {
-                        vulnerability_id: "CVE-2".into(),
-                        pkg_name: "bad".into(),
-                        installed_version: "1".into(),
-                        fixed_version: None,
-                        severity: "HIGH".into(),
-                        title: Some(big_title),
-                        primary_url: None,
-                        references: Vec::new(),
-                        vendor_ids: Vec::new(),
-                        cvss: BTreeMap::new(),
-                        published_date: None,
-                    },
-                ]),
+                vulnerabilities: Some(
+                    vulns
+                        .iter()
+                        .map(|(id, pkg_name, title)| TrivyVulnerability {
+                            vulnerability_id: (*id).into(),
+                            pkg_name: (*pkg_name).into(),
+                            title: Some(title.clone()),
+                            ..vuln_skeleton()
+                        })
+                        .collect(),
+                ),
             }],
-        };
-        let findings = aggregate_findings(&report);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].vulnerability_id, "CVE-1");
+        }
+    }
+
+    /// **The descriptive half.** An over-cap title used to drop the
+    /// whole finding, and the title is the only cap in this lowering an
+    /// entry can still overflow — every other field is truncated where
+    /// it is collected, and `Title` is bounded nowhere in the Trivy
+    /// schema. It is bounded where it is built instead, so the finding
+    /// survives with its identity and severity intact — and a mixed
+    /// report keeps *every* finding, not just the short ones.
+    #[test]
+    fn an_over_cap_title_is_bounded_and_the_finding_survives() {
+        let report = report_of(&[
+            ("CVE-1", "ok", "ok".to_string()),
+            ("CVE-2", "bad", "x".repeat(1100)),
+        ]);
+        let findings = aggregate_findings(&report).expect("a long description is not a refusal");
+        assert_eq!(
+            findings
+                .iter()
+                .map(|f| f.vulnerability_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CVE-1", "CVE-2"],
+            "both reported vulnerabilities must reach the caller"
+        );
+        let long = &findings[1];
+        assert!(
+            long.title.len() <= 1024,
+            "title is {} bytes",
+            long.title.len()
+        );
+        assert!(
+            long.title.ends_with('…'),
+            "a truncated title is marked: {}",
+            long.title
+        );
+        assert_eq!(long.severity, SeverityThreshold::High);
+        long.validate().expect("the bounded finding is valid");
+    }
+
+    /// **The false clean.** A report whose every finding is over-cap
+    /// used to lower to an empty finding list, which the adapter returns
+    /// as `ScanAnalysis::Analysed([])` — a clean verdict carrying
+    /// release authority over a package Trivy had just reported
+    /// vulnerabilities for.
+    #[test]
+    fn a_report_whose_every_finding_is_over_cap_never_reduces_to_clean() {
+        let report = report_of(&[
+            ("CVE-1", "a", "x".repeat(5000)),
+            ("CVE-2", "b", "y".repeat(5000)),
+        ]);
+        let findings = aggregate_findings(&report).expect("bounded, not refused");
+        assert_eq!(
+            findings.len(),
+            2,
+            "a clean (empty) list would be a false verdict"
+        );
+    }
+
+    /// **The identity half**, which cannot be repaired: truncating a
+    /// `purl` names a different package, so the report is refused rather
+    /// than quietly losing the finding. Asserted over a *mixed* report,
+    /// because returning the representable finding alone is the shape
+    /// that reads as a complete verdict while being a short one. `Err`
+    /// reaches the orchestrator as a backend error and fails closed.
+    #[test]
+    fn a_mixed_report_refuses_rather_than_drop_an_unrepresentable_identity() {
+        // `purl` is `pkg:cargo/<name>@<version>`; a 600-byte name puts
+        // it past the 512-byte cap.
+        let report = report_of(&[
+            ("CVE-1", "ok", "ok".to_string()),
+            ("CVE-2", &"n".repeat(600), "also vulnerable".to_string()),
+        ]);
+        let err = aggregate_findings(&report)
+            .expect_err("an unrepresentable identity must not be silently dropped");
+        assert!(err.to_string().contains("CVE-2"), "{err}");
     }
 
     #[test]
@@ -722,7 +823,7 @@ mod tests {
                 vulnerabilities: None,
             }],
         };
-        assert!(aggregate_findings(&report).is_empty());
+        assert!(aggregate_findings(&report).expect("no findings").is_empty());
     }
 
     #[test]

@@ -261,7 +261,29 @@ async fn upload(
             }
             _ => {
                 if let Ok(text) = field.text().await {
-                    metadata_fields.insert(name, serde_json::Value::String(text));
+                    // A `METADATA` header that may appear more than once
+                    // arrives as a repeated multipart field, which is
+                    // the only shape the legacy upload API has for a
+                    // list — `Requires-Dist`, `Classifier`,
+                    // `Project-URL`, `Provides-Extra`. Last-writer-wins
+                    // would keep one requirement out of N and report the
+                    // rest as undeclared, and a BOM-adjudicating scan
+                    // backend reads an undeclared dependency as one that
+                    // is not there. So a second occurrence promotes the
+                    // value to an array and appends; a field that occurs
+                    // once stays a bare string, which is the shape the
+                    // scalar readers (`pkg_info.requires_python`) expect.
+                    let value = serde_json::Value::String(text);
+                    match metadata_fields.get_mut(&name) {
+                        Some(serde_json::Value::Array(existing)) => existing.push(value),
+                        Some(slot) => {
+                            let first = std::mem::replace(slot, serde_json::Value::Null);
+                            *slot = serde_json::Value::Array(vec![first, value]);
+                        }
+                        None => {
+                            metadata_fields.insert(name, value);
+                        }
+                    }
                 }
             }
         }
@@ -3910,6 +3932,114 @@ mod tests {
         assert!(
             kinds.contains(&"ArtifactIngested") && kinds.contains(&"ChecksumVerified"),
             "ArtifactIngested + ChecksumVerified must ride atomically in the same batch; got {kinds:?}"
+        );
+    }
+
+    /// **The F11-3 regression, publish half.** The legacy upload API's
+    /// only list shape is a repeated multipart field, which is how
+    /// `twine` sends a distribution's several `Requires-Dist` headers.
+    /// The harvest was last-writer-wins, so N declared dependencies
+    /// reached the stored metadata as one — and under a policy whose
+    /// scan backend adjudicates the component list, the other N-1 were
+    /// assessed as not declared at all.
+    #[tokio::test]
+    async fn publish_keeps_every_occurrence_of_a_repeated_metadata_field() {
+        use hort_domain::events::DomainEvent;
+        use sha2::{Digest, Sha256};
+
+        let h = harness();
+        insert_repo(&h, "pypi-test");
+
+        let content = b"repeated-field-upload".to_vec();
+        let sha = hex::encode(Sha256::digest(&content));
+        let boundary = "----hortrepeated";
+
+        let mut body: Vec<u8> = Vec::new();
+        let push_field = |buf: &mut Vec<u8>, name: &str, value: &str| {
+            buf.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            buf.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        };
+        push_field(&mut body, "name", "e2e_pkg");
+        push_field(&mut body, "version", "1.0");
+        push_field(&mut body, ":action", "file_upload");
+        push_field(&mut body, "sha256_digest", &sha);
+        // The scalar field a reader already depends on, to prove it is
+        // not promoted to an array by the repeated-field handling.
+        push_field(&mut body, "requires_python", ">=3.8");
+        push_field(&mut body, "requires_dist", "requests (==2.31.0)");
+        push_field(&mut body, "requires_dist", "click (>=8.0)");
+        push_field(&mut body, "requires_dist", "urllib3 (==2.0.7)");
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"content\"; filename=\"e2e-pkg-1.0.tar.gz\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(&content);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let res = post_publish(&h, boundary, body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let transitions = h.lifecycle.committed_transitions();
+        let (_artifact, batch, _meta) = &transitions[0];
+        let ingested = batch
+            .events
+            .iter()
+            .find_map(|e| match &e.event {
+                DomainEvent::ArtifactIngested(i) => Some(i),
+                _ => None,
+            })
+            .expect("ArtifactIngested carries the multipart harvest");
+        let pkg_info = ingested
+            .metadata
+            .get("pkg_info")
+            .expect("the harvest lands under pkg_info");
+
+        assert_eq!(
+            pkg_info.get("requires_dist"),
+            Some(&serde_json::json!([
+                "requests (==2.31.0)",
+                "click (>=8.0)",
+                "urllib3 (==2.0.7)"
+            ])),
+            "every declared dependency must survive the harvest, in order"
+        );
+        assert_eq!(
+            pkg_info.get("requires_python"),
+            Some(&serde_json::json!(">=3.8")),
+            "a field that occurs once stays a bare string — the simple-index reader \
+             consumes this one as a scalar"
+        );
+
+        // And the whole point: the handler turns that harvest into the
+        // component list a scan backend adjudicates.
+        let coords = ArtifactCoords {
+            name: "e2e-pkg".to_string(),
+            name_as_published: "e2e_pkg".to_string(),
+            version: Some("1.0".to_string()),
+            path: "simple/e2e-pkg/e2e-pkg-1.0.tar.gz".to_string(),
+            format: RepositoryFormat::Pypi,
+            metadata: serde_json::Value::Null,
+        };
+        let sbom = PyPiFormatHandler
+            .extract_sbom(
+                &coords,
+                &ingested.metadata,
+                hort_domain::types::PayloadAccess::Bytes(b""),
+            )
+            .expect("extract_sbom")
+            .expect("a BOM");
+        let mut names: Vec<&str> = sbom.components.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["click", "requests", "urllib3"],
+            "all three declared dependencies reach the scan subject"
         );
     }
 

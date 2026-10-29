@@ -30,15 +30,19 @@
 //! }
 //! ```
 //!
-//! Findings that fail [`Finding::validate`] are dropped with
-//! `tracing::warn!` and the rest are returned. The orchestrator never
-//! sees a malformed finding; caps are an adapter-side hygiene gate
-//! (mirrors the Trivy adapter's `aggregate_findings`).
+//! The domain's per-field caps are honoured where each field is built —
+//! the list collectors truncate and so does
+//! [`cap_finding_title`](hort_domain::types::cap_finding_title) — and a
+//! finding that still fails [`Finding::validate`] after that refuses the
+//! whole report rather than being dropped from it. See
+//! [`aggregate_findings`] for why a dropped finding is not a safe
+//! answer.
 
 use hort_domain::entities::scan_policy::SeverityThreshold;
+use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::types::{
-    collapse_alias_groups, is_informational_class, parse_advisory_published_at, ComponentRelation,
-    Finding, FindingStatement, SeverityBasis,
+    cap_finding_title, collapse_alias_groups, is_informational_class, parse_advisory_published_at,
+    ComponentRelation, Finding, FindingStatement, SeverityBasis,
 };
 use serde::Deserialize;
 
@@ -231,9 +235,8 @@ pub(crate) fn parse_osv_scanner_report(
 
 /// Lower a parsed [`OsvScannerReport`] into a deduplicated `Vec<Finding>`.
 ///
-/// Every `OsvVulnerability` becomes one [`Finding`]; over-cap findings
-/// are dropped with a `tracing::warn!`. Output preserves the
-/// scanner-given order so fixture tests stay stable.
+/// Every `OsvVulnerability` becomes one [`Finding`], and output preserves
+/// the scanner-given order so fixture tests stay stable.
 ///
 /// Mutually-aliased findings are then collapsed to one finding per
 /// advisory ([`collapse_alias_groups`]). osv-scanner forwards the upstream
@@ -246,27 +249,58 @@ pub(crate) fn parse_osv_scanner_report(
 ///
 /// The collapse runs after per-finding validation, and its alias union is
 /// itself capped, so a surviving finding is still valid.
-pub(crate) fn aggregate_findings(report: &OsvScannerReport) -> Vec<Finding> {
+///
+/// # A finding this adapter cannot represent is not a finding it may drop
+///
+/// `Err` when any lowered finding fails
+/// [`Finding::validate`](hort_domain::types::Finding::validate), which
+/// the caller surfaces the same way it surfaces malformed JSON: as an
+/// indeterminate scan. Silently dropping the finding and returning the
+/// rest is the same fail-open shape as reading empty stdout as clean
+/// (SUP-3, [`parse_osv_scanner_report`]) — worse in one respect, because
+/// it does not only lose "clean vs unknown": a dropped `Critical` beside
+/// four surviving `Low`s records a *wrong verdict* rather than a missing
+/// one, and an advisory set that is entirely over-cap reduces to an
+/// empty finding list, which carries release authority.
+///
+/// The fields whose caps a real OSV record reaches are **descriptive**,
+/// and the lowering bounds them where they are built rather than
+/// refusing the record over them: the three list fields are truncated by
+/// [`collect_fixed_versions`] / [`collect_references`] /
+/// [`collect_aliases`], and the title (OSV's `details` is long-form
+/// markdown and routinely exceeds the cap) by
+/// [`cap_finding_title`](hort_domain::types::cap_finding_title), whose
+/// one definition both scanner adapters share. What is
+/// left is **identity** — `purl`, `vulnerability_id`, an alias
+/// element — and those cannot be truncated without naming a different
+/// package or a different advisory, which would also silently void an
+/// operator exclusion keyed on the real id. So identity over-cap refuses
+/// the report, and nothing in it is quietly repaired.
+pub(crate) fn aggregate_findings(report: &OsvScannerReport) -> DomainResult<Vec<Finding>> {
     let mut out: Vec<Finding> = Vec::new();
     for src in &report.results {
         for entry in &src.packages {
             for vuln in &entry.vulnerabilities {
                 let finding = vuln_to_finding(&entry.package, &entry.groups, vuln);
-                match finding.validate() {
-                    Ok(()) => out.push(finding),
-                    Err(e) => {
-                        tracing::warn!(
-                            scanner = "osv",
-                            vulnerability_id = %vuln.id,
-                            error = %e,
-                            "osv adapter: dropping over-cap finding"
-                        );
-                    }
-                }
+                finding.validate().map_err(|e| {
+                    tracing::warn!(
+                        scanner = "osv",
+                        vulnerability_id = %vuln.id,
+                        error = %e,
+                        "osv adapter: a reported finding cannot be represented; refusing the \
+                         whole report rather than returning a finding list the scanner did not \
+                         produce"
+                    );
+                    DomainError::Validation(format!(
+                        "osv adapter: finding {} cannot be represented: {e}",
+                        vuln.id
+                    ))
+                })?;
+                out.push(finding);
             }
         }
     }
-    collapse_alias_groups(out)
+    Ok(collapse_alias_groups(out))
 }
 
 /// Every id osv-scanner lists in the same `groups[]` entry as `vuln_id`.
@@ -519,11 +553,12 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
 
     let (cvss_score, severity, severity_basis) = resolve_severity(groups, vuln, informational);
 
-    let title = vuln
-        .summary
-        .clone()
-        .or_else(|| vuln.details.clone())
-        .unwrap_or_else(|| vuln.id.clone());
+    let title = cap_finding_title(
+        vuln.summary
+            .clone()
+            .or_else(|| vuln.details.clone())
+            .unwrap_or_else(|| vuln.id.clone()),
+    );
 
     Finding {
         purl,
@@ -1001,34 +1036,100 @@ mod tests {
         assert_eq!(f.references[1], "https://example.com/b");
     }
 
-    // ----- aggregate_findings drops over-cap and preserves order ------------
+    // ----- aggregate_findings: no finding is ever dropped -------------------
 
-    #[test]
-    fn aggregate_drops_over_cap_findings_and_keeps_valid_ones() {
-        let big_title = "x".repeat(1100);
-        let report = OsvScannerReport {
+    /// Build a one-package report out of `(id, summary)` pairs.
+    fn report_of(vulns: &[(&str, String)]) -> OsvScannerReport {
+        OsvScannerReport {
             results: vec![OsvSource {
                 packages: vec![OsvPackageEntry {
                     package: pkg("ok", "npm", "1"),
-                    vulnerabilities: vec![
-                        OsvVulnerability {
-                            id: "OSV-1".into(),
-                            summary: Some("ok".into()),
+                    vulnerabilities: vulns
+                        .iter()
+                        .map(|(id, summary)| OsvVulnerability {
+                            id: (*id).into(),
+                            summary: Some(summary.clone()),
                             ..Default::default()
-                        },
-                        OsvVulnerability {
-                            id: "OSV-2".into(),
-                            summary: Some(big_title),
-                            ..Default::default()
-                        },
-                    ],
+                        })
+                        .collect(),
+                    groups: vec![],
+                }],
+            }],
+        }
+    }
+
+    /// **The S9-2 regression, descriptive half.** An over-cap title is
+    /// the cap a real OSV record actually reaches (`details` is
+    /// long-form markdown), and it used to drop the whole finding —
+    /// which turned a vulnerable package into a clean scan whenever
+    /// every finding in the report was over-cap. The title is bounded
+    /// where it is built instead, so the finding survives with its
+    /// identity and severity intact.
+    #[test]
+    fn an_over_cap_title_is_bounded_and_the_finding_survives() {
+        let report = report_of(&[("OSV-1", "ok".to_string()), ("OSV-2", "x".repeat(1100))]);
+        let findings = aggregate_findings(&report).expect("a long description is not a refusal");
+        assert_eq!(
+            findings
+                .iter()
+                .map(|f| f.vulnerability_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["OSV-1", "OSV-2"],
+            "both reported vulnerabilities must reach the caller"
+        );
+        let long = &findings[1];
+        assert!(
+            long.title.len() <= 1024,
+            "title is {} bytes",
+            long.title.len()
+        );
+        assert!(
+            long.title.ends_with('…'),
+            "a truncated title is marked: {}",
+            long.title
+        );
+        long.validate().expect("the bounded finding is valid");
+    }
+
+    /// **The S9-2 regression, clean-result half.** A report whose every
+    /// finding is over-cap used to reduce to an empty finding list — a
+    /// clean verdict carrying release authority over an artifact the
+    /// scanner had just reported a vulnerability for.
+    #[test]
+    fn a_report_whose_every_finding_is_over_cap_never_reduces_to_clean() {
+        let report = report_of(&[("OSV-1", "x".repeat(5000)), ("OSV-2", "y".repeat(5000))]);
+        let findings = aggregate_findings(&report).expect("bounded, not refused");
+        assert_eq!(
+            findings.len(),
+            2,
+            "a clean (empty) list would be a false verdict"
+        );
+    }
+
+    /// The identity half, which cannot be repaired: truncating a `purl`
+    /// names a different package, so the report is refused rather than
+    /// quietly losing the finding. `Err` reaches the caller as an
+    /// indeterminate scan, exactly as empty stdout does (SUP-3).
+    #[test]
+    fn a_finding_whose_identity_is_over_cap_refuses_the_report() {
+        let report = OsvScannerReport {
+            results: vec![OsvSource {
+                packages: vec![OsvPackageEntry {
+                    // `purl` is `pkg:npm/<name>@<version>`; a 600-byte
+                    // name puts it past the 512-byte cap.
+                    package: pkg(&"n".repeat(600), "npm", "1"),
+                    vulnerabilities: vec![OsvVulnerability {
+                        id: "OSV-1".into(),
+                        summary: Some("vulnerable".into()),
+                        ..Default::default()
+                    }],
                     groups: vec![],
                 }],
             }],
         };
-        let findings = aggregate_findings(&report);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].vulnerability_id, "OSV-1");
+        let err = aggregate_findings(&report)
+            .expect_err("an unrepresentable identity must not be silently dropped");
+        assert!(err.to_string().contains("OSV-1"), "{err}");
     }
 
     #[test]
@@ -1042,6 +1143,6 @@ mod tests {
                 }],
             }],
         };
-        assert!(aggregate_findings(&report).is_empty());
+        assert!(aggregate_findings(&report).expect("no findings").is_empty());
     }
 }

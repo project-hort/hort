@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **An input a scanner could not read no longer records a passing scan.**
+  Artifacts that such paths released as "nothing to assess" now stay held
+  until they are assessed, and a hosted PyPI publish's declared dependencies
+  reach the scan (#373).
 - **The failed-credential controls (PAT brute-force lockout, auth rate limit)
   now key on the real caller, and a deployment that cannot identify one
   refuses to start.** Set `HORT_TRUSTED_PROXY_CIDRS` to your edge's source
