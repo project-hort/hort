@@ -841,7 +841,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hort-app"
-version = "0.16.1-dev"
+version = "0.17.0-dev"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "hort-config"
-version = "0.16.1-dev"
+version = "0.17.0-dev"
 dependencies = [
  "chrono",
  "hort-domain",
@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "hort-domain"
-version = "0.16.1-dev"
+version = "0.17.0-dev"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "hort-formats"
-version = "0.16.1-dev"
+version = "0.17.0-dev"
 dependencies = [
  "base64 0.23.1",
  "bytes",
