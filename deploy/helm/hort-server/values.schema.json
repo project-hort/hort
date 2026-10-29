@@ -645,6 +645,7 @@
     },
     "requireHttps": {"type": "boolean"},
     "trustedProxyCidrs": {"type": "array", "items": {"type": "string"}},
+    "clientIpFromSocketPeer": {"type": "boolean"},
     "rateLimitExemptCidrs": {"type": "array", "items": {"type": "string"}},
     "http": {
       "type": "object",

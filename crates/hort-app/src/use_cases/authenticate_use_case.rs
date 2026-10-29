@@ -548,13 +548,58 @@ impl AuthenticateUseCase {
     /// and `jit_created = true` iff the user row was newly inserted.
     #[instrument(skip(self, token))]
     pub async fn authenticate_bearer(&self, token: &str) -> AppResult<CallerPrincipal> {
-        // Legacy entry-point preserved for OIDC-only
-        // callers that have no `client_ip` to thread (in-process tests,
-        // bootstrap CLI, etc.). Delegates to the client-IP-aware path
-        // with `None`, which makes the PAT validator's per-IP lockout
-        // a no-op. Production middleware uses
-        // [`Self::authenticate_bearer_with_client_ip`] so the lockout
-        // keys on the bucketed source.
+        // Convenience entry point for callers that genuinely have no
+        // `client_ip` to thread — in-process tests. It delegates with
+        // `None`, which makes the PAT validator's per-IP brute-force
+        // lockout a **no-op**, so it is NOT a valid shape for anything
+        // serving a request: every inbound credential presentation
+        // calls [`Self::authenticate_bearer_with_client_ip`] with the
+        // trust-resolved caller, and the one read path that
+        // deliberately does not attribute calls
+        // [`Self::authenticate_bearer_read_path_without_ip_lockout`],
+        // which says so in its name.
+        //
+        // That is a property of the code, not an aspiration: all four
+        // production call sites used this two-argument form, so the
+        // lockout was armed nowhere and the client-IP-aware entry point
+        // had no caller outside this file. The guard test
+        // `crates/hort-app/tests/bearer_auth_threads_client_ip.rs`
+        // now rejects any `.authenticate_bearer(` under `crates/*/src`
+        // so a regression to `None` fails the suite instead of silently
+        // disarming the gate again.
+        self.authenticate_bearer_with_client_ip(token, None).await
+    }
+
+    /// Read-path bearer validation — deliberately **not** attributed to
+    /// a client IP, so the PAT per-IP brute-force lockout does not arm.
+    ///
+    /// The name is deliberately unwieldy: it is the grep-able audit
+    /// checkpoint for the one production credential path that does not
+    /// thread its caller, and the guard test
+    /// `crates/hort-app/tests/bearer_auth_threads_client_ip.rs` bans the
+    /// plain [`Self::authenticate_bearer`] from production source so
+    /// this decision cannot be made by accident or by omission.
+    ///
+    /// **Why no lockout here.** An anonymous reader needs no credential
+    /// at all (reads are public by design, ADR 0021), so a bad token on
+    /// a read is not a step towards access — but the lockout is keyed on
+    /// a /24, and the write paths share that bucket. Arming it here
+    /// would let an unauthenticated caller spend thirty bad tokens to
+    /// deny its whole /24's *writes* for fifteen minutes: one
+    /// amplification traded for another, strictly worse than the one it
+    /// closes.
+    ///
+    /// The read path's exposure is **cost**, not credential guessing — a
+    /// cache miss buys an Argon2id verify at
+    /// `m=19456, t=2, p=1`. That is bounded by the auth-scope rate-limit
+    /// bucket instead, which counts a failed credentialed read and
+    /// recovers on a 60-second window rather than a 15-minute flag
+    /// (`auth_rate_limit_middleware_impl` in
+    /// `hort-http-core::middleware::rate_limit`).
+    pub async fn authenticate_bearer_read_path_without_ip_lockout(
+        &self,
+        token: &str,
+    ) -> AppResult<CallerPrincipal> {
         self.authenticate_bearer_with_client_ip(token, None).await
     }
 
@@ -2976,6 +3021,25 @@ mod tests {
                     entries: StdMutex::new(StdHashMap::new()),
                 })
             }
+
+            /// Every unexpired key. The lockout tests assert on the
+            /// KEYS the PAT validator wrote rather than on an
+            /// observable response, because every `PatValidationError`
+            /// arm — `RateLimited` included — surfaces as the same
+            /// generic `Unauthorized`.
+            fn live_keys(&self) -> Vec<String> {
+                let now = std::time::Instant::now();
+                let mut keys: Vec<String> = self
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, (_, exp))| *exp > now)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                keys.sort();
+                keys
+            }
         }
         impl EphemeralStore for StubEphemeralStore {
             fn get(&self, key: &str) -> BoxFuture<'_, DomainResult<Option<Bytes>>> {
@@ -3094,12 +3158,17 @@ mod tests {
             // harness, so we don't need to expose the handle.
             #[allow(dead_code)]
             tokens: Arc<StubTokenRepo>,
+            /// The store the PAT validator keys its per-IP lockout
+            /// into. Held so the attribution tests can read whether a
+            /// failure was counted at all, and under which key.
+            ephemeral: Arc<StubEphemeralStore>,
         }
 
         fn build_harness(verify_ok: bool, tokens: Arc<StubTokenRepo>) -> PatHarness {
             let idp = Arc::new(MockIdentityProvider::new());
             let users = Arc::new(MockUserRepository::new());
             let ephemeral = StubEphemeralStore::new();
+            let ephemeral_handle = ephemeral.clone();
             let cache = Arc::new(PatCache::new(64, Duration::from_secs(300)));
             let clock = Arc::new(StubClock(AtomicI64::new(T0_SECS)));
             let verifier: Arc<dyn Argon2Verifier> = Arc::new(StubVerifier { ok: verify_ok });
@@ -3118,7 +3187,70 @@ mod tests {
                 admin_mapping(),
             )
             .with_pat_validation(pat_uc);
-            PatHarness { uc, users, tokens }
+            PatHarness {
+                uc,
+                users,
+                tokens,
+                ephemeral: ephemeral_handle,
+            }
+        }
+
+        // ---- per-IP lockout: which entry point arms it ----
+        //
+        // The three inbound credential presentations
+        // (`require_principal`, the OCI bearer middleware, `/exchange`)
+        // thread the trust-resolved caller and MUST arm the gate. The
+        // read path calls the named no-lockout entry point and MUST
+        // NOT: the lockout keys on a /24 that the write paths share,
+        // so arming it on an anonymous-by-default surface would let an
+        // unauthenticated reader with a bad token deny that /24's
+        // writes for fifteen minutes.
+        //
+        // The pair is deliberate. The negative test alone would also
+        // pass against a validator that recorded nothing anywhere,
+        // which is how the lockout came to be unarmed on every path
+        // while its own doc comment claimed otherwise.
+
+        #[tokio::test]
+        async fn credential_path_failure_records_per_ip_lockout_state() {
+            let tokens = StubTokenRepo::new();
+            // No row for the prefix: the validator runs its sentinel
+            // verify, fails, and books the failure.
+            let h = build_harness(false, tokens);
+
+            let client: IpAddr = "203.0.113.7".parse().unwrap();
+            h.uc.authenticate_bearer_with_client_ip(VALID_PAT, Some(client))
+                .await
+                .expect_err("no token row: validation must fail");
+
+            let bucket = client_ip_bucket(client);
+            assert_eq!(
+                h.ephemeral.live_keys(),
+                vec![format!(
+                    "{}{bucket}",
+                    crate::use_cases::pat_validation_use_case::PAT_LOCKOUT_BY_IP_COUNTER_PREFIX
+                )],
+                "a threaded credential failure must count against the \
+                 caller's own bucket"
+            );
+        }
+
+        #[tokio::test]
+        async fn read_path_failure_records_no_lockout_state_at_all() {
+            let tokens = StubTokenRepo::new();
+            let h = build_harness(false, tokens);
+
+            h.uc.authenticate_bearer_read_path_without_ip_lockout(VALID_PAT)
+                .await
+                .expect_err("no token row: validation must fail");
+
+            assert!(
+                h.ephemeral.live_keys().is_empty(),
+                "the read path must arm no per-IP lockout: a bad token on a \
+                 public read must not be able to deny the /24's writes. \
+                 Wrote: {:?}",
+                h.ephemeral.live_keys()
+            );
         }
 
         // ---- happy path ----

@@ -88,7 +88,22 @@ Four caveats:
   exposed as `trustedProxyCidrs`. It predates the HTTPS hardening, which
   made it a
   precondition for `HORT_REQUIRE_HTTPS=true` to start without an
-  `https://` `publicBaseUrl`.
+  `https://` `publicBaseUrl`. It is also the **sole** input to client-IP
+  attribution: with it empty, every request is attributed to its TCP
+  peer, which in a Kubernetes install is the ingress or LB for every
+  caller — collapsing the PAT brute-force lockout, the auth-failure
+  rate limit and the per-IP concurrency cap onto one bucket. Set it to
+  your edge's source ranges, never to `0.0.0.0/0` (which trusts
+  `X-Forwarded-For` from everyone and lets any caller choose its own
+  attribution).
+- `HORT_CLIENT_IP_FROM_SOCKET_PEER` is exposed as
+  `clientIpFromSocketPeer` (default `false`) and declares that clients
+  reach the server directly, with no proxy in between. It is required
+  `true` only when `trustedProxyCidrs` is empty, and the chart does not
+  render it when `trustedProxyCidrs` is set. With neither value supplied
+  the binary refuses to start (`ClientIpAttributionUnconfigured`) rather
+  than guess which deployment it is in — a chart install with the
+  default empty `trustedProxyCidrs` must therefore set one of the two.
 - `HORT_OCI_LEGACY_CATALOG_ENABLED` (`oci.legacyCatalogEnabled`) is not
   an audit-driven knob — it is exposed for operators consuming the
   aggregating catalog endpoint.

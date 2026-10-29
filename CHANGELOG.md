@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The failed-credential controls (PAT brute-force lockout, auth rate limit)
+  now key on the real caller, and a deployment that cannot identify one
+  refuses to start.** Set `HORT_TRUSTED_PROXY_CIDRS` to your edge's source
+  ranges, or `HORT_CLIENT_IP_FROM_SOCKET_PEER=true` (chart
+  `clientIpFromSocketPeer`) if clients reach hort directly (#372).
 - **`HasFindingDetectedFor` now measures how long the vulnerability has been
   known, not how long the artifact has been scanned** — the advisory's
   publication date where a scanner reports one, else our own first observation

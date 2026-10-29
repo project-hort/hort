@@ -85,6 +85,7 @@
 //! and post-validation 403s must not share a label with OIDC
 //! credential-abuse rejects.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -349,6 +350,11 @@ pub fn token_exchange_routes() -> Router<Arc<AppContext>> {
 /// absent on test paths that do not run the trust middleware. The
 /// `request.extensions().get::<RequestTrust>()` lookup falls back to
 /// the literal `"unknown"` source IP in that case.
+///
+/// The resolved IP is used twice: as the session-description source
+/// string, and typed, as the `client_ip` threaded into
+/// `authenticate_bearer_with_client_ip` so the PAT validator's per-IP
+/// lockout is armed on this path too.
 #[tracing::instrument(skip(ctx, request))]
 async fn post_exchange(State(ctx): State<Arc<AppContext>>, request: Request) -> Response {
     let started = Instant::now();
@@ -357,13 +363,15 @@ async fn post_exchange(State(ctx): State<Arc<AppContext>>, request: Request) -> 
     // extraction. The trust middleware populates it; tests without
     // the middleware fall back to "unknown" so the description string
     // is always well-formed.
-    let source_ip = request
+    let client_ip = request
         .extensions()
         .get::<RequestTrust>()
-        .map(|t| t.client_ip.to_string())
+        .map(|t| t.client_ip);
+    let source_ip = client_ip
+        .map(|ip| ip.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let response = run(&ctx, request, &source_ip).await;
+    let response = run(&ctx, request, &source_ip, client_ip).await;
     record_duration(
         response.kind,
         response.label,
@@ -387,7 +395,12 @@ struct Outcome {
     kind: &'static str,
 }
 
-async fn run(ctx: &Arc<AppContext>, request: Request, source_ip: &str) -> Outcome {
+async fn run(
+    ctx: &Arc<AppContext>,
+    request: Request,
+    source_ip: &str,
+    client_ip: Option<IpAddr>,
+) -> Outcome {
     // 1. Form parsing — RFC 8693 §2.1 wire body. Map axum's typed
     //    rejection into the RFC 8693 error envelope. Most variants
     //    return HTTP 400 `invalid_request`; `InvalidFormContentType`
@@ -531,7 +544,18 @@ async fn run(ctx: &Arc<AppContext>, request: Request, source_ip: &str) -> Outcom
         }
     };
 
-    let principal = match authenticate.authenticate_bearer(subject_token).await {
+    // Threaded for the per-IP PAT lockout the client-IP-aware entry
+    // point arms. On THIS path the PAT branch is unreachable — step 6
+    // above rejects every PAT-shaped `subject_token` before we get
+    // here — so the lockout cannot engage from the exchange endpoint
+    // today. It is threaded anyway because the alternative is a
+    // credential path that silently reverts to `None` the moment that
+    // gate moves, which is exactly how the lockout came to be armed
+    // nowhere.
+    let principal = match authenticate
+        .authenticate_bearer_with_client_ip(subject_token, client_ip)
+        .await
+    {
         Ok(p) => p,
         Err(AppError::OidcValidation(OidcValidationError::Expired)) => {
             return error_outcome(

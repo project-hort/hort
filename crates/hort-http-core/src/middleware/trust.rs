@@ -8,14 +8,49 @@
 //!
 //! # Policy
 //!
-//! | `HORT_PUBLIC_BASE_URL` | `HORT_TRUSTED_PROXY_CIDRS` | `public_url` | `client_ip` |
+//! The two fields are derived from **different** inputs, so the policy
+//! is two independent tables rather than one.
+//! `HORT_PUBLIC_BASE_URL` governs `public_url` only;
+//! `HORT_TRUSTED_PROXY_CIDRS` governs `client_ip` only. In
+//! particular a pinned public base URL does **not** switch off
+//! `X-Forwarded-For` attribution: [`evaluate_trust`] never reads
+//! `public_base_url` when computing `client_ip`. (An earlier single
+//! table here claimed the opposite — "set ⇒ socket peer,
+//! `X-Forwarded-*` ignored" — which no code path implements.)
+//!
+//! `public_url`:
+//!
+//! | `HORT_PUBLIC_BASE_URL` | peer | `public_url` |
+//! |---|---|---|
+//! | set | (any) | the configured URL (`X-Forwarded-*` and `Host` ignored) |
+//! | unset | trusted | `X-Forwarded-Proto` + `-Host` (falling back to `Host`) |
+//! | unset | NOT trusted | `Host` + `https` scheme |
+//! | unset | NOT trusted, no `Host` | bind-address-derived default (`warn!` emitted) |
+//!
+//! `client_ip`:
+//!
+//! | `HORT_TRUSTED_PROXY_CIDRS` | peer | `X-Forwarded-For` | `client_ip` |
 //! |---|---|---|---|
-//! | set | (ignored) | the configured URL | socket peer (`X-Forwarded-*` ignored) |
-//! | unset | set, peer is trusted, XFF present | `X-Forwarded-Proto` + `-Host` (falling back to `Host`) | rightmost-untrusted `X-Forwarded-For` |
-//! | unset | set, peer is trusted, XFF absent | (as above) | [`XFF_MISSING_SENTINEL`] (`0.0.0.0`) + throttled `warn!` |
-//! | unset | set, peer NOT trusted | `Host` + `https` scheme | socket peer |
-//! | unset | set, peer NOT trusted, no `Host` | bind-address-derived default (`warn!` emitted) | socket peer |
-//! | unset | unset | handled upstream — `Config::from_env` refuses to start |
+//! | set | trusted | at least one untrusted entry | rightmost-untrusted entry |
+//! | set | trusted | absent, or every entry trusted | [`XFF_MISSING_SENTINEL`] (`0.0.0.0`) + throttled `warn!` |
+//! | set | NOT trusted | (ignored) | socket peer |
+//! | empty | (any) | (ignored) | socket peer — requires the operator to declare `HORT_CLIENT_IP_FROM_SOCKET_PEER=true` at startup |
+//!
+//! The last row is the one an operator reaches by accident: with an
+//! empty allowlist every caller behind an edge is attributed to the
+//! edge, so the per-IP controls keyed on `client_ip` (PAT lockout,
+//! auth-failure bucket, per-IP concurrency cap, fail2ban) collapse onto
+//! one bucket. Nothing here can tell a directly-exposed deployment from
+//! a proxied one, and no runtime test can either — "an untrusted peer
+//! sent `X-Forwarded-For`" would let a directly-connected attacker opt
+//! out of its own bucket by adding a header. So the operator declares
+//! it and `hort-server::config::Config::from_env` refuses the
+//! undeclared case
+//! (`hort_server::config::ConfigError::ClientIpAttributionUnconfigured`),
+//! which is why this middleware can treat the row as deliberate.
+//!
+//! `HORT_PUBLIC_BASE_URL` unset together with `HORT_TRUSTED_PROXY_CIDRS`
+//! unset never reaches this middleware — see the startup note below.
 //!
 //! On the "trusted peer, XFF absent" sentinel row: falling back to the
 //! proxy's socket peer would collapse
@@ -276,14 +311,14 @@ pub(crate) fn evaluate_trust(
     };
 
     let client_ip = if peer_trusted {
-        // `peer_trusted == true` implies `peer_ip == Some(_)` AND that
-        // ip is in `trusted_proxy_cidrs` (see how `peer_trusted` is
-        // computed above) — the `expect` is a structural invariant,
-        // not a runtime check. The right-to-left walk strips trusted
-        // hops; the first untrusted hop is the real client.
-        let trusted_peer = peer_ip.expect("peer_trusted=true implies peer_ip is Some");
-        rightmost_untrusted_forwarded_for(headers, trusted_peer, &config.trusted_proxy_cidrs)
-            .unwrap_or_else(|| {
+        // The right-to-left walk steps over trusted hops; the
+        // rightmost entry that is not itself a trusted hop is the real
+        // client. The socket peer is not an input: it is in
+        // `trusted_proxy_cidrs` by construction of `peer_trusted`, so
+        // it can only ever be a hop to step over.
+        match rightmost_untrusted_forwarded_for(headers, &config.trusted_proxy_cidrs) {
+            Some(client) => client,
+            None => {
                 // Trusted proxy set the allowlist but omitted (or every
                 // hop was trusted in) `X-Forwarded-For` — proxy
                 // misconfiguration or strip attempt. So:
@@ -305,7 +340,8 @@ pub(crate) fn evaluate_trust(
                     );
                 }
                 XFF_MISSING_SENTINEL
-            })
+            }
+        }
     } else {
         peer_ip.unwrap_or(XFF_MISSING_SENTINEL)
     };
@@ -399,67 +435,40 @@ fn forwarded_host(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Walk `X-Forwarded-For` right-to-left and return the rightmost hop
-/// that is NOT in `trusted_cidrs`. The naive "leftmost" reading is
-/// **spoofable**: any client can prepend a fake IP to its own request,
-/// and an appending proxy will dutifully tack the real client on the
-/// right without stripping the spoofed entry. Walking right-to-left
-/// strips trusted-proxy hops until we cross the trust boundary — that
-/// boundary entry is the correct attribution (RFC 7239 §5.2 / OWASP
-/// proxy-headers guidance).
+/// that is NOT in `trusted_cidrs`; `None` when every entry is trusted
+/// (the caller substitutes [`XFF_MISSING_SENTINEL`]).
 ///
-/// Algorithm (with the trust-boundary edge case spelled out — the bare
-/// pseudocode misses the leftmost-untrusted-after-all-trusted-hops
-/// case):
-/// - Parse the XFF header into a `Vec<IpAddr>`, dropping unparseable
-///   entries silently (matches the previous parser's `.ok()` shape).
-/// - Maintain `prev_trusted`, initialised to `cidr_contains(peer_ip)`.
-///   The "previous hop" relative to the rightmost XFF entry is the
-///   socket peer that handed us the request.
-/// - Walking right-to-left, on each entry: if `prev_trusted` is
-///   `false`, the hop to our right was already untrusted, so the
-///   chain has been compromised — return the current entry as the
-///   attribution boundary. Otherwise, remember this entry as the
-///   running "last entry walked" candidate and update
-///   `prev_trusted = cidr_contains(entry)`.
-/// - After the loop:
-///   - If `prev_trusted` is still `true`, every hop including the
-///     leftmost was trusted → no external attribution boundary →
-///     return `None` (caller falls back to `XFF_MISSING_SENTINEL`).
-///   - If `prev_trusted` flipped to `false` on the final entry, that
-///     leftmost entry is the original (untrusted) sender — return it.
+/// The naive "leftmost" reading is **spoofable**: any client can
+/// prepend a fake IP to its own request, and an appending proxy
+/// (nginx's `$proxy_add_x_forwarded_for`) will dutifully tack the real
+/// client on the right without stripping the prepended entry. So the
+/// real client is the RIGHTMOST entry a trusted proxy did not write,
+/// and everything to its left is either a proxy hop we trust or a
+/// string the caller chose (RFC 7239 §5.2 / OWASP proxy-headers
+/// guidance).
 ///
-/// This is the spoof-resistant attribution walk — see the test-module
-/// rationale below.
+/// The predicate is per-entry and local: an entry is a proxy hop iff
+/// its own address is in `trusted_cidrs`. Nothing about an entry's
+/// neighbours can make it attributable — in particular a prepended
+/// entry naming an address inside `trusted_cidrs` is skipped as the
+/// proxy hop it claims to be, never returned, because naming an
+/// internal address costs a caller nothing.
+///
+/// A chain of several real trusted proxies therefore still resolves:
+/// their addresses are in `trusted_cidrs`, so the walk steps over all
+/// of them and stops at the first entry that is not.
+///
+/// Unparseable entries are dropped silently (an unparseable entry is
+/// not an address, so it is neither a trusted hop nor an attribution).
 fn rightmost_untrusted_forwarded_for(
     headers: &HeaderMap,
-    peer_ip: IpAddr,
     trusted_cidrs: &[IpNet],
 ) -> Option<IpAddr> {
     let raw = header_str(headers, "x-forwarded-for")?;
-    let entries: Vec<IpAddr> = raw
-        .split(',')
+    raw.split(',')
         .filter_map(|s| s.trim().parse::<IpAddr>().ok())
-        .collect();
-    let mut prev_trusted = cidr_contains(peer_ip, trusted_cidrs);
-    let mut candidate: Option<IpAddr> = None;
-    for entry in entries.iter().rev() {
-        if !prev_trusted {
-            return Some(*entry);
-        }
-        candidate = Some(*entry);
-        prev_trusted = cidr_contains(*entry, trusted_cidrs);
-    }
-    // Loop ended without surfacing a mid-chain untrusted hop.
-    // - prev_trusted == true: all hops trusted including leftmost.
-    // - prev_trusted == false: the LAST update (leftmost entry) made
-    //   it false. That leftmost entry is the original sender — return
-    //   it. This is the trust-boundary edge case the design pseudocode
-    //   omits but the unit tests pin.
-    if prev_trusted {
-        None
-    } else {
-        candidate
-    }
+        .rev()
+        .find(|entry| !cidr_contains(*entry, trusted_cidrs))
 }
 
 fn build_url(scheme: &str, authority: &str) -> Option<url::Url> {
@@ -781,15 +790,14 @@ mod tests {
     #[test]
     fn rightmost_untrusted_single_xff_entry_with_trusted_peer() {
         // Single-hop trusted proxy. The only XFF entry IS the real
-        // client — the algorithm's trust-boundary fallback (the
-        // post-loop `if !prev_trusted { candidate }` arm) returns it.
-        // Without that arm, this case would silently fall through to
-        // the sentinel and we'd lose attribution for the most common
-        // single-proxy deployment.
+        // client: it is not in the trusted range, so the walk returns
+        // it on its first step. This is the most common single-proxy
+        // deployment, and a walk that required a trusted entry to its
+        // right would lose attribution for all of it.
         let cidrs = vec![cidr("192.168.0.0/16")];
         let h = headers(&[("x-forwarded-for", "1.2.3.4")]);
         assert_eq!(
-            rightmost_untrusted_forwarded_for(&h, ip("192.168.0.1"), &cidrs),
+            rightmost_untrusted_forwarded_for(&h, &cidrs),
             Some(ip("1.2.3.4")),
             "trusted single-hop proxy: the only entry IS the real client"
         );
@@ -798,13 +806,13 @@ mod tests {
     #[test]
     fn rightmost_untrusted_walks_chain_of_trusted_proxies() {
         // Three-hop chain: original client 1.2.3.4 → trusted proxy
-        // 192.168.1.1 → trusted proxy 10.0.0.1 → us. Peer is the last
-        // trusted hop (10.0.0.1). Walk right-to-left, strip trusted
-        // hops, surface the first untrusted entry.
+        // 192.168.1.1 → trusted proxy 10.0.0.1 → us, each proxy
+        // appending the address it saw. Walk right-to-left, step over
+        // both trusted hops, surface the first entry that is not one.
         let cidrs = vec![cidr("10.0.0.0/8"), cidr("192.168.0.0/16")];
         let h = headers(&[("x-forwarded-for", "1.2.3.4, 192.168.1.1, 10.0.0.1")]);
         assert_eq!(
-            rightmost_untrusted_forwarded_for(&h, ip("10.0.0.1"), &cidrs),
+            rightmost_untrusted_forwarded_for(&h, &cidrs),
             Some(ip("1.2.3.4")),
             "chained trusted proxies: the leftmost untrusted entry is the real client"
         );
@@ -812,15 +820,14 @@ mod tests {
 
     #[test]
     fn rightmost_untrusted_rejects_spoofed_leftmost_when_peer_untrusted() {
-        // XFF `<spoofed-1.2.3.4>, <real-5.6.7.8>`,
-        // peer 5.6.7.8 (untrusted) → returns real client 5.6.7.8 (NOT
-        // the spoofed 1.2.3.4). Function-level: prev_trusted starts
-        // false (peer not in CIDRs); the first rev iteration is the
-        // rightmost entry 5.6.7.8 → returned immediately.
+        // XFF `<spoofed-1.2.3.4>, <real-5.6.7.8>` → returns the real
+        // client 5.6.7.8, NOT the spoofed 1.2.3.4: the rightmost entry
+        // is outside the trusted range, so the walk stops there and
+        // never reads the prepended entry.
         let cidrs = vec![cidr("10.0.0.0/8")];
         let h = headers(&[("x-forwarded-for", "1.2.3.4, 5.6.7.8")]);
         assert_eq!(
-            rightmost_untrusted_forwarded_for(&h, ip("5.6.7.8"), &cidrs),
+            rightmost_untrusted_forwarded_for(&h, &cidrs),
             Some(ip("5.6.7.8")),
             "rightmost-untrusted: real client wins, spoofed leftmost ignored"
         );
@@ -861,6 +868,94 @@ mod tests {
         );
     }
 
+    // -- the prepended-entry corpus --
+    //
+    // Every chain below is what an APPENDING proxy (nginx
+    // `$proxy_add_x_forwarded_for`) hands us after a client sent its own
+    // `X-Forwarded-For`: the client's forged entries first, the real
+    // client's socket address appended on the right. The real client is
+    // therefore the RIGHTMOST entry in all four, and the forged prefix is
+    // whatever the attacker chose — including addresses inside the
+    // trusted range, which it may name freely because naming them is
+    // free.
+    //
+    // The walk must cross the forged prefix without stopping in it. A
+    // walk that stops at the first entry whose RIGHT-hand neighbour was
+    // untrusted stops one entry too early and attributes the request to
+    // the attacker's choice — which is both the wrong bucket and, with
+    // the third and fourth chains, a bucket the attacker can point at an
+    // internal address.
+
+    #[test]
+    fn rightmost_untrusted_ignores_one_prepended_foreign_entry() {
+        let cidrs = vec![cidr("10.0.0.0/8")];
+        let h = headers(&[("x-forwarded-for", "1.2.3.4, 203.0.113.7")]);
+        assert_eq!(
+            rightmost_untrusted_forwarded_for(&h, &cidrs),
+            Some(ip("203.0.113.7")),
+            "the appended rightmost entry is the real client; the prepended \
+             1.2.3.4 is the attacker's own string"
+        );
+    }
+
+    #[test]
+    fn rightmost_untrusted_ignores_several_prepended_foreign_entries() {
+        let cidrs = vec![cidr("10.0.0.0/8")];
+        let h = headers(&[("x-forwarded-for", "9.9.9.9, 8.8.8.8, 203.0.113.7")]);
+        assert_eq!(
+            rightmost_untrusted_forwarded_for(&h, &cidrs),
+            Some(ip("203.0.113.7")),
+            "a longer forged prefix changes nothing: the rightmost untrusted \
+             entry is still the real client"
+        );
+    }
+
+    #[test]
+    fn rightmost_untrusted_ignores_prepended_entry_from_trusted_range() {
+        let cidrs = vec![cidr("10.0.0.0/8")];
+        let h = headers(&[("x-forwarded-for", "10.0.0.9, 203.0.113.7")]);
+        assert_eq!(
+            rightmost_untrusted_forwarded_for(&h, &cidrs),
+            Some(ip("203.0.113.7")),
+            "a forged entry from inside the trusted range must not be \
+             returned: it is skipped as a proxy hop, never attributed to"
+        );
+    }
+
+    #[test]
+    fn rightmost_untrusted_two_chained_trusted_proxies_with_client_rightmost() {
+        let cidrs = vec![cidr("10.0.0.0/8")];
+        let h = headers(&[("x-forwarded-for", "10.0.0.1, 10.0.0.2, 203.0.113.7")]);
+        assert_eq!(
+            rightmost_untrusted_forwarded_for(&h, &cidrs),
+            Some(ip("203.0.113.7")),
+            "a forged two-hop internal chain is skipped entry by entry; the \
+             appended real client is the attribution"
+        );
+    }
+
+    #[test]
+    fn evaluate_trust_attributes_appended_client_not_prepended_entry() {
+        // The same defect one level up: what the rate-limit bucket, the
+        // PAT lockout and the auth audit log actually see.
+        let config = default_config(None, &["10.0.0.0/8"]);
+        let h = headers(&[
+            ("host", "hort.example.com"),
+            ("x-forwarded-for", "1.2.3.4, 203.0.113.7"),
+        ]);
+        let trust = evaluate_trust(&config, Some(ip("10.0.0.5")), &h);
+        assert_eq!(
+            trust.client_ip,
+            ip("203.0.113.7"),
+            "client_ip must be the real caller, not the prepended string"
+        );
+        assert_ne!(
+            trust.client_ip,
+            ip("1.2.3.4"),
+            "a caller must not be able to choose its own attribution bucket"
+        );
+    }
+
     #[test]
     fn rightmost_untrusted_all_trusted_chain_returns_none() {
         // Every entry is in the trusted CIDR set — including the
@@ -873,7 +968,7 @@ mod tests {
         let cidrs = vec![cidr("10.0.0.0/8"), cidr("192.168.0.0/16")];
         let h = headers(&[("x-forwarded-for", "10.0.0.5, 192.168.1.7, 10.0.0.1")]);
         assert_eq!(
-            rightmost_untrusted_forwarded_for(&h, ip("10.0.0.1"), &cidrs),
+            rightmost_untrusted_forwarded_for(&h, &cidrs),
             None,
             "all-trusted chain: no untrusted hop to surface; caller sentinel takes over"
         );

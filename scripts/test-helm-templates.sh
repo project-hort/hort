@@ -161,6 +161,10 @@ EOF
 # `<fixture>|<template path, relative to the chart dir>|<grep -cE pattern>|<expected count>|<human label>`.
 scoped_expectations() {
     cat <<'EOF'
+test-values.yaml|templates/deployment.yaml|HORT_CLIENT_IP_FROM_SOCKET_PEER|1|with trustedProxyCidrs empty the server Deployment renders the attribution declaration (default false ⇒ the binary refuses to start, which is the point: an empty allowlist attributes every caller to the TCP peer)
+test-values.yaml|templates/deployment.yaml|HORT_TRUSTED_PROXY_CIDRS|0|the allowlist env is NOT rendered on the server Deployment when trustedProxyCidrs is empty
+test-values-ha.yaml|templates/deployment.yaml|HORT_TRUSTED_PROXY_CIDRS|1|trustedProxyCidrs set ⇒ the allowlist env renders on the server Deployment. Scoped, because `hort-server.runtimeEnv` renders the same variable into every CronJob and the worker, so a full-render count tracks how many scheduled tasks the fixture enables rather than anything about the server
+test-values-ha.yaml|templates/deployment.yaml|HORT_CLIENT_IP_FROM_SOCKET_PEER|0|the declaration is NOT rendered when trustedProxyCidrs is set — the allowlist already says where the edge is, so the two are mutually exclusive by construction and an operator cannot set both
 test-values-cronjobs.yaml|templates/worker-deployment.yaml|readOnly: true|0|worker's CAS data mount renders WITHOUT readOnly (the worker writes scan-finding + prefetch-ingest blobs)
 test-values-cronjobs.yaml|templates/worker-deployment.yaml|mountPath: /var/lib/hort-server/cas|1|worker's CAS data mount still renders (filesystem backend)
 test-values-ha.yaml|templates/deployment.yaml|app.kubernetes.io/component: server|2|server Deployment's spec.selector.matchLabels carries the component discriminator (1) alongside the existing pod-template label (1) — matchLabels stays a subset of the pod labels

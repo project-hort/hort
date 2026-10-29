@@ -499,6 +499,11 @@ image:
 # smoke test on a private kind cluster, not a production install.
 publicBaseUrl: "http://hort-server.${NAMESPACE}.svc.cluster.local"
 requireHttps: false
+# Pods reach the Service directly on this kind cluster — no ingress, so
+# the TCP peer is the caller. Required whenever trustedProxyCidrs is
+# empty: the server refuses to start undeclared rather than silently
+# attribute every caller to an edge address.
+clientIpFromSocketPeer: true
 
 postgres:
   app:

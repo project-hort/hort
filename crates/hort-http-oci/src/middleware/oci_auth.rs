@@ -127,6 +127,18 @@ pub async fn oci_bearer_auth(
         return next.run(req).await;
     }
 
+    // Client attribution for the PAT validator's per-IP brute-force
+    // lockout, which `authenticate_bearer_with_client_ip` arms and a
+    // `None` disables. Read from the `RequestTrust` extension — never
+    // from `ConnectInfo`, which behind a proxy is one address for every
+    // caller. `None` only on a router with no trust layer (the
+    // standalone-router tests), which disarms the lockout rather than
+    // mis-attributing it.
+    let client_ip = req
+        .extensions()
+        .get::<hort_http_core::middleware::trust::RequestTrust>()
+        .map(|t| t.client_ip);
+
     // Resolve a token from `Authorization`. Bearer or Basic-as-JWT
     // both supply the same string; absent → anonymous pass-through.
     let token = extract_token(&req);
@@ -213,7 +225,10 @@ pub async fn oci_bearer_auth(
                     );
                     return unauthorized_response(&ctx, &method, &path);
                 };
-                match authenticate.authenticate_bearer(&token).await {
+                match authenticate
+                    .authenticate_bearer_with_client_ip(&token, client_ip)
+                    .await
+                {
                     Ok(p) => Some(p),
                     Err(err) => {
                         tracing::info!(
@@ -771,6 +786,18 @@ mod tests {
     /// a live principal carrying `token_kind: Some(kind)` and
     /// `token_cap: Some(..)`.
     fn bearer_only_ctx_with_pat(kind: TokenKind, verify_ok: bool) -> Arc<AppContext> {
+        bearer_only_ctx_with_pat_lockout(kind, verify_ok, PatLockoutConfig::DEFAULT).0
+    }
+
+    /// [`bearer_only_ctx_with_pat`] with an operator-chosen lockout
+    /// policy, also handing back the durable ephemeral store the
+    /// lockout keys into — the only observable, since every
+    /// `PatValidationError` arm reaches the wire as the same `401`.
+    fn bearer_only_ctx_with_pat_lockout(
+        kind: TokenKind,
+        verify_ok: bool,
+        lockout: PatLockoutConfig,
+    ) -> (Arc<AppContext>, Arc<dyn EphemeralStore>) {
         let handle = PrometheusBuilder::new().build_recorder().handle();
         let (ctx, mocks) = build_mock_ctx(handle);
 
@@ -817,7 +844,7 @@ mod tests {
             pat_cache,
             Arc::new(StubVerifier(verify_ok)) as Arc<dyn Argon2Verifier>,
             Arc::new(SystemClock),
-            PatLockoutConfig::DEFAULT,
+            lockout,
         ));
 
         let idp = Arc::new(MockIdentityProvider::new());
@@ -832,13 +859,109 @@ mod tests {
         let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(
             Vec::new(),
         )));
-        with_auth(
+        let ctx = with_auth(
             &ctx,
             AuthContext::BearerOnly {
                 authenticate: auth,
                 rbac,
             },
+        );
+        (
+            ctx,
+            mocks.ephemeral_durable.clone() as Arc<dyn EphemeralStore>,
         )
+    }
+
+    // -------------------- 0. Client attribution --------------------------
+    //
+    // The consume-side bearer middleware is a credential presentation
+    // too: a directly-presented native `hort_pat_*` reaches the PAT
+    // validator through `authenticate_bearer_with_client_ip`, and the
+    // per-IP brute-force lockout only exists if the IP gets there. This
+    // middleware previously called the two-argument form, which
+    // delegates with `None` and disarms the gate.
+    //
+    // The request carries a `RequestTrust` with the real caller AND a
+    // different `ConnectInfo` peer, so attributing to the socket peer
+    // (or to nothing) fails here.
+
+    #[test]
+    fn oci_bearer_failure_counts_against_the_trust_resolved_client() {
+        use hort_app::metrics::client_ip_bucket;
+        use hort_app::use_cases::pat_validation_use_case::{
+            PAT_LOCKOUT_BY_IP_COUNTER_PREFIX, PAT_LOCKOUT_BY_IP_FLAG_PREFIX,
+        };
+        use hort_http_core::middleware::trust::RequestTrust;
+
+        let client: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let peer: std::net::SocketAddr = "10.0.0.5:4444".parse().unwrap();
+        let (counter, flag, proxy_counter) = run(async {
+            let (ctx, store) = bearer_only_ctx_with_pat_lockout(
+                TokenKind::Pat,
+                // The planted row's hash never matches: the validator
+                // runs, fails, and books the failure.
+                false,
+                PatLockoutConfig {
+                    threshold: 2,
+                    ..PatLockoutConfig::DEFAULT
+                },
+            );
+            let trust = RequestTrust {
+                client_ip: client,
+                public_url: url::Url::parse("https://hort.example.com/").unwrap(),
+            };
+            let router = build_test_router(&ctx).layer(axum::Extension(trust));
+            for _ in 0..2 {
+                let resp = router
+                    .clone()
+                    .oneshot(
+                        HttpRequest::get("/v2/probe")
+                            .header(header::AUTHORIZATION, format!("Bearer {VALID_PAT}"))
+                            .extension(axum::extract::ConnectInfo(peer))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "a PAT whose hash does not match must 401"
+                );
+            }
+            let bucket = client_ip_bucket(client);
+            let counter = store
+                .get(&format!("{PAT_LOCKOUT_BY_IP_COUNTER_PREFIX}{bucket}"))
+                .await
+                .unwrap();
+            let flag = store
+                .get(&format!("{PAT_LOCKOUT_BY_IP_FLAG_PREFIX}{bucket}"))
+                .await
+                .unwrap();
+            let proxy_counter = store
+                .get(&format!(
+                    "{PAT_LOCKOUT_BY_IP_COUNTER_PREFIX}{}",
+                    client_ip_bucket(peer.ip())
+                ))
+                .await
+                .unwrap();
+            (counter, flag, proxy_counter)
+        });
+        assert!(
+            counter.is_some(),
+            "a failed native-token presentation on /v2/* must count against \
+             the caller's bucket; absent means the middleware threaded None \
+             and the lockout is disarmed"
+        );
+        assert!(
+            flag.is_some(),
+            "two failures at threshold 2 must trip the lockout flag"
+        );
+        assert!(
+            proxy_counter.is_none(),
+            "nothing may be attributed to the socket peer: behind a proxy \
+             that is one address for every caller"
+        );
     }
 
     // -------------------- 1. Anonymous (no header) -----------------------

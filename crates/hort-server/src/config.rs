@@ -1582,6 +1582,29 @@ pub enum ConfigError {
         X-Forwarded-Host injection from poisoning package download URLs."
     )]
     TrustUnconfigured,
+    /// `HORT_TRUSTED_PROXY_CIDRS` is empty and the operator has not
+    /// declared that clients reach this server directly.
+    ///
+    /// With an empty allowlist, `RequestTrust` attributes every request
+    /// to its socket peer. That is correct for a directly-exposed
+    /// server and catastrophic behind an edge: the peer is then the
+    /// edge's address for every caller on earth, so the per-IP controls
+    /// keyed on it — the PAT brute-force lockout, the auth-failure
+    /// bucket, the per-IP concurrency cap, fail2ban — all collapse onto
+    /// one bucket and thirty failed credential presentations from
+    /// anywhere lock out the whole deployment.
+    ///
+    /// Nothing observable at boot distinguishes the two deployments,
+    /// and no runtime heuristic can: "an untrusted peer sent
+    /// `X-Forwarded-For`" would let a directly-connected attacker opt
+    /// out of its own bucket by adding a header. So the operator
+    /// declares the shape, and the undeclared case fails closed at
+    /// admission rather than degrading attribution at runtime
+    /// (ADR 0016).
+    #[error(
+        "client-IP attribution unconfigured: HORT_TRUSTED_PROXY_CIDRS is empty,         so every request is attributed to its TCP peer. If a reverse proxy,         ingress or load balancer sits in front of this server, that peer is the         proxy — one bucket for every caller — and the per-IP controls keyed on         it (PAT brute-force lockout, auth-failure rate limit, per-IP         concurrency cap, fail2ban) are disabled deployment-wide: 30 failed         credential presentations from anywhere lock out every client.         Set HORT_TRUSTED_PROXY_CIDRS to the edge's source ranges         (e.g. 10.0.0.0/8,::1/128) so X-Forwarded-For from those peers is         trusted. ONLY if clients connect to this server directly, with nothing         in between, set HORT_CLIENT_IP_FROM_SOCKET_PEER=true to declare that         the TCP peer IS the client. Do not set it to silence this error on a         proxied deployment, and do not set HORT_TRUSTED_PROXY_CIDRS=0.0.0.0/0         — that trusts X-Forwarded-For from everyone, which lets any caller         choose its own attribution."
+    )]
+    ClientIpAttributionUnconfigured,
     /// Env var parsed as a valid integer but the value is zero, which
     /// carries a different (and usually wrong) semantic than the
     /// operator intended — e.g. `SET statement_timeout = 0` in Postgres
@@ -2129,6 +2152,28 @@ impl Config {
         // serves URLs to clients — auth or no auth.
         if public_base_url.is_none() && trusted_proxy_cidrs.is_empty() {
             return Err(ConfigError::TrustUnconfigured);
+        }
+
+        // Client-IP attribution admission check. Deliberately keyed on
+        // `trusted_proxy_cidrs` ALONE, not on the pair above:
+        // `evaluate_trust` derives `client_ip` from the CIDR list and
+        // never reads `public_base_url`, so a pinned public URL — the
+        // value an operator sets first, because it is the obviously
+        // required one — does nothing for attribution. The check above
+        // is about URL emission (X-Forwarded-Host poisoning package
+        // download URLs); this one is about who the per-IP controls
+        // think the caller is.
+        //
+        // The declaration is NOT stored on `Config`: its entire effect
+        // is admission. Nothing branches on it at runtime — with the
+        // allowlist empty, attribution is the socket peer either way —
+        // so carrying it as a field would be an operator-visible
+        // setting with no consumer. The boot log line in
+        // `cli::serve` reports the resulting attribution source from
+        // the CIDR list itself.
+        let client_ip_from_socket_peer = parse_bool("HORT_CLIENT_IP_FROM_SOCKET_PEER", false)?;
+        if trusted_proxy_cidrs.is_empty() && !client_ip_from_socket_peer {
+            return Err(ConfigError::ClientIpAttributionUnconfigured);
         }
 
         // `HORT_REQUIRE_HTTPS` opt-in gate — see `enforce_require_https`.
@@ -4480,6 +4525,14 @@ mod tests {
             // `env.last_mut()` or by constructing a fresh env slice.
             ("HORT_PUBLIC_BASE_URL", Some("http://hort-server:8080")),
             ("HORT_TRUSTED_PROXY_CIDRS", None),
+            // Client-IP attribution is required at startup too: an
+            // empty `HORT_TRUSTED_PROXY_CIDRS` attributes every request
+            // to its socket peer, which is only correct when nothing
+            // sits in front of the server. `fs_env` declares the
+            // direct-connection shape so existing tests don't trip on
+            // `ConfigError::ClientIpAttributionUnconfigured`; the tests
+            // that exercise the refusal override this slot.
+            ("HORT_CLIENT_IP_FROM_SOCKET_PEER", Some("true")),
             // Operator override of the shared
             // publish body-size ceiling. Absent in the default test
             // env so `publish_body_limit_bytes` falls through to
@@ -4729,6 +4782,9 @@ mod tests {
             // Trust config required at startup.
             ("HORT_PUBLIC_BASE_URL", Some("http://hort-server:8080")),
             ("HORT_TRUSTED_PROXY_CIDRS", None),
+            // Declares the direct-connection shape, same as `fs_env` —
+            // see the comment there.
+            ("HORT_CLIENT_IP_FROM_SOCKET_PEER", Some("true")),
         ];
         temp_env::with_vars(env, || {
             let cfg = Config::from_env().unwrap();
@@ -4815,6 +4871,9 @@ mod tests {
             ("HORT_METADATA_BLOB_MAX_SIZE", None),
             ("HORT_PUBLIC_BASE_URL", Some("http://hort-server:8080")),
             ("HORT_TRUSTED_PROXY_CIDRS", None),
+            // Declares the direct-connection shape, same as `fs_env` —
+            // see the comment there.
+            ("HORT_CLIENT_IP_FROM_SOCKET_PEER", Some("true")),
         ]
     }
 
@@ -4909,6 +4968,9 @@ mod tests {
             ("HORT_METADATA_BLOB_MAX_SIZE", None),
             ("HORT_PUBLIC_BASE_URL", Some("http://hort-server:8080")),
             ("HORT_TRUSTED_PROXY_CIDRS", None),
+            // Declares the direct-connection shape, same as `fs_env` —
+            // see the comment there.
+            ("HORT_CLIENT_IP_FROM_SOCKET_PEER", Some("true")),
         ]
     }
 
@@ -5003,6 +5065,9 @@ mod tests {
             ("HORT_METADATA_BLOB_MAX_SIZE", None),
             ("HORT_PUBLIC_BASE_URL", Some("http://hort-server:8080")),
             ("HORT_TRUSTED_PROXY_CIDRS", None),
+            // Declares the direct-connection shape, same as `fs_env` —
+            // see the comment there.
+            ("HORT_CLIENT_IP_FROM_SOCKET_PEER", Some("true")),
         ]
     }
 
@@ -5133,6 +5198,9 @@ mod tests {
             ("HORT_METADATA_BLOB_MAX_SIZE", None),
             ("HORT_PUBLIC_BASE_URL", Some("http://hort-server:8080")),
             ("HORT_TRUSTED_PROXY_CIDRS", None),
+            // Declares the direct-connection shape, same as `fs_env` —
+            // see the comment there.
+            ("HORT_CLIENT_IP_FROM_SOCKET_PEER", Some("true")),
         ]
     }
 
@@ -6800,14 +6868,135 @@ mod tests {
         });
     }
 
-    // Only HORT_PUBLIC_BASE_URL set — the default `fs_env` case.
+    /// Overwrite the `HORT_CLIENT_IP_FROM_SOCKET_PEER` slot.
+    fn set_client_ip_from_socket_peer(
+        env: &mut [(&'static str, Option<&'static str>)],
+        value: Option<&'static str>,
+    ) {
+        for slot in env.iter_mut() {
+            if slot.0 == "HORT_CLIENT_IP_FROM_SOCKET_PEER" {
+                *slot = ("HORT_CLIENT_IP_FROM_SOCKET_PEER", value);
+                return;
+            }
+        }
+        panic!("fs_env is missing HORT_CLIENT_IP_FROM_SOCKET_PEER slot — check fs_env definition");
+    }
+
+    // Only HORT_PUBLIC_BASE_URL set — the default `fs_env` case. It
+    // satisfies the URL half of trust configuration; the attribution
+    // half is satisfied separately (and in `fs_env` by the
+    // direct-connection declaration), because `public_base_url` governs
+    // URL emission and has no bearing on who the per-IP controls think
+    // the caller is.
 
     #[test]
-    fn trust_public_base_url_alone_is_sufficient() {
+    fn trust_public_base_url_satisfies_the_url_half() {
         temp_env::with_vars(fs_env(), || {
             let cfg = Config::from_env().unwrap();
             assert!(cfg.public_base_url.is_some());
             assert!(cfg.trusted_proxy_cidrs.is_empty());
+        });
+    }
+
+    // -- Client-IP attribution admission ------------------------------------
+    //
+    // An empty `HORT_TRUSTED_PROXY_CIDRS` attributes every request to
+    // its socket peer. Behind an edge that is one address for every
+    // caller, which collapses the PAT lockout, the auth-failure bucket
+    // and the per-IP concurrency cap onto a single bucket. Nothing
+    // observable at boot tells the two deployments apart, so the
+    // operator declares which one this is and the undeclared case fails
+    // closed.
+
+    #[test]
+    fn client_ip_attribution_unconfigured_fails_startup() {
+        // The REACHABLE unsafe shape: the public URL is set (the value
+        // an operator reaches for first) and the proxy allowlist is
+        // not. `TrustUnconfigured` does not fire here — that is exactly
+        // why this check exists.
+        let mut env = fs_env();
+        set_client_ip_from_socket_peer(&mut env, None);
+        temp_env::with_vars(env, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::ClientIpAttributionUnconfigured),
+                "got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn client_ip_attribution_error_names_the_missing_values() {
+        let mut env = fs_env();
+        set_client_ip_from_socket_peer(&mut env, None);
+        temp_env::with_vars(env, || {
+            let msg = format!("{}", Config::from_env().unwrap_err());
+            assert!(
+                msg.contains("HORT_TRUSTED_PROXY_CIDRS"),
+                "error must name the proxied-deployment fix; got {msg}"
+            );
+            assert!(
+                msg.contains("HORT_CLIENT_IP_FROM_SOCKET_PEER"),
+                "error must name the direct-deployment declaration; got {msg}"
+            );
+            assert!(
+                msg.contains("lockout"),
+                "error must say what breaks, not just which var is missing; got {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn client_ip_attribution_satisfied_by_trusted_proxy_cidrs() {
+        // A proxied deployment needs no declaration: the allowlist IS
+        // the declaration, and attribution comes from the
+        // `X-Forwarded-For` walk for peers inside it.
+        let mut env = fs_env();
+        set_client_ip_from_socket_peer(&mut env, None);
+        set_trusted_proxy_cidrs(&mut env, Some("10.0.0.0/8"));
+        temp_env::with_vars(env, || {
+            let cfg = Config::from_env().expect("a declared edge is a complete configuration");
+            assert_eq!(cfg.trusted_proxy_cidrs.len(), 1);
+        });
+    }
+
+    #[test]
+    fn client_ip_attribution_declaration_defaults_to_the_safe_answer() {
+        // An explicit `false` is refused exactly like an absent value:
+        // the declaration has no unsafe default, so an operator cannot
+        // reach the collapsed-bucket deployment by typing the word
+        // "false" any more than by omitting the variable.
+        let mut env = fs_env();
+        set_client_ip_from_socket_peer(&mut env, Some("false"));
+        temp_env::with_vars(env, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::ClientIpAttributionUnconfigured),
+                "got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn client_ip_attribution_declaration_is_not_satisfied_by_a_non_bool() {
+        // The declaration goes through `parse_bool`, so a typo is a
+        // loud `InvalidBool` rather than a silent falsy value that
+        // would then surface as the attribution refusal and send the
+        // operator looking for the wrong thing.
+        let mut env = fs_env();
+        set_client_ip_from_socket_peer(&mut env, Some("yes"));
+        temp_env::with_vars(env, || {
+            let err = Config::from_env().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidBool {
+                        var: "HORT_CLIENT_IP_FROM_SOCKET_PEER",
+                        ..
+                    }
+                ),
+                "got {err:?}"
+            );
         });
     }
 
@@ -7843,6 +8032,9 @@ mod tests {
             ("HORT_METADATA_BLOB_MAX_SIZE", None),
             ("HORT_PUBLIC_BASE_URL", Some("http://hort-server:8080")),
             ("HORT_TRUSTED_PROXY_CIDRS", None),
+            // Declares the direct-connection shape, same as `fs_env` —
+            // see the comment there.
+            ("HORT_CLIENT_IP_FROM_SOCKET_PEER", Some("true")),
             ("HORT_STATEFUL_UPLOAD_STAGING_DIR", None),
         ];
         temp_env::with_vars(env, || {

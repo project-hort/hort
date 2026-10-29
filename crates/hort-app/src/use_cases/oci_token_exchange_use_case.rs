@@ -87,8 +87,12 @@ pub struct OciTokenExchangeRequest {
     /// `axum_extra::extract::Query` / `serde_html_form`, which surfaces
     /// repeated keys as a `Vec<String>`).
     pub scopes: Vec<String>,
-    /// Client IP for the brute-force-lockout gate. `None` for
-    /// in-process callers (tests / CLI).
+    /// Client IP for the brute-force-lockout gate — the
+    /// proxy-trust-resolved caller, which the inbound handler reads
+    /// from the `RequestTrust` request extension. NEVER the raw socket
+    /// peer: behind a reverse proxy that is one address for every
+    /// caller, and a lockout keyed on it locks out the deployment.
+    /// `None` for in-process callers (tests / CLI).
     pub client_ip: Option<IpAddr>,
 }
 
