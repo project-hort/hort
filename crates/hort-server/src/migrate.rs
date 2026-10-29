@@ -89,21 +89,24 @@ fn embedded_migration_versions() -> BTreeSet<i64> {
 /// `events_immutable` trigger itself: belt-and-braces, two
 /// independent mechanisms enforce the same audit invariant.
 ///
-/// **Why a second hardening step for the bookkeeping ledger.**
-/// `_sqlx_migrations` is created by the DDL role on the first migrate
-/// run, so it picks up whatever `ALTER DEFAULT PRIVILEGES` grants the
-/// runtime role on future tables — in the canonical operator recipe
-/// that is `SELECT, INSERT, UPDATE, DELETE`. ADR 0009 keeps the runtime
-/// role *unable* to change the schema rather than merely expected not
-/// to, and that guarantee was only ever enforced on the DDL axis: a
-/// regression that attempted no DDL but wrote the ledger — forging a
+/// **Why a second hardening step for the migration bookkeeping.** Both
+/// bookkeeping tables — the applied-migration ledger `_sqlx_migrations`
+/// and the compatibility register `schema_compat_register` — are
+/// created by the DDL role, so each picks up whatever
+/// `ALTER DEFAULT PRIVILEGES` grants the runtime role on future tables;
+/// in the canonical operator recipe that is
+/// `SELECT, INSERT, UPDATE, DELETE`. ADR 0009 keeps the runtime role
+/// *unable* to change the schema rather than merely expected not to,
+/// and that guarantee was only ever enforced on the DDL axis: a
+/// regression that attempted no DDL but wrote either table — forging a
 /// row, rewriting a checksum, deleting a row — would have succeeded
 /// silently, and `assert_current`, the expand/contract version
-/// arithmetic and sqlx's own checksum-drift detection all believe that
-/// table. `harden_migrations_ledger_role` takes the write privileges
-/// away so such a regression fails loud instead, the same way the
-/// missing `CREATE` makes a stray `migrate::run` on the serve path fail
-/// loud. `SELECT` stays: `assert_current` needs it.
+/// arithmetic and sqlx's own checksum-drift detection all believe what
+/// those two tables say. `harden_migration_bookkeeping_role` takes the
+/// write privileges away so such a regression fails loud instead, the
+/// same way the missing `CREATE` makes a stray `migrate::run` on the
+/// serve path fail loud. `SELECT` stays on both: `assert_current` and
+/// the worker's boot gate read them.
 pub async fn run(pool: &PgPool) -> anyhow::Result<()> {
     let applied = applied_migration_versions(pool).await?;
     let mut register = read_schema_compat_register(pool).await?;
@@ -176,9 +179,9 @@ pub async fn run(pool: &PgPool) -> anyhow::Result<()> {
     harden_events_role(pool)
         .await
         .context("re-asserting events role hardening")?;
-    harden_migrations_ledger_role(pool)
+    harden_migration_bookkeeping_role(pool)
         .await
-        .context("re-asserting migrations-ledger role hardening")?;
+        .context("re-asserting migration-bookkeeping role hardening")?;
     Ok(())
 }
 
@@ -226,37 +229,50 @@ pub async fn harden_events_role(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Re-assert that `hort_app_role` holds no write privileges on the
-/// `_sqlx_migrations` bookkeeping ledger. `SELECT` is deliberately left
-/// in place — it is what [`assert_current`] and the worker's boot gate
-/// read the applied version set through.
+/// Re-assert that `hort_app_role` holds no write privileges on either
+/// migration-bookkeeping table: the applied-migration ledger
+/// `_sqlx_migrations` and the compatibility register
+/// `schema_compat_register`. `SELECT` is deliberately left in place on
+/// both — the ledger is what [`assert_current`] and the worker's boot
+/// gate read the applied version set through, and the register is what
+/// the same two gates read each applied migration's oldest tolerated
+/// binary version through.
 ///
 /// A sibling of [`harden_events_role`] rather than a second concern
-/// inside it: both NOTICE texts below name the table they are about, so
+/// inside it: every NOTICE text below names the table it is about, so
 /// a skip raised on a half-provisioned database says *which* hardening
 /// was skipped.
 ///
-/// **Why the runtime role has these privileges to lose.** The ledger is
-/// created by the DDL role on the first migrate run, which makes it a
-/// "future table" for the operator recipe's
+/// **Why the runtime role has these privileges to lose.** Both tables
+/// are created by the DDL role — the ledger by sqlx on the first
+/// migrate run, the register by `025_schema_compat_register.sql` —
+/// which makes each a "future table" for the operator recipe's
 /// `ALTER DEFAULT PRIVILEGES … GRANT SELECT, INSERT, UPDATE, DELETE ON
-/// TABLES TO hort_app_role` — so the runtime inherits write access to it
-/// without anybody deciding to grant it. ADR 0009's guarantee is that
-/// the runtime role is kept *unable*, not merely expected not to: the
-/// serve path reads the ledger and nothing more, but "the code does not
-/// write it today" is a property of the code, and a regression that
-/// forged a row, rewrote a checksum or deleted a row would have
-/// succeeded in silence. `assert_current`, the expand/contract version
-/// arithmetic and sqlx's own checksum-drift detection all decide on what
-/// this table says.
+/// TABLES TO hort_app_role`, so the runtime inherits write access to
+/// both without anybody deciding to grant it. (`025`'s own header says
+/// as much: it grants nothing explicitly and relies on exactly that
+/// inheritance.) ADR 0009's guarantee is that the runtime role is kept
+/// *unable*, not merely expected not to: the serve path reads both
+/// tables and nothing more, but "the code does not write them today" is
+/// a property of the code, and a regression that forged a row, rewrote
+/// a checksum or deleted a row would have succeeded in silence.
+/// `assert_current`, the expand/contract version arithmetic and sqlx's
+/// own checksum-drift detection all decide on what these two tables
+/// say — the ledger answers "which migrations are applied", the
+/// register answers "how far back may a binary roll", and a forged
+/// register row is what would let a binary serve a schema that has
+/// already contracted out from under it.
 ///
 /// **Why here and not in a migration.** A migration runs once and is
 /// then skipped forever, while a later bulk
 /// `GRANT … ON ALL TABLES IN SCHEMA public TO hort_app_role` by an
 /// operator, a reconcile loop or an out-of-band fix-up silently
-/// re-grants the writes. Re-asserting it on every `migrate` run keeps
-/// the duty with the binary instead of the operator — the same reason
-/// [`harden_events_role`] exists beside `004_events.sql`'s own REVOKE.
+/// re-grants the writes. `ALTER DEFAULT PRIVILEGES` re-grants them on
+/// any freshly-created database as well, so a one-shot migration would
+/// harden only the installations that already existed when it shipped.
+/// Re-asserting on every `migrate` run keeps the duty with the binary
+/// instead of the operator — the same reason [`harden_events_role`]
+/// exists beside `004_events.sql`'s own REVOKE.
 ///
 /// **Why the full write set and not just the recipe's three.** The
 /// canonical recipe grants only `SELECT, INSERT, UPDATE, DELETE`, so
@@ -265,27 +281,36 @@ pub async fn harden_events_role(pool: &PgPool) -> anyhow::Result<()> {
 /// SCHEMA public TO hort_app_role` is the likelier spelling of an
 /// out-of-band fix-up, and it also lands `TRUNCATE`, `REFERENCES` and
 /// `TRIGGER`. `TRIGGER` is the one that matters: it would let the
-/// runtime role install a trigger on the ledger that fires on the *DDL
-/// role's* writes during a later migration, which is both silent and a
-/// reach into the migrator's own work. Revoking the same set as
-/// [`harden_events_role`] closes that and removes the question of why
-/// two tables hardened for one reason carry different lists.
+/// runtime role install a trigger on a bookkeeping table that fires on
+/// the *DDL role's* writes during a later migration, which is both
+/// silent and a reach into the migrator's own work. Revoking the same
+/// set as [`harden_events_role`] closes that and removes the question
+/// of why tables hardened for one reason carry different lists.
+///
+/// **Why two `DO` blocks and not one.** A PL/pgSQL block that handles
+/// an exception rolls back everything the block did before raising it:
+/// with both REVOKEs inside one block, a database missing either table
+/// would discard the other table's revoke on the way to the NOTICE, so
+/// a register-less database would silently stop hardening the ledger.
+/// One block per table makes each statement's outcome its own.
 ///
 /// Idempotent: `REVOKE` is silent when the privilege is not held, and
-/// the owner of the table (the DDL role) keeps its implicit privileges,
-/// so the `migrate` path itself is unaffected.
+/// the owner of each table (the DDL role) keeps its implicit
+/// privileges, so the `migrate` path's own register write is
+/// unaffected.
 ///
 /// Edge cases handled inline (so a missing role / table is a NOTICE,
 /// not a migration failure):
 /// - **Role missing** (`undefined_object`, 42704) — a dev/test database
 ///   that bootstraps without the operator's two-role recipe. With no
 ///   runtime role there is no privilege to take away, and the role the
-///   single-role database connects as owns the ledger anyway.
-/// - **Table missing** (`undefined_table`, 42P01) — unreachable after
-///   `MIGRATOR.run` succeeds (it creates the ledger before recording
-///   anything in it), but cheap to defend against so calling this
-///   against an unmigrated database is a NOTICE rather than a crash.
-pub async fn harden_migrations_ledger_role(pool: &PgPool) -> anyhow::Result<()> {
+///   single-role database connects as owns both tables anyway.
+/// - **Table missing** (`undefined_table`, 42P01) — unreachable for the
+///   ledger after `MIGRATOR.run` succeeds (it creates the ledger before
+///   recording anything in it), and reachable for the register on a
+///   database whose last migrate predates `025`, which is the same
+///   state [`read_schema_compat_register`] treats as an empty register.
+pub async fn harden_migration_bookkeeping_role(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         DO $$
@@ -303,9 +328,30 @@ pub async fn harden_migrations_ledger_role(pool: &PgPool) -> anyhow::Result<()> 
     )
     .execute(pool)
     .await
-    .context("executing harden_migrations_ledger_role DO block")?;
+    .context("executing the _sqlx_migrations re-hardening DO block")?;
 
-    tracing::info!("migrations-ledger role hardening re-asserted");
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+                ON schema_compat_register FROM hort_app_role;
+        EXCEPTION
+            WHEN undefined_object THEN
+                RAISE NOTICE
+                    'hort_app_role missing; skipping schema_compat_register re-hardening';
+            WHEN undefined_table THEN
+                RAISE NOTICE
+                    'schema_compat_register not found; skipping its role re-hardening';
+        END
+        $$;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("executing the schema_compat_register re-hardening DO block")?;
+
+    tracing::info!("migration-bookkeeping role hardening re-asserted");
     Ok(())
 }
 
@@ -681,7 +727,7 @@ mod tests {
     //! Enforcement model (ADR 0009): the operator `REVOKE`/grant
     //! least-privilege recipe provisions the split, and the binary
     //! re-asserts the parts of it that an out-of-band bulk `GRANT` can
-    //! undo (`harden_events_role`, `harden_migrations_ledger_role`). The
+    //! undo (`harden_events_role`, `harden_migration_bookkeeping_role`). The
     //! serve path's own read-only-ness is the third, independent layer.
 
     use super::*;

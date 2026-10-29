@@ -347,21 +347,22 @@ async fn fresh_db_bails_with_table_missing() {
 }
 
 /// The worker binds with the *same* `hort_app_role` the server does, and
-/// `hort-server migrate` now revokes `INSERT, UPDATE, DELETE` on the
-/// bookkeeping ledger from that role (ADR 0009 — the runtime role is
-/// kept unable to rewrite the applied-migration history, not merely
-/// expected not to). So the worker's boot gate has to be read-only in
-/// fact and not only by inspection: this drives it under a role in
-/// exactly that state and asserts each write is refused.
+/// `hort-server migrate` now revokes `INSERT, UPDATE, DELETE` on both
+/// migration-bookkeeping tables from that role (ADR 0009 — the runtime
+/// role is kept unable to rewrite the applied-migration history or the
+/// rollback floor, not merely expected not to). The worker's boot gate
+/// reads both, so it has to be read-only in fact and not only by
+/// inspection: this drives it under a role in exactly that state and
+/// asserts each write is refused.
 ///
-/// The role-hardening statement is spelled out here rather than called
+/// The role-hardening statements are spelled out here rather than called
 /// across crates: the worker must not depend on `hort-server` (it embeds
 /// its own copy of the migration set for the same reason), and what this
 /// test needs is the privilege *state*, not the function that produces
 /// it.
 #[tokio::test]
 #[serial(hort_pg_db)]
-async fn boot_gate_runs_without_write_privileges_on_the_ledger() {
+async fn boot_gate_runs_without_write_privileges_on_the_bookkeeping_tables() {
     let Some(admin) = admin_pool().await else {
         return;
     };
@@ -373,21 +374,30 @@ async fn boot_gate_runs_without_write_privileges_on_the_ledger() {
         .expect("migrations apply cleanly to fresh DB");
 
     // The canonical operator recipe's runtime grant set, then the
-    // ledger hardening the migrate run re-asserts on top of it. A
+    // bookkeeping hardening the migrate run re-asserts on top of it. A
     // privilege inherited from `template1` would answer for
-    // `hort_app_role` here, so `PUBLIC` is stripped from the ledger
-    // first — the recipe's `hort_admin`-owned table never carries one.
-    pool.execute("REVOKE ALL ON _sqlx_migrations FROM PUBLIC")
+    // `hort_app_role` here, so `PUBLIC` is stripped from both tables
+    // first — the recipe's `hort_admin`-owned tables never carry one.
+    for table in ["_sqlx_migrations", "schema_compat_register"] {
+        pool.execute(sqlx::AssertSqlSafe(format!(
+            "REVOKE ALL ON {table} FROM PUBLIC"
+        )))
         .await
-        .expect("REVOKE ALL on the ledger from PUBLIC");
+        .expect("REVOKE ALL on a bookkeeping table from PUBLIC");
+    }
     pool.execute(
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO hort_app_role",
     )
     .await
     .expect("GRANT the operator recipe's table DML to hort_app_role");
-    pool.execute("REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON _sqlx_migrations FROM hort_app_role")
+    for table in ["_sqlx_migrations", "schema_compat_register"] {
+        pool.execute(sqlx::AssertSqlSafe(format!(
+            "REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER \
+             ON {table} FROM hort_app_role"
+        )))
         .await
-        .expect("revoke the ledger writes from the runtime role");
+        .expect("revoke the bookkeeping writes from the runtime role");
+    }
 
     // A throwaway non-superuser member of `hort_app_role` — Postgres
     // puts superusers outside the privilege system, so the runtime
@@ -419,21 +429,31 @@ async fn boot_gate_runs_without_write_privileges_on_the_ledger() {
 
     for (label, statement) in [
         (
-            "INSERT",
+            "ledger INSERT",
             "INSERT INTO _sqlx_migrations \
              (version, description, installed_on, success, checksum, execution_time) \
              VALUES (-1, 'forged', now(), true, decode('00', 'hex'), 0)",
         ),
         (
-            "UPDATE",
+            "ledger UPDATE",
             "UPDATE _sqlx_migrations SET checksum = decode('00', 'hex')",
         ),
-        ("DELETE", "DELETE FROM _sqlx_migrations"),
+        ("ledger DELETE", "DELETE FROM _sqlx_migrations"),
+        (
+            "register INSERT",
+            "INSERT INTO schema_compat_register (version, min_binary_version) \
+             VALUES (-1, '0.0.1')",
+        ),
+        (
+            "register UPDATE",
+            "UPDATE schema_compat_register SET min_binary_version = '0.0.1'",
+        ),
+        ("register DELETE", "DELETE FROM schema_compat_register"),
     ] {
         let err = sqlx::query(statement)
             .execute(&runtime_pool)
             .await
-            .expect_err("a write on the ledger must be refused");
+            .expect_err("a write on a bookkeeping table must be refused");
         let code = match &err {
             sqlx::Error::Database(db) => db.code().map(std::borrow::Cow::into_owned),
             _ => None,
