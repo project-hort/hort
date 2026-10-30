@@ -626,6 +626,22 @@ async fn upload(
         return Ok(StatusCode::OK.into_response());
     }
 
+    // What the deployed file declares about itself must agree with the
+    // coordinate it is being stored under, or the PUT is refused. The GAV
+    // comes wholly from the request URL and the body travels on with
+    // `payload_metadata: Null`, so nothing in the pipeline has ever looked
+    // at what the bytes say they are — and the scan subject is built from
+    // the stored coordinate while the dependencies are read out of the POM,
+    // which puts one artifact's dependencies under another's name in the
+    // scan record.
+    //
+    // After the metadata / sidecar early-returns above (those bodies are
+    // accepted and discarded, so they have no identity to compare) and
+    // before `ingest_direct`, so a divergence costs no CAS write.
+    if let Some(refusal) = identity_refusal_for(&coords, filename, &body).await {
+        return Ok(refusal);
+    }
+
     // A real content file → ingest_direct. The coords already carry the
     // stored logical path (= the request tail) and the GA:V identity from
     // the parser; content files become group members via the post-commit
@@ -687,6 +703,131 @@ async fn upload(
         StatusCode::CREATED
     };
     Ok(status.into_response())
+}
+
+/// Compare what the deployed file declares about itself against the
+/// coordinate the PUT is storing it under, returning the refusal response
+/// when they disagree.
+///
+/// # Which PUTs this is decidable on
+///
+/// A Maven deploy is one PUT per file, and only some of those files carry
+/// a coordinate:
+///
+/// - **`.pom`** — the POM document *is* the coordinate declaration, with
+///   Maven's own `<parent>` fallback for `groupId`/`version`. Decidable.
+///   A `.pom` that does not parse as a `<project>` document is refused:
+///   the stored bytes are what the metadata generator and the dependency
+///   reader go on to read as a POM, so a `.pom` that is not one is a
+///   malformed deploy rather than a fact to wave through.
+/// - **`.jar` / `.war` / `.ear` / `.par`** — a Java archive declares its
+///   coordinate only in an **optional**
+///   `META-INF/maven/{g}/{a}/pom.properties`, so an absent descriptor
+///   proceeds. See `hort_formats::maven::read_jar_descriptor_identity` for
+///   why more than one descriptor also proceeds.
+/// - **everything else** (`.module`, `.aar`, `.zip`, `.asc`, a classifier
+///   artifact, any other packaging) — no coordinate declaration this
+///   function reads, so nothing to compare.
+///
+/// # Bounds and buffering
+///
+/// Both reads route through `hort-formats`, which routes through the
+/// audited `archive_bounds` helpers (`iter_zip_entries` for the jar) and
+/// the `POM_MAX_BYTES` capped read for the POM. Nothing is buffered that
+/// was not already in hand: `upload` takes the body as an owned `Bytes`
+/// (one PUT of one file), and this borrows it. ADR 0003's streaming CAS is
+/// untouched — `ingest_direct` still streams from its own cursor over the
+/// same `Bytes`.
+///
+/// # Blocking
+///
+/// ZIP central-directory reads and inflation are CPU/IO-bound, so the work
+/// happens inside `spawn_blocking`. A joined-task failure is a 503 rather
+/// than an accept: an identity the server failed to read is not one that
+/// agreed.
+async fn identity_refusal_for(
+    coords: &ArtifactCoords,
+    filename: &str,
+    body: &Bytes,
+) -> Option<Response> {
+    use hort_formats::maven::{is_java_archive_filename, is_pom_filename};
+
+    if !is_pom_filename(filename) && !is_java_archive_filename(filename) {
+        return None;
+    }
+
+    // `parse_download_path` guarantees the file shape carries both halves
+    // of the GA name and a version; split them back out for the comparison.
+    let (group_id, artifact_id) = hort_formats::maven::split_ga(&coords.name).ok()?;
+    let version = coords.version.as_deref()?;
+
+    let is_pom = is_pom_filename(filename);
+    let bytes = body.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        if is_pom {
+            hort_formats::maven::pom::parse_pom_identity(&mut std::io::Cursor::new(bytes))
+                .map(DeclaredMavenIdentity::Pom)
+        } else {
+            Ok(DeclaredMavenIdentity::JarDescriptor(
+                hort_formats::maven::read_jar_descriptor_identity(&bytes),
+            ))
+        }
+    })
+    .await;
+
+    let declared = match joined {
+        Ok(Ok(declared)) => declared,
+        // A `.pom` that is not a parseable `<project>` document. Only the
+        // POM arm can produce this — the jar arm degrades to `Undeclared`.
+        Ok(Err(domain_err)) => {
+            return Some(plain_refusal(
+                StatusCode::BAD_REQUEST,
+                &domain_err.to_string(),
+            ))
+        }
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "maven identity read task failed");
+            return Some(plain_refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "deploy identity check failed",
+            ));
+        }
+    };
+
+    let check = match &declared {
+        DeclaredMavenIdentity::Pom(identity) => identity.check(group_id, artifact_id, version),
+        DeclaredMavenIdentity::JarDescriptor(identity) => {
+            identity.check(group_id, artifact_id, version)
+        }
+    };
+    let noun = if is_pom { "maven pom" } else { "maven archive" };
+    check
+        .divergence()
+        .map(|divergence| plain_refusal(StatusCode::BAD_REQUEST, &divergence.message(noun)))
+}
+
+/// Which declaration a deployed file carried, so one comparison site can
+/// handle both shapes.
+enum DeclaredMavenIdentity {
+    Pom(hort_formats::maven::pom::PomIdentity),
+    JarDescriptor(hort_formats::maven::JarDescriptorIdentity),
+}
+
+/// A Maven-shaped refusal: a status code and a short `text/plain` body.
+///
+/// Maven deploys over plain HTTP PUT — the repository layout defines the
+/// path, not a wire error envelope, and `maven-resolver-transport-http`
+/// surfaces a transfer failure as the status line plus (for a short 4xx)
+/// the response body text. A JSON envelope would be noise in a Maven build
+/// log; the status code and a one-sentence body are what the client
+/// actually shows the publisher.
+fn plain_refusal(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+        message.to_string(),
+    )
+        .into_response()
 }
 
 /// Best-effort `Content-Type` for a Maven filename by extension. Maven

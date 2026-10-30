@@ -25,6 +25,7 @@ use hort_domain::types::{
     ArtifactCoords, ArtifactKind, Ecosystem, PayloadAccess, Sbom, SbomComponent,
 };
 
+use crate::publish_identity::IdentityCheck;
 use crate::range_resolvers::resolve_semver_range_max;
 use crate::sbom_helpers::{build_subject_component, strip_version_constraint};
 
@@ -1118,6 +1119,134 @@ fn is_top_level_entry(path: &str, file_name: &str) -> bool {
     !dir.is_empty() && !dir.contains('/')
 }
 
+// ---------------------------------------------------------------------------
+// The identity the `.crate` declares about itself
+// ---------------------------------------------------------------------------
+
+/// The `[package]` `name` / `version` a cargo `.crate` declares in its own
+/// top-level `Cargo.toml`.
+///
+/// Both fields are optional because this reader reports what the manifest
+/// said rather than what cargo requires it to say: a field the manifest
+/// does not carry is `None`, which the publish path treats as
+/// [`IdentityCheck::Undeclared`] rather than a refusal. See
+/// [`crate::publish_identity`] for why undeclared and divergent are
+/// different answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrateIdentity {
+    /// `[package] name`, or `None` when absent or not a string.
+    pub name: Option<String>,
+    /// `[package] version`, or `None` when absent or not a string.
+    pub version: Option<String>,
+}
+
+/// Read the identity a cargo `.crate` declares in its archive-root
+/// `Cargo.toml`.
+///
+/// `crate_file` is the **gzipped** `.crate` byte stream; `compressed_size`
+/// is its length, which the compression-ratio bound needs because gzip
+/// carries no reliable decompressed-size header.
+///
+/// The entry is located by [`is_top_level_cargo_toml`] — exactly one
+/// directory segment before `/Cargo.toml`, without hardcoding the crate
+/// name or version. That predicate already constrains the *depth* of the
+/// manifest; what it does not constrain is the *name* of that segment, and
+/// nothing read the manifest inside it, which is the gap this reader
+/// closes. `Cargo.toml.orig` (the pre-`cargo package` manifest, which on a
+/// workspace member still carries `version.workspace = true` rather than a
+/// literal) is deliberately not matched: `cargo package` rewrites
+/// `Cargo.toml` to a fully-resolved form, so the resolved one is the only
+/// entry whose `version` is a concrete string to compare.
+///
+/// **Archive bounds.** The read routes through the audited
+/// [`crate::archive_bounds::read_tar_gz_entry`] — bounded decompressed
+/// output, bounded entry count, nested archives rejected. The output cap is
+/// cumulative across the sequential tar scan, so the manifest has to be an
+/// early entry; `cargo package` writes it near the front.
+///
+/// **Streaming.** The caller passes a reader, not a buffer. The cargo
+/// publish frame is length-prefixed, so the publish path already holds the
+/// `.crate` bytes in memory before this is called — no second pass and no
+/// buffering introduced here; only the matched manifest entry, itself
+/// capped, is materialised.
+///
+/// # Errors
+///
+/// `Validation` when the bytes are not a gzip-tar, when no top-level
+/// `{dir}/Cargo.toml` is present, when the manifest is not valid UTF-8 or
+/// TOML, or on any `archive_bounds` guard trip. An identity that could not
+/// be read is **not** an identity that agreed: a `.crate` whose own
+/// manifest is unreachable cannot show that it declares the coordinates it
+/// is being published under, and cargo's archive format requires that
+/// manifest to be there.
+pub fn read_crate_identity(
+    crate_file: &mut dyn std::io::Read,
+    compressed_size: u64,
+) -> DomainResult<CrateIdentity> {
+    let manifest = crate::archive_bounds::read_tar_gz_entry(
+        crate_file,
+        compressed_size,
+        crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
+        is_top_level_cargo_toml,
+    )?
+    .ok_or_else(|| {
+        DomainError::Validation(
+            "cargo .crate is missing a top-level {name}-{version}/Cargo.toml, so the \
+             identity it declares cannot be read"
+                .to_string(),
+        )
+    })?;
+    parse_crate_identity(&manifest)
+}
+
+/// Parse `[package]` `name` / `version` out of a `Cargo.toml` body.
+///
+/// Bounded by [`CARGO_MANIFEST_MAX_BYTES`] as a parser-input sanity cap,
+/// the same bound [`parse_cargo_toml_runtime_dependencies`] applies to the
+/// same bytes.
+fn parse_crate_identity(manifest: &[u8]) -> DomainResult<CrateIdentity> {
+    if manifest.len() > CARGO_MANIFEST_MAX_BYTES {
+        return Err(DomainError::Validation(format!(
+            "cargo Cargo.toml body is {} bytes; cargo manifest max is {CARGO_MANIFEST_MAX_BYTES}",
+            manifest.len()
+        )));
+    }
+    let text = std::str::from_utf8(manifest)
+        .map_err(|e| DomainError::Validation(format!("Cargo.toml is not valid UTF-8: {e}")))?;
+    let doc: toml::Value = toml::from_str(text)
+        .map_err(|e| DomainError::Validation(format!("Cargo.toml is not valid TOML: {e}")))?;
+    let Some(package) = doc.get("package").and_then(|v| v.as_table()) else {
+        return Ok(CrateIdentity::default());
+    };
+    let field = |key: &str| {
+        package
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+    };
+    Ok(CrateIdentity {
+        name: field("name"),
+        version: field("version"),
+    })
+}
+
+impl CrateIdentity {
+    /// Compare this declaration against the coordinates the publish path is
+    /// storing the `.crate` under.
+    ///
+    /// `stored_name` / `stored_version` are the publish frame's `name` and
+    /// `vers`, pre-normalisation — the raw spellings cargo took from the
+    /// same `Cargo.toml` this reader just read, so the comparison is
+    /// byte-exact and a tolerance would only widen what passes.
+    #[must_use]
+    pub fn check(&self, stored_name: &str, stored_version: &str) -> IdentityCheck {
+        IdentityCheck::first_divergence([
+            IdentityCheck::compare("name", self.name.as_deref(), stored_name),
+            IdentityCheck::compare("version", self.version.as_deref(), stored_version),
+        ])
+    }
+}
+
 /// Parse the *declared runtime* dependency specs from a `Cargo.toml`
 /// manifest body.
 ///
@@ -1282,6 +1411,149 @@ mod tests {
 
     fn handler() -> CargoFormatHandler {
         CargoFormatHandler
+    }
+
+    // -- the identity the `.crate` declares --------------------------------
+
+    fn crate_identity_of(archive: &[u8]) -> DomainResult<CrateIdentity> {
+        read_crate_identity(&mut &archive[..], archive.len() as u64)
+    }
+
+    /// The entry order `cargo package` actually writes: `Cargo.toml.orig`
+    /// first (the author's manifest, which on a workspace member still
+    /// carries `version.workspace = true`), then the resolved `Cargo.toml`,
+    /// then sources.
+    fn cargo_package_shaped(dir: &str, name: &str, version: &str) -> Vec<u8> {
+        let orig = format!("[package]\nname = \"{name}\"\nversion.workspace = true\n");
+        let resolved = format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n");
+        crate::test_support::build_tar_gz_bytes(&[
+            (&format!("{dir}/Cargo.toml.orig"), orig.as_bytes()),
+            (&format!("{dir}/Cargo.toml"), resolved.as_bytes()),
+            (&format!("{dir}/src/lib.rs"), b"pub fn f() {}"),
+        ])
+    }
+
+    #[test]
+    fn reads_the_package_name_and_version_the_manifest_declares() {
+        let archive = cargo_package_shaped("mycrate-0.1.0", "mycrate", "0.1.0");
+        let identity = crate_identity_of(&archive).expect("reads");
+        assert_eq!(identity.name.as_deref(), Some("mycrate"));
+        assert_eq!(identity.version.as_deref(), Some("0.1.0"));
+        assert_eq!(identity.check("mycrate", "0.1.0"), IdentityCheck::Agrees);
+    }
+
+    /// `Cargo.toml.orig` sits BEFORE the resolved manifest in a real
+    /// `.crate` and still carries `version.workspace = true`. Reading it
+    /// would yield no version at all — the predicate must not match it.
+    #[test]
+    fn the_unresolved_cargo_toml_orig_is_not_read_as_the_manifest() {
+        let archive = cargo_package_shaped("mycrate-0.1.0", "mycrate", "0.1.0");
+        let identity = crate_identity_of(&archive).expect("reads");
+        assert_eq!(
+            identity.version.as_deref(),
+            Some("0.1.0"),
+            "the resolved manifest is the one with a concrete version"
+        );
+    }
+
+    /// The gap the directory predicate leaves: `is_top_level_entry`
+    /// constrains the DEPTH of the manifest but not the NAME of the
+    /// segment, and nothing read the manifest inside it. So a `.crate`
+    /// whose directory segment matches the frame while its manifest does
+    /// not still diverges.
+    #[test]
+    fn a_matching_directory_does_not_excuse_a_disagreeing_manifest() {
+        let archive = cargo_package_shaped("mycrate-0.1.0", "evilcrate", "0.1.0");
+        let identity = crate_identity_of(&archive).expect("reads");
+        let check = identity.check("mycrate", "0.1.0");
+        let divergence = check.divergence().expect("diverges");
+        assert_eq!(divergence.field, "name");
+        assert_eq!(divergence.declared, "evilcrate");
+        assert_eq!(divergence.stored, "mycrate");
+    }
+
+    #[test]
+    fn a_declared_version_that_differs_from_the_frame_diverges() {
+        let archive = cargo_package_shaped("mycrate-0.1.0", "mycrate", "9.9.9");
+        let identity = crate_identity_of(&archive).expect("reads");
+        let check = identity.check("mycrate", "0.1.0");
+        assert_eq!(check.divergence().expect("diverges").field, "version");
+    }
+
+    #[test]
+    fn a_manifest_with_no_package_table_declares_nothing() {
+        let archive = crate::test_support::build_tar_gz_bytes(&[(
+            "mycrate-0.1.0/Cargo.toml",
+            b"[dependencies]\nserde = \"1\"\n".as_slice(),
+        )]);
+        let identity = crate_identity_of(&archive).expect("reads");
+        assert_eq!(identity, CrateIdentity::default());
+        assert!(identity.check("mycrate", "0.1.0").divergence().is_none());
+    }
+
+    #[test]
+    fn a_crate_without_a_top_level_manifest_is_an_error_not_an_agreement() {
+        // Incompressible filler keeps the whole scan inside the cumulative
+        // output cap, so the error reported is the missing manifest and not
+        // a bounds trip.
+        let filler: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let archive = crate::test_support::build_tar_gz_bytes(&[
+            ("mycrate-0.1.0/src/lib.rs", b"pub fn f() {}"),
+            ("mycrate-0.1.0/data.bin", &filler),
+        ]);
+        let err = crate_identity_of(&archive).expect_err("a missing manifest cannot agree");
+        assert!(err.to_string().contains("Cargo.toml"), "{err}");
+    }
+
+    #[test]
+    fn a_nested_manifest_is_not_read_as_the_archive_root_one() {
+        let filler: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let archive = crate::test_support::build_tar_gz_bytes(&[
+            ("mycrate-0.1.0/data.bin", &filler),
+            (
+                "mycrate-0.1.0/vendor/evil/Cargo.toml",
+                b"[package]\nname = \"evilcrate\"\nversion = \"9.9.9\"\n".as_slice(),
+            ),
+        ]);
+        let err = crate_identity_of(&archive).expect_err("no archive-root manifest");
+        assert!(err.to_string().contains("Cargo.toml"), "{err}");
+    }
+
+    #[test]
+    fn a_payload_that_is_not_a_gzip_tar_is_an_error() {
+        let err = crate_identity_of(b"fake crate tarball content").expect_err("not an archive");
+        assert!(err.to_string().contains("gzip-tar"), "{err}");
+    }
+
+    #[test]
+    fn a_manifest_that_is_not_toml_is_an_error() {
+        let archive = crate::test_support::build_tar_gz_bytes(&[(
+            "mycrate-0.1.0/Cargo.toml",
+            b"{{{ not toml".as_slice(),
+        )]);
+        let err = crate_identity_of(&archive).expect_err("unparseable manifest");
+        assert!(err.to_string().contains("not valid TOML"), "{err}");
+    }
+
+    #[test]
+    fn an_oversized_manifest_trips_the_parser_input_cap() {
+        let body = vec![b' '; CARGO_MANIFEST_MAX_BYTES + 1];
+        let err = parse_crate_identity(&body).expect_err("over the cap");
+        assert!(
+            err.to_string()
+                .contains(&CARGO_MANIFEST_MAX_BYTES.to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_is_not_utf8_is_an_error() {
+        let err = parse_crate_identity(&[0xff, 0xfe, 0xfd]).expect_err("not UTF-8");
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
     }
 
     // -- format_key -----------------------------------------------------------

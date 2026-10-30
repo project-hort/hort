@@ -79,15 +79,29 @@
 //!   at `package/package.json`; …). The helper provides primitives,
 //!   not a one-size-fits-all extraction.
 //!
-//! - Open the archive itself. Callers construct the decompressor /
-//!   archive reader with the concrete crate; this module only supplies
-//!   the bounded `Read` wrapper, the entry counter, and the config.
+//! - Open the archive itself, for the primitives. [`BoundedReader`] /
+//!   [`EntryCounter`] / [`BoundsConfig`] are building blocks a caller
+//!   composes with the concrete archive crate; [`iter_zip_entries`] and
+//!   [`read_tar_gz_entry`] are the two complete walks this module does
+//!   own.
 //!
-//! - Hold a direct dep on any archive crate today. If we did, the
-//!   `[bans]` exception would already be exercised, but the lockfile
-//!   would acquire `tar` / etc. without a real consumer. The exception
-//!   activates the moment a future PR plumbs a concrete decoder
-//!   through this helper.
+//! ## Who reads through it today
+//!
+//! The prefetch cascade's per-format dependency extractors
+//! (`npm::extract_dependency_specs`, `cargo::extract_dependency_specs`,
+//! `cargo::lockfile`, PyPI's wheel-`METADATA` readers, Maven's
+//! embedded-POM SBOM reader), the OSV bulk-feed walk in
+//! `hort-adapters-advisory-osv`, and — since the hosted publish paths
+//! began comparing the identity an archive declares with the identity it
+//! is stored under — the npm / cargo / Maven publish-identity readers
+//! (`npm::read_npm_tarball_identity`, `cargo::read_crate_identity`,
+//! `maven::read_jar_descriptor_identity`).
+//!
+//! That last group is the one to keep in mind when touching the caps:
+//! those readers sit on an **admission** path, so a bound that trips
+//! refuses a publish rather than degrading an enrichment. The
+//! cumulative-output note on [`read_tar_gz_entry`] is the sharp edge —
+//! see its own doc comment.
 
 use std::io::{self, Read, Seek};
 
@@ -601,6 +615,20 @@ const NESTED_ARCHIVE_SUFFIXES: &[&str] = &[
 /// Zip is unaffected: [`iter_zip_entries`] reads the central directory and
 /// seeks to the target, so it does not decompress the whole archive to reach
 /// a late entry.
+///
+/// The edge this constraint has, now that a publish **admission** path reads
+/// through here: on a *tiny* archive the compression-ratio bound is the
+/// binding one, and tar's zero padding compresses far better than 10:1, so
+/// `output_cap_for` can land *below* the decompressed size of a handful of
+/// near-empty entries. Measured on a four-entry gzip-tar of a few bytes
+/// each: 242 compressed bytes → a 2420-byte cap against ~3 KiB of padded
+/// tar, so a manifest in last position is unreachable. `npm pack` places
+/// `package/package.json` first — which is what lets any registry read a
+/// manifest off the stream head at all — and `cargo package` writes
+/// `Cargo.toml` second, so the real publishing tools are nowhere near it. A
+/// hand-assembled archive of a near-empty package can reach it, and there the
+/// outcome is a refused publish rather than a degraded read. Pinned by
+/// `npm::tests::a_late_manifest_in_a_tiny_tarball_trips_the_cumulative_cap`.
 ///
 /// # Security
 ///

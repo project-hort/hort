@@ -281,6 +281,220 @@ pub fn pypi_extract_version_from_filename(filename: &str) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// The version the distribution filename carries, against the declared one
+// ---------------------------------------------------------------------------
+
+/// Distribution-filename extensions whose stem ends with the version.
+///
+/// Longest suffixes first so `.tar.gz` does not short-circuit on `.gz` —
+/// the same ordering, for the same reason, as
+/// [`pypi_extract_version_from_filename`].
+const PYPI_SDIST_EXTENSIONS: &[&str] = &[".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip", ".egg"];
+
+/// PEP 503 name normalisation: lowercase, and collapse every run of
+/// `-`, `_` or `.` to a single `-`.
+///
+/// The body of [`PyPiFormatHandler::normalize_name`], lifted to a free
+/// function because [`check_pypi_filename_version`] needs the same
+/// normalisation to apply pip's filename rule and a second copy of it is a
+/// second answer to "are these the same project".
+#[must_use]
+pub fn pep_503_normalize(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    let mut in_separator_run = false;
+
+    for c in name.chars() {
+        if c == '-' || c == '_' || c == '.' {
+            if !in_separator_run && !result.is_empty() {
+                result.push('-');
+                in_separator_run = true;
+            }
+        } else {
+            in_separator_run = false;
+            result.extend(c.to_lowercase());
+        }
+    }
+
+    // Remove trailing separator.
+    if result.ends_with('-') {
+        result.pop();
+    }
+
+    result
+}
+
+/// Escape a version the way a distribution filename carries it.
+///
+/// The binary-distribution-format specification (PEP 427 and its successor
+/// text) defines the wheel filename's components as escaped with
+/// `re.sub("[^\w\d.]+", "_", component)` — so `1.0.0+local.1` is written
+/// `1.0.0_local.1` in the filename while the metadata still says
+/// `1.0.0+local.1`. Comparing the two spellings byte-for-byte would refuse
+/// the exact form the specification prescribes.
+///
+/// The fold is ASCII-only on the `\w` class and additionally lowercases,
+/// because a PEP 440 version compares case-insensitively and a build
+/// backend may normalise `1.0.0RC1` to `1.0.0rc1` in the filename while the
+/// metadata keeps the author's spelling. Both moves can only make two
+/// spellings of the *same* version agree; neither can make two different
+/// versions agree, because every character that survives the fold survives
+/// it identically on both sides.
+fn pypi_filename_version_key(version: &str) -> String {
+    let mut out = String::with_capacity(version.len());
+    let mut pending_underscore = false;
+    for ch in version.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
+            if pending_underscore {
+                out.push('_');
+                pending_underscore = false;
+            }
+            out.extend(ch.to_lowercase());
+        } else {
+            // A *run* of non-class characters collapses to one `_`.
+            pending_underscore = true;
+        }
+    }
+    if pending_underscore {
+        out.push('_');
+    }
+    out
+}
+
+/// What comparing a distribution filename's version against the declared
+/// one concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PypiFilenameVersion {
+    /// The filename carries the declared version, under the escaping its
+    /// own grammar defines.
+    Agrees,
+    /// The filename carries no version this grammar can read, so there is
+    /// nothing to disagree with.
+    ///
+    /// `pip` derives a candidate's version from the filename and skips a
+    /// link whose filename it cannot parse, so a filename with no readable
+    /// version produces no divergence between what hort records and what a
+    /// client resolves — it produces a file no client will install.
+    Undecidable,
+    /// The filename names a different version than the declared one.
+    Diverges {
+        /// The version the filename carries, sanitised.
+        in_filename: String,
+    },
+}
+
+/// Compare the version a PyPI distribution filename carries against the
+/// version the upload declared.
+///
+/// # Why these two can diverge at all, and why that matters
+///
+/// A legacy-API upload declares `name` and `version` as form fields, and
+/// supplies the filename separately in the `content` part's
+/// `Content-Disposition`. hort stores the declared version and serves the
+/// file at `simple/{name}/{filename}` — but a client resolving that index
+/// does **not** read hort's stored version. PEP 503 publishes only links,
+/// and `pip` recovers each candidate's version from the *filename*. So an
+/// upload declaring `1.0.0` under the filename `foo-9.9.9.tar.gz` is
+/// installed as `9.9.9` by every client while every record hort keeps of it
+/// says `1.0.0`.
+///
+/// # How the filename's version is recovered
+///
+/// `declared_name` is what makes this faithful rather than approximate, and
+/// it is the whole reason this is not just a call to
+/// [`pypi_extract_version_from_filename`]:
+///
+/// - **Wheel** — the binary-distribution-format specification fixes the
+///   filename as
+///   `{distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl`, and
+///   escapes every component so a `-` cannot survive inside one. The version
+///   is therefore the second `-`-delimited component, unambiguously, and the
+///   name is not needed to find it.
+/// - **sdist** — the version is whatever follows the project name, and the
+///   name itself may contain `-`. `pip` finds the boundary by walking the
+///   stem's `-` positions and taking the first one whose prefix
+///   PEP 503-normalises to the project it is resolving
+///   (`_find_name_version_sep`); everything after it is the version. This
+///   function applies that same rule, because a rule that disagrees with the
+///   client's is a check that can pass on a filename the client reads
+///   differently. A trailing-`-` split would read `foo-9.9.9-0.tar.gz` as
+///   version `0` where `pip` reads `9.9.9-0` — and an upload declaring `0`
+///   under that filename would then be waved through as agreeing.
+/// - If no `-` prefix normalises to `declared_name`, the filename's name
+///   component is not this project's — a *name* divergence, which is a
+///   different question and not this one. The grammar helper's answer stands
+///   so that case is neither refused here nor silently blessed.
+///
+/// # The two spellings the specifications allow
+///
+/// The comparison is not byte equality, because two spellings of one version
+/// are both legal:
+///
+/// 1. The filename escaping. The specification escapes each component with
+///    `re.sub("[^\w\d.]+", "_", component)`, so the metadata version
+///    `1.0.0+local.1` is written `1.0.0_local.1`. Both sides pass through
+///    [`pypi_filename_version_key`], which also ASCII-lowercases (a PEP 440
+///    version compares case-insensitively, and a backend may normalise
+///    `1.0.0RC1` → `1.0.0rc1` in the filename while the metadata keeps the
+///    author's spelling). Every character that survives the fold survives it
+///    identically on both sides, so the fold can make two spellings of the
+///    *same* version agree and can never make two different versions agree.
+/// 2. The unescaped spelling, compared verbatim. PEP 625 requires a
+///    normalised PEP 440 version in an sdist filename and a normalised one
+///    never contains `-`, but [`validate_pypi_version`] is a permissive
+///    charset gate that admits the legacy spelling — so `foo-1.0-1.tar.gz`
+///    declaring `1.0-1` agrees, rather than this check inventing a grammar
+///    rule the publish path does not otherwise enforce.
+#[must_use]
+pub fn check_pypi_filename_version(
+    filename: &str,
+    declared_name: &str,
+    declared_version: &str,
+) -> PypiFilenameVersion {
+    // No version this grammar can read: `pip` skips a link it cannot parse,
+    // so there is no disagreement between what hort records and what a
+    // client resolves — there is a file no client will install.
+    let Some(in_filename) = pypi_filename_version_component(filename, declared_name) else {
+        return PypiFilenameVersion::Undecidable;
+    };
+    if in_filename == declared_version
+        || pypi_filename_version_key(&in_filename) == pypi_filename_version_key(declared_version)
+    {
+        return PypiFilenameVersion::Agrees;
+    }
+    PypiFilenameVersion::Diverges {
+        in_filename: crate::publish_identity::sanitize_declared(&in_filename),
+    }
+}
+
+/// The version component of a distribution filename, by the rule the
+/// resolving client uses. See [`check_pypi_filename_version`] for why the
+/// project name is part of the sdist rule and not the wheel one.
+fn pypi_filename_version_component(filename: &str, declared_name: &str) -> Option<String> {
+    // Wheels first: the longest extension wins so `.whl` is not shadowed,
+    // and its version component is positional.
+    if filename.strip_suffix(".whl").is_some() {
+        return pypi_extract_version_from_filename(filename);
+    }
+    for ext in PYPI_SDIST_EXTENSIONS {
+        let Some(stem) = filename.strip_suffix(ext) else {
+            continue;
+        };
+        let canonical = pep_503_normalize(declared_name);
+        for (sep, _) in stem.match_indices('-') {
+            if pep_503_normalize(&stem[..sep]) == canonical {
+                let version = &stem[sep + 1..];
+                return (!version.is_empty()).then(|| version.to_string());
+            }
+        }
+        break;
+    }
+    // Not a recognised archive suffix, or an sdist whose name component is
+    // not this project's. Fall back to the shared filename grammar, which is
+    // also what the index-side readers use.
+    pypi_extract_version_from_filename(filename)
+}
+
 /// Extract the basename of an `href="…"` attribute value (the filename —
 /// the last `/`-delimited segment, with both the `?…` query and the
 /// `#…` fragment stripped). Used by the PyPI simple-index
@@ -700,27 +914,7 @@ impl FormatHandler for PyPiFormatHandler {
     /// Normalize a package name per PEP 503 §4:
     /// replace any run of `-`, `_`, or `.` with a single `-`, then lowercase.
     fn normalize_name(&self, name: &str) -> String {
-        let mut result = String::with_capacity(name.len());
-        let mut in_separator_run = false;
-
-        for c in name.chars() {
-            if c == '-' || c == '_' || c == '.' {
-                if !in_separator_run && !result.is_empty() {
-                    result.push('-');
-                    in_separator_run = true;
-                }
-            } else {
-                in_separator_run = false;
-                result.extend(c.to_lowercase());
-            }
-        }
-
-        // Remove trailing separator.
-        if result.ends_with('-') {
-            result.pop();
-        }
-
-        result
+        pep_503_normalize(name)
     }
 
     /// Build an SBOM from a PyPI per-version JSON API body. Narrowed to
@@ -1653,6 +1847,202 @@ mod tests {
 
     fn handler() -> PyPiFormatHandler {
         PyPiFormatHandler
+    }
+
+    // -- the version the distribution filename carries ---------------------
+
+    #[test]
+    fn an_agreeing_sdist_filename_agrees() {
+        assert_eq!(
+            check_pypi_filename_version("foo-1.0.0.tar.gz", "foo", "1.0.0"),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    #[test]
+    fn an_agreeing_wheel_filename_agrees() {
+        assert_eq!(
+            check_pypi_filename_version("foo-1.0.0-py3-none-any.whl", "foo", "1.0.0"),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    #[test]
+    fn a_sdist_filename_naming_another_version_diverges() {
+        assert_eq!(
+            check_pypi_filename_version("foo-9.9.9.tar.gz", "foo", "1.0.0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_wheel_filename_naming_another_version_diverges() {
+        assert_eq!(
+            check_pypi_filename_version("foo-9.9.9-py3-none-any.whl", "foo", "1.0.0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9".into()
+            }
+        );
+    }
+
+    /// The binary-distribution-format specification escapes a filename
+    /// component with `re.sub("[^\w\d.]+", "_", component)`, so a local
+    /// version `1.0.0+local.1` is written `1.0.0_local.1`. Byte equality
+    /// would refuse the exact spelling the spec prescribes.
+    #[test]
+    fn the_wheel_filename_escaping_the_spec_prescribes_agrees() {
+        assert_eq!(
+            check_pypi_filename_version(
+                "foo-1.0.0_local.1-py3-none-any.whl",
+                "foo",
+                "1.0.0+local.1",
+            ),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    /// A PEP 440 version compares case-insensitively and a build backend
+    /// may normalise the spelling in the filename while the metadata keeps
+    /// the author's.
+    #[test]
+    fn a_case_difference_in_the_version_agrees() {
+        assert_eq!(
+            check_pypi_filename_version("foo-1.0.0rc1-py3-none-any.whl", "foo", "1.0.0RC1"),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    /// The fold collapses a RUN of out-of-class characters to one `_`, as
+    /// the specification's `+` quantifier does.
+    #[test]
+    fn a_run_of_escaped_characters_collapses_to_one_underscore() {
+        assert_eq!(pypi_filename_version_key("1.0.0+-+1"), "1.0.0_1");
+        assert_eq!(pypi_filename_version_key("1.0.0+"), "1.0.0_");
+    }
+
+    /// `validate_pypi_version` is a permissive charset gate that admits a
+    /// legacy non-normalised version containing `-`. `pip`'s rule recovers
+    /// the whole thing because it finds the boundary by the project name,
+    /// so this agrees; refusing it would be this check inventing a grammar
+    /// rule the publish path does not otherwise enforce.
+    #[test]
+    fn a_legacy_version_containing_a_hyphen_agrees_under_pips_rule() {
+        assert_eq!(
+            check_pypi_filename_version("foo-1.0-1.tar.gz", "foo", "1.0-1"),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    /// The reason the project name is part of the sdist rule. A
+    /// trailing-`-` split reads `foo-9.9.9-0.tar.gz` as version `0`, so an
+    /// upload declaring `0` under that filename would be waved through as
+    /// agreeing — while `pip`, which finds the boundary after the project
+    /// name, resolves it as `9.9.9-0` and installs that.
+    #[test]
+    fn the_sdist_version_is_everything_after_the_project_name() {
+        assert_eq!(
+            check_pypi_filename_version("foo-9.9.9-0.tar.gz", "foo", "0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9-0".into()
+            }
+        );
+        // And the same filename declaring what it actually carries agrees.
+        assert_eq!(
+            check_pypi_filename_version("foo-9.9.9-0.tar.gz", "foo", "9.9.9-0"),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    /// The boundary is found on the PEP 503-*normalised* name, so the
+    /// `-`/`_`/`.` spelling of the filename's name component does not have
+    /// to match the declared one character for character.
+    #[test]
+    fn the_project_name_boundary_is_found_on_the_normalised_name() {
+        for (filename, name) in [
+            ("my_package-1.0.0.tar.gz", "my-package"),
+            ("My.Package-1.0.0.tar.gz", "my_package"),
+            ("my-package-1.0.0.tar.gz", "My.Package"),
+        ] {
+            assert_eq!(
+                check_pypi_filename_version(filename, name, "1.0.0"),
+                PypiFilenameVersion::Agrees,
+                "{filename} / {name}"
+            );
+        }
+    }
+
+    /// A hyphenated project name whose own `-` would otherwise be read as
+    /// the version boundary.
+    #[test]
+    fn a_hyphenated_project_name_does_not_swallow_the_version() {
+        assert_eq!(
+            check_pypi_filename_version("my-package-9.9.9.tar.gz", "my-package", "1.0.0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9".into()
+            }
+        );
+    }
+
+    /// An sdist whose name component is not this project's is a *name*
+    /// divergence, which is a different question. The grammar helper's
+    /// answer stands, so the case is neither refused here nor blessed.
+    #[test]
+    fn an_sdist_naming_another_project_falls_back_to_the_grammar() {
+        assert_eq!(
+            check_pypi_filename_version("other-1.0.0.tar.gz", "foo", "1.0.0"),
+            PypiFilenameVersion::Agrees
+        );
+        assert_eq!(
+            check_pypi_filename_version("other-9.9.9.tar.gz", "foo", "1.0.0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9".into()
+            }
+        );
+    }
+
+    /// A filename whose grammar yields no version is undecidable, not
+    /// divergent: `pip` skips a link it cannot parse, so nothing a client
+    /// resolves disagrees with what hort recorded.
+    #[test]
+    fn a_filename_with_no_readable_version_is_undecidable() {
+        for name in ["foo.tar.gz", "foo", "foo-.tar.gz", "foo.whl"] {
+            assert_eq!(
+                check_pypi_filename_version(name, "foo", "1.0.0"),
+                PypiFilenameVersion::Undecidable,
+                "{name}"
+            );
+        }
+    }
+
+    /// The stem-suffix fallback must not let a wheel through on the
+    /// strength of a tag that happens to end with the declared version.
+    #[test]
+    fn a_wheel_is_judged_on_its_version_component_alone() {
+        assert_eq!(
+            check_pypi_filename_version("foo-9.9.9-py3-none-1.0.0.whl", "foo", "1.0.0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_crafted_filename_version_is_sanitised_before_it_reaches_the_refusal() {
+        // `validate_pypi_filename` rejects control bytes before this check
+        // ever runs on the publish path; the sanitiser is the second line,
+        // for every other caller.
+        let long = "9".repeat(crate::publish_identity::DECLARED_FRAGMENT_MAX_CHARS + 50);
+        let PypiFilenameVersion::Diverges { in_filename } =
+            check_pypi_filename_version(&format!("foo-{long}.tar.gz"), "foo", "1.0.0")
+        else {
+            panic!("expected a divergence");
+        };
+        assert_eq!(
+            in_filename.chars().count(),
+            crate::publish_identity::DECLARED_FRAGMENT_MAX_CHARS
+        );
     }
 
     // -- normalize_name -------------------------------------------------------

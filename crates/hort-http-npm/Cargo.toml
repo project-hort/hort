@@ -58,6 +58,14 @@ futures      = { workspace = true }
 tokio                       = { workspace = true, features = ["test-util"] }
 hort-app                      = { path = "../hort-app", features = ["test-support"] }
 hort-http-core                = { path = "../hort-http-core", features = ["test-support"] }
+# Test-only: the publish-path identity fixtures build real archives
+# (gzip-tar / zip). `tar` / `flate2` / `zip` are `deny.toml`-locked to
+# `hort-formats` as the only sanctioned archive-handling home, so
+# `test_support`'s builders are the only way to construct one here.
+# `hort-formats` is already a normal dependency above; this dev-dep edge
+# only flips its `test-support` feature on for the tests (Cargo's feature
+# unification merges the two).
+hort-formats                  = { path = "../hort-formats", features = ["test-support"] }
 metrics-util                = { workspace = true, features = ["debugging"] }
 regex                       = "1"
 sha2                        = { workspace = true }

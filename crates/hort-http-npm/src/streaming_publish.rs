@@ -90,6 +90,21 @@ pub(crate) struct DecodedPublish {
     /// original envelope minus the base64 payload — typically a few
     /// KiB; capped at [`MAX_ENVELOPE_BYTES`].
     pub envelope: Vec<u8>,
+
+    /// The `_attachments` key whose `data` value the decode actually
+    /// consumed — the FIRST one on the wire, which is the only attachment
+    /// this decoder traverses.
+    ///
+    /// This travels out because the key and the bytes have to be read off
+    /// the *same* entry. The caller cannot recover it from the parsed
+    /// envelope: `serde_json::Map` is a `BTreeMap` here (the `Cargo.lock`
+    /// `serde_json` entry has no `indexmap` dependency, so `preserve_order`
+    /// is off), so iterating the parsed object yields the
+    /// lexicographically smallest key, which on an envelope whose keys are
+    /// not in lexicographic order is a different entry than the one these
+    /// bytes came from — binding an attachment's filename to another
+    /// attachment's bytes.
+    pub attachment_key: String,
     /// `tempfile::NamedTempFile` holding the decoded tarball bytes.
     /// File is open for reading via [`tempfile_reader`]; drops at
     /// scope-exit, removing the file from /tmp; aborted publishes
@@ -233,6 +248,19 @@ pub(crate) async fn stream_decode_body(
         .map_err(|e| StreamDecodeError::Infrastructure(format!("tempfile flush failed: {e}")))?;
     drop(writer);
 
+    // The key whose `data` the walk consumed. `finish()` above has already
+    // rejected every path that reaches here without having decoded a
+    // `data` value, so the slot is populated — but it is decoded rather
+    // than unwrapped, because a key this process cannot read as UTF-8 is a
+    // filename it must not go on to parse a version out of.
+    let attachment_key = state
+        .consumed_attachment_key
+        .clone()
+        .ok_or_else(|| StreamDecodeError::Validation("attachment missing `data` field".into()))?;
+    let attachment_key = String::from_utf8(attachment_key).map_err(|_| {
+        StreamDecodeError::Validation("attachment filename is not valid UTF-8".into())
+    })?;
+
     let envelope = state.into_envelope_bytes()?;
     let sha1_hex = hex::encode(sha1.finalize());
 
@@ -244,6 +272,7 @@ pub(crate) async fn stream_decode_body(
 
     Ok(DecodedPublish {
         envelope,
+        attachment_key,
         tarball_file,
         sha1_hex,
         tarball_size: decoded_bytes,
@@ -374,6 +403,15 @@ struct ParseState {
     /// of 4 characters → 3 bytes; the carry holds the partial group
     /// across chunk boundaries.
     b64_carry: Vec<u8>,
+    /// The most-recent string key seen directly inside the
+    /// `_attachments` object — the candidate filename for whichever
+    /// attachment we end up taking `data` from. Overwritten each time the
+    /// walk re-enters `InAttachmentsObject` and tries the next key.
+    candidate_attachment_key: Vec<u8>,
+    /// The candidate, frozen at the moment `"data":` was recognised inside
+    /// an attachment object. `None` until then — which `finish()`'s
+    /// existing "no `data` found" rejections already cover.
+    consumed_attachment_key: Option<Vec<u8>>,
 }
 
 impl ParseState {
@@ -389,6 +427,8 @@ impl ParseState {
             prefix: Vec::new(),
             suffix: Vec::new(),
             b64_carry: Vec::new(),
+            candidate_attachment_key: Vec::new(),
+            consumed_attachment_key: None,
         }
     }
 
@@ -566,12 +606,24 @@ impl ParseState {
                             // already entered the first attachment.
                             self.seek = Seek::AwaitingAttachmentObject;
                             self.first_attachment_outer_depth = self.brace_depth;
+                            // Remember which filename this attachment is
+                            // keyed under. If this entry turns out to carry
+                            // no `data` the walk returns here and overwrites
+                            // the candidate with the next key, so what
+                            // survives is the key of the entry whose bytes
+                            // are actually decoded.
+                            self.candidate_attachment_key = self.last_string.clone();
                         }
                         Seek::InFirstAttachment
                             if self.brace_depth == self.first_attachment_outer_depth + 1
                                 && self.last_string == b"data" =>
                         {
                             self.seek = Seek::AwaitingBase64Open;
+                            // Freeze the pairing: from here the bytes are
+                            // this key's bytes, whatever else the envelope
+                            // goes on to say.
+                            self.consumed_attachment_key =
+                                Some(std::mem::take(&mut self.candidate_attachment_key));
                         }
                         _ => {}
                     }
@@ -810,6 +862,65 @@ mod tests {
             .read_to_end(&mut spooled)
             .unwrap();
         assert_eq!(spooled, tarball);
+    }
+
+    // -- which attachment the decode consumed ------------------------------
+
+    #[tokio::test]
+    async fn the_consumed_attachment_key_travels_out() {
+        let result =
+            stream_decode_body(body_from(build_envelope("express", "1.0.0", b"t")), 65_536)
+                .await
+                .expect("decode succeeds");
+        assert_eq!(result.attachment_key, "express-1.0.0.tgz");
+    }
+
+    /// The pairing this field exists for. The decode consumes the FIRST
+    /// attachment on the wire; `serde_json::Map` is a `BTreeMap` here (no
+    /// `preserve_order` feature), so iterating the parsed envelope would
+    /// yield the lexicographically smallest key instead. With the two keys
+    /// in opposite orders those are different entries, and the filename a
+    /// caller reads must be the one whose bytes it holds.
+    #[tokio::test]
+    async fn the_key_is_the_wire_first_entry_not_the_lexicographically_smallest() {
+        let sent = b"the-bytes-actually-sent";
+        let body = format!(
+            concat!(
+                r#"{{"name":"express","_attachments":{{"#,
+                r#""express-2.0.0.tgz":{{"data":"{sent}"}},"#,
+                r#""express-1.0.0.tgz":{{"data":"{other}"}}"#,
+                r#"}}}}"#,
+            ),
+            sent = base64::engine::general_purpose::STANDARD.encode(sent),
+            other = base64::engine::general_purpose::STANDARD.encode(b"never-read"),
+        );
+        let result = stream_decode_body(body_from(body.into_bytes()), 65_536)
+            .await
+            .expect("decode succeeds");
+        assert_eq!(result.attachment_key, "express-2.0.0.tgz");
+        assert_eq!(result.sha1_hex, hex::encode(Sha1Hasher::digest(sent)));
+    }
+
+    /// An attachment with no `data` is skipped by the walk, which returns
+    /// to the attachments object and tries the next key. What survives is
+    /// the key of the entry whose bytes were actually decoded.
+    #[tokio::test]
+    async fn the_key_skips_an_attachment_that_carried_no_data() {
+        let sent = b"second-entry-bytes";
+        let body = format!(
+            concat!(
+                r#"{{"name":"express","_attachments":{{"#,
+                r#""no-data-entry.tgz":{{"content_type":"application/octet-stream"}},"#,
+                r#""express-1.0.0.tgz":{{"data":"{sent}"}}"#,
+                r#"}}}}"#,
+            ),
+            sent = base64::engine::general_purpose::STANDARD.encode(sent),
+        );
+        let result = stream_decode_body(body_from(body.into_bytes()), 65_536)
+            .await
+            .expect("decode succeeds");
+        assert_eq!(result.attachment_key, "express-1.0.0.tgz");
+        assert_eq!(result.sha1_hex, hex::encode(Sha1Hasher::digest(sent)));
     }
 
     #[tokio::test]

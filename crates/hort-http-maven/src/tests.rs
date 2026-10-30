@@ -331,6 +331,220 @@ async fn pom_gradle_marker_comment_round_trips_verbatim() {
 }
 
 // ---------------------------------------------------------------------------
+// the identity the deployed file declares
+// ---------------------------------------------------------------------------
+//
+// Maven's coordinates come wholly from the request URL and the body goes on
+// with `payload_metadata: Null`. A `.pom` carries its own GAV and can be
+// compared; a `.jar` carries one only in an OPTIONAL
+// `META-INF/maven/{g}/{a}/pom.properties`.
+
+/// Body helper: the PUT response plus its body, so a refusal's text can be
+/// asserted (the shared `put` helper returns the status alone).
+async fn put_with_body(router: &Router, path: &str, body: &[u8]) -> (StatusCode, Vec<u8>) {
+    let res = router
+        .clone()
+        .oneshot(Request::put(path).body(Body::from(body.to_vec())).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap().to_vec();
+    (status, body)
+}
+
+#[tokio::test]
+async fn pom_put_refuses_a_document_declaring_another_group_id() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let router = router(ctx);
+
+    let pom = hort_formats::test_support::build_maven_pom("org.evil", "foo", "1.0");
+    let (status, body) =
+        put_with_body(&router, "/maven/mvn/com/example/foo/1.0/foo-1.0.pom", &pom).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Maven deploys over plain HTTP PUT; `maven-resolver-transport-http`
+    // reports the status line and (for a short 4xx body) the body text.
+    // There is no JSON error convention in the repository layout.
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("org.evil") && text.contains("com.example"),
+        "the refusal must name BOTH identities: {text}"
+    );
+}
+
+#[tokio::test]
+async fn pom_put_refuses_a_document_declaring_another_version() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let router = router(ctx);
+
+    let pom = hort_formats::test_support::build_maven_pom("com.example", "foo", "9.9.9");
+    let (status, body) =
+        put_with_body(&router, "/maven/mvn/com/example/foo/1.0/foo-1.0.pom", &pom).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("9.9.9") && text.contains("1.0"), "{text}");
+}
+
+/// The counter-test: an agreeing POM still deploys.
+#[tokio::test]
+async fn pom_put_of_an_agreeing_document_still_succeeds() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let router = router(ctx);
+
+    let pom = hort_formats::test_support::build_maven_pom("com.example", "foo", "1.0");
+    assert_eq!(
+        put(&router, "/maven/mvn/com/example/foo/1.0/foo-1.0.pom", &pom).await,
+        StatusCode::CREATED
+    );
+}
+
+/// A SNAPSHOT deploy uploads a TIMESTAMPED filename under the
+/// `-SNAPSHOT` version directory, and the POM inside still says
+/// `-SNAPSHOT`. The comparison reads the version DIRECTORY segment for
+/// exactly this reason — against the filename's timestamped form it would
+/// refuse every correct snapshot deploy.
+#[tokio::test]
+async fn pom_put_of_a_timestamped_snapshot_still_succeeds() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let router = router(ctx);
+
+    let pom = hort_formats::test_support::build_maven_pom("com.example", "foo", "1.0-SNAPSHOT");
+    assert_eq!(
+        put(
+            &router,
+            "/maven/mvn/com/example/foo/1.0-SNAPSHOT/foo-1.0-20260101.120000-1.pom",
+            &pom
+        )
+        .await,
+        StatusCode::CREATED
+    );
+}
+
+/// A POM whose `<version>` is an unresolved `${...}` placeholder (Maven's
+/// CI-friendly versions, unflattened) declares nothing this reader can
+/// compare, so the deploy proceeds rather than being refused over a fact
+/// the bytes do not settle.
+#[tokio::test]
+async fn pom_put_with_an_unresolved_version_property_still_succeeds() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let router = router(ctx);
+
+    let pom = br#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>foo</artifactId>
+  <version>${revision}</version>
+</project>"#;
+    assert_eq!(
+        put(&router, "/maven/mvn/com/example/foo/1.0/foo-1.0.pom", pom).await,
+        StatusCode::CREATED
+    );
+}
+
+/// A `.pom` that is not a parseable `<project>` document is refused. The
+/// stored bytes are what the metadata generator and the dependency reader
+/// go on to read as a POM, so a `.pom` that is not one cannot show it
+/// declares the coordinate it is deployed under — and an identity that
+/// could not be read is not an identity that agreed.
+#[tokio::test]
+async fn pom_put_of_a_document_that_is_not_a_pom_is_refused() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let router = router(ctx);
+
+    for body in [b"JARBYTES".as_slice(), b"<settings/>".as_slice()] {
+        let (status, text) =
+            put_with_body(&router, "/maven/mvn/com/example/foo/1.0/foo-1.0.pom", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert!(
+            String::from_utf8_lossy(&text).contains("maven.pom"),
+            "{text:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn jar_put_refuses_a_descriptor_declaring_another_coordinate() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let router = router(ctx);
+
+    let jar = hort_formats::test_support::build_maven_jar("org.evil", "foo", "1.0");
+    let (status, body) =
+        put_with_body(&router, "/maven/mvn/com/example/foo/1.0/foo-1.0.jar", &jar).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("org.evil") && text.contains("com.example"),
+        "{text}"
+    );
+}
+
+/// The counter-test the decision turns on: a jar with NO
+/// `META-INF/maven/**/pom.properties` still deploys. The descriptor is a
+/// Maven convention (`maven-archiver`'s `addMavenDescriptor`, routinely
+/// switched off, and absent from every Gradle / Bazel / sbt build), not a
+/// requirement of the repository layout — refusing one would reject
+/// correct artifacts over a fact Maven does not require them to carry.
+#[tokio::test]
+async fn jar_put_without_a_maven_descriptor_still_succeeds() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let router = router(ctx);
+
+    let jar = hort_formats::test_support::build_maven_jar_without_descriptor();
+    assert_eq!(
+        put(&router, "/maven/mvn/com/example/foo/1.0/foo-1.0.jar", &jar).await,
+        StatusCode::CREATED
+    );
+}
+
+/// A shaded / uber jar carries its own descriptor PLUS one per bundled
+/// dependency, and nothing in the archive says which is which. With more
+/// than one present the descriptor set does not identify the archive, so
+/// there is no single declaration to disagree with.
+#[tokio::test]
+async fn jar_put_with_several_descriptors_is_not_refused() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let router = router(ctx);
+
+    let jar = hort_formats::test_support::build_wheel_zip(&[
+        ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n"),
+        (
+            "META-INF/maven/com.example/foo/pom.properties",
+            b"groupId=com.example\nartifactId=foo\nversion=1.0\n",
+        ),
+        (
+            "META-INF/maven/org.third/party/pom.properties",
+            b"groupId=org.third\nartifactId=party\nversion=4.2\n",
+        ),
+    ]);
+    assert_eq!(
+        put(&router, "/maven/mvn/com/example/foo/1.0/foo-1.0.jar", &jar).await,
+        StatusCode::CREATED
+    );
+}
+
+/// An agreeing descriptor still deploys.
+#[tokio::test]
+async fn jar_put_of_an_agreeing_descriptor_still_succeeds() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let router = router(ctx);
+
+    let jar = hort_formats::test_support::build_maven_jar("com.example", "foo", "1.0");
+    assert_eq!(
+        put(&router, "/maven/mvn/com/example/foo/1.0/foo-1.0.jar", &jar).await,
+        StatusCode::CREATED
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A-level maven-metadata.xml (server-generated)
 // ---------------------------------------------------------------------------
 
