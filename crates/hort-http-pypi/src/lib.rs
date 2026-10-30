@@ -342,6 +342,30 @@ async fn upload(
     hort_formats::pypi::validate_pypi_filename(&file_name)
         .map_err(|e| ApiError::from(hort_app::error::AppError::Domain(e)))?;
 
+    // The version the filename carries must agree with the declared one,
+    // or the upload is refused. hort stores the declared `version` and
+    // serves the file at `simple/{name}/{filename}` — but a client
+    // resolving the PEP 503 index does not read hort's stored version:
+    // PEP 503 publishes only links, and `pip` recovers each candidate's
+    // version from the filename. An upload declaring `1.0.0` under the
+    // filename `foo-9.9.9.tar.gz` is therefore installed as `9.9.9` by
+    // every client while every record hort keeps of it says `1.0.0`.
+    //
+    // `pkg_name` is passed because the version's boundary in an sdist
+    // filename is "whatever follows the project name" — the rule `pip`
+    // itself applies — and a rule that disagrees with the resolving
+    // client's is a check that can pass on a filename the client reads
+    // differently.
+    //
+    // Runs AFTER the name/version/filename grammar validators so their
+    // negative paths keep hitting THEIR error first, and BEFORE
+    // `coords`/ingest so a divergence costs no storage write.
+    if let hort_formats::pypi::PypiFilenameVersion::Diverges { in_filename } =
+        hort_formats::pypi::check_pypi_filename_version(&file_name, &pkg_name, &pkg_version)
+    {
+        return Ok(filename_version_refusal(&in_filename, &pkg_version));
+    }
+
     // Require the client-declared `sha256_digest` and route the upload
     // through the verified-ingest framework (ADR 0006). The maintainer
     // chose the stronger supply-chain stance: a direct upload that omits
@@ -948,6 +972,34 @@ async fn pypi_member_coord_fetch(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The PyPI-shaped refusal for an upload whose filename carries a
+/// different version than the one it declared.
+///
+/// **400 + a `text/plain` body.** The legacy upload API (the endpoint
+/// twine posts to) reports a rejection as a 4xx status with a
+/// human-readable message body, which twine prints to the publisher
+/// verbatim; it has no JSON error envelope. The message names BOTH
+/// versions, because a publisher told only "version mismatch" cannot tell
+/// a stale filename from their build system apart from a tampered upload,
+/// and the two call for opposite responses.
+///
+/// `in_filename` has already been through
+/// `hort_formats::publish_identity::sanitize_declared` — it comes from a
+/// client-supplied filename and reaches a log line.
+fn filename_version_refusal(in_filename: &str, declared: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!(
+            "filename carries version '{in_filename}' but the upload declares \
+             version '{declared}'; a PEP 503 index publishes links only, so a \
+             client resolves the version from the filename and would install \
+             something other than what was declared"
+        ),
+    )
+        .into_response()
+}
 
 fn validation_error(msg: &str) -> ApiError {
     ApiError::from(hort_app::error::AppError::Domain(
@@ -3589,6 +3641,168 @@ mod tests {
             post_upload_with_filename("evil_pkg-1.0.tar.gz").await,
             StatusCode::OK
         );
+    }
+
+    // -- the version the filename carries ------------------------------------
+    //
+    // An upload declares `name`/`version` as form fields and supplies the
+    // filename separately on the `content` part. hort stores the declared
+    // version and serves the file at `simple/{name}/{filename}` — but a
+    // client resolving a PEP 503 index does NOT read hort's stored
+    // version: PEP 503 publishes only links, and `pip` recovers each
+    // candidate's version from the filename. So the two can diverge, and
+    // when they do every client installs one version while every record
+    // hort keeps says another.
+
+    /// Drive an upload with a caller-chosen `filename` and return the
+    /// status plus the body, so a refusal's text can be asserted.
+    async fn post_upload_with_filename_capturing_body(filename: &str) -> (StatusCode, Vec<u8>) {
+        let h = harness();
+        insert_repo(&h, "pypi-test");
+        let router = router(h.ctx.clone());
+        let boundary = "----hortversiontest";
+        let body = build_publish_multipart_with_filename(boundary, filename, b"payload");
+        let res = router
+            .oneshot(
+                Request::post("/pypi/pypi-test/")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = to_bytes(res.into_body(), 8192).await.unwrap().to_vec();
+        (status, body)
+    }
+
+    /// The builder declares `version = 1.0`; the filename says `9.9.9`.
+    #[tokio::test]
+    async fn upload_refuses_a_filename_carrying_another_version() {
+        let (status, body) =
+            post_upload_with_filename_capturing_body("evil_pkg-9.9.9.tar.gz").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // The legacy upload API reports a rejection as a 4xx with a
+        // human-readable body, which twine prints verbatim.
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("9.9.9") && text.contains("1.0"),
+            "the refusal must name BOTH versions: {text}"
+        );
+    }
+
+    /// Same for a wheel, whose version is the second `-`-delimited
+    /// component of the stem.
+    #[tokio::test]
+    async fn upload_refuses_a_wheel_filename_carrying_another_version() {
+        let (status, _) =
+            post_upload_with_filename_capturing_body("evil_pkg-9.9.9-py3-none-any.whl").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The counter-test: an agreeing wheel filename still uploads.
+    #[tokio::test]
+    async fn upload_of_an_agreeing_wheel_filename_still_succeeds() {
+        assert_eq!(
+            post_upload_with_filename("evil_pkg-1.0-py3-none-any.whl").await,
+            StatusCode::OK
+        );
+    }
+
+    /// A filename whose version component is the escaped spelling the
+    /// binary-distribution-format specification prescribes (`+` → `_`)
+    /// still uploads — byte equality would refuse the exact form the spec
+    /// requires.
+    #[tokio::test]
+    async fn upload_accepts_the_filename_escaping_the_wheel_spec_prescribes() {
+        let h = harness();
+        insert_repo(&h, "pypi-test");
+        let router = router(h.ctx.clone());
+        let boundary = "----horthescapetest";
+        let mut body = build_publish_multipart_with_filename(
+            boundary,
+            "evil_pkg-1.0_local.1-py3-none-any.whl",
+            b"payload",
+        );
+        // Re-declare `version` as the un-escaped metadata spelling.
+        body = replace_multipart_field(&body, "version", "1.0+local.1");
+        let res = router
+            .oneshot(
+                Request::post("/pypi/pypi-test/")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// The sdist version boundary is found after the project name, which
+    /// is `pip`'s own rule. A trailing-`-` split would read
+    /// `evil_pkg-9.9.9-0.tar.gz` as version `0` and wave through an upload
+    /// declaring `0` — while `pip` resolves `9.9.9-0` and installs that.
+    #[tokio::test]
+    async fn upload_refuses_a_filename_whose_version_only_looks_like_the_declared_one() {
+        let h = harness();
+        insert_repo(&h, "pypi-test");
+        let router = router(h.ctx.clone());
+        let boundary = "----hortpipruletest";
+        let mut body =
+            build_publish_multipart_with_filename(boundary, "evil_pkg-9.9.9-0.tar.gz", b"payload");
+        body = replace_multipart_field(&body, "version", "0");
+        let res = router
+            .oneshot(
+                Request::post("/pypi/pypi-test/")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = to_bytes(res.into_body(), 8192).await.unwrap();
+        let text = String::from_utf8_lossy(&text);
+        assert!(
+            text.contains("9.9.9-0"),
+            "the refusal must name the version a client would resolve: {text}"
+        );
+    }
+
+    /// A filename whose grammar yields no version at all is not a
+    /// divergence — `pip` skips a link it cannot parse, so there is no
+    /// disagreement between what hort records and what a client resolves.
+    /// It is also not this ticket's business to validate the file list.
+    #[tokio::test]
+    async fn upload_with_an_unparseable_filename_is_not_refused_for_its_version() {
+        assert_eq!(
+            post_upload_with_filename("evil_pkg.tar.gz").await,
+            StatusCode::OK,
+            "no version in the filename means nothing to disagree with"
+        );
+    }
+
+    /// Overwrite the value of a multipart text field in an already-built
+    /// body. Used to make the declared version and the filename's version
+    /// differ in their *spelling* rather than their value.
+    fn replace_multipart_field(body: &[u8], name: &str, value: &str) -> Vec<u8> {
+        let text = String::from_utf8(body.to_vec()).expect("fixture body is UTF-8");
+        let header = format!("name=\"{name}\"\r\n\r\n");
+        let start = text.find(&header).expect("field present") + header.len();
+        let end = start + text[start..].find("\r\n").expect("value terminator");
+        let mut out = text[..start].to_string();
+        out.push_str(value);
+        out.push_str(&text[end..]);
+        out.into_bytes()
     }
 
     // -- publish-handler validators (name / version / filename) ---------------

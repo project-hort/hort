@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A publish whose archive disagrees with its coordinates is now refused.**
+  npm, Cargo and Maven hosted publishes read the identity the uploaded
+  archive declares about itself and reject a disagreement in each format's
+  own error shape, and a PyPI upload whose filename names a different
+  version than the form field is rejected. A Maven jar with no embedded
+  `pom.properties` still publishes (#376).
 - **Scan evidence a release decision could not read no longer reads as clean.**
   An artifact whose stored findings are unreadable is judged on its recorded
   severity counts instead of released, a CVE exclusion no longer clears a hold

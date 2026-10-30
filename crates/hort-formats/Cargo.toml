@@ -78,11 +78,15 @@ quick-xml     = "0.41"
 
 [features]
 # Exposes cross-crate test fixtures: `archive_bounds::build_zip_bytes`
-# (UTF-8 bodies, used by `hort-adapters-advisory-osv`) and
+# (UTF-8 bodies, used by `hort-adapters-advisory-osv`),
 # `test_support::build_wheel_zip` (raw-bytes bodies, used by
-# `hort-http-pypi` for wheel METADATA fixtures). The `zip` crate is
-# `deny.toml`-locked to `hort-formats` as the only wrapper; this
-# feature is the cross-crate tunnel.
+# `hort-http-pypi` for wheel METADATA fixtures), and the gzip-tar /
+# publish-archive builders (`build_tar_gz_bytes`, `build_npm_tarball`,
+# `build_cargo_crate`, `build_maven_pom`, `build_maven_jar`) the
+# `hort-http-{npm,cargo,maven}` publish-identity fixtures need. The
+# `zip` / `tar` / `flate2` crates are `deny.toml`-locked to
+# `hort-formats` as the only wrapper; this feature is the cross-crate
+# tunnel.
 test-support = []
 
 [dev-dependencies]

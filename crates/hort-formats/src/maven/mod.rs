@@ -47,11 +47,13 @@ use hort_domain::types::{
     ArtifactCoords, ArtifactKind, Ecosystem, PayloadAccess, Sbom, SbomComponent,
 };
 
+use crate::publish_identity::IdentityCheck;
 use crate::sbom_helpers::build_subject_component;
 
 pub use coords::{
-    build_logical_path, parse_download_path, parse_sidecar_hex, validate_maven_coordinate,
-    MAVEN_KIND_FILE, MAVEN_KIND_METADATA_A, MAVEN_KIND_METADATA_V, MAVEN_PATH_KIND_KEY,
+    build_logical_path, parse_download_path, parse_sidecar_hex, split_ga,
+    validate_maven_coordinate, MAVEN_KIND_FILE, MAVEN_KIND_METADATA_A, MAVEN_KIND_METADATA_V,
+    MAVEN_PATH_KIND_KEY,
 };
 
 /// Maven (and Gradle) format handler.
@@ -139,6 +141,291 @@ fn classify_scan_kind(path: &str) -> ArtifactKind {
         ArtifactKind::MavenPom
     } else {
         ArtifactKind::Other
+    }
+}
+
+/// Whether `filename` names a Java archive — the packagings whose embedded
+/// Maven descriptor (if any) declares the archive's own coordinate.
+///
+/// Extension-driven, the same signal [`classify_scan_kind`] reads, because
+/// a Maven repository path carries no other packaging marker: the POM's
+/// `<packaging>` element lives inside XML a path-level predicate does not
+/// open.
+#[must_use]
+pub fn is_java_archive_filename(filename: &str) -> bool {
+    let Some((_, ext)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    JAVA_ARCHIVE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+}
+
+/// Whether `filename` names a POM document.
+#[must_use]
+pub fn is_pom_filename(filename: &str) -> bool {
+    filename
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("pom"))
+}
+
+// ---------------------------------------------------------------------------
+// The identity a Java archive declares about itself
+// ---------------------------------------------------------------------------
+
+/// The shape of the Maven build descriptor a Java archive may carry:
+/// `META-INF/maven/{groupId}/{artifactId}/pom.properties`.
+///
+/// Matched by shape rather than by the expected literal path. Building the
+/// expected path from the coordinate under which the archive is being
+/// stored — which is what the SBOM extractor does, because it is looking up
+/// a known artifact's own POM rather than auditing it — makes the lookup
+/// tautological for this purpose: an archive carrying a *different*
+/// coordinate's descriptor would simply not be found, and the disagreement
+/// the check exists to catch would read as "no descriptor".
+fn jar_descriptor_entry_path(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("META-INF/maven/") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix("/pom.properties") else {
+        return false;
+    };
+    // Exactly `{groupId}/{artifactId}` between the prefix and the file:
+    // two non-empty segments, neither of which may be a traversal marker.
+    let mut segments = rest.split('/');
+    let (Some(group), Some(artifact), None) = (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    !group.is_empty() && !artifact.is_empty() && group != ".." && artifact != ".."
+}
+
+/// What reading a Java archive's embedded Maven descriptor concluded.
+///
+/// The three arms are not three degrees of confidence — they are three
+/// different facts, and only the first one is comparable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JarDescriptorIdentity {
+    /// The archive carries exactly one Maven build descriptor, and it
+    /// declares all three coordinates.
+    Declared {
+        /// `groupId` from `pom.properties`.
+        group_id: String,
+        /// `artifactId` from `pom.properties`.
+        artifact_id: String,
+        /// `version` from `pom.properties`.
+        version: String,
+    },
+    /// The archive declares no coordinate this reader can attribute to the
+    /// archive itself. `reason` says which of the ways that happened.
+    Undeclared {
+        /// A `&'static str` so it is safe in a log field or metric label.
+        reason: &'static str,
+    },
+}
+
+/// Read the coordinate a Java archive declares about itself, from
+/// `META-INF/maven/{groupId}/{artifactId}/pom.properties`.
+///
+/// # Why an absent descriptor is not a refusal
+///
+/// `maven-archiver` writes `META-INF/maven/**/pom.{xml,properties}` into
+/// every jar it builds, but it is governed by the archiver's
+/// `addMavenDescriptor` flag (default on, routinely switched off) and
+/// nothing outside Maven writes it at all — a Gradle, Bazel, sbt or
+/// hand-assembled jar has none. The descriptor is a Maven *convention*, not
+/// a requirement of the repository layout, so refusing a jar that lacks one
+/// would reject correct artifacts over a fact Maven does not require them
+/// to carry.
+///
+/// # Why more than one descriptor is also not a refusal
+///
+/// A shaded / uber jar (`maven-shade-plugin`, `maven-assembly-plugin`)
+/// carries its own descriptor **plus** one for every bundled dependency,
+/// and nothing in the archive distinguishes them. With two or more present
+/// the descriptor set does not identify the archive, so there is no single
+/// declaration to agree or disagree with — refusing would reject every
+/// correctly-built uber jar in existence.
+///
+/// # Bounds and streaming
+///
+/// Routed through the audited
+/// [`crate::archive_bounds::iter_zip_entries`] under
+/// [`BoundsConfig::default_for_metadata_extraction`](crate::archive_bounds::BoundsConfig::default_for_metadata_extraction)
+/// — bounded entry count, per-entry bounded decompressed output. `jar` is
+/// a `&[u8]` because ZIP needs `Read + Seek` and the Maven PUT path already
+/// holds the whole body as an owned `Bytes` (a single PUT of one file, not
+/// a stream being spooled to CAS in parallel) — this read introduces no
+/// buffering that was not already paid for.
+///
+/// A ZIP this reader cannot open, or a descriptor it cannot read, is
+/// [`JarDescriptorIdentity::Undeclared`] rather than an error: the Maven
+/// repository layout says nothing about a deployed file's contents, so a
+/// `.jar` that is not a ZIP is a file the operator chose to deploy under
+/// that name and not a malformed publish this path gets to adjudicate.
+///
+/// # How far this reaches, and where it stops
+///
+/// `BoundsConfig::default_for_metadata_extraction`'s `max_entries` is
+/// **1024**, which an ordinary application jar exceeds — a Spring-Boot-shaped
+/// fat jar runs to thousands of entries. When the walk trips that cap the
+/// result is `Undeclared`, *even if a descriptor was already read*: an
+/// incomplete walk cannot report one descriptor as "exactly one", because the
+/// entry it stopped before might have been a second (the shaded-jar case).
+/// So the comparison is decidable on jars **under** the audited entry cap and
+/// declines on the rest, which is the same answer it gives a jar with no
+/// descriptor at all and is consistent with refusing only on a disagreement
+/// it can actually establish. Raising the cap for this read is a change to
+/// the audited bounds and belongs in a reviewed change to
+/// [`crate::archive_bounds`], not here. Pinned by
+/// `tests::a_jar_above_the_entry_cap_is_undeclared_rather_than_half_read`.
+#[must_use]
+pub fn read_jar_descriptor_identity(jar: &[u8]) -> JarDescriptorIdentity {
+    let mut found: Vec<Vec<u8>> = Vec::new();
+    let mut read_failed = false;
+    let iter_result = crate::archive_bounds::iter_zip_entries(
+        Cursor::new(jar),
+        crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
+        |name, reader| {
+            // Stop collecting once a second descriptor proves the set is
+            // not attributable to this archive — the outcome is already
+            // decided and reading more buys nothing.
+            if found.len() > 1 || !jar_descriptor_entry_path(name) {
+                return;
+            }
+            let mut out = Vec::new();
+            match reader.read_to_end(&mut out) {
+                Ok(_) => found.push(out),
+                Err(_) => read_failed = true,
+            }
+        },
+    );
+    // An incomplete walk cannot report `found.len() == 1` as "exactly one":
+    // the entry it stopped before might have been a second descriptor, which
+    // is precisely the shaded-jar case. So a trip discards what was read.
+    match iter_result {
+        Ok(_) => {}
+        Err(crate::archive_bounds::ZipIterError::Open(_)) => {
+            return JarDescriptorIdentity::Undeclared {
+                reason: "jar is not a readable zip archive",
+            }
+        }
+        Err(e) => {
+            // A readable zip the audited bounds stopped walking — in
+            // practice the `max_entries` cap, which any application jar
+            // exceeds. Logged because this is the one arm where the archive
+            // may well have carried a comparable coordinate and the check
+            // declined to read it, and an operator asking "why was this
+            // not checked" has no other way to find out.
+            tracing::warn!(
+                error = %e,
+                "maven identity: jar zip walk stopped by the archive bounds;                  the embedded coordinate was not compared"
+            );
+            return JarDescriptorIdentity::Undeclared {
+                reason: "jar zip walk stopped by the archive bounds",
+            };
+        }
+    }
+    if read_failed {
+        return JarDescriptorIdentity::Undeclared {
+            reason: "embedded pom.properties could not be read",
+        };
+    }
+    match found.len() {
+        0 => JarDescriptorIdentity::Undeclared {
+            reason: "jar carries no META-INF/maven/**/pom.properties",
+        },
+        1 => parse_jar_descriptor(&found[0]),
+        // Shaded / uber jar: its own descriptor plus the bundled
+        // dependencies', indistinguishable from each other.
+        _ => JarDescriptorIdentity::Undeclared {
+            reason: "jar carries more than one META-INF/maven/**/pom.properties",
+        },
+    }
+}
+
+/// Parse the three coordinates out of a `pom.properties` body.
+///
+/// `pom.properties` is a `java.util.Properties` text file; the three keys
+/// `groupId` / `artifactId` / `version` are the ones `maven-archiver`
+/// writes. Only `key=value` lines are read — `:` as a separator and
+/// backslash line continuations are Properties features `maven-archiver`
+/// does not emit, and reading a coordinate out of a shape the writer never
+/// produces would be inventing a declaration rather than reading one.
+fn parse_jar_descriptor(body: &[u8]) -> JarDescriptorIdentity {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return JarDescriptorIdentity::Undeclared {
+            reason: "embedded pom.properties is not valid UTF-8",
+        };
+    };
+    let mut group_id: Option<&str> = None;
+    let mut artifact_id: Option<&str> = None;
+    let mut version: Option<&str> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        // First occurrence wins, matching `java.util.Properties` only in
+        // the shape `maven-archiver` writes (one line per key). A repeated
+        // key is a descriptor that says two things; taking the first is the
+        // conservative read and the duplicate cannot widen what passes.
+        let slot = match key.trim() {
+            "groupId" => &mut group_id,
+            "artifactId" => &mut artifact_id,
+            "version" => &mut version,
+            _ => continue,
+        };
+        if slot.is_none() {
+            *slot = Some(value);
+        }
+    }
+    match (group_id, artifact_id, version) {
+        (Some(group_id), Some(artifact_id), Some(version)) => JarDescriptorIdentity::Declared {
+            group_id: group_id.to_string(),
+            artifact_id: artifact_id.to_string(),
+            version: version.to_string(),
+        },
+        // A descriptor missing any of the three does not name a coordinate
+        // to compare: two matching fields beside an absent third says
+        // nothing about whether this archive is the one it is stored as.
+        _ => JarDescriptorIdentity::Undeclared {
+            reason: "embedded pom.properties does not declare groupId, artifactId and version",
+        },
+    }
+}
+
+impl JarDescriptorIdentity {
+    /// Compare this declaration against the coordinate the PUT path is
+    /// storing the archive under.
+    ///
+    /// `stored_version` is the **version directory segment** of the request
+    /// path, which is what makes the comparison SNAPSHOT-safe — see
+    /// [`pom::PomIdentity::check`] for the same reasoning on the POM side.
+    #[must_use]
+    pub fn check(
+        &self,
+        stored_group_id: &str,
+        stored_artifact_id: &str,
+        stored_version: &str,
+    ) -> IdentityCheck {
+        match self {
+            Self::Undeclared { reason } => IdentityCheck::Undeclared { reason },
+            Self::Declared {
+                group_id,
+                artifact_id,
+                version,
+            } => IdentityCheck::first_divergence([
+                IdentityCheck::compare("groupId", Some(group_id), stored_group_id),
+                IdentityCheck::compare("artifactId", Some(artifact_id), stored_artifact_id),
+                IdentityCheck::compare("version", Some(version), stored_version),
+            ]),
+        }
     }
 }
 
@@ -410,7 +697,7 @@ impl VersionDiscovery for MavenFormatHandler {
     /// coordinate guard — a caller that cannot name an artifact has no
     /// version list to fetch.
     fn upstream_metadata_path(&self, package: &str) -> Option<String> {
-        let (group_id, artifact_id) = coords::split_ga(package).ok()?;
+        let (group_id, artifact_id) = split_ga(package).ok()?;
         validate_maven_coordinate(group_id, artifact_id, None).ok()?;
         let group_path = group_id.replace('.', "/");
         Some(format!(
@@ -605,7 +892,7 @@ impl PayloadSbom for MavenFormatHandler {
             }
             Some("jar") => {
                 let subject = maven_subject_component(coords)?;
-                let (group_id, artifact_id) = coords::split_ga(&coords.name)?;
+                let (group_id, artifact_id) = split_ga(&coords.name)?;
                 extract_jar_embedded_pom_sbom(coords, group_id, artifact_id, subject, payload)
             }
             _ => Ok(PayloadSbomExtraction {
@@ -620,7 +907,7 @@ impl PayloadSbom for MavenFormatHandler {
 /// Build the [`Sbom::subject`] component for a Maven coordinate:
 /// `pkg:maven/{groupId}/{artifactId}@{version}`, `Ecosystem::Maven`.
 fn maven_subject_component(coords: &ArtifactCoords) -> DomainResult<SbomComponent> {
-    let (group_id, artifact_id) = coords::split_ga(&coords.name)?;
+    let (group_id, artifact_id) = split_ga(&coords.name)?;
     let purl_name = format!("{group_id}/{artifact_id}");
     Ok(build_subject_component(
         coords,
@@ -642,7 +929,7 @@ fn maven_sbom_components(specs: &[DependencySpec]) -> Vec<SbomComponent> {
     specs
         .iter()
         .filter_map(|spec| {
-            let (group_id, artifact_id) = coords::split_ga(&spec.name).ok()?;
+            let (group_id, artifact_id) = split_ga(&spec.name).ok()?;
             Some(SbomComponent {
                 purl: format!("pkg:maven/{group_id}/{artifact_id}@{}", spec.range),
                 name: spec.name.clone(),
@@ -810,6 +1097,239 @@ mod tests {
 
     fn handler() -> MavenFormatHandler {
         MavenFormatHandler
+    }
+
+    // -- the identity a Java archive declares about itself -----------------
+
+    #[test]
+    fn java_archive_and_pom_filenames_are_classified_by_extension() {
+        for name in ["foo-1.0.jar", "foo-1.0.war", "foo-1.0.EAR", "foo-1.0.par"] {
+            assert!(is_java_archive_filename(name), "{name}");
+            assert!(!is_pom_filename(name), "{name}");
+        }
+        assert!(is_pom_filename("foo-1.0.pom"));
+        assert!(!is_java_archive_filename("foo-1.0.pom"));
+        // Neither shape: nothing this check reads a coordinate out of.
+        for name in [
+            "foo-1.0.module",
+            "foo-1.0.aar",
+            "foo-1.0.zip",
+            "noextension",
+        ] {
+            assert!(!is_java_archive_filename(name), "{name}");
+            assert!(!is_pom_filename(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn reads_the_coordinate_a_single_descriptor_declares() {
+        let jar = crate::test_support::build_maven_jar("com.example", "foo", "1.0");
+        let identity = read_jar_descriptor_identity(&jar);
+        assert_eq!(
+            identity,
+            JarDescriptorIdentity::Declared {
+                group_id: "com.example".into(),
+                artifact_id: "foo".into(),
+                version: "1.0".into(),
+            }
+        );
+        assert_eq!(
+            identity.check("com.example", "foo", "1.0"),
+            IdentityCheck::Agrees
+        );
+    }
+
+    #[test]
+    fn a_descriptor_declaring_another_coordinate_diverges() {
+        let jar = crate::test_support::build_maven_jar("org.evil", "foo", "1.0");
+        let identity = read_jar_descriptor_identity(&jar);
+        let check = identity.check("com.example", "foo", "1.0");
+        let divergence = check.divergence().expect("diverges");
+        assert_eq!(divergence.field, "groupId");
+        assert_eq!(divergence.declared, "org.evil");
+    }
+
+    /// The decision this check turns on: `maven-archiver`'s descriptor is a
+    /// Maven convention governed by `addMavenDescriptor` (default on,
+    /// routinely switched off) and absent from every non-Maven build, so an
+    /// absent one is not a refusal.
+    #[test]
+    fn a_jar_without_a_descriptor_is_undeclared() {
+        let jar = crate::test_support::build_maven_jar_without_descriptor();
+        let identity = read_jar_descriptor_identity(&jar);
+        assert!(matches!(identity, JarDescriptorIdentity::Undeclared { .. }));
+        assert!(identity
+            .check("com.example", "foo", "1.0")
+            .divergence()
+            .is_none());
+    }
+
+    /// A shaded / uber jar carries its own descriptor plus one per bundled
+    /// dependency, indistinguishable from each other — so the descriptor
+    /// set does not identify the archive and there is nothing to disagree
+    /// with. Refusing would reject every correctly-built uber jar.
+    #[test]
+    fn a_jar_with_several_descriptors_is_undeclared() {
+        let jar = crate::test_support::build_wheel_zip(&[
+            (
+                "META-INF/maven/com.example/foo/pom.properties",
+                b"groupId=com.example\nartifactId=foo\nversion=1.0\n",
+            ),
+            (
+                "META-INF/maven/org.third/party/pom.properties",
+                b"groupId=org.third\nartifactId=party\nversion=4.2\n",
+            ),
+        ]);
+        assert!(read_jar_descriptor_identity(&jar)
+            .check("com.example", "foo", "1.0")
+            .divergence()
+            .is_none());
+    }
+
+    /// The descriptor is matched by SHAPE, not by the path the stored
+    /// coordinate would imply. Building the expected path from the
+    /// coordinate under which the archive is being stored makes the lookup
+    /// tautological: an archive carrying a different coordinate's
+    /// descriptor would simply not be found.
+    #[test]
+    fn the_descriptor_is_found_under_a_coordinate_nobody_expected() {
+        let jar = crate::test_support::build_maven_jar("org.totally.other", "thing", "7.7");
+        assert!(matches!(
+            read_jar_descriptor_identity(&jar),
+            JarDescriptorIdentity::Declared { .. }
+        ));
+    }
+
+    /// The entry cap's reach, measured. A readable jar with more entries
+    /// than `BoundsConfig::default_for_metadata_extraction`'s `max_entries`
+    /// is `Undeclared` — **even though its descriptor is an early entry and
+    /// was read** — because an incomplete walk cannot report one descriptor
+    /// as "exactly one". This is the same answer a jar with no descriptor
+    /// gets, so it declines rather than mis-refusing; it is pinned because
+    /// it bounds how far the comparison reaches, and an ordinary application
+    /// jar is on the far side of it.
+    #[test]
+    fn a_jar_above_the_entry_cap_is_undeclared_rather_than_half_read() {
+        let names: Vec<String> = (0..crate::archive_bounds::MAX_ENTRIES + 1)
+            .map(|i| format!("com/example/C{i}.class"))
+            .collect();
+        let mut files: Vec<(&str, &[u8])> = vec![
+            // The descriptor is the FIRST entry, so it is read before the
+            // counter trips — and discarded anyway.
+            (
+                "META-INF/maven/com.example/foo/pom.properties",
+                b"groupId=com.example\nartifactId=foo\nversion=1.0\n",
+            ),
+        ];
+        files.extend(
+            names
+                .iter()
+                .map(|n| (n.as_str(), b"\xca\xfe\xba\xbe".as_slice())),
+        );
+        let jar = crate::test_support::build_wheel_zip(&files);
+        assert_eq!(
+            read_jar_descriptor_identity(&jar),
+            JarDescriptorIdentity::Undeclared {
+                reason: "jar zip walk stopped by the archive bounds",
+            },
+            "a walk that could not finish must not claim it saw the whole set"
+        );
+        // Counter-assertion: the identical archive one entry under the cap
+        // DOES declare, so the test is about the cap and not about the
+        // fixture being unreadable.
+        let under =
+            crate::test_support::build_wheel_zip(&files[..crate::archive_bounds::MAX_ENTRIES]);
+        assert_eq!(
+            read_jar_descriptor_identity(&under),
+            JarDescriptorIdentity::Declared {
+                group_id: "com.example".into(),
+                artifact_id: "foo".into(),
+                version: "1.0".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_jar_that_is_not_a_zip_is_undeclared_not_an_error() {
+        // The Maven repository layout says nothing about a deployed file's
+        // contents — a `.jar` that is not a ZIP is a file the operator
+        // chose to deploy under that name.
+        assert!(matches!(
+            read_jar_descriptor_identity(b"JARBYTES"),
+            JarDescriptorIdentity::Undeclared { .. }
+        ));
+    }
+
+    #[test]
+    fn a_descriptor_missing_one_of_the_three_keys_is_undeclared() {
+        let jar = crate::test_support::build_wheel_zip(&[(
+            "META-INF/maven/com.example/foo/pom.properties",
+            b"groupId=com.example\nartifactId=foo\n",
+        )]);
+        assert!(read_jar_descriptor_identity(&jar)
+            .check("com.example", "foo", "1.0")
+            .divergence()
+            .is_none());
+    }
+
+    #[test]
+    fn descriptor_comments_and_blank_values_are_skipped() {
+        let jar = crate::test_support::build_wheel_zip(&[(
+            "META-INF/maven/com.example/foo/pom.properties",
+            b"#Generated by Maven\n!also a comment\nversion=\ngroupId=com.example\n\
+              artifactId=foo\nversion=1.0\nversion=9.9.9\n",
+        )]);
+        assert_eq!(
+            read_jar_descriptor_identity(&jar),
+            JarDescriptorIdentity::Declared {
+                group_id: "com.example".into(),
+                artifact_id: "foo".into(),
+                // First non-empty occurrence wins; the duplicate cannot
+                // widen what passes.
+                version: "1.0".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_descriptor_is_undeclared() {
+        let jar = crate::test_support::build_wheel_zip(&[(
+            "META-INF/maven/com.example/foo/pom.properties",
+            &[0xff, 0xfe, 0xfd],
+        )]);
+        assert!(matches!(
+            read_jar_descriptor_identity(&jar),
+            JarDescriptorIdentity::Undeclared { .. }
+        ));
+    }
+
+    #[test]
+    fn only_the_two_segment_descriptor_shape_matches() {
+        assert!(jar_descriptor_entry_path(
+            "META-INF/maven/com.example/foo/pom.properties"
+        ));
+        // Wrong depth, wrong file, traversal-shaped, or empty segments.
+        for name in [
+            "META-INF/maven/com.example/pom.properties",
+            "META-INF/maven/a/b/c/pom.properties",
+            "META-INF/maven/com.example/foo/pom.xml",
+            "META-INF/maven/../foo/pom.properties",
+            "META-INF/maven//foo/pom.properties",
+            "other/maven/com.example/foo/pom.properties",
+        ] {
+            assert!(!jar_descriptor_entry_path(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_crafted_descriptor_is_sanitised_before_it_reaches_the_refusal() {
+        let jar = crate::test_support::build_wheel_zip(&[(
+            "META-INF/maven/g/a/pom.properties",
+            b"groupId=org.evil\nartifactId=foo\nversion=1.0\n",
+        )]);
+        let identity = read_jar_descriptor_identity(&jar);
+        let check = identity.check("com.example", "foo", "1.0");
+        assert_eq!(check.divergence().expect("diverges").declared, "org.evil");
     }
 
     // -- format_key / normalize_name -----------------------------------------
