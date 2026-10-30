@@ -104,8 +104,14 @@ impl ApplyConfigUseCase {
                 }
                 GrantSubjectSpec::User { user_id } => {
                     let uid = Uuid::parse_str(user_id.trim()).map_err(|_| {
-                        DomainError::Validation(format!(
-                            "PermissionGrant `{}` subject.userId `{}` is not a valid UUID",
+                        // Unreachable in practice: `validate_permission_grant`
+                        // gated the subject.userId syntax before the apply
+                        // stage. This stage runs last, so a syntax error
+                        // raised here would abort an apply that has already
+                        // committed the rest of the bundle.
+                        DomainError::Invariant(format!(
+                            "PermissionGrant `{}` carries subject.userId `{}` that should \
+                             have been rejected by validate_permission_grant",
                             env.metadata.name, user_id
                         ))
                     })?;

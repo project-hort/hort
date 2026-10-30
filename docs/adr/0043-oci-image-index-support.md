@@ -232,7 +232,7 @@ content nobody has asked for yet, which is exactly the kind of trade-off an
 operator has the information to make.
 
 **Attestation manifests are included.** The enqueue enumerates `manifests[]`
-through the domain's `index_child_digests`, with no filter on `platform` or on a
+through the domain's `index_child_descriptors`, with no filter on `platform` or on a
 child's media type — an attestation manifest is a declared member of the index
 like any other. Excluding it (as a `platform: unknown/unknown` entry, say) would
 recreate the second lazy window for precisely the artifact that provenance

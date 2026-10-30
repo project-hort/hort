@@ -806,15 +806,31 @@ podDisruptionBudget:
 # allowance to those Job pods WITHOUT relaxing the app pods. The DB
 # endpoint lives inside the opaque Secret DSN — the chart deliberately
 # does not guess CIDRs; the carve-out is the standard no-guess
-# bootstrap-Job allowance. If you know your CIDRs and want that Job
-# egress tighter, the only lever is narrowing the `to:` of that rule
-# itself (fork the chart, or patch the rendered policy with
-# `--post-renderer`): NetworkPolicy allowances are additive, so a
-# second, tighter policy cannot subtract this one, and the app `egress`
-# rules above never reach the Job pods at all. Setting
-# `networkPolicy.enabled: false` disables BOTH policies. See the
-# docstring in `templates/networkpolicy-migrate-job.yaml` for the full
-# per-Job verdict table.
+# bootstrap-Job allowance. If you know your destinations and want that
+# Job egress tighter, `networkPolicy.jobEgress` below is the supported
+# lever — it REPLACES that one unrestricted rule. A second, tighter
+# NetworkPolicy is not: allowances are additive, so another policy can
+# only ADD, never subtract this one, and the app `egress` rules above
+# never reach the Job pods at all. Setting `networkPolicy.enabled: false`
+# disables BOTH policies. See the docstring in
+# `templates/networkpolicy-migrate-job.yaml` for the full per-Job verdict
+# table.
+#
+# WHAT THAT SELECTOR CAN AND CANNOT DO — read this before you rely on it.
+# A NetworkPolicy selects on pod labels and namespaces, and that is the
+# whole of what Kubernetes gives it: no ServiceAccount, no owner
+# reference, no "Helm created this pod". The three labels above are
+# therefore a SCOPE, not a credential — they are as settable as any
+# label, and anyone who may create or label a Pod in this namespace can
+# write all three onto a pod of their own and be selected by this policy.
+# No NetworkPolicy can close that and this chart does not claim to: a
+# principal holding create-Pod in the release's namespace is not an
+# attacker a NetworkPolicy defends against. Keep Pod creation in this
+# namespace off untrusted principals — that is your cluster RBAC's
+# boundary, and network position never substitutes for authorization.
+# What the chart CAN bound is how much a selected pod gets, which is what
+# `jobEgress` is for; narrowing the destinations does not make the
+# selector unforgeable, it bounds what a pod wearing the labels receives.
 networkPolicy:
   # Default ON. Flip to `false` to opt out (documented escape hatch —
   # see the section comment above).
@@ -834,6 +850,40 @@ networkPolicy:
   # Open up to those plus the known webhook-forwarder set ONLY
   # (egress allowlist posture).
   egress: []
+  # Operator-supplied egress rules for the Job-scoped bootstrap policy —
+  # this release's Job/CronJob pods, NOT the app pods. The default
+  # allowance those pods get is DNS plus UNRESTRICTED egress, because the
+  # pre-install `migrate` hook has to reach a Postgres whose address lives
+  # in an opaque Secret DSN the chart never sees. Set this to your own
+  # destinations and they REPLACE that unrestricted rule, so the Job pods
+  # reach what you list and DNS, and nothing else.
+  #
+  # NOTE the semantics are the OPPOSITE of `egress` above: an EMPTY list
+  # here KEEPS the shipped allowance rather than denying everything. That
+  # is deliberate — an upgrade must not stop letting the `migrate` hook
+  # through — and it is the one thing to get right when reading this key.
+  # Two consequences worth knowing: this list can only ever narrow the
+  # allowance (the default already permits every destination on every
+  # port, so any rules you write are a subset), and the DNS rule stays
+  # regardless of what you put here, because a destination list that
+  # forgot it would break every hostname DSN.
+  #
+  # Entries are verbatim Kubernetes NetworkPolicy egress rules, same shape
+  # as `egress` above. One allowance covers every Job/CronJob pod of the
+  # release, so cover the union of what they reach: Postgres (migrate,
+  # svc-token bootstrap), the kube-apiserver (pre-pull wait, svc-token
+  # bootstrap), and whatever the scheduled tasks you enable reach (S3 /
+  # OIDC issuer / upstream registries). Getting it wrong fails loudly, not
+  # quietly: `helm install` aborts at the pre-install hook when the
+  # migrate Job cannot reach the database.
+  #
+  #   jobEgress:
+  #     - to:
+  #         - ipBlock:
+  #             cidr: <your-postgres-cidr>
+  #       ports:
+  #         - { protocol: TCP, port: 5432 }
+  jobEgress: []
 
 # -------------------- Extra surface --------------------
 # extraEnv — for any HORT_* knob the chart does not yet surface as a

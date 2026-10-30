@@ -19,11 +19,26 @@
 //! Given the bytes of a manifest that was just ingested, enqueue one
 //! `oci-index-child-ingest` row per child the manifest declares. A
 //! single-image manifest declares none, so it is a no-op — the domain's
-//! [`index_child_digests`] yields an empty set for a body with no
+//! [`index_child_descriptors`] yields an empty set for a body with no
 //! `manifests[]`, which is the "not an index, no enqueue" rule expressed as
 //! data rather than as a second media-type branch. The **body** decides,
 //! never the upstream's declared `Content-Type`: those are the bytes that
 //! were hashed and stored.
+//!
+//! # A child this registry cannot address is skipped, and said out loud
+//!
+//! A declared child whose descriptor names no `sha256:` CAS object — no
+//! `digest` at all, an algorithm hort cannot address, malformed hex — is
+//! **skipped, per child**, and reported. It is deliberately not a refusal of
+//! the whole index here: there is no fetch this facade could enqueue for a
+//! digest it cannot address, while the index's other children have fetches
+//! that are perfectly well-defined, and dropping those too would send a whole
+//! multi-arch cohort onto the lazy path over one unaddressable platform.
+//!
+//! This is the same set of children that was skipped before — the difference
+//! is that the skip is now reported rather than invisible. `IndexChildren`
+//! requires the report, which is why the warn is not something a later edit
+//! can quietly drop.
 //!
 //! # Every failure is non-fatal
 //!
@@ -83,7 +98,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use hort_domain::oci::index_child_digests;
+use hort_domain::oci::index_child_descriptors;
 use hort_domain::ports::jobs_repository::{IdempotentEnqueueRow, JobsRepository};
 
 use crate::task_handlers::oci_index_child_ingest::{
@@ -129,7 +144,7 @@ impl OciIndexChildEnqueueUseCase {
         requested_name: &str,
         manifest_body: &[u8],
     ) {
-        let children = match index_child_digests(manifest_body) {
+        let declared = match index_child_descriptors(manifest_body) {
             Ok(c) => c,
             Err(err) => {
                 tracing::warn!(
@@ -142,6 +157,19 @@ impl OciIndexChildEnqueueUseCase {
                 return;
             }
         };
+        let declared_count = declared.declared();
+        // Per-child skip, reported: there is no fetch to enqueue for a digest
+        // this registry cannot address, and the siblings' fetches are
+        // unaffected. See the module doc.
+        let children = declared.into_resolvable(|fault| {
+            tracing::warn!(
+                %repository_id,
+                requested_name,
+                child = %fault,
+                "OCI eager child ingest: an index child declares no addressable content; \
+                 no row enqueued for it (its siblings are unaffected)",
+            );
+        });
         if children.is_empty() {
             return;
         }
@@ -150,10 +178,10 @@ impl OciIndexChildEnqueueUseCase {
             .iter()
             .map(|child| IdempotentEnqueueRow {
                 kind: OCI_INDEX_CHILD_INGEST_KIND.to_string(),
-                params: child_ingest_params(repository_id, requested_name, child),
+                params: child_ingest_params(repository_id, requested_name, &child.hash),
                 priority: CHILD_INGEST_ENQUEUE_PRIORITY,
                 trigger_source: CHILD_INGEST_TRIGGER_SOURCE.to_string(),
-                idempotency_key: child_ingest_idempotency_key(repository_id, child),
+                idempotency_key: child_ingest_idempotency_key(repository_id, &child.hash),
             })
             .collect();
 
@@ -161,7 +189,8 @@ impl OciIndexChildEnqueueUseCase {
             Ok(inserted) => tracing::info!(
                 %repository_id,
                 requested_name,
-                declared_children = children.len(),
+                declared_children = declared_count,
+                enqueueable_children = children.len(),
                 enqueued = inserted.len(),
                 deduped = rows.len() - inserted.len(),
                 "OCI eager child ingest: index children queued",
@@ -173,7 +202,8 @@ impl OciIndexChildEnqueueUseCase {
                 error = %err,
                 %repository_id,
                 requested_name,
-                declared_children = children.len(),
+                declared_children = declared_count,
+                enqueueable_children = children.len(),
                 "OCI eager child ingest: child row enqueue failed; those children stay \
                  on the lazy pull path (non-fatal)",
             ),
@@ -394,6 +424,76 @@ mod tests {
         );
     }
 
+    /// A descriptor naming no addressable content costs **that child** its
+    /// row and nothing else. This path is not an admission gate: the index is
+    /// already stored, there is no fetch to enqueue for a digest this registry
+    /// cannot address, and refusing the cohort would send every platform onto
+    /// the lazy path over one it could never pull.
+    ///
+    /// Before the correction the skip happened too — invisibly, inside the
+    /// domain projection's `filter_map`. What is new is that it is reported.
+    #[tokio::test]
+    async fn an_unaddressable_child_is_skipped_and_its_siblings_are_still_enqueued() {
+        let (uc, jobs) = fixture();
+        let good_a = deterministic_sha(1);
+        let good_b = deterministic_sha(2);
+        let body = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                { "digest": format!("sha256:{}", good_a.as_ref()), "size": 7 },
+                { "digest": format!("sha512:{}", "a".repeat(128)), "size": 7 },
+                { "size": 7 },
+                { "digest": "sha256:not-hex", "size": 7 },
+                { "digest": format!("sha256:{}", good_b.as_ref()), "size": 7 },
+            ],
+        })
+        .to_string()
+        .into_bytes();
+
+        uc.enqueue_declared_children(Uuid::new_v4(), "dockerhub/library/nginx", &body)
+            .await;
+
+        let cohort = single_cohort(&jobs);
+        assert_eq!(
+            cohort.len(),
+            2,
+            "both addressable children keep their rows; the three that name no CAS \
+             object get none",
+        );
+        let targets: Vec<String> = cohort
+            .iter()
+            .map(|r| r.params["child_digest"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                format!("sha256:{}", good_a.as_ref()),
+                format!("sha256:{}", good_b.as_ref()),
+            ],
+        );
+    }
+
+    /// An index whose children are ALL unaddressable enqueues nothing — and
+    /// does so without issuing an empty statement.
+    #[tokio::test]
+    async fn an_index_of_only_unaddressable_children_enqueues_nothing() {
+        let (uc, jobs) = fixture();
+        let body = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                { "digest": format!("sha512:{}", "a".repeat(128)), "size": 7 },
+                { "size": 7 },
+            ],
+        })
+        .to_string()
+        .into_bytes();
+        uc.enqueue_declared_children(Uuid::new_v4(), "dockerhub/library/nginx", &body)
+            .await;
+        assert!(jobs.idempotent_batch_calls().is_empty());
+    }
+
     #[tokio::test]
     async fn a_single_image_manifest_enqueues_nothing() {
         let (uc, jobs) = fixture();
@@ -423,7 +523,7 @@ mod tests {
     }
 
     /// An index declaring more children than the domain's per-index cap is
-    /// REFUSED by `index_child_digests`, never truncated — so it enqueues
+    /// REFUSED by `index_child_descriptors`, never truncated — so it enqueues
     /// nothing rather than a partial child set.
     #[tokio::test]
     async fn an_over_cap_index_enqueues_nothing() {

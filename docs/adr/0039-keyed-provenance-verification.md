@@ -400,7 +400,7 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
 
     **Mechanism.** When the orchestrator's folded verdict is `Verified`
     under `Required`, it derives the constituent set **from the verified
-    subject's CAS bytes** (`is_image_index` → `index_child_digests`, then
+    subject's CAS bytes** (`is_image_index` → `index_child_descriptors`, then
     per child manifest read back from CAS — and for a single-image subject,
     the subject bytes themselves — `manifest_blob_digests` for the
     `config` + `layers[]` digests), resolves each digest to an artifact row

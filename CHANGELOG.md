@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Checks that arrived after the write, and a Job allowance wider than it had
+  to be.** An OCI image index whose `manifests[]` carries a descriptor with no
+  usable digest — or a child whose stored size disagrees with the size declared
+  for it — is now refused rather than accepted with a graph edge missing, and a
+  malformed `subject.userId` in a gitops `PermissionGrant` is rejected before
+  the apply's first write instead of after it. The chart's Job-egress allowance
+  can now be narrowed to destinations you name, via the opt-in
+  `networkPolicy.jobEgress`; left empty it keeps the shipped allowance, so an
+  upgrade changes nothing (#382).
 - **A boundary drawn when something is issued now holds when it is consumed.**
   An OCI `/v2/auth` bearer minted for `push` on one repository no longer
   authorises a write on another repository it was granted only `pull` on; a

@@ -85,7 +85,7 @@
 //!    [`super::oci_membership_edge_backfill`] exists to repair; an index
 //!    needs one `oci_index_member` row per child. They come out of
 //!    [`FormatHandler::extract_oci_manifest_blob_refs`] /
-//!    [`index_child_digests`], as that handler does. The cached body is read
+//!    [`index_child_descriptors`], as that handler does. The cached body is read
 //!    into memory ONCE and both this derivation and the ingest consume those
 //!    bytes — bounded work, not an unbounded buffer: the upstream adapter
 //!    already refused anything over its manifest body cap when it wrote the
@@ -106,8 +106,9 @@
 //!    row's conflict is the unique index's business rather than this handler's.
 //!    Recursion falls out of
 //!    the handler enqueueing its own kind, and it is bounded in both directions:
-//!    the domain's per-index child cap bounds each level ([`index_child_digests`]
-//!    rejects an over-cap index outright rather than truncating it), and
+//!    the domain's per-index child cap bounds each level
+//!    ([`index_child_descriptors`] rejects an over-cap index outright rather
+//!    than truncating it), and
 //!    [`MAX_CHILD_INGEST_DEPTH`] bounds the chain of nested indexes. Neither is
 //!    operator-visible — both are constants, because a safety bound is not a
 //!    trade-off to tune. At the depth cap the member edges are still claimed and
@@ -180,7 +181,7 @@ use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::ApiActor;
 use hort_domain::oci::{
-    index_child_digests, is_image_index, ManifestBlobRole, DOCKER_MANIFEST_LIST_MEDIA_TYPE,
+    index_child_descriptors, is_image_index, ManifestBlobRole, DOCKER_MANIFEST_LIST_MEDIA_TYPE,
     OCI_IMAGE_INDEX_MEDIA_TYPE,
 };
 use hort_domain::ports::artifact_repository::ArtifactRepository;
@@ -909,7 +910,7 @@ impl OciIndexChildIngestHandler {
         summary.is_index = body_is_index;
 
         if body_is_index {
-            let children = match index_child_digests(body) {
+            let declared = match index_child_descriptors(body) {
                 Ok(c) => c,
                 Err(err) => {
                     tracing::warn!(
@@ -922,6 +923,22 @@ impl OciIndexChildIngestHandler {
                     return ChildClaims::default();
                 }
             };
+            // A grandchild descriptor that names no addressable content is
+            // skipped per child, reported, and costs its siblings nothing.
+            // Refusing the whole nested index instead would give it NO member
+            // edges — the un-keepalived state the membership-edge backfill
+            // exists to repair — over one grandchild hort could never fetch;
+            // and these bytes are already stored and digest-verified, so this
+            // is a reader of a document that was admitted, not an admission.
+            let children = declared.into_resolvable(|fault| {
+                tracing::warn!(
+                    repository = %repo.key,
+                    child_digest = %parsed.child_digest,
+                    grandchild = %fault,
+                    "oci-index-child-ingest: a nested index child declares no addressable \
+                     content; no member edge and no row for it (its siblings are unaffected)",
+                );
+            });
             // The member edges are membership facts about the manifest being
             // minted, so they are claimed at every depth. Only the
             // grandchild ROWS are bounded — they are what makes the fan-out
@@ -933,7 +950,7 @@ impl OciIndexChildIngestHandler {
                     child_digest = %parsed.child_digest,
                     depth = parsed.depth,
                     max_depth = MAX_CHILD_INGEST_DEPTH,
-                    declared_children = children.len(),
+                    addressable_children = children.len(),
                     "oci-index-child-ingest: nested index at the recursion depth cap; \
                      member edges claimed but no grandchild rows enqueued — those \
                      children stay on the lazy pull path",
@@ -942,10 +959,10 @@ impl OciIndexChildIngestHandler {
             let edges = children
                 .iter()
                 .map(|grandchild| ContentReferenceClaim {
-                    target_content_hash: grandchild.clone(),
+                    target_content_hash: grandchild.hash.clone(),
                     kind: OCI_INDEX_MEMBER_KIND.to_string(),
                     metadata: json!({
-                        "child_digest": oci_digest_ref(grandchild),
+                        "child_digest": oci_digest_ref(&grandchild.hash),
                         "media_type": media_type,
                     }),
                 })
@@ -955,7 +972,7 @@ impl OciIndexChildIngestHandler {
                 grandchildren: if summary.depth_capped {
                     Vec::new()
                 } else {
-                    children
+                    children.into_iter().map(|c| c.hash).collect()
                 },
             };
         }
@@ -1270,7 +1287,7 @@ mod tests {
 
     /// An image-index body declaring `children`, and a single-image manifest
     /// body. Both are real JSON so the domain's structural probes
-    /// (`is_image_index` / `index_child_digests`) see what production would.
+    /// (`is_image_index` / `index_child_descriptors`) see what production would.
     fn index_body(children: &[ContentHash]) -> Vec<u8> {
         let manifests: Vec<serde_json::Value> = children
             .iter()
@@ -2417,6 +2434,78 @@ mod tests {
             .is_none());
     }
 
+    /// A nested index carrying grandchild descriptors this registry cannot
+    /// address: each is skipped, each is reported, and the addressable
+    /// grandchildren keep both their member edge and their row.
+    ///
+    /// Refusing the nested index instead would give it **no** member edges at
+    /// all — the un-keepalived state `oci_membership_edge_backfill` exists to
+    /// repair — over one grandchild hort could never fetch. These bytes are
+    /// already fetched and digest-verified, so this frame reads a document
+    /// that was admitted; it is not itself an admission gate.
+    #[tokio::test]
+    async fn an_unaddressable_grandchild_costs_only_itself_its_edge_and_its_row() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(Vec::new())).await;
+        let good = [deterministic_sha(1), deterministic_sha(2)];
+        let body = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_INDEX_MEDIA_TYPE,
+            "manifests": [
+                { "digest": format!("sha256:{}", good[0].as_ref()), "size": 7 },
+                { "digest": format!("sha512:{}", "a".repeat(128)), "size": 7 },
+                { "mediaType": IMAGE_MANIFEST_MEDIA_TYPE, "size": 7 },
+                { "digest": "sha256:not-hex", "size": 7 },
+                { "digest": format!("sha256:{}", good[1].as_ref()), "size": 7 },
+            ],
+        })
+        .to_string()
+        .into_bytes();
+        let digest = seed_child(&f.proxy, &body, OCI_IMAGE_INDEX_MEDIA_TYPE, None);
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("an unaddressable grandchild descriptor must not fail the unit"),
+        );
+        assert_eq!(summary["outcome"], "ingested");
+        assert_eq!(summary["is_index"], true);
+        assert_eq!(
+            summary["membership_edges_written"], 2,
+            "one edge per ADDRESSABLE grandchild — the three that name no CAS object get \
+             none, and the two that do are unaffected"
+        );
+        assert_eq!(summary["grandchildren_enqueued"], 2);
+
+        let cohort = single_cohort(&f.jobs);
+        let targets: Vec<String> = cohort
+            .iter()
+            .map(|r| r.params["child_digest"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                format!("sha256:{}", good[0].as_ref()),
+                format!("sha256:{}", good[1].as_ref()),
+            ],
+        );
+
+        // And the nested index is minted carrying member edges rather than
+        // none, which is the whole point of skipping rather than refusing.
+        let minted = f
+            .artifacts
+            .find_by_repo_and_checksum(f.repo.id, &sha256_hex(&body).parse().expect("sha"))
+            .await
+            .expect("query")
+            .expect("index row minted");
+        assert!(f
+            .refs
+            .find_by_source_and_kind(f.repo.id, minted.id, OCI_INDEX_MEMBER_KIND)
+            .await
+            .expect("query")
+            .is_some());
+    }
+
     #[tokio::test]
     async fn run_with_duplicate_grandchild_enqueue_counts_it_as_deduped() {
         let f = fixture(OciMembershipEdgesStubBehaviour::Edges(Vec::new())).await;
@@ -2466,7 +2555,7 @@ mod tests {
     }
 
     /// An index declaring more children than the domain's per-index cap is
-    /// REFUSED by `index_child_digests`, never truncated. The child manifest
+    /// REFUSED by `index_child_descriptors`, never truncated. The child manifest
     /// itself still ingests; it simply contributes no member edges and no
     /// grandchild rows — an over-cap index must not be silently accepted with
     /// a partial child set.

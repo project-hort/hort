@@ -869,6 +869,7 @@ typical single-replica deployments accept eviction).
 | `networkPolicy.enabled` | boolean | `true` | no |
 | `networkPolicy.ingress` | list (NetworkPolicy ingress rules) | `[]` | no |
 | `networkPolicy.egress` | list (NetworkPolicy egress rules) | `[]` | no |
+| `networkPolicy.jobEgress` | list (NetworkPolicy egress rules) | `[]` | no |
 
 **Default-on** (flipped from the previous default off). Set `networkPolicy.enabled: false` to opt out entirely (documented
 escape hatch — e.g. a mesh `AuthorizationPolicy` already governs the
@@ -892,6 +893,25 @@ image pulls happen via the node's container runtime, outside the pod
 network namespace NetworkPolicy governs.
 See [`control-plane-tiers.md`](./control-plane-tiers.md) for a
 worked three-tier example.
+
+**`networkPolicy.jobEgress` narrows that Job allowance**, and its empty
+default is the OPPOSITE of `egress` above: empty **keeps** the shipped
+DNS + unrestricted-egress allowance rather than denying everything, because
+an upgrade must not stop letting the pre-install `migrate` hook reach a
+database the chart never sees. Populate it with your own egress rules and
+they **replace** the unrestricted rule — the chart-owned DNS rule stays
+regardless, since a destination list that dropped it would break every
+hostname DSN. The list can only narrow (the default already allows every
+destination on every port), one allowance covers every Job/CronJob pod of the
+release (so cover the union: Postgres, the kube-apiserver, and whatever
+scheduled tasks you enable reach), and a list the migrate Job cannot reach
+Postgres through aborts `helm install` at the pre-install hook rather than
+failing quietly. Narrowing the destinations is also all the chart can do
+here: a NetworkPolicy selects on pod labels and namespaces and nothing else,
+so the release-scoped selector is a scope rather than a credential — anyone
+who may create or label a Pod in the namespace can wear those labels. That
+is the cluster RBAC's boundary, not this policy's; see the chart README's
+NetworkPolicy section.
 
 ### `prePull`
 
