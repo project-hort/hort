@@ -15,10 +15,15 @@
 //!    `modified > since`.
 //!
 //! Per-ecosystem failures (network, parse, zip-format) surface as
-//! `Err` from [`pull_one_ecosystem`]; the caller in `lib.rs` records
-//! the failure into [`AdvisoryDiffResult.all_ecosystems_ok`] without
-//! aborting the whole tick. That contract is what keeps the watch
-//! handler's checkpoint-on-success-only invariant intact.
+//! `Err` from [`pull_one_ecosystem`], and a walk that *completed* while
+//! leaving members out reports them in [`EcosystemPull::skipped`]. The
+//! caller in `lib.rs` lowers both to
+//! [`AdvisoryDiffResult.all_ecosystems_ok`] without aborting the whole
+//! tick, and both halves are needed to keep the watch handler's
+//! checkpoint-on-success-only invariant intact: the checkpoint is the
+//! only thing that decides whether a window is read again, and once it
+//! has moved, every record in that window fails the `modified > since`
+//! filter of every later pull.
 
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
@@ -113,11 +118,171 @@ pub(crate) struct BulkOsvPackage {
 }
 
 // ---------------------------------------------------------------------------
+// What one ecosystem's walk produced, and what it left out
+// ---------------------------------------------------------------------------
+
+/// One ecosystem's bulk walk: the advisories it collected, plus what it
+/// never got a reading of.
+///
+/// The second field is the reason this is a struct and not the
+/// `Vec<AdvisoryEntry>` it replaced. That shape had no room for "it
+/// worked, and it left members out", so a walk that dropped a member was
+/// indistinguishable from one that read the archive whole — and the feed
+/// checkpoint advanced over the gap. An advanced checkpoint is not
+/// re-readable: [`bulk_record_to_advisory_entry`] filters on
+/// `modified > since`, so a member missed once is missed on this path
+/// permanently.
+#[derive(Debug)]
+pub(crate) struct EcosystemPull {
+    /// Advisories the walk did collect. Real advisories whether or not
+    /// the walk was complete, so they are enqueued either way; only the
+    /// checkpoint is withheld.
+    pub entries: Vec<AdvisoryEntry>,
+    /// Members the walk could not read, by reason.
+    pub skipped: SkippedMembers,
+}
+
+/// Members of one bulk archive the walk did not turn into an advisory,
+/// split by reason.
+///
+/// Per reason rather than one boolean because the operational answer
+/// differs: `entry_cap_tripped` says the ecosystem outgrew
+/// [`MAX_ENTRIES_TRUSTED_BULK`](hort_formats::archive_bounds::MAX_ENTRIES_TRUSTED_BULK)
+/// and the cap is what to raise, while the three counts say the archive
+/// carried members whose bytes this process could not read — an upstream
+/// or decoding question, with no cap to raise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SkippedMembers {
+    /// `.json` members whose body did not read as UTF-8 text. Also where
+    /// a member that exceeded the per-entry `BoundedReader` output cap
+    /// lands — the read errors either way, and both mean the advisory
+    /// was never seen.
+    pub unreadable_bodies: usize,
+    /// `.json` members whose body is not deserialisable as an OSV
+    /// record.
+    pub unparseable_records: usize,
+    /// Members skipped because the archive carries no name for them that
+    /// this process can decode (`ZipScanStats::undecodable_names`).
+    /// Never offered to the visitor at all.
+    pub undecodable_names: usize,
+    /// The walk stopped at `BoundsConfig::max_entries` with members
+    /// still unvisited. A flag rather than a count: the walk never
+    /// reached the rest, so how many there were is not knowable here.
+    pub entry_cap_tripped: bool,
+}
+
+impl SkippedMembers {
+    /// `true` when the walk left at least one member out, so the pull is
+    /// not a complete reading of this ecosystem's archive and the feed
+    /// checkpoint must not move past the window it covers.
+    ///
+    /// Deliberately **not** a hit on [`bulk_record_to_advisory_entry`]
+    /// returning `None`. That is the `modified > since` window filter
+    /// plus the ecosystem filter, and it rejects the overwhelming
+    /// majority of records in every healthy run — a full-ecosystem
+    /// archive is re-read every tick and almost nothing in it is new.
+    /// Counting those would make every pull incomplete, hold the
+    /// checkpoint back forever, and stop the watch path entirely: a
+    /// worse failure than the one this type exists to report.
+    pub fn is_incomplete(&self) -> bool {
+        self.entry_cap_tripped
+            || self.unreadable_bodies > 0
+            || self.unparseable_records > 0
+            || self.undecodable_names > 0
+    }
+}
+
+/// Offer one zip member to the bulk parse: read it, deserialise it,
+/// convert it, and record on `skipped` anything that stopped short of an
+/// advisory.
+///
+/// Extracted from [`pull_one_ecosystem`]'s visitor closure so the
+/// skip accounting is reachable from a test with a tighter
+/// [`BoundsConfig`] than the trusted-bulk one production uses — the
+/// alternative is a test that re-types the classification it means to
+/// check, which passes while production says something else.
+fn visit_bulk_member(
+    name: &str,
+    reader: &mut dyn std::io::Read,
+    expected_eco: &Ecosystem,
+    since: DateTime<Utc>,
+    out: &mut Vec<AdvisoryEntry>,
+    skipped: &mut SkippedMembers,
+) {
+    if !name.ends_with(".json") {
+        // Not a member the walk was looking for. The archive ships a
+        // README alongside the records; it is not a missing advisory.
+        return;
+    }
+    let mut buf = String::new();
+    if reader.read_to_string(&mut buf).is_err() {
+        skipped.unreadable_bodies += 1;
+        return;
+    }
+    let Ok(parsed) = serde_json::from_str::<BulkOsvVuln>(&buf) else {
+        // A record the feed published and this process could not read.
+        // The cron rescan sweep is not a net for it: that sweep re-scans
+        // artifacts on their own interval, it does not replay the watch
+        // window this record fell out of, and the checkpoint is what
+        // decides whether that window is read again.
+        skipped.unparseable_records += 1;
+        return;
+    };
+    if let Some(entry) = bulk_record_to_advisory_entry(parsed, expected_eco, since) {
+        out.push(entry);
+    }
+    // A `None` from the conversion is the window + ecosystem filter and
+    // is counted nowhere — see `SkippedMembers::is_incomplete`.
+}
+
+/// Lower one finished zip walk onto `skipped`, or onto a
+/// [`BulkFetchError`] for the archive-level failures that end the
+/// ecosystem.
+///
+/// Extracted alongside [`visit_bulk_member`] and for the same reason:
+/// the `Bounds` arm is the one a test can reach cheaply (a tight
+/// `max_entries` produces the same `BoundsError::EntryCapExceeded` the
+/// real cap does), and it should reach the production classifier rather
+/// than a copy of it.
+fn classify_zip_walk(
+    result: Result<hort_formats::archive_bounds::ZipScanStats, ZipIterError>,
+    osv_label: &str,
+    skipped: &mut SkippedMembers,
+) -> Result<(), BulkFetchError> {
+    match result {
+        Ok(stats) => {
+            // The walk cannot name the feed it is reading, so the count
+            // of members whose names did not decode travels out in the
+            // `Ok` value for this caller to attribute. Such a member was
+            // never offered to the visitor, so its advisory is simply
+            // absent from the collection.
+            skipped.undecodable_names = stats.undecodable_names;
+            Ok(())
+        }
+        Err(ZipIterError::Bounds(_)) => {
+            // Bounds-tripped on a trusted bulk feed is not a parse
+            // failure: the archive is well-formed and the members
+            // already visited are kept. It is incompleteness — the
+            // members past the cap were never read. The trip discards
+            // the walk's stats, which costs nothing, because the trip
+            // alone already makes the pull incomplete.
+            skipped.entry_cap_tripped = true;
+            Ok(())
+        }
+        Err(e) => Err(BulkFetchError {
+            kind: BulkFetchErrorKind::ParseError,
+            message: format!("osv bulk: zip parse ({osv_label}): {e}"),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-ecosystem fetch + parse
 // ---------------------------------------------------------------------------
 
 /// Fetch one ecosystem's bulk archive, stream-decode it, return the
-/// `modified > since` subset as `AdvisoryEntry`s.
+/// `modified > since` subset as `AdvisoryEntry`s **together with what
+/// the walk left out** — see [`EcosystemPull`].
 ///
 /// `osv_eco_label` is the literal segment from the URL (e.g. `"npm"`,
 /// `"PyPI"`, `"crates.io"`). The corresponding [`Ecosystem`] enum
@@ -130,7 +295,7 @@ pub(crate) async fn pull_one_ecosystem(
     osv_eco_label: &str,
     eco_enum: Ecosystem,
     since: DateTime<Utc>,
-) -> Result<Vec<AdvisoryEntry>, BulkFetchError> {
+) -> Result<EcosystemPull, BulkFetchError> {
     let url = format!(
         "{}/{}/all.zip",
         bulk_url.trim_end_matches('/'),
@@ -214,84 +379,46 @@ pub(crate) async fn pull_one_ecosystem(
     // while still enforcing decompression-bomb limits.
     //
     // If the generous trusted-bulk cap IS exceeded (`Err(ZipIterError::Bounds(...))`),
-    // we warn and keep the advisories already collected — this is an operational
-    // signal to raise `MAX_ENTRIES_TRUSTED_BULK`, NOT a parse failure.
+    // the advisories already collected are kept and the pull is reported
+    // incomplete — this is an operational signal to raise
+    // `MAX_ENTRIES_TRUSTED_BULK`, NOT a parse failure.
     // Every other `ZipIterError` variant (corrupt zip, unreadable entry) is a
-    // genuine `ParseError`. This distinction is enforced at this call site by
-    // matching the typed `ZipIterError::Bounds` arm explicitly.
+    // genuine `ParseError`. Both distinctions live in [`classify_zip_walk`].
     let eco_enum_for_blocking = eco_enum.clone();
     let osv_label = osv_eco_label.to_string();
-    let entries =
-        tokio::task::spawn_blocking(move || -> Result<Vec<AdvisoryEntry>, BulkFetchError> {
-            let file = tmp.reopen().map_err(|e| BulkFetchError {
-                kind: BulkFetchErrorKind::ParseError,
-                message: format!("osv bulk: reopen tempfile: {e}"),
-            })?;
-            let mut out: Vec<AdvisoryEntry> = Vec::new();
-            // Use for_trusted_bulk_feed(), NOT default_for_metadata_extraction().
-            let result = iter_zip_entries(
-                file,
-                BoundsConfig::for_trusted_bulk_feed(),
-                |name, reader| {
-                    if !name.ends_with(".json") {
-                        return;
-                    }
-                    let mut buf = String::new();
-                    if reader.read_to_string(&mut buf).is_err() {
-                        // Skip non-UTF-8 / unreadable / bounds-exceeded entries.
-                        return;
-                    }
-                    let Ok(parsed) = serde_json::from_str::<BulkOsvVuln>(&buf) else {
-                        // Skip malformed entries; cron rescan is the safety net.
-                        return;
-                    };
-                    if let Some(entry) =
-                        bulk_record_to_advisory_entry(parsed, &eco_enum_for_blocking, since)
-                    {
-                        out.push(entry);
-                    }
-                },
-            );
-            match result {
-                // The skipped-name count is not picked up here: the bulk
-                // feed is a whole-ecosystem archive whose members are
-                // selected by a `.json` suffix rather than by one exact
-                // name, so a skipped member is one advisory the next cron
-                // rescan picks up, not a verdict about one artifact.
-                Ok(_) => {}
-                // Bounds-tripped on a trusted bulk feed is a warning,
-                // not a ParseError. The entries already visited are kept; the
-                // cap only fires if the ecosystem has grown beyond
-                // MAX_ENTRIES_TRUSTED_BULK (~1e5) — an operational signal to
-                // raise the cap. Contrast: any other ZipIterError (corrupt zip
-                // format, unreadable entry index) is a genuine parse failure
-                // and surfaces as ParseError below.
-                Err(ZipIterError::Bounds(ref b)) => {
-                    tracing::warn!(
-                        feed = "osv",
-                        ecosystem = %osv_label,
-                        ingested = out.len(),
-                        "osv bulk: trusted bulk feed tripped entry cap ({b}) — \
-                         advisories beyond the cap were not ingested; \
-                         consider raising MAX_ENTRIES_TRUSTED_BULK"
-                    );
-                }
-                Err(e) => {
-                    return Err(BulkFetchError {
-                        kind: BulkFetchErrorKind::ParseError,
-                        message: format!("osv bulk: zip parse ({osv_label}): {e}"),
-                    });
-                }
-            }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| BulkFetchError {
+    tokio::task::spawn_blocking(move || -> Result<EcosystemPull, BulkFetchError> {
+        let file = tmp.reopen().map_err(|e| BulkFetchError {
             kind: BulkFetchErrorKind::ParseError,
-            message: format!("osv bulk: parse join: {e}"),
-        })??;
-
-    Ok(entries)
+            message: format!("osv bulk: reopen tempfile: {e}"),
+        })?;
+        let mut out: Vec<AdvisoryEntry> = Vec::new();
+        let mut skipped = SkippedMembers::default();
+        // Use for_trusted_bulk_feed(), NOT default_for_metadata_extraction().
+        let result = iter_zip_entries(
+            file,
+            BoundsConfig::for_trusted_bulk_feed(),
+            |name, reader| {
+                visit_bulk_member(
+                    name,
+                    reader,
+                    &eco_enum_for_blocking,
+                    since,
+                    &mut out,
+                    &mut skipped,
+                );
+            },
+        );
+        classify_zip_walk(result, &osv_label, &mut skipped)?;
+        Ok(EcosystemPull {
+            entries: out,
+            skipped,
+        })
+    })
+    .await
+    .map_err(|e| BulkFetchError {
+        kind: BulkFetchErrorKind::ParseError,
+        message: format!("osv bulk: parse join: {e}"),
+    })?
 }
 
 /// Convert one `BulkOsvVuln` into an [`AdvisoryEntry`] if and only if
@@ -588,7 +715,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let entries = pull_one_ecosystem(
+        let pull = pull_one_ecosystem(
             &http_client(),
             &server.uri(),
             "npm",
@@ -598,11 +725,21 @@ mod tests {
         .await
         .expect("happy path returns Ok");
         assert_eq!(
-            entries.len(),
+            pull.entries.len(),
             1,
             "only the after-record survives the filter"
         );
-        assert_eq!(entries[0].id, "GHSA-after");
+        assert_eq!(pull.entries[0].id, "GHSA-after");
+        assert_eq!(
+            pull.skipped,
+            SkippedMembers::default(),
+            "the window-filtered record and the non-`.json` member are not \
+             members the walk failed to read"
+        );
+        assert!(
+            !pull.skipped.is_incomplete(),
+            "a complete reading lets the caller advance the checkpoint"
+        );
     }
 
     #[tokio::test]
@@ -627,7 +764,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let entries = pull_one_ecosystem(
+        let pull = pull_one_ecosystem(
             &http_client(),
             &server.uri(),
             "npm",
@@ -636,8 +773,19 @@ mod tests {
         )
         .await
         .expect("malformed entry must not abort the ecosystem");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, "GHSA-good");
+        assert_eq!(pull.entries.len(), 1);
+        assert_eq!(pull.entries[0].id, "GHSA-good");
+        // Skipping the member keeps the other advisories, but it is not a
+        // full reading of the archive, and the caller needs that in order
+        // to withhold the feed checkpoint.
+        assert_eq!(pull.skipped.unparseable_records, 1);
+        assert_eq!(
+            pull.skipped.unreadable_bodies, 0,
+            "a body that read fine and then failed to deserialise is the \
+             unparseable reason, not the unreadable one"
+        );
+        assert!(!pull.skipped.entry_cap_tripped);
+        assert!(pull.skipped.is_incomplete());
     }
 
     #[tokio::test]
@@ -737,12 +885,18 @@ mod tests {
             result.is_ok(),
             "large ecosystem zip must not abort as ParseError: {result:?}"
         );
-        let advisories = result.unwrap();
+        let pull = result.unwrap();
         assert_eq!(
-            advisories.len(),
+            pull.entries.len(),
             n,
             "all {n} advisories must be ingested, got {}",
-            advisories.len()
+            pull.entries.len()
+        );
+        assert!(
+            !pull.skipped.is_incomplete(),
+            "1030 entries is well under MAX_ENTRIES_TRUSTED_BULK, so the walk \
+             read the archive whole: {:?}",
+            pull.skipped
         );
     }
 
@@ -865,13 +1019,21 @@ mod tests {
     // Call-site tolerance — bounds trip on trusted path must NOT be ParseError
     // -----------------------------------------------------------------------
     //
-    // The match logic inside the blocking closure of `pull_one_ecosystem`
-    // distinguishes `Err(ZipIterError::Bounds(_))`
-    // (warn + keep collected advisories) from all other `ZipIterError` variants
-    // (→ ParseError). This test exercises that arm directly using a deliberately
-    // tiny `BoundsConfig` to force `Err(ZipIterError::Bounds(...))`, verifying
-    // that the call-site match keeps already-collected advisories instead of
-    // aborting with ParseError.
+    // `classify_zip_walk` distinguishes `Err(ZipIterError::Bounds(_))`
+    // (keep the collected advisories, report the pull incomplete) from all
+    // other `ZipIterError` variants (→ ParseError). This test drives the
+    // production classifier and the production visitor, with a
+    // deliberately tiny `BoundsConfig` as the only substitution: a
+    // `max_entries` of 2 produces exactly the `BoundsError::EntryCapExceeded`
+    // that exceeding MAX_ENTRIES_TRUSTED_BULK produces, at a size a unit
+    // test can build (a real 100 001-entry archive costs seconds to
+    // compress).
+    //
+    // The name still holds — a cap trip is not a ParseError — and the
+    // assertions now also pin the incompleteness the pre-change call site
+    // had no way to report: the members past the cap were never read, so
+    // the window was not read, so the feed checkpoint must not advance
+    // over it.
     #[test]
     fn call_site_bounds_trip_keeps_collected_advisories_and_does_not_parse_error() {
         // Build a 3-entry zip where every entry has a valid advisory JSON.
@@ -900,9 +1062,6 @@ mod tests {
             ("GHSA-c.json", entry_c.as_str()),
         ]);
 
-        // Tight config: only 2 entries allowed — forces Err(ZipIterError::Bounds(...))
-        // when the 3rd entry is reached. This mirrors the scenario where
-        // MAX_ENTRIES_TRUSTED_BULK is exceeded (but at a tiny scale for test speed).
         let tight_cfg = BoundsConfig {
             max_entries: 2,
             ..BoundsConfig::for_trusted_bulk_feed()
@@ -911,25 +1070,13 @@ mod tests {
         let eco = Ecosystem::Npm;
         let since = ts(0);
         let mut out: Vec<AdvisoryEntry> = Vec::new();
+        let mut skipped = SkippedMembers::default();
 
-        // Replicate the pull_one_ecosystem match logic at the call site.
         let result = iter_zip_entries(
             std::io::Cursor::new(zip_bytes),
             tight_cfg,
             |name, reader| {
-                if !name.ends_with(".json") {
-                    return;
-                }
-                let mut buf = String::new();
-                if reader.read_to_string(&mut buf).is_err() {
-                    return;
-                }
-                let Ok(parsed) = serde_json::from_str::<BulkOsvVuln>(&buf) else {
-                    return;
-                };
-                if let Some(entry) = bulk_record_to_advisory_entry(parsed, &eco, since) {
-                    out.push(entry);
-                }
+                visit_bulk_member(name, reader, &eco, since, &mut out, &mut skipped);
             },
         );
 
@@ -939,17 +1086,10 @@ mod tests {
             "bounds trip on trusted path must be Err(Bounds(_)), got {result:?}"
         );
 
-        // The call-site match (mirroring pull_one_ecosystem's blocking closure):
-        // Bounds error → warn + keep collected advisories (do NOT return ParseError).
-        match result {
-            Ok(_) => {}
-            Err(ZipIterError::Bounds(_)) => {
-                // This is the tolerated arm — keep `out` as-is, do NOT abort.
-                // In production this emits tracing::warn!; here we just verify
-                // we reach this arm and not a ParseError return.
-            }
-            Err(e) => panic!("non-Bounds ZipIterError must be ParseError, got {e}"),
-        }
+        // The production classifier: a Bounds trip is tolerated (no
+        // ParseError) but recorded as incompleteness.
+        classify_zip_walk(result, "npm", &mut skipped)
+            .expect("a bounds trip on a trusted bulk feed is not a ParseError");
 
         // Advisories already visited before the cap tripped must be present.
         // With max_entries=2, entries a and b are visited; c is beyond the cap.
@@ -964,6 +1104,156 @@ mod tests {
         assert!(
             !ids.contains(&"GHSA-c"),
             "GHSA-c was beyond the cap and must not be collected"
+        );
+
+        // The cap is named apart from every other reason: the operational
+        // answer to this one is "raise MAX_ENTRIES_TRUSTED_BULK", which no
+        // other reason has.
+        assert!(
+            skipped.entry_cap_tripped,
+            "the cap trip is recorded as such"
+        );
+        assert_eq!(skipped.unreadable_bodies, 0, "every visited body read");
+        assert_eq!(skipped.unparseable_records, 0, "every visited body parsed");
+        assert_eq!(skipped.undecodable_names, 0, "every name decoded");
+        assert!(
+            skipped.is_incomplete(),
+            "members past the cap were never read, so the checkpoint must not \
+             advance over this window"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The other two skip reasons, each named apart from the cap
+    // -----------------------------------------------------------------------
+
+    /// A member whose body cannot be read in full — here because it
+    /// exceeds the per-entry output cap, the same arm a non-UTF-8 body
+    /// lands on — is a member whose advisory was never seen. The pull is
+    /// incomplete, and the reason is distinct from both a parse failure
+    /// and a cap trip.
+    #[test]
+    fn a_body_that_cannot_be_read_is_its_own_skip_reason() {
+        let versions: Vec<String> = (0..2_000)
+            .map(|i| format!("{}.{}.{}", i / 100, (i / 10) % 10, i % 10))
+            .collect();
+        let big = serde_json::json!({
+            "id": "GHSA-big",
+            "modified": "1970-01-01T00:16:40Z",
+            "affected": [{
+                "package": { "ecosystem": "npm", "name": "big-pkg" },
+                "versions": versions
+            }]
+        })
+        .to_string();
+        let small = serde_json::json!({
+            "id": "GHSA-small",
+            "modified": "1970-01-01T00:16:40Z",
+            "affected": [{"package": {"ecosystem": "npm", "name": "sm"}, "versions": ["1.0"]}]
+        })
+        .to_string();
+        let zip_bytes = build_zip_with(&[
+            ("GHSA-big.json", big.as_str()),
+            ("GHSA-small.json", small.as_str()),
+        ]);
+
+        // 16 KiB ceiling — the big advisory is ~20 KiB uncompressed, the
+        // small one is a few hundred bytes, so exactly one member fails to
+        // read.
+        let tight_cfg = BoundsConfig {
+            max_output_bytes: 16 * 1024,
+            ..BoundsConfig::for_trusted_bulk_feed()
+        };
+
+        let eco = Ecosystem::Npm;
+        let since = ts(0);
+        let mut out: Vec<AdvisoryEntry> = Vec::new();
+        let mut skipped = SkippedMembers::default();
+        let result = iter_zip_entries(
+            std::io::Cursor::new(zip_bytes),
+            tight_cfg,
+            |name, reader| {
+                visit_bulk_member(name, reader, &eco, since, &mut out, &mut skipped);
+            },
+        );
+        classify_zip_walk(result, "npm", &mut skipped).expect("the archive itself parsed");
+
+        assert_eq!(out.len(), 1, "the readable advisory is kept");
+        assert_eq!(out[0].id, "GHSA-small");
+        assert_eq!(skipped.unreadable_bodies, 1);
+        assert_eq!(skipped.unparseable_records, 0);
+        assert!(!skipped.entry_cap_tripped);
+        assert!(skipped.is_incomplete());
+    }
+
+    /// A member the walk never offered to the visitor because the archive
+    /// carries no decodable name for it is reported out of the walk in
+    /// `ZipScanStats`. The pre-change call site discarded that count on
+    /// the grounds that a skipped member is "one advisory the next cron
+    /// rescan picks up, not a verdict about one artifact" — true of an
+    /// artifact's verdict, and silent about the checkpoint, which is the
+    /// decision it actually reached. It is carried onto the pull now.
+    #[test]
+    fn an_undecodable_member_name_makes_the_pull_incomplete() {
+        let mut skipped = SkippedMembers::default();
+        let stats = hort_formats::archive_bounds::ZipScanStats {
+            undecodable_names: 2,
+        };
+        classify_zip_walk(Ok(stats), "npm", &mut skipped)
+            .expect("a completed walk is not a fetch or parse failure");
+        assert_eq!(skipped.undecodable_names, 2);
+        assert!(skipped.is_incomplete());
+    }
+
+    /// A completed walk that skipped nothing is complete — the shape the
+    /// checkpoint advance rests on, asserted directly so the predicate
+    /// cannot drift to "always incomplete".
+    #[test]
+    fn a_walk_that_skipped_nothing_is_complete() {
+        let mut skipped = SkippedMembers::default();
+        classify_zip_walk(
+            Ok(hort_formats::archive_bounds::ZipScanStats::default()),
+            "npm",
+            &mut skipped,
+        )
+        .expect("completed walk");
+        assert_eq!(skipped, SkippedMembers::default());
+        assert!(!skipped.is_incomplete());
+    }
+
+    /// Every `ZipIterError` that is not a bounds trip is a genuine
+    /// archive-level parse failure and ends the ecosystem.
+    #[test]
+    fn a_non_bounds_zip_error_is_a_parse_error() {
+        // Obtain a real non-`Bounds` `ZipIterError` by failing to open a
+        // non-archive. The variant's payload is a `zip` crate type this
+        // crate cannot name — `deny.toml` limits the `zip` dependency to
+        // `hort-formats` and the trivy extractor — so the error is taken
+        // from the function that produces it rather than constructed.
+        let open_err = iter_zip_entries(
+            std::io::Cursor::new(b"not-a-zip".to_vec()),
+            BoundsConfig::for_trusted_bulk_feed(),
+            |_n, _r| {},
+        )
+        .expect_err("not-a-zip does not open as an archive");
+        assert!(
+            !matches!(open_err, ZipIterError::Bounds(_)),
+            "the fixture must not be the tolerated arm"
+        );
+
+        let mut skipped = SkippedMembers::default();
+        let err = classify_zip_walk(Err(open_err), "npm", &mut skipped)
+            .expect_err("a corrupt archive is a ParseError");
+        assert_eq!(err.kind, BulkFetchErrorKind::ParseError);
+        assert!(
+            err.message.contains("npm"),
+            "the message names the ecosystem: {}",
+            err.message
+        );
+        assert!(
+            !skipped.is_incomplete(),
+            "an ecosystem that failed outright reports through the error, not \
+             through the skip counts"
         );
     }
 

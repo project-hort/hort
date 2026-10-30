@@ -3093,7 +3093,7 @@ pub fn observe_scan_duration(scanner: &str, duration: std::time::Duration) {
 }
 
 /// Outcome label of `hort_advisory_query_total`.
-/// Closed taxonomy of 6 — every distinct cache-or-upstream outcome
+/// Closed taxonomy of 7 — every distinct cache-or-upstream outcome
 /// the OSV adapter produces maps to exactly one variant.
 ///
 /// String values are normative — they appear verbatim in
@@ -3122,6 +3122,15 @@ pub enum AdvisoryQueryResult {
     /// The per-request deadline elapsed before the batch responded.
     /// One tick per timed-out batch.
     Timeout,
+    /// OSV `/v1/querybatch` answered 2xx with a well-formed body whose
+    /// `results` count disagrees with the number of queries sent. One
+    /// tick per such batch. `results[i]` corresponds to `queries[i]`,
+    /// so a count mismatch leaves no component attributable and the
+    /// whole batch is failed rather than read slot-by-slot — it is a
+    /// failed query that happens to carry a 200, which is why it is a
+    /// result label of its own rather than folded into `upstream_4xx` /
+    /// `upstream_5xx`.
+    LengthMismatch,
 }
 
 impl AdvisoryQueryResult {
@@ -3135,6 +3144,7 @@ impl AdvisoryQueryResult {
             Self::Upstream5xx => "upstream_5xx",
             Self::NetworkError => "network_error",
             Self::Timeout => "timeout",
+            Self::LengthMismatch => "length_mismatch",
         }
     }
 }
@@ -3803,7 +3813,7 @@ pub fn emit_release(reason: &'static str) {
 
 /// Per-ecosystem outcome label of `hort_advisory_diff_processed_total`.
 /// One emission per ecosystem per advisory-watch tick
-/// from inside the OSV adapter's bulk loop. Closed taxonomy of 4.
+/// from inside the OSV adapter's bulk loop. Closed taxonomy of 5.
 ///
 /// String values are normative — they appear verbatim in
 /// `docs/metrics-catalog.md`.
@@ -3825,6 +3835,17 @@ pub enum AdvisoryDiffResult {
     /// responded. Surfaced separately from `fetch_error` so operators
     /// can split slow-upstream from upstream-broken on dashboards.
     Timeout,
+    /// Per-ecosystem fetch + parse completed, but the archive walk left
+    /// at least one member unread — an unreadable or unparseable
+    /// record, a member whose name did not decode, or an entry-count cap
+    /// trip that stopped the walk early. The advisories collected are
+    /// appended to the diff result and still enqueue their rescans, but
+    /// the handler's checkpoint is NOT advanced: the window was not read
+    /// in full, and an advanced checkpoint makes every record in it fail
+    /// the `modified > since` filter of every later pull. Distinct from
+    /// `ok` because the pull is not a full success, and from
+    /// `parse_error` because the archive itself parsed.
+    Incomplete,
 }
 
 impl AdvisoryDiffResult {
@@ -3836,6 +3857,7 @@ impl AdvisoryDiffResult {
             Self::FetchError => "fetch_error",
             Self::ParseError => "parse_error",
             Self::Timeout => "timeout",
+            Self::Incomplete => "incomplete",
         }
     }
 }
@@ -3847,7 +3869,7 @@ impl AdvisoryDiffResult {
 /// `"crates.io"`, `"Maven"`, `"Go"`, `"RubyGems"`, `"NuGet"`,
 /// `"Packagist"`, `"Hex"`, `"Pub"`, `"Conda"`) — passing a free-form
 /// name would inflate the cardinality ceiling beyond the documented
-/// `≤ 8 × 4 = 32` series.
+/// `≤ 8 × 5 = 40` series.
 pub fn emit_advisory_diff(ecosystem: &str, result: AdvisoryDiffResult) {
     metrics::counter!(
         "hort_advisory_diff_processed_total",
@@ -6863,6 +6885,10 @@ mod tests {
             "network_error"
         );
         assert_eq!(super::AdvisoryQueryResult::Timeout.as_str(), "timeout");
+        assert_eq!(
+            super::AdvisoryQueryResult::LengthMismatch.as_str(),
+            "length_mismatch"
+        );
     }
 
     #[test]
@@ -6874,6 +6900,7 @@ mod tests {
             super::AdvisoryQueryResult::Upstream5xx,
             super::AdvisoryQueryResult::NetworkError,
             super::AdvisoryQueryResult::Timeout,
+            super::AdvisoryQueryResult::LengthMismatch,
         ];
         let set: HashSet<&'static str> = variants
             .iter()
@@ -7570,6 +7597,7 @@ mod tests {
             "parse_error"
         );
         assert_eq!(super::AdvisoryDiffResult::Timeout.as_str(), "timeout");
+        assert_eq!(super::AdvisoryDiffResult::Incomplete.as_str(), "incomplete");
     }
 
     #[test]
@@ -7579,6 +7607,7 @@ mod tests {
             super::AdvisoryDiffResult::FetchError,
             super::AdvisoryDiffResult::ParseError,
             super::AdvisoryDiffResult::Timeout,
+            super::AdvisoryDiffResult::Incomplete,
         ];
         let set: HashSet<&'static str> = variants.iter().map(|v| v.as_str()).collect();
         assert_eq!(set.len(), variants.len());

@@ -377,25 +377,34 @@ async fn query_skips_unknown_ecosystem_components() {
 async fn query_chunks_oversized_input_into_multiple_batches() {
     let server = MockServer::start().await;
 
-    // Each batch returns a stable shape — one empty result per query
-    // so the parsing layer does not produce findings (the test only
-    // cares about the request count).
-    let large_empty =
-        json!({ "results": (0..4).map(|_| json!({"vulns": []})).collect::<Vec<_>>() });
-    let small_empty =
-        json!({ "results": (0..2).map(|_| json!({"vulns": []})).collect::<Vec<_>>() });
+    // Each batch returns one empty result per query, so the parsing
+    // layer produces no findings (the test only cares about the request
+    // count) — and, crucially, each response is the length of the chunk
+    // it answers: a response whose `results` count disagrees with the
+    // query count is rejected outright, so a fixture that returned a
+    // fixed length would be exercising that rejection instead of the
+    // chunking.
+    //
+    // 10 components at `batch_size = 4` chunk as 4 + 4 + 2.
+    // wiremock's first matching mock wins and `up_to_n_times` retires a
+    // mock once it has served its share, so the two four-result
+    // responses go out first and the two-result response serves the
+    // final short chunk. The three `expect`s together are the
+    // load-bearing assertion on the request count.
+    let four_empty = json!({ "results": (0..4).map(|_| json!({"vulns": []})).collect::<Vec<_>>() });
+    let two_empty = json!({ "results": (0..2).map(|_| json!({"vulns": []})).collect::<Vec<_>>() });
 
-    // The mock returns the same "all-empty" shape for every request;
-    // `expect(3)` is the load-bearing assertion. wiremock's first
-    // matching mock wins, so any single mock can serve all three —
-    // but the response must accommodate any batch size. We use the
-    // larger payload (4 entries) and rely on the parser tolerating
-    // shorter batches via `results.get(i).cloned().unwrap_or_default()`.
-    let _ = small_empty;
     Mock::given(method("POST"))
         .and(path("/v1/querybatch"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(large_empty))
-        .expect(3)
+        .respond_with(ResponseTemplate::new(200).set_body_json(four_empty))
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(two_empty))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -1453,4 +1462,176 @@ async fn unrelated_advisories_on_one_component_are_not_collapsed() {
     let findings = adapter.query(&comps).await.expect("query succeeds");
     assert_eq!(findings.len(), 2);
     server.verify().await;
+}
+
+// ---------------------------------------------------------------------------
+// Batch response length — index correspondence is the whole attribution
+// ---------------------------------------------------------------------------
+
+/// Collapse a snapshot into `result → hort_advisory_query_total` counts.
+/// [`find_advisory_query_count`] answers one label and consumes the
+/// snapshot; these tests assert on several labels from the same run.
+fn advisory_query_counts(snap: Snapshot) -> std::collections::HashMap<String, u64> {
+    let mut out = std::collections::HashMap::new();
+    for (key, _, _, value) in snap.into_vec() {
+        if key.key().name() != "hort_advisory_query_total" {
+            continue;
+        }
+        let Some(result) = key
+            .key()
+            .labels()
+            .find(|l| l.key() == "result")
+            .map(|l| l.value().to_string())
+        else {
+            continue;
+        };
+        if let DebugValue::Counter(v) = value {
+            out.insert(result, v);
+        }
+    }
+    out
+}
+
+/// A `/v1/querybatch` response carrying fewer results than the request
+/// carried queries is a failed query, not "no advisories". `results[i]`
+/// corresponds to `queries[i]` and that correspondence is the only thing
+/// that attributes an advisory to a component, so a response that breaks
+/// it says nothing about any component in the chunk — and nothing from it
+/// may be cached, because a cached empty is an answer later runs never
+/// re-ask.
+#[test]
+fn short_batch_response_fails_the_query_and_caches_nothing() {
+    let snap = capture_metrics_around(|rt| {
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            // Two queries, one result. `expect(2)` is load-bearing: the
+            // second `query` call must reach upstream again, which it can
+            // only do if the first left no cache entry behind.
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(querybatch_body(&[&[]])))
+                .expect(2)
+                .mount(&server)
+                .await;
+
+            let cache = Arc::new(InMemoryEphemeralStore::new());
+            let adapter = build_adapter_with_url(server.uri(), cache, None).await;
+            let comps = vec![
+                make_component("left", "1.0.0", Ecosystem::Npm),
+                make_component("right", "2.0.0", Ecosystem::Npm),
+            ];
+
+            let err = adapter
+                .query(&comps)
+                .await
+                .expect_err("a short response must fail the query");
+            match err {
+                DomainError::Validation(msg) => {
+                    assert!(
+                        msg.contains('1') && msg.contains('2'),
+                        "the error names how many results came back for how many \
+                         queries: {msg}"
+                    );
+                }
+                other => panic!("expected Validation error, got {other:?}"),
+            }
+
+            adapter
+                .query(&comps)
+                .await
+                .expect_err("second call fails the same way");
+
+            server.verify().await;
+        });
+    });
+
+    let counts = advisory_query_counts(snap);
+    assert_eq!(
+        counts.get("length_mismatch"),
+        Some(&2),
+        "the mismatch is its own result label, as loud as a failed request: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("cache_hit"),
+        None,
+        "nothing was cached, so the second call cannot have hit the cache: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("cache_miss"),
+        Some(&4),
+        "both components missed the cache on both calls: {counts:?}"
+    );
+}
+
+/// Counter-test: "we asked OSV, it has nothing for this component" is a
+/// real answer and must keep being cached. The fix rejects a response
+/// whose *length* disagrees with the request — not an empty slot inside a
+/// correctly-sized response.
+#[test]
+fn full_length_response_with_an_empty_slot_still_caches_we_asked_none() {
+    let snap = capture_metrics_around(|rt| {
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            // Two queries, two results — the second legitimately empty.
+            // `expect(1)` is the assertion: the second `query` call must
+            // be served entirely from the cache, which requires the empty
+            // slot to have been cached alongside the non-empty one.
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(querybatch_body(&[&[("OSV-2024-777", MODIFIED)], &[]])),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            mount_vuln_record(
+                &server,
+                "OSV-2024-777",
+                json!({
+                    "id": "OSV-2024-777",
+                    "modified": MODIFIED,
+                    "database_specific": { "severity": "MEDIUM" }
+                }),
+                1,
+            )
+            .await;
+
+            let cache = Arc::new(InMemoryEphemeralStore::new());
+            let adapter = build_adapter_with_url(server.uri(), cache, None).await;
+            let comps = vec![
+                make_component("vulnerable", "1.0.0", Ecosystem::Npm),
+                make_component("clean", "2.0.0", Ecosystem::Npm),
+            ];
+
+            let first = adapter
+                .query(&comps)
+                .await
+                .expect("full-length response is Ok");
+            assert_eq!(first.len(), 1, "one finding, for the first component");
+            assert_eq!(first[0].vulnerability_id, "OSV-2024-777");
+
+            let second = adapter.query(&comps).await.expect("second call Ok");
+            assert_eq!(
+                second, first,
+                "the second call returns the same answer from the cache"
+            );
+
+            server.verify().await;
+        });
+    });
+
+    let counts = advisory_query_counts(snap);
+    assert_eq!(
+        counts.get("length_mismatch"),
+        None,
+        "an empty slot in a correctly-sized response is an answer, not a \
+         mismatch: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("cache_hit"),
+        Some(&2),
+        "both components — including the one with no advisories — answered \
+         from the cache on the second call: {counts:?}"
+    );
 }

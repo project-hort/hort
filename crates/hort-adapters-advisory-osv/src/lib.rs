@@ -268,7 +268,16 @@ impl OsvAdvisoryAdapter {
     // OSV batch HTTP call.
     // -----------------------------------------------------------------------
 
+    /// POST one chunk to `/v1/querybatch` and return its response.
+    ///
+    /// The returned `results` is guaranteed to carry exactly one entry
+    /// per query: `results[i]` corresponds to `queries[i]`, and that
+    /// index correspondence is the only thing that attributes an advisory
+    /// to a component, so a response that breaks it says nothing about
+    /// any component in the chunk. Enforced here rather than at the call
+    /// site so no caller can read a response that never answered it.
     async fn post_batch(&self, queries: Vec<OsvQuery>) -> DomainResult<OsvBatchResponse> {
+        let asked = queries.len();
         let req_body = OsvBatchRequest { queries };
         let resp = match self
             .http
@@ -324,6 +333,27 @@ impl OsvAdvisoryAdapter {
         let parsed: OsvBatchResponse = serde_json::from_str(&body).map_err(|e| {
             DomainError::Validation(format!("osv adapter: malformed batch response: {e}"))
         })?;
+
+        // A result count that disagrees with the query count is a failed
+        // query, not "no advisories for the missing slots". The test is
+        // `!=`, not `<`: a longer response violates the same
+        // correspondence a shorter one does, and neither can be read
+        // component-by-component. `AdvisoryPort::query` has no partial
+        // shape to return — a caller handed findings for some components
+        // and silence for others cannot tell which is which — so the
+        // honest answer at this boundary is an error, and nothing from
+        // this response is cached. A cached empty is worse than a failed
+        // query: the failure is retried on the next scan, the cache entry
+        // is an answer later runs never re-ask.
+        if parsed.results.len() != asked {
+            emit_advisory_query(AdvisoryQueryResult::LengthMismatch);
+            return Err(DomainError::Validation(format!(
+                "osv adapter: batch response carried {} results for {asked} queries; \
+                 results[i]/queries[i] correspondence is the only attribution of an \
+                 advisory to a component, so no part of this response can be read",
+                parsed.results.len()
+            )));
+        }
         Ok(parsed)
     }
 
@@ -679,15 +709,15 @@ impl AdvisoryPort for OsvAdvisoryAdapter {
                     .collect();
 
                 let response = self.post_batch(queries).await?;
-                let results = response.results;
 
-                // OSV's `results[i]` corresponds to `queries[i]`. If
-                // the response is shorter than the batch (the OSV API
-                // docs say it shouldn't be, but we tolerate),
-                // empty-pad missing entries so the index remains
-                // valid.
-                for (i, (comp, _key)) in chunk.iter().enumerate() {
-                    let result_for_comp = results.get(i).cloned().unwrap_or_default();
+                // `results[i]` corresponds to `queries[i]`, and
+                // `post_batch` has already refused a response whose length
+                // disagrees with the chunk's — so this zip is exact and
+                // pairs every component with the slot that answered it.
+                // There is no padding arm: an invented empty result is
+                // evidence no upstream produced, and this path writes its
+                // results to the cache.
+                for ((comp, _key), result_for_comp) in chunk.iter().zip(response.results) {
                     fetched.push((comp.clone(), result_for_comp.vulns));
                 }
             }
@@ -752,19 +782,49 @@ impl AdvisoryPort for OsvAdvisoryAdapter {
                     pull_one_ecosystem(&self.http, &self.bulk_url, label, eco.clone(), since).await;
                 observe_advisory_diff_duration(label, started.elapsed().as_secs_f64());
                 match outcome {
-                    Ok(mut got) => {
-                        emit_advisory_diff(label, AdvisoryDiffMetricResult::Ok);
+                    Ok(pull) => {
+                        // A walk that left a member out did not read the
+                        // window it was asked for, so the feed checkpoint
+                        // must not move past it: the next tick re-reads the
+                        // same window and picks up what was missed. The
+                        // advisories this walk *did* collect are real and
+                        // still enqueue their rescans — withholding the
+                        // checkpoint is the whole of the consequence.
+                        let skipped = pull.skipped;
+                        let complete = !skipped.is_incomplete();
+                        if !complete {
+                            all_ecosystems_ok = false;
+                            emit_advisory_diff(label, AdvisoryDiffMetricResult::Incomplete);
+                            tracing::warn!(
+                                feed = "osv",
+                                ecosystem = %label,
+                                ingested = pull.entries.len(),
+                                unreadable_bodies = skipped.unreadable_bodies,
+                                unparseable_records = skipped.unparseable_records,
+                                undecodable_names = skipped.undecodable_names,
+                                entry_cap_tripped = skipped.entry_cap_tripped,
+                                "advisory diff incomplete; collected advisories kept and \
+                                 checkpoint withheld so the next tick re-reads this window. \
+                                 entry_cap_tripped means the ecosystem outgrew \
+                                 MAX_ENTRIES_TRUSTED_BULK and the cap is what to raise; the \
+                                 counts mean the archive carried members this process could \
+                                 not read",
+                            );
+                        } else {
+                            emit_advisory_diff(label, AdvisoryDiffMetricResult::Ok);
+                        }
                         // Per-ecosystem advisory ingest count vs expected
                         // floor (NIS2 Art. 21(2)(f) efficacy). Uses bounded
                         // `category` label (not raw ecosystem string) to
                         // keep cardinality fixed.
-                        emit_advisory_ingest_count(label, got.len() as u64);
+                        emit_advisory_ingest_count(label, pull.entries.len() as u64);
                         tracing::info!(
                             ecosystem = %label,
-                            new_advisories = got.len(),
+                            new_advisories = pull.entries.len(),
+                            complete,
                             "advisory diff processed"
                         );
-                        entries.append(&mut got);
+                        entries.extend(pull.entries);
                     }
                     Err(e) => {
                         all_ecosystems_ok = false;
@@ -1850,5 +1910,231 @@ mod tests {
         });
         let (_, _, _, v) = pypi_err.expect("PyPI/parse_error must fire");
         assert!(matches!(v, DebugValue::Counter(1)));
+    }
+
+    // -----------------------------------------------------------------------
+    // pull_diff_since — an incomplete reading is not a full success
+    // -----------------------------------------------------------------------
+
+    /// Collapse a snapshot into
+    /// `(ecosystem, result) → hort_advisory_diff_processed_total` counts.
+    /// A pair absent from the map never fired, which is what the
+    /// "and the `ok` series did not fire" assertions below rest on.
+    fn diff_counters(
+        snap: metrics_util::debugging::Snapshot,
+    ) -> std::collections::HashMap<(String, String), u64> {
+        use metrics_util::debugging::DebugValue;
+        use metrics_util::MetricKind;
+        let mut out = std::collections::HashMap::new();
+        for (key, _, _, value) in snap.into_vec() {
+            if key.kind() != MetricKind::Counter
+                || key.key().name() != "hort_advisory_diff_processed_total"
+            {
+                continue;
+            }
+            let eco = key
+                .key()
+                .labels()
+                .find(|l| l.key() == "ecosystem")
+                .map(|l| l.value().to_string());
+            let result = key
+                .key()
+                .labels()
+                .find(|l| l.key() == "result")
+                .map(|l| l.value().to_string());
+            if let (Some(eco), Some(result), DebugValue::Counter(n)) = (eco, result, value) {
+                out.insert((eco, result), n);
+            }
+        }
+        out
+    }
+
+    /// Run `f`'s future on a current-thread runtime under a scoped
+    /// `DebuggingRecorder` and return the snapshot. The adapter emits its
+    /// per-ecosystem counters from inside `pull_diff_since`, so the
+    /// recorder has to be in scope for the whole await.
+    fn capture_diff_metrics<F, Fut>(f: F) -> metrics_util::debugging::Snapshot
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(f());
+        });
+        snapshotter.snapshot()
+    }
+
+    /// Seconds past the epoch as a UTC timestamp — the `since` values in
+    /// this section are epoch-relative so the fixture bodies can carry
+    /// literal RFC-3339 strings either side of them.
+    fn ts(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(secs, 0).expect("in-range timestamp")
+    }
+
+    /// Mount one `/<eco>/all.zip` responding with `zip_bytes`.
+    async fn mount_bulk_archive(server: &wiremock::MockServer, eco: &str, zip_bytes: Vec<u8>) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{eco}/all.zip")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(zip_bytes)
+                    .insert_header("content-type", "application/zip"),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// An OSV bulk record body whose `modified` is `secs` past the epoch.
+    fn bulk_record_json(id: &str, eco: &str, name: &str, modified: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "modified": modified,
+            "affected": [{
+                "package": { "ecosystem": eco, "name": name },
+                "versions": ["1.0.0"]
+            }]
+        })
+        .to_string()
+    }
+
+    async fn adapter_against_bulk(server: &wiremock::MockServer, eco: &str) -> OsvAdvisoryAdapter {
+        use hort_adapters_ephemeral_memory::InMemoryEphemeralStore;
+        use std::sync::Arc;
+        let cache: Arc<dyn EphemeralStore> = Arc::new(InMemoryEphemeralStore::new());
+        let cfg = OsvAdvisoryConfig {
+            bulk_url: server.uri(),
+            ecosystems: vec![eco.to_string()],
+            ..OsvAdvisoryConfig::default()
+        };
+        OsvAdvisoryAdapter::new(cfg, cache, None).expect("constructor Ok")
+    }
+
+    /// A member the walk could not turn into an advisory leaves the pull
+    /// an incomplete reading of the window: the advisories it did collect
+    /// are returned, and `all_ecosystems_ok` is `false` so the handler
+    /// holds the checkpoint and the next tick re-reads the same window.
+    #[test]
+    fn pull_diff_since_reports_incomplete_when_a_member_does_not_parse() {
+        let good = bulk_record_json("GHSA-good", "npm", "lodash", "1970-01-01T00:33:20Z");
+        let zip_bytes = hort_formats::archive_bounds::build_zip_bytes(&[
+            ("GHSA-good.json", good.as_str()),
+            ("GHSA-broken.json", "{not-valid-json"),
+        ]);
+
+        let mut result: Option<AdvisoryDiffResult> = None;
+        let snap = capture_diff_metrics(|| async {
+            let server = wiremock::MockServer::start().await;
+            mount_bulk_archive(&server, "npm", zip_bytes).await;
+            let adapter = adapter_against_bulk(&server, "npm").await;
+            result = Some(
+                adapter
+                    .pull_diff_since(ts(1_000))
+                    .await
+                    .expect("one unreadable member must not abort the tick"),
+            );
+        });
+        let result = result.expect("pull_diff_since ran");
+
+        assert_eq!(
+            result.entries.len(),
+            1,
+            "the advisory that did parse is still collected and still enqueues its rescan"
+        );
+        assert_eq!(result.entries[0].id, "GHSA-good");
+        assert!(
+            !result.all_ecosystems_ok,
+            "a walk that left a member out did not read the window, so the \
+             checkpoint must not advance past it"
+        );
+
+        let counters = diff_counters(snap);
+        assert_eq!(
+            counters.get(&("npm".to_string(), "incomplete".to_string())),
+            Some(&1),
+            "the incomplete reading gets its own result label: {counters:?}"
+        );
+        assert_eq!(
+            counters.get(&("npm".to_string(), "ok".to_string())),
+            None,
+            "`ok` must not co-fire with `incomplete` — one emission per ecosystem \
+             per tick: {counters:?}"
+        );
+    }
+
+    /// Counter-test for the over-correction that would freeze the watch
+    /// path forever. `bulk_record_to_advisory_entry` returns `None` for
+    /// the overwhelming majority of records in every healthy run — the
+    /// `modified <= since` window filter and the ecosystem filter. None of
+    /// those is a member the walk failed to read, so a pull made entirely
+    /// of them is complete and the checkpoint advances.
+    #[test]
+    fn pull_diff_since_window_and_ecosystem_filtered_records_are_not_incompleteness() {
+        let after = bulk_record_json("GHSA-after", "npm", "lodash", "1970-01-01T00:33:20Z");
+        // Window filter: `modified <= since`.
+        let before = bulk_record_json("GHSA-before", "npm", "old", "1970-01-01T00:08:20Z");
+        // Ecosystem filter: OSV cross-publishes an advisory into archives
+        // whose ecosystem it does not target.
+        let other_eco = bulk_record_json("GHSA-pypi", "PyPI", "django", "1970-01-01T00:33:20Z");
+        // A record carrying no `modified` at all cannot be window-tested,
+        // and is filtered here rather than counted as a drop: the counting
+        // side is reserved for a member whose *bytes* this process could
+        // not read. Widening it to record-level malformedness would hold
+        // the checkpoint back forever on one out-of-spec publisher record.
+        let undated = serde_json::json!({
+            "id": "GHSA-undated",
+            "affected": [{
+                "package": { "ecosystem": "npm", "name": "undated" },
+                "versions": ["1.0.0"]
+            }]
+        })
+        .to_string();
+        let zip_bytes = hort_formats::archive_bounds::build_zip_bytes(&[
+            ("GHSA-after.json", after.as_str()),
+            ("GHSA-before.json", before.as_str()),
+            ("GHSA-pypi.json", other_eco.as_str()),
+            ("GHSA-undated.json", undated.as_str()),
+            // A non-`.json` member is not a member the walk wanted.
+            ("README.txt", "ignored"),
+        ]);
+
+        let mut result: Option<AdvisoryDiffResult> = None;
+        let snap = capture_diff_metrics(|| async {
+            let server = wiremock::MockServer::start().await;
+            mount_bulk_archive(&server, "npm", zip_bytes).await;
+            let adapter = adapter_against_bulk(&server, "npm").await;
+            result = Some(
+                adapter
+                    .pull_diff_since(ts(1_000))
+                    .await
+                    .expect("pull_diff_since Ok"),
+            );
+        });
+        let result = result.expect("pull_diff_since ran");
+
+        assert_eq!(result.entries.len(), 1, "only the in-window npm record");
+        assert_eq!(result.entries[0].id, "GHSA-after");
+        assert!(
+            result.all_ecosystems_ok,
+            "every member parsed — the filters are not incompleteness, and \
+             counting them would stop the watch path advancing ever again"
+        );
+
+        let counters = diff_counters(snap);
+        assert_eq!(
+            counters.get(&("npm".to_string(), "ok".to_string())),
+            Some(&1),
+            "a complete reading stays `ok`: {counters:?}"
+        );
+        assert_eq!(
+            counters.get(&("npm".to_string(), "incomplete".to_string())),
+            None,
+            "the filters must not reach the `incomplete` series: {counters:?}"
+        );
     }
 }

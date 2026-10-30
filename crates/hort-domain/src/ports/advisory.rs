@@ -58,19 +58,35 @@ pub struct AdvisoryAffectedPackage {
 /// from the per-ecosystem zip archives whose `modified` field is
 /// strictly after the `since` timestamp the caller supplied.
 ///
-/// `all_ecosystems_ok` is `true` only when every configured ecosystem's
-/// fetch + parse succeeded. The handler advances the
+/// `all_ecosystems_ok` is `true` only when every configured ecosystem
+/// was read **in full**. The handler advances the
 /// `advisory_sync_state.last_sync_at` checkpoint **only** when this
-/// flag is `true`; partial-ecosystem failure preserves the prior
-/// timestamp so the next tick re-attempts the missed window.
+/// flag is `true`; anything less preserves the prior timestamp so the
+/// next tick re-attempts the same window.
 #[derive(Debug, Clone)]
 pub struct AdvisoryDiffResult {
     /// Advisory entries with `modified > since`, flattened across all
-    /// configured ecosystems in adapter-defined order.
+    /// configured ecosystems in adapter-defined order. Carries whatever
+    /// each ecosystem's pull did collect, including a pull that was
+    /// incomplete — the entries are real advisories either way.
     pub entries: Vec<AdvisoryEntry>,
-    /// `true` iff every configured ecosystem's bulk pull + parse step
-    /// completed without error. The handler reads this flag to decide
-    /// whether to advance the per-feed checkpoint.
+    /// `true` iff every configured ecosystem's bulk pull completed
+    /// without error **and** read every member of its archive. An
+    /// adapter that errored on an ecosystem, and one whose walk
+    /// completed while leaving a member unread, both report `false`.
+    ///
+    /// The second half is not a refinement: the checkpoint is the only
+    /// thing that decides whether a window is read again, and every
+    /// record in a window the checkpoint has passed fails the
+    /// `modified > since` filter of every later pull. So a member left
+    /// out of a pull that advanced the checkpoint is a missed advisory
+    /// on this path permanently, and the only honest reading of an
+    /// incomplete archive walk is that this window has not been read.
+    ///
+    /// The handler reads this flag to decide whether to advance the
+    /// per-feed checkpoint. It is the entries' companion, not their
+    /// gate: an incomplete pull still enqueues the rescans its entries
+    /// imply.
     pub all_ecosystems_ok: bool,
 }
 
@@ -102,10 +118,19 @@ pub trait AdvisoryPort: Send + Sync {
     ///
     /// Returns an [`AdvisoryDiffResult`] aggregating entries across
     /// every configured ecosystem plus a boolean flag indicating
-    /// whether every ecosystem's pull succeeded. The handler advances
+    /// whether every ecosystem was read in full. The handler advances
     /// the `advisory_sync_state.last_sync_at` checkpoint only when
-    /// `all_ecosystems_ok` is `true` — partial failure preserves the
-    /// prior timestamp so the next tick retries the missed window.
+    /// `all_ecosystems_ok` is `true` — anything less preserves the
+    /// prior timestamp so the next tick retries the same window.
+    ///
+    /// **An implementation sets the flag `false` for an ecosystem it
+    /// could not read completely, not merely for one that errored.** A
+    /// walk that returned successfully having skipped a member — an
+    /// unreadable or unparseable record, a member whose name could not
+    /// be decoded, an entry-count cap that stopped it early — did not
+    /// read the window it was asked for, and reporting it as a full
+    /// success books an incomplete answer as a complete one. The
+    /// entries such a walk did collect belong in `entries` regardless.
     ///
     /// Default impl returns `DomainError::Invariant("not implemented")`
     /// so existing test fixtures that pre-date the bulk-diff path
