@@ -329,7 +329,9 @@ pub enum CliSessionRejection {
 mod tests {
     use super::*;
 
-    use crate::oci_token_signing::{AccessEntry, OciAccessClaims, OciTokenSigningKey};
+    use crate::oci_token_signing::{
+        AccessEntry, OciAccessClaims, OciTokenSigningKey, RepoScopeEntry,
+    };
     use ed25519_dalek::SigningKey;
     use rand::rand_core::UnwrapErr;
     use rand::rngs::SysRng;
@@ -581,6 +583,10 @@ mod tests {
                 name: "library/nginx".into(),
                 actions: vec!["pull".into()],
             }],
+            hort_repo_scope: Some(vec![RepoScopeEntry {
+                repo: Uuid::from_u128(0x11),
+                actions: vec!["pull".into()],
+            }]),
         };
         let oci_jwt = key.mint(&oci_claims).expect("mint oci");
 

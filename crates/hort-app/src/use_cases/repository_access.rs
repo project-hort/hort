@@ -783,6 +783,7 @@ mod tests {
         p.token_cap = Some(TokenCap {
             permissions: vec![Permission::Read],
             repository_ids: None,
+            per_repository_permissions: None,
         });
         p
     }

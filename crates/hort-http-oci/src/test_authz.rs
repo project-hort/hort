@@ -257,6 +257,7 @@ pub(crate) fn pull_scoped_cap_principal(uid: Uuid) -> CallerPrincipal {
         token_cap: Some(TokenCap {
             permissions: vec![Permission::Read],
             repository_ids: None,
+            per_repository_permissions: None,
         }),
     }
 }

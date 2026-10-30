@@ -1349,7 +1349,7 @@ mod tests {
     /// typed `OciVerifyOutcome::Verified` mapping.
     #[test]
     fn inbound_oci_jwt_validates_via_signing_key() {
-        use hort_app::oci_token_signing::{AccessEntry, OciAccessClaims};
+        use hort_app::oci_token_signing::{AccessEntry, OciAccessClaims, RepoScopeEntry};
         use hort_http_core::test_support::with_oci_public_base_url;
         let parsed = run(async {
             let (ctx, mocks) = enabled_auth_ctx_no_tokens_with_mocks();
@@ -1370,6 +1370,10 @@ mod tests {
                     name: "foo/bar".into(),
                     actions: vec!["pull".into()],
                 }],
+                hort_repo_scope: Some(vec![RepoScopeEntry {
+                    repo: uuid::Uuid::from_u128(0xF00),
+                    actions: vec!["pull".into()],
+                }]),
             };
             let jwt = signing.mint(&claims).expect("mint");
 
@@ -1424,6 +1428,7 @@ mod tests {
                 aud: "hort.example.com".into(),
                 exp: Utc::now() + chrono::Duration::seconds(300),
                 access: vec![],
+                hort_repo_scope: Some(vec![]),
             };
             let jwt = attacker_signing.mint(&claims).expect("mint");
             let ctx = with_native_oci_tokens(&ctx, &mocks, active_signing, "hort.example.com");
@@ -1442,6 +1447,108 @@ mod tests {
         // Falls through to the legacy IdP path which has no JWKS for
         // this fake; still 401.
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A correctly-signed, right-`aud` OCI JWT carrying NO
+    /// `hort_repo_scope` claim is refused at the middleware. Only a
+    /// token minted before that claim existed can be in this state, and
+    /// honouring it would mean reconstituting its cap as a flat union
+    /// across `access[]` — the boundary this surface exists to keep.
+    ///
+    /// The `hort-app` test
+    /// `verify_inbound_token_without_scope_claim_is_rejected_not_fallen_through`
+    /// pins that this is a `Rejected` and not a `NotOurToken`
+    /// fall-through; this one pins what the client sees.
+    #[test]
+    fn inbound_oci_jwt_without_repo_scope_claim_is_refused() {
+        let status = run(async {
+            let (ctx, mocks) = enabled_auth_ctx_no_tokens_with_mocks();
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                rand::rngs::SysRng,
+            ));
+            let signing = OciTokenSigningKey::new(sk, None);
+            let claims = hort_app::oci_token_signing::OciAccessClaims {
+                iss: "https://hort.example.com/v2/auth".into(),
+                sub: uuid::Uuid::from_u128(0xC0FFEE),
+                aud: "hort.example.com".into(),
+                exp: Utc::now() + chrono::Duration::seconds(300),
+                access: vec![hort_app::oci_token_signing::AccessEntry {
+                    resource_type: "repository".into(),
+                    name: "foo/bar".into(),
+                    actions: vec!["pull".into(), "push".into()],
+                }],
+                hort_repo_scope: None,
+            };
+            let jwt = signing.mint(&claims).expect("mint");
+            let ctx = with_native_oci_tokens(&ctx, &mocks, Arc::new(signing), "hort.example.com");
+            let router = build_test_router(&ctx);
+            let resp = router
+                .oneshot(
+                    HttpRequest::get("/v2/probe")
+                        .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            resp.status()
+        });
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The per-resource binding survives the
+    /// `mint_authenticated_principal_for_format_middleware` seam and
+    /// reaches the handler on the principal's cap — so every downstream
+    /// `/v2/*` gate evaluates against it, not against a flat union.
+    #[test]
+    fn inbound_oci_jwt_carries_its_per_repository_binding_to_the_handler() {
+        let repo = uuid::Uuid::from_u128(0xBEEF);
+        let parsed = run(async {
+            let (ctx, mocks) = enabled_auth_ctx_no_tokens_with_mocks();
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                rand::rngs::SysRng,
+            ));
+            let signing = OciTokenSigningKey::new(sk, None);
+            let claims = hort_app::oci_token_signing::OciAccessClaims {
+                iss: "https://hort.example.com/v2/auth".into(),
+                sub: uuid::Uuid::from_u128(0xC0FFEE),
+                aud: "hort.example.com".into(),
+                exp: Utc::now() + chrono::Duration::seconds(300),
+                access: vec![hort_app::oci_token_signing::AccessEntry {
+                    resource_type: "repository".into(),
+                    name: "foo/bar".into(),
+                    actions: vec!["pull".into()],
+                }],
+                hort_repo_scope: Some(vec![hort_app::oci_token_signing::RepoScopeEntry {
+                    repo,
+                    actions: vec!["pull".into()],
+                }]),
+            };
+            let jwt = signing.mint(&claims).expect("mint");
+            let ctx = with_native_oci_tokens(&ctx, &mocks, Arc::new(signing), "hort.example.com");
+            let router = build_test_router(&ctx);
+            let resp = router
+                .oneshot(
+                    HttpRequest::get("/v2/probe")
+                        .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        });
+        let cap = parsed["token_cap"].as_str().expect("token_cap echoed");
+        assert!(
+            cap.contains("per_repository_permissions: Some("),
+            "the consumed cap must be per-resource: {cap}"
+        );
+        assert!(
+            cap.contains(&repo.to_string()),
+            "the cap must name the repository the grant was bound to: {cap}"
+        );
     }
 
     // -------------------- 6. BearerOnly native-token parity (D3) ---------

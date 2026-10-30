@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A boundary drawn when something is issued now holds when it is consumed.**
+  An OCI `/v2/auth` bearer minted for `push` on one repository no longer
+  authorises a write on another repository it was granted only `pull` on; a
+  JWKS fetch redirected from `https` to `http` on the issuer's own host is
+  refused; and one forged signature no longer makes every other signing key
+  read as stale. OCI clients holding a token minted before this release are
+  challenged and re-mint (#381).
 - **A digest hort recorded is now the digest hort checks, and a fact is re-read
   before it is acted on.** A same-length corrupted CAS read fails the download
   instead of completing as a successful `200`, the metadata mirror refuses a
