@@ -563,21 +563,43 @@ pub struct PrefetchPolicy {
     #[serde(default)]
     pub max_age_days: Option<u32>,
     /// Global cumulative cap on the
-    /// transitive cascade. The per-package `transitive_depth` knob
-    /// bounds the *depth* of a single walk but does NOT bound the
-    /// *breadth*: a manifest declaring N distinct dependencies
-    /// amplifies as `N × transitive_depth × …` per parent trigger.
-    /// `max_descendants` caps the cumulative descendant count carried
-    /// across the cascade in the `prefetch-dependencies` task params
-    /// (`current_descendants_so_far`). When a cohort would exceed the
-    /// cap the walk truncates the cohort *before* enqueueing and emits
-    /// a `warn!` (see `prefetch_dependencies::plan_and_enqueue`).
+    /// transitive cascade: the TOTAL number of descendant rows one
+    /// cascade may enqueue, summed over every branch of it. The
+    /// per-package `transitive_depth` knob bounds the *depth* of a
+    /// single walk but does NOT bound the *breadth*: a manifest
+    /// declaring N distinct dependencies amplifies as
+    /// `N × transitive_depth × …` per parent trigger.
+    ///
+    /// The cap is realised as a **partitioned budget** carried in the
+    /// `prefetch-dependencies` task params (`descendant_budget`), not
+    /// as a running total of what has been spent. A node holding
+    /// budget `b` enqueues at most `b` leaves, then divides whatever
+    /// is left over EQUALLY among the children it enqueues — so the
+    /// whole subtree below it can never enqueue more than `b` rows,
+    /// and sibling branches cannot each spend the full cap. A cohort
+    /// that would exceed its own budget is truncated *before*
+    /// enqueueing and emits a `warn!` (see
+    /// `prefetch_dependencies::plan_and_enqueue`). Carrying a
+    /// *spent-so-far* counter instead is what made the cap per-branch:
+    /// siblings inherited the same counter and spent it independently,
+    /// so the real amplification was `kᵈᵉᵖᵗʰ` rather than `cap`.
+    ///
+    /// The budget is divided by **integer division with no remainder
+    /// spread** — the ≤ `cohort - 1` rows that rounding forfeits buy a
+    /// deterministic allocation, so two runs of the same cascade warm
+    /// the same subtree.
     ///
     /// Default `200` — a typical realistic npm transitive closure for
     /// a small package is ~100 deps; 200 leaves headroom for the
-    /// legitimate case and trips on a runaway. The validator caps
+    /// legitimate case and trips on a runaway. Because the budget is
+    /// global, this default is a statement about the whole closure,
+    /// which is how it reads: a cascade whose graph is wider than the
+    /// budget warms the top of the graph and truncates the rest rather
+    /// than warming every branch to the full 200. The validator caps
     /// operator-set values at 100_000 (hort-config) so an operator-typo
-    /// (e.g. `4_000_000_000`) cannot effectively disable the cap.
+    /// (e.g. `4_000_000_000`) cannot effectively disable the cap; that
+    /// ceiling is now 100_000 rows per cascade in total, not per
+    /// branch.
     /// Setting `0` disables transitive enqueueing entirely (defense-
     /// in-depth — operators can collapse the feature to leaf-prefetch
     /// only without disabling the `TransitiveDeps` trigger).

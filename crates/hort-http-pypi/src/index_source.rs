@@ -253,13 +253,22 @@ impl IndexSource for HostedPypiSource {
                 metadata_hash,
             };
 
-            // Multi-file artifacts under the same version inherit the
-            // first artifact's quarantine_status — the operator
-            // contract is "a version is in or out as a whole", not
-            // "per-file". A future per-file status would amend this.
+            // A version's reported status is the WORST across its files
+            // — the operator contract is "a version is in or out as a
+            // whole", not "per-file", so one non-servable file takes
+            // the version out. Taking the first file's status instead
+            // let a quarantined wheel ride into the served index behind
+            // a released sdist, and *which* file was first was not even
+            // stable: the artifact read orders by `version` alone, which
+            // does not order files sharing a version.
+            // `QuarantineStatus::worst_of` is order-independent, so the
+            // fold is the fix rather than a tiebreak on the query.
             per_version
                 .entry(version)
-                .and_modify(|(_status, files)| files.push(file.clone()))
+                .and_modify(|(status, files)| {
+                    *status = status.worst_of(artifact.quarantine_status);
+                    files.push(file.clone());
+                })
                 .or_insert_with(|| (artifact.quarantine_status, vec![file]));
         }
 
@@ -472,6 +481,7 @@ impl IndexSource for ProxyPypiSource {
             &normalized,
             &projection,
             &pkg_status,
+            caller,
         );
         let status_map: std::collections::HashMap<
             String,

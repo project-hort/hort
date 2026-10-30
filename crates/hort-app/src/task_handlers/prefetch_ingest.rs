@@ -93,7 +93,8 @@ use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::ApiActor;
 use hort_domain::ports::format_handler::{
-    require_https_metadata_url, FormatHandler, MetadataUrlSubject,
+    require_https_metadata_url, split_metadata_files_per_version, FormatHandler,
+    MetadataUrlSubject, MAX_METADATA_FILES_PER_VERSION,
 };
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
@@ -186,6 +187,13 @@ struct LeafSummary {
     /// Feeds [`completion_is_error`]; not part of the persisted
     /// `result_summary` JSON.
     any_hard_failure: bool,
+    /// How many of this version's upstream-advertised distribution
+    /// files were refused unfetched because the version's file cohort
+    /// exceeded [`MAX_METADATA_FILES_PER_VERSION`]. `0` on every
+    /// ordinary version; non-zero is the operator's signal that an
+    /// upstream advertised a per-version fan-out far outside observed
+    /// publishing practice.
+    urls_refused_over_cap: u64,
 }
 
 impl LeafSummary {
@@ -198,6 +206,7 @@ impl LeafSummary {
             "urls_succeeded":   self.urls_succeeded,
             "urls_failed":      self.urls_failed,
             "short_circuited":  self.short_circuited,
+            "urls_refused_over_cap": self.urls_refused_over_cap,
         })
     }
 }
@@ -1350,7 +1359,29 @@ async fn pypi_per_distribution_fanout(
         return;
     };
 
-    for entry in urls_arr {
+    // Bound the per-version fan-out. Each `urls[]` entry becomes an
+    // upstream fetch plus a CAS write, and nothing in the protocol
+    // bounds how many entries the document carries — without this the
+    // only limit is the metadata body's 64 MiB storage backstop, which
+    // is on the order of a million entries. The refused tail is
+    // reported once; the admitted prefix still ingests, so a version
+    // over the ceiling degrades rather than failing whole.
+    let (admitted, refused) = split_metadata_files_per_version(urls_arr.len());
+    if refused > 0 {
+        tracing::warn!(
+            repository = %repo.key,
+            package = %parsed.package,
+            version = %parsed.version,
+            advertised = urls_arr.len(),
+            cap = MAX_METADATA_FILES_PER_VERSION,
+            refused,
+            "prefetch (pypi): per-version distribution-file cohort exceeds the \
+             per-version ceiling; the tail is refused unfetched",
+        );
+        summary.urls_refused_over_cap = refused as u64;
+    }
+
+    for entry in &urls_arr[..admitted] {
         let Some(filename) = entry.get("filename").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -3382,6 +3413,103 @@ mod tests {
             summary["short_circuited"], false,
             "a refused URL is non-fatal per URL, not a short-circuit: {summary}"
         );
+    }
+
+    // -- per-version distribution-file fan-out ceiling ---------------------
+
+    /// Build a PyPI per-version manifest advertising `count` distribution
+    /// files for `flask 2.0.0`.
+    ///
+    /// Every entry is on plaintext `http://`, which the scheme rule
+    /// refuses *before* any fetch — so `urls_attempted` counts exactly
+    /// the entries the fan-out loop iterated, with no ingest machinery
+    /// in the way. That is the quantity the ceiling bounds.
+    fn pypi_manifest_with_file_count(count: usize) -> serde_json::Value {
+        let urls: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                let filename = format!("flask-2.0.0-py3-none-plat{i}.whl");
+                json!({
+                    "filename": filename,
+                    "url": format!("http://files.example/packages/aa/{filename}"),
+                    "digests": { "sha256": sha256_hex(filename.as_bytes()) },
+                })
+            })
+            .collect();
+        json!({ "urls": urls })
+    }
+
+    /// Drive the PyPI leaf-pull for a `flask 2.0.0` advertising
+    /// `advertised` distribution files, and return its
+    /// `result_summary`.
+    async fn pypi_leaf_summary_for_file_count(advertised: usize) -> serde_json::Value {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Pypi);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+        proxy.insert_metadata(
+            "",
+            "/pypi/flask/2.0.0/json",
+            pypi_manifest_with_file_count(advertised)
+                .to_string()
+                .into_bytes(),
+        );
+
+        let handler =
+            build_dispatch_handler(repos, proxy, mappings, "pypi", Arc::new(PypiDispatchStub));
+
+        let outcome = handler
+            .run(&leaf_params(repo.id, "flask", "2.0.0"), make_context())
+            .await
+            .expect("Ok");
+        match outcome {
+            TaskOutcome::Completed { result_summary } => result_summary,
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// The leaf-pull refuses past the per-version ceiling: an upstream
+    /// version advertising more distribution files than
+    /// `MAX_METADATA_FILES_PER_VERSION` iterates the admitted prefix and
+    /// never reaches the tail.
+    ///
+    /// Without the ceiling `urls_attempted` is the full advertised count,
+    /// and the only bound on it is the metadata body's 64 MiB storage
+    /// backstop — on the order of a million entries.
+    #[tokio::test]
+    async fn prefetch_pypi_refuses_distribution_files_past_the_per_version_ceiling() {
+        let advertised = MAX_METADATA_FILES_PER_VERSION + 4;
+        let summary = pypi_leaf_summary_for_file_count(advertised).await;
+        assert_eq!(
+            summary["urls_attempted"], MAX_METADATA_FILES_PER_VERSION,
+            "the fan-out loop must iterate at most the per-version ceiling, \
+             not the {advertised} entries upstream advertised: {summary}"
+        );
+        assert_eq!(
+            summary["urls_refused_over_cap"], 4,
+            "the refused tail is reported so an operator can see an upstream \
+             fanning out past observed publishing practice: {summary}"
+        );
+        assert_eq!(
+            summary["short_circuited"], false,
+            "a version over the ceiling degrades to its admitted prefix; it is \
+             not skipped whole: {summary}"
+        );
+    }
+
+    /// Counter-test: a version whose file count is inside the ceiling has
+    /// every entry attempted and nothing reported refused — the bound
+    /// must not clip an ordinary publisher.
+    #[tokio::test]
+    async fn prefetch_pypi_attempts_every_file_of_an_ordinary_version() {
+        // A full CPython-matrix release, the widest shape observed in
+        // practice.
+        const ORDINARY: usize = 52;
+        let summary = pypi_leaf_summary_for_file_count(ORDINARY).await;
+        assert_eq!(summary["urls_attempted"], ORDINARY, "{summary}");
+        assert_eq!(summary["urls_refused_over_cap"], 0, "{summary}");
     }
 
     /// npm: the packument's `dist.tarball` is `http://`. npm resolves one

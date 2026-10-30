@@ -185,12 +185,16 @@ pub struct RejectedItem {
     pub reason: RejectionReason,
 }
 
-/// Terminal HORT statuses that refuse a fresh prefetch.
+/// Why a requested prefetch coordinate is refused.
 ///
-/// **Arm set is pinned at two** — `ScanRejected` and `ScanIndeterminate`.
-/// Both share the same operator-actionable handling ("curator
-/// waive OR admin override"); the discriminator is preserved here so
-/// dashboards / future audit consumers can distinguish them.
+/// **Arm set is pinned at three.** `ScanRejected` and
+/// `ScanIndeterminate` are terminal HORT statuses on an
+/// already-ingested coordinate; both share the same
+/// operator-actionable handling ("curator waive OR admin override"),
+/// and the discriminator is preserved here so dashboards / future audit
+/// consumers can distinguish them. `NameOwnedByMember` is a different
+/// shape — nothing is wrong with the coordinate, the name is simply not
+/// one this target may warm from upstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectionReason {
@@ -199,6 +203,19 @@ pub enum RejectionReason {
     /// Terminal `ScanIndeterminate` status — scanner could not produce
     /// a verdict; treated as terminal for the auto-release path.
     ScanIndeterminate,
+    /// A non-proxy member of the target virtual repository owns the
+    /// requested name, so an upstream copy of it is never warmed
+    /// (ADR 0031 rule 2b, the same name-level pinning the virtual
+    /// download and index paths apply). Warming one would place an
+    /// upstream artifact under a locally-owned name — the
+    /// dependency-confusion shape pinning exists to close.
+    ///
+    /// The refusal names no member. Ownership is determined across
+    /// **every** member, including ones the caller cannot Read, because
+    /// a check limited to the visible members answers "is this name
+    /// owned by a member you can see" — a different question, and one
+    /// whose answer is `false` exactly when the hazard is worst.
+    NameOwnedByMember,
 }
 
 /// One entry in [`PrefetchOutcome::failed`].
@@ -613,10 +630,27 @@ mod tests {
     }
 
     #[test]
+    fn rejection_reason_name_owned_by_member_arm() {
+        let r = RejectionReason::NameOwnedByMember;
+        let copy = r;
+        assert_eq!(r, copy);
+        let json = serde_json::to_value(r).unwrap();
+        assert_eq!(json, serde_json::json!("name_owned_by_member"));
+    }
+
+    #[test]
     fn rejection_reason_arms_are_distinct() {
         assert_ne!(
             RejectionReason::ScanRejected,
             RejectionReason::ScanIndeterminate
+        );
+        assert_ne!(
+            RejectionReason::ScanRejected,
+            RejectionReason::NameOwnedByMember
+        );
+        assert_ne!(
+            RejectionReason::ScanIndeterminate,
+            RejectionReason::NameOwnedByMember
         );
     }
 
