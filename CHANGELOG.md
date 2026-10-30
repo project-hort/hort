@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Three bounds that were bypassed after being checked now hold.** Wheel
+  PEP 658 metadata extraction no longer holds the whole wheel in memory,
+  releasing an upload session no longer discards one admitted concurrently
+  (which let a principal exceed the upload-session cap), and OSV advisory
+  responses are now read under byte ceilings — refused, never truncated, with a
+  new `hort_advisory_query_total{result="body_too_large"}` label (#377).
 - **A publish whose archive disagrees with its coordinates is now refused.**
   npm, Cargo and Maven hosted publishes read the identity the uploaded
   archive declares about itself and reject a disagreement in each format's

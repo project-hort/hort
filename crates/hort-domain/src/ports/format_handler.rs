@@ -977,6 +977,18 @@ pub trait FormatHandler: Send + Sync {
     /// and [`extract_dependency_specs`](Self::extract_dependency_specs):
     /// same trait, same input shape, different return shape.
     ///
+    /// **The payload must not be read whole.** A wheel is a ZIP, which
+    /// is indexed at its tail, so the member this method wants is
+    /// reachable with `Seek` — and
+    /// [`PayloadAccess::ReadSeek`](PayloadAccess::ReadSeek) is what the
+    /// production callers hand over, precisely so the cost of reading a
+    /// capped member does not become the cost of the archive holding it.
+    /// Nothing bounds that archive: there is no per-format ingest size
+    /// ceiling, and the inbound body limit that bounds a publish request
+    /// has no counterpart on the pull-through path. An implementation
+    /// that buffers the seekable variant to get at the member gives that
+    /// bound back.
+    ///
     /// Default returns `Ok(None)` — opaque formats (npm, cargo, OCI,
     /// generic, raw uploads, helm, conda, …) have no wheel concept and
     /// inherit the inert default. Only PyPI overrides today; the
@@ -1626,6 +1638,22 @@ mod tests {
         let coords = sbom_test_coords();
         let stream: Box<dyn std::io::Read + Send + '_> = Box::new(&b""[..]);
         let payload = PayloadAccess::ReadStream(stream);
+        let result = DefaultsOnlyHandler.extract_wheel_metadata_bytes(&coords, payload);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn default_extract_wheel_metadata_bytes_returns_none_for_read_seek_payload() {
+        // Same default contract over the seekable variant — the one the
+        // production wheel callers hand over. An inheriting handler must
+        // neither read nor seek it: every format except PyPI reaches
+        // this default, and a default that touched the payload would
+        // spend a CAS round-trip per non-wheel artifact to answer
+        // `None`.
+        let coords = sbom_test_coords();
+        let seekable: Box<dyn crate::types::SeekableRead + Send + '_> =
+            Box::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let payload = PayloadAccess::ReadSeek(seekable);
         let result = DefaultsOnlyHandler.extract_wheel_metadata_bytes(&coords, payload);
         assert!(matches!(result, Ok(None)));
     }

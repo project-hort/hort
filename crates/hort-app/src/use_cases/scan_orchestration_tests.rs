@@ -2975,6 +2975,14 @@ impl PayloadSbom for PayloadShapedSbomHandler {
                 std::io::Read::read_to_end(&mut r, &mut buf)
                     .map_err(|e| DomainError::Invariant(format!("payload read: {e}")))?;
             }
+            // The scan path hands this double a `ReadStream`; the arm
+            // exists so the double keeps covering the whole variant set
+            // and a future producer change shows up as a test failure
+            // rather than as a `_ =>` that quietly swallows it.
+            PayloadAccess::ReadSeek(mut r) => {
+                std::io::Read::read_to_end(&mut r, &mut buf)
+                    .map_err(|e| DomainError::Invariant(format!("payload read: {e}")))?;
+            }
         }
         *self.seen_payload.lock().unwrap() = Some(buf.clone());
 

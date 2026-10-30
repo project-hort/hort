@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 
 use bytes::Bytes;
 use hort_domain::entities::repository::RepositoryFormat;
@@ -571,15 +571,24 @@ fn pypi_scan_href_values(html: &str) -> Vec<&str> {
     out
 }
 
-/// Find the wheel's `<dist-info>/METADATA` member in a ZIP byte buffer
-/// and return its contents bounded by [`PYPI_WHEEL_METADATA_MAX_BYTES`].
+/// Find the wheel's `<dist-info>/METADATA` member in a ZIP and return
+/// its contents bounded by [`PYPI_WHEEL_METADATA_MAX_BYTES`].
 ///
-/// Separated from the `FormatHandler` impl so the bytes-in-/bytes-out
-/// kernel is testable directly without manufacturing a
-/// [`PayloadAccess`]. Lives next to the only caller; not exported.
+/// Generic over `Read + Seek` rather than taking `&[u8]`, because a ZIP
+/// is indexed at its tail: `iter_zip_entries` reads the central
+/// directory and then seeks to the one member this function wants. Given
+/// a seekable payload that is not in memory — a spill file — the bytes
+/// this reads are the central directory plus one member, so extracting a
+/// megabyte of METADATA out of a gigabyte wheel costs a megabyte. A
+/// `&[u8]` parameter would have obliged every caller to hold the whole
+/// archive first, which is the cost this signature exists to avoid.
+///
+/// Separated from the `FormatHandler` impl so the kernel is testable
+/// directly without manufacturing a [`PayloadAccess`]. Lives next to its
+/// callers; not exported.
 ///
 /// Returns:
-/// - `Ok(None)` — buffer is not a valid ZIP, or the ZIP carries zero
+/// - `Ok(None)` — the payload is not a valid ZIP, or the ZIP carries zero
 ///   `*.dist-info/METADATA` entries. Non-fatal: the wheel ingest
 ///   already succeeded; PEP 658 is simply not advertised.
 /// - `Ok(Some(bytes))` — METADATA bytes (first matching entry; the
@@ -600,16 +609,16 @@ fn pypi_scan_href_values(html: &str) -> Vec<&str> {
 /// 658 path is best-effort (a non-ZIP / corrupt buffer is `Ok(None)`,
 /// because the primary wheel ingest already succeeded and PEP 658 is
 /// merely not advertised), whereas the dependency-extraction sibling has
-/// already magic-sniffed the buffer as a zip and treats a parse failure
+/// already magic-sniffed its buffer as a zip and treats a parse failure
 /// as a corrupt-wheel `Err`. A *bounds* trip (entry cap / ratio) is fatal
 /// on BOTH paths — never silently downgraded to `Ok(None)`.
-fn extract_wheel_metadata_bytes_from_zip(buf: &[u8]) -> DomainResult<Option<Bytes>> {
+fn extract_wheel_metadata_from_zip<R: Read + Seek>(zip: R) -> DomainResult<Option<Bytes>> {
     let mut first_match: Option<Bytes> = None;
     let mut match_count: usize = 0;
     let mut read_err: Option<String> = None;
 
     let iter_result = crate::archive_bounds::iter_zip_entries(
-        Cursor::new(buf),
+        zip,
         crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
         |name, reader| {
             if read_err.is_some() || !is_wheel_metadata_path(name) {
@@ -1021,13 +1030,24 @@ impl FormatHandler for PyPiFormatHandler {
         if !coords.path.ends_with(".whl") {
             return Ok(None);
         }
-        // Materialise the payload into memory. ZIP parsing needs
-        // `Read + Seek`; PyPI wheels rarely exceed ~100 MB and the
-        // ingest hook has already buffered the artifact for the
-        // primary-content-hash computation, so the memory cost is
-        // already paid at this point in the pipeline.
-        let buf: Vec<u8> = match payload {
-            PayloadAccess::Bytes(b) => b.to_vec(),
+        // ZIP parsing needs `Read + Seek`, and each arm supplies it
+        // without copying the payload a second time:
+        //
+        // - `Bytes` wraps the caller's slice in a `Cursor`. Copying it
+        //   into a `Vec` first would hold a second whole archive
+        //   alongside the caller's for the duration of the walk, to no
+        //   end — `Cursor<&[u8]>` is already `Read + Seek`.
+        // - `ReadSeek` is passed straight through. These bytes are not
+        //   in memory and must not be put there: the walk reads the
+        //   central directory and the one METADATA member, so peak
+        //   occupancy is the member's cap rather than the wheel's size.
+        // - `ReadStream` is forward-only, so there is no way to reach a
+        //   ZIP's tail-indexed member table other than to buffer it.
+        //   No production caller takes this arm for a wheel; it is kept
+        //   so the variant has a defined meaning rather than a panic.
+        match payload {
+            PayloadAccess::Bytes(b) => extract_wheel_metadata_from_zip(Cursor::new(b)),
+            PayloadAccess::ReadSeek(r) => extract_wheel_metadata_from_zip(r),
             PayloadAccess::ReadStream(mut r) => {
                 let mut v = Vec::new();
                 if r.read_to_end(&mut v).is_err() {
@@ -1036,10 +1056,9 @@ impl FormatHandler for PyPiFormatHandler {
                     // ingest succeeded before this method is invoked.
                     return Ok(None);
                 }
-                v
+                extract_wheel_metadata_from_zip(Cursor::new(v))
             }
-        };
-        extract_wheel_metadata_bytes_from_zip(&buf)
+        }
     }
 }
 
@@ -1364,7 +1383,7 @@ impl VersionDiscovery for PyPiFormatHandler {
 /// `iter_zip_entries` reads the central directory and seeks to each entry, so
 /// reaching the METADATA member does not decompress the whole archive.
 ///
-/// Distinct from [`extract_wheel_metadata_bytes_from_zip`] (the PEP 658
+/// Distinct from [`extract_wheel_metadata_from_zip`] (the PEP 658
 /// path), which uses the `zip` crate directly and returns `Ok(None)` for
 /// a corrupt / non-ZIP buffer because that path is non-fatal at ingest. Here
 /// the buffer has already been magic-sniffed as a zip, so a parse failure is a

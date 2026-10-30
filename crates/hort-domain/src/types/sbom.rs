@@ -16,13 +16,13 @@
 //! is NOT serialisable — it carries either a borrowed byte slice or a
 //! type-erased streaming reader. The manual `Debug` impl prints only
 //! the variant tag and the byte count for `Bytes`; the streaming
-//! variant prints `<read-stream>` so logged Debug output never leaks
-//! payload content.
+//! variants print `<read-stream>` / `<seekable-read>` so logged Debug
+//! output never leaks payload content.
 //!
 //! See `docs/architecture/explanation/scanning-pipeline.md`.
 
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Seek};
 
 use serde::Serialize;
 
@@ -159,7 +159,36 @@ pub enum PayloadAccess<'a> {
     Bytes(&'a [u8]),
     /// Streaming reader — used for payloads too large to buffer.
     ReadStream(Box<dyn Read + Send + 'a>),
+    /// Random-access reader over payload bytes that are **not** in
+    /// memory — the caller has made the payload seekable (a spill file)
+    /// without materialising it.
+    ///
+    /// Exists for container formats that are indexed at the tail rather
+    /// than readable front-to-back: a ZIP's member table is its central
+    /// directory, so locating one member needs `Seek`, and a
+    /// forward-only [`Self::ReadStream`] leaves a handler no option but
+    /// to buffer the whole archive to get it. That buffer is what this
+    /// variant removes: a wheel's `<dist-info>/METADATA` member is at
+    /// most a megabyte, and reading it should cost a megabyte whatever
+    /// the wheel weighs.
+    ///
+    /// The seek target is the caller's concern and stays outside the
+    /// domain — a format handler only reads and seeks, which is why this
+    /// carries `std::io` traits and no I/O of its own. A handler that is
+    /// handed this variant must not read the payload whole; if it does,
+    /// the variant has bought nothing.
+    ReadSeek(Box<dyn SeekableRead + Send + 'a>),
 }
+
+/// `Read + Seek` as one object-safe trait, so [`PayloadAccess::ReadSeek`]
+/// can carry a single `Box<dyn …>` instead of a generic parameter the
+/// enum cannot have.
+///
+/// Blanket-implemented, so every `Read + Seek` type (`std::fs::File`,
+/// `std::io::Cursor<_>`) satisfies it without naming it.
+pub trait SeekableRead: Read + Seek {}
+
+impl<T: Read + Seek> SeekableRead for T {}
 
 impl fmt::Debug for PayloadAccess<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -171,6 +200,10 @@ impl fmt::Debug for PayloadAccess<'_> {
             PayloadAccess::ReadStream(_) => f
                 .debug_tuple("ReadStream")
                 .field(&format_args!("<read-stream>"))
+                .finish(),
+            PayloadAccess::ReadSeek(_) => f
+                .debug_tuple("ReadSeek")
+                .field(&format_args!("<seekable-read>"))
                 .finish(),
         }
     }
@@ -512,5 +545,57 @@ mod tests {
             rendered.contains("read-stream"),
             "Debug output should mark stream variant: {rendered}"
         );
+    }
+
+    #[test]
+    fn payload_access_read_seek_constructs_and_debug_does_not_leak_content() {
+        // Same contract as the stream variant: the tag identifies the
+        // payload shape and nothing identifies its content. This one
+        // matters a little more — a seekable payload is reached for
+        // precisely when the content is large, so a Debug that dumped it
+        // would dump the most of anything.
+        let sentinel: &[u8] = b"SECRET-SENTINEL-DO-NOT-LEAK";
+        let seekable: Box<dyn SeekableRead + Send + '_> = Box::new(std::io::Cursor::new(sentinel));
+        let p = PayloadAccess::ReadSeek(seekable);
+        let rendered = format!("{p:?}");
+        assert!(
+            rendered.contains("ReadSeek"),
+            "Debug output should name the variant: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SECRET-SENTINEL"),
+            "Debug output must not leak payload content: {rendered}"
+        );
+        assert!(
+            rendered.contains("seekable-read"),
+            "Debug output should mark the seekable variant: {rendered}"
+        );
+    }
+
+    /// The blanket impl is the whole reason the variant can carry one
+    /// boxed trait object: every `Read + Seek` type satisfies
+    /// `SeekableRead` without naming it, and both of the shapes
+    /// production uses — an in-memory cursor and a real file handle —
+    /// must coerce. A missing blanket impl would be a compile error at
+    /// each call site rather than here, so this pins it once.
+    #[test]
+    fn seekable_read_is_blanket_implemented_and_still_reads_and_seeks() {
+        fn accepts<T: SeekableRead>(_: &T) {}
+        let mut cursor = std::io::Cursor::new(b"0123456789".to_vec());
+        accepts(&cursor);
+
+        use std::io::{Seek as _, SeekFrom};
+        cursor.seek(SeekFrom::Start(4)).expect("seek");
+        let mut tail = Vec::new();
+        cursor.read_to_end(&mut tail).expect("read");
+        assert_eq!(tail, b"456789", "the boxed object must still seek and read");
+
+        // Erased to the trait object the variant actually carries.
+        let mut erased: Box<dyn SeekableRead + Send> =
+            Box::new(std::io::Cursor::new(b"abcdef".to_vec()));
+        erased.seek(SeekFrom::End(-2)).expect("seek from end");
+        let mut last = Vec::new();
+        erased.read_to_end(&mut last).expect("read");
+        assert_eq!(last, b"ef");
     }
 }

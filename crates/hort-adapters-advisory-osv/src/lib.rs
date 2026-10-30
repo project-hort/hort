@@ -21,6 +21,7 @@
 
 mod bulk;
 mod cache;
+mod capped;
 mod ecosystem;
 mod extra_ca;
 mod hydrate;
@@ -122,6 +123,41 @@ impl Default for OsvAdvisoryConfig {
 
 const DEFAULT_BATCH_SIZE: usize = 100;
 
+/// Per-query byte budget for a `/v1/querybatch` response.
+///
+/// The cap applied to one batch is this times the number of queries that
+/// batch actually sent, so it tracks what was asked rather than assuming
+/// the default `batch_size`: an operator who raises `batch_size` gets
+/// proportionally more headroom, and one who lowers it gets a tighter
+/// bound, with no second knob to keep in step.
+///
+/// 128 KiB per query. A `querybatch` result entry is a list of
+/// `{"id","modified"}` pairs at roughly 70 bytes each, so this admits on
+/// the order of 1,800 advisories for a single component — orders of
+/// magnitude past any real package, and still a bound. Exceeding it
+/// fails the batch rather than truncating it: `results[i]` corresponds
+/// to `queries[i]`, and a body cut mid-array is not a shorter answer but
+/// an unattributable one.
+const OSV_BATCH_RESPONSE_BYTES_PER_QUERY: u64 = 128 * 1024;
+
+/// Byte ceiling on one `/v1/vulns/{id}` full-record response.
+///
+/// 4 MiB. The largest real OSV records in the ecosystems this adapter
+/// queries are a few hundred kilobytes — a GHSA touching many Maven
+/// coordinates, each with a long `versions[]` array — so this is roughly
+/// an order of magnitude of headroom over the pathological case and two
+/// or three over the typical one.
+///
+/// Capping here is doubly worth it because the body is also **cached**:
+/// without the cap, one oversized response is both read into memory and
+/// then written into the ephemeral store, where it becomes a big-key
+/// problem that outlives the request. Exceeding the cap fails this one
+/// hydration, which falls back to the abbreviated `querybatch` record
+/// and therefore fails **closed** to `Critical` severity — loud and
+/// safe, which is the right direction for a bound that might be set too
+/// tight.
+pub(crate) const OSV_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Cached payload shape
 // ---------------------------------------------------------------------------
@@ -154,6 +190,11 @@ pub struct OsvAdvisoryAdapter {
     /// Base URL for the bulk-diff path. Per-ecosystem archives live at
     /// `<bulk_url>/<ECO>/all.zip`.
     bulk_url: String,
+    /// Compressed-download ceiling for one per-ecosystem `all.zip`.
+    /// Always [`bulk::BULK_ARCHIVE_MAX_BYTES`] in production; a field
+    /// rather than a direct constant read so a test can reach the
+    /// refusal path without serving half a gigabyte.
+    bulk_archive_max_bytes: u64,
     /// Configured ecosystems for the bulk-diff path. Pre-resolved into
     /// `(label, Ecosystem)` pairs at construction so the watch tick
     /// can iterate without repeating the lookup. Unrecognised labels
@@ -206,8 +247,22 @@ impl OsvAdvisoryAdapter {
             cache_ttl: config.cache_ttl,
             batch_size: config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE),
             bulk_url: config.bulk_url,
+            bulk_archive_max_bytes: bulk::BULK_ARCHIVE_MAX_BYTES,
             bulk_ecosystems,
         })
+    }
+
+    /// Shrink the bulk-archive download ceiling.
+    ///
+    /// Test-only, and deliberately not an operator knob: the cap bounds
+    /// how much disk one untrusted response may claim, which is a
+    /// property of the process rather than a policy an operator tunes.
+    /// Tests use it to reach the refusal path with a kilobyte instead of
+    /// [`bulk::BULK_ARCHIVE_MAX_BYTES`].
+    #[cfg(test)]
+    fn with_bulk_archive_max_bytes(mut self, cap: u64) -> Self {
+        self.bulk_archive_max_bytes = cap;
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -323,12 +378,34 @@ impl OsvAdvisoryAdapter {
             )));
         }
 
-        // Use `text()` then `from_str` so we control the error path —
-        // a malformed response body surfaces as `DomainError::Validation`,
-        // which is the contract the wiremock test pins.
-        let body = resp.text().await.map_err(|e| {
-            DomainError::Invariant(format!("osv adapter: failed to read batch body: {e}"))
-        })?;
+        // Read the body under a byte cap rather than with `text()`,
+        // which buffers to EOF unconditionally. The only other bound on
+        // this read is `request_timeout`, and a timeout bounds duration:
+        // a compromised endpoint can serve more bytes than the process
+        // has memory without ever being slow.
+        //
+        // `from_str` on the capped body so a malformed response surfaces
+        // as `DomainError::Validation`, which is the contract the
+        // wiremock test pins. A cap breach is NOT that: it gets its own
+        // metric label so an operator can tell "this endpoint is serving
+        // more than we will read" from "this endpoint is broken" and
+        // from "this endpoint is unreachable".
+        let cap = OSV_BATCH_RESPONSE_BYTES_PER_QUERY.saturating_mul(asked.max(1) as u64);
+        let body = match capped::read_capped_text(resp, cap).await {
+            Ok(body) => body,
+            Err(e @ capped::CappedReadError::TooLarge { .. }) => {
+                emit_advisory_query(AdvisoryQueryResult::BodyTooLarge);
+                return Err(DomainError::Validation(format!(
+                    "osv adapter: batch response refused: {e}"
+                )));
+            }
+            Err(e) => {
+                emit_advisory_query(AdvisoryQueryResult::NetworkError);
+                return Err(DomainError::Invariant(format!(
+                    "osv adapter: failed to read batch body: {e}"
+                )));
+            }
+        };
 
         let parsed: OsvBatchResponse = serde_json::from_str(&body).map_err(|e| {
             DomainError::Validation(format!("osv adapter: malformed batch response: {e}"))
@@ -778,8 +855,15 @@ impl AdvisoryPort for OsvAdvisoryAdapter {
                 // the fetch + parse, mirroring the `observe_scan_duration`
                 // shape.
                 let started = std::time::Instant::now();
-                let outcome =
-                    pull_one_ecosystem(&self.http, &self.bulk_url, label, eco.clone(), since).await;
+                let outcome = pull_one_ecosystem(
+                    &self.http,
+                    &self.bulk_url,
+                    label,
+                    eco.clone(),
+                    since,
+                    self.bulk_archive_max_bytes,
+                )
+                .await;
                 observe_advisory_diff_duration(label, started.elapsed().as_secs_f64());
                 match outcome {
                     Ok(pull) => {
@@ -2064,6 +2148,111 @@ mod tests {
             None,
             "`ok` must not co-fire with `incomplete` — one emission per ecosystem \
              per tick: {counters:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Byte bounds on the bulk archive download
+    // ------------------------------------------------------------------
+
+    /// A bulk archive that crosses the download byte cap is a **failed
+    /// fetch**, not an incomplete walk.
+    ///
+    /// The distinction is the whole of what an operator does next.
+    /// `SkippedMembers` counts members a *completed* walk left out, and
+    /// `entry_cap_tripped` in particular says "the ecosystem outgrew
+    /// `MAX_ENTRIES_TRUSTED_BULK`, raise that cap". A download refused on
+    /// bytes never produced a walk at all: there is no member accounting
+    /// to report, and routing it through `is_incomplete` would tell the
+    /// operator to raise an entry cap that has nothing to do with it.
+    ///
+    /// Both halves matter and both are asserted: `all_ecosystems_ok` is
+    /// `false` (so the checkpoint is withheld and the window is re-read),
+    /// and the result label is `fetch_error` rather than `incomplete`.
+    #[test]
+    fn a_bulk_download_refused_on_bytes_is_a_fetch_error_not_an_incomplete_walk() {
+        // A *valid, walkable* archive, refused purely on size. Serving
+        // half a gigabyte to trip the production cap is impractical in a
+        // test, so the cap is shrunk below the fixture instead — which is
+        // the stronger fixture anyway: the bytes that arrive would parse
+        // and would yield an advisory, so anything this test observes is
+        // the cap's doing and not a malformed body's.
+        let good = bulk_record_json("GHSA-good", "npm", "lodash", "1970-01-01T00:33:20Z");
+        let zip_bytes =
+            hort_formats::archive_bounds::build_zip_bytes(&[("GHSA-good.json", good.as_str())]);
+        let cap = (zip_bytes.len() - 1) as u64;
+
+        let mut result: Option<AdvisoryDiffResult> = None;
+        let snap = capture_diff_metrics(|| async {
+            let server = wiremock::MockServer::start().await;
+            mount_bulk_archive(&server, "npm", zip_bytes).await;
+            let adapter = adapter_against_bulk(&server, "npm")
+                .await
+                .with_bulk_archive_max_bytes(cap);
+            result = Some(
+                adapter
+                    .pull_diff_since(ts(1_000))
+                    .await
+                    .expect("a refused download must not abort the whole tick"),
+            );
+        });
+        let result = result.expect("pull_diff_since ran");
+
+        assert!(
+            result.entries.is_empty(),
+            "a refused download yields no advisories"
+        );
+        assert!(
+            !result.all_ecosystems_ok,
+            "a refused download did not read the window, so the checkpoint must \
+             not advance past it"
+        );
+
+        let counters = diff_counters(snap);
+        assert_eq!(
+            counters.get(&("npm".to_string(), "fetch_error".to_string())),
+            Some(&1),
+            "a download refused on bytes is a failed fetch: {counters:?}"
+        );
+        assert_eq!(
+            counters.get(&("npm".to_string(), "incomplete".to_string())),
+            None,
+            "`incomplete` reports members a COMPLETED walk left out; a refused \
+             download produced no walk: {counters:?}"
+        );
+    }
+
+    /// Counter-test: an ordinary-sized archive still succeeds. Without
+    /// this, a cap set to zero — or a comparison inverted — would pass
+    /// the test above and fail every real pull.
+    #[test]
+    fn a_bulk_download_within_the_cap_still_succeeds() {
+        let good = bulk_record_json("GHSA-good", "npm", "lodash", "1970-01-01T00:33:20Z");
+        let zip_bytes =
+            hort_formats::archive_bounds::build_zip_bytes(&[("GHSA-good.json", good.as_str())]);
+
+        let mut result: Option<AdvisoryDiffResult> = None;
+        let snap = capture_diff_metrics(|| async {
+            let server = wiremock::MockServer::start().await;
+            mount_bulk_archive(&server, "npm", zip_bytes).await;
+            let adapter = adapter_against_bulk(&server, "npm").await;
+            result = Some(
+                adapter
+                    .pull_diff_since(ts(1_000))
+                    .await
+                    .expect("an ordinary archive must pull"),
+            );
+        });
+        let result = result.expect("pull_diff_since ran");
+
+        assert_eq!(result.entries.len(), 1, "the advisory is collected");
+        assert!(
+            result.all_ecosystems_ok,
+            "a complete reading advances the checkpoint"
+        );
+        assert_eq!(
+            diff_counters(snap).get(&("npm".to_string(), "ok".to_string())),
+            Some(&1),
         );
     }
 

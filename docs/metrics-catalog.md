@@ -2791,7 +2791,7 @@ intentionally NOT operator-tunable.
 | `hort_scan_findings_total` | counter | `scanner`, `severity` | — | `scanner ∈ {trivy, osv, advisory, …registered backend names}`; `severity ∈ {critical, high, medium, low}` |
 | `hort_scan_duration_seconds` | histogram | `scanner` | seconds | — |
 | `hort_scan_queue_depth` | gauge | (none) | rows | — |
-| `hort_advisory_query_total` | counter | `result` | — | `cache_hit`, `cache_miss`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout`, `length_mismatch` |
+| `hort_advisory_query_total` | counter | `result` | — | `cache_hit`, `cache_miss`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout`, `length_mismatch`, `body_too_large` |
 | `hort_advisory_hydration_total` | counter | `result` | — | `cache_hit`, `fetched`, `failed` |
 | `hort_sbom_extraction_total` | counter | `format`, `result` | — | `result ∈ {success, unsupported_format, parse_error, payload_unavailable}` |
 | `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, unusable_lockfile, payload_unavailable, not_applicable}` |
@@ -2906,7 +2906,7 @@ each replica; gauge semantics handle the replication so dashboards
 need no aggregation. No labels — the depth is a single global
 signal.
 
-**`hort_advisory_query_total.result` semantics** (closed taxonomy of 7;
+**`hort_advisory_query_total.result` semantics** (closed taxonomy of 8;
 emitted by `OsvAdvisoryAdapter`):
 
 - `cache_hit` — per-component lookup short-circuited on the
@@ -2937,6 +2937,22 @@ emitted by `OsvAdvisoryAdapter`):
   `upstream_4xx` / `upstream_5xx` because the request *succeeded* — a
   non-zero rate points at the upstream's batch semantics, not at its
   availability.
+- `body_too_large` — `/v1/querybatch` answered 2xx with a body that
+  crossed the adapter's byte cap (128 KiB per query sent), so none of it
+  was read. One tick per such batch. The cap exists because the only
+  other bound on that read is `request_timeout`, which bounds duration
+  rather than bytes. Its own label for the same reason as
+  `length_mismatch`: the endpoint was reached and answered, so neither
+  availability nor batch semantics is the thing to look at — the
+  response is larger than this adapter will read, which points at the
+  configured endpoint. The body is refused, never truncated.
+
+**Alert spec:** `body_too_large` SHOULD be zero at all times against
+`api.osv.dev`. Sustained non-zero means advisory enrichment is
+contributing nothing for the affected components (same fail-open
+posture as `length_mismatch`) and the configured endpoint is serving
+more than the cap admits — investigate the endpoint before raising the
+cap.
 
 **Alert spec:** `length_mismatch` SHOULD be zero at all times — the OSV
 API documents one result per query. Alert on
@@ -3174,7 +3190,7 @@ Cardinality:
   histograms in the v1 default deployment. Operators that register
   additional backends extend the axis.
 - `hort_scan_queue_depth`: 1 series (no labels).
-- `hort_advisory_query_total`: 7 result values → 7 series.
+- `hort_advisory_query_total`: 8 result values → 8 series.
 - `hort_advisory_hydration_total`: 3 result values → 3 series.
 - `hort_sbom_extraction_total`: ~15 formats × 4 results → 60 series.
 - `hort_sbom_resolution_total`: ~15 formats × 5 results → 75 series.

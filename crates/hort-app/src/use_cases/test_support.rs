@@ -4592,6 +4592,32 @@ pub struct StubFormatHandler {
     /// stand in for an OCI blob row without pulling `hort-formats` into
     /// `hort-app` (the dependency direction forbids it).
     pub provenance_constituent: bool,
+    /// The [`PayloadAccess`](hort_domain::types::PayloadAccess) variant
+    /// each `extract_wheel_metadata_bytes` call was handed, in call
+    /// order — read back through
+    /// [`StubFormatHandler::wheel_payload_shapes`].
+    ///
+    /// Which variant arrives is the whole of whether the caller holds
+    /// the artifact in memory: `Bytes` can only be built from a slice
+    /// somebody already materialised, so observing it *is* observing a
+    /// whole-artifact buffer, and observing `ReadSeek` is observing its
+    /// absence. A byte count could not tell the two apart.
+    wheel_payload_shapes: Arc<Mutex<Vec<WheelPayloadShape>>>,
+}
+
+/// Which [`PayloadAccess`](hort_domain::types::PayloadAccess) variant a
+/// caller handed [`FormatHandler::extract_wheel_metadata_bytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelPayloadShape {
+    /// `PayloadAccess::Bytes` — the caller materialised the whole
+    /// artifact before calling.
+    Bytes,
+    /// `PayloadAccess::ReadStream` — forward-only; the handler has to
+    /// buffer it to reach a ZIP's tail-indexed member table.
+    ReadStream,
+    /// `PayloadAccess::ReadSeek` — seekable and not resident, so the
+    /// handler reads the central directory plus one member.
+    ReadSeek,
 }
 
 /// Canned response shapes for the
@@ -4653,7 +4679,14 @@ impl StubFormatHandler {
             oci_membership_edges: None,
             collision_fold: false,
             provenance_constituent: false,
+            wheel_payload_shapes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Handle onto the recorded payload shapes, cloneable before the
+    /// stub is moved into an `Arc<dyn FormatHandler>`.
+    pub fn wheel_payload_shapes(&self) -> Arc<Mutex<Vec<WheelPayloadShape>>> {
+        Arc::clone(&self.wheel_payload_shapes)
     }
 
     /// Make this stub classify every artifact as a provenance
@@ -4768,8 +4801,16 @@ impl FormatHandler for StubFormatHandler {
     fn extract_wheel_metadata_bytes(
         &self,
         _coords: &ArtifactCoords,
-        _payload: hort_domain::types::PayloadAccess<'_>,
+        payload: hort_domain::types::PayloadAccess<'_>,
     ) -> DomainResult<Option<bytes::Bytes>> {
+        self.wheel_payload_shapes
+            .lock()
+            .unwrap()
+            .push(match payload {
+                hort_domain::types::PayloadAccess::Bytes(_) => WheelPayloadShape::Bytes,
+                hort_domain::types::PayloadAccess::ReadStream(_) => WheelPayloadShape::ReadStream,
+                hort_domain::types::PayloadAccess::ReadSeek(_) => WheelPayloadShape::ReadSeek,
+            });
         // No override → trait default (Ok(None)). Mirrors every
         // non-PyPI production handler.
         match &self.wheel_metadata {

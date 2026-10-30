@@ -138,7 +138,6 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::json;
-use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::Artifact;
@@ -262,12 +261,18 @@ impl WheelMetadataBackfillHandler {
     /// ingest path.
     #[tracing::instrument(skip(self, artifact), fields(artifact_id = %artifact.id))]
     async fn extract_and_persist(&self, artifact: &Artifact) -> ExtractOutcome {
-        // Re-read the wheel from CAS. The 1 MiB cap on METADATA is
-        // enforced INSIDE `extract_wheel_metadata_bytes` on the ZIP
-        // entry's header — the raw wheel bytes here are bounded only
-        // by the per-format ingest cap that applied at original
-        // ingest time (so no extra cap needed here).
-        let mut wheel_bytes: Vec<u8> = Vec::new();
+        // Re-read the wheel from CAS, spilled to a temporary file rather
+        // than buffered. The 1 MiB cap on METADATA is enforced INSIDE
+        // `extract_wheel_metadata_bytes` on the ZIP entry's header, and
+        // it bounds the member — not the wheel the member sits in.
+        //
+        // Nothing bounds the wheel: no per-format ingest size ceiling
+        // exists, and these artifacts are read out of CAS long after any
+        // inbound request limit could have applied — a pull-through
+        // ingest never had one. This loop walks a whole batch, so a
+        // buffer here would hold one unbounded artifact after another.
+        // Spilling makes memory the copy buffer and leaves the ZIP's
+        // central directory to decide how much of the file is read back.
         let mut stream = match self.storage.get(&artifact.sha256_checksum).await {
             Ok(s) => s,
             Err(err) => {
@@ -278,13 +283,16 @@ impl WheelMetadataBackfillHandler {
                 return ExtractOutcome::SkippedTransient;
             }
         };
-        if let Err(err) = stream.read_to_end(&mut wheel_bytes).await {
-            tracing::warn!(
-                error = %err,
-                "wheel-metadata-backfill: CAS stream read failed; skipping (transient)"
-            );
-            return ExtractOutcome::SkippedTransient;
-        }
+        let wheel = match crate::seekable_spill::spill_to_seekable(&mut *stream).await {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "wheel-metadata-backfill: CAS stream read failed; skipping (transient)"
+                );
+                return ExtractOutcome::SkippedTransient;
+            }
+        };
 
         // Synthesise the minimum `ArtifactCoords` the trait method
         // needs. The PyPI format handler reads `coords.path` to gate
@@ -303,14 +311,14 @@ impl WheelMetadataBackfillHandler {
 
         let extract = self
             .pypi_handler
-            .extract_wheel_metadata_bytes(&coords, PayloadAccess::Bytes(&wheel_bytes));
+            .extract_wheel_metadata_bytes(&coords, PayloadAccess::ReadSeek(Box::new(wheel)));
 
         match extract {
             Ok(Some(metadata_bytes)) => {
                 let metadata_len = metadata_bytes.len();
                 let put_result = match self
                     .storage
-                    .put(Box::new(std::io::Cursor::new(metadata_bytes.to_vec())))
+                    .put(Box::new(std::io::Cursor::new(metadata_bytes)))
                     .await
                 {
                     Ok(r) => r,
@@ -565,7 +573,7 @@ mod tests {
 
     use crate::use_cases::test_support::{
         MockArtifactRepository, MockContentReferenceIndex, MockStoragePort, StubFormatHandler,
-        WheelMetadataStubBehaviour,
+        WheelMetadataStubBehaviour, WheelPayloadShape,
     };
 
     // ---------- helpers ---------------------------------------------------
@@ -674,6 +682,55 @@ mod tests {
             storage as Arc<dyn StoragePort>,
             handler,
         )
+    }
+
+    // =====================================================================
+    // The batch read must not buffer the wheel
+    // =====================================================================
+
+    /// The backfill's per-artifact read must not materialise the wheel.
+    ///
+    /// Same observable as the ingest hook's sibling test: the
+    /// `PayloadAccess` variant is the evidence, because `Bytes` cannot
+    /// be built without a whole-artifact slice already existing.
+    ///
+    /// This path carries the hazard further than the ingest hook does.
+    /// A publish route at least bounds its request body; the backfill
+    /// reads whatever is already in CAS — including artifacts that
+    /// arrived by pull-through, where no inbound body limit ever
+    /// applied — and it does it in a batch loop, so the sizes are
+    /// consecutive rather than one per request.
+    #[tokio::test]
+    async fn run_hands_the_handler_a_seekable_payload_not_a_whole_buffer() {
+        let repo_id = Uuid::new_v4();
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let refs = Arc::new(MockContentReferenceIndex::new());
+        let storage = Arc::new(MockStoragePort::new());
+
+        let sha = put_into_cas(&storage, b"fake-wheel-bytes").await;
+        artifacts.insert(make_wheel(repo_id, 0, sha, "1.0.0"));
+
+        let stub = StubFormatHandler::new("pypi")
+            .with_wheel_metadata(WheelMetadataStubBehaviour::EmitBytes(b"METADATA".to_vec()));
+        let shapes = stub.wheel_payload_shapes();
+        let handler = WheelMetadataBackfillHandler::new(
+            artifacts as Arc<dyn ArtifactRepository>,
+            refs as Arc<dyn ContentReferenceIndex>,
+            storage as Arc<dyn StoragePort>,
+            Arc::new(stub) as Arc<dyn FormatHandler>,
+        );
+
+        handler
+            .run(&serde_json::json!({"batch_size": 4}), make_context())
+            .await
+            .expect("Ok");
+
+        assert_eq!(
+            shapes.lock().unwrap().clone(),
+            vec![WheelPayloadShape::ReadSeek],
+            "the backfill must hand the handler a seekable payload, not a \
+             materialised whole-artifact buffer",
+        );
     }
 
     // =====================================================================

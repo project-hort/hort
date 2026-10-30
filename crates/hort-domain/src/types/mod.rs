@@ -23,7 +23,7 @@ pub use finding::{
     Finding, FindingStatement, SeverityBasis,
 };
 pub use idempotency_key::IdempotencyKey;
-pub use sbom::{Ecosystem, PayloadAccess, Sbom, SbomComponent};
+pub use sbom::{Ecosystem, PayloadAccess, Sbom, SbomComponent, SeekableRead};
 
 // ---------------------------------------------------------------------------
 // PageRequest

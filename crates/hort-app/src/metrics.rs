@@ -3131,6 +3131,17 @@ pub enum AdvisoryQueryResult {
     /// result label of its own rather than folded into `upstream_4xx` /
     /// `upstream_5xx`.
     LengthMismatch,
+    /// OSV `/v1/querybatch` answered 2xx with a body that crossed the
+    /// adapter's byte cap, so none of it was read. One tick per such
+    /// batch.
+    ///
+    /// Its own label because the remedy is different from every other
+    /// failure here: the request reached the endpoint and the endpoint
+    /// answered, so neither availability (`upstream_*`, `network_error`)
+    /// nor batch semantics (`length_mismatch`) is the thing to look at —
+    /// the response is simply larger than this adapter will read, which
+    /// points at the configured endpoint.
+    BodyTooLarge,
 }
 
 impl AdvisoryQueryResult {
@@ -3145,6 +3156,7 @@ impl AdvisoryQueryResult {
             Self::NetworkError => "network_error",
             Self::Timeout => "timeout",
             Self::LengthMismatch => "length_mismatch",
+            Self::BodyTooLarge => "body_too_large",
         }
     }
 }
@@ -6889,6 +6901,10 @@ mod tests {
             super::AdvisoryQueryResult::LengthMismatch.as_str(),
             "length_mismatch"
         );
+        assert_eq!(
+            super::AdvisoryQueryResult::BodyTooLarge.as_str(),
+            "body_too_large"
+        );
     }
 
     #[test]
@@ -6901,6 +6917,7 @@ mod tests {
             super::AdvisoryQueryResult::NetworkError,
             super::AdvisoryQueryResult::Timeout,
             super::AdvisoryQueryResult::LengthMismatch,
+            super::AdvisoryQueryResult::BodyTooLarge,
         ];
         let set: HashSet<&'static str> = variants
             .iter()

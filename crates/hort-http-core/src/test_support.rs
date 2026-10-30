@@ -1834,6 +1834,31 @@ pub fn build_mock_ctx_with_label_flag(
     (ctx, mocks)
 }
 
+/// Opt-in helper that replaces the `AppContext`'s `ephemeral_durable`
+/// slot with a caller-supplied store, leaving every other port on the
+/// default mock wiring.
+///
+/// For tests that need to observe or perturb the durable store's call
+/// sequence rather than only its final state — a decorator that
+/// interleaves a second caller's write between another caller's `get`
+/// and its own write, say. That interleaving cannot be reached from
+/// outside, because the operation under test is a single `await`, so the
+/// store is the only seam.
+///
+/// The returned `MockPorts.ephemeral_durable` still points at the
+/// default in-memory store and is NOT the one the context uses; a test
+/// reaching for this helper reads state through its own store handle.
+pub fn build_mock_ctx_with_ephemeral_durable(
+    handle: PrometheusHandle,
+    durable: &Arc<dyn hort_domain::ports::ephemeral_store::EphemeralStore>,
+) -> (Arc<AppContext>, MockPorts) {
+    let (base, mocks) = build_mock_ctx(handle);
+    let ctx = rebuild(&base, |ctx| {
+        ctx.ephemeral_durable = Arc::clone(durable);
+    });
+    (ctx, mocks)
+}
+
 /// Opt-in helper that aliases both
 /// `ephemeral_evictable` and `ephemeral_durable` slots (both on the
 /// returned `AppContext` AND on both `MockPorts` handles) onto the
