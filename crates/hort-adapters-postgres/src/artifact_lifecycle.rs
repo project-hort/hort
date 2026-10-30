@@ -5,7 +5,9 @@ use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
+use hort_domain::ports::artifact_lifecycle::{
+    require_paired_artifact_stream, ArtifactLifecyclePort, IngestEnqueue,
+};
 use hort_domain::ports::content_reference_index::ContentReference;
 use hort_domain::ports::event_store::{AppendEvents, AppendResult};
 use hort_domain::ports::repo_security_score_repository::ScoreDelta;
@@ -32,6 +34,13 @@ use crate::scan_findings_repository::insert_findings_in_tx;
 /// method takes the prefix of that order it needs; no method reorders it,
 /// which is what keeps two of them running concurrently from forming a
 /// cycle.
+///
+/// Every method checks the pair's identity
+/// ([`require_paired_artifact_stream`]) **before** it opens a
+/// transaction, so a batch that is not the handed-in artifact's stream
+/// never reaches the connection. A disagreeing pair would otherwise
+/// commit atomically, which is precisely what makes the contradiction
+/// permanent rather than recoverable.
 pub struct PgArtifactLifecycle {
     event_store: Arc<PgEventStore>,
     artifact_repo: Arc<PgArtifactRepository>,
@@ -61,6 +70,7 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
     ) -> BoxFuture<'_, DomainResult<AppendResult>> {
         let artifact = artifact.clone();
         Box::pin(async move {
+            require_paired_artifact_stream(&artifact, &events)?;
             let mut uow = self.event_store.begin_unit_of_work().await?;
 
             let result = self.event_store.append_in_tx(&mut uow, events).await?;
@@ -91,6 +101,7 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
     ) -> BoxFuture<'a, DomainResult<AppendResult>> {
         let artifact = artifact.clone();
         Box::pin(async move {
+            require_paired_artifact_stream(&artifact, &events)?;
             let mut uow = self.event_store.begin_unit_of_work().await?;
 
             let result = self.event_store.append_in_tx(&mut uow, events).await?;
@@ -135,6 +146,7 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
         let rows = scan_findings_rows.to_vec();
         let components: Option<Vec<SbomComponent>> = sbom_components.map(<[_]>::to_vec);
         Box::pin(async move {
+            require_paired_artifact_stream(&artifact, &events)?;
             let mut uow = self.event_store.begin_unit_of_work().await?;
 
             let result = self.event_store.append_in_tx(&mut uow, events).await?;
@@ -243,6 +255,9 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
         let enqueues = enqueues.to_vec();
         let edges = edges.to_vec();
         Box::pin(async move {
+            // Outside the retry loop: the pair is the caller's, so a
+            // re-run would present the identical mismatch.
+            require_paired_artifact_stream(&artifact, &events)?;
             with_contention_retry(
                 "ingest transition",
                 CONTENTION_RETRY_ATTEMPTS,
@@ -330,6 +345,9 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
         events: AppendEvents,
         prior_status: QuarantineStatus,
     ) -> BoxFuture<'a, DomainResult<AppendResult>> {
+        if let Err(e) = require_paired_artifact_stream(artifact, &events) {
+            return Box::pin(async move { Err(e) });
+        }
         let artifact_id = artifact.id;
         let quarantine_status: QuarantineStatus = artifact.quarantine_status;
         let updated_at = artifact.updated_at;
