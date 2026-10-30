@@ -1203,7 +1203,8 @@ grant evaluation, which is precisely why it has no
   validated, no JWT minted. The requested/expected hosts are in the
   structured audit log (`event="oci_v2_auth_denied"`), never a label.
 - `denied` — mint path: PAT invalid / scope invalid / mint failure.
-  Consume path: `OciVerifyOutcome::Rejected` (expired / wrong aud).
+  Consume path: `OciVerifyOutcome::Rejected` (expired / wrong aud /
+  no `hort_repo_scope` claim — see `docs/auth-catalog.md` Entry 7).
   `OciVerifyOutcome::NotOurToken` is **NOT** counted `denied` — it is
   a fall-through to the IdP validator, not a denial (counting it
   would double-count against the IdP path's own telemetry).

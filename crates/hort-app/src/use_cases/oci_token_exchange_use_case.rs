@@ -31,6 +31,7 @@
 //! exact wire shape the spec mandates; the handler attaches the
 //! response.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -47,8 +48,8 @@ use hort_domain::ports::user_repository::UserRepository;
 
 use crate::metrics::labels;
 use crate::oci_token_signing::{
-    AccessEntry, OciAccessClaims, OciTokenSigningKey, SigningError, VerificationError,
-    DEFAULT_MINT_TTL,
+    AccessEntry, OciAccessClaims, OciTokenSigningKey, RepoScopeEntry, SigningError,
+    VerificationError, DEFAULT_MINT_TTL,
 };
 use crate::rbac::RbacEvaluator;
 use crate::use_cases::pat_validation_use_case::{PatValidationError, PatValidationUseCase};
@@ -341,7 +342,7 @@ impl OciTokenExchangeUseCase {
 
         // Per-scope authorization for an ANONYMOUS actor. Grant `pull`
         // iff the repo is public; nothing else is anonymously grantable.
-        let mut granted: Vec<AccessEntry> = Vec::with_capacity(parsed.len());
+        let mut granted: Vec<GrantedScope> = Vec::with_capacity(parsed.len());
         for scope in &parsed {
             match scope.resource_type {
                 ResourceType::Repository => {
@@ -356,22 +357,27 @@ impl OciTokenExchangeUseCase {
                     // or missing repo resolves to `Err` (anti-enumeration
                     // `NotFound`) → no grant, no leak. Resolve by the
                     // owning first-segment key (mirrors `evaluate_scope`
-                    // and the `/v2/*` consume route param).
+                    // and the `/v2/*` consume route param). The resolved
+                    // row carries the repository id the grant binds to —
+                    // the anonymous path gets the same per-resource
+                    // binding as the credentialed one, for no extra read.
                     let repo_key = scope_name_to_repo_key(&scope.resource_name);
-                    if self
+                    if let Ok(repo) = self
                         .repo_access
                         .resolve(repo_key, None, AccessLevel::Read)
                         .await
-                        .is_ok()
                     {
                         emit_action_metric(ScopeAction::Pull.wire_str());
-                        granted.push(AccessEntry {
-                            // Echo the FULL `resource_name` per the
-                            // Distribution Spec (only the authz lookup uses
-                            // the first segment).
-                            resource_type: scope.resource_type.wire_str().to_string(),
-                            name: scope.resource_name.clone(),
-                            actions: vec![ScopeAction::Pull.wire_str().to_string()],
+                        granted.push(GrantedScope {
+                            entry: AccessEntry {
+                                // Echo the FULL `resource_name` per the
+                                // Distribution Spec (only the authz lookup
+                                // uses the first segment).
+                                resource_type: scope.resource_type.wire_str().to_string(),
+                                name: scope.resource_name.clone(),
+                                actions: vec![ScopeAction::Pull.wire_str().to_string()],
+                            },
+                            repo_id: repo.id,
                         });
                     }
                 }
@@ -393,6 +399,7 @@ impl OciTokenExchangeUseCase {
         });
 
         // Mint the JWT with the anonymous sentinel subject.
+        let (access, hort_repo_scope) = project_granted_scopes(granted);
         let now = Utc::now();
         let exp = now
             + chrono::Duration::from_std(self.config.mint_ttl)
@@ -402,7 +409,8 @@ impl OciTokenExchangeUseCase {
             sub: Uuid::nil(),
             aud: self.config.jwt_audience.clone(),
             exp,
-            access: granted.clone(),
+            access: access.clone(),
+            hort_repo_scope: Some(hort_repo_scope),
         };
         let jwt = match self.signing_key.mint(&claims) {
             Ok(jwt) => jwt,
@@ -417,7 +425,7 @@ impl OciTokenExchangeUseCase {
             jwt,
             expires_in_secs: self.config.mint_ttl.as_secs(),
             issued_at: now,
-            granted_subset: granted,
+            granted_subset: access,
         })
     }
 
@@ -490,14 +498,14 @@ impl OciTokenExchangeUseCase {
         };
 
         // Step 4: per-scope authorization. Build the granted subset.
-        let mut granted: Vec<AccessEntry> = Vec::with_capacity(parsed.len());
+        let mut granted: Vec<GrantedScope> = Vec::with_capacity(parsed.len());
         let mut requested_action_count: usize = 0;
         let mut granted_action_count: usize = 0;
         for scope in &parsed {
             let grants = self.evaluate_scope(scope, &principal).await?;
             requested_action_count += scope.actions.len();
-            granted_action_count += grants.actions.len();
-            for action in &grants.actions {
+            granted_action_count += grants.actions().len();
+            for action in grants.actions() {
                 emit_action_metric(action);
             }
             // Empty per-scope grant = no `access[]` entry for that
@@ -506,11 +514,14 @@ impl OciTokenExchangeUseCase {
             // entry with `actions: ["pull"]` knows pull was granted
             // and push was not. An entirely-omitted entry signals
             // "nothing was granted on that resource".
-            if !grants.actions.is_empty() {
-                granted.push(AccessEntry {
-                    resource_type: scope.resource_type.wire_str().to_string(),
-                    name: scope.resource_name.clone(),
-                    actions: grants.actions,
+            if let GrantedActions::OnRepo { repo_id, actions } = grants {
+                granted.push(GrantedScope {
+                    entry: AccessEntry {
+                        resource_type: scope.resource_type.wire_str().to_string(),
+                        name: scope.resource_name.clone(),
+                        actions,
+                    },
+                    repo_id,
                 });
             }
         }
@@ -533,6 +544,7 @@ impl OciTokenExchangeUseCase {
         emit_result_metric(result_label);
 
         // Step 6: mint the JWT.
+        let (access, hort_repo_scope) = project_granted_scopes(granted);
         let now = Utc::now();
         let exp = now
             + chrono::Duration::from_std(self.config.mint_ttl)
@@ -542,7 +554,8 @@ impl OciTokenExchangeUseCase {
             sub: validation.user_id,
             aud: self.config.jwt_audience.clone(),
             exp,
-            access: granted.clone(),
+            access: access.clone(),
+            hort_repo_scope: Some(hort_repo_scope),
         };
         let jwt = match self.signing_key.mint(&claims) {
             Ok(jwt) => jwt,
@@ -565,7 +578,7 @@ impl OciTokenExchangeUseCase {
             jwt,
             expires_in_secs: self.config.mint_ttl.as_secs(),
             issued_at: now,
-            granted_subset: granted,
+            granted_subset: access,
         })
     }
 
@@ -620,7 +633,11 @@ impl OciTokenExchangeUseCase {
                         granted_actions.push(action.wire_str().to_string());
                     }
                 }
-                Ok(GrantedActions {
+                if granted_actions.is_empty() {
+                    return Ok(GrantedActions::Nothing);
+                }
+                Ok(GrantedActions::OnRepo {
+                    repo_id,
                     actions: granted_actions,
                 })
             }
@@ -655,10 +672,26 @@ impl OciTokenExchangeUseCase {
     #[tracing::instrument(skip_all)]
     pub fn verify_inbound(&self, jwt: &str) -> OciVerifyOutcome {
         match self.signing_key.verify(jwt, &self.config.jwt_audience) {
-            Ok(claims) => {
-                emit_verify_metric(VerifyResultLabel::Ok);
-                OciVerifyOutcome::Verified(Box::new(synthesize_principal_from_jwt(&claims)))
-            }
+            Ok(claims) => match synthesize_principal_from_jwt(&claims) {
+                Some(principal) => {
+                    emit_verify_metric(VerifyResultLabel::Ok);
+                    OciVerifyOutcome::Verified(Box::new(principal))
+                }
+                // Signature and `aud` are ours, but the token carries no
+                // per-repository scope claim — it cannot be minted that
+                // way today. HARD reject, NOT `NotOurToken`: the token
+                // verified against our key, so falling through to the
+                // IdP validator would be wrong on a token we issued.
+                None => {
+                    emit_verify_metric(VerifyResultLabel::Denied);
+                    tracing::info!(
+                        event = "oci_bearer_rejected",
+                        reason = "missing_resource_scope",
+                        "oci_bearer_auth: native OCI JWT rejected"
+                    );
+                    OciVerifyOutcome::Rejected(OciVerifyRejection::MissingResourceScope)
+                }
+            },
             // Not an hort-server-OCI-minted JWT (bad signature /
             // structurally not ours). Fall through to the IdP-JWT
             // validator. NOT counted `denied` — a fall-through is not
@@ -723,47 +756,81 @@ pub enum OciVerifyRejection {
     Expired,
     /// `aud` claim did not match the configured audience.
     InvalidAudience,
+    /// Correctly signed for the right audience, but the private
+    /// `hort_repo_scope` claim is absent — so the token states no
+    /// binding between the actions it grants and the repositories it
+    /// grants them on.
+    ///
+    /// Only a token minted before that claim existed can be in this
+    /// state. The answer is **fail-closed**: a 401 with the `/v2/auth`
+    /// challenge, which is the Distribution-Spec flow working as
+    /// designed — the client re-mints and retries, and a mint TTL is
+    /// minutes. Honouring the token instead would mean reviving the
+    /// flat union of `access[]` for the token's remaining life, i.e.
+    /// keeping the path where an action granted on one repository
+    /// authorises it on every other repository the token names.
+    MissingResourceScope,
 }
 
 /// Build a synthetic [`CallerPrincipal`] from the OCI JWT claims.
 ///
-/// Moved **verbatim** out of `hort-http-oci`'s
-/// `oci_bearer_auth` middleware — the format crate keeps no bespoke
-/// validation logic. It is pure (claims
-/// → principal, no I/O) and is validation logic — it belongs with the
-/// verifier in `hort-app`.
+/// Pure (claims → principal, no I/O) and validation logic, so it lives
+/// with the verifier in `hort-app` rather than in the inbound format
+/// crate, which keeps no bespoke validation.
 ///
-/// The JWT carries the granted `access[]` array — we materialise it
-/// as a [`TokenCap`] so downstream `RbacEvaluator::authorize` applies
-/// the cap leg correctly. The cap's `permissions` is the union of
-/// every action across every entry, mapped via the `pull→Read`,
-/// `push→Write`, `delete→Delete` rule. The cap's `repository_ids`
-/// stays `None` because the claims carry repo NAMES, not ids — the
-/// per-request authz at the storage layer re-resolves the name to an
-/// id and the cap leg falls through to the user's grants.
+/// The JWT's grant becomes a [`TokenCap`] so downstream
+/// `RbacEvaluator::authorize` applies the cap leg. The cap is
+/// **per-resource**: it is built from the private `hort_repo_scope`
+/// claim, which binds each action to the repository id the mint
+/// authorised it against, so an action granted on one repository does
+/// not authorise it on another. `permissions` carries the union — the
+/// flat upper bound every other cap consumer reads — and
+/// `per_repository_permissions` carries the binding that decides.
 ///
-/// This is admittedly a coarser cap than the original PAT carried
-/// (we lose the per-repo-id scoping when the repo set is wide), but
-/// it preserves the invariant "a token's permissions never
-/// widen": the JWT claims carry an upper bound on the actions the
-/// user could exercise at mint time, and `RbacEvaluator::authorize`
-/// re-resolves the user's *current* grants on every call.
-fn synthesize_principal_from_jwt(claims: &OciAccessClaims) -> CallerPrincipal {
+/// `repository_ids` stays `None`. The per-repository map already states
+/// the repository bound of this cap, and a second field restating it
+/// would be a second place to keep correct: the two could disagree, and
+/// only one of them would be consulted at any given call site. Its
+/// meaning is unchanged for every other token kind.
+///
+/// Returns `None` when `hort_repo_scope` is absent, which is a token
+/// minted before the claim existed. The caller turns that into a hard
+/// rejection — see [`OciVerifyRejection::MissingResourceScope`]. The
+/// previous behaviour, a flat union of every action across every
+/// `access[]` entry, is what that rejection exists to avoid: it let a
+/// token minted for `repository:A:push` + `repository:B:pull` write to
+/// B, because the union discarded the per-entry binding the
+/// Distribution Spec's `access` array exists to express.
+///
+/// Authority remains bounded by the user's *current* grants either way
+/// — `RbacEvaluator::authorize` re-resolves them on every call — but
+/// that bound is about the subject, not about the token: a narrow
+/// credential handed to a CI job must do what it was issued for and
+/// nothing else its subject happens to be able to do.
+fn synthesize_principal_from_jwt(claims: &OciAccessClaims) -> Option<CallerPrincipal> {
+    let repo_scope = claims.hort_repo_scope.as_ref()?;
     let mut permissions: Vec<Permission> = Vec::new();
-    for entry in &claims.access {
+    let mut per_repository: BTreeMap<Uuid, Vec<Permission>> = BTreeMap::new();
+    for entry in repo_scope {
+        let bound = per_repository.entry(entry.repo).or_default();
         for action in &entry.actions {
-            let perm = match action.as_str() {
-                "pull" => Permission::Read,
-                "push" => Permission::Write,
-                "delete" => Permission::Delete,
-                _ => continue,
+            // Unknown action strings are skipped rather than rejected:
+            // the mint only ever writes the three the parser accepts, so
+            // an unknown one is a token from a future vocabulary and
+            // dropping it is the narrowing answer.
+            let Some(perm) = ScopeAction::from_wire(action).map(ScopeAction::required_permission)
+            else {
+                continue;
             };
+            if !bound.contains(&perm) {
+                bound.push(perm);
+            }
             if !permissions.contains(&perm) {
                 permissions.push(perm);
             }
         }
     }
-    CallerPrincipal {
+    Some(CallerPrincipal {
         user_id: claims.sub,
         external_id: format!("oci-jwt:{}", claims.sub),
         username: format!("oci-jwt:{}", claims.sub),
@@ -780,8 +847,9 @@ fn synthesize_principal_from_jwt(claims: &OciAccessClaims) -> CallerPrincipal {
         token_cap: Some(TokenCap {
             permissions,
             repository_ids: None,
+            per_repository_permissions: Some(per_repository),
         }),
-    }
+    })
 }
 
 /// Normalize a `service=` / `aud` host for
@@ -850,6 +918,21 @@ pub enum ScopeAction {
 }
 
 impl ScopeAction {
+    /// Inverse of [`Self::wire_str`] — parse a Distribution-Spec action
+    /// string. `None` for anything outside `{pull, push, delete}`.
+    ///
+    /// The consume side reads actions back off the minted token, so the
+    /// string-to-action rule lives here rather than being re-typed
+    /// there: one spelling of the mapping, used in both directions.
+    fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "pull" => Some(Self::Pull),
+            "push" => Some(Self::Push),
+            "delete" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+
     fn wire_str(self) -> &'static str {
         match self {
             Self::Pull => "pull",
@@ -871,17 +954,84 @@ impl ScopeAction {
     }
 }
 
-/// Per-scope granted-actions accumulator. Kept distinct from
-/// [`AccessEntry`] so we can decide whether to push an entry into the
-/// response (empty = skip).
-struct GrantedActions {
-    actions: Vec<String>,
+/// Per-scope authorization outcome. Kept distinct from [`AccessEntry`]
+/// because an empty grant produces no `access[]` entry at all.
+///
+/// Two variants rather than a `Vec<String>` beside an `Option<Uuid>`:
+/// the minted token binds every granted action to the repository it was
+/// authorised against, and carrying the id out of the authorization step
+/// (where it is already in hand) is what makes that binding free on both
+/// sides. As separate variants there is no "actions without a
+/// repository" state to check for and fail on at mint time — the
+/// property holds by construction.
+enum GrantedActions {
+    /// Nothing was granted: a repository that missed, a resource type
+    /// that grants nothing, or every requested action denied. There is
+    /// no repository to bind to because there is no grant.
+    Nothing,
+    /// Actions granted on a resolved repository.
+    OnRepo { repo_id: Uuid, actions: Vec<String> },
 }
 
 impl GrantedActions {
     fn empty() -> Self {
-        Self { actions: vec![] }
+        Self::Nothing
     }
+
+    /// The granted actions, for the metric + grant-breadth accounting
+    /// that does not care which repository they landed on.
+    fn actions(&self) -> &[String] {
+        match self {
+            Self::Nothing => &[],
+            Self::OnRepo { actions, .. } => actions,
+        }
+    }
+}
+
+/// One granted scope as the mint resolved it: the Distribution-Spec
+/// `access[]` view and the repository id its actions were authorised
+/// against, held together so the two cannot be assembled separately.
+struct GrantedScope {
+    entry: AccessEntry,
+    repo_id: Uuid,
+}
+
+/// Project the resolved grants into the two claim views the minted JWT
+/// carries — the spec-shaped `access[]` and the private
+/// `hort_repo_scope`.
+///
+/// Both views come out of this one function from one input, so a change
+/// cannot extend one and leave the other behind. Two independently
+/// assembled views of the same grant is how mint and consume diverged
+/// before (ADR 0036).
+///
+/// `hort_repo_scope` is the per-repository **union** of the actions.
+/// Two `access[]` entries whose `resource_name`s share a first path
+/// segment resolve to the same repository — `proxy/library/alpine` and
+/// `proxy/library/nginx` are both repo `proxy` — and every
+/// consume-side gate decides against a repository, so the repository
+/// is the finest unit there is to bind to. The entries stay separate in
+/// `access[]`, which is what the client reads.
+///
+/// Claim order is by repository id (`BTreeMap`), so the same grant set
+/// mints the same claim regardless of the order the scopes arrived in.
+fn project_granted_scopes(granted: Vec<GrantedScope>) -> (Vec<AccessEntry>, Vec<RepoScopeEntry>) {
+    let mut access: Vec<AccessEntry> = Vec::with_capacity(granted.len());
+    let mut per_repo: BTreeMap<Uuid, Vec<String>> = BTreeMap::new();
+    for scope in granted {
+        let slot = per_repo.entry(scope.repo_id).or_default();
+        for action in &scope.entry.actions {
+            if !slot.iter().any(|seen| seen == action) {
+                slot.push(action.clone());
+            }
+        }
+        access.push(scope.entry);
+    }
+    let repo_scope = per_repo
+        .into_iter()
+        .map(|(repo, actions)| RepoScopeEntry { repo, actions })
+        .collect();
+    (access, repo_scope)
 }
 
 /// Parse one raw `scope=…` value. Returns the raw string on failure
@@ -1189,7 +1339,7 @@ mod tests {
     use metrics_util::{CompositeKey, MetricKind};
     use uuid::Uuid;
 
-    use hort_domain::entities::api_token::{ApiToken, TokenKind};
+    use hort_domain::entities::api_token::{cap_allows_optional_repo, ApiToken, TokenKind};
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::rbac::{GrantSubject, PermissionGrant};
     use hort_domain::entities::repository::{
@@ -2630,7 +2780,30 @@ mod tests {
         }
     }
 
+    /// Repository id the [`mint_token`] fixture binds its grant to.
+    const MINT_TOKEN_REPO: Uuid = Uuid::from_u128(0xF00D_BA12);
+
     fn mint_token(signing: &OciTokenSigningKey, aud: &str, exp_offset_secs: i64) -> String {
+        mint_token_with_scope(
+            signing,
+            aud,
+            exp_offset_secs,
+            Some(vec![RepoScopeEntry {
+                repo: MINT_TOKEN_REPO,
+                actions: vec!["pull".into(), "push".into()],
+            }]),
+        )
+    }
+
+    /// As [`mint_token`], with explicit control over the private
+    /// `hort_repo_scope` claim — `None` reproduces a token minted
+    /// before that claim existed.
+    fn mint_token_with_scope(
+        signing: &OciTokenSigningKey,
+        aud: &str,
+        exp_offset_secs: i64,
+        hort_repo_scope: Option<Vec<RepoScopeEntry>>,
+    ) -> String {
         let claims = OciAccessClaims {
             iss: "https://hort.test/v2/auth".into(),
             sub: Uuid::from_u128(0xABCDEF),
@@ -2641,6 +2814,7 @@ mod tests {
                 name: "foo/bar".into(),
                 actions: vec!["pull".into(), "push".into()],
             }],
+            hort_repo_scope,
         };
         signing.mint(&claims).expect("mint")
     }
@@ -3006,5 +3180,511 @@ mod tests {
                 })
                 .await
             })
+    }
+
+    // =================================================================
+    // Per-resource bearer scope — the minted token's resource boundary
+    // must hold on consume.
+    //
+    // The whole block drives mint (`exchange` / `exchange_anonymous`)
+    // and consume (`verify_inbound` + `RbacEvaluator::authorize`) in
+    // one test, because the defect only exists in the hand-off: each
+    // half is self-consistent on its own.
+    // =================================================================
+
+    /// Build a repository with a caller-chosen id and visibility, so a
+    /// test can assert against the exact id the mint binds to.
+    fn build_repo_with(key: &str, id: Uuid, is_public: bool) -> Repository {
+        let mut repo = build_repo(key);
+        repo.id = id;
+        repo.is_public = is_public;
+        repo
+    }
+
+    const REPO_A: Uuid = Uuid::from_u128(0x0A);
+    const REPO_B: Uuid = Uuid::from_u128(0x0B);
+
+    /// Decode a token the use case just minted, through the use case's
+    /// own signing key and audience.
+    fn decode_minted(uc: &OciTokenExchangeUseCase, jwt: &str) -> OciAccessClaims {
+        uc.signing_key
+            .verify(jwt, &uc.config.jwt_audience)
+            .expect("minted token verifies against its own key")
+    }
+
+    /// THE ACCEPTANCE CASE. A bearer minted for `repository:A:push` +
+    /// `repository:B:pull` must not authorise a write on B, and must
+    /// still authorise the write on A and the read on B.
+    ///
+    /// Driven end to end: real `exchange` mint, real `verify_inbound`
+    /// consume, real `RbacEvaluator::authorize` over the reconstituted
+    /// principal — the same evaluator every `/v2/*` gate calls.
+    #[test]
+    fn a_bearer_scoped_push_on_a_and_pull_on_b_cannot_write_b() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // The user holds Read+Write GLOBALLY, so the user-grants leg
+            // allows a write on B: only the cap can deny it. That is the
+            // point — the token, not the subject, is the boundary.
+            let (uc, tokens, users, repos) = make_use_case(
+                vec![(Permission::Read, None), (Permission::Write, None)],
+                true,
+            );
+            let (plaintext, _u) = seed_pat_row(
+                &tokens,
+                &users,
+                false,
+                vec![Permission::Read, Permission::Write, Permission::Delete],
+            );
+            repos.insert(build_repo_with("alpha", REPO_A, false));
+            repos.insert(build_repo_with("beta", REPO_B, false));
+
+            let resp = uc
+                .exchange(OciTokenExchangeRequest {
+                    plaintext_pat: plaintext,
+                    service: "hort.test".into(),
+                    scopes: vec![
+                        "repository:alpha:push".into(),
+                        "repository:beta:pull".into(),
+                    ],
+                    client_ip: Some(ip()),
+                })
+                .await
+                .expect("mint");
+
+            // Mint side: push on alpha (push implies pull), pull on beta.
+            assert_eq!(resp.granted_subset.len(), 2);
+            assert_eq!(resp.granted_subset[0].actions, vec!["pull", "push"]);
+            assert_eq!(resp.granted_subset[1].actions, vec!["pull"]);
+
+            // Consume side.
+            let principal = match uc.verify_inbound(&resp.jwt) {
+                OciVerifyOutcome::Verified(p) => *p,
+                other => panic!("expected Verified, got {other:?}"),
+            };
+            let rbac = uc.rbac.load();
+            assert!(
+                rbac.authorize(&principal, Permission::Write, Some(REPO_A)),
+                "push was granted on alpha — the write there must still be authorized"
+            );
+            assert!(
+                rbac.authorize(&principal, Permission::Read, Some(REPO_B)),
+                "pull was granted on beta — the read there must still be authorized"
+            );
+            assert!(
+                !rbac.authorize(&principal, Permission::Write, Some(REPO_B)),
+                "push was granted on alpha, NOT on beta: the bearer must not write beta"
+            );
+        });
+    }
+
+    /// Two `access[]` entries whose `resource_name`s share a first path
+    /// segment are ONE repository, and their actions bind to that
+    /// repository as a union. `access[]` keeps both entries — it is what
+    /// the client reads — while `hort_repo_scope` carries one.
+    #[test]
+    fn two_access_entries_on_one_repo_key_union_per_repo() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, tokens, users, repos) = make_use_case(
+                vec![(Permission::Read, None), (Permission::Write, None)],
+                true,
+            );
+            let (plaintext, _u) = seed_pat_row(
+                &tokens,
+                &users,
+                false,
+                vec![Permission::Read, Permission::Write, Permission::Delete],
+            );
+            repos.insert(build_repo_with("proxy", REPO_A, false));
+
+            let resp = uc
+                .exchange(OciTokenExchangeRequest {
+                    plaintext_pat: plaintext,
+                    service: "hort.test".into(),
+                    scopes: vec![
+                        "repository:proxy/library/alpine:pull".into(),
+                        "repository:proxy/library/nginx:push".into(),
+                    ],
+                    client_ip: Some(ip()),
+                })
+                .await
+                .expect("mint");
+
+            // Spec-shaped view: two entries, full names preserved.
+            assert_eq!(resp.granted_subset.len(), 2);
+            assert_eq!(resp.granted_subset[0].name, "proxy/library/alpine");
+            assert_eq!(resp.granted_subset[1].name, "proxy/library/nginx");
+
+            // Binding view: one repository, unioned actions.
+            let claims = decode_minted(&uc, &resp.jwt);
+            let scope = claims.hort_repo_scope.expect("scope claim present");
+            assert_eq!(scope.len(), 1, "both names resolve to repo `proxy`");
+            assert_eq!(scope[0].repo, REPO_A);
+            assert_eq!(scope[0].actions, vec!["pull", "push"]);
+
+            // And the consumed cap carries that union on that repo only.
+            let principal = match uc.verify_inbound(&resp.jwt) {
+                OciVerifyOutcome::Verified(p) => *p,
+                other => panic!("expected Verified, got {other:?}"),
+            };
+            let cap = principal.token_cap.as_ref().expect("cap");
+            let bound = cap
+                .per_repository_permissions
+                .as_ref()
+                .expect("per-resource cap")
+                .get(&REPO_A)
+                .expect("repo bound");
+            assert_eq!(bound, &vec![Permission::Read, Permission::Write]);
+        });
+    }
+
+    /// `access[]` and `hort_repo_scope` are two views of one grant and
+    /// must not drift: every `access[]` entry's actions appear under the
+    /// repository the scope claim names, and the scope claim carries no
+    /// repository `access[]` does not reach.
+    #[test]
+    fn access_and_scope_claim_are_two_views_of_one_grant() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, tokens, users, repos) = make_use_case(
+                vec![
+                    (Permission::Read, None),
+                    (Permission::Write, None),
+                    (Permission::Delete, None),
+                ],
+                true,
+            );
+            let (plaintext, _u) = seed_pat_row(
+                &tokens,
+                &users,
+                false,
+                vec![Permission::Read, Permission::Write, Permission::Delete],
+            );
+            repos.insert(build_repo_with("alpha", REPO_A, false));
+            repos.insert(build_repo_with("beta", REPO_B, false));
+
+            let resp = uc
+                .exchange(OciTokenExchangeRequest {
+                    plaintext_pat: plaintext,
+                    service: "hort.test".into(),
+                    scopes: vec![
+                        "repository:alpha/one:push".into(),
+                        "repository:alpha/two:delete".into(),
+                        "repository:beta:pull".into(),
+                    ],
+                    client_ip: Some(ip()),
+                })
+                .await
+                .expect("mint");
+
+            let claims = decode_minted(&uc, &resp.jwt);
+            let scope = claims.hort_repo_scope.expect("scope claim present");
+            // Rebuild the expected union from `access[]` alone and
+            // require the claim to equal it.
+            let mut expected: BTreeMap<Uuid, Vec<String>> = BTreeMap::new();
+            for entry in &claims.access {
+                let key = scope_name_to_repo_key(&entry.name);
+                let repo = match key {
+                    "alpha" => REPO_A,
+                    "beta" => REPO_B,
+                    other => panic!("unexpected repo key {other}"),
+                };
+                let slot = expected.entry(repo).or_default();
+                for a in &entry.actions {
+                    if !slot.contains(a) {
+                        slot.push(a.clone());
+                    }
+                }
+            }
+            let got: BTreeMap<Uuid, Vec<String>> =
+                scope.iter().map(|e| (e.repo, e.actions.clone())).collect();
+            assert_eq!(
+                got, expected,
+                "hort_repo_scope must be exactly the per-repo union of access[]"
+            );
+        });
+    }
+
+    /// A token with NO `hort_repo_scope` claim — the only way to hold
+    /// one is to have minted it before the claim existed — is a hard
+    /// rejection, not a fall-through. `NotOurToken` would send a token
+    /// we signed to the IdP validator; honouring it would revive the
+    /// flat union for the token's remaining life.
+    #[test]
+    fn verify_inbound_token_without_scope_claim_is_rejected_not_fallen_through() {
+        let snap = capture_async(|| async {
+            let signing = Arc::new(OciTokenSigningKey::new(
+                SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)),
+                None,
+            ));
+            let jwt = mint_token_with_scope(&signing, "hort.test", 300, None);
+            let uc = make_verify_uc(signing, "hort.test");
+            match uc.verify_inbound(&jwt) {
+                OciVerifyOutcome::Rejected(OciVerifyRejection::MissingResourceScope) => {}
+                OciVerifyOutcome::NotOurToken => {
+                    panic!("a token that verified against OUR key must not fall through")
+                }
+                other => panic!("expected Rejected(MissingResourceScope), got {other:?}"),
+            }
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_oci_auth_verify_total", &[("result", "denied")]),
+            1,
+            "a rejection is counted on the verify axis"
+        );
+        assert_eq!(
+            counter_value(&snap, "hort_oci_auth_verify_total", &[("result", "ok")]),
+            0
+        );
+    }
+
+    /// An EMPTY scope claim is not an absent one: `Some(vec![])` is a
+    /// token that was granted nothing, which verifies and confers
+    /// nothing. This is the boundary the absent-claim rejection must
+    /// not swallow — the Distribution-Spec "anonymous ping" token.
+    #[test]
+    fn verify_inbound_token_with_empty_scope_claim_verifies_and_confers_nothing() {
+        let signing = Arc::new(OciTokenSigningKey::new(
+            SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)),
+            None,
+        ));
+        let jwt = mint_token_with_scope(&signing, "hort.test", 300, Some(vec![]));
+        let uc = make_verify_uc(signing, "hort.test");
+        let principal = match uc.verify_inbound(&jwt) {
+            OciVerifyOutcome::Verified(p) => *p,
+            other => panic!("expected Verified, got {other:?}"),
+        };
+        let cap = principal.token_cap.as_ref().expect("cap");
+        assert!(cap.permissions.is_empty());
+        assert!(cap
+            .per_repository_permissions
+            .as_ref()
+            .expect("per-resource cap")
+            .is_empty());
+        assert!(!cap_allows_optional_repo(
+            Some(cap),
+            Permission::Read,
+            Some(REPO_A)
+        ));
+    }
+
+    /// A repository deleted and recreated under the same key takes a new
+    /// id, so an in-flight token's binding stops matching: the request
+    /// is denied (the fail-closed direction) rather than erroring, and
+    /// the client re-mints.
+    #[test]
+    fn a_recreated_repo_under_the_same_key_denies_an_in_flight_token() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, tokens, users, repos) = make_use_case(vec![(Permission::Read, None)], true);
+            let (plaintext, _u) = seed_pat_row(&tokens, &users, false, vec![Permission::Read]);
+            repos.insert(build_repo_with("alpha", REPO_A, false));
+
+            let resp = uc
+                .exchange(OciTokenExchangeRequest {
+                    plaintext_pat: plaintext,
+                    service: "hort.test".into(),
+                    scopes: vec!["repository:alpha:pull".into()],
+                    client_ip: Some(ip()),
+                })
+                .await
+                .expect("mint");
+            let principal = match uc.verify_inbound(&resp.jwt) {
+                OciVerifyOutcome::Verified(p) => *p,
+                other => panic!("expected Verified, got {other:?}"),
+            };
+            let rbac = uc.rbac.load();
+            assert!(rbac.authorize(&principal, Permission::Read, Some(REPO_A)));
+
+            // Recreated under the same key, new id.
+            let recreated = Uuid::from_u128(0x0A_FE);
+            repos.insert(build_repo_with("alpha", recreated, false));
+            assert!(
+                !rbac.authorize(&principal, Permission::Read, Some(recreated)),
+                "the token was bound to the OLD repository id; the new one is outside it"
+            );
+        });
+    }
+
+    /// `exchange_anonymous` on an all-private request still mints a
+    /// valid 200 with an empty `access[]`, and the resulting token
+    /// confers nothing through its cap — including on the private repo
+    /// it asked for.
+    #[test]
+    fn exchange_anonymous_all_private_mints_empty_access_conferring_nothing() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _tokens, _users, repos) = make_use_case(vec![], true);
+            repos.insert(build_repo_with("alpha", REPO_A, false));
+
+            let resp = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes: vec!["repository:alpha:pull".into()],
+                })
+                .await
+                .expect("anonymous mint is a 200, never a 401");
+            assert!(
+                resp.granted_subset.is_empty(),
+                "private repo grants nothing"
+            );
+
+            let claims = decode_minted(&uc, &resp.jwt);
+            assert_eq!(claims.sub, Uuid::nil());
+            assert_eq!(
+                claims.hort_repo_scope.as_deref(),
+                Some(&[][..]),
+                "the claim is written and empty, not absent"
+            );
+
+            let principal = match uc.verify_inbound(&resp.jwt) {
+                OciVerifyOutcome::Verified(p) => *p,
+                other => panic!("expected Verified, got {other:?}"),
+            };
+            let cap = principal.token_cap.as_ref().expect("cap");
+            assert!(!cap_allows_optional_repo(
+                Some(cap),
+                Permission::Read,
+                Some(REPO_A)
+            ));
+        });
+    }
+
+    /// The anonymous path carries the same per-resource binding as the
+    /// credentialed one — it is not the one path left with a flat cap.
+    #[test]
+    fn exchange_anonymous_binds_its_grant_to_the_public_repo_id() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _tokens, _users, repos) = make_use_case(vec![], true);
+            repos.insert(build_repo_with("pub", REPO_A, true));
+            repos.insert(build_repo_with("priv", REPO_B, false));
+
+            let resp = uc
+                .exchange_anonymous(OciAnonymousTokenRequest {
+                    service: "hort.test".into(),
+                    scopes: vec![
+                        "repository:pub/library/alpine:pull".into(),
+                        "repository:priv:pull".into(),
+                    ],
+                })
+                .await
+                .expect("mint");
+            assert_eq!(resp.granted_subset.len(), 1);
+
+            let claims = decode_minted(&uc, &resp.jwt);
+            let scope = claims.hort_repo_scope.expect("scope claim present");
+            assert_eq!(scope.len(), 1);
+            assert_eq!(scope[0].repo, REPO_A, "bound to the PUBLIC repo's id");
+            assert_eq!(scope[0].actions, vec!["pull"]);
+
+            let principal = match uc.verify_inbound(&resp.jwt) {
+                OciVerifyOutcome::Verified(p) => *p,
+                other => panic!("expected Verified, got {other:?}"),
+            };
+            let cap = principal.token_cap.as_ref().expect("cap");
+            assert!(cap_allows_optional_repo(
+                Some(cap),
+                Permission::Read,
+                Some(REPO_A)
+            ));
+            assert!(
+                !cap_allows_optional_repo(Some(cap), Permission::Read, Some(REPO_B)),
+                "the private repo was never granted, so the cap must not reach it"
+            );
+        });
+    }
+
+    /// Reading the scope claim back is narrowing on every input it does
+    /// not recognise: an action string outside `{pull, push, delete}` is
+    /// dropped rather than admitted or treated as a reason to reject the
+    /// whole token, and a repeated action adds nothing twice.
+    #[test]
+    fn consumed_scope_claim_drops_unknown_actions_and_dedupes() {
+        let signing = Arc::new(OciTokenSigningKey::new(
+            SigningKey::generate(&mut rand::rand_core::UnwrapErr(rand::rngs::SysRng)),
+            None,
+        ));
+        let jwt = mint_token_with_scope(
+            &signing,
+            "hort.test",
+            300,
+            Some(vec![
+                RepoScopeEntry {
+                    repo: REPO_A,
+                    // `teleport` is not an action this system mints;
+                    // `pull` twice is the dedup path.
+                    actions: vec![
+                        "pull".into(),
+                        "teleport".into(),
+                        "pull".into(),
+                        "push".into(),
+                    ],
+                },
+                RepoScopeEntry {
+                    repo: REPO_B,
+                    // `pull` again, this time already in the flat union.
+                    actions: vec!["pull".into()],
+                },
+            ]),
+        );
+        let uc = make_verify_uc(signing, "hort.test");
+        let principal = match uc.verify_inbound(&jwt) {
+            OciVerifyOutcome::Verified(p) => *p,
+            other => panic!("expected Verified, got {other:?}"),
+        };
+        let cap = principal.token_cap.as_ref().expect("cap");
+        assert_eq!(cap.permissions, vec![Permission::Read, Permission::Write]);
+        let per_repo = cap
+            .per_repository_permissions
+            .as_ref()
+            .expect("per-resource cap");
+        assert_eq!(
+            per_repo.get(&REPO_A),
+            Some(&vec![Permission::Read, Permission::Write])
+        );
+        assert_eq!(per_repo.get(&REPO_B), Some(&vec![Permission::Read]));
+        // The unknown action conferred nothing anywhere.
+        assert!(!cap_allows_optional_repo(
+            Some(cap),
+            Permission::Delete,
+            Some(REPO_A)
+        ));
+    }
+
+    /// `project_granted_scopes` is the single projection both views come
+    /// from: claim order is by repository id, so the same grant set
+    /// mints the same claim whatever order the scopes arrived in.
+    #[test]
+    fn project_granted_scopes_is_order_independent_in_the_claim() {
+        let entry = |name: &str, actions: Vec<&str>| AccessEntry {
+            resource_type: "repository".into(),
+            name: name.into(),
+            actions: actions.into_iter().map(str::to_string).collect(),
+        };
+        let forward = vec![
+            GrantedScope {
+                entry: entry("alpha", vec!["pull"]),
+                repo_id: REPO_A,
+            },
+            GrantedScope {
+                entry: entry("beta", vec!["pull", "push"]),
+                repo_id: REPO_B,
+            },
+        ];
+        let reverse = vec![
+            GrantedScope {
+                entry: entry("beta", vec!["pull", "push"]),
+                repo_id: REPO_B,
+            },
+            GrantedScope {
+                entry: entry("alpha", vec!["pull"]),
+                repo_id: REPO_A,
+            },
+        ];
+        let (access_f, scope_f) = project_granted_scopes(forward);
+        let (access_r, scope_r) = project_granted_scopes(reverse);
+        // `access[]` keeps the client's order; the binding claim does not.
+        assert_eq!(access_f.len(), 2);
+        assert_eq!(access_r.len(), 2);
+        assert_ne!(access_f[0].name, access_r[0].name);
+        assert_eq!(scope_f, scope_r);
+        assert_eq!(scope_f[0].repo, REPO_A);
+        assert_eq!(scope_f[1].repo, REPO_B);
     }
 }

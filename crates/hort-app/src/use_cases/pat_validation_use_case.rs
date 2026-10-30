@@ -659,6 +659,7 @@ impl PatValidationUseCase {
             token_cap: TokenCap {
                 permissions: token.declared_permissions.clone(),
                 repository_ids: token.repository_ids.clone(),
+                per_repository_permissions: None,
             },
             expires_at: token.expires_at,
             revoked_at: token.revoked_at,
@@ -1911,6 +1912,7 @@ mod tests {
                 token_cap: TokenCap {
                     permissions: vec![Permission::Read],
                     repository_ids: None,
+                    per_repository_permissions: None,
                 },
                 expires_at: None,
                 revoked_at: Some(t0()),
@@ -1940,6 +1942,7 @@ mod tests {
                 token_cap: TokenCap {
                     permissions: vec![Permission::Read],
                     repository_ids: None,
+                    per_repository_permissions: None,
                 },
                 expires_at: Some(t0() - ChronoDuration::seconds(1)),
                 revoked_at: None,
@@ -1970,6 +1973,7 @@ mod tests {
                 token_cap: TokenCap {
                     permissions: vec![Permission::Read],
                     repository_ids: None,
+                    per_repository_permissions: None,
                 },
                 expires_at: None,
                 revoked_at: None,
@@ -2010,6 +2014,7 @@ mod tests {
                 token_cap: TokenCap {
                     permissions: vec![Permission::Read],
                     repository_ids: None,
+                    per_repository_permissions: None,
                 },
                 // Expires 60s after t0; advance >60s to trip.
                 expires_at: Some(t0() + ChronoDuration::seconds(60)),
@@ -2355,6 +2360,7 @@ mod tests {
             token_cap: TokenCap {
                 permissions: vec![],
                 repository_ids: None,
+                per_repository_permissions: None,
             },
             expires_at: None,
             revoked_at: None,

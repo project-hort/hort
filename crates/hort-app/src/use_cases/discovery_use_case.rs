@@ -557,6 +557,7 @@ mod tests {
         c.token_cap = Some(TokenCap {
             permissions: cap,
             repository_ids: None,
+            per_repository_permissions: None,
         });
         c
     }

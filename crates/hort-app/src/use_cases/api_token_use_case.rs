@@ -5237,6 +5237,7 @@ mod tests {
             token_cap: Some(hort_domain::entities::api_token::TokenCap {
                 permissions: full_admin_cap(),
                 repository_ids: None,
+                per_repository_permissions: None,
             }),
         }
     }

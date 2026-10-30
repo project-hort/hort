@@ -6,9 +6,9 @@
 //! - [`build_http_client`] — the canonical `reqwest::Client` builder used
 //!   by every OIDC outbound HTTP request. Centralises:
 //!   - extra-CA-bundle layering (ADR 0010),
-//!   - the redirect policy: every hop stays on the host of the URL the
-//!     fetch was asked for, within a cap of 3 hops
-//!     ([`same_host_redirect_policy`]),
+//!   - the redirect policy: every hop stays on the ORIGIN (scheme and
+//!     host) of the URL the fetch was asked for, within a cap of 3 hops
+//!     ([`same_origin_redirect_policy`]),
 //!   - per-client timeout,
 //!   - TLS version pin: TLS 1.3 preferred, TLS 1.2 accepted
 //!     (BSI TR-02102-2, ADR 0010).
@@ -17,6 +17,8 @@
 //!   misconfigured IdP returns an unbounded body).
 //! - [`hosts_match`] — the crate's single host-equality predicate, shared
 //!   by the pre-fetch `jwks_uri` binding and the per-hop redirect binding.
+//! - [`check_hop_bound_to_origin`] — the per-hop origin binding the
+//!   redirect policy applies, as a pure predicate over two parsed URLs.
 //! - [`HTTP_DEFAULT_TIMEOUT`] / [`HTTP_MAX_REDIRECTS`] /
 //!   [`OUTBOUND_TLS_MIN_VERSION`] / [`OUTBOUND_TLS_MAX_VERSION`] —
 //!   constants shared across both adapters.
@@ -58,8 +60,8 @@ pub(crate) const HTTP_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// reqwest's default of 10 is too generous.
 ///
 /// The cap bounds *how many* hops; it says nothing about *where* they
-/// point — that is [`same_host_redirect_policy`]'s host leg, which the
-/// cap is nested inside. Neither property substitutes for the other.
+/// point — that is [`same_origin_redirect_policy`]'s origin legs, which
+/// the cap is nested inside. Neither property substitutes for the other.
 pub(crate) const HTTP_MAX_REDIRECTS: usize = 3;
 
 /// Outbound TLS version floor — pinned to TLS 1.2 per BSI TR-02102-2 §3
@@ -76,12 +78,12 @@ pub(crate) const OUTBOUND_TLS_MAX_VERSION: reqwest::tls::Version = reqwest::tls:
 
 /// The crate's single host-equality predicate.
 ///
-/// Both OIDC host bindings ask the same question, so they are one
+/// Both OIDC origin bindings ask the same host question, so they are one
 /// comparison with one rationale:
 ///
 /// 1. [`check_jwks_uri_bound`] — does the discovery-declared `jwks_uri`
 ///    sit on the issuer's host?
-/// 2. [`same_host_redirect_policy`] — does this redirect hop sit on the
+/// 2. [`check_hop_bound_to_origin`] — does this redirect hop sit on the
 ///    host of the URL the fetch was asked for?
 ///
 /// Two host comparisons with the same intent is how the two halves of one
@@ -89,8 +91,12 @@ pub(crate) const OUTBOUND_TLS_MAX_VERSION: reqwest::tls::Version = reqwest::tls:
 /// sites.
 ///
 /// **Hosts, not URLs.** A legitimate discovery document, or an IdP's own
-/// internal rewrite, may serve the same host on a different scheme, port
-/// or path — a *different host* is the vector. Callers therefore pass
+/// internal rewrite, may serve the same host on a different port or path,
+/// and both bindings tolerate that. The **scheme** is not in that
+/// tolerated set: each of those same two call sites binds it separately
+/// and with equal force, because a transport change mid-fetch is authored
+/// by the upstream whose `Location` header (or discovery document) is the
+/// untrusted input the binding exists to contain. Callers therefore pass
 /// parsed `Url::host_str()` values, never raw URL strings.
 ///
 /// **Case-insensitive.** `url::Url` already lower-cases registered domain
@@ -100,19 +106,125 @@ fn hosts_match(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
-/// The OIDC redirect policy: **every hop stays on the host of the URL the
-/// fetch was asked for**, within [`HTTP_MAX_REDIRECTS`] hops.
+/// Why a redirect hop was refused by [`same_origin_redirect_policy`].
+///
+/// Two refusals rather than one because the only thing that survives to
+/// tell them apart — from each other and from the hop cap — is the text
+/// that rides as the `source()` of reqwest's `Redirect`-kind error. The
+/// split mirrors [`JwksUriCheckError`]'s on the pre-fetch side of the
+/// same property: [`HopRefusal::OffHost`] ↔
+/// [`JwksUriCheckError::OffHost`], [`HopRefusal::SchemeChanged`] ↔
+/// [`JwksUriCheckError::SchemeMismatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HopRefusal {
+    /// The hop does not sit on the host of the URL the fetch was asked
+    /// for — or one of the two URLs has no host component at all, which
+    /// is the same refusal because a hop with nothing to bind to fails
+    /// closed.
+    OffHost,
+    /// The hop sits on the requested host but does not speak the
+    /// requested scheme. An `https` fetch that a `Location` header moves
+    /// to `http` on the same host reads the keys that decide every
+    /// token's validity in cleartext, on a path the issuer's own
+    /// transport was chosen to rule out.
+    SchemeChanged,
+}
+
+impl HopRefusal {
+    /// The refusal text handed to `reqwest::redirect::Attempt::error`.
+    /// Distinct per variant, and distinct from reqwest's own
+    /// `too many redirects` cap text.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OffHost => "redirect target is not on the requested host",
+            Self::SchemeChanged => "redirect target changes the scheme of the requested origin",
+        }
+    }
+}
+
+/// `scheme://host` of `url`, for a refusal log line. Path and query of an
+/// upstream `Location` are upstream-controlled, so the line carries only
+/// the two components the binding actually compares.
+fn origin_for_log(url: &url::Url) -> String {
+    format!(
+        "{}://{}",
+        url.scheme(),
+        url.host_str().unwrap_or("<no-host>")
+    )
+}
+
+/// Bind one redirect hop to the origin the fetch was asked for: the hop's
+/// HOST and its SCHEME must both equal the requested URL's.
+///
+/// `requested` is `attempt.previous().first()` — the URL **this request**
+/// was asked for (see [`same_origin_redirect_policy`] § Per request, not
+/// per client). `None` fails closed: a chain with no origin to bind to is
+/// refused.
+///
+/// # Origin here is (scheme, host) — deliberately not the port
+///
+/// RFC 6454's origin triple includes the port; this binding drops it,
+/// because an IdP's own internal rewrite legitimately moves between ports
+/// on one host (`https://idp/realms/x` → `https://idp:8443/keys`) and
+/// refusing that rejects the operator's own issuer — the same reasoning
+/// [`hosts_match`] records for the pre-fetch leg. The scheme is a
+/// different matter: no legitimate deployment needs the transport to
+/// change halfway through one fetch.
+///
+/// # Equality, not a no-downgrade test — and not `https_only`
+///
+/// A scheme change in EITHER direction leaves the origin that was bound,
+/// so both are refused. `ClientBuilder::https_only(true)` would close the
+/// HTTPS→HTTP downgrade but binds nothing to an origin, and it forbids the
+/// plain-HTTP issuer that the canonical in-cluster deployment runs on and
+/// that [`check_jwks_uri_bound`] deliberately permits. Equality in the
+/// policy keeps both properties: an `http` issuer stays on `http`, an
+/// `https` issuer stays on `https`, and neither can be moved by a
+/// `Location` header.
+fn check_hop_bound_to_origin(
+    requested: Option<&url::Url>,
+    next: &url::Url,
+) -> Result<(), HopRefusal> {
+    let Some(requested) = requested else {
+        return Err(HopRefusal::OffHost);
+    };
+    match (requested.host_str(), next.host_str()) {
+        (Some(from), Some(to)) if hosts_match(from, to) => {}
+        _ => return Err(HopRefusal::OffHost),
+    }
+    // Same comparison and same rationale as `check_jwks_uri_bound`'s
+    // scheme leg, on the hop instead of the declared URL: `Url::parse`
+    // has already normalised both schemes to lower case.
+    if requested.scheme() != next.scheme() {
+        return Err(HopRefusal::SchemeChanged);
+    }
+    Ok(())
+}
+
+/// The OIDC redirect policy: **every hop stays on the origin — scheme and
+/// host — of the URL the fetch was asked for**, within
+/// [`HTTP_MAX_REDIRECTS`] hops.
 ///
 /// # Why the hop cap alone was not enough
 ///
 /// [`check_jwks_uri_bound`] binds the discovery-*declared* `jwks_uri` to
-/// the issuer's host, but it can only see a URL — it cannot see a
+/// the issuer's origin, but it can only see a URL — it cannot see a
 /// redirect. A bare `Policy::limited(n)` is the mirror image: it counts
-/// hops and is blind to hosts. So a `302` from the issuer's own host (or
-/// from anything that can answer for it) moved the fetch to any host at
-/// all within the cap, and the keys that decide every token's validity
-/// were then read from there. Neither half owned the property; this
-/// policy owns it across the two.
+/// hops and is blind to where they point. So a `302` from the issuer's own
+/// host (or from anything that can answer for it) moved the fetch to any
+/// host at all within the cap, and the keys that decide every token's
+/// validity were then read from there. Neither half owned the property;
+/// this policy owns it across the two.
+///
+/// # Both legs of the origin, because the host leg alone was not enough
+///
+/// Binding the host and leaving the scheme free left a hop from
+/// `https://<issuer>/…` to `http://<issuer>/…` on the bound host, and it
+/// was followed in cleartext. The client sets no `https_only`, and the
+/// pre-fetch scheme binding in [`check_jwks_uri_bound`] runs *before* the
+/// fetch, so a `Location` header arrives after the only control that had
+/// ever compared schemes. [`check_hop_bound_to_origin`] carries that
+/// comparison onto every hop.
 ///
 /// # Both OIDC fetches are covered
 ///
@@ -141,8 +253,8 @@ fn hosts_match(a: &str, b: &str) -> bool {
 ///
 /// # Outcome shape
 ///
-/// A cross-host attempt fails the redirect with [`reqwest::Error`] of kind
-/// `Redirect`, so the caller's `send().await` returns `Err` and
+/// An off-origin attempt fails the redirect with [`reqwest::Error`] of
+/// kind `Redirect`, so the caller's `send().await` returns `Err` and
 /// [`get_capped_body`] classifies it as [`CappedBodyError::FetchFailed`] —
 /// which both paths already map onto their existing JWKS-fetch rejection
 /// (single-issuer → `OidcValidationError::IdpUnavailable`; multi-issuer →
@@ -160,57 +272,57 @@ fn hosts_match(a: &str, b: &str) -> bool {
 /// The hop cap is unchanged and still reqwest's own
 /// `Policy::limited(HTTP_MAX_REDIRECTS)`, delegated to below via the
 /// documented `Policy::redirect` wrapping hook — same construction, same
-/// `TooManyRedirects` error. The two refusals are distinguishable by how
-/// deep the chain got: a cross-host refusal stops at the first hop, a cap
-/// breach only after three were followed.
+/// `TooManyRedirects` error. The three refusals are distinguishable two
+/// ways: by the `source()` text ([`HopRefusal::as_str`] per leg, reqwest's
+/// own `too many redirects` for the cap), and by how deep the chain got —
+/// an origin refusal stops at the first hop, a cap breach only after
+/// three were followed.
 ///
 /// # No routability leg
 ///
-/// A hop that stays on the issuer's host is exactly as internal as the
+/// A hop that stays on the issuer's origin is exactly as internal as the
 /// issuer itself, and in the canonical deployment the IdP *is* internal
 /// (Keycloak in-cluster on an RFC 1918 address) — so an address-based
 /// control rejects the operator's own issuer and nothing else. See
 /// [`check_jwks_uri_bound`]'s `# Why no routability leg`. A redirect to a
 /// *different* internal service is precisely what the same-host binding
 /// refuses, without consulting an address.
-fn same_host_redirect_policy() -> reqwest::redirect::Policy {
+fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
     let hop_cap = reqwest::redirect::Policy::limited(HTTP_MAX_REDIRECTS);
     reqwest::redirect::Policy::custom(move |attempt| {
         // `previous()[0]` is the URL the caller asked for; the entries
-        // after it are the hops already taken. A chain with no origin to
-        // bind to, or a hop URL with no host component, fails closed.
-        let requested_host = attempt.previous().first().and_then(|u| u.host_str());
-        let redirect_host = attempt.url().host_str();
-        let on_requested_host = match (requested_host, redirect_host) {
-            (Some(requested), Some(next)) => hosts_match(requested, next),
-            _ => false,
-        };
-        if !on_requested_host {
+        // after it are the hops already taken.
+        let requested = attempt.previous().first();
+        if let Err(refusal) = check_hop_bound_to_origin(requested, attempt.url()) {
             // reqwest's `Display` for a redirect error prints only
             // "error following redirect for url (...)" — the cause lives
             // in `source()` — so without this line the operator cannot
-            // tell a host refusal from a cap breach. Mirrors the
-            // `warn!` both call sites already emit for the pre-fetch
-            // `jwks_uri` rejection. Hosts only, so nothing upstream-
-            // controlled beyond a hostname reaches the log; no credential
-            // ever rides an OIDC discovery/JWKS fetch in the first place.
+            // tell one origin refusal from the other, or either from a cap
+            // breach. Mirrors the `warn!` both call sites already emit for
+            // the pre-fetch `jwks_uri` rejection. Scheme and host only, so
+            // nothing upstream-controlled beyond an origin reaches the
+            // log; no credential ever rides an OIDC discovery/JWKS fetch
+            // in the first place.
             warn!(
-                requested_host,
-                redirect_host, "oidc fetch refused a redirect off the requested host"
+                requested_origin = %requested
+                    .map_or_else(|| "<none>".to_string(), origin_for_log),
+                hop_origin = %origin_for_log(attempt.url()),
+                refusal = refusal.as_str(),
+                "oidc fetch refused a redirect off the requested origin"
             );
             // The cause rides as the `source()` of a `Redirect`-kind
             // `reqwest::Error`, the same place reqwest puts its own
             // `TooManyRedirects` — not as a new variant on any error type
             // this crate exposes.
-            return attempt.error("redirect target is not on the requested host");
+            return attempt.error(refusal.as_str());
         }
         hop_cap.redirect(attempt)
     })
 }
 
-/// Build the canonical OIDC `reqwest::Client` with extra-CA, the same-host
-/// redirect policy (host binding + 3-hop cap), timeout, and TLS-version
-/// pin all layered consistently. Used by both the `OidcProvider`
+/// Build the canonical OIDC `reqwest::Client` with extra-CA, the
+/// same-origin redirect policy (scheme + host binding + 3-hop cap),
+/// timeout, and TLS-version pin all layered consistently. Used by both the `OidcProvider`
 /// (single-issuer user-login) and the `MultiIssuerJwksValidator`
 /// (workload federation).
 ///
@@ -237,7 +349,7 @@ pub(crate) fn build_http_client(
         extra_ca::apply_to_reqwest_builder(reqwest::Client::builder(), extra_trust_anchors)?;
     builder
         .timeout(HTTP_DEFAULT_TIMEOUT)
-        .redirect(same_host_redirect_policy())
+        .redirect(same_origin_redirect_policy())
         .min_tls_version(OUTBOUND_TLS_MIN_VERSION)
         .max_tls_version(OUTBOUND_TLS_MAX_VERSION)
         .build()
@@ -358,8 +470,14 @@ pub(crate) enum JwksUriCheckError {
 ///
 /// **Same-host binding.** `jwks_uri`'s HOST must equal `issuer_url`'s
 /// HOST, via the crate's one host predicate [`hosts_match`] — which
-/// documents why the comparison is host-only and case-insensitive, and is
-/// the same predicate [`same_host_redirect_policy`] applies per hop.
+/// documents why port and path are tolerated and why the comparison is
+/// case-insensitive, and is the same predicate
+/// [`check_hop_bound_to_origin`] applies per hop.
+///
+/// **Scheme binding.** `jwks_uri`'s SCHEME must equal `issuer_url`'s, for
+/// the reason recorded on [`JwksUriCheckError::SchemeMismatch`]. The
+/// per-hop binding carries the same comparison onto every hop the fetch
+/// then takes.
 ///
 /// # What this check does and does not reach
 ///
@@ -369,7 +487,7 @@ pub(crate) enum JwksUriCheckError {
 /// together, and both are required:
 ///
 /// 1. this function, on the URL the discovery document declares, and
-/// 2. [`same_host_redirect_policy`], on every hop of the fetch that
+/// 2. [`same_origin_redirect_policy`], on every hop of the fetch that
 ///    follows.
 ///
 /// # Why no routability leg
@@ -382,8 +500,8 @@ pub(crate) enum JwksUriCheckError {
 /// issuer's own host resolves internally, so the routability leg rejected
 /// every auth attempt with `idp_unavailable`. Given the same-host binding
 /// — which, together with the per-hop binding in
-/// [`same_host_redirect_policy`], pins the fetch to the issuer's own host
-/// so a compromised discovery document can redirect it neither by
+/// [`same_origin_redirect_policy`], pins the fetch to the issuer's own
+/// origin so a compromised discovery document can redirect it neither by
 /// declaration nor by `Location` header — `is_routable` only ever rejects
 /// the operator's own trusted issuer host for negligible security
 /// benefit. Same-host binding is the load-bearing SSRF control;
@@ -559,11 +677,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `same_host_redirect_policy`: every hop stays on the host of the URL
-    // the fetch was asked for. Asserted at the helper boundary, so the
-    // classification (`CappedBodyError::FetchFailed`) is pinned where both
-    // adapters consume it. The foreign target is a LIVE wiremock on
-    // `127.0.0.2` carrying `.expect(0)`.
+    // `same_origin_redirect_policy`: every hop stays on the ORIGIN —
+    // scheme and host — of the URL the fetch was asked for. Asserted at
+    // the helper boundary, so the classification
+    // (`CappedBodyError::FetchFailed`) is pinned where both adapters
+    // consume it. The foreign target is a LIVE wiremock on `127.0.0.2`
+    // carrying `.expect(0)`.
     // -----------------------------------------------------------------
 
     #[tokio::test]
@@ -650,6 +769,268 @@ mod tests {
             .expect("a same-host redirect must still be followed");
         assert_eq!(&out[..], b"same-host-body");
         server.verify().await;
+    }
+
+    /// Walk the cause chain reqwest hung off the redirect error.
+    ///
+    /// reqwest's `Display` for a redirect error prints only
+    /// "error following redirect for url (...)" and drops the cause, so
+    /// the leg that refused — and the hop cap's own `too many redirects` —
+    /// are readable only here. This is the mechanism the policy's refusal
+    /// strings exist for.
+    fn refusal_cause(err: &reqwest::Error) -> String {
+        let mut causes = Vec::new();
+        let mut next: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+        while let Some(cause) = next {
+            causes.push(cause.to_string());
+            next = cause.source();
+        }
+        causes.join(" | ")
+    }
+
+    #[tokio::test]
+    async fn each_redirect_refusal_names_the_leg_that_refused() {
+        // Three refusals from one client, asserted together because the
+        // property is that they are TOLD APART: an operator reading a log
+        // (and the assertions in this file) must be able to distinguish a
+        // scheme change from an off-host hop and both from a hop-cap
+        // breach, and the `source()` text is the only carrier that
+        // survives. Driven through the client directly rather than
+        // `get_capped_body`, which folds every send error into one
+        // `FetchFailed(String)` built from reqwest's cause-less `Display`.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let foreign = start_server_on_foreign_loopback_host().await;
+        let server = MockServer::start().await;
+        let base = server.uri();
+        assert_ne!(
+            host_of(&base),
+            host_of(&foreign.uri()),
+            "the two mock servers must sit on different host literals"
+        );
+
+        // (1) off-host: same scheme, different host.
+        Mock::given(method("GET"))
+            .and(path("/off-host"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/keys", foreign.uri()).as_str()),
+            )
+            .mount(&server)
+            .await;
+        // (2) scheme change: the SAME host and the SAME port, `https`
+        // instead of `http` — the host leg cannot refuse this, so if the
+        // cause below names the scheme leg then the scheme leg is what
+        // ran. (The target speaks plain HTTP, so a followed hop would
+        // fail the TLS handshake instead and surface a connect-kind
+        // cause — which is exactly why the assertion is on the cause and
+        // not merely on "it errored".)
+        let scheme_swapped = base.replacen("http://", "https://", 1);
+        assert!(
+            scheme_swapped.starts_with("https://") && base.starts_with("http://"),
+            "the swap must actually change the scheme, or this leg silently \
+             becomes a same-origin hop: {base} -> {scheme_swapped}"
+        );
+        Mock::given(method("GET"))
+            .and(path("/scheme"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{scheme_swapped}/keys").as_str()),
+            )
+            .mount(&server)
+            .await;
+        // (3) hop cap: every hop on the requested origin, five deep.
+        for i in 0..5 {
+            Mock::given(method("GET"))
+                .and(path(format!("/hop/{i}")))
+                .respond_with(
+                    ResponseTemplate::new(302)
+                        .insert_header("Location", format!("{base}/hop/{}", i + 1).as_str()),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let client = build_http_client(None).expect("client builds");
+        let mut causes = Vec::new();
+        for leg in ["off-host", "scheme", "hop/0"] {
+            let err = client
+                .get(format!("{base}/{leg}"))
+                .send()
+                .await
+                .expect_err("every chain above must be refused");
+            assert!(
+                err.is_redirect(),
+                "{leg}: refusal must be reqwest's redirect kind, got {err:?}"
+            );
+            causes.push(refusal_cause(&err));
+        }
+
+        assert!(
+            causes[0].contains(HopRefusal::OffHost.as_str()),
+            "off-host cause must name the host leg: {}",
+            causes[0]
+        );
+        assert!(
+            causes[1].contains(HopRefusal::SchemeChanged.as_str()),
+            "same-host scheme change must name the scheme leg, not a TLS \
+             or connect failure: {}",
+            causes[1]
+        );
+        assert!(
+            causes[2].contains("too many redirects"),
+            "a same-origin chain past the cap must be cut by reqwest's own \
+             cap, not by either origin leg: {}",
+            causes[2]
+        );
+        assert_ne!(causes[0], causes[1], "the two origin legs must differ");
+        assert_ne!(causes[1], causes[2], "a scheme refusal is not a cap breach");
+    }
+
+    // -----------------------------------------------------------------
+    // `check_hop_bound_to_origin`: the per-hop binding as a pure
+    // predicate. The live tests above drive it through reqwest, which can
+    // only reach the scheme leg in one direction (wiremock speaks plain
+    // HTTP, so an `https` *requested* URL needs the TLS harness in
+    // `lib.rs`). Here both directions are stated directly, which is also
+    // where the "equality, not no-downgrade" rule is written down.
+    // -----------------------------------------------------------------
+
+    /// Parse helper: every input below is a literal the test author
+    /// controls, so a parse failure is a broken test, not a case.
+    fn u(raw: &str) -> url::Url {
+        url::Url::parse(raw).expect("test url literal parses")
+    }
+
+    #[test]
+    fn hop_bound_to_origin_accepts_the_same_origin_on_another_port_and_path() {
+        // The tolerated difference: an IdP's own rewrite may move between
+        // ports and paths on one host. Refusing this rejects the
+        // operator's own issuer, which is why the bound tuple is
+        // (scheme, host) and not RFC 6454's full triple.
+        check_hop_bound_to_origin(
+            Some(&u("https://idp.example.com/realms/x")),
+            &u("https://idp.example.com:8443/keys"),
+        )
+        .expect("same scheme + host on another port/path must be followed");
+    }
+
+    #[test]
+    fn hop_bound_to_origin_accepts_a_case_differing_host() {
+        // Host equality is the crate's one case-insensitive predicate.
+        check_hop_bound_to_origin(
+            Some(&u("https://IDP.EXAMPLE.COM/realms/x")),
+            &u("https://idp.example.com/keys"),
+        )
+        .expect("host match must be case-insensitive");
+    }
+
+    #[test]
+    fn hop_bound_to_origin_refuses_another_host() {
+        assert_eq!(
+            check_hop_bound_to_origin(
+                Some(&u("https://idp.example.com/realms/x")),
+                &u("https://attacker.example.net/keys"),
+            ),
+            Err(HopRefusal::OffHost)
+        );
+    }
+
+    #[test]
+    fn hop_bound_to_origin_refuses_an_https_to_http_downgrade_on_the_same_host() {
+        // The hop stays on the bound host, so the host leg cannot refuse
+        // it, and the keys that decide every token's validity would be
+        // read in cleartext. The pre-fetch `jwks_uri` scheme binding
+        // cannot reach this either — a `Location` header arrives after it
+        // has run.
+        assert_eq!(
+            check_hop_bound_to_origin(
+                Some(&u("https://idp.example.com/realms/x")),
+                &u("http://idp.example.com/realms/x/certs"),
+            ),
+            Err(HopRefusal::SchemeChanged)
+        );
+    }
+
+    #[test]
+    fn hop_bound_to_origin_refuses_an_http_to_https_upgrade_on_the_same_host() {
+        // Equality, not a no-downgrade test. An `http` issuer that a
+        // `Location` header moves to `https` has also left the origin the
+        // fetch was bound to, and the party that moved it is the upstream
+        // whose header is the untrusted input. Refusing both directions is
+        // what makes the rule a binding rather than a floor; a floor is
+        // what `https_only(true)` would be, and it would reject the
+        // canonical in-cluster plain-HTTP issuer outright.
+        assert_eq!(
+            check_hop_bound_to_origin(
+                Some(&u("http://10.0.0.5:8080/realms/x")),
+                &u("https://10.0.0.5:8080/realms/x/certs"),
+            ),
+            Err(HopRefusal::SchemeChanged)
+        );
+    }
+
+    #[test]
+    fn hop_bound_to_origin_fails_closed_with_no_requested_url() {
+        // reqwest always supplies the requested URL as `previous()[0]`;
+        // an empty chain would mean the binding has nothing to bind to,
+        // and the refusal is the fail-closed answer.
+        assert_eq!(
+            check_hop_bound_to_origin(None, &u("https://idp.example.com/keys")),
+            Err(HopRefusal::OffHost)
+        );
+    }
+
+    #[test]
+    fn hop_bound_to_origin_fails_closed_when_a_url_has_no_host() {
+        // A host-less URL has no origin to compare, in either position.
+        assert_eq!(
+            check_hop_bound_to_origin(
+                Some(&u("https://idp.example.com/realms/x")),
+                &u("data:text/plain,keys"),
+            ),
+            Err(HopRefusal::OffHost)
+        );
+        assert_eq!(
+            check_hop_bound_to_origin(
+                Some(&u("data:text/plain,issuer")),
+                &u("https://idp.example.com/keys"),
+            ),
+            Err(HopRefusal::OffHost)
+        );
+    }
+
+    #[test]
+    fn hop_refusal_texts_are_distinct_and_not_the_cap_text() {
+        // The `source()` text is the only thing that survives to tell the
+        // three refusals apart (reqwest's `Display` drops the cause), so
+        // two legs collapsing onto one string — or onto reqwest's own cap
+        // wording — would make the live assertions below vacuous.
+        let off_host = HopRefusal::OffHost.as_str();
+        let scheme = HopRefusal::SchemeChanged.as_str();
+        assert_ne!(off_host, scheme);
+        for text in [off_host, scheme] {
+            assert!(
+                !text.contains("too many redirects"),
+                "a leg's text must not read as reqwest's hop-cap text: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_for_log_carries_scheme_and_host_only() {
+        // Path and query of an upstream `Location` are upstream-controlled
+        // and must not reach the log line.
+        assert_eq!(
+            origin_for_log(&u("https://idp.example.com:8443/realms/x?token=secret")),
+            "https://idp.example.com"
+        );
+        assert_eq!(
+            origin_for_log(&u("data:text/plain,x")),
+            "data://<no-host>",
+            "a host-less URL still logs legibly"
+        );
     }
 
     // -----------------------------------------------------------------

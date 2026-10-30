@@ -2465,6 +2465,7 @@ mod tests {
         p.token_cap = Some(TokenCap {
             permissions: vec![Permission::Read],
             repository_ids: None,
+            per_repository_permissions: None,
         });
         let hint = deny_hint(&p, None);
         assert!(hint.contains("token-cap"), "hint: {hint}");
@@ -2490,6 +2491,7 @@ mod tests {
         hort_domain::entities::api_token::TokenCap {
             permissions,
             repository_ids: None,
+            per_repository_permissions: None,
         }
     }
 
@@ -2620,6 +2622,7 @@ mod tests {
             p.token_cap = Some(hort_domain::entities::api_token::TokenCap {
                 permissions: vec![Permission::Read, Permission::Write, Permission::Delete],
                 repository_ids: None,
+                per_repository_permissions: None,
             });
             let req = request_with_principal("/admin/thing", Some(p));
             router.oneshot(req).await.unwrap()
@@ -2650,6 +2653,7 @@ mod tests {
             p.token_cap = Some(hort_domain::entities::api_token::TokenCap {
                 permissions: vec![Permission::Read, Permission::Write, Permission::Delete],
                 repository_ids: None,
+                per_repository_permissions: None,
             });
             let req = request_with_principal("/admin/thing", Some(p));
             router.oneshot(req).await.unwrap()
@@ -2960,6 +2964,7 @@ mod tests {
         p.token_cap = Some(hort_domain::entities::api_token::TokenCap {
             permissions: vec![Permission::Write],
             repository_ids: Some(vec![other_repo_id]),
+            per_repository_permissions: None,
         });
         let (entries, status) = write_attempt(|_| rbac_with_global_write_grant(), p);
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -3047,6 +3052,7 @@ mod tests {
         p.token_cap = Some(hort_domain::entities::api_token::TokenCap {
             permissions: vec![Permission::Write],
             repository_ids: Some(vec![Uuid::new_v4()]),
+            per_repository_permissions: None,
         });
         let (_entries, status) = write_attempt(|_| rbac_with_global_write_grant(), p);
         assert_eq!(status, StatusCode::FORBIDDEN);

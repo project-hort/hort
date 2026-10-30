@@ -410,6 +410,7 @@ fn service_account_with_read_returns_200_and_names_the_withheld_version() {
             actor.token_cap = Some(TokenCap {
                 permissions: vec![Permission::Read],
                 repository_ids: None,
+                per_repository_permissions: None,
             });
             auth_test::inject_optional_principal_some(&mut req, actor);
 
