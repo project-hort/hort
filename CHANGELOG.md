@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Scan evidence a release decision could not read no longer reads as clean.**
+  An artifact whose stored findings are unreadable is judged on its recorded
+  severity counts instead of released, a CVE exclusion no longer clears a hold
+  it cannot be matched against (rescan to restore exact matching), and an
+  artifact under an active curation block is no longer handed to the release
+  timer (#375).
 - **An incomplete answer from the advisory feed is no longer booked as a
   complete one.** A bulk-diff tick that could not read part of an ecosystem
   archive holds the feed checkpoint and re-reads that window, and a batch

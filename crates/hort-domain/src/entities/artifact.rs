@@ -1891,21 +1891,38 @@ impl Artifact {
     ///   only when `provenance ∈ {NotRequired, Cleared}` — a scan-cleared
     ///   artifact with `Pending` (Required mode, not yet a
     ///   `ProvenanceVerified`) provenance stays `Rejected` (fail-closed).
-    /// - **(c) Active curation precondition.** The `Released` arm fires
-    ///   only when `curation == Cleared` — a `Blocked` (a currently-active
-    ///   curation rule matches) artifact stays `Rejected`. Symmetric to
-    ///   (b); not covered by (a) (see [`CurationClearance`]).
+    /// - **(c) Active curation precondition.** **Both** arms fire only
+    ///   when `curation == Cleared` — a `Blocked` (a currently-active
+    ///   curation rule matches) artifact stays `Rejected` whether the
+    ///   window has elapsed or not. Not covered by (a) (see
+    ///   [`CurationClearance`]), and not deferrable the way (b) is: see
+    ///   below.
     ///
     /// `provenance` and `curation` are verified facts the application
     /// layer computes from the live provenance state / curation rules and
     /// passes in (mirroring the [`ProvenanceClearance`] param on
     /// [`Self::release`]); the domain stays pure (no I/O).
     ///
+    /// **(c) gates the whole method; (b) gates only the release arm.**
+    /// The asymmetry is not a judgement about which axis matters more —
+    /// it is about which gate the artifact reaches next.
+    ///
     /// The **re-quarantine** arm (`Rejected → Quarantined`, window still
-    /// active) is **not** gated by (b)/(c): the artifact remains held
-    /// (downloads blocked), so deferring the curation/provenance gate to
-    /// the eventual timer release is fail-closed-safe. The reason guard
-    /// (a) gates the whole method.
+    /// active) leaves the artifact held and hands it to the timer sweep,
+    /// which releases it through [`Self::release`]. That function carries
+    /// a provenance AND-precondition on each of its timer arms, so a
+    /// provenance question deferred to it is a question that still gets
+    /// asked — which is why (b) may stay on the release arm. It takes no
+    /// curation input at all, and nothing else between the re-quarantine
+    /// and the timer release asks one: the retroactive curation pass walks
+    /// only the *active* population, so a rule applied while this
+    /// artifact was `Rejected` never marked it. A curation block deferred
+    /// to the timer is therefore a conjunct dropped, not deferred, and
+    /// ADR 0041 invariant #6 requires each conjunct mechanized rather than
+    /// proxied. So the curation conjunct is checked before the window
+    /// branch, and a `Blocked` artifact stays `Rejected` from either arm.
+    ///
+    /// The reason guard (a) likewise gates the whole method.
     ///
     /// **The window check reads the transient
     /// [`Self::quarantine_deadline`]** — the computed deadline, NOT the
@@ -1948,6 +1965,19 @@ impl Artifact {
             )));
         }
 
+        // (c) The active-curation conjunct, before the window branch, so
+        // it holds on BOTH targets. Neither one can answer it later: a
+        // `Released` artifact is past every gate, and the timer release a
+        // re-quarantine hands off to reads provenance only. See the
+        // rustdoc for why (b) is not here with it.
+        if !matches!(curation, CurationClearance::Cleared) {
+            return Err(DomainError::Invariant(format!(
+                "cannot re-evaluate artifact under an active curation block: \
+                 cross-axis release conjunction not satisfied \
+                 (curation={curation:?}) — ADR 0041 invariant #6(c)"
+            )));
+        }
+
         let still_in_window = self
             .quarantine_deadline
             .is_some_and(|deadline| deadline > now);
@@ -1957,7 +1987,10 @@ impl Artifact {
             // The artifact stays held; clearing the scan reason here keeps
             // a subsequent re-evaluation from treating a now-re-quarantined
             // artifact as a stale scan rejection. The eventual timer
-            // release applies the provenance gate via `release()`.
+            // release applies the provenance gate via `release()`, which is
+            // what lets `provenance` go unread on this arm; the curation
+            // conjunct is already settled above, because that release
+            // cannot ask it.
             self.rejection_reason = None;
             Ok(DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
                 artifact_id: self.id,
@@ -1966,20 +1999,24 @@ impl Artifact {
                 quarantine_window_start: self.quarantine_window_start.unwrap_or(now),
             }))
         } else {
-            // (b)+(c) the release arm requires both cross-axis conjuncts
-            // to currently clear. A pending/failed provenance or an active
-            // curation block keeps the artifact `Rejected` (fail-closed) —
-            // return without mutating so the pass skips it.
+            // (b) The release arm additionally requires provenance to
+            // currently clear — there is no later gate for it here, where
+            // the re-quarantine arm has one. A pending/failed provenance
+            // keeps the artifact `Rejected` (fail-closed); return without
+            // mutating so the pass skips it. (c) was settled before the
+            // window branch and holds on this arm too.
             let provenance_clears = matches!(
                 provenance,
                 ProvenanceClearance::NotRequired | ProvenanceClearance::Cleared
             );
-            let curation_clears = matches!(curation, CurationClearance::Cleared);
-            if !provenance_clears || !curation_clears {
+            if !provenance_clears {
+                // Curation is provably `Cleared` here — the guard above
+                // returned otherwise — so naming it in the message would
+                // report a conjunct that did not deny.
                 return Err(DomainError::Invariant(format!(
                     "cannot release re-evaluated artifact: cross-axis release \
-                     conjunction not satisfied (provenance={provenance:?}, \
-                     curation={curation:?}) — ADR 0041 invariant #6"
+                     conjunction not satisfied (provenance={provenance:?}) \
+                     — ADR 0041 invariant #6(b)"
                 )));
             }
 
@@ -5479,19 +5516,70 @@ mod tests {
     }
 
     /// The re-quarantine arm (future window) is NOT gated by the
-    /// provenance / curation conjuncts — the artifact stays held
-    /// (downloads blocked), so deferring those gates to the eventual timer
-    /// release is fail-closed-safe. Even a `Blocked` curation + `Pending`
-    /// provenance re-quarantines rather than erroring.
+    /// **provenance** conjunct, and that deferral is sound because the
+    /// timer release it hands the artifact to re-applies it:
+    /// [`Artifact::release`]'s timer arms each carry the provenance
+    /// AND-precondition. A `Pending` provenance therefore re-quarantines
+    /// rather than erroring.
     #[test]
-    fn re_evaluate_future_window_requarantines_regardless_of_conjuncts() {
+    fn re_evaluate_future_window_requarantines_despite_pending_provenance() {
         let mut a = rejected_artifact();
         a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(12));
         let event = a
             .re_evaluate(
                 Utc::now(),
                 ProvenanceClearance::Pending,
+                CurationClearance::Cleared,
+            )
+            .unwrap();
+        assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+        assert!(matches!(event, DomainEvent::ArtifactQuarantined(_)));
+    }
+
+    /// **The curation conjunct is not deferrable, so it gates this arm
+    /// too.** A re-quarantine hands the artifact to the timer sweep, and
+    /// [`Artifact::release`] takes no curation input — nor does anything
+    /// else between here and that release: the retroactive curation pass
+    /// walks only the active population, so the rule that was applied
+    /// while this artifact was `Rejected` never marked it. Re-quarantining
+    /// under an active block would therefore be the last point at which
+    /// the question could be asked, and the timer would release the
+    /// artifact past a live curation block.
+    #[test]
+    fn re_evaluate_future_window_refuses_an_active_curation_block() {
+        let mut a = rejected_artifact();
+        a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(12));
+        let err = a
+            .re_evaluate(
+                Utc::now(),
+                ProvenanceClearance::NotRequired,
                 CurationClearance::Blocked,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("curation"),
+            "the error must name the conjunct that denied it, got: {err}"
+        );
+        assert_eq!(
+            a.quarantine_status,
+            QuarantineStatus::Rejected,
+            "a denied re-evaluation must not mutate the artifact"
+        );
+    }
+
+    /// Counter to the test above: a `Cleared` curation still
+    /// re-quarantines on a future window. Without this the curation gate
+    /// could be spelled as "always refuse" and the test above would not
+    /// notice.
+    #[test]
+    fn re_evaluate_future_window_requarantines_when_curation_clears() {
+        let mut a = rejected_artifact();
+        a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(12));
+        let event = a
+            .re_evaluate(
+                Utc::now(),
+                ProvenanceClearance::NotRequired,
+                CurationClearance::Cleared,
             )
             .unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);

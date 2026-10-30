@@ -61,8 +61,9 @@
 //! functions, and it is stated at each call site with its reason.
 //!
 //! The one place the two functions knowingly differ is the
-//! aggregate-summary fallback, which has no per-finding data to narrow —
-//! an accepted, fail-closed residual documented on
+//! aggregate-summary mode, which has no per-finding data to narrow and
+//! no finding identities for an exclusion to match — a residual that
+//! runs fail-closed in both respects, documented on
 //! [`decide_rejected_transition`].
 //!
 //! Pure domain — zero I/O, zero `tracing`. The application caller is
@@ -98,15 +99,13 @@ use chrono::{DateTime, Utc};
 
 use crate::entities::artifact::Artifact;
 use crate::entities::scan_policy::{
-    CompositeVerdictMode, ExclusionProjection, ScanEnforcement, ScanPolicyProjection,
+    CompositeVerdictMode, ExclusionProjection, ScanPolicyProjection,
 };
 use crate::events::SeveritySummary;
 use crate::types::{severity_summary_from_findings, ArtifactCoords, ArtifactKind, Finding};
 
-use super::cve::evaluate_cve_thresholds;
-use super::exclusion::{filter_excluded_findings, filter_excluded_summary};
-use super::primitives::{PolicyAction, ViolationsAccumulator};
-use super::scan::{collect_negligible_action, DefaultPolicy};
+use super::exclusion::filter_excluded_findings;
+use super::scan::{evaluate_scan_summary, ScanOutcome};
 
 /// Outcome of [`decide_rejected_transition`].
 ///
@@ -152,30 +151,50 @@ pub enum ReEvaluationOutcome {
 ///    differently about one finding list; see the body for the sequence
 ///    that strands an artifact when only one of them does.
 ///
-/// 2. **Aggregate-summary fallback** — when
-///    `last_findings` is `None`, [`filter_excluded_summary`] applies
-///    the highest-tier-first decrement: each active+pattern-matching
-///    exclusion decrements one count from the highest non-zero tier
-///    (Critical → High → Medium → Low). Preserved bit-for-bit
-///    for callers that cannot resolve the `findings_blob`
-///    (clean scans, missing CAS object, deserialise failure).
+/// 2. **Aggregate-summary mode** — when `last_findings` is `None`, the
+///    `ScanCompleted` aggregate the caller loaded is the verdict input
+///    **as recorded**, and [`evaluate_scan_summary`] walks it. Reached
+///    when the per-finding blob could not be resolved: a scan that
+///    recorded no blob because it found nothing, a `findings_blob`
+///    absent from CAS, or one that did not deserialise.
 ///
-///    **This path cannot narrow the condemning set, and that is an
-///    accepted residual rather than an inconsistency.** Per-tier counts
-///    carry no per-finding data, so there is nothing to ask
+///    **The exclusion set does not reach this input, and that is the
+///    rule rather than an omission.** An exclusion names one CVE; a
+///    severity count names no vulnerability. Decrementing a count per
+///    matching exclusion therefore removes whatever finding happened to
+///    sit in the highest non-zero tier, which is a hold loosened over
+///    evidence that may never have mentioned the excluded CVE — and this
+///    is the direction that matters, because `remaining` here decides
+///    whether a rejected artifact may be un-rejected. An exclusion may
+///    only subtract what it is about; on counts it cannot say what it is
+///    about, so it subtracts nothing. An operator whose exclusion should
+///    clear this artifact gets that through a rescan, which rebuilds the
+///    blob and re-enters mode 1.
+///
+///    **This path also cannot narrow the condemning set, and that
+///    residual is fail-closed.** Per-tier counts carry no per-finding
+///    data, so there is nothing to ask
 ///    [`crate::types::Finding::may_condemn_artifact`] about: a finding
 ///    naming a component the artifact does not carry keeps the release
 ///    authority the per-finding mode above denies it, because on this
-///    path nothing records that it was such a finding. The divergence is
-///    fail-closed — a degraded read holds an artifact the per-finding
-///    verdict might have cleared, never the reverse — and it is the one
-///    this path already takes with `severity_basis`, which a count
-///    cannot carry either (a `critical: 1` does not say whether that
-///    Critical was assessed or was the unreadable-advisory floor).
+///    path nothing records that it was such a finding. That divergence
+///    runs the safe way — a degraded read holds an artifact the
+///    per-finding verdict might have cleared, never the reverse — and it
+///    is the one this path already takes with `severity_basis`, which a
+///    count cannot carry either (a `critical: 1` does not say whether
+///    that Critical was assessed or was the unreadable-advisory floor).
 ///    Reconstructing the relation from counts would mean inventing it,
 ///    and the fail-closed reading of absent evidence is that the finding
-///    still counts (ADR 0007); the correctable path is a rescan, which
-///    re-establishes the relation and re-enters mode 1.
+///    still counts (ADR 0007); the correctable path is the same rescan.
+///
+///    **An absent blob and an unreadable one are not told apart here,
+///    and need not be.** A `ScanCompleted` that recorded no blob has
+///    `finding_count == 0`, and its own validator requires
+///    `finding_count` to equal the sum of the severity counts — so a
+///    genuine absence arrives as an all-zero summary that walks to
+///    `Clean`, while an unreadable blob arrives with the counts its scan
+///    actually recorded and is judged on them. The summary is what
+///    distinguishes the two cases, so the caller does not have to.
 ///
 /// The caller has already loaded the artifact's last `ScanCompleted`
 /// summary (`last_scan_summary`), the resolved active scan policy
@@ -229,28 +248,29 @@ pub fn decide_rejected_transition(
     quarantine_deadline: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> ReEvaluationOutcome {
-    let coords = ArtifactCoords {
-        name: artifact.name.clone(),
-        name_as_published: artifact.name_as_published.clone(),
-        version: artifact.version.clone(),
-        path: artifact.path.clone(),
-        // Format is required by `coords` but not consulted by the
-        // exclusion filter's `package_pattern` matcher (which uses
-        // `coords.name`). Use a sentinel — the domain layer must not
-        // reach across to the repository repository to resolve the
-        // real format here, and the evaluator does not need it.
-        format: crate::entities::repository::RepositoryFormat::Other(String::new()),
-        metadata: serde_json::Value::Null,
-    };
-
-    // Prefer per-finding matching when the caller
-    // hydrated the findings_blob from CAS. Falls back to the
-    // aggregate-summary path when `last_findings` is `None` (clean
-    // scan, missing CAS object, or deserialise failure — the helper
-    // `scan_history::last_findings` already logged a warn for the corruption
-    // cases).
-    let post_exclusion_summary = match last_findings {
+    // Per-finding matching when the caller hydrated the findings_blob
+    // from CAS; the aggregate the `ScanCompleted` recorded when it could
+    // not (no blob to read, or a blob the CAS could not hand back).
+    let verdict_summary = match last_findings {
         Some(findings) => {
+            // Coords exist for the exclusion filter's `package_pattern`
+            // matcher and for nothing else, which is why they are built
+            // here rather than at the top: the summary arm below runs no
+            // exclusion filter, so it has no pattern to match and no name
+            // to match it against.
+            let coords = ArtifactCoords {
+                name: artifact.name.clone(),
+                name_as_published: artifact.name_as_published.clone(),
+                version: artifact.version.clone(),
+                path: artifact.path.clone(),
+                // Format is required by `coords` but not consulted by the
+                // `package_pattern` matcher (which uses `coords.name`).
+                // Use a sentinel — the domain layer must not reach across
+                // to the repository repository to resolve the real format
+                // here, and the evaluator does not need it.
+                format: crate::entities::repository::RepositoryFormat::Other(String::new()),
+                metadata: serde_json::Value::Null,
+            };
             // The exclusion filter, then step 1b — the same two questions
             // `evaluate_scan_result` asks of the same input, in the same
             // order, before any threshold exists to walk: which findings
@@ -303,49 +323,32 @@ pub fn decide_rejected_transition(
             condemning.retain(|f| f.may_condemn_artifact(kind, composite_verdict));
             severity_summary_from_findings(&condemning)
         }
-        // The aggregate-summary fallback cannot consult the relation —
-        // per-tier counts carry no per-finding data. See this function's
-        // rustdoc: an accepted, fail-closed residual, not an oversight.
-        None => {
-            filter_excluded_summary(last_scan_summary, updated_exclusions, &coords, now).remaining
-        }
+        // No readable per-finding evidence. The recorded aggregate is
+        // what is left, and it is taken **as recorded** — the exclusion
+        // set does not reach it. An exclusion names one CVE; a severity
+        // count names no vulnerability at all, so subtracting a count per
+        // matching exclusion removes whatever finding happened to sit in
+        // the highest non-zero tier and loosens the hold over evidence
+        // that may never have mentioned the excluded CVE. An exclusion
+        // may only subtract what it is about, and on counts it cannot say
+        // what it is about, so here it subtracts nothing. See this
+        // function's rustdoc, mode 2.
+        None => last_scan_summary.clone(),
     };
-    let threshold = policy
-        .map(|p| p.severity_threshold)
-        .unwrap_or_else(DefaultPolicy::block_on_critical);
-    let mut accumulator = ViolationsAccumulator::new();
-    accumulator.collect_with_severity_escalation(evaluate_cve_thresholds(
-        &post_exclusion_summary,
-        threshold,
-    ));
-    // Mirror the initial scan's Step 4b: a `negligible_action: Block`
-    // rejection must survive an exclusion-triggered re-evaluation. The
-    // shared helper is the single source of this decision, so this path
-    // cannot silently drop a Block that `evaluate_scan_result` enforces.
-    let negligible_action = policy
-        .map(|p| p.negligible_action)
-        .unwrap_or_else(DefaultPolicy::negligible_action);
-    collect_negligible_action(
-        &mut accumulator,
-        negligible_action,
-        post_exclusion_summary.negligible,
-    );
-    let (action, _violations) = accumulator.into_outcome();
 
-    // Mirror the initial scan's Step 5: the resolved `enforcement`
-    // decides whether a blocking verdict may hold the artifact at all.
-    // Under `record` a `Block` is recorded, never enforced — so a policy
-    // loosened `reject → record` clears the rejection here, exactly as an
-    // exclusion that drops the last blocking finding does, and the
-    // artifact leaves `Rejected` through release authority #5. The two
-    // enforcement branches share the same computed `action`, so the
-    // loosen and tighten directions cannot disagree about the verdict.
-    let enforcement = policy
-        .map(|p| p.enforcement)
-        .unwrap_or_else(DefaultPolicy::enforcement);
-    let blocks =
-        matches!(action, PolicyAction::Block) && matches!(enforcement, ScanEnforcement::Reject);
-    if blocks {
+    // One definition of "do these counts block under this policy?",
+    // shared with the tighten direction's unreadable-blob arm so the two
+    // directions cannot answer differently about one summary (ADR 0041
+    // invariant #2). Under `enforcement: record` a blocking verdict is
+    // recorded and never enforced, so a policy loosened `reject → record`
+    // clears the rejection here exactly as an exclusion that drops the
+    // last blocking finding does, and the artifact leaves `Rejected`
+    // through release authority #5 — `evaluate_scan_summary` returns
+    // `FindingsRecorded` rather than `Reject` for it.
+    if matches!(
+        evaluate_scan_summary(&verdict_summary, policy),
+        ScanOutcome::Reject(_)
+    ) {
         return ReEvaluationOutcome::StillRejected;
     }
     match quarantine_deadline {
@@ -361,7 +364,9 @@ mod tests {
     use crate::entities::artifact::QuarantineStatus;
     use crate::entities::repository::RepositoryFormat;
     use crate::entities::scan_policy::CompositeVerdictMode;
-    use crate::entities::scan_policy::{NegligibleAction, ProvenanceMode, SeverityThreshold};
+    use crate::entities::scan_policy::{
+        NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
+    };
     use crate::events::PolicyScope;
     use crate::policy::{composite_verdict_mode_of, evaluate_scan_result, ScanOutcome};
     use crate::types::{ComponentRelation, ContentHash, Finding};
@@ -459,10 +464,10 @@ mod tests {
     // -- StillRejected ------------------------------------------------------
 
     #[test]
-    fn still_rejected_when_critical_unmasked_by_exclusion() {
-        // Two critical findings, only one exclusion — one finding still
-        // blocks under default threshold (aggregate-summary fallback
-        // path).
+    fn still_rejected_when_the_summary_path_cannot_match_the_exclusion() {
+        // Two Criticals in the recorded aggregate and an exclusion the
+        // summary cannot be compared against: it subtracts nothing, so
+        // both Criticals still block under the default threshold.
         let artifact = rejected_artifact("xz-utils");
         let summary = summary(2, 0, 0, 0);
         let exclusions = vec![exclusion("CVE-A")];
@@ -470,12 +475,98 @@ mod tests {
             &artifact,
             TEST_KIND,
             &summary,
-            None, // last_findings: fallback path
+            None, // last_findings: the aggregate-summary arm
             None,
             &exclusions,
             CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::StillRejected);
+    }
+
+    /// **An exclusion may only subtract what it is about.** The recorded
+    /// aggregate says one Critical and nothing about which vulnerability
+    /// it was; the operator's exclusion names a different one. Walking
+    /// the counts as recorded is the only answer that evidence supports,
+    /// and the direction matters: `remaining` here decides whether a
+    /// rejected artifact may be un-rejected, so a count subtracted for a
+    /// CVE the artifact does not carry is a hold lifted on nothing.
+    ///
+    /// The artifact's real CVE is pinned in the assertion message rather
+    /// than passed to the function, because the point is that the
+    /// function cannot be told: the summary arm is reached precisely when
+    /// no per-finding evidence is readable.
+    #[test]
+    fn an_exclusion_for_an_absent_cve_does_not_loosen_the_summary_path() {
+        let artifact = rejected_artifact("xz-utils");
+        // The one recorded Critical is CVE-X. The operator excluded
+        // CVE-Y, which this artifact never carried.
+        let summary = summary(1, 0, 0, 0);
+        let exclusions = vec![exclusion("CVE-Y")];
+        let outcome = decide_rejected_transition(
+            &artifact,
+            TEST_KIND,
+            &summary,
+            None, // the findings blob did not resolve
+            None,
+            &exclusions,
+            CompositeVerdictMode::Observed,
+            Some(ts(1_000_000)), // window elapsed: nothing else holds it
+            ts(2_000_000),
+        );
+        assert_eq!(
+            outcome,
+            ReEvaluationOutcome::StillRejected,
+            "a CVE-Y exclusion must not remove the count a CVE-X finding \
+             contributed",
+        );
+    }
+
+    /// The counter to the test above: the per-finding arm is untouched by
+    /// it. With the blob in hand the exclusion is matched against the
+    /// finding's own identity, so an exclusion that **does** name the
+    /// artifact's CVE still clears the rejection.
+    #[test]
+    fn a_matching_exclusion_still_loosens_on_the_per_finding_path() {
+        let artifact = rejected_artifact("xz-utils");
+        let summary = summary(1, 0, 0, 0);
+        let findings = vec![finding("CVE-X", SeverityThreshold::Critical)];
+        let exclusions = vec![exclusion("CVE-X")];
+        let outcome = decide_rejected_transition(
+            &artifact,
+            TEST_KIND,
+            &summary,
+            Some(&findings),
+            None,
+            &exclusions,
+            CompositeVerdictMode::Observed,
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::ResetToReleased);
+    }
+
+    /// And the complement of that counter, so the pair cannot both pass
+    /// by the exclusion set being ignored everywhere: on the per-finding
+    /// arm an exclusion for a CVE the findings do not carry leaves the
+    /// artifact held.
+    #[test]
+    fn a_non_matching_exclusion_does_not_loosen_the_per_finding_path() {
+        let artifact = rejected_artifact("xz-utils");
+        let summary = summary(1, 0, 0, 0);
+        let findings = vec![finding("CVE-X", SeverityThreshold::Critical)];
+        let exclusions = vec![exclusion("CVE-Y")];
+        let outcome = decide_rejected_transition(
+            &artifact,
+            TEST_KIND,
+            &summary,
+            Some(&findings),
+            None,
+            &exclusions,
+            CompositeVerdictMode::Observed,
+            Some(ts(1_000_000)),
+            ts(2_000_000),
         );
         assert_eq!(outcome, ReEvaluationOutcome::StillRejected);
     }
@@ -504,14 +595,19 @@ mod tests {
 
     #[test]
     fn reset_to_quarantined_when_clean_and_window_in_future() {
+        // The exclusion clears the one blocking finding, so the boundary
+        // check is what picks between the two clean outcomes. The
+        // findings are in hand: an exclusion only matches a CVE it can
+        // see, so the summary arm would not have cleared anything.
         let artifact = rejected_artifact("xz-utils");
         let summary = summary(1, 0, 0, 0);
+        let findings = vec![finding("CVE-A", SeverityThreshold::Critical)];
         let exclusions = vec![exclusion("CVE-A")];
         let outcome = decide_rejected_transition(
             &artifact,
             TEST_KIND,
             &summary,
-            None,
+            Some(&findings),
             None,
             &exclusions,
             CompositeVerdictMode::Observed,
@@ -526,12 +622,13 @@ mod tests {
     #[test]
     fn reset_to_released_when_clean_and_window_elapsed() {
         let summary = summary(1, 0, 0, 0);
+        let findings = vec![finding("CVE-A", SeverityThreshold::Critical)];
         let exclusions = vec![exclusion("CVE-A")];
         let outcome = decide_rejected_transition(
             &rejected_artifact("xz-utils"),
             TEST_KIND,
             &summary,
-            None,
+            Some(&findings),
             None,
             &exclusions,
             CompositeVerdictMode::Observed,
@@ -546,12 +643,13 @@ mod tests {
         // `None` deadline is treated as "elapsed" — no quarantine hold
         // applies, so a clean re-eval lands directly on released.
         let summary = summary(1, 0, 0, 0);
+        let findings = vec![finding("CVE-A", SeverityThreshold::Critical)];
         let exclusions = vec![exclusion("CVE-A")];
         let outcome = decide_rejected_transition(
             &rejected_artifact("xz-utils"),
             TEST_KIND,
             &summary,
-            None,
+            Some(&findings),
             None,
             &exclusions,
             CompositeVerdictMode::Observed,
@@ -566,13 +664,14 @@ mod tests {
         // Boundary: computed deadline == now. The `<=` favouring
         // released is documented in the module rustdoc.
         let summary = summary(1, 0, 0, 0);
+        let findings = vec![finding("CVE-A", SeverityThreshold::Critical)];
         let exclusions = vec![exclusion("CVE-A")];
         let now = ts(2_000_000);
         let outcome = decide_rejected_transition(
             &rejected_artifact("xz-utils"),
             TEST_KIND,
             &summary,
-            None,
+            Some(&findings),
             None,
             &exclusions,
             CompositeVerdictMode::Observed,
@@ -787,10 +886,13 @@ mod tests {
 
     #[test]
     fn coords_format_sentinel_does_not_affect_outcome() {
-        // The function constructs `coords` with `RepositoryFormat::Other("")`
-        // — the exclusion filter's `package_pattern` matcher uses
-        // `coords.name`, not `coords.format`. Verify that an artifact whose
-        // real format would differ still produces the same outcome.
+        // The per-finding arm constructs `coords` with
+        // `RepositoryFormat::Other("")` — the exclusion filter's
+        // `package_pattern` matcher uses `coords.name`, not
+        // `coords.format`. Verify that an artifact whose real format
+        // would differ still produces the same outcome. Only that arm
+        // builds coords at all; the summary arm runs no exclusion filter
+        // and so has no pattern to match.
         let mut artifact = rejected_artifact("xz-utils");
         artifact.path = "/xz-utils".into();
         // Real artifacts are stored with their actual format, but the
@@ -798,12 +900,13 @@ mod tests {
         // a sanity check that the sentinel didn't leak into a comparison.
         let _format_irrelevant = RepositoryFormat::Cargo;
         let summary = summary(1, 0, 0, 0);
+        let findings = vec![finding("CVE-A", SeverityThreshold::Critical)];
         let exclusions = vec![exclusion("CVE-A")];
         let outcome = decide_rejected_transition(
             &artifact,
             TEST_KIND,
             &summary,
-            None,
+            Some(&findings),
             None,
             &exclusions,
             CompositeVerdictMode::Observed,
