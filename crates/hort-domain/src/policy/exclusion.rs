@@ -246,19 +246,18 @@ fn matches_coords(ex: &ExclusionProjection, coords: &ArtifactCoords) -> bool {
     }
 }
 
-/// Aggregate-summary exclusion filter — used by the
-/// promotion and post-exclusion-add re-evaluation paths
-/// ([`crate::policy::evaluate_promotion`],
-/// [`crate::policy::decide_rejected_transition`]) which receive a
-/// historical [`SeveritySummary`] reconstructed from the artifact's
-/// most recent `ScanCompleted` event rather than per-finding rows.
+/// Aggregate-summary exclusion filter — the promotion gate's exclusion
+/// step ([`crate::policy::evaluate_promotion`]), which by design works
+/// off a historical [`SeveritySummary`] reconstructed from the
+/// artifact's most recent `ScanCompleted` event rather than per-finding
+/// rows.
 ///
 /// The per-scan path uses
 /// [`filter_excluded_findings`] with `&[Finding]` for exact CVE-ID
-/// matching. The promotion + re-eval paths do not have findings
-/// readily available (the use cases work off `read_last_scan_summary`
-/// which surfaces the cached aggregate); this helper preserves the
-/// original highest-tier-first decrement semantics for those callers.
+/// matching. Promotion does not have findings readily available (it
+/// works off `read_last_scan_summary`, which surfaces the cached
+/// aggregate); this helper is the highest-tier-first decrement that
+/// caller is built on.
 ///
 /// The semantics: each active+pattern-matching exclusion decrements
 /// **one count** from the highest non-zero severity tier in the
@@ -267,6 +266,30 @@ fn matches_coords(ex: &ExclusionProjection, coords: &ArtifactCoords) -> bool {
 /// [`crate::policy::threshold`]). If every meaningful tier is already
 /// zero the exclusion has no effect on the summary but is still
 /// recorded in `matched_exclusion_ids` for audit.
+///
+/// # What this cannot say, and where it therefore must not be used
+///
+/// [`cve_matches`] is **not** on this path and cannot be: a severity
+/// count names no vulnerability, so there is no identity for an
+/// exclusion's `cve_id` to be compared against. `is_active` and
+/// `matches_coords` are the only two predicates applied, which means an
+/// exclusion for CVE-Y removes the count a CVE-X finding contributed.
+///
+/// That is tolerable here only because of what the caller does with the
+/// result. Promotion asks "may this artifact move forward now?", an
+/// operator-initiated act over the one aggregate it has, and an operator
+/// who waived a CVE on a package expects the waiver to count; the
+/// alternative — an exclusion that never helps a promotion — removes a
+/// supported workflow rather than a hazard.
+///
+/// **It is not tolerable where the decrement decides whether an existing
+/// hold may be lifted on degraded evidence.** There the subtraction runs
+/// fail-open: it removes a count the exclusion was not about and
+/// un-rejects on evidence that never mentioned the excluded CVE. A
+/// caller in that position evaluates the summary **as recorded** —
+/// [`crate::policy::evaluate_scan_summary`] takes no exclusions for
+/// exactly this reason — and leaves the operator a rescan, which rebuilds
+/// the per-finding blob and restores exact matching.
 pub fn filter_excluded_summary(
     summary: &SeveritySummary,
     exclusions: &[ExclusionProjection],

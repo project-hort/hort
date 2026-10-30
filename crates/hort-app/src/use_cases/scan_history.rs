@@ -9,9 +9,15 @@
 //! The surface is a [`ScanCompletedSnapshot`] carrying both the cached
 //! aggregate AND the `findings_blob` hash so a caller can either run
 //! aggregate-summary evaluation cheaply or hydrate the per-finding
-//! `Vec<Finding>` from CAS and use exact CVE-ID matching (avoiding the
-//! "one exclusion drops one count" limitation called out in
+//! `Vec<Finding>` from CAS and use exact CVE-ID matching — which is the
+//! only mode in which an exclusion can match anything at all, because a
+//! severity count carries no vulnerability id (see
 //! `crates/hort-domain/src/policy/exclusion.rs`).
+//!
+//! [`last_findings`] answers in a [`FindingsEvidence`] rather than an
+//! `Option`, because "this scan found nothing" and "this scan's findings
+//! could not be read" are different facts and no caller can be correct
+//! while they share one answer.
 //!
 //! Beside that, [`latest_scan_standing`] answers the one question the
 //! release gate asks of the same evidence — "does the latest scan
@@ -367,30 +373,79 @@ pub(crate) fn latest_scan_standing<'a>(
     }
 }
 
+/// What the artifact's latest scan can tell a verdict about its
+/// **per-finding** evidence — surfaced by [`last_findings`].
+///
+/// Three variants rather than an `Option`, because the absence of a
+/// finding list has two meanings a caller must not merge:
+///
+/// * [`Absent`](Self::Absent) — there are no findings. Either the stream
+///   carries no `ScanCompleted` at all, or the latest one recorded no
+///   `findings_blob`, which by that event's own invariant
+///   (`findings_blob.is_some() == (finding_count > 0)`) means the scan
+///   found nothing.
+/// * [`Unreadable`](Self::Unreadable) — there ARE findings and this
+///   process could not read them: the recorded `findings_blob` is absent
+///   from CAS, could not be streamed, or did not deserialise.
+///
+/// **An unreadable blob is not an empty finding set**, and an `Option`
+/// said it was. Both callers evaluate the artifact against a policy, so
+/// a caller handed `None` for all four reasons either treats a corrupt
+/// blob as a clean scan (fail-open) or treats an unscanned artifact as a
+/// violating one (fail-closed, but wrong, and it re-holds every artifact
+/// that has never been scanned). Neither reading can be right while the
+/// two facts share a representation.
+///
+/// `Unreadable` carries the aggregate the same `ScanCompleted` recorded,
+/// so the caller has evidence to decide on rather than nothing: the
+/// counts say how many findings sat in each severity tier, which is
+/// exactly what a threshold walk needs
+/// ([`hort_domain::policy::evaluate_scan_summary`]). It rides the variant
+/// because it is only meaningful alongside it — a caller cannot read the
+/// summary of a scan whose blob it could read and get the narrowing
+/// right, and cannot be handed one for a scan that recorded no findings
+/// and tell it apart from zeros.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FindingsEvidence {
+    /// The latest scan's `findings_blob` resolved and deserialised.
+    Resolved(Vec<Finding>),
+    /// There are no findings to read — no `ScanCompleted` on the stream,
+    /// or a scan that recorded no blob because it found nothing.
+    Absent,
+    /// The latest scan recorded findings whose blob this process could
+    /// not read. `summary` is that scan's own `severity_summary`.
+    Unreadable { summary: SeveritySummary },
+}
+
 /// Resolve the stream's most recent `ScanCompleted.findings_blob` to the
 /// underlying `Vec<Finding>` via [`StoragePort::get`] and JSON decode.
-/// The `Rejected`-re-evaluation callers use this to enable exact CVE-ID
-/// matching via
+/// The re-evaluation callers use this to enable exact CVE-ID matching via
 /// [`hort_domain::policy::exclusion::filter_excluded_findings`].
 ///
-/// Returns `None` for any best-effort failure mode (no `ScanCompleted`
-/// on the stream, clean scan with no blob, missing CAS object, or
-/// deserialise failure). The caller falls back to the aggregate-summary
-/// path on `None`.
+/// The return type separates "no findings" from "findings this process
+/// could not read" — see [`FindingsEvidence`] for why a caller cannot be
+/// correct while those share one answer.
 ///
-/// Failure modes (missing blob, malformed blob) log a
-/// `tracing::warn!` so operators can correlate a silent fallback with
-/// CAS rot. The aggregate-summary fallback is still safe — it
-/// preserves the highest-tier-first decrement semantics — so
-/// degrading gracefully here is the right tradeoff (the alternative
-/// would be skipping the artifact entirely, which is worse from an
-/// operator's perspective).
+/// The unreadable modes log a `tracing::warn!` so operators can correlate
+/// a degraded verdict with CAS rot. Degrading rather than erroring is
+/// still the right trade — skipping the artifact entirely leaves it in
+/// whatever state it was in with nothing recorded about why — but the
+/// caller now knows the verdict it is about to compute rests on counts
+/// alone.
 pub(crate) async fn last_findings(
     stream: &[PersistedEvent],
     storage: &Arc<dyn StoragePort>,
     artifact_id: Uuid,
-) -> Option<Vec<Finding>> {
-    let blob_hash = last_scan_completed(stream)?.findings_blob?;
+) -> FindingsEvidence {
+    let Some(snapshot) = last_scan_completed(stream) else {
+        return FindingsEvidence::Absent;
+    };
+    let Some(blob_hash) = snapshot.findings_blob else {
+        return FindingsEvidence::Absent;
+    };
+    let unreadable = || FindingsEvidence::Unreadable {
+        summary: snapshot.summary.clone(),
+    };
 
     let mut reader = match storage.get(&blob_hash).await {
         Ok(r) => r,
@@ -399,9 +454,10 @@ pub(crate) async fn last_findings(
                 artifact_id = %artifact_id,
                 findings_blob = %blob_hash,
                 error = %e,
-                "findings_blob absent from CAS; falling back to aggregate-summary re-evaluation",
+                "findings_blob absent from CAS; the verdict falls back to the \
+                 recorded severity counts",
             );
-            return None;
+            return unreadable();
         }
     };
 
@@ -411,21 +467,23 @@ pub(crate) async fn last_findings(
             artifact_id = %artifact_id,
             findings_blob = %blob_hash,
             error = %e,
-            "findings_blob read failed; falling back to aggregate-summary re-evaluation",
+            "findings_blob read failed; the verdict falls back to the recorded \
+             severity counts",
         );
-        return None;
+        return unreadable();
     }
 
     match serde_json::from_slice::<Vec<Finding>>(&buf) {
-        Ok(findings) => Some(findings),
+        Ok(findings) => FindingsEvidence::Resolved(findings),
         Err(e) => {
             tracing::warn!(
                 artifact_id = %artifact_id,
                 findings_blob = %blob_hash,
                 error = %e,
-                "findings_blob malformed; falling back to aggregate-summary re-evaluation",
+                "findings_blob malformed; the verdict falls back to the recorded \
+                 severity counts",
             );
-            None
+            unreadable()
         }
     }
 }
@@ -1107,16 +1165,24 @@ mod tests {
 
     // ---- last_findings -----------------------------------------------------
 
+    /// Reason (1) for an absence: no `ScanCompleted` anywhere on the
+    /// stream. There are no findings, so the answer is `Absent` — not
+    /// `Unreadable`, which would hold every never-scanned artifact on the
+    /// tighten path.
     #[tokio::test]
-    async fn last_findings_returns_none_when_no_scan_completed() {
+    async fn last_findings_is_absent_when_no_scan_completed() {
         let storage: Arc<dyn StoragePort> = Arc::new(MockStoragePort::new());
-        assert!(last_findings(&[], &storage, Uuid::new_v4()).await.is_none());
+        assert_eq!(
+            last_findings(&[], &storage, Uuid::new_v4()).await,
+            FindingsEvidence::Absent
+        );
     }
 
+    /// Reason (2): a scan that recorded no blob because it found
+    /// nothing. Also `Absent` — the `ScanCompleted` invariant ties an
+    /// absent blob to `finding_count == 0`, so there genuinely are none.
     #[tokio::test]
-    async fn last_findings_returns_none_when_scan_was_clean() {
-        // Clean scan: `findings_blob = None`. Caller falls back to
-        // aggregate-summary path (which sees an empty summary).
+    async fn last_findings_is_absent_when_scan_was_clean() {
         let storage: Arc<dyn StoragePort> = Arc::new(MockStoragePort::new());
         let artifact_id = Uuid::new_v4();
         let stream_id = StreamId::artifact(artifact_id);
@@ -1134,9 +1200,10 @@ mod tests {
             }),
         )];
 
-        assert!(last_findings(&stream, &storage, artifact_id)
-            .await
-            .is_none());
+        assert_eq!(
+            last_findings(&stream, &storage, artifact_id).await,
+            FindingsEvidence::Absent
+        );
     }
 
     #[tokio::test]
@@ -1175,18 +1242,22 @@ mod tests {
         )];
 
         let storage: Arc<dyn StoragePort> = mock_storage;
-        let hydrated = last_findings(&stream, &storage, artifact_id)
-            .await
-            .expect("findings hydrated from CAS");
+        let FindingsEvidence::Resolved(hydrated) =
+            last_findings(&stream, &storage, artifact_id).await
+        else {
+            panic!("findings hydrated from CAS");
+        };
         assert_eq!(hydrated.len(), 2);
         assert_eq!(hydrated[0].vulnerability_id, "CVE-2021-23337");
         assert_eq!(hydrated[1].vulnerability_id, "CVE-OTHER");
     }
 
+    /// Reason (3): the `ScanCompleted` references a hash that is NOT in
+    /// CAS. **This is `Unreadable`, not `Absent`** — the scan did find
+    /// something, and the recorded counts ride the variant so the caller
+    /// has evidence to judge rather than an empty list that reads clean.
     #[tokio::test]
-    async fn last_findings_returns_none_when_blob_missing_from_storage() {
-        // The `ScanCompleted` event references a hash that is NOT in
-        // CAS — best-effort: log warn, return None, caller falls back.
+    async fn last_findings_is_unreadable_when_blob_missing_from_storage() {
         let storage: Arc<dyn StoragePort> = Arc::new(MockStoragePort::new());
         let artifact_id = Uuid::new_v4();
         let stream_id = StreamId::artifact(artifact_id);
@@ -1204,15 +1275,56 @@ mod tests {
             }),
         )];
 
-        assert!(last_findings(&stream, &storage, artifact_id)
-            .await
-            .is_none());
+        assert_eq!(
+            last_findings(&stream, &storage, artifact_id).await,
+            FindingsEvidence::Unreadable {
+                summary: findings_in_tier(1, SeverityThreshold::Critical)
+            },
+            "a blob absent from CAS is evidence that could not be read, \
+             never an empty finding set",
+        );
     }
 
+    /// Reason (3), second shape: the `get` succeeded and the **stream**
+    /// failed partway. Also `Unreadable` — a read that stopped mid-blob
+    /// says nothing about what the blob contained, so the counts are
+    /// still what is left to judge.
     #[tokio::test]
-    async fn last_findings_returns_none_when_blob_is_malformed_json() {
-        // The blob bytes are present but don't deserialise as
-        // `Vec<Finding>` — best-effort: log warn, return None.
+    async fn last_findings_is_unreadable_when_the_blob_stream_fails() {
+        let mock_storage = Arc::new(MockStoragePort::new());
+        let artifact_id = Uuid::new_v4();
+        let stream_id = StreamId::artifact(artifact_id);
+
+        let blob_hash = placeholder_findings_blob();
+        // Delivers a prefix, then a backend I/O error.
+        mock_storage.inject_read_failure(blob_hash.clone(), b"[{\"purl\":".to_vec());
+
+        let stream = vec![persisted(
+            &stream_id,
+            0,
+            DomainEvent::ScanCompleted(ScanCompleted {
+                artifact_id,
+                scanner: "osv".into(),
+                finding_count: 1,
+                severity_summary: findings_in_tier(1, SeverityThreshold::Critical),
+                findings_blob: Some(blob_hash),
+                assessment: ScanAssessment::Analysed,
+            }),
+        )];
+
+        let storage: Arc<dyn StoragePort> = mock_storage;
+        assert_eq!(
+            last_findings(&stream, &storage, artifact_id).await,
+            FindingsEvidence::Unreadable {
+                summary: findings_in_tier(1, SeverityThreshold::Critical)
+            },
+        );
+    }
+
+    /// Reason (4): the blob bytes are present but do not deserialise.
+    /// `Unreadable` for the same reason as (3).
+    #[tokio::test]
+    async fn last_findings_is_unreadable_when_blob_is_malformed_json() {
         let mock_storage = Arc::new(MockStoragePort::new());
         let artifact_id = Uuid::new_v4();
         let stream_id = StreamId::artifact(artifact_id);
@@ -1240,8 +1352,11 @@ mod tests {
         )];
 
         let storage: Arc<dyn StoragePort> = mock_storage;
-        assert!(last_findings(&stream, &storage, artifact_id)
-            .await
-            .is_none());
+        assert_eq!(
+            last_findings(&stream, &storage, artifact_id).await,
+            FindingsEvidence::Unreadable {
+                summary: findings_in_tier(1, SeverityThreshold::Critical)
+            },
+        );
     }
 }

@@ -89,7 +89,7 @@ use crate::entities::scan_policy::{
     CompositeVerdictMode, ExclusionProjection, NegligibleAction, ScanEnforcement,
     ScanPolicyProjection, SeverityThreshold,
 };
-use crate::events::PolicyViolation;
+use crate::events::{PolicyViolation, SeveritySummary};
 use crate::types::{severity_summary_from_findings, ArtifactCoords, ArtifactKind, Finding};
 
 use super::cve::evaluate_cve_thresholds;
@@ -459,6 +459,75 @@ pub fn evaluate_scan_result(
         // See module rustdoc — a `Warn` outcome with violations would
         // surface through `PolicyEvaluated(Pass, violations)` on a
         // future enhancement; today a non-blocking result is clean.
+        PolicyAction::Warn | PolicyAction::Allow => ScanOutcome::Clean,
+    }
+}
+
+/// Evaluate a scan verdict over an artifact's **aggregate severity
+/// summary alone** — the threshold walk, the negligible lane and the
+/// enforcement mode, with no per-finding input.
+///
+/// This is [`evaluate_scan_result`] minus the two steps a count cannot
+/// feed, and it is deliberately not reachable with findings in hand:
+/// steps 1 and 1b (the exclusion filter and
+/// [`crate::types::Finding::may_condemn_artifact`]) both ask about
+/// individual findings, and per-tier counts carry no finding identities
+/// to ask about. Steps 2, 3, 4b and 5 need only the counts, and this
+/// function is those steps.
+///
+/// **There is no `exclusions` parameter, and that absence is the
+/// contract.** An exclusion names one CVE; the summary says how many
+/// findings sat in each severity tier and nothing about which
+/// vulnerabilities they were. Subtracting a count for an exclusion the
+/// summary cannot be matched against removes the count a *different*
+/// finding contributed, which loosens a hold over evidence that never
+/// mentioned the excluded CVE. An exclusion may only subtract what it
+/// is about, so on this input it subtracts nothing.
+///
+/// License evaluation (step 4) is likewise absent: it reads the
+/// artifact's license list, not its severity counts, and is unreachable
+/// from a summary.
+///
+/// **Who asks this question.** The two callers that hold a
+/// `ScanCompleted` aggregate and no readable per-finding blob: the
+/// aggregate-summary arm of
+/// [`crate::policy::decide_rejected_transition`] (the loosen direction
+/// and the curator's re-evaluation) and the tighten direction's
+/// unreadable-blob arm. One definition, so the two directions cannot
+/// answer differently about one summary (ADR 0041 invariant #2).
+pub fn evaluate_scan_summary(
+    summary: &SeveritySummary,
+    policy: Option<&ScanPolicyProjection>,
+) -> ScanOutcome {
+    // Step 2 — resolve threshold.
+    let threshold = policy
+        .map(|p| p.severity_threshold)
+        .unwrap_or_else(DefaultPolicy::block_on_critical);
+
+    // Step 3 — accumulate CVE-threshold violations with severity
+    // escalation, exactly as the finding path does over its narrowed
+    // aggregate.
+    let mut accumulator = ViolationsAccumulator::new();
+    accumulator.collect_with_severity_escalation(evaluate_cve_thresholds(summary, threshold));
+
+    // Step 4b — the negligible lane, through the shared helper, so a
+    // `negligible_action: Block` cannot be enforced on one input shape
+    // and dropped on the other.
+    let negligible_action = policy
+        .map(|p| p.negligible_action)
+        .unwrap_or_else(DefaultPolicy::negligible_action);
+    collect_negligible_action(&mut accumulator, negligible_action, summary.negligible);
+
+    // Step 5 — enforcement selects between the two blocking variants.
+    let enforcement = policy
+        .map(|p| p.enforcement)
+        .unwrap_or_else(DefaultPolicy::enforcement);
+    let (action, violations) = accumulator.into_outcome();
+    match action {
+        PolicyAction::Block => match enforcement {
+            ScanEnforcement::Reject => ScanOutcome::Reject(violations),
+            ScanEnforcement::Record => ScanOutcome::FindingsRecorded(violations),
+        },
         PolicyAction::Warn | PolicyAction::Allow => ScanOutcome::Clean,
     }
 }
@@ -1897,5 +1966,112 @@ mod tests {
         assert!(s.contains("Reject"));
         let s = format!("{:?}", ScanOutcome::FindingsRecorded(vec![]));
         assert!(s.contains("FindingsRecorded"));
+    }
+    // ---- evaluate_scan_summary: the counts-only verdict ----
+
+    fn summary_of(
+        critical: u32,
+        high: u32,
+        medium: u32,
+        low: u32,
+        negligible: u32,
+    ) -> SeveritySummary {
+        SeveritySummary {
+            critical,
+            high,
+            medium,
+            low,
+            negligible,
+        }
+    }
+
+    #[test]
+    fn summary_verdict_blocks_a_critical_under_the_default_policy() {
+        assert!(matches!(
+            evaluate_scan_summary(&summary_of(1, 0, 0, 0, 0), None),
+            ScanOutcome::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn summary_verdict_is_clean_below_the_resolved_threshold() {
+        // Threshold High: a lone Medium does not reach it.
+        let policy = projection(SeverityThreshold::High, serde_json::Value::Null);
+        assert_eq!(
+            evaluate_scan_summary(&summary_of(0, 0, 1, 0, 0), Some(&policy)),
+            ScanOutcome::Clean
+        );
+    }
+
+    #[test]
+    fn summary_verdict_is_clean_on_an_all_zero_summary() {
+        // The shape a `ScanCompleted` with no findings_blob always has:
+        // its validator requires `finding_count` to equal the sum of the
+        // severity counts, so "no blob recorded" arrives here as zeros.
+        let policy = projection(SeverityThreshold::Critical, serde_json::Value::Null);
+        assert_eq!(
+            evaluate_scan_summary(&summary_of(0, 0, 0, 0, 0), Some(&policy)),
+            ScanOutcome::Clean
+        );
+    }
+
+    #[test]
+    fn summary_verdict_records_rather_than_rejects_under_record_enforcement() {
+        let policy = projection_with_enforcement(ScanEnforcement::Record);
+        assert!(matches!(
+            evaluate_scan_summary(&summary_of(1, 0, 0, 0, 0), Some(&policy)),
+            ScanOutcome::FindingsRecorded(_)
+        ));
+    }
+
+    #[test]
+    fn summary_verdict_rejects_under_reject_enforcement() {
+        let policy = projection_with_enforcement(ScanEnforcement::Reject);
+        assert!(matches!(
+            evaluate_scan_summary(&summary_of(1, 0, 0, 0, 0), Some(&policy)),
+            ScanOutcome::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn summary_verdict_blocks_a_negligible_count_under_negligible_block() {
+        // The negligible lane runs on this input too, so a
+        // `negligibleAction: block` is enforced whether or not the
+        // per-finding blob was readable.
+        let policy = projection_with_negligible(NegligibleAction::Block);
+        assert!(matches!(
+            evaluate_scan_summary(&summary_of(0, 0, 0, 0, 1), Some(&policy)),
+            ScanOutcome::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn summary_verdict_warns_without_blocking_under_negligible_warn() {
+        let policy = projection_with_negligible(NegligibleAction::Warn);
+        assert_eq!(
+            evaluate_scan_summary(&summary_of(0, 0, 0, 0, 1), Some(&policy)),
+            ScanOutcome::Clean
+        );
+    }
+
+    /// The counts-only verdict agrees with the finding-shaped one over
+    /// the same severities. Both walk the same threshold, so a tighten
+    /// that loses the blob cannot answer differently from one that kept
+    /// it about findings of the same severity.
+    #[test]
+    fn summary_verdict_agrees_with_the_finding_verdict_on_equal_severities() {
+        let policy = projection(SeverityThreshold::High, serde_json::Value::Null);
+        let findings = vec![finding("CVE-2024-1", SeverityThreshold::Critical)];
+        let from_findings = evaluate_scan_result(
+            &coords("lodash"),
+            TEST_KIND,
+            &findings,
+            Some(&policy),
+            &[],
+            ts(1_000),
+        );
+        let from_summary = evaluate_scan_summary(&summary_of(1, 0, 0, 0, 0), Some(&policy));
+        assert!(matches!(from_findings, ScanOutcome::Reject(_)));
+        assert!(matches!(from_summary, ScanOutcome::Reject(_)));
     }
 }
