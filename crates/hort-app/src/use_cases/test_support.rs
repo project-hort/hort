@@ -40,7 +40,9 @@ use hort_domain::ports::artifact_group_lifecycle::{
     ArtifactGroupLifecyclePort, GroupCommitOutcome, GroupMemberCommit,
 };
 use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
-use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
+use hort_domain::ports::artifact_lifecycle::{
+    require_paired_artifact_stream, ArtifactLifecyclePort, IngestEnqueue,
+};
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::composite_scan_observation::{
@@ -2750,6 +2752,14 @@ impl EventStore for MockEventStore {
 /// The recorded tuple carries the optional `ArtifactMetadata` too.
 /// Existing tests destructure with `(artifact, events, _)` or read
 /// the first two tuple fields directly.
+///
+/// This double **round-trips the pair**: the artifact it accepts is
+/// readable back from the paired artifact repository, and the events it
+/// accepts are readable back from the paired [`MockEventStore`]. So it
+/// refuses what the adapter refuses — every method calls
+/// [`require_paired_artifact_stream`] first. A double that accepted a
+/// pair naming two different artifacts would let a test assert over a
+/// projection/stream disagreement no producer in the system can write.
 pub struct MockArtifactLifecycle {
     transitions: Mutex<Vec<(Artifact, AppendEvents, Option<ArtifactMetadata>)>>,
     artifacts: Arc<MockArtifactRepository>,
@@ -3140,6 +3150,11 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         events: AppendEvents,
         metadata: Option<ArtifactMetadata>,
     ) -> BoxFut<'_, DomainResult<AppendResult>> {
+        // First, as in the adapter: the pair's identity is a
+        // precondition on the arguments, not an outcome of the write.
+        if let Err(e) = require_paired_artifact_stream(artifact, &events) {
+            return Box::pin(async move { Err(e) });
+        }
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
@@ -3187,6 +3202,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         events: AppendEvents,
         prior_status: QuarantineStatus,
     ) -> BoxFut<'a, DomainResult<AppendResult>> {
+        if let Err(e) = require_paired_artifact_stream(artifact, &events) {
+            return Box::pin(async move { Err(e) });
+        }
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
@@ -3239,6 +3257,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         let recorded = enqueues.to_vec();
         let recorded_edges = edges.to_vec();
         Box::pin(async move {
+            require_paired_artifact_stream(artifact, &events)?;
             // Failure-injection up front (mirrors `commit_transition`), before
             // recording anything, so a forced error leaves no stray enqueue.
             if let Some(err) = self.next_error.lock().unwrap().pop_front() {
@@ -3295,6 +3314,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         // applies BEFORE the score delta is recorded so a forced
         // error doesn't leave a stray delta in the snapshot.
         Box::pin(async move {
+            require_paired_artifact_stream(artifact, &events)?;
             // Replicate the failure check up front (mirrors the
             // legacy `commit_transition` path).
             if let Some(err) = self.next_error.lock().unwrap().pop_front() {
@@ -3344,6 +3364,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         let count = events_clone.events.len() as u64;
         let sbom_owned: Option<Vec<SbomComponent>> = sbom_components.map(<[_]>::to_vec);
 
+        if let Err(e) = require_paired_artifact_stream(artifact, &events_clone) {
+            return Box::pin(async move { Err(e) });
+        }
         // Failure injection guard. Mirrors the `commit_transition`
         // path: the failure fires BEFORE any state is recorded, so a
         // forced error doesn't leave a stray entry in the snapshot.
@@ -8944,6 +8967,56 @@ mod tests {
     const VALID_SHA256_A: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const VALID_SHA256_B: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
     const VALID_SHA256_C: &str = "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae";
+
+    /// The lifecycle mock refuses a pair whose batch is not the
+    /// handed-in artifact's stream, exactly as the adapter does — and
+    /// that mirroring is load-bearing for the same reason as the one
+    /// below: this double round-trips the pair (the artifact is
+    /// readable back from the paired repository, the events from the
+    /// paired event store), so a double that accepted the mismatch
+    /// would let an app-layer test assert over a projection/stream
+    /// disagreement no production path can write.
+    ///
+    /// Nothing is recorded either: the refusal precedes the record, so a
+    /// test cannot find the rejected transition in the snapshot.
+    #[tokio::test]
+    async fn mock_lifecycle_refuses_a_pair_naming_two_artifacts() {
+        use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort as _;
+
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let lc = MockArtifactLifecycle::new(artifacts.clone());
+        let a = sample_artifact(QuarantineStatus::Quarantined);
+        let other = Uuid::new_v4();
+
+        // Only the batch's stream id matters to the rule, so the batch
+        // carries nothing else.
+        let events = AppendEvents {
+            stream_id: StreamId::artifact(other),
+            expected_version: ExpectedVersion::Any,
+            events: Vec::new(),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: hort_domain::events::system_actor(),
+        };
+        assert_ne!(events.stream_id, StreamId::artifact(a.id));
+
+        let err = lc
+            .commit_transition(&a, events, None)
+            .await
+            .expect_err("the double must refuse what the adapter refuses");
+        assert!(matches!(err, DomainError::Invariant(_)), "{err:?}");
+        assert!(
+            lc.committed_transitions().is_empty(),
+            "a refused pair must leave no recorded transition",
+        );
+        assert!(
+            matches!(
+                artifacts.find_by_id(a.id).await,
+                Err(DomainError::NotFound { .. })
+            ),
+            "a refused pair must leave no artifact row",
+        );
+    }
 
     /// The upstream-mapping mock's gitops-write guard mirrors the
     /// adapter's, and that mirroring is load-bearing: the app-layer

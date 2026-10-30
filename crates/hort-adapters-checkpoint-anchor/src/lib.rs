@@ -897,8 +897,8 @@ mod tests {
 
     use ed25519_dalek::pkcs8::EncodePrivateKey;
     use hort_domain::events::{
-        build_checkpoint, verify_against_checkpoint, AnchorFindings, BackfillBaseline, Checkpoint,
-        MissingReason, StreamHead,
+        build_checkpoint, verify_against_checkpoint, AnchorFindings, AnchoredPositionHashes,
+        BackfillBaseline, Checkpoint, MissingReason, StreamHead,
     };
 
     /// An Ed25519 keypair as the operator would provision it: a PKCS#8
@@ -1012,10 +1012,16 @@ mod tests {
             ("admin-a".to_string(), 1u64, EventHash([0xaa; 32])),
             ("admin-b".to_string(), 3u64, EventHash([0xbb; 32])),
         ];
+        // No anchored-position hashes: this test states heads as literal
+        // byte patterns with no stored rows behind them, so no walk could
+        // have recomputed one. The live heads sit at exactly the anchored
+        // positions, which the final-head halves of the relation decide on
+        // their own.
         let findings = verify_against_checkpoint(
             &live,
             &[],
             &cps,
+            &AnchoredPositionHashes::default(),
             Utc.timestamp_opt(1_700_000_001, 0).unwrap(),
             std::time::Duration::from_secs(3600),
         );
@@ -1125,6 +1131,7 @@ mod tests {
             &[],
             &[],
             &cps,
+            &AnchoredPositionHashes::default(),
             Utc::now(),
             std::time::Duration::from_secs(3600),
         );

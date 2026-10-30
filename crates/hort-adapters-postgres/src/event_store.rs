@@ -2471,8 +2471,18 @@ mod tests {
     // end-to-end.
     // -----------------------------------------------------------------
     use hort_domain::events::{
-        verify_against_checkpoint, AnchorBreak, AnchorFindings, Checkpoint, SealedStreamRecord,
+        verify_against_checkpoint, AnchorBreak, AnchorFindings, AnchoredPositionHashes, Checkpoint,
+        SealedStreamRecord,
     };
+
+    /// No anchored-position hashes. Every cross-check below is about an
+    /// **absent** stream, so there are no rows for a walk to have
+    /// recomputed a hash from and an empty set is the only truthful
+    /// input; the anchored-position read only decides a stream that is
+    /// still live.
+    fn no_observed() -> AnchoredPositionHashes {
+        AnchoredPositionHashes::default()
+    }
 
     /// Build the `StreamSealed` tombstone exactly as `seal_and_remove`
     /// constructs it for a sealed stream with the given head, so the
@@ -2540,6 +2550,7 @@ mod tests {
                 &[], // sealed stream is absent (deleted)
                 std::slice::from_ref(&sealed_record),
                 std::slice::from_ref(&checkpoint),
+                &no_observed(),
                 now,
                 std::time::Duration::from_secs(3600),
             ),
@@ -2557,6 +2568,7 @@ mod tests {
                 &[],
                 &[], // NO StreamSealed
                 std::slice::from_ref(&checkpoint),
+                &no_observed(),
                 now,
                 std::time::Duration::from_secs(3600),
             ),
@@ -2579,6 +2591,7 @@ mod tests {
                 &[],
                 &[wrong_head],
                 &[checkpoint],
+                &no_observed(),
                 now,
                 std::time::Duration::from_secs(3600),
             ),

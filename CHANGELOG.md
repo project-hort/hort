@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The event chain and the row derived from it can no longer drift apart
+  unnoticed.** `verify-event-chain` now checks each stream's recomputed hash at
+  every position a checkpoint anchored, so a wholesale rewrite that also
+  extends the stream is reported instead of passing; and an artifact-lifecycle
+  commit whose event batch is not the artifact's own stream is refused rather
+  than committed atomically against the wrong artifact (#379).
 - **Prefetch fan-out is now bounded where it claimed to be, and a prefetch
   target asks who owns the name.** `prefetchPolicy.maxDescendants` caps a
   cascade's total rows across every branch instead of per branch, so a wide
