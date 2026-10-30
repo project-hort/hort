@@ -35,7 +35,7 @@ pub mod pom;
 pub mod snapshot;
 pub(crate) mod xml;
 
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::format_handler::{
@@ -861,6 +861,7 @@ impl PayloadSbom for MavenFormatHandler {
                 let subject = maven_subject_component(coords)?;
                 let mut slice;
                 let mut stream;
+                let mut seekable;
                 let content: &mut dyn Read = match payload {
                     PayloadAccess::Bytes(b) => {
                         slice = b;
@@ -869,6 +870,13 @@ impl PayloadSbom for MavenFormatHandler {
                     PayloadAccess::ReadStream(r) => {
                         stream = r;
                         &mut stream
+                    }
+                    // A POM is XML read front-to-back, so the seek this
+                    // variant offers buys nothing here — it is read as
+                    // the plain stream it also is.
+                    PayloadAccess::ReadSeek(r) => {
+                        seekable = r;
+                        &mut seekable
                     }
                 };
                 match pom::parse_pom_dependencies(content) {
@@ -989,21 +997,43 @@ fn extract_jar_embedded_pom_sbom(
     subject: SbomComponent,
     payload: PayloadAccess<'_>,
 ) -> DomainResult<PayloadSbomExtraction> {
-    // ZIP parsing needs `Read + Seek`; materialise into memory the same
-    // way the PyPI wheel-METADATA extractor does — the ingest hook has
-    // already buffered the artifact for the primary-content-hash
-    // computation, so the memory cost is already paid at this point.
-    let buf: Vec<u8> = match payload {
-        PayloadAccess::Bytes(b) => b.to_vec(),
+    // ZIP parsing needs `Read + Seek`, which each variant supplies
+    // differently:
+    //
+    // - `Bytes` is seekable in place through a `Cursor`.
+    // - `ReadSeek` already is what the walk wants, and these bytes are
+    //   deliberately not in memory — buffering them would spend the
+    //   whole archive to read one `pom.xml`.
+    // - `ReadStream` is forward-only, so a tail-indexed member table is
+    //   out of reach without buffering it first.
+    match payload {
+        PayloadAccess::Bytes(b) => {
+            jar_embedded_pom_sbom_from_zip(Cursor::new(b), coords, group_id, artifact_id, subject)
+        }
+        PayloadAccess::ReadSeek(r) => {
+            jar_embedded_pom_sbom_from_zip(r, coords, group_id, artifact_id, subject)
+        }
         PayloadAccess::ReadStream(mut r) => {
             let mut v = Vec::new();
             if r.read_to_end(&mut v).is_err() {
                 return Ok(subject_only(subject, SbomResolution::UnusableLockfile));
             }
-            v
+            jar_embedded_pom_sbom_from_zip(Cursor::new(v), coords, group_id, artifact_id, subject)
         }
-    };
+    }
+}
 
+/// The ZIP half of [`extract_jar_embedded_pom_sbom`], over any seekable
+/// archive. Generic rather than `&[u8]` for the reason the sibling PyPI
+/// kernel is: a ZIP's member table is its central directory, so the walk
+/// seeks to the one entry it wants and never needs the archive resident.
+fn jar_embedded_pom_sbom_from_zip<R: Read + Seek>(
+    zip: R,
+    coords: &ArtifactCoords,
+    group_id: &str,
+    artifact_id: &str,
+    subject: SbomComponent,
+) -> DomainResult<PayloadSbomExtraction> {
     // Unlike the storage/download layout path (where groupId is
     // slash-expanded), the JAR's own internal `META-INF/maven/` convention
     // keeps groupId as a single literal dotted path segment — real-world
@@ -1014,7 +1044,7 @@ fn extract_jar_embedded_pom_sbom(
     let mut pom_bytes: Option<Vec<u8>> = None;
     let mut read_err: Option<String> = None;
     let iter_result = crate::archive_bounds::iter_zip_entries(
-        Cursor::new(&buf),
+        zip,
         crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
         |name, reader| {
             if read_err.is_some() || pom_bytes.is_some() {

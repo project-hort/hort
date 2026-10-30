@@ -678,6 +678,7 @@ impl PayloadSbom for CargoFormatHandler {
 
         let mut stream;
         let mut slice;
+        let mut seekable;
         let content: &mut dyn std::io::Read = match payload {
             PayloadAccess::Bytes(b) => {
                 slice = b;
@@ -686,6 +687,13 @@ impl PayloadSbom for CargoFormatHandler {
             PayloadAccess::ReadStream(r) => {
                 stream = r;
                 &mut stream
+            }
+            // A `.crate` is a gzip stream read front-to-back, so the
+            // seek this variant offers buys nothing here — it is read
+            // as the plain stream it also is.
+            PayloadAccess::ReadSeek(r) => {
+                seekable = r;
+                &mut seekable
             }
         };
 

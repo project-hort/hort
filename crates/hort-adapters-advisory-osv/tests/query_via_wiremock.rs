@@ -1635,3 +1635,343 @@ fn full_length_response_with_an_empty_slot_still_caches_we_asked_none() {
          from the cache on the second call: {counts:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Byte bounds on the two buffered response reads
+//
+// Neither read had a byte bound: the batch query and the per-record
+// hydration each buffered an entire body into a `String`. The only
+// bound was `request_timeout`, and a timeout bounds duration — a
+// compromised or misconfigured endpoint can serve more bytes than the
+// process has memory, comfortably within 30 seconds.
+//
+// Each path gets both halves: an over-cap body is an error and says so
+// distinguishably, and an ordinary-sized body on the same path still
+// succeeds. The second half is what keeps the first from being satisfied
+// by a cap of zero or an inverted comparison.
+// ---------------------------------------------------------------------------
+
+/// Every `result` label on `hort_advisory_hydration_total` with its
+/// count. The sibling [`find_hydration_count`] answers for one label and
+/// returns `0` for both "fired as zero" and "never fired"; a test that
+/// asserts a label did **not** fire needs those kept apart.
+fn hydration_counts(snap: Snapshot) -> std::collections::HashMap<String, u64> {
+    let mut out = std::collections::HashMap::new();
+    for (key, _, _, value) in snap.into_vec() {
+        if key.key().name() != "hort_advisory_hydration_total" {
+            continue;
+        }
+        let result = key
+            .key()
+            .labels()
+            .find(|l| l.key() == "result")
+            .map(|l| l.value().to_string());
+        if let (Some(result), DebugValue::Counter(v)) = (result, value) {
+            out.insert(result, v);
+        }
+    }
+    out
+}
+
+/// A JSON body that parses as a `querybatch` response **and** exceeds
+/// the per-batch cap, so the only thing being tested is the cap.
+///
+/// The cap is 128 KiB per query sent; this is a single-query batch whose
+/// `vulns[]` array is padded past that. The ids are well-formed, so
+/// without the cap the adapter would read this body, parse it, and
+/// produce findings — which is exactly what it used to do.
+fn oversize_querybatch_body() -> serde_json::Value {
+    // ~70 bytes per entry; 4,000 entries is comfortably past 128 KiB.
+    let vulns: Vec<serde_json::Value> = (0..4_000)
+        .map(|i| json!({ "id": format!("GHSA-pad0-pad0-{i:04}"), "modified": MODIFIED }))
+        .collect();
+    json!({ "results": [ { "vulns": vulns } ] })
+}
+
+#[tokio::test]
+async fn batch_response_over_the_byte_cap_is_refused_not_read() {
+    let server = MockServer::start().await;
+    let body = oversize_querybatch_body();
+    let encoded = serde_json::to_vec(&body).expect("encode");
+    assert!(
+        encoded.len() > 128 * 1024,
+        "the fixture must exceed the single-query cap it is meant to break: {} bytes",
+        encoded.len()
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let cache = Arc::new(InMemoryEphemeralStore::new());
+    let adapter = build_adapter_with_url(server.uri(), cache, None).await;
+    let comps = vec![make_component("lodash", "4.17.20", Ecosystem::Npm)];
+
+    let err = adapter
+        .query(&comps)
+        .await
+        .expect_err("an over-cap batch body must fail the query");
+    match err {
+        DomainError::Validation(msg) => {
+            assert!(
+                msg.contains("refused") && msg.contains("cap"),
+                "the error must say the body was refused on size: {msg}"
+            );
+            assert!(
+                msg.contains("rather than truncating"),
+                "and must say it was not shortened: {msg}"
+            );
+        }
+        other => panic!("expected Validation, got {other:?}"),
+    }
+}
+
+/// The cap breach must be distinguishable from a body that is merely
+/// malformed — the two have different remedies and different metric
+/// labels, and a reader of either error must not be sent to the wrong
+/// one.
+#[tokio::test]
+async fn an_over_cap_batch_body_is_distinguishable_from_a_malformed_one() {
+    let over = {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(oversize_querybatch_body()))
+            .mount(&server)
+            .await;
+        let adapter =
+            build_adapter_with_url(server.uri(), Arc::new(InMemoryEphemeralStore::new()), None)
+                .await;
+        adapter
+            .query(&[make_component("lodash", "4.17.20", Ecosystem::Npm)])
+            .await
+            .expect_err("over cap")
+            .to_string()
+    };
+    let malformed = {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
+            .mount(&server)
+            .await;
+        let adapter =
+            build_adapter_with_url(server.uri(), Arc::new(InMemoryEphemeralStore::new()), None)
+                .await;
+        adapter
+            .query(&[make_component("lodash", "4.17.20", Ecosystem::Npm)])
+            .await
+            .expect_err("malformed")
+            .to_string()
+    };
+
+    assert!(over.contains("refused"), "over-cap message: {over}");
+    assert!(
+        malformed.contains("malformed"),
+        "malformed message: {malformed}"
+    );
+    assert_ne!(over, malformed, "the two failures must not read alike");
+}
+
+#[test]
+fn batch_response_over_the_byte_cap_ticks_body_too_large() {
+    let snap = capture_metrics_around(|rt| {
+        rt.block_on(async move {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(oversize_querybatch_body()))
+                .mount(&server)
+                .await;
+            let adapter =
+                build_adapter_with_url(server.uri(), Arc::new(InMemoryEphemeralStore::new()), None)
+                    .await;
+            let _ = adapter
+                .query(&[make_component("lodash", "4.17.20", Ecosystem::Npm)])
+                .await;
+        });
+    });
+
+    let counts = advisory_query_counts(snap);
+    assert_eq!(
+        counts.get("body_too_large"),
+        Some(&1),
+        "a refused body gets its own label, not an availability one: {counts:?}"
+    );
+    for availability in ["network_error", "timeout", "upstream_4xx", "upstream_5xx"] {
+        assert_eq!(
+            counts.get(availability),
+            None,
+            "`{availability}` must not co-fire — the endpoint answered: {counts:?}"
+        );
+    }
+}
+
+/// Counter-test for the batch cap: an ordinary-sized response on the
+/// same path still succeeds. Note the cap tracks the number of queries
+/// actually sent, so this also covers the multi-query case having
+/// proportionally more room rather than the same room.
+#[tokio::test]
+async fn an_ordinary_batch_response_still_succeeds_under_the_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(querybatch_body(&[
+            &[("GHSA-aaaa-bbbb-cccc", MODIFIED)],
+            &[],
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_vuln_record(
+        &server,
+        "GHSA-aaaa-bbbb-cccc",
+        json!({
+            "id": "GHSA-aaaa-bbbb-cccc",
+            "modified": MODIFIED,
+            "summary": "ordinary",
+            "database_specific": { "severity": "LOW" },
+            "affected": [ { "package": { "ecosystem": "npm", "name": "lodash" } } ],
+        }),
+        1,
+    )
+    .await;
+
+    let adapter =
+        build_adapter_with_url(server.uri(), Arc::new(InMemoryEphemeralStore::new()), None).await;
+    let findings = adapter
+        .query(&[
+            make_component("lodash", "4.17.20", Ecosystem::Npm),
+            make_component("express", "4.18.0", Ecosystem::Npm),
+        ])
+        .await
+        .expect("an ordinary batch body must still be read");
+    assert_eq!(
+        findings.len(),
+        1,
+        "the one advisory is returned: {findings:?}"
+    );
+}
+
+/// A hydration record over the byte cap fails **that one hydration**,
+/// which is the existing fail-soft skip: the finding falls back to the
+/// abbreviated `querybatch` record, which carries no severity and
+/// therefore fails closed to `Critical`.
+///
+/// That direction is what makes a possibly-too-tight cap safe here —
+/// over-capping makes a finding louder, never quieter.
+#[tokio::test]
+async fn a_hydration_record_over_the_byte_cap_fails_closed_to_critical() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(querybatch_body(&[&[("RUSTSEC-2023-0071", MODIFIED)]])),
+        )
+        .mount(&server)
+        .await;
+
+    // A record that would hydrate — and score the finding `Medium` off
+    // its CVSS vector — padded past the 4 MiB record cap. Without the
+    // cap this body is read and the finding comes back scored; with it,
+    // the hydration is skipped and the finding fails closed.
+    let mut record = marvin_full_record();
+    record["summary"] = json!("x".repeat(5 * 1024 * 1024));
+    Mock::given(method("GET"))
+        .and(path("/v1/vulns/RUSTSEC-2023-0071"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(record))
+        .mount(&server)
+        .await;
+
+    let adapter =
+        build_adapter_with_url(server.uri(), Arc::new(InMemoryEphemeralStore::new()), None).await;
+    let findings = adapter
+        .query(&[make_component("rsa", "0.9.6", Ecosystem::Cargo)])
+        .await
+        .expect("a refused hydration is fail-soft, not a failed query");
+
+    assert_eq!(findings.len(), 1, "the advisory is still reported");
+    assert_eq!(
+        findings[0].severity,
+        SeverityThreshold::Critical,
+        "an unhydrated finding carries no score and fails closed: {:?}",
+        findings[0]
+    );
+}
+
+#[test]
+fn a_hydration_record_over_the_byte_cap_ticks_failed_not_fetched() {
+    let snap = capture_metrics_around(|rt| {
+        rt.block_on(async move {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(querybatch_body(&[&[("RUSTSEC-2023-0071", MODIFIED)]])),
+                )
+                .mount(&server)
+                .await;
+            let mut record = marvin_full_record();
+            record["summary"] = json!("x".repeat(5 * 1024 * 1024));
+            Mock::given(method("GET"))
+                .and(path("/v1/vulns/RUSTSEC-2023-0071"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(record))
+                .mount(&server)
+                .await;
+            let adapter =
+                build_adapter_with_url(server.uri(), Arc::new(InMemoryEphemeralStore::new()), None)
+                    .await;
+            let _ = adapter
+                .query(&[make_component("rsa", "0.9.6", Ecosystem::Cargo)])
+                .await;
+        });
+    });
+
+    let counts = hydration_counts(snap);
+    assert_eq!(
+        counts.get("failed"),
+        Some(&1),
+        "a refused record body is a failed hydration: {counts:?}"
+    );
+    assert_eq!(
+        counts.get("fetched"),
+        None,
+        "it must not also count as fetched — nothing was read: {counts:?}"
+    );
+}
+
+/// Counter-test for the hydration cap: an ordinary record on the same
+/// path still hydrates and still scores the finding.
+#[tokio::test]
+async fn an_ordinary_hydration_record_still_scores_the_finding() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(querybatch_body(&[&[("RUSTSEC-2023-0071", MODIFIED)]])),
+        )
+        .mount(&server)
+        .await;
+    mount_vuln_record(&server, "RUSTSEC-2023-0071", marvin_full_record(), 1).await;
+
+    let adapter =
+        build_adapter_with_url(server.uri(), Arc::new(InMemoryEphemeralStore::new()), None).await;
+    let findings = adapter
+        .query(&[make_component("rsa", "0.9.6", Ecosystem::Cargo)])
+        .await
+        .expect("query");
+
+    assert_eq!(findings.len(), 1);
+    assert_ne!(
+        findings[0].severity,
+        SeverityThreshold::Critical,
+        "an ordinary record hydrates and scores off its CVSS vector, so the \
+         fail-closed Critical must NOT be what we see: {:?}",
+        findings[0]
+    );
+}

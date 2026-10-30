@@ -4,10 +4,12 @@
 //! configured ecosystem list and asks this module to fetch + parse one
 //! ecosystem at a time. Every per-ecosystem fetch:
 //!
-//! 1. streams `<bulk_url>/<ECO>/all.zip` into a tempfile
-//!    (`reqwest::Response::bytes_stream` → `tokio::fs::File` via
-//!    `tokio_util::io::StreamReader`) — the archive is never fully
-//!    buffered in RAM; ecosystem zips routinely exceed 50 MB;
+//! 1. streams `<bulk_url>/<ECO>/all.zip` into a tempfile under a
+//!    byte cap ([`BULK_ARCHIVE_MAX_BYTES`]) — the archive is never fully
+//!    buffered in RAM; ecosystem zips routinely exceed 50 MB. The cap is
+//!    on the **compressed** body, because the archive's decompression
+//!    bounds (`hort_formats::archive_bounds`) cannot engage until the
+//!    whole compressed body is already on disk;
 //! 2. opens the tempfile with the synchronous `zip` crate and walks
 //!    every entry whose name ends in `.json`;
 //! 3. deserialises each entry's JSON into [`BulkOsvVuln`] and converts
@@ -26,11 +28,9 @@
 //! filter of every later pull.
 
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
 use hort_formats::archive_bounds::{iter_zip_entries, BoundsConfig, ZipIterError};
 use serde::Deserialize;
 use tempfile::NamedTempFile;
-use tokio::io::AsyncWriteExt;
 
 use hort_domain::error::DomainError;
 use hort_domain::ports::advisory::{AdvisoryAffectedPackage, AdvisoryEntry};
@@ -49,6 +49,24 @@ use hort_domain::types::Ecosystem;
 /// dashboards, so this struct carries the classification alongside the
 /// underlying message; the conversion to `DomainError::Invariant` for
 /// the outer Result happens at the call site.
+/// Byte ceiling on one per-ecosystem `all.zip` **compressed** download.
+///
+/// 512 MiB. Sized against two things. Above: the largest OSV ecosystem
+/// archives today are tens of megabytes (npm is the biggest), so this is
+/// roughly an order of magnitude of growth headroom — a cap that real
+/// growth reaches is a cap that silently stops the feed. Below: the ZIP
+/// walk that follows admits
+/// [`MAX_ENTRIES_TRUSTED_BULK`](hort_formats::archive_bounds::MAX_ENTRIES_TRUSTED_BULK)
+/// entries of a few kilobytes each, so an archive that could not fit
+/// inside this bound carries more than that walk would read anyway.
+///
+/// It bounds **disk**, not memory: the body is streamed to a tempfile,
+/// and without the cap a hostile endpoint fills the volume inside the
+/// request timeout. Exceeding it fails the fetch — see
+/// [`crate::capped::copy_capped`] for why a partial archive must never
+/// be parsed.
+pub(crate) const BULK_ARCHIVE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
 #[derive(Debug)]
 pub(crate) struct BulkFetchError {
     pub kind: BulkFetchErrorKind,
@@ -289,12 +307,17 @@ fn classify_zip_walk(
 /// variant is determined by the caller via [`osv_label_to_ecosystem`]
 /// — a single-source mapping that mirrors the existing
 /// `ecosystem::osv_ecosystem_for` direction.
+///
+/// `archive_max_bytes` is the compressed-download ceiling — normally
+/// [`BULK_ARCHIVE_MAX_BYTES`], threaded as a parameter so the fetch's
+/// refusal path is reachable from a test without serving half a gigabyte.
 pub(crate) async fn pull_one_ecosystem(
     http: &reqwest::Client,
     bulk_url: &str,
     osv_eco_label: &str,
     eco_enum: Ecosystem,
     since: DateTime<Utc>,
+    archive_max_bytes: u64,
 ) -> Result<EcosystemPull, BulkFetchError> {
     let url = format!(
         "{}/{}/all.zip",
@@ -351,20 +374,26 @@ pub(crate) async fn pull_one_ecosystem(
                 kind: BulkFetchErrorKind::FetchError,
                 message: format!("osv bulk: open tempfile {}: {e}", path.display()),
             })?;
-        let stream = resp
-            .bytes_stream()
-            .map_err(|e| std::io::Error::other(e.to_string()));
-        let mut reader = tokio_util::io::StreamReader::new(stream);
-        tokio::io::copy(&mut reader, &mut tokio_file)
+        // A body that crosses the cap is a **failed fetch**, classified
+        // `FetchError` exactly like a reset connection: the caller's
+        // `Err` arm clears `all_ecosystems_ok`, holds the checkpoint and
+        // re-reads the window next tick. It is deliberately NOT a
+        // `SkippedMembers` reason — those count members a *completed*
+        // walk left out, and there is no walk here. Routing a refused
+        // download through `is_incomplete` would report an entry-cap
+        // problem that does not exist and point the operator at
+        // `MAX_ENTRIES_TRUSTED_BULK`.
+        //
+        // The partial bytes already written are abandoned with the
+        // tempfile rather than parsed. A truncated ZIP is not a smaller
+        // feed: it parses, yields fewer advisories, and reports a
+        // vulnerable package as clean.
+        crate::capped::copy_capped(resp, &mut tokio_file, archive_max_bytes)
             .await
             .map_err(|e| BulkFetchError {
                 kind: BulkFetchErrorKind::FetchError,
-                message: format!("osv bulk: stream copy: {e}"),
+                message: format!("osv bulk: GET {url}: {e}"),
             })?;
-        tokio_file.flush().await.map_err(|e| BulkFetchError {
-            kind: BulkFetchErrorKind::FetchError,
-            message: format!("osv bulk: flush: {e}"),
-        })?;
     }
 
     // Parse the zip on a blocking thread — the zip crate is sync and the
@@ -721,6 +750,7 @@ mod tests {
             "npm",
             Ecosystem::Npm,
             ts(1_000),
+            BULK_ARCHIVE_MAX_BYTES,
         )
         .await
         .expect("happy path returns Ok");
@@ -770,6 +800,7 @@ mod tests {
             "npm",
             Ecosystem::Npm,
             ts(1_000),
+            BULK_ARCHIVE_MAX_BYTES,
         )
         .await
         .expect("malformed entry must not abort the ecosystem");
@@ -796,9 +827,16 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let err = pull_one_ecosystem(&http_client(), &server.uri(), "npm", Ecosystem::Npm, ts(0))
-            .await
-            .expect_err("500 must surface as Err");
+        let err = pull_one_ecosystem(
+            &http_client(),
+            &server.uri(),
+            "npm",
+            Ecosystem::Npm,
+            ts(0),
+            BULK_ARCHIVE_MAX_BYTES,
+        )
+        .await
+        .expect_err("500 must surface as Err");
         assert_eq!(err.kind, BulkFetchErrorKind::FetchError);
         assert!(
             err.message.contains("500"),
@@ -817,9 +855,16 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let err = pull_one_ecosystem(&http_client(), &server.uri(), "npm", Ecosystem::Npm, ts(0))
-            .await
-            .expect_err("invalid zip payload must Err out the ecosystem");
+        let err = pull_one_ecosystem(
+            &http_client(),
+            &server.uri(),
+            "npm",
+            Ecosystem::Npm,
+            ts(0),
+            BULK_ARCHIVE_MAX_BYTES,
+        )
+        .await
+        .expect_err("invalid zip payload must Err out the ecosystem");
         // The bytes "not-a-zip" make `zip::ZipArchive::new` fail; that
         // path is classified as ParseError.
         assert_eq!(err.kind, BulkFetchErrorKind::ParseError);
@@ -877,8 +922,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result =
-            pull_one_ecosystem(&http_client(), &server.uri(), "npm", Ecosystem::Npm, since).await;
+        let result = pull_one_ecosystem(
+            &http_client(),
+            &server.uri(),
+            "npm",
+            Ecosystem::Npm,
+            since,
+            BULK_ARCHIVE_MAX_BYTES,
+        )
+        .await;
 
         // Must NOT fail with ParseError.
         assert!(
