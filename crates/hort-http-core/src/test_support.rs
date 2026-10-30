@@ -14,7 +14,7 @@
 //! duplicated across every test module in the inbound-HTTP crates
 //! (ADR 0008).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -617,15 +617,71 @@ pub fn trust_config_untrusted_peer_fallback() -> TrustConfig {
 /// `get` streams back (or `None`), `delete` is idempotent. Tests that need
 /// to assert mirror writes hold the same `Arc<MockMetadataMirror>` and
 /// inspect it via [`MockMetadataMirror::get`] / [`MockMetadataMirror::keys`].
+///
+/// Any byte string is a valid mirror body, on this double and in
+/// production alike: the production adapters record the body's digest in
+/// a frame header of their own and strip it again on read, so what goes
+/// through `put` is what comes back out of `get`. The one production
+/// outcome a plain `HashMap` cannot express is a body that *fails* its
+/// recorded digest, which is why [`Self::arm_digest_mismatch`] exists —
+/// without it a consumer's fall-through on a refused mirror read has no
+/// way to be driven from here.
 #[derive(Default)]
 pub struct MockMetadataMirror {
     data: Mutex<HashMap<String, Vec<u8>>>,
+    refused: Mutex<HashSet<String>>,
 }
 
 impl MockMetadataMirror {
     /// All keys currently held, for test assertions.
     pub fn keys(&self) -> Vec<String> {
         self.data.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Make `key`'s reader fail the way the production adapters' does
+    /// when the stored body no longer hashes to the digest recorded with
+    /// it: the bytes stream out and the read then yields
+    /// `io::ErrorKind::InvalidData` instead of EOF.
+    ///
+    /// The failure is on the **read**, not on `get`, because that is
+    /// where it lands in production — the digest is only decidable at the
+    /// last byte, so `get` hands back a verifying reader and the verdict
+    /// arrives when the consumer drains it. A mock that failed `get`
+    /// instead would exercise a different arm of the consumer than the
+    /// one a real mismatch reaches.
+    pub fn arm_digest_mismatch(&self, key: &str) {
+        self.refused.lock().unwrap().insert(key.to_string());
+    }
+}
+
+/// Yields `body`, then `io::ErrorKind::InvalidData` — the wire shape of a
+/// mirror (or CAS) read whose streaming digest check fails at EOF.
+struct RefusedAtEof {
+    body: std::io::Cursor<Vec<u8>>,
+}
+
+impl tokio::io::AsyncRead for RefusedAtEof {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let pos = self.body.position() as usize;
+        let take = {
+            let inner = self.body.get_ref();
+            let take = (inner.len() - pos).min(buf.remaining());
+            buf.put_slice(&inner[pos..pos + take]);
+            take
+        };
+        self.body.set_position((pos + take) as u64);
+        if buf.filled().len() == before {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mock mirror digest mismatch",
+            )));
+        }
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -667,9 +723,17 @@ impl MetadataMirrorStore for MockMetadataMirror {
         key: &str,
     ) -> BoxFuture<'_, DomainResult<Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>>> {
         let value = self.data.lock().unwrap().get(key).cloned();
+        let refused = self.refused.lock().unwrap().contains(key);
         Box::pin(async move {
             Ok(value.map(|v| {
-                Box::new(std::io::Cursor::new(v)) as Box<dyn tokio::io::AsyncRead + Send + Unpin>
+                if refused {
+                    Box::new(RefusedAtEof {
+                        body: std::io::Cursor::new(v),
+                    }) as Box<dyn tokio::io::AsyncRead + Send + Unpin>
+                } else {
+                    Box::new(std::io::Cursor::new(v))
+                        as Box<dyn tokio::io::AsyncRead + Send + Unpin>
+                }
             }))
         })
     }

@@ -2805,6 +2805,18 @@ mod tests {
     struct FailingArtifactsRepo;
 
     impl ArtifactRepository for FailingArtifactsRepo {
+        fn package_file_digests(
+            &self,
+            _r: Uuid,
+            _p: &str,
+        ) -> hort_domain::ports::BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<
+                Vec<hort_domain::ports::artifact_repository::PackageFileDigestRow>,
+            >,
+        > {
+            unimplemented!("not used by self-service-prefetch test")
+        }
         fn find_by_id(
             &self,
             _id: Uuid,

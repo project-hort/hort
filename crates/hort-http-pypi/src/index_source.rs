@@ -50,6 +50,14 @@
 //! the per-file rows (sdist + N wheels) the builder turns back into
 //! `<a>` anchors or `files[]` rows.
 //!
+//! Each of those rows' advertised `sha256` is decided per FILE by
+//! [`advertised_digest`] against [`ArtifactUseCase::package_file_digests`]:
+//! the served `href` points back at hort, so for a file hort holds the
+//! advertisement is hort's own stored digest — the one the CAS read is
+//! verified against — and only a file hort does not hold keeps the
+//! upstream's value. Per-file rather than per-version because a version
+//! holds several files and hort may hold only some of them.
+//!
 //! # `truncated` channel
 //!
 //! The `IndexSourceOutput.truncated` channel lets the hosted source
@@ -488,6 +496,27 @@ impl IndexSource for ProxyPypiSource {
             hort_domain::entities::artifact::QuarantineStatus,
         > = pkg_status.into_iter().collect();
 
+        // What hort actually holds, per FILE. The served `href` points
+        // back at hort, so for a file hort stores it is hort's bytes the
+        // client will check the advertised digest against — see
+        // [`advertised_digest`]. `status_map` cannot carry this: it is
+        // keyed by version, and a version holds several files of which
+        // hort may hold only some.
+        //
+        // `?`, not a degrade-to-empty: an empty map is the claim "hort
+        // holds none of these files", under which every advertisement
+        // falls back to the upstream's claim about bytes hort serves
+        // from its own store — exactly the substitution this read
+        // closes. Unlike cargo's `pubtime`, there is no omittable field
+        // to fall back to.
+        let held_digests: HeldFileDigests = ctx
+            .artifact_use_case
+            .package_file_digests(repo.id, &normalized)
+            .await?
+            .into_iter()
+            .map(|(path, hash)| (stored_filename(&path).to_string(), hash))
+            .collect();
+
         // Map the cached projection into per-version entries. The
         // projection is already computed (the helper streamed the body
         // through the format-appropriate projector on the fetch path;
@@ -496,7 +525,38 @@ impl IndexSource for ProxyPypiSource {
         // and surfaces as `MetadataMalformed` above — it never reaches
         // here as a partially-projected body. The mapping is
         // format-INDEPENDENT (both arms share the same projection).
-        let entries = projection_to_entries(projection, &normalized, &status_map);
+        let mut divergence: Vec<String> = Vec::new();
+        let entries = projection_to_entries(
+            projection,
+            &normalized,
+            &status_map,
+            &held_digests,
+            &mut divergence,
+        );
+
+        if !divergence.is_empty() {
+            let repo_label = if ctx.include_repository_label {
+                repo.key.as_str()
+            } else {
+                hort_app::metrics::values::REPOSITORY_ALL
+            };
+            metrics::counter!(
+                "hort_index_digest_divergence_total",
+                "format" => "pypi",
+                "repository" => repo_label.to_string(),
+            )
+            .increment(divergence.len() as u64);
+            // The filenames belong in the log, not the metric — a
+            // per-file label would be unbounded cardinality.
+            tracing::warn!(
+                repository = %repo.key,
+                package = %normalized,
+                files = ?divergence,
+                "pypi simple-index serve: upstream advertises a different sha256 than hort \
+                 stored for these filenames; serving hort's own digest for the bytes hort \
+                 will hand back",
+            );
+        }
 
         Ok(IndexSourceOutput {
             entries,
@@ -506,12 +566,98 @@ impl IndexSource for ProxyPypiSource {
     }
 }
 
+/// Filename → the SHA-256 of the bytes **hort itself holds** under that
+/// filename for one `(repository, project)`.
+///
+/// Built from [`ArtifactUseCase::package_file_digests`], whose rows carry
+/// the full logical projection path; pypi's
+/// `build_artifact_logical_path` puts the filename last and verbatim
+/// (`simple/{normalized}/{filename}`), so the basename is the key the
+/// upstream projection's `files[].filename` is comparable against.
+///
+/// Presence means hort holds the file and a download of it is served
+/// from hort's own store. Absence means hort does not hold it: the
+/// upstream's advertisement is the only digest anyone knows, and is also
+/// the one the pull-through will verify against (ADR 0006), so it is
+/// kept as-is.
+pub(crate) type HeldFileDigests =
+    std::collections::HashMap<String, hort_domain::types::ContentHash>;
+
+/// The filename a stored pypi artifact is served under — the last
+/// segment of its logical projection path.
+///
+/// `PyPiFormatHandler::build_artifact_logical_path` is the single
+/// constructor of that path and embeds the filename verbatim as the last
+/// segment, which is why a basename is the whole derivation. Mirrors
+/// what [`HostedPypiSource`] does with `artifact.path`.
+fn stored_filename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Pick the digest the served simple index advertises for one file.
+///
+/// The `href` a proxy serve emits points back at hort, so whichever
+/// digest lands in it is the one a client checks the bytes **hort**
+/// hands back against. There are three cases and they are not
+/// symmetric:
+///
+/// - **hort holds the file** → advertise hort's own stored digest. It is
+///   the digest `VerifyingReader` checks that CAS read against (ADR
+///   0003), so it is the only value for which the client's own
+///   `hexdigest()` can agree.
+/// - **hort does not hold it** → keep the upstream's value, whatever it
+///   is, including `None`. hort will pull the file on first request and
+///   verify it against exactly this advertisement (ADR 0006), so the
+///   two agree by construction. Substituting a digest of hort's own
+///   here would be an advertisement for bytes hort has never seen —
+///   the same defect one step over.
+/// - **both known and they DISAGREE** → hort's own wins, and the
+///   divergence is reported. The upstream index now names different
+///   bytes than hort stored under this filename: an upstream that
+///   re-used a filename, a mapping repointed at a different index, or a
+///   stale projection. Serving the upstream's value in that state is
+///   not a weaker check, it is a *guaranteed-failing* one — hort will
+///   never hand back those bytes, so the labelled comparison can only
+///   fail. (The same reasoning the `hash_sha256` field documents for
+///   dropping a non-hex digest: a check that cannot succeed is not a
+///   check.) The honest answer is the digest of the bytes the client is
+///   about to receive, plus a loud signal that upstream and hort
+///   disagree about what this filename means — which is a supply-chain
+///   fact an operator needs, not a serve-path detail.
+///
+/// Divergent filenames are pushed onto `divergence` rather than logged
+/// here: this function is called once per file, and the caller holds
+/// the repository/project context that makes a log line useful.
+fn advertised_digest(
+    filename: &str,
+    upstream: Option<hort_domain::types::ContentHash>,
+    held: Option<&hort_domain::types::ContentHash>,
+    divergence: &mut Vec<String>,
+) -> Option<hort_domain::types::ContentHash> {
+    match held {
+        Some(held) => {
+            if upstream.as_ref().is_some_and(|up| up != held) {
+                divergence.push(filename.to_string());
+            }
+            Some(held.clone())
+        }
+        None => upstream,
+    }
+}
+
 /// Map a representation-independent [`PypiSimpleIndexProjection`] into
 /// `Vec<VersionEntry>`. Each version groups its files; each file becomes
 /// one [`PypiVersionFile`]. The `status_map` hydrates the entry's
 /// `status` field via `(version, status)` lookup; absent → `None`
 /// the "unknown" tier (status absent means hort has never seen the
 /// version from upstream).
+///
+/// `held_digests` is the per-FILE half, and it is keyed by filename
+/// rather than by version on purpose: a version holds several files
+/// (sdist + N wheels) and hort may hold only some of them, so a
+/// per-version answer derived from one file would mislabel its
+/// siblings. It decides each file's advertised `hash_sha256` — see
+/// [`advertised_digest`].
 ///
 /// The serve cache holds the projection (produced once by the
 /// format-appropriate projector on the fetch path; both the HTML and
@@ -526,6 +672,8 @@ pub(crate) fn projection_to_entries(
         String,
         hort_domain::entities::artifact::QuarantineStatus,
     >,
+    held_digests: &HeldFileDigests,
+    divergence: &mut Vec<String>,
 ) -> Vec<VersionEntry> {
     use std::collections::BTreeMap;
     let mut per_version: BTreeMap<String, Vec<PypiVersionFile>> = BTreeMap::new();
@@ -538,6 +686,14 @@ pub(crate) fn projection_to_entries(
                 .as_ref()
                 .and_then(|u| u.rsplit('/').next().map(str::to_string))
         }) else {
+            continue;
+        };
+        // Resolve the version key before deciding anything per file: a
+        // filename this cannot parse is dropped from the document
+        // entirely, and the digest decision below has a reportable
+        // side effect, so counting a file nobody is served would
+        // inflate the divergence signal with entries no client sees.
+        let Some(version) = extract_version_from_filename(&filename, normalized_project) else {
             continue;
         };
         // The projection carries `metadata_sha256` as the verbatim hex
@@ -558,14 +714,17 @@ pub(crate) fn projection_to_entries(
         // digest, and lowercase is the form a client's own `hexdigest()`
         // produces — dropping it would lose a check that can succeed,
         // which a non-hex or wrong-length value never could.
-        let hash_sha256 = f
+        let upstream_sha256 = f
             .sha256
             .as_deref()
             .map(str::to_ascii_lowercase)
             .and_then(|hex| hex.parse::<hort_domain::types::ContentHash>().ok());
-        let Some(version) = extract_version_from_filename(&filename, normalized_project) else {
-            continue;
-        };
+        let hash_sha256 = advertised_digest(
+            &filename,
+            upstream_sha256,
+            held_digests.get(&filename),
+            divergence,
+        );
         per_version
             .entry(version)
             .or_default()
@@ -672,6 +831,7 @@ pub(crate) fn parse_body_to_entries(
         String,
         hort_domain::entities::artifact::QuarantineStatus,
     >,
+    held_digests: &HeldFileDigests,
 ) -> (Vec<VersionEntry>, bool) {
     use crate::simple_index::SimpleIndexFormat;
     use hort_domain::ports::upstream_proxy::MetadataProjector;
@@ -697,7 +857,13 @@ pub(crate) fn parse_body_to_entries(
         }
     };
     (
-        projection_to_entries(projection, normalized_project, status_map),
+        projection_to_entries(
+            projection,
+            normalized_project,
+            status_map,
+            held_digests,
+            &mut Vec::new(),
+        ),
         cap_tripped,
     )
 }

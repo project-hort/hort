@@ -1483,6 +1483,8 @@ mod tests {
             projection,
             "flask",
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &mut Vec::new(),
         );
         assert_eq!(entries.len(), 1, "one version (3.0.0)");
         assert_eq!(entries[0].version, "3.0.0");

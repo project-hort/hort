@@ -1313,6 +1313,64 @@ mod tests {
         );
     }
 
+    /// The other half of the mirror fallback: a mirror body the port
+    /// **refuses** must not become the authority for the pull that
+    /// follows.
+    ///
+    /// The seeded body is valid and would project cleanly — the
+    /// preceding test proves exactly that, with the same bytes — so the
+    /// only thing standing between it and a served `9.9.9` is the port's
+    /// refusal. That matters because the projection it would produce
+    /// carries each version's `dist.tarball` and `integrity`, and those
+    /// are the values the subsequent tarball pull verifies the
+    /// downloaded bytes against: re-projecting a body whose own digest
+    /// no longer holds would make that verification circular. An
+    /// upstream error is the honest answer.
+    #[tokio::test]
+    async fn fetch_does_not_reproject_a_mirror_body_the_port_refuses() {
+        let metrics = PrometheusBuilder::new().build_recorder().handle();
+        let (ctx, mocks) = build_mock_ctx(metrics);
+        let repo = proxy_npm_repo("npm-mirror");
+        mocks.repositories.insert(repo.clone());
+        let mapping_id = seed_mapping(&mocks, repo.id);
+
+        let raw = br#"{"dist-tags":{"latest":"9.9.9"},
+            "versions":{"9.9.9":{"name":"express","dist":{
+            "tarball":"https://registry.npmjs.org/express/-/express-9.9.9.tgz",
+            "integrity":"sha512-zzz"}}}}"#;
+        let mkey = mirror_key("npm", &mapping_id.to_string(), "express");
+        mocks
+            .metadata_mirror
+            .put(&mkey, Box::new(std::io::Cursor::new(raw.to_vec())))
+            .await
+            .unwrap();
+        // The body no longer hashes to the digest recorded with it.
+        mocks.metadata_mirror.arm_digest_mismatch(&mkey);
+
+        mocks
+            .upstream_proxy
+            .fail_next_metadata_with(DomainError::Invariant("upstream:down".into()));
+
+        let err = fetch_raw_with_cache(
+            ctx.upstream_resolver.as_ref(),
+            ctx.ephemeral_evictable.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
+            ctx.pull_dedup.as_ref(),
+            Some(ctx.metadata_mirror.as_ref()),
+            cap(),
+            &repo,
+            "express",
+        )
+        .await
+        .expect_err("a refused mirror body must not be served as a projection");
+        assert!(
+            matches!(err, PackumentFetchError::UpstreamUnavailable),
+            "got {err:?}"
+        );
+    }
+
     /// No upstream mapping → NoUpstream.
     #[tokio::test]
     async fn fetch_no_mapping_returns_no_upstream() {

@@ -293,6 +293,46 @@ mod tests {
         );
     }
 
+    /// A **same-length** substitution — different bytes, identical
+    /// length — is delivered in full and only then errors. That is the
+    /// reader working as designed (the digest is unknowable before the
+    /// last byte), and it is the premise the serving path has to cope
+    /// with: a length-delimited HTTP body is complete from the
+    /// recipient's point of view the moment the Nth byte lands, and the
+    /// verdict after it has no field left to arrive in. Pinned here so
+    /// `hort-http-core`'s
+    /// `served_blob_integrity_is_client_visible` scripts a double
+    /// against a measured contract rather than an assumed one.
+    #[tokio::test]
+    async fn same_length_substitution_delivers_every_byte_then_errors() {
+        // Same length as b"hello world" (11), different bytes.
+        let substituted = b"HELLO WORLD".to_vec();
+        assert_eq!(substituted.len(), b"hello world".len());
+
+        let inner = Cursor::new(substituted.clone());
+        let mut reader = VerifyingReader::new(inner, hash(HELLO_WORLD_SHA256), None);
+
+        // Read byte-by-byte so the delivered count is observable up to
+        // the moment the verdict lands.
+        let mut delivered = Vec::new();
+        let mut one = [0u8; 1];
+        let err = loop {
+            match reader.read(&mut one).await {
+                Ok(0) => panic!("a substituted body must not report a clean EOF"),
+                Ok(n) => delivered.extend_from_slice(&one[..n]),
+                Err(e) => break e,
+            }
+        };
+
+        assert_eq!(
+            delivered, substituted,
+            "every substituted byte is handed on before the verdict"
+        );
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let verdict = CasIntegrityFailure::from_io_error(&err).expect("verdict payload");
+        assert_eq!(verdict.expected, hash(HELLO_WORLD_SHA256));
+    }
+
     /// The mismatch error carries the verdict as a *recoverable payload*,
     /// not only as text. This is what lets `CasScrubUseCase` record a
     /// `CasIntegrityMismatch` with the observed digest and reach the

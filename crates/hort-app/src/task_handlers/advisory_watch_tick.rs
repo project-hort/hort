@@ -406,6 +406,7 @@ mod tests {
     use hort_domain::ports::advisory::{
         AdvisoryAffectedPackage, AdvisoryDiffResult, AdvisoryEntry,
     };
+    use hort_domain::ports::artifact_repository::PackageFileDigestRow;
     use hort_domain::ports::jobs_repository::{
         JobRow, JobStatus, JobsRepository, KindFields, ListJobsFilter, ListJobsPage,
         ResultWriteOutcome, ScanJob,
@@ -698,6 +699,15 @@ mod tests {
     }
 
     impl ArtifactRepository for MockArtifacts {
+        fn package_file_digests(
+            &self,
+            _repository_id: Uuid,
+            _package: &str,
+        ) -> BoxFuture<'_, DomainResult<Vec<PackageFileDigestRow>>> {
+            // Required, not defaulted: this double holds no artifacts,
+            // so an empty answer is a statement, not a fallback.
+            Box::pin(async { Ok(Vec::new()) })
+        }
         fn find_by_id(&self, id: Uuid) -> BoxFuture<'_, DomainResult<Artifact>> {
             let got = self.by_id.lock().unwrap().get(&id).cloned();
             Box::pin(async move {

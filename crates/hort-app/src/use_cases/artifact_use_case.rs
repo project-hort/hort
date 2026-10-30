@@ -1379,6 +1379,35 @@ impl ArtifactUseCase {
             .package_version_publish_times(repository_id, package)
             .await?)
     }
+
+    /// Per-`(repository, package)` `(path, checksum_sha256)` read — the
+    /// per-FILE "what does hort actually hold" fact a proxy index serve
+    /// needs in order to advertise the digest of the bytes it will hand
+    /// back itself rather than the digest the upstream index claims for
+    /// that filename.
+    ///
+    /// Thin pass-through to
+    /// [`ArtifactRepository::package_file_digests`]. Row presence means
+    /// "hort holds these bytes under this path"; a file with no row is
+    /// not held, and the caller keeps whatever the upstream advertised
+    /// (or nothing) — never a digest of its own invention.
+    ///
+    /// **Errors propagate.** Unlike
+    /// [`Self::package_version_publish_times`], whose failure degrades to
+    /// an omitted `pubtime`, a failure here has no degraded form: the
+    /// caller would fall back to the upstream's claim about bytes hort
+    /// stores, which is the defect. Callers `?` this.
+    #[tracing::instrument(skip(self))]
+    pub async fn package_file_digests(
+        &self,
+        repository_id: Uuid,
+        package: &str,
+    ) -> AppResult<Vec<hort_domain::ports::artifact_repository::PackageFileDigestRow>> {
+        Ok(self
+            .artifacts
+            .package_file_digests(repository_id, package)
+            .await?)
+    }
 }
 
 /// Iterate a paginated port-call until exhaustion or the `cap`,
@@ -2125,6 +2154,18 @@ mod tests {
     struct FailingFindArtifactRepository;
 
     impl ArtifactRepository for FailingFindArtifactRepository {
+        fn package_file_digests(
+            &self,
+            _repository_id: Uuid,
+            _package: &str,
+        ) -> hort_domain::ports::BoxFuture<
+            '_,
+            DomainResult<Vec<hort_domain::ports::artifact_repository::PackageFileDigestRow>>,
+        > {
+            // Required, not defaulted: this double holds no artifacts,
+            // so an empty answer is a statement, not a fallback.
+            Box::pin(async { Ok(Vec::new()) })
+        }
         fn find_by_id(
             &self,
             id: Uuid,
@@ -2359,6 +2400,11 @@ mod tests {
             // when a future refactor reshuffles arms.
             assert!(repo
                 .package_version_status(Uuid::nil(), "x")
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(repo
+                .package_file_digests(Uuid::nil(), "x")
                 .await
                 .unwrap()
                 .is_empty());
@@ -4441,6 +4487,18 @@ mod visibility_extension_tests {
     async fn find_visible_by_id_propagates_invariant_errors_from_artifact_lookup() {
         struct FailingFind;
         impl ArtifactRepository for FailingFind {
+            fn package_file_digests(
+                &self,
+                _repository_id: Uuid,
+                _package: &str,
+            ) -> hort_domain::ports::BoxFuture<
+                '_,
+                hort_domain::error::DomainResult<
+                    Vec<hort_domain::ports::artifact_repository::PackageFileDigestRow>,
+                >,
+            > {
+                Box::pin(async { Ok(Vec::new()) })
+            }
             fn find_by_id(
                 &self,
                 _id: Uuid,
@@ -5447,6 +5505,86 @@ mod visibility_extension_tests {
         let uc = ArtifactUseCase::new(artifacts, storage, repos, true);
         let rows = uc
             .package_version_publish_times(Uuid::new_v4(), "never-seen")
+            .await
+            .expect("ok");
+        assert!(rows.is_empty());
+    }
+
+    // -- package_file_digests wrapper ---------------------------------------
+
+    /// Per-FILE pass-through. Two axes the shape has to carry and
+    /// `package_version_status` does not: a **null-version** row is
+    /// included (it is still a file hort holds), and the row key is the
+    /// stored `path`, not the version — two files sharing one version
+    /// both come back.
+    #[tokio::test]
+    async fn package_file_digests_passes_through_to_port() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let repo_id = Uuid::new_v4();
+
+        // Two files at one version.
+        let mut a1 = sample_artifact(QuarantineStatus::Released);
+        a1.id = Uuid::new_v4();
+        a1.repository_id = repo_id;
+        a1.name = "leftpad".into();
+        a1.version = Some("1.0.0".into());
+        a1.path = "simple/leftpad/leftpad-1.0.0.tar.gz".into();
+        a1.sha256_checksum = "1111111111111111111111111111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        artifacts.insert(a1.clone());
+
+        let mut a2 = sample_artifact(QuarantineStatus::Released);
+        a2.id = Uuid::new_v4();
+        a2.repository_id = repo_id;
+        a2.name = "leftpad".into();
+        a2.version = Some("1.0.0".into());
+        a2.path = "simple/leftpad/leftpad-1.0.0-py3-none-any.whl".into();
+        a2.sha256_checksum = "2222222222222222222222222222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        artifacts.insert(a2.clone());
+
+        // Null version — still a file hort holds.
+        let mut a3 = sample_artifact(QuarantineStatus::Released);
+        a3.id = Uuid::new_v4();
+        a3.repository_id = repo_id;
+        a3.name = "leftpad".into();
+        a3.version = None;
+        a3.path = "simple/leftpad/leftpad-unversioned.zip".into();
+        a3.sha256_checksum = "3333333333333333333333333333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        artifacts.insert(a3.clone());
+
+        let uc = ArtifactUseCase::new(artifacts, storage, repos, true);
+        let mut rows = uc
+            .package_file_digests(repo_id, "leftpad")
+            .await
+            .expect("ok");
+        rows.sort_by(|x, y| x.0.cmp(&y.0));
+        let mut want = vec![
+            (a1.path.clone(), a1.sha256_checksum.clone()),
+            (a2.path.clone(), a2.sha256_checksum.clone()),
+            (a3.path.clone(), a3.sha256_checksum.clone()),
+        ];
+        want.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(rows, want);
+    }
+
+    /// Absence is "hort holds none of these files" — which the caller
+    /// reads as "keep every upstream advertisement verbatim", never as a
+    /// licence to substitute one.
+    #[tokio::test]
+    async fn package_file_digests_unknown_package_returns_empty() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let uc = ArtifactUseCase::new(artifacts, storage, repos, true);
+        let rows = uc
+            .package_file_digests(Uuid::new_v4(), "never-seen")
             .await
             .expect("ok");
         assert!(rows.is_empty());

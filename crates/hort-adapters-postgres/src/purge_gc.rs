@@ -70,22 +70,34 @@
 //!
 //! # `purge_artifact_refs` — durable preparation in one transaction
 //!
-//! 1. `SELECT … FROM artifacts WHERE id = $1 FOR UPDATE` — lock the
+//! 1. `SELECT a.id FROM artifacts WHERE id = $1 FOR UPDATE` — lock the
 //!    artifact row so a concurrent ingest/promote cannot race the
-//!    refcount decrement; also recovers the authoritative
-//!    `checksum_sha256` for the idempotent-retry path. This lock is
-//!    about *this artifact's* bookkeeping and says nothing about the
-//!    blobs it points at — see `begin_blob_reclaim` below, which is the
-//!    lock the destructive step runs under.
+//!    refcount decrement, and so a ref write cannot make this artifact
+//!    a tag target while the decision below is being taken (every ref
+//!    write takes `FOR SHARE` on the artifact rows its target names —
+//!    `ref_lifecycle`'s `lock_target_artifacts`). This lock is about
+//!    *this artifact's* bookkeeping and says nothing about the blobs it
+//!    points at — see `begin_blob_reclaim` below, which is the lock the
+//!    destructive step runs under.
 //!
-//!    The same statement reads the four protection facts
-//!    (`quarantine_status`, `tag_targeted`,
-//!    `expired_only_by_keep_last_n`, `user_deleted`), and the two port
+//!    Then a **second** statement, under that lock, reads the
+//!    authoritative `checksum_sha256` for the idempotent-retry path and
+//!    the four protection facts (`quarantine_status`, `tag_targeted`,
+//!    `expired_only_by_keep_last_n`, `user_deleted`); the two port
 //!    predicates (`PendingPurge::is_gc_protected` /
 //!    `::is_tag_exempt`) are applied to them. Either one holding ends
 //!    the transaction here — `PurgePreparation::Protected` /
 //!    `::TagExempt`, no `DELETE`, no worklist row, no event, work item
 //!    still pending.
+//!
+//!    Two statements rather than one because three of the four facts
+//!    are subqueries over other tables, and a subquery is answered
+//!    from its own statement's snapshot. Read in the locking statement,
+//!    they answer about the moment the lock wait *began* — so a tag
+//!    that committed during the wait is invisible to the very
+//!    transaction that waited for it. Lock first, read second, and the
+//!    read's snapshot postdates the lock. The function body carries the
+//!    per-fact argument.
 //!
 //!    This is where the protection decision belongs, because step 2 is
 //!    the first irreversible one and the facts move while the sweep
@@ -285,10 +297,10 @@ const ARTIFACT_USER_DELETED_SQL: &str = r#"
     )
 "#;
 
-/// The artifact row as read under the `FOR UPDATE` lock that opens the
-/// worklist preparation: the authoritative `checksum_sha256` for the
-/// idempotent-retry path, plus the four facts the two protection rules
-/// are computed from.
+/// The artifact row as read under — and in the statement after — the
+/// `FOR UPDATE` lock that opens the worklist preparation: the
+/// authoritative `checksum_sha256` for the idempotent-retry path, plus
+/// the four facts the two protection rules are computed from.
 #[derive(Debug, FromRow)]
 struct LockedArtifactRow {
     checksum_sha256: String,
@@ -764,29 +776,27 @@ impl PurgeGcPort for PgPurgeGcPort {
             // normal retry cannot invert the final transition's
             // worklist -> events -> artifact lock order.
             //
-            // The lock also carries the protection facts, and that is
-            // the point of reading them here rather than trusting the
-            // page row the caller holds: this statement runs in the
-            // transaction that is about to delete the edges, and the
-            // page row was taken before the sweep processed a single
-            // item of its page.
+            // The lock is taken here, and the protection facts are
+            // read by the *next* statement, and that split is the
+            // whole mechanism rather than a style choice.
             //
-            // For `quarantine_status` the lock makes the read
-            // conclusive — a scan writing that column takes the same
-            // row lock, so this either waits for it and then observes
-            // the committed value (`FOR UPDATE` re-fetches the latest
-            // row version) or the write was already committed and is
-            // read. The tag fact lives in `mutable_refs` and a ref
-            // write takes no artifact lock, so what this cannot see is
-            // a tag committing after it — which is what "after the
-            // purge" means anywhere. What it does close is the page.
-            let sql = format!(
-                r#"
-                SELECT a.checksum_sha256   AS checksum_sha256,
-                       a.quarantine_status AS quarantine_status,
-                       {tag_targeted}      AS tag_targeted,
-                       {keep_last_n_only}  AS expired_only_by_keep_last_n,
-                       {user_deleted}      AS user_deleted
+            // Three of the four facts are subqueries over other tables
+            // (`mutable_refs` for the tag, `events` for the two expiry
+            // facts), and a subquery is answered from the snapshot of
+            // the statement that contains it. A statement that both
+            // acquires the row lock and evaluates those subqueries
+            // took its snapshot *before* it waited, so a write that
+            // committed during the wait is invisible to it — even
+            // though the wait was for that very writer. Only the
+            // artifacts row's own columns are re-fetched on release.
+            //
+            // Acquiring the lock in its own statement gives the next
+            // one a snapshot taken while the lock is held, which is
+            // what makes "no mutable ref points at this artifact" a
+            // fact about now instead of a fact about the moment the
+            // wait began.
+            let lock_sql = r#"
+                SELECT a.id
                 -- DELETED-INCLUSIVE: the row lock a purge takes before
                 -- acting, on an artifact `list_pending_purge` just handed
                 -- it — and that set admits soft-deleted rows on purpose.
@@ -797,6 +807,64 @@ impl PurgeGcPort for PgPurgeGcPort {
                   FROM artifacts a
                  WHERE a.id = $1
                    FOR UPDATE
+                "#;
+            let present: Option<Uuid> = sqlx::query_scalar(lock_sql)
+                .bind(artifact_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "purge_gc", "lock_artifact"))?;
+            if present.is_none() {
+                tx.commit().await.map_err(|e| {
+                    DomainError::Invariant(format!("purge_gc commit (no-artifact): {e}"))
+                })?;
+                return Ok(PurgePreparation::NoArtifact);
+            }
+
+            // The protection facts, under the lock just taken and on a
+            // snapshot newer than it. Read here rather than trusting
+            // the page row the caller holds: this runs in the
+            // transaction that is about to delete the edges, and the
+            // page row was taken before the sweep processed a single
+            // item of its page.
+            //
+            // What each of the four facts rests on:
+            //
+            // - `quarantine_status` — a scan writing that column takes
+            //   this same row lock, so either this transaction waited
+            //   for it and reads the committed value, or the write was
+            //   already committed.
+            // - `tag_targeted` — the fact lives in `mutable_refs`, and
+            //   a ref write cannot reach it without first taking
+            //   `FOR SHARE` on the artifact rows its target names
+            //   (`ref_lifecycle`'s `lock_target_artifacts`). So a tag
+            //   write is either committed before this snapshot, or
+            //   blocked until this transaction ends and therefore not
+            //   a tag yet. A row lock on `mutable_refs` could not
+            //   carry this: the predicate is an `EXISTS` over a set and
+            //   the dangerous write is an INSERT of a row that does not
+            //   exist to be locked.
+            // - `expired_only_by_keep_last_n` / `user_deleted` — reads
+            //   of an append-only stream, and both move only in the
+            //   direction that makes a purge more willing. There is
+            //   nothing to exclude; the snapshot being the newer one is
+            //   what keeps them from disagreeing with the tag fact
+            //   read beside them.
+            let sql = format!(
+                r#"
+                SELECT a.checksum_sha256   AS checksum_sha256,
+                       a.quarantine_status AS quarantine_status,
+                       {tag_targeted}      AS tag_targeted,
+                       {keep_last_n_only}  AS expired_only_by_keep_last_n,
+                       {user_deleted}      AS user_deleted
+                -- DELETED-INCLUSIVE: the facts behind a purge decision,
+                -- on an artifact `list_pending_purge` just handed it — and
+                -- that set admits soft-deleted rows on purpose. A liveness
+                -- predicate here would hide the facts of a user-deleted
+                -- artifact from the statement that decides about it, so
+                -- every one of them would cycle through the worklist
+                -- forever without being purged.
+                  FROM artifacts a
+                 WHERE a.id = $1
                 "#,
                 tag_targeted = crate::ARTIFACT_IS_TAG_TARGETED_SQL,
                 keep_last_n_only = ARTIFACT_EXPIRED_ONLY_BY_KEEP_LAST_N_SQL,
@@ -806,17 +874,14 @@ impl PurgeGcPort for PgPurgeGcPort {
             // three interpolated fragments are crate `const`s, so the
             // statement text is fixed at compile time, and the only
             // runtime value (`artifact_id`) is bound ($1).
-            let locked: Option<LockedArtifactRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            //
+            // `fetch_one`: the row lock above is held, so the row this
+            // reads cannot have gone away between the two statements.
+            let locked: LockedArtifactRow = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(artifact_id)
-                .fetch_optional(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await
-                .map_err(|e| map_sqlx_error(&e, "purge_gc", "lock_artifact"))?;
-            let Some(locked) = locked else {
-                tx.commit().await.map_err(|e| {
-                    DomainError::Invariant(format!("purge_gc commit (no-artifact): {e}"))
-                })?;
-                return Ok(PurgePreparation::NoArtifact);
-            };
+                .map_err(|e| map_sqlx_error(&e, "purge_gc", "protection_facts"))?;
             let checksum_sha256 = locked.checksum_sha256;
 
             // Another first-time preparer may have committed while this
@@ -5087,6 +5152,357 @@ mod tests {
             first,
             "the committed worklist is the authoritative target set; a \
              refusal here would leave a purge that can never finish"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+    // -- the tag fact and the lock that has to cover it ------------------
+    //
+    // The purge decides on "no mutable ref points at this artifact"
+    // while holding the artifact row. That fact lives in `mutable_refs`,
+    // which a ref write reaches without touching `artifacts` unless it
+    // takes `ref_lifecycle::lock_target_artifacts` first — so these
+    // tests drive the real `PgRefLifecycle::move_ref` against the real
+    // `purge_artifact_refs` and watch the two interleave.
+
+    /// Seed an artifact that is pending purge, expired under
+    /// `KeepLastN` alone and pointed at by nothing — the one state in
+    /// which a tag arriving late is the difference between surviving
+    /// and being destroyed.
+    async fn untagged_keep_last_n_candidate(
+        pool: &PgPool,
+        repo: Uuid,
+        name: &str,
+        hash: &str,
+    ) -> Uuid {
+        let art = seed_artifact(pool, repo, name, hash, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(art)
+            .execute(pool)
+            .await
+            .unwrap();
+        insert_cr(pool, repo, art, "primary_content", hash).await;
+        append_expired_with_reason(pool, art, 0, keep_last_n_reason()).await;
+        assert!(
+            !pending_for(pool, art).await.tag_targeted,
+            "the premise of the race is an artifact nothing points at"
+        );
+        art
+    }
+
+    /// The real ref-write adapter, and a first-placement `move_ref`
+    /// call for `target` under `(namespace, ref_name)`.
+    fn first_placement(
+        repo: Uuid,
+        namespace: &str,
+        ref_name: &str,
+        target: hort_domain::entities::mutable_ref::RefTarget,
+    ) -> (hort_domain::entities::mutable_ref::MutableRef, AppendEvents) {
+        use hort_domain::entities::mutable_ref::MutableRef;
+        use hort_domain::events::{Actor, ApiActor, RefMoved};
+        use hort_domain::ports::event_store::{EventToAppend, ExpectedVersion};
+
+        let r = MutableRef {
+            id: Uuid::new_v4(),
+            repository_id: repo,
+            namespace: namespace.to_string(),
+            ref_name: ref_name.to_string(),
+            target: target.clone(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let batch = AppendEvents {
+            stream_id: StreamId::ref_(r.id),
+            expected_version: ExpectedVersion::NoStream,
+            events: vec![EventToAppend::new(DomainEvent::RefMoved(RefMoved {
+                ref_id: r.id,
+                repository_id: repo,
+                namespace: namespace.to_string(),
+                ref_name: ref_name.to_string(),
+                from: None,
+                to: target,
+            }))],
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: Actor::Api(ApiActor {
+                user_id: Uuid::new_v4(),
+            }),
+        };
+        (r, batch)
+    }
+
+    /// Hold the `(repository_id, namespace, ref_name)` key with an
+    /// uncommitted INSERT.
+    ///
+    /// This is the pause button for a *real* `move_ref`: the
+    /// first-placement path's
+    /// `INSERT … ON CONFLICT DO NOTHING RETURNING id` waits on an
+    /// in-progress duplicate, so `move_ref` stops there — after it has
+    /// taken the artifact lock and with its own INSERT genuinely
+    /// pending. Roll this back and the real INSERT wins the key and
+    /// commits. Nothing about the race is simulated: the ref row that
+    /// lands is the one the production adapter wrote, in the
+    /// transaction the production adapter opened.
+    async fn hold_ref_key(
+        pool: &PgPool,
+        repo: Uuid,
+        namespace: &str,
+        ref_name: &str,
+    ) -> Transaction<'static, Postgres> {
+        let mut tx = pool.begin().await.expect("blocker begin");
+        sqlx::query(
+            r#"INSERT INTO mutable_refs (
+                   id, repository_id, namespace, ref_name, target_kind,
+                   target_hash, target_version
+               ) VALUES ($1, $2, $3, $4, 'version', NULL, '0.0.0-blocker')"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo)
+        .bind(namespace)
+        .bind(ref_name)
+        .execute(&mut *tx)
+        .await
+        .expect("blocker holds the ref key");
+        tx
+    }
+
+    /// A tag INSERT in flight when the purge starts: the purge must not
+    /// be able to read its protection facts past it.
+    ///
+    /// The interleaving, all of it real: `move_ref` opens its
+    /// transaction, locks the artifact rows its target names, and
+    /// parks on its own `mutable_refs` INSERT. `purge_artifact_refs`
+    /// then runs and must *block* — that is the half a lock on the ref
+    /// row could never give, because the row being inserted does not
+    /// exist to be locked. Release the blocker, `move_ref` commits, and
+    /// the purge wakes up and reads the tag it waited for.
+    ///
+    /// Both halves are assertions. That the purge blocks is what says
+    /// the two take the same lock; that it answers `TagExempt`
+    /// afterwards is what says the lock bought a *fresh* reading rather
+    /// than just a delayed stale one — the protection facts are read in
+    /// the statement after the lock for exactly that reason.
+    async fn a_tag_insert_during_the_purge_keeps_its_artifact(
+        namespace: &str,
+        target: hort_domain::entities::mutable_ref::RefTarget,
+    ) {
+        use hort_domain::ports::ref_lifecycle::{RefCommitOutcome, RefLifecyclePort};
+
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = untagged_keep_last_n_candidate(&pool, repo, namespace, HASH_A).await;
+
+        let event_store = Arc::new(PgEventStore::new(pool.clone()).await.unwrap());
+        let refs = Arc::new(crate::ref_lifecycle::PgRefLifecycle::new(event_store));
+
+        let blocker = hold_ref_key(&pool, repo, namespace, "latest").await;
+
+        let (r, batch) = first_placement(repo, namespace, "latest", target);
+        let tagging = {
+            let refs = Arc::clone(&refs);
+            tokio::spawn(async move { refs.move_ref(r, batch).await })
+        };
+        // Let the tag write reach its blocked INSERT. Without this the
+        // purge below could win on scheduling alone and the test would
+        // pass with no lock at all.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !tagging.is_finished(),
+            "the tag write must be parked on its own INSERT, holding the \
+             artifact lock it took on the way in"
+        );
+
+        let purging = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                adapter(&pool)
+                    .await
+                    .purge_artifact_refs(art, Utc::now())
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        assert!(
+            !purging.is_finished(),
+            "the purge must wait on the artifact lock the in-flight tag \
+             write holds; finishing here means it read its protection \
+             facts beside a ref INSERT it could not see"
+        );
+
+        blocker.rollback().await.expect("release the ref key");
+        let committed = tokio::time::timeout(std::time::Duration::from_secs(10), tagging)
+            .await
+            .expect("the tag write proceeds once the key is free")
+            .expect("the tag write task did not panic")
+            .expect("the tag write succeeds");
+        assert_eq!(
+            committed,
+            RefCommitOutcome::Committed,
+            "the production INSERT is the one that landed"
+        );
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), purging)
+            .await
+            .expect("the purge proceeds once the tag write commits")
+            .expect("the purge task did not panic")
+            .expect("the purge call succeeds");
+        assert_eq!(
+            outcome,
+            PurgePreparation::TagExempt,
+            "the tag committed before this transaction could read the \
+             facts, so the reading has to show it"
+        );
+
+        // A refusal leaves the artifact in service and its edges intact.
+        let retired: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                .bind(art)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(retired.is_none(), "a refused purge must not retire the row");
+        assert_eq!(
+            cr_rows_for(&pool, art).await,
+            vec![("primary_content".to_string(), HASH_A.to_string())],
+            "a refused purge must not release the edge"
+        );
+        assert!(
+            purged_refs_remaining(&pool, art).await.is_empty(),
+            "a refused purge writes no worklist row"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The OCI shape: `target_kind = 'hash'` against `checksum_sha256`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    #[serial(hort_pg_db)]
+    async fn a_hash_tag_insert_during_the_purge_keeps_its_artifact() {
+        a_tag_insert_during_the_purge_keeps_its_artifact(
+            "oci-keeper",
+            hort_domain::entities::mutable_ref::RefTarget::ContentHash(HASH_A.parse().unwrap()),
+        )
+        .await;
+    }
+
+    /// The npm dist-tag shape: `target_kind = 'version'` against
+    /// `(namespace = name, version)`. A separate arm of the same
+    /// predicate, so a lock covering only the hash arm protects nothing
+    /// outside OCI — and `seed_artifact` versions every row `1.0.0`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    #[serial(hort_pg_db)]
+    async fn a_version_tag_insert_during_the_purge_keeps_its_artifact() {
+        a_tag_insert_during_the_purge_keeps_its_artifact(
+            "npm-keeper",
+            hort_domain::entities::mutable_ref::RefTarget::Version("1.0.0".into()),
+        )
+        .await;
+    }
+
+    /// Counter-test: the lock is the purge's row, not a gate on ref
+    /// writes.
+    ///
+    /// A transaction holds the purge's own locking statement against one
+    /// artifact. A tag write naming a *different* artifact must commit
+    /// straight through it — if it did not, every tag push in the
+    /// registry would queue behind unrelated housekeeping. A tag write
+    /// naming the *locked* artifact must not, and must complete once
+    /// the lock ends; that second half is what keeps the first from
+    /// being satisfied by taking no lock at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    #[serial(hort_pg_db)]
+    async fn a_tag_write_waits_only_on_the_purge_of_the_artifact_it_names() {
+        use hort_domain::entities::mutable_ref::RefTarget;
+        use hort_domain::ports::ref_lifecycle::RefLifecyclePort;
+
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let locked = seed_artifact(&pool, repo, "under-purge", HASH_A, Some("released")).await;
+        seed_artifact(&pool, repo, "untouched", HASH_B, Some("released")).await;
+
+        let event_store = Arc::new(PgEventStore::new(pool.clone()).await.unwrap());
+        let refs = Arc::new(crate::ref_lifecycle::PgRefLifecycle::new(event_store));
+
+        // Byte-for-byte the statement `purge_artifact_refs` opens with.
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT a.id FROM artifacts a WHERE a.id = $1 FOR UPDATE")
+            .bind(locked)
+            .fetch_optional(&mut *holder)
+            .await
+            .unwrap();
+
+        let (r, batch) = first_placement(
+            repo,
+            "untouched",
+            "latest",
+            RefTarget::ContentHash(HASH_B.parse().unwrap()),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), refs.move_ref(r, batch))
+            .await
+            .expect("an unrelated artifact's tag must not queue behind this lock")
+            .expect("the unrelated tag write succeeds");
+
+        let (r, batch) = first_placement(
+            repo,
+            "under-purge",
+            "latest",
+            RefTarget::ContentHash(HASH_A.parse().unwrap()),
+        );
+        let waiting = {
+            let refs = Arc::clone(&refs);
+            tokio::spawn(async move { refs.move_ref(r, batch).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a tag naming the locked artifact must wait on the very lock \
+             the purge holds"
+        );
+
+        holder.rollback().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+            .await
+            .expect("the tag write proceeds once the purge's lock ends")
+            .expect("the tag write task did not panic")
+            .expect("the tag write succeeds");
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// Counter-test: nothing about the split read changed an ordinary
+    /// purge. An untagged expired artifact still prepares, and the
+    /// `checksum_sha256` the second statement recovers — the value the
+    /// whole idempotent-retry path turns on — is still the row's own.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_untagged_artifact_still_prepares_and_recovers_its_checksum() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = untagged_keep_last_n_candidate(&pool, repo, "ordinary", HASH_B).await;
+
+        let refs = prepared(
+            adapter(&pool)
+                .await
+                .purge_artifact_refs(art, Utc::now())
+                .await
+                .expect("an untagged candidate prepares"),
+        );
+        assert_eq!(
+            refs.iter()
+                .map(|r| r.content_hash.as_ref().to_string())
+                .collect::<Vec<_>>(),
+            vec![HASH_B.to_string()],
+            "the worklist target is the artifact's own content hash"
+        );
+        assert!(
+            cr_rows_for(&pool, art).await.is_empty(),
+            "a prepared purge releases the edge"
         );
 
         cleanup(&pool, repo).await;

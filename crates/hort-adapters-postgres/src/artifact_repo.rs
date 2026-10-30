@@ -8,7 +8,7 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{Actor, DomainEvent, StreamId};
-use hort_domain::ports::artifact_repository::ArtifactRepository;
+use hort_domain::ports::artifact_repository::{ArtifactRepository, PackageFileDigestRow};
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::types::{ContentHash, LimitedList, Page, PageRequest, LIMIT_LIST_MAX_ITEMS};
 
@@ -815,6 +815,67 @@ impl ArtifactRepository for PgArtifactRepository {
             .await
             .map_err(|e| map_sqlx_error(&e, "Artifact", &pkg))?;
             Ok(rows)
+        })
+    }
+
+    fn package_file_digests(
+        &self,
+        repository_id: Uuid,
+        package: &str,
+    ) -> BoxFuture<'_, DomainResult<Vec<PackageFileDigestRow>>> {
+        let pkg = package.to_owned();
+        Box::pin(async move {
+            tracing::debug!(
+                entity = "Artifact",
+                %repository_id,
+                package = %pkg,
+                "package_file_digests"
+            );
+            // Per-FILE read behind a proxy index serve's own digest
+            // advertisement. A heap fetch for `path` /
+            // `checksum_sha256`, deliberately NOT folded into the
+            // `package_version_status` covering-index scan (same
+            // reasoning as `package_version_publish_times` above), and
+            // deliberately WITHOUT that query's `version IS NOT NULL`
+            // filter: the question here is "does hort hold this
+            // filename", and a pypi row carries no version in its
+            // download path at all, so a null-version row is still a
+            // file hort holds and serves.
+            //
+            // `checksum_sha256` is NOT NULL, so every returned row
+            // carries a digest; `path` is the logical projection path and
+            // the caller derives its own per-format key from it.
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT path, checksum_sha256 \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND name = $2 \
+                   AND deleted_at IS NULL",
+            )
+            .bind(repository_id)
+            .bind(&pkg)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Artifact", &pkg))?;
+
+            let mut out: Vec<PackageFileDigestRow> = Vec::with_capacity(rows.len());
+            for (path, checksum) in rows {
+                // Fail closed. This read decides which digest the served
+                // index advertises for bytes hort hands back itself, so a
+                // column that will not parse as a canonical SHA-256 fails
+                // the serve rather than dropping the row: a dropped row
+                // reads as "hort does not hold this file" and
+                // re-advertises the upstream's claim about bytes hort
+                // stored, which is the exact substitution this read
+                // exists to prevent.
+                let hash: ContentHash = checksum.parse().map_err(|_| {
+                    DomainError::Invariant(format!(
+                        "artifacts.checksum_sha256 is not a canonical SHA-256 digest for \
+                         package_file_digests({repository_id}, {pkg:?}, path={path:?})"
+                    ))
+                })?;
+                out.push((path, hash));
+            }
+            Ok(out)
         })
     }
 
@@ -1722,6 +1783,130 @@ mod tests {
 
         cleanup_repo(&pool, repo_a).await;
         cleanup_repo(&pool, repo_b).await;
+    }
+
+    /// Round-trip for [`ArtifactRepository::package_file_digests`].
+    ///
+    /// The axes that matter are the ones where it deliberately differs
+    /// from `package_version_status`:
+    ///   - a **null-version** row is INCLUDED, not excluded — it is a
+    ///     file hort holds, and pypi's download path carries no version
+    ///     segment at all, so excluding it would drop exactly the rows
+    ///     the proxy index serve needs,
+    ///   - quarantine status is irrelevant: the question is "does hort
+    ///     hold these bytes", which a `rejected` row answers yes to
+    ///     (whether it is *served* is the status filter's decision, one
+    ///     layer up),
+    ///   - and both the name and repository filters still bound it.
+    ///
+    /// `#[serial]` on the crate-wide `hort_pg_db` key per CLAUDE.md
+    /// DB-backed test isolation contract.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn package_file_digests_returns_every_live_row_including_null_version() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_a = seed_repo(&pool).await;
+        let repo_b = seed_repo(&pool).await;
+
+        // Two versioned rows, one rejected, plus a null-version row —
+        // all three are files hort holds.
+        seed_artifact_status(&pool, repo_a, "leftpad", Some("1.0.0"), None, 10).await;
+        seed_artifact_status(
+            &pool,
+            repo_a,
+            "leftpad",
+            Some("1.1.0"),
+            Some("rejected"),
+            11,
+        )
+        .await;
+        seed_artifact_status(&pool, repo_a, "leftpad", None, Some("released"), 12).await;
+        // Different name in the same repo — MUST be excluded.
+        seed_artifact_status(&pool, repo_a, "other-pkg", Some("1.0.0"), None, 13).await;
+        // Same name, different repo — MUST be excluded.
+        seed_artifact_status(&pool, repo_b, "leftpad", Some("2.0.0"), None, 14).await;
+
+        let r = repo_under_test(&pool).await;
+        let mut got = r
+            .package_file_digests(repo_a, "leftpad")
+            .await
+            .expect("package_file_digests");
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut want: Vec<(String, ContentHash)> = vec![
+            (
+                "simple/leftpad/leftpad-1.0.0-0010.tar.gz".to_string(),
+                deterministic_hex64(10_usize ^ 0x1247_BEEF_usize)
+                    .parse()
+                    .unwrap(),
+            ),
+            (
+                "simple/leftpad/leftpad-1.1.0-0011.tar.gz".to_string(),
+                deterministic_hex64(11_usize ^ 0x1247_BEEF_usize)
+                    .parse()
+                    .unwrap(),
+            ),
+            (
+                "simple/leftpad/leftpad-nover-0012.tar.gz".to_string(),
+                deterministic_hex64(12_usize ^ 0x1247_BEEF_usize)
+                    .parse()
+                    .unwrap(),
+            ),
+        ];
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got, want);
+
+        cleanup_repo(&pool, repo_a).await;
+        cleanup_repo(&pool, repo_b).await;
+    }
+
+    /// A soft-deleted row is not a file hort serves, so it must not
+    /// contribute an advertisement. Pins the `deleted_at IS NULL` half
+    /// of the statement (`live_reads_exclude_deleted`'s own subject, one
+    /// layer down from its source scan).
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn package_file_digests_excludes_soft_deleted_rows() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        seed_artifact_status(&pool, repo, "leftpad", Some("1.0.0"), None, 20).await;
+        sqlx::query("UPDATE artifacts SET deleted_at = now() WHERE repository_id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .expect("soft-delete the seeded row");
+
+        let r = repo_under_test(&pool).await;
+        assert!(r
+            .package_file_digests(repo, "leftpad")
+            .await
+            .expect("package_file_digests")
+            .is_empty());
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// A never-seen package is an empty vec, not an error — and the
+    /// caller reads that as "hort holds none of these files", which
+    /// keeps every upstream advertisement verbatim.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn package_file_digests_unknown_package_returns_empty_vec() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let r = repo_under_test(&pool).await;
+        assert!(r
+            .package_file_digests(repo, "never-seen-package")
+            .await
+            .expect("package_file_digests")
+            .is_empty());
+        cleanup_repo(&pool, repo).await;
     }
 
     /// Sanity check: a never-seen package returns an empty vec, not an

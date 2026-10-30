@@ -1971,6 +1971,27 @@ No per-version or per-package label — those would explode cardinality per the 
 
 The metric is emitted at the per-format serve site (npm: `hort-http-npm/src/packument.rs::rewrite_packument`; pypi/cargo/maven: their analogues), each with `format` set to the format literal. The `hort-app` `filter_served_versions` helper is format-agnostic and intentionally does NOT emit — the format is a per-call-site fact, mirroring the established `hort_ingest_*` / `hort_download_*` pattern.
 
+### Advertised-digest divergence on a proxy index serve
+
+| Metric | Type | Labels | Unit | `result` values |
+|--------|------|--------|------|-----------------|
+| `hort_index_digest_divergence_total` | counter | `format`, `repository` | — | — |
+
+**`hort_index_digest_divergence_total` semantics:**
+
+Emitted by a proxy index source when the upstream index document advertises a SHA-256 for a filename that **disagrees** with the digest hort has stored for that same filename. The increment is the **count of divergent files** in that served document, not "1 per serve"; a document where every advertisement agrees emits nothing (steady state).
+
+A proxy serve rewrites every download link to point back at hort, so the served digest is the one a client checks hort's own bytes against. The serve therefore advertises hort's stored digest and keeps serving — the upstream's value would be a check that can only fail — and this counter is the signal that the two parties disagree about what the filename means. Non-zero means one of: an upstream that re-used a filename for different bytes, an upstream mapping repointed at a different index, or a stale stored row. It is a supply-chain signal, not an error rate: no request fails on it.
+
+Labels:
+
+- `format` — the format key (`pypi` today; the other proxy index sources join the set as they gain the per-file digest read).
+- `repository` — the served repository key, subject to `METRICS_INCLUDE_REPOSITORY_LABEL` (falls back to the `_all` sentinel per the global rules).
+
+No `package` or `filename` label — that is unbounded cardinality per the *Forbidden labels* rule. The divergent filenames, the package and the repository key ride on the accompanying `tracing::warn!` on the same code path, which is what an operator reads to identify the files.
+
+Emission site: `crates/hort-http-pypi/src/index_source.rs::ProxyPypiSource::fetch`, from the per-file decision in `advertised_digest`.
+
 ### Prefetch triggers
 
 | Metric | Type | Labels | Unit | Label values |
@@ -5132,6 +5153,7 @@ series (absence vs `0.0` is ambiguous to dashboards).
 | `hort_storage_operation_duration_seconds` | histogram | `backend`, `operation` | seconds | — |
 | `hort_storage_dedup_total` | counter | `backend` | — | content already present during `put` |
 | `hort_storage_integrity_failures_total` | counter | `backend` | — | streaming SHA-256 verification failed on a `get` read (ADR 0003) |
+| `hort_metadata_mirror_integrity_failures_total` | counter | `backend`, `reason` | — | a metadata-mirror `get` refused the stored body: `unframed`, `digest_mismatch` |
 
 **`hort_storage_integrity_failures_total` semantics:**
 
@@ -5150,6 +5172,30 @@ series (absence vs `0.0` is ambiguous to dashboards).
   backend, bit rot on underlying media, or a bug in the CAS write path.
   Operator response: inspect backend health and cross-check with the
   background integrity sweep (when available).
+
+**`hort_metadata_mirror_integrity_failures_total` semantics:**
+
+The metadata mirror (ADR 0026) records its body's SHA-256 in a frame
+header on `put` and verifies the body against it on `get`. This counter
+is the mirror's sibling of the CAS counter above, and its `reason` label
+separates two states an operator must not confuse:
+
+- `digest_mismatch` — the body did not hash to the digest recorded with
+  it. Corruption, truncation, or alteration at rest. The read fails and
+  the body is not handed out, so the affected package falls back to the
+  upstream error rather than re-projecting from bytes whose per-version
+  checksums can no longer be trusted. A sustained non-zero rate is the
+  same class of signal as the CAS counter: inspect the volume.
+- `unframed` — the stored body carries no frame header, so no digest was
+  ever recorded for it and there is nothing to verify against. Expected
+  for a bounded window after upgrading from a release that predates the
+  frame: every already-mirrored body reads this way until its next
+  upstream refresh rewrites it, and the hot serve path (which renders the
+  cached projection and never reads the mirror) is unaffected. What it
+  costs meanwhile is the outage / air-gapped fallback for packages not
+  yet refreshed. A rate that does **not** decay toward zero means bodies
+  are not being refreshed — an air-gapped deployment, or a mapping whose
+  upstream is unreachable.
 
 ### CAS integrity scrub
 
