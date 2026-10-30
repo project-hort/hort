@@ -33,9 +33,9 @@ SELECTOR — two clauses, both load-bearing
 
   Neither clause may be dropped:
   - WITHOUT the release scope, the only thing between any pod in the
-    namespace and this unrestricted-egress allowance is one label of its
-    own choosing. A principal who may create or label a Pod but may NOT
-    touch NetworkPolicies would take the allowance by writing
+    namespace and this allowance is one label of its own choosing. A
+    principal who may create or label a Pod but may NOT touch
+    NetworkPolicies would take the allowance by writing
     `hort-server.io/job: anything`, and in a namespace whose own policy
     denies egress would reach the destinations that policy meant to
     block; patching the label onto an existing restricted pod does the
@@ -48,7 +48,28 @@ SELECTOR — two clauses, both load-bearing
     `app.kubernetes.io/component: server` instead). The app-pod deny-all
     is untouched.
 
-EGRESS SHAPE — why unrestricted egress + explicit DNS, not an ipBlock
+  WHAT THE SELECTOR CANNOT DO — the accepted limit
+  A NetworkPolicy selects on pod labels and namespaces, and that is the
+  whole of what the Kubernetes API gives it: no ServiceAccount, no owner
+  reference, no "Helm created this pod". So the release scope above
+  raises the bar from one freely-settable label to three freely-settable
+  labels — it is a SCOPE, not a credential. A principal who may create
+  or label a Pod in this namespace can wear all three. Nothing
+  expressible in a NetworkPolicy closes that, and this template does not
+  pretend otherwise: a principal holding create-Pod in the release's
+  namespace is not an attacker a NetworkPolicy defends against, and
+  keeping Pod creation off untrusted principals is the cluster RBAC's
+  boundary, not this policy's. Network position never substitutes for
+  authorization.
+  What the chart CAN bound is how much a selected pod gets — see EGRESS
+  SHAPE below and `networkPolicy.jobEgress`. Narrowing the destinations
+  does not make the selector unforgeable; it bounds what a pod wearing
+  the labels receives. Both halves are stated for OPERATORS in
+  `values.yaml` at the `jobEgress` key and in the chart README, because a
+  template comment is not where an operator reads; keep those two in step
+  with this one.
+
+EGRESS SHAPE — why unrestricted egress + explicit DNS by default, not an ipBlock
   The DB endpoint is inside the operator-supplied opaque Secret DSN
   (`postgres://…@host:5432/db` in `postgres.{admin,app}.existingSecret`)
   — the chart never sees the host/port/CIDR. This is the SAME reason
@@ -66,18 +87,36 @@ EGRESS SHAPE — why unrestricted egress + explicit DNS, not an ipBlock
   covered by the un-narrowed `to: []` egress rule below without the
   chart guessing any address.
 
-  An operator who DOES know their cluster CIDRs and wants a tighter Job
-  egress has exactly one lever: narrowing the `to:` of THIS rule — by
-  forking the chart or by a `--post-renderer` patch. Two things that do
-  NOT work, and were once recommended here: a second, tighter
-  NetworkPolicy (by the additivity rule above the effective allow set is
-  the UNION of every policy selecting the pod, so another policy can
-  only ADD — nothing can subtract this `to: []`); and the app `egress`
-  posture, which never reaches these pods at all (it selects the app
-  pods, which the `Exists` clause excludes). Editing this rule is safe
-  to reason about precisely because its scope is now this release's Job
-  pods: it does not reach a neighbouring release or any unrelated pod in
-  the namespace.
+  An operator who DOES know their destinations narrows the allowance
+  with `networkPolicy.jobEgress`: a defaulted-empty list of NetworkPolicy
+  egress rules that REPLACES the unrestricted rule below. Three
+  properties make that safe to ship into existing installs:
+  - EMPTY is the shipped default and renders the unrestricted rule, so an
+    upgrade changes no allow rule. A chart that stopped letting the
+    `migrate` hook through on upgrade would be worse than the width it
+    was closing.
+  - The list can only NARROW. The default already allows every
+    destination on every port, so any union of operator rules is a
+    subset of it — there is no value of `jobEgress` whose effect is wider
+    than the default. (Contrast `worker.metrics.scrapeFrom`, where an
+    empty list means ALL sources and the schema therefore has to reject
+    it: that fail-open direction does not exist here.)
+  - DNS stays chart-owned and unconditional, outside what `jobEgress`
+    replaces: a destination list that forgot it would break every
+    hostname DSN.
+  The failure mode is loud, not silent: a list the migrate Job cannot
+  reach Postgres through aborts `helm install` at the pre-install hook.
+
+  Two things that do NOT work, and were once recommended here: a second,
+  tighter NetworkPolicy (by the additivity rule above the effective allow
+  set is the UNION of every policy selecting the pod, so another policy
+  can only ADD — nothing can subtract an allow rule, which is why
+  `jobEgress` has to replace THIS rule rather than ship as a companion
+  policy); and the app `egress` posture, which never reaches these pods
+  at all (it selects the app pods, which the `Exists` clause excludes).
+  Editing this rule is safe to reason about precisely because its scope
+  is this release's Job pods: it does not reach a neighbouring release or
+  any unrelated pod in the namespace.
 
 PER-PRE-APP-HOOK-JOB VERDICT (audit table)
   | Template                       | Kind | Helm hook / trigger          | Needs net before app readiness?              | Disposition |
@@ -105,11 +144,19 @@ PER-PRE-APP-HOOK-JOB VERDICT (audit table)
   release-scoped `hort-server.io/job Exists` selector covers them too at
   zero extra cost and with no posture change to the app pods.
 
+  Every pod template in that table shares ONE allowance, so a
+  `jobEgress` list has to cover the union of what they reach: Postgres
+  for migrate and the svc-token-bootstrap init container, the
+  kube-apiserver for prepull-job and the svc-token-bootstrap main
+  container, plus whatever the CronJobs the install enables reach (S3 /
+  OIDC / upstream registries for the dsn-direct ones).
+
 ESCAPE HATCH PARITY
   Gated on the SAME `.Values.networkPolicy.enabled` as the app-pod
   policy. `networkPolicy.enabled: false` disables BOTH: no app-pod
   policy, no Job-scoped policy, stock cluster default applies to
-  everything.
+  everything. `jobEgress` lives inside that gate — it narrows this
+  policy, it never renders one.
 */}}
 {{- if .Values.networkPolicy.enabled -}}
 apiVersion: networking.k8s.io/v1
@@ -121,10 +168,12 @@ metadata:
 spec:
   # Selects exactly THIS RELEASE's Job/CronJob pods. The two clauses AND
   # together: a pod must carry this release's name/instance labels AND an
-  # `hort-server.io/job` key. Dropping the first would hand this
-  # unrestricted-egress allowance to any pod in the namespace willing to
-  # set one label of its own; dropping the second would hand it to the app
-  # pods, which carry the same name/instance labels. See SELECTOR above.
+  # `hort-server.io/job` key. Dropping the first would hand this egress
+  # allowance to any pod in the namespace willing to set one label of its
+  # own; dropping the second would hand it to the app pods, which carry
+  # the same name/instance labels. The three labels are a scope, not a
+  # credential — a principal who may create or label a Pod here can wear
+  # them, and no NetworkPolicy can prevent that. See SELECTOR above.
   podSelector:
     matchLabels:
       {{- include "hort-server.selectorLabels" . | nindent 6 }}
@@ -137,19 +186,31 @@ spec:
     # DNS — Postgres/S3/OIDC/registry hostnames in the operator DSNs and
     # config must resolve before any TCP connection. UDP is the default
     # resolver transport; TCP 53 covers truncated/large responses and
-    # resolvers configured TCP-only.
+    # resolvers configured TCP-only. Chart-owned and unconditional:
+    # `networkPolicy.jobEgress` replaces the bootstrap rule below, never
+    # this one — a destination list that forgot DNS would break every
+    # hostname DSN.
     - ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
+    {{- with .Values.networkPolicy.jobEgress }}
+    # Bootstrap egress, narrowed to the operator's `networkPolicy.jobEgress`
+    # entries, which REPLACE the chart's unrestricted rule: this release's
+    # Job pods reach these destinations and DNS, and nothing else. The
+    # pre-install `migrate` hook is on this path, so a list it cannot
+    # reach Postgres through aborts `helm install` at that hook.
+    {{- toYaml . | nindent 4 }}
+    {{- else }}
     # Bootstrap egress. Unrestricted `to:` because the destination (the
     # Postgres host in the opaque Secret DSN, and — for the
     # svc-token-bootstrap Job — the kube-apiserver) is not known to the
     # chart and MUST NOT be guessed (the chart deliberately keeps
     # CIDR auto-discovery out of scope). This is an ADDITIVE allowance
     # on this release's Job pods only; the app-pod deny-all is
-    # unchanged. Narrowing it means editing THIS rule (chart fork or
-    # `--post-renderer` patch): a second, tighter NetworkPolicy cannot
-    # subtract an allow rule — see the additivity note at the top of
-    # this file.
+    # unchanged. An operator who knows their destinations narrows THIS
+    # rule by setting `networkPolicy.jobEgress`, which replaces it; a
+    # second, tighter NetworkPolicy cannot subtract an allow rule — see
+    # the additivity note at the top of this file.
     - {}
+    {{- end }}
 {{- end -}}

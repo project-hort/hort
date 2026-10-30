@@ -24,9 +24,17 @@ pub(super) enum DigestParse {
 }
 
 /// Message shared by every call site that maps [`DigestParse::Unsupported`]
-/// onto the wire — deliberately constant (never carries the requested
-/// `algorithm`, which is attacker-controlled and unbounded up to the first
-/// `:`) so a future call site can't accidentally reintroduce the echo.
+/// onto the wire — a constant, so a future call site can't accidentally
+/// reintroduce the echo of the requested `algorithm`, which is
+/// attacker-controlled and unbounded up to the first `:`.
+///
+/// The invariant is **no part of the declaration**, not "no interpolation at
+/// all": the `UNSUPPORTED` envelope carries no `detail`, so a call site that
+/// has to say *where* in a document the offending digest sat has only this
+/// message to say it in. Appending a position hort derived itself — an index
+/// child's `manifests[N]` slot, bounded by the domain's per-index child cap —
+/// is therefore permitted and reflects nothing the declarant supplied.
+/// Appending the algorithm, the digest, or any inner parser message is not.
 pub(super) const UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE: &str = "unsupported digest algorithm";
 
 /// Parse a client-supplied digest string into a [`ContentHash`] or a

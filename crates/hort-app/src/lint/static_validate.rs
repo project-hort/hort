@@ -780,11 +780,14 @@ impl StaticConfigValidator {
                     sorted.sort();
                     GrantSubject::Claims(sorted)
                 }
-                // A malformed userId is row 0's concern (apply errors on
-                // it, but cross-validate / parse runs first); offline,
-                // a non-UUID string yields a fresh placeholder uid — it is
-                // never SA-owned, so it lints exactly as a bare hand-
-                // declared direct-user grant, which is the faithful verdict.
+                // A malformed userId is row 0's rejection
+                // (`validate_permission_grant` checks UUID syntax), and
+                // row 0 runs before this row on both the apply and the
+                // offline path — so the fallback below is for totality,
+                // not a verdict. Should it ever be reached, a non-UUID
+                // string yields a fresh placeholder uid: never SA-owned,
+                // so it lints exactly as a bare hand-declared direct-user
+                // grant, which is the faithful verdict.
                 GrantSubjectSpec::User { user_id } => GrantSubject::User(
                     Uuid::parse_str(user_id.trim()).unwrap_or_else(|_| Uuid::new_v4()),
                 ),

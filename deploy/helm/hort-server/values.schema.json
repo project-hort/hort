@@ -830,7 +830,8 @@
       "properties": {
         "enabled": {"type": "boolean"},
         "ingress": {"type": "array"},
-        "egress": {"type": "array"}
+        "egress": {"type": "array"},
+        "jobEgress": {"type": "array"}
       }
     },
     "extraEnv": {"type": "array"},

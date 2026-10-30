@@ -46,6 +46,40 @@ helm install hort-server oci://${REGISTRY}/${IMAGE_PREFIX}/charts/hort-server \
 The schema blocks the inconsistent middle states. RWO PVC cannot
 multi-attach; in-process ephemeral state cannot survive across pods.
 
+## NetworkPolicy — what it bounds, and what it does not
+
+`networkPolicy.enabled` is **on by default** and renders two policies: a
+deny-all-until-you-populate posture on the app pods (`networkPolicy.ingress`
+/ `networkPolicy.egress`, both empty by default), and an additive allowance
+on this release's Job/CronJob pods so the pre-install `migrate` hook can
+reach a Postgres whose address the chart never sees. Setting
+`networkPolicy.enabled: false` disables both.
+
+The Job-scoped policy selects its pods by label — this release's
+`app.kubernetes.io/{name,instance}` plus the `hort-server.io/job` key every
+Job/CronJob pod template carries — because pod labels and namespaces are the
+whole of what a NetworkPolicy can see. It cannot see a ServiceAccount, an
+owner reference, or whether Helm created the pod. **Those labels are a scope,
+not a credential:** anyone who may create or label a Pod in the namespace can
+write all three onto a pod of their own and be selected. No NetworkPolicy can
+close that and this chart does not claim to — a principal holding create-Pod
+in the release's namespace is not an attacker a NetworkPolicy defends
+against. Keep Pod creation in that namespace off untrusted principals;
+network position never substitutes for authorization.
+
+What the chart does bound is how much a selected pod gets. By default that is
+DNS plus unrestricted egress, because the destinations live in opaque Secret
+DSNs. If you know yours, set **`networkPolicy.jobEgress`** to your own
+Kubernetes egress rules: they replace the unrestricted rule (the DNS rule
+stays), so those Job pods reach what you list and nothing else. Note the
+semantics are the opposite of `networkPolicy.egress` — leaving `jobEgress`
+empty keeps the shipped allowance rather than denying everything, so an
+upgrade changes nothing until you populate it. One allowance covers every
+Job/CronJob pod of the release, so cover the union of what they reach:
+Postgres, the kube-apiserver, and whatever the scheduled tasks you enable
+reach. Getting it wrong fails loudly — `helm install` aborts at the
+pre-install hook when the migrate Job cannot reach the database.
+
 ## Operator documentation
 
 | Doc | Purpose |

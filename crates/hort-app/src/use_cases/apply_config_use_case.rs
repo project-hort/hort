@@ -2947,17 +2947,54 @@ mod tests {
         permission: &str,
         repo: Option<&str>,
     ) -> Envelope<PermissionGrantSpec> {
+        raw_user_grant_env(name, &user_id.to_string(), permission, repo)
+    }
+
+    /// As [`user_grant_env`], but `subject.userId` is carried **verbatim**
+    /// — the string an operator typed, including one that is not UUID
+    /// syntax. `user_grant_env`'s `Uuid` parameter cannot express that
+    /// shape, and the shape is the point of the pre-write rejection tests.
+    pub(in crate::use_cases::apply_config_use_case) fn raw_user_grant_env(
+        name: &str,
+        user_id: &str,
+        permission: &str,
+        repo: Option<&str>,
+    ) -> Envelope<PermissionGrantSpec> {
         Envelope {
             api_version: ApiVersion::V1,
             kind: Kind::PermissionGrant,
             metadata: Metadata { name: name.into() },
             spec: PermissionGrantSpec {
                 subject: GrantSubjectSpec::User {
-                    user_id: user_id.to_string(),
+                    user_id: user_id.into(),
                 },
                 permission: permission.into(),
                 repository: repo.map(Into::into),
             },
+        }
+    }
+
+    /// A bundle whose only grant is a `User`-subject `read` on a
+    /// declared repository.
+    ///
+    /// Both halves are load-bearing for the `subject.userId` tests.
+    /// Repo-scoped `read` is the shape the row-8 direct-user rule only
+    /// *warns* about (its reject arm needs `admin`, or a global grant of
+    /// `write`/`delete`/an admin-class permission), so a refusal of this
+    /// bundle is attributable to the userId rule and nothing else. And the
+    /// declared repository is the earlier stage whose write the refusal
+    /// has to precede — `apply_repository_rows` is Stage 2, the
+    /// consolidated grant reconcile is last.
+    fn user_id_bundle(grant_name: &str, user_id: &str) -> DesiredState {
+        DesiredState {
+            repositories: vec![repo_env("repo-x", "hosted")],
+            permission_grants: vec![raw_user_grant_env(
+                grant_name,
+                user_id,
+                "read",
+                Some("repo-x"),
+            )],
+            ..Default::default()
         }
     }
 
@@ -4264,26 +4301,159 @@ mod tests {
         );
     }
 
+    /// A `subject.userId` that is not UUID syntax fails the apply — and
+    /// the refusal is the **pre-write** one, not the grant stage's.
+    ///
+    /// The second half is the whole point and is asserted negatively: the
+    /// grant stage keeps its own parse as defence-in-depth, but reaching
+    /// it would mean the pre-write pass let the value through, so its
+    /// `DomainError::Invariant` text must NOT be what the operator sees.
+    /// Delete the per-spec rule and this assertion goes red while the
+    /// `uuid`-mentioning one above stays green — which is exactly how the
+    /// late refusal hid.
     #[tokio::test]
     async fn user_subject_grant_invalid_uuid_fails_apply() {
-        // The apply layer parses `subject.userId`; a
-        // non-UUID string is a Validation error (the apply aborts
-        // strict-atomic before any reconcile).
         let h = build_harness();
         let mut desired = DesiredState::default();
-        let mut env = user_grant_env("bad", Uuid::new_v4(), "read", None);
-        env.spec.subject = GrantSubjectSpec::User {
-            user_id: "not-a-uuid".into(),
-        };
-        desired.permission_grants.push(env);
+        desired
+            .permission_grants
+            .push(raw_user_grant_env("bad", "not-a-uuid", "read", None));
         let err = h.uc.apply(desired, env_oidc()).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("not-a-uuid") || msg.to_lowercase().contains("uuid"),
-            "expected a UUID-parse validation error, got: {msg}"
+            "expected a UUID-syntax validation error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("should have been rejected by validate_permission_grant"),
+            "the grant stage's invariant text means the pre-write pass let the \
+             value through and the refusal happened from a write-capable \
+             stage: {msg}"
         );
         // Strict-atomic: nothing reconciled.
         assert_eq!(h.grant_repo.managed_count(), 0);
+    }
+
+    /// The acceptance shape for the `subject.userId` syntax rule: a typo
+    /// in a UUID leaves the **repository write of the same bundle**
+    /// undone.
+    ///
+    /// Before the per-spec rule existed, the reachable bad state was
+    /// exactly this: `apply_repository_rows` (Stage 2) committed
+    /// `repo-x`, the consolidated grant reconcile (last) then failed on
+    /// `Uuid::parse_str`, and the operator's atomic-looking `apply`
+    /// returned an error with a repository they never saw created live.
+    /// The grant is repo-scoped `read` — the shape row 8 only *warns*
+    /// about — so the linter is not what refuses it.
+    #[tokio::test]
+    async fn a_malformed_subject_user_id_writes_no_earlier_stage() {
+        // Positive control: the same bundle with a well-formed userId
+        // applies and lands the repository row, so the "nothing written"
+        // assertions below cannot pass vacuously.
+        let control = build_harness();
+        control
+            .uc
+            .apply(
+                user_id_bundle("fine", &Uuid::new_v4().to_string()),
+                env_oidc(),
+            )
+            .await
+            .expect("the same bundle with a well-formed userId must apply");
+        assert!(
+            !control.repos.calls().is_empty() && control.grant_repo.managed_count() == 1,
+            "positive control: the repository row and the grant must both land"
+        );
+
+        let h = build_harness();
+        let err =
+            h.uc.apply(
+                user_id_bundle("typo", "0f8fad5b-d9cb-469f-a165-70867728950X"),
+                env_oidc(),
+            )
+            .await
+            .expect_err("a userId that is not UUID syntax must fail the apply");
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => assert!(
+                msg.contains("PermissionGrant `typo`") && msg.contains("subject.userId"),
+                "the abort must name the offending grant and field, got: {msg}"
+            ),
+            other => panic!("expected a park-eligible Validation error, got {other:?}"),
+        }
+        assert!(
+            h.repos.calls().is_empty()
+                && h.grant_repo.reconcile_call_count() == 0
+                && h.events.appended().is_empty(),
+            "the repository row of the same bundle must NOT have been written — \
+             repo calls {:?}, grant reconciles {}, event batches {}",
+            h.repos.calls(),
+            h.grant_repo.reconcile_call_count(),
+            h.events.appended().len(),
+        );
+    }
+
+    /// The pre-write rule and the grant stage agree on **which** userId
+    /// strings are acceptable, asserted end-to-end through `apply`.
+    ///
+    /// This is the agreement the grant stage's `DomainError::Invariant`
+    /// rests on, and trimming is the half most likely to drift: the stage
+    /// parses `user_id.trim()`, so a pre-write rule that rejected padding
+    /// would refuse a bundle the stage applies, and one that accepted more
+    /// than the parse does would hand the stage a value it can only fail
+    /// on. Each accepted form is checked by the **materialised subject**,
+    /// not merely by `apply` returning `Ok`.
+    #[tokio::test]
+    async fn pre_write_and_grant_stage_agree_on_acceptable_user_ids() {
+        let expected = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let accepted = [
+            "11111111-2222-3333-4444-555555555555",
+            "  11111111-2222-3333-4444-555555555555  ",
+            "11111111222233334444555555555555",
+            "{11111111-2222-3333-4444-555555555555}",
+            "urn:uuid:11111111-2222-3333-4444-555555555555",
+        ];
+        for candidate in accepted {
+            let h = build_harness();
+            h.uc.apply(user_id_bundle("ok", candidate), env_oidc())
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "`{candidate}` is a form the grant stage parses, so the \
+                        pre-write rule must accept it too: {e:?}"
+                    )
+                });
+            let subjects: Vec<GrantSubject> = h
+                .grant_repo
+                .managed_snapshot()
+                .into_iter()
+                .map(|g| g.subject)
+                .collect();
+            assert_eq!(
+                subjects,
+                vec![GrantSubject::User(expected)],
+                "`{candidate}` must materialise as the trimmed, parsed UUID"
+            );
+        }
+
+        let refused = [
+            "0f8fad5b-d9cb-469f-a165-70867728950X",
+            "not-a-uuid",
+            "11111111-2222-3333-4444-55555555555",
+            "11111111-2222-3333-4444-555555555555 extra",
+            "   ",
+        ];
+        for candidate in refused {
+            let h = build_harness();
+            h.uc.apply(user_id_bundle("nope", candidate), env_oidc())
+                .await
+                .expect_err(&format!(
+                    "`{candidate}` is not a form the grant stage can parse, so the \
+                 pre-write rule must refuse the bundle"
+                ));
+            assert!(
+                h.repos.calls().is_empty(),
+                "`{candidate}`: refused after the repository write"
+            );
+        }
     }
 
     #[tokio::test]
@@ -8037,6 +8207,18 @@ mod tests {
                     permission_grants: vec![user_grant_env("god", Uuid::new_v4(), "admin", None)],
                     ..Default::default()
                 },
+            },
+            // `apply_permission_grants` (last) — the `subject.userId`
+            // UUID parse. The grant is deliberately the shape row 8 only
+            // *warns* about (repo-scoped, `read`), so the syntax defect is
+            // the whole reason the bundle is refused; the mirror is
+            // per-spec `validate_permission_grant`. A repository declared
+            // beside it is what makes the lateness visible — the grant
+            // stage runs last, so before the mirror existed this bundle
+            // wrote `repo-x` and only then failed.
+            Case {
+                what: "apply_permission_grants / subject.userId UUID parse",
+                desired: user_id_bundle("typo", "0f8fad5b-d9cb-469f-a165-70867728950X"),
             },
             // `apply_upstream_mappings` (Stage 3) — the value-object
             // constructor's TLS invariants, mirrored at per-spec validation.
