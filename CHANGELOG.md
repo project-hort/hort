@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **An incomplete answer from the advisory feed is no longer booked as a
+  complete one.** A bulk-diff tick that could not read part of an ecosystem
+  archive holds the feed checkpoint and re-reads that window, and a batch
+  reply with the wrong result count fails instead of caching an invented
+  "no advisories" (#374).
 - **An input a scanner could not read no longer records a passing scan.**
   Artifacts that such paths released as "nothing to assess" now stay held
   until they are assessed, and a hosted PyPI publish's declared dependencies

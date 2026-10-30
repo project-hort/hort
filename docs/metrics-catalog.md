@@ -2791,7 +2791,7 @@ intentionally NOT operator-tunable.
 | `hort_scan_findings_total` | counter | `scanner`, `severity` | — | `scanner ∈ {trivy, osv, advisory, …registered backend names}`; `severity ∈ {critical, high, medium, low}` |
 | `hort_scan_duration_seconds` | histogram | `scanner` | seconds | — |
 | `hort_scan_queue_depth` | gauge | (none) | rows | — |
-| `hort_advisory_query_total` | counter | `result` | — | `cache_hit`, `cache_miss`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout` |
+| `hort_advisory_query_total` | counter | `result` | — | `cache_hit`, `cache_miss`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout`, `length_mismatch` |
 | `hort_advisory_hydration_total` | counter | `result` | — | `cache_hit`, `fetched`, `failed` |
 | `hort_sbom_extraction_total` | counter | `format`, `result` | — | `result ∈ {success, unsupported_format, parse_error, payload_unavailable}` |
 | `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, unusable_lockfile, payload_unavailable, not_applicable}` |
@@ -2906,7 +2906,7 @@ each replica; gauge semantics handle the replication so dashboards
 need no aggregation. No labels — the depth is a single global
 signal.
 
-**`hort_advisory_query_total.result` semantics** (closed taxonomy of 6;
+**`hort_advisory_query_total.result` semantics** (closed taxonomy of 7;
 emitted by `OsvAdvisoryAdapter`):
 
 - `cache_hit` — per-component lookup short-circuited on the
@@ -2926,6 +2926,24 @@ emitted by `OsvAdvisoryAdapter`):
   status code was observed (DNS, TCP, TLS). One tick per failed batch.
 - `timeout` — the per-request deadline elapsed before the batch
   responded. One tick per timed-out batch.
+- `length_mismatch` — `/v1/querybatch` answered 2xx with a well-formed
+  body whose `results` count disagrees with the number of queries sent.
+  One tick per such batch. `results[i]` corresponds to `queries[i]`, so
+  a count mismatch leaves no component attributable: the whole batch
+  fails rather than being read slot-by-slot, and nothing from it is
+  cached. A failed query is retried by the next scan; a cached empty
+  result is an answer later runs never re-ask, which is why this is a
+  failure rather than a tolerance. Its own label rather than folded into
+  `upstream_4xx` / `upstream_5xx` because the request *succeeded* — a
+  non-zero rate points at the upstream's batch semantics, not at its
+  availability.
+
+**Alert spec:** `length_mismatch` SHOULD be zero at all times — the OSV
+API documents one result per query. Alert on
+`rate(hort_advisory_query_total{result="length_mismatch"}[15m]) > 0`:
+sustained non-zero means advisory enrichment is contributing nothing for
+the affected components, and the enrichment path is fail-open (the scan
+proceeds with an empty advisory contribution, logged at warn level).
 
 **`hort_advisory_hydration_total.result` semantics** (closed taxonomy of
 3; emitted by `OsvAdvisoryAdapter`, one tick per **distinct advisory
@@ -3156,7 +3174,7 @@ Cardinality:
   histograms in the v1 default deployment. Operators that register
   additional backends extend the axis.
 - `hort_scan_queue_depth`: 1 series (no labels).
-- `hort_advisory_query_total`: 6 result values → 6 series.
+- `hort_advisory_query_total`: 7 result values → 7 series.
 - `hort_advisory_hydration_total`: 3 result values → 3 series.
 - `hort_sbom_extraction_total`: ~15 formats × 4 results → 60 series.
 - `hort_sbom_resolution_total`: ~15 formats × 5 results → 75 series.
@@ -3415,7 +3433,7 @@ the OSV bulk diff).
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
 | `hort_scan_jobs_enqueued_total` | counter | `trigger_source` | — | `trigger_source ∈ {ingest, cron, advisory, manual}` — exact mirror of the SQL CHECK on `jobs.trigger_source` |
-| `hort_advisory_diff_processed_total` | counter | `ecosystem`, `result` | — | OSV bulk-archive ecosystem labels (`npm`, `PyPI`, `crates.io`, `Maven`, `Go`, `RubyGems`, `NuGet`, `Packagist`, `Hex`, `Pub`, `Conda`); `result ∈ {ok, fetch_error, parse_error, timeout}` |
+| `hort_advisory_diff_processed_total` | counter | `ecosystem`, `result` | — | OSV bulk-archive ecosystem labels (`npm`, `PyPI`, `crates.io`, `Maven`, `Go`, `RubyGems`, `NuGet`, `Packagist`, `Hex`, `Pub`, `Conda`); `result ∈ {ok, fetch_error, parse_error, timeout, incomplete}` |
 | `hort_advisory_diff_duration_seconds` | histogram | `ecosystem` | seconds | per OSV bulk-archive ecosystem label |
 | `hort_cron_rescan_eligible_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation; operator alarms on sustained `> batch_size` (cron loop can't keep up) |
 | `hort_cron_rescan_stranded_eligible_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation to the count `RescanCandidatesRepository::select_stranded` returned (issue #6) — `quarantine_status='quarantined'` artifacts whose last scan attempt errored (every backend failed to run) and exhausted retries, with no in-flight scan job. Distinct operational signal from the row above: non-zero here means artifacts are stuck because a scanner backend is down, not that the routine interval-based sweep is falling behind. Operators alarm on sustained `> 0` — a recovered scanner drains this to zero every tick as the sweep re-enqueues each stranded artifact. |
@@ -3499,7 +3517,7 @@ counter):
   (jumps the queue ahead of cron and advisory).
 
 **`hort_advisory_diff_processed_total` result semantics** (closed
-taxonomy of 4; one emission per ecosystem per advisory-watch tick from
+taxonomy of 5; one emission per ecosystem per advisory-watch tick from
 inside the OSV adapter's bulk loop —
 [`OsvAdvisoryAdapter::pull_diff_since`](../crates/hort-adapters-advisory-osv/src/lib.rs)):
 
@@ -3520,11 +3538,31 @@ inside the OSV adapter's bulk loop —
 - `timeout` — the per-request deadline elapsed before the bulk archive
   responded. Surfaced separately from `fetch_error` so operators can
   split slow-upstream from upstream-broken on dashboards.
+- `incomplete` — fetch and archive parse both succeeded, but the walk
+  left at least one member unread: a record whose body could not be
+  read (non-UTF-8, or past the per-entry decompression cap), a record
+  that did not deserialise as OSV, a member whose name could not be
+  decoded, or an entry-count cap trip that stopped the walk early. The
+  advisories the walk did collect are kept and still enqueue their
+  rescans; what is withheld is the checkpoint. Distinct from `ok`
+  because the window was not read in full, and from `parse_error`
+  because the archive itself parsed. The `warn` line emitted alongside
+  carries a count per reason — `entry_cap_tripped` means the ecosystem
+  outgrew `MAX_ENTRIES_TRUSTED_BULK` and the cap is what to raise; the
+  other counts mean the archive carried members this process could not
+  read, which has no cap to raise.
+
+**Alert spec:** `incomplete` holds the `advisory_sync_state.last_sync_at`
+checkpoint still, so a *sustained* non-zero rate means the watch window
+is no longer advancing and the same span is being re-read every tick.
+Alert on `rate(hort_advisory_diff_processed_total{result="incomplete"}[6h]) > 0`
+sustained across several ticks. A single occurrence is self-healing: the
+next tick re-reads the same window and advances if it reads it whole.
 
 The handler aggregates per-ecosystem results into
 `AdvisoryDiffResult.all_ecosystems_ok` for the checkpoint-advance
-gate; the counter and histogram below are the operator-visible
-breakdown.
+gate — `ok` is the only result that leaves it `true`; the counter and
+histogram below are the operator-visible breakdown.
 
 **`hort_patch_candidates_listed_total` result semantics** (closed
 taxonomy of 4; one emission per call to
@@ -3599,7 +3637,7 @@ expose CronJob single-active enforcement; we don't reinvent it.
 Cardinality:
 - `hort_scan_jobs_enqueued_total`: 4 trigger_source values → 4 series.
 - `hort_advisory_diff_processed_total`: ≤ 11 ecosystems (default 8) ×
-  4 results = ≤ 44 series ceiling. Default deployment 8 × 4 = 32.
+  5 results = ≤ 55 series ceiling. Default deployment 8 × 5 = 40.
 - `hort_advisory_diff_duration_seconds`: ≤ 11 histograms (one per
   configured ecosystem). Default deployment 8 histograms.
 - `hort_cron_rescan_eligible_artifacts`: 1 gauge (no labels).
@@ -3634,7 +3672,7 @@ advisory database (and by extension that `ArtifactBecameVulnerable` /
 
 | Metric | Type | Labels | Unit | Notes |
 |--------|------|--------|------|-------|
-| `hort_advisory_ingest_count` | counter | `category` | advisories | Per-ecosystem count of `AdvisoryEntry` values ingested in each `pull_diff_since` tick. `category` is a bounded fixed set (see below). **Only incremented on successful per-ecosystem ingest** — zero increments indicate the pipeline is silent. |
+| `hort_advisory_ingest_count` | counter | `category` | advisories | Per-ecosystem count of `AdvisoryEntry` values ingested in each `pull_diff_since` tick. `category` is a bounded fixed set (see below). **Only incremented on a per-ecosystem ingest that did not error** — zero increments indicate the pipeline is silent. An ingest whose archive walk left members unread (`hort_advisory_diff_processed_total{result="incomplete"}`) counts what it did ingest; the resulting undercount against the expected floor is the efficacy signal, and the two series are read together. |
 
 **`category` label semantics** (closed taxonomy of 11 + `other`):
 
