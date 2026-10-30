@@ -2135,15 +2135,19 @@ Adding a variant requires updating this catalog in the same PR
   cap AND every cold-cohort upstream resolution succeeded
   (`summary.cap_hit == false && summary.no_upstream_mapping == 0`).
   The happy path; the steady-state value on a healthy deployment.
-- `cap_hit` — walk truncated by the cumulative-cap safety net
-  (`summary.cap_hit == true`). The accompanying `tracing::warn!` at
-  the truncation site carries `cap` / `current_descendants` /
-  `attempted_to_enqueue` for per-instance diagnosis; the metric is
-  the dashboard signal operators alert on. Used to surface runaway
-  amplification — either an attacker (or an unlucky manifest)
-  producing N distinct package coordinates per ingest, or an
-  operator-misconfigured `max_descendants` value that legitimate
-  traffic outgrows.
+- `cap_hit` — this walk's cohort was truncated to the node's share of
+  the `max_descendants` budget (`summary.cap_hit == true`). The
+  accompanying `tracing::warn!` at the truncation site carries `cap` /
+  `descendant_budget` / `attempted_to_enqueue` for per-instance
+  diagnosis; the metric is the dashboard signal operators alert on.
+  Used to surface runaway amplification — either an attacker (or an
+  unlucky manifest) producing N distinct package coordinates per
+  ingest, or an operator-misconfigured `max_descendants` value that
+  legitimate traffic outgrows. Because the budget is **global** across
+  the cascade rather than per branch, a dependency graph wider than the
+  budget trips this at the levels where the budget runs out, so a
+  non-zero steady-state rate on a wide graph is the cap working rather
+  than a misconfiguration on its own.
 - `resolver_failed` — cold-cohort upstream resolution failed
   (`summary.no_upstream_mapping > 0`). Today this fires when the
   repo has no catch-all upstream mapping (`path_prefix=""`) — the

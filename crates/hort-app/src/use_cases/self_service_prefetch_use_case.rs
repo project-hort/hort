@@ -60,6 +60,20 @@
 //!
 //! For each [`PrefetchRequestItem`]:
 //!
+//! - **Name ownership (virtual targets only), first.** The enqueue
+//!   target for a virtual repo is its first member carrying a catch-all
+//!   upstream mapping — a proxy. ADR 0031 rule 2b says a name a
+//!   non-proxy member owns is never served from a proxy, so warming an
+//!   upstream copy under that name is refused:
+//!   `rejected_packages` with [`RejectionReason::NameOwnedByMember`].
+//!   The probe runs over **every** member, including ones the caller
+//!   cannot Read — a check limited to the visible members answers a
+//!   different question, and answers it `unowned` in exactly the case
+//!   that matters (a private hosted owner). It runs before version
+//!   resolution so an owned, internal name is never sent to a public
+//!   upstream only to be refused afterwards. See
+//!   [`VirtualResolutionUseCase::name_owned_by_any_member`] for what
+//!   the probe does and does not disclose.
 //! - **Resolve version.** If `item.version` is `None`, call
 //!   [`UpstreamMetadataPort::list_versions`] and pick the newest per the
 //!   format's [`VersionOrdering`]. An empty upstream list or an
@@ -153,7 +167,9 @@ use crate::metrics::{
 use crate::ports::upstream_metadata::UpstreamMetadataPort;
 use crate::rbac::RbacEvaluator;
 use crate::use_cases::index_serve_filter::{ordering_for_format, VersionOrdering};
-use crate::use_cases::virtual_resolution::VirtualResolutionUseCase;
+use crate::use_cases::virtual_resolution::{
+    name_owned_by_members, MemberNamePresence, VirtualResolutionUseCase,
+};
 
 // Exact wording propagated verbatim to the client via
 // `AppError::Domain(DomainError::Validation(_))`. Mirrors the constant
@@ -369,6 +385,21 @@ impl SelfServicePrefetchUseCase {
         // own; every held-check and upstream-capability lookup below
         // walks its members instead.
         let is_virtual = matches!(repository.repo_type, RepositoryType::Virtual);
+        //
+        // The ownership set comes first: it is the gate every item passes
+        // through, so a virtual whose members cannot be listed at all
+        // fails before anything else is resolved. It is deliberately NOT
+        // Read-filtered — see `VirtualResolutionUseCase::unfiltered_members`
+        // — and it never reaches the response envelope; the only thing
+        // derived from it is the `bool` `name_owned_by_members` returns.
+        // Resolved ONCE per call rather than per item.
+        let ownership_members: Vec<Repository> = if is_virtual {
+            self.virtual_resolution
+                .unfiltered_members(&repository)
+                .await?
+        } else {
+            Vec::new()
+        };
         let members: Vec<Repository> = if is_virtual {
             self.virtual_resolution
                 .resolve_members(&repository, Some(caller))
@@ -448,6 +479,7 @@ impl SelfServicePrefetchUseCase {
                 &repository_label,
                 is_virtual,
                 &members,
+                &ownership_members,
                 &resolved_target,
                 ordering,
                 item,
@@ -484,17 +516,65 @@ impl SelfServicePrefetchUseCase {
         repository_label: &str,
         is_virtual: bool,
         members: &[Repository],
+        ownership_members: &[Repository],
         resolved_target: &Option<(Uuid, RepositoryUpstreamMapping)>,
         ordering: Option<&(dyn VersionOrdering + Send + Sync)>,
         item: PrefetchRequestItem,
         outcome: &mut PrefetchOutcome,
     ) {
-        // ----- Resolve version (None ⇒ latest upstream) --------------
         let coords_request = PackageCoords {
             package: item.package.clone(),
             version: item.version.clone(),
         };
 
+        // ----- Name ownership, before anything else -------------------
+        //
+        // The enqueue target for a virtual repo is the first member with
+        // a catch-all upstream mapping — a PROXY. ADR 0031 rule 2b says
+        // a name a non-proxy member owns is never served from a proxy,
+        // and warming one is how an upstream artifact would come to
+        // exist under a locally-owned name in the first place. So the
+        // same ownership question the download and index paths ask gets
+        // asked here, before the target is used.
+        //
+        // **Ownership-first**, mirroring
+        // `VirtualResolutionUseCase::aggregate_virtual_index`'s phase
+        // ordering and for its reason: the `version = None` branch below
+        // sends the requested name to the member's configured upstream,
+        // so asking ownership afterwards would hand an internal name to
+        // a public registry only to refuse the item anyway.
+        //
+        // `ownership_members` is unfiltered by the caller's Read and is
+        // empty for a non-virtual target, so this is a no-op there. See
+        // `VirtualResolutionUseCase::unfiltered_members` for why a
+        // caller-filtered ownership check answers the wrong question,
+        // and `name_owned_by_members` for what the `bool` does and does
+        // not disclose.
+        if self
+            .name_is_owned_by_member(ownership_members, &item.package)
+            .await
+        {
+            tracing::info!(
+                repository = %repository.key,
+                package = %item.package,
+                outcome = "name_owned_by_member",
+                "self-service prefetch refused: a non-proxy member of this virtual \
+                 repository owns the requested name, so no upstream copy is warmed \
+                 under it",
+            );
+            outcome.rejected_packages.push(RejectedItem {
+                coords: coords_request,
+                reason: RejectionReason::NameOwnedByMember,
+            });
+            emit_prefetch_self_service(
+                format_label,
+                repository_label,
+                PrefetchSelfServiceResult::RejectedVersion,
+            );
+            return;
+        }
+
+        // ----- Resolve version (None ⇒ latest upstream) --------------
         let resolved_version = match item.version.clone() {
             Some(v) => v,
             None => {
@@ -904,6 +984,44 @@ impl SelfServicePrefetchUseCase {
         Ok(None)
     }
 
+    /// Does any non-proxy member of this virtual repository hold the
+    /// requested name — including a member the caller cannot Read?
+    ///
+    /// Supplies the per-member name lookup to
+    /// [`VirtualResolutionUseCase::name_owned_by_any_member`], which
+    /// owns the ownership rule itself (ADR 0031 rule 2b, non-proxy only,
+    /// fail-closed on an errored member) so this call site cannot
+    /// diverge from the download and index paths' version of it.
+    ///
+    /// "Holds the name" is name-level, not version-level: any version
+    /// at all is ownership. That is deliberate and is the half a
+    /// per-version held-check cannot reach — a member owning
+    /// `internal-lib` at `1.0` makes `internal-lib` theirs at every
+    /// version, which is precisely the new-version confusion variant
+    /// rule 2b closes.
+    ///
+    /// A port error for a member maps to
+    /// [`MemberNamePresence::Unavailable`], i.e. "potential owner" — an
+    /// outage of the trusted owner must not read as the name being free.
+    async fn name_is_owned_by_member(
+        &self,
+        ownership_members: &[Repository],
+        package: &str,
+    ) -> bool {
+        name_owned_by_members(ownership_members, |member| {
+            let artifacts = Arc::clone(&self.artifacts);
+            let package = package.to_string();
+            async move {
+                match artifacts.package_version_status(member.id, &package).await {
+                    Ok(rows) if rows.is_empty() => MemberNamePresence::Absent,
+                    Ok(_) => MemberNamePresence::Present,
+                    Err(_) => MemberNamePresence::Unavailable,
+                }
+            }
+        })
+        .await
+    }
+
     /// Read-only outcome of a prefetch job minted by
     /// [`Self::enqueue_self_service`] on the same repository —
     /// `GET /api/v1/repositories/{repo_key}/prefetch/jobs/{job_id}`.
@@ -1122,6 +1240,16 @@ mod tests {
         r
     }
 
+    /// A `Hosted`-typed member repo — a member that can OWN a name
+    /// (ADR 0031 rule 2b: proxies never own).
+    fn hosted_member_repo() -> Repository {
+        let mut r = sample_repository();
+        r.format = RepositoryFormat::Npm;
+        r.repo_type = RepositoryType::Hosted;
+        r.is_public = false;
+        r
+    }
+
     /// A `Proxy`-typed member repo (as opposed to `virtual_repo()`'s
     /// default `Hosted`), for tests that pin the "direct POST against a
     /// proxy member behaves exactly as today" regression.
@@ -1212,6 +1340,63 @@ mod tests {
             repos as Arc<dyn RepositoryRepository>,
             repository_access,
         ))
+    }
+
+    /// [`virtual_resolution_for`] with per-member Read enforcement ON —
+    /// what the name-ownership tests need, because the whole point of
+    /// those is a member the caller cannot see. `evaluator` is the same
+    /// grant set the top-level gate uses, so a member with no grant in
+    /// it is filtered out of `resolve_members` (collapsed to `NotFound`
+    /// per ADR 0021) exactly as in production.
+    fn virtual_resolution_rbac_filtered(
+        repos: Arc<MockRepositoryRepository>,
+        rbac: Arc<ArcSwap<RbacEvaluator>>,
+    ) -> Arc<VirtualResolutionUseCase> {
+        let repository_access = Arc::new(RepositoryAccessUseCase::new(
+            repos.clone() as Arc<dyn RepositoryRepository>,
+            RbacAccess::Enabled(rbac),
+            true,
+        ));
+        Arc::new(VirtualResolutionUseCase::new(
+            repos as Arc<dyn RepositoryRepository>,
+            repository_access,
+        ))
+    }
+
+    /// [`wire_with_repos`] with per-member Read enforcement ON (see
+    /// [`virtual_resolution_rbac_filtered`]).
+    fn wire_with_repos_member_read_enforced(
+        repos: Vec<Repository>,
+        evaluator: RbacEvaluator,
+    ) -> Harness {
+        let repositories = Arc::new(MockRepositoryRepository::new());
+        for repo in repos {
+            repositories.insert(repo);
+        }
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        let upstream = Arc::new(MockUpstreamMetadataPort::new());
+        let jobs = Arc::new(MockJobsRepository::new());
+        let rbac = Arc::new(ArcSwap::from_pointee(evaluator));
+        let virtual_resolution =
+            virtual_resolution_rbac_filtered(repositories.clone(), rbac.clone());
+        let uc = SelfServicePrefetchUseCase::new(
+            repositories.clone(),
+            artifacts.clone(),
+            mappings.clone(),
+            upstream.clone(),
+            jobs.clone(),
+            rbac,
+            virtual_resolution,
+        );
+        Harness {
+            uc,
+            repositories,
+            artifacts,
+            mappings,
+            upstream,
+            jobs,
+        }
     }
 
     fn wire(repo: Repository, evaluator: RbacEvaluator) -> Harness {
@@ -3538,6 +3723,328 @@ mod tests {
         assert_eq!(outcome.skipped_already_held.len(), 2);
         assert!(outcome.enqueued_job_ids.is_empty());
         assert!(h.jobs.enqueue_calls().is_empty());
+    }
+
+    // ============================================================
+    // Name ownership at target selection (ADR 0031 rule 2b)
+    // ============================================================
+
+    /// The shared name-ownership fixture: a virtual root with a hosted
+    /// member (which can own a name) and a proxy member (which carries
+    /// the catch-all mapping, so it is the enqueue target target
+    /// selection picks). Returns the harness plus
+    /// `(virtual_key, owner_id)`.
+    ///
+    /// `owner_visible` decides whether the caller holds `Read` on the
+    /// hosted member. It is the only axis these tests vary, and the
+    /// point of the whole finding: the refusal must not depend on it.
+    /// The caller always holds `Read ∧ Prefetch` on the root and `Read`
+    /// on the proxy, since without those there is no target to select.
+    async fn wire_ownership_fixture(owner_visible: bool) -> (Harness, String, Uuid) {
+        let vroot = virtual_repo();
+        let vroot_id = vroot.id;
+        let vkey = vroot.key.clone();
+        let owner = hosted_member_repo();
+        let owner_id = owner.id;
+        let proxy = proxy_member_repo();
+        let proxy_id = proxy.id;
+        let mut grants = vec![
+            grant("dev", vroot_id, Permission::Read),
+            grant("dev", vroot_id, Permission::Prefetch),
+            grant("dev", proxy_id, Permission::Read),
+        ];
+        if owner_visible {
+            grants.push(grant("dev", owner_id, Permission::Read));
+        }
+        let h = wire_with_repos_member_read_enforced(
+            vec![vroot, owner, proxy],
+            evaluator_with_grants(grants),
+        );
+        // Priority order: the proxy holds the catch-all mapping, so it is
+        // the target selection picked before the ownership probe existed.
+        h.repositories.seed_virtual_member(vroot_id, proxy_id);
+        h.repositories.seed_virtual_member(vroot_id, owner_id);
+        h.mappings.upsert(mapping(proxy_id)).await.unwrap();
+        (h, vkey, owner_id)
+    }
+
+    /// Seed `internal-lib@1.0.0` into the owning member — a version
+    /// DIFFERENT from the `2.0.0` the tests request, so a per-version
+    /// held check would not catch it even if it could see the member.
+    fn seed_owned_name(h: &Harness, owner_id: Uuid) {
+        h.artifacts.seed_package_version_status(
+            owner_id,
+            "internal-lib",
+            vec![("1.0.0".into(), QuarantineStatus::Released)],
+        );
+    }
+
+    /// A name owned by a member the caller **cannot see** is still
+    /// refused.
+    ///
+    /// The caller holds Read + Prefetch on the virtual root and on its
+    /// proxy member, and nothing at all on the hosted member that owns
+    /// `internal-lib` — so that member is absent from every list this
+    /// request's caller can produce, including the per-version held
+    /// check. Before the ownership probe, this request enqueued an
+    /// upstream pull of `internal-lib` into the proxy member: an
+    /// upstream artifact created under a name a member owns.
+    #[test]
+    fn virtual_name_owned_by_an_invisible_member_is_still_refused() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let (h, vkey, owner_id) = wire_ownership_fixture(false).await;
+                seed_owned_name(&h, owner_id);
+
+                let actor = caller_cli_session(&["dev"]);
+                let outcome = h
+                    .uc
+                    .enqueue_self_service(&vkey, vec![item("internal-lib", Some("2.0.0"))], &actor)
+                    .await
+                    .expect("ok");
+
+                assert!(
+                    outcome.enqueued_job_ids.is_empty(),
+                    "no upstream copy of an owned name may be warmed: {outcome:?}",
+                );
+                assert_eq!(outcome.rejected_packages.len(), 1, "{outcome:?}");
+                assert_eq!(
+                    outcome.rejected_packages[0].reason,
+                    RejectionReason::NameOwnedByMember,
+                );
+                assert!(
+                    h.jobs.enqueue_calls().is_empty(),
+                    "the refusal happens before the enqueue, not after",
+                );
+            })
+        });
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "rejected_version"
+            ),
+            Some(1)
+        );
+    }
+
+    /// The invisible owner stays invisible: the refusal is the same
+    /// shape whether the owning member is one the caller may Read or
+    /// not, so the envelope carries no signal distinguishing the two
+    /// and names no member either way.
+    #[test]
+    fn name_ownership_refusal_is_identical_for_a_visible_owner() {
+        let refusal_with_visible_owner = capture(|| {
+            Box::pin(async {
+                // The one difference from the test above: the caller CAN
+                // read the owning member.
+                let (h, vkey, owner_id) = wire_ownership_fixture(true).await;
+                seed_owned_name(&h, owner_id);
+
+                let actor = caller_cli_session(&["dev"]);
+                let outcome = h
+                    .uc
+                    .enqueue_self_service(&vkey, vec![item("internal-lib", Some("2.0.0"))], &actor)
+                    .await
+                    .expect("ok");
+                assert_eq!(outcome.rejected_packages.len(), 1, "{outcome:?}");
+                assert_eq!(
+                    outcome.rejected_packages[0].reason,
+                    RejectionReason::NameOwnedByMember,
+                );
+                assert_eq!(outcome.rejected_packages[0].coords.package, "internal-lib");
+                assert_eq!(
+                    outcome.rejected_packages[0].coords.version.as_deref(),
+                    Some("2.0.0"),
+                    "the envelope echoes the caller's own coordinate and nothing \
+                     about the owner",
+                );
+            })
+        });
+        assert_eq!(
+            counter_value(
+                &refusal_with_visible_owner,
+                "hort_prefetch_self_service_total",
+                "rejected_version"
+            ),
+            Some(1),
+            "same metric bucket as the invisible-owner case",
+        );
+    }
+
+    /// Counter-test: an ordinary self-service prefetch for an unowned
+    /// name still succeeds. The fixture is the invisible-member one with
+    /// a different package requested, so a probe that refused
+    /// everything would fail here.
+    #[test]
+    fn virtual_unowned_name_still_enqueues() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let (h, vkey, owner_id) = wire_ownership_fixture(false).await;
+                seed_owned_name(&h, owner_id);
+
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&vkey, vec![item("lodash", Some("4.17.21"))], &actor)
+                        .await
+                        .expect("ok");
+                assert_eq!(outcome.enqueued_job_ids.len(), 1, "{outcome:?}");
+                assert!(outcome.rejected_packages.is_empty(), "{outcome:?}");
+                assert_eq!(h.jobs.enqueue_calls().len(), 1);
+            })
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
+            Some(1)
+        );
+    }
+
+    /// A PROXY member holding the name is not ownership (ADR 0031 rule
+    /// 2b: proxies never own). Otherwise the first warm of any public
+    /// package would permanently refuse every later warm of it.
+    #[test]
+    fn a_proxy_member_holding_the_name_is_not_ownership() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let vroot = virtual_repo();
+                let vroot_id = vroot.id;
+                let vkey = vroot.key.clone();
+                let proxy = proxy_member_repo();
+                let proxy_id = proxy.id;
+                let h = wire_with_repos_member_read_enforced(
+                    vec![vroot, proxy],
+                    evaluator_with_grants(vec![
+                        grant("dev", vroot_id, Permission::Read),
+                        grant("dev", vroot_id, Permission::Prefetch),
+                        grant("dev", proxy_id, Permission::Read),
+                    ]),
+                );
+                h.repositories.seed_virtual_member(vroot_id, proxy_id);
+                h.mappings.upsert(mapping(proxy_id)).await.unwrap();
+                // The proxy already holds an earlier version of the name.
+                h.artifacts.seed_package_version_status(
+                    proxy_id,
+                    "lodash",
+                    vec![("4.17.20".into(), QuarantineStatus::Released)],
+                );
+
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&vkey, vec![item("lodash", Some("4.17.21"))], &actor)
+                        .await
+                        .expect("ok");
+                assert_eq!(
+                    outcome.enqueued_job_ids.len(),
+                    1,
+                    "a proxy's own held version must not read as ownership: {outcome:?}",
+                );
+                assert!(outcome.rejected_packages.is_empty(), "{outcome:?}");
+            })
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
+            Some(1)
+        );
+    }
+
+    /// Fail-closed per member: a non-proxy member whose name lookup
+    /// errored is a *potential* owner, so the item is refused. An
+    /// outage of the trusted owner must not make its names warmable.
+    #[test]
+    fn a_members_failed_name_lookup_refuses_rather_than_warms() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let (h, vkey, _owner_id) = wire_ownership_fixture(false).await;
+                // The hosted member's name lookup is the first the probe
+                // makes, and it fails.
+                h.artifacts
+                    .fail_next_package_version_status(DomainError::Invariant("pool gone".into()));
+
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&vkey, vec![item("lodash", Some("4.17.21"))], &actor)
+                        .await
+                        .expect("ok");
+                assert!(outcome.enqueued_job_ids.is_empty(), "{outcome:?}");
+                assert_eq!(
+                    outcome.rejected_packages[0].reason,
+                    RejectionReason::NameOwnedByMember,
+                );
+            })
+        });
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "rejected_version"
+            ),
+            Some(1)
+        );
+    }
+
+    /// A failure to LIST the members is different from a member failing:
+    /// there is no member set to reason about at all, so no item can be
+    /// judged and the whole call fails rather than enqueueing anything.
+    #[test]
+    fn a_failed_member_listing_surfaces_internal_not_an_enqueue() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let vroot = virtual_repo();
+                let vroot_id = vroot.id;
+                let vkey = vroot.key.clone();
+                let proxy = proxy_member_repo();
+                let proxy_id = proxy.id;
+                let h = wire_with_repos_member_read_enforced(
+                    vec![vroot, proxy],
+                    evaluator_with_grants(vec![
+                        grant("dev", vroot_id, Permission::Read),
+                        grant("dev", vroot_id, Permission::Prefetch),
+                        grant("dev", proxy_id, Permission::Read),
+                    ]),
+                );
+                h.repositories.seed_virtual_member(vroot_id, proxy_id);
+                h.mappings.upsert(mapping(proxy_id)).await.unwrap();
+                h.repositories
+                    .fail_next_get_virtual_members(DomainError::Invariant("db down".into()));
+
+                let actor = caller_cli_session(&["dev"]);
+                let err =
+                    h.uc.enqueue_self_service(&vkey, vec![item("lodash", Some("4.17.21"))], &actor)
+                        .await
+                        .expect_err("an unlistable member set fails the call");
+                assert!(err.to_string().contains("db down"), "{err}");
+                assert!(
+                    h.jobs.enqueue_calls().is_empty(),
+                    "nothing is enqueued against an unanswered ownership question",
+                );
+            })
+        });
+        assert!(counter_value(&snap, "hort_prefetch_self_service_total", "success").is_none());
+    }
+
+    /// A non-virtual target has no member set, so the ownership probe
+    /// does not run and the single-repo path is untouched.
+    #[test]
+    fn non_virtual_target_is_unaffected_by_the_ownership_probe() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = npm_repo();
+                let repo_id = repo.id;
+                let key = repo.key.clone();
+                let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+                h.mappings.upsert(mapping(repo_id)).await.unwrap();
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&key, vec![item("lodash", Some("4.17.21"))], &actor)
+                        .await
+                        .expect("ok");
+                assert_eq!(outcome.enqueued_job_ids.len(), 1, "{outcome:?}");
+            })
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
+            Some(1)
+        );
     }
 
     // ============================================================

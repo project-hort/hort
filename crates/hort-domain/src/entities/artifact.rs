@@ -81,6 +81,56 @@ impl FromStr for QuarantineStatus {
 }
 
 impl QuarantineStatus {
+    /// The more restrictive of two statuses — **the** rule for reducing
+    /// a set of per-file statuses to the one status a version reports.
+    ///
+    /// Several formats map one version to many stored files (a PyPI
+    /// version's sdist plus its wheels, a Maven A-level version's POM
+    /// plus its jar). The index pipeline decides per *version*, so the
+    /// per-file statuses have to collapse, and the operator contract is
+    /// "a version is in or out as a whole": a version with any
+    /// non-servable file is non-servable, so that
+    /// `NonServableStatusFilter` drops it rather than advertising a
+    /// version whose download would `503`.
+    ///
+    /// Taking *a* file's status instead — whichever row the query
+    /// happened to return first — makes a version's advertised
+    /// visibility depend on row order, which no `ORDER BY` in the
+    /// artifact reads makes deterministic for files sharing a version.
+    /// This fold is order-independent by construction (it is
+    /// commutative and associative), which is why it is the fix rather
+    /// than a tiebreak.
+    ///
+    /// Ordering, most → least restrictive: `Rejected` > `Quarantined` >
+    /// `ScanIndeterminate` > `Released` > `None`. Only the servable /
+    /// non-servable split is load-bearing — `is_downloadable` and the
+    /// index filters admit exactly `{Released, None}` — so the ordering
+    /// *within* each side decides which of two equally-filtered
+    /// statuses a mixed version reports, and nothing else. It is
+    /// reproduced from the Maven A-level fold this method replaced so
+    /// that hoisting the rule changed no format's behaviour.
+    ///
+    /// Exhaustive with no wildcard arm, so a sixth
+    /// [`QuarantineStatus`] variant is a compile error here rather than
+    /// silently ranking as least restrictive.
+    #[must_use]
+    pub fn worst_of(self, other: Self) -> Self {
+        fn rank(s: QuarantineStatus) -> u8 {
+            match s {
+                QuarantineStatus::Rejected => 4,
+                QuarantineStatus::Quarantined => 3,
+                QuarantineStatus::ScanIndeterminate => 2,
+                QuarantineStatus::Released => 1,
+                QuarantineStatus::None => 0,
+            }
+        }
+        if rank(self) >= rank(other) {
+            self
+        } else {
+            other
+        }
+    }
+
     /// Is this state **terminal** — has the artifact's lifecycle concluded
     /// against delivery, with nothing outstanding that the passage of time
     /// resolves?
@@ -2521,6 +2571,68 @@ mod tests {
         assert!(!QuarantineStatus::None.is_terminal());
         assert!(!QuarantineStatus::Released.is_terminal());
         assert!(!QuarantineStatus::Quarantined.is_terminal());
+    }
+
+    /// `worst_of` is a fold over a version's per-file statuses, so the
+    /// property that matters is not any one pair but that the result
+    /// does not depend on the order the files arrived in — which is
+    /// exactly what the artifact reads cannot guarantee. Asserted over
+    /// the whole vocabulary: commutative, associative, idempotent.
+    #[test]
+    fn worst_of_is_order_independent_over_the_whole_vocabulary() {
+        for a in QuarantineStatus::ALL {
+            assert_eq!(a.worst_of(a), a, "idempotent");
+            for b in QuarantineStatus::ALL {
+                assert_eq!(a.worst_of(b), b.worst_of(a), "commutative: {a:?} {b:?}");
+                for c in QuarantineStatus::ALL {
+                    assert_eq!(
+                        a.worst_of(b).worst_of(c),
+                        a.worst_of(b.worst_of(c)),
+                        "associative: {a:?} {b:?} {c:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The load-bearing half of the ordering: a version mixing a
+    /// servable file with a non-servable one reports the non-servable
+    /// status, so `NonServableStatusFilter` drops the version rather
+    /// than advertising one whose download would `503`.
+    #[test]
+    fn worst_of_lets_any_non_servable_file_decide_the_version() {
+        for servable in [QuarantineStatus::Released, QuarantineStatus::None] {
+            for non_servable in [
+                QuarantineStatus::Quarantined,
+                QuarantineStatus::Rejected,
+                QuarantineStatus::ScanIndeterminate,
+            ] {
+                assert_eq!(
+                    servable.worst_of(non_servable),
+                    non_servable,
+                    "{servable:?} + {non_servable:?}",
+                );
+            }
+        }
+    }
+
+    /// The exact ordering, pinned pair by pair — this is the rule the
+    /// Maven A-level fold carried before it was hoisted here, and
+    /// hoisting it must not have changed any format's behaviour.
+    #[test]
+    fn worst_of_ranks_rejected_over_quarantined_over_indeterminate_over_released_over_none() {
+        use QuarantineStatus as Q;
+        assert_eq!(Q::Rejected.worst_of(Q::Quarantined), Q::Rejected);
+        assert_eq!(
+            Q::Quarantined.worst_of(Q::ScanIndeterminate),
+            Q::Quarantined
+        );
+        assert_eq!(
+            Q::ScanIndeterminate.worst_of(Q::Released),
+            Q::ScanIndeterminate
+        );
+        assert_eq!(Q::Released.worst_of(Q::None), Q::Released);
+        assert_eq!(Q::Rejected.worst_of(Q::None), Q::Rejected);
     }
 
     /// [`QuarantineStatus::ALL`] is the whole vocabulary, and both

@@ -105,6 +105,59 @@ pub fn require_https_metadata_url(url: &str, subject: MetadataUrlSubject) -> Dom
     )))
 }
 
+// ---------------------------------------------------------------------------
+// The per-version distribution-file fan-out ceiling
+// ---------------------------------------------------------------------------
+
+/// **The** ceiling on how many distribution files one upstream-advertised
+/// version may fan a prefetch out to.
+///
+/// A version's file set is enumerated from an upstream metadata document
+/// (PyPI's per-version JSON `urls[]`, or the simple-index projection's
+/// `files[]`), and each entry becomes an upstream fetch plus a CAS write.
+/// Nothing in the protocol bounds how many entries that document carries,
+/// so without a ceiling the per-version fan-out is bounded only by the
+/// metadata body's storage backstop — `metadata_cache_max_bytes`, 64 MiB
+/// by default, which is on the order of a million entries.
+///
+/// `128` is the chosen bound. A package publishing the full CPython
+/// matrix — five or six interpreter versions across ten
+/// platform/arch wheel tags — lands near 50 files for a version, plus an
+/// sdist and any pure-Python wheel; the widest real publishers sit in the
+/// 20-60 range. 128 leaves room for that matrix to roughly double (free-
+/// threaded builds, more arches) before a legitimate publisher meets the
+/// ceiling, while cutting the hostile case by three to four orders of
+/// magnitude. It is a cap, NOT a target: a version that meets it is
+/// either a publisher far outside observed practice or an upstream
+/// amplifying against us, and both are worth a `warn!`.
+pub const MAX_METADATA_FILES_PER_VERSION: usize = 128;
+
+/// Split a per-version distribution-file cohort at
+/// [`MAX_METADATA_FILES_PER_VERSION`], returning
+/// `(admitted, refused)`.
+///
+/// `admitted` is how many of `total` entries may be fetched; `refused`
+/// is the remainder, which the caller logs once and does not fetch. The
+/// two always sum to `total`, so a caller cannot report a count it did
+/// not account for.
+///
+/// # Why this lives in the domain layer
+///
+/// Both consumers enumerate the same upstream document and neither can
+/// see the other: the autonomous prefetch leaf-pull in the application
+/// layer (`hort-app`'s `prefetch_ingest`) and the hot-path trigger in
+/// the inbound PyPI adapter (`hort-http-pypi`). ADR 0008 forbids
+/// `hort-app` depending on an `hort-http-*` crate, and the ceiling is a
+/// pure arithmetic split, so the domain layer — which both already
+/// depend on — is where one number can serve both. Same placement
+/// rationale, and the same failure it prevents, as
+/// [`require_https_metadata_url`].
+#[must_use]
+pub fn split_metadata_files_per_version(total: usize) -> (usize, usize) {
+    let admitted = total.min(MAX_METADATA_FILES_PER_VERSION);
+    (admitted, total - admitted)
+}
+
 /// Discovering a format's upstream-published versions and resolving their
 /// download URLs — the **VersionDiscovery** capability group (ADR 0005).
 ///
@@ -1219,6 +1272,47 @@ mod tests {
         let copied = MetadataUrlSubject::NpmTarballUrl;
         assert_eq!(copied, MetadataUrlSubject::NpmTarballUrl);
         let _ = format!("{copied:?}");
+    }
+
+    // -- split_metadata_files_per_version -----------------------------------
+
+    /// The split accounts for every entry — `admitted + refused` is the
+    /// input — and admits nothing past the ceiling.
+    #[test]
+    fn metadata_file_split_accounts_for_every_entry() {
+        for total in [
+            0,
+            1,
+            MAX_METADATA_FILES_PER_VERSION - 1,
+            MAX_METADATA_FILES_PER_VERSION,
+            MAX_METADATA_FILES_PER_VERSION + 1,
+            937,
+            2_500_000,
+        ] {
+            let (admitted, refused) = split_metadata_files_per_version(total);
+            assert_eq!(admitted + refused, total, "total {total} must be accounted");
+            assert!(
+                admitted <= MAX_METADATA_FILES_PER_VERSION,
+                "total {total} admitted {admitted} past the ceiling",
+            );
+        }
+    }
+
+    /// A cohort at or under the ceiling is admitted whole — the ceiling
+    /// must not clip an ordinary publisher.
+    #[test]
+    fn metadata_file_split_admits_an_ordinary_cohort_whole() {
+        // A full CPython-matrix release, the widest shape observed in
+        // practice.
+        assert_eq!(split_metadata_files_per_version(52), (52, 0));
+        assert_eq!(
+            split_metadata_files_per_version(MAX_METADATA_FILES_PER_VERSION),
+            (MAX_METADATA_FILES_PER_VERSION, 0),
+        );
+        assert_eq!(
+            split_metadata_files_per_version(MAX_METADATA_FILES_PER_VERSION + 3),
+            (MAX_METADATA_FILES_PER_VERSION, 3),
+        );
     }
 
     /// Compile-time assertion that `FormatHandler` is dyn-compatible.

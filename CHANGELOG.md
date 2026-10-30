@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Prefetch fan-out is now bounded where it claimed to be, and a prefetch
+  target asks who owns the name.** `prefetchPolicy.maxDescendants` caps a
+  cascade's total rows across every branch instead of per branch, so a wide
+  dependency graph warms fewer packages than before; a PyPI version warms at
+  most 128 distribution files; an index read carrying no credential no longer
+  fires the PyPI prefetch triggers; self-service prefetch into a virtual
+  repository refuses a name one of its members owns; and a PyPI version with a
+  quarantined file is no longer advertised because a sibling file was released
+  (#378).
 - **Three bounds that were bypassed after being checked now hold.** Wheel
   PEP 658 metadata extraction no longer holds the whole wheel in memory,
   releasing an upload session no longer discards one admitted concurrently

@@ -72,10 +72,13 @@ use hort_app::use_cases::index_serve_filter::Pep440Ordering;
 // `try_upstream_file_pull` fan-out for.
 use hort_app::use_cases::prefetch_use_case::PrefetchPlan;
 use hort_domain::entities::artifact::QuarantineStatus;
+use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{PrefetchTrigger, Repository};
 use hort_domain::error::{DomainError, DomainResult, FetchClass};
 use hort_domain::ports::ephemeral_store::EphemeralStore;
-use hort_domain::ports::format_handler::FormatHandler;
+use hort_domain::ports::format_handler::{
+    split_metadata_files_per_version, FormatHandler, MAX_METADATA_FILES_PER_VERSION,
+};
 use hort_domain::ports::metadata_mirror_store::{mirror_key, MetadataMirrorStore};
 use hort_domain::ports::upstream_proxy::{MetadataProjector, UpstreamProxy};
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
@@ -743,12 +746,20 @@ async fn project_from_mirror(
 /// file (sdist + N wheels). The quarantine window elapses *off* the
 /// next build's critical path. The trigger never blocks the serve.
 ///
-/// (There is deliberately no `OnIndexFetch` trigger — an implicit
-/// prefetch on every anonymous index read would let unauthenticated
-/// reads drive upstream fetches; see
-/// `hort_domain::entities::repository::PrefetchTrigger`. The Mode-2
-/// gate below still requires the repository to have opted in to
-/// `TransitiveDeps`; it does not fire unconditionally.)
+/// **An anonymous read fires nothing.** "Anonymous reads never trigger
+/// prefetch" is the standing rule (see
+/// `hort_domain::entities::repository::PrefetchTrigger` and
+/// `docs/architecture/explanation/prefetch-pipeline.md`), and retiring
+/// the `OnIndexFetch` trigger only removed the *unconditional* case:
+/// `OnDistTagMove` and the Mode-2 `TransitiveDeps` gate below both fire
+/// from this same index serve, which on a public proxy is reachable
+/// with no credential at all. So the serve's caller is threaded in
+/// here, and a `None` caller returns before either gate — otherwise an
+/// unauthenticated reader chooses which packages Hort fetches from
+/// upstream, and (via the per-version fan-out below, and the cascade
+/// the ingest seeds) how much work each of those choices costs. The
+/// Mode-2 gate additionally requires the repository to have opted in to
+/// `TransitiveDeps`; it does not fire unconditionally.
 ///
 /// **Filename-keyed pull rationale.** Unlike npm / cargo where one
 /// version maps to a single tarball, a PyPI version typically
@@ -798,7 +809,17 @@ pub(crate) fn fire_prefetch_trigger_pypi(
     normalized_name: &str,
     projection: &PypiSimpleIndexProjection,
     pkg_status: &[(String, QuarantineStatus)],
+    caller: Option<&CallerPrincipal>,
 ) {
+    if caller.is_none() {
+        tracing::debug!(
+            format = "pypi",
+            repository_key = %repo.key,
+            package = %project_name,
+            "prefetch trigger not fired: the index read carries no caller",
+        );
+        return;
+    }
     let project_name_owned = project_name.to_string();
     let versions = versions_from_projection(projection, normalized_name);
 
@@ -1096,12 +1117,35 @@ async fn prefetch_pypi_version(
         }
     };
 
-    // 3. Enumerate distribution filenames from the projection's `urls[]`.
-    let filenames: Vec<String> = projection
+    // 3. Enumerate distribution filenames from the projection's `urls[]`,
+    //    bounded by the per-version file ceiling. Each filename becomes an
+    //    upstream fetch plus a CAS write, and nothing in the protocol
+    //    bounds how many the document carries — without this the only
+    //    limit is the metadata body's 64 MiB storage backstop, which is on
+    //    the order of a million entries. The refused tail is reported
+    //    once; the admitted prefix still warms, so a version over the
+    //    ceiling degrades rather than being skipped whole.
+    let mut filenames: Vec<String> = projection
         .files
         .iter()
         .filter_map(|f| f.filename.clone())
         .collect();
+    let (admitted, refused) = split_metadata_files_per_version(filenames.len());
+    if refused > 0 {
+        tracing::warn!(
+            format = "pypi",
+            repository_key = %repo.key,
+            package = %project_name,
+            version = %version,
+            trigger = %trigger_str,
+            advertised = filenames.len(),
+            cap = MAX_METADATA_FILES_PER_VERSION,
+            refused,
+            "prefetch per-version distribution-file cohort exceeds the per-version \
+             ceiling; the tail is refused unfetched",
+        );
+        filenames.truncate(admitted);
+    }
     if filenames.is_empty() {
         tracing::warn!(
             format = "pypi",
@@ -2042,5 +2086,207 @@ mod tests {
             "IncludePending already advertises never-ingested upstream versions; \
              Mode 2's empty-index gate must not apply"
         );
+    }
+
+    // ===================================================================
+    // Per-version distribution-file fan-out ceiling + caller forwarding.
+    // ===================================================================
+
+    use hort_domain::ports::artifact_repository::ArtifactRepository as _;
+
+    fn sha256_hex(content: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(content);
+        hex::encode(h.finalize())
+    }
+
+    /// Seed a per-version JSON manifest advertising `count` distinct
+    /// distribution files for `requests 1.0.0`, plus each file's body at
+    /// its own absolute URL, so every admitted pull can complete.
+    ///
+    /// Bodies are distinct per filename on purpose: identical content
+    /// would share one `DedupKey::blob_by_hash` and collapse into a
+    /// single CAS write plus a single artifact row, which is exactly the
+    /// quantity the test counts.
+    fn seed_wide_version(mocks: &MockPorts, count: usize) {
+        let mut entries: Vec<String> = Vec::with_capacity(count);
+        for i in 0..count {
+            let filename = format!("requests-1.0.0-py3-none-plat{i}.whl");
+            let url = format!("https://files.pythonhosted.org/packages/aa/{filename}");
+            let body = format!("body-of-{filename}").into_bytes();
+            let sha = sha256_hex(&body);
+            mocks.upstream_proxy.insert_artifact("", &url, body);
+            entries.push(format!(
+                r#"{{"filename":"{filename}","url":"{url}","digests":{{"sha256":"{sha}"}}}}"#
+            ));
+        }
+        let json = format!(r#"{{"urls":[{}]}}"#, entries.join(",")).into_bytes();
+        mocks
+            .upstream_proxy
+            .insert_metadata("", "/pypi/requests/1.0.0/json", json);
+    }
+
+    /// Drive the per-version hot-path prefetch for a `requests 1.0.0`
+    /// advertising `advertised` distribution files, and return how many
+    /// artifacts were actually ingested.
+    ///
+    /// Ingested rows are the right quantity to count: each admitted file
+    /// costs one upstream fetch, one CAS write and one ingest, and that
+    /// cost is what the ceiling exists to bound.
+    async fn warmed_file_count(advertised: usize) -> u64 {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_pypi_repo("pypi-public");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+        seed_wide_version(&mocks, advertised);
+
+        prefetch_pypi_version(&ctx, &repo, "requests", "1.0.0", "on_dist_tag_move").await;
+
+        mocks
+            .artifacts
+            .find_by_name_in_repo(
+                repo.id,
+                "requests",
+                hort_domain::types::PageRequest::default(),
+            )
+            .await
+            .expect("held lookup")
+            .total
+    }
+
+    /// The hot-path trigger refuses past the per-version ceiling: an
+    /// upstream version advertising more distribution files than
+    /// `MAX_METADATA_FILES_PER_VERSION` warms the admitted prefix and
+    /// fetches nothing beyond it. Without the ceiling this reports the
+    /// full advertised count.
+    #[tokio::test]
+    async fn hot_path_refuses_past_the_per_version_file_ceiling() {
+        let advertised = MAX_METADATA_FILES_PER_VERSION + 4;
+        assert_eq!(
+            warmed_file_count(advertised).await,
+            MAX_METADATA_FILES_PER_VERSION as u64,
+            "a version advertising {advertised} files must warm at most the \
+             per-version ceiling",
+        );
+    }
+
+    /// Counter-test: a version whose file count is inside the ceiling is
+    /// warmed whole — the bound must not clip an ordinary publisher. 52
+    /// is a full CPython-matrix release, the widest shape observed in
+    /// practice.
+    #[tokio::test]
+    async fn hot_path_warms_an_ordinary_version_whole() {
+        assert_eq!(
+            warmed_file_count(52).await,
+            52,
+            "every file of an ordinary version is warmed",
+        );
+    }
+
+    /// "Anonymous reads never trigger prefetch" — the trigger is handed
+    /// the serve's caller and fires nothing without one. The fixture's
+    /// repo is Mode-2 eligible (cold `ReleasedOnly` + `TransitiveDeps`),
+    /// which is the gate reachable on a public proxy with no credential.
+    /// Fire the PyPI hot-path trigger for a Mode-2-eligible cold repo
+    /// with `caller`, and return the rendered metrics.
+    ///
+    /// The planner's own counters are the observation point:
+    /// `PrefetchUseCase::plan` emits `hort_prefetch_enqueued_total` per
+    /// planned version and `hort_prefetch_skipped_total{reason}` on each
+    /// early exit, so a trigger that never fired leaves both silent.
+    fn rendered_metrics_for_trigger(caller: Option<&CallerPrincipal>) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (ctx, _mocks) = build_mock_ctx(metrics_handle.clone());
+                    let repo = cold_repo(
+                        vec![PrefetchTrigger::TransitiveDeps],
+                        IndexMode::ReleasedOnly,
+                    );
+                    let projection = wide_simple_index_projection();
+                    fire_prefetch_trigger_pypi(
+                        &ctx,
+                        &repo,
+                        "rapidfuzz",
+                        "rapidfuzz",
+                        &projection,
+                        &[],
+                        caller,
+                    );
+                    metrics_handle.render()
+                })
+        })
+    }
+
+    #[test]
+    fn anonymous_index_read_fires_no_prefetch_trigger() {
+        let rendered = rendered_metrics_for_trigger(None);
+        assert!(
+            !rendered.contains("hort_prefetch_enqueued_total"),
+            "an anonymous index read must plan nothing; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("hort_prefetch_skipped_total"),
+            "the trigger must return before the planner is consulted at all, \
+             so not even a skip is counted; rendered: {rendered}"
+        );
+    }
+
+    /// Counter-test for the gate above: the same repository, package and
+    /// projection with an authenticated caller DOES plan — so the
+    /// anonymous assertion above is about the caller and not about a
+    /// fixture that could never have planned anything.
+    #[test]
+    fn authenticated_index_read_still_fires_the_prefetch_trigger() {
+        let caller = authenticated_caller();
+        let rendered = rendered_metrics_for_trigger(Some(&caller));
+        assert!(
+            rendered.contains("hort_prefetch_enqueued_total"),
+            "an authenticated index read plans the cold candidate set; \
+             rendered: {rendered}"
+        );
+    }
+
+    /// A caller the RBAC layer never has to judge — the trigger gate asks
+    /// only whether the serve carried one at all, which is the question
+    /// "anonymous reads never trigger prefetch" is about.
+    fn authenticated_caller() -> CallerPrincipal {
+        CallerPrincipal {
+            user_id: uuid::Uuid::new_v4(),
+            external_id: "keycloak:realm-users:ci".into(),
+            username: "ci".into(),
+            email: "ci@example.com".into(),
+            claims: Vec::new(),
+            token_kind: None,
+            issued_at: Utc::now(),
+            token_cap: None,
+        }
+    }
+
+    /// A two-version simple-index projection for the trigger gate tests.
+    fn wide_simple_index_projection() -> PypiSimpleIndexProjection {
+        PypiSimpleIndexProjection {
+            files: [
+                "rapidfuzz-1.0.0-py3-none-any.whl",
+                "rapidfuzz-1.1.0-py3-none-any.whl",
+            ]
+            .into_iter()
+            .map(|filename| hort_formats::pypi::projection::PypiSimpleFile {
+                filename: Some(filename.to_string()),
+                url: Some(format!(
+                    "https://files.pythonhosted.org/packages/aa/{filename}"
+                )),
+                sha256: None,
+                requires_python: None,
+                metadata_sha256: None,
+            })
+            .collect(),
+        }
     }
 }

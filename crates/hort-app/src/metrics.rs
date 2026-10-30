@@ -4808,12 +4808,14 @@ pub fn emit_streams_archived(result: StreamsArchivedResult) {
 ///   cap AND every cold-cohort upstream resolution succeeded
 ///   (`summary.cap_hit == false && summary.no_upstream_mapping == 0`).
 ///   The happy path; the steady-state value on a healthy deployment.
-/// - [`Self::CapHit`] — walk truncated by the
-///   `PrefetchPolicy::max_descendants` cumulative-cap safety net
+/// - [`Self::CapHit`] — this walk's cohort was truncated to its share
+///   of the `PrefetchPolicy::max_descendants` budget
 ///   (`summary.cap_hit == true`). The accompanying `tracing::warn!`
-///   at the truncation site carries `cap` / `current_descendants` /
+///   at the truncation site carries `cap` / `descendant_budget` /
 ///   `attempted_to_enqueue` for per-instance diagnosis; the metric is
-///   the dashboard signal that operators alert on.
+///   the dashboard signal that operators alert on. The budget is
+///   global across the cascade, so a graph wider than it trips this at
+///   the levels where it runs out.
 /// - [`Self::ResolverFailed`] — cold-cohort upstream resolution
 ///   failed (`summary.no_upstream_mapping > 0`). Today this fires
 ///   when the repo has no catch-all upstream mapping
