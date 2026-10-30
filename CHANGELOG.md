@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A digest hort recorded is now the digest hort checks, and a fact is re-read
+  before it is acted on.** A same-length corrupted CAS read fails the download
+  instead of completing as a successful `200`, the metadata mirror refuses a
+  body altered at rest rather than becoming the checksum authority for a later
+  pull and no longer exposes its staging writes as keys of their own, a PyPI
+  Simple index advertises hort's own digest for a file hort holds, and a
+  retention purge can no longer delete an artifact a mutable ref was repointed
+  at concurrently (#380).
 - **The event chain and the row derived from it can no longer drift apart
   unnoticed.** `verify-event-chain` now checks each stream's recomputed hash at
   every position a checkpoint anchored, so a wholesale rewrite that also

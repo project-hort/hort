@@ -4865,6 +4865,311 @@ mod tests {
         );
     }
 
+    // --- Advertised digest vs. the digest hort would verify -----------
+    //
+    // A proxy serve rewrites every `href` to point back at hort, so the
+    // digest in the served document is the one a client checks the bytes
+    // *hort* hands back against. For a file hort holds, that is hort's
+    // own `sha256_checksum`; only a file hort does not hold keeps the
+    // upstream's advertisement (which is also what the pull-through will
+    // verify against, so the two agree by construction). The decision is
+    // per FILE: a version holds an sdist plus N wheels and hort may hold
+    // only some of them.
+
+    /// Stand up a pypi proxy repo with an upstream mapping and one
+    /// seeded upstream simple-index HTML body, serve
+    /// `/simple/{project}/`, and hand back the served document.
+    ///
+    /// `held` seeds one artifact row per `(filename, sha256-hex)` pair at
+    /// the pypi logical path `simple/{project}/{filename}` — i.e. "hort
+    /// holds this file under this digest". The seeded row's `version`
+    /// field is deliberately left at the `sample_artifact` default and
+    /// does NOT match the version in the filename: the digest decision is
+    /// keyed by filename alone, and a test that quietly aligned the two
+    /// could not tell that apart from a version-keyed lookup. `IndexMode::IncludePending`
+    /// because the seeded rows carry `QuarantineStatus::None` and the
+    /// default `ReleasedOnly` would filter the version out of the
+    /// document these tests read.
+    async fn serve_proxy_simple_index(
+        project: &str,
+        upstream_html: &str,
+        held: &[(&str, &str)],
+    ) -> String {
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::repository::RepositoryType;
+        use hort_domain::ports::repository_upstream_mapping_repository::{
+            RepositoryUpstreamMapping, UpstreamAuth,
+        };
+        use hort_http_core::test_support::build_mock_ctx;
+
+        let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        let (ctx, mocks) = build_mock_ctx(metrics_handle);
+
+        let mut repo = sample_repository();
+        repo.key = "pypi-mirror".into();
+        repo.format = RepositoryFormat::Pypi;
+        repo.repo_type = RepositoryType::Proxy;
+        repo.upstream_url = Some("https://pypi.org".into());
+        repo.index_mode = hort_domain::entities::repository::IndexMode::IncludePending;
+        mocks.repositories.insert(repo.clone());
+
+        let now = Utc::now();
+        mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
+            id: Uuid::new_v4(),
+            repository_id: repo.id,
+            path_prefix: "".into(),
+            upstream_url: "https://pypi.org".into(),
+            upstream_name_prefix: None,
+            upstream_auth: UpstreamAuth::Anonymous,
+            secret_ref: None,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+            insecure_upstream_url: false,
+            trust_upstream_publish_time: false,
+            mtls_cert_ref: None,
+            mtls_key_ref: None,
+            ca_bundle_ref: None,
+            pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        });
+
+        for (filename, sha_hex) in held {
+            let mut artifact = sample_artifact(QuarantineStatus::None);
+            artifact.repository_id = repo.id;
+            artifact.name = project.to_string();
+            artifact.name_as_published = project.to_string();
+            artifact.path = format!("simple/{project}/{filename}");
+            artifact.sha256_checksum = sha_hex.parse().expect("64 lowercase hex");
+            mocks.artifacts.insert(artifact);
+        }
+
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("/simple/{project}/"),
+            upstream_html.as_bytes().to_vec(),
+        );
+
+        let res = router(ctx)
+            .oneshot(
+                Request::get(format!("/pypi/pypi-mirror/simple/{project}/"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 65536).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    const UPSTREAM_SHA_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const HORT_SHA_A: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const UPSTREAM_SHA_B: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn one_anchor(filename: &str, sha_hex: &str) -> String {
+        format!(
+            r#"<a href="https://files.pythonhosted.org/x/y/{filename}#sha256={sha_hex}">{filename}</a>"#
+        )
+    }
+
+    /// hort holds the file and its stored digest DISAGREES with the
+    /// upstream index's: the served fragment is hort's, because hort is
+    /// what will serve the bytes.
+    ///
+    /// Before the fix this emitted `#sha256={UPSTREAM_SHA_A}` — the
+    /// upstream's value, for bytes hort would never hand back — so the
+    /// `HORT_SHA_A` assertion failed and the `UPSTREAM_SHA_A` one caught
+    /// it on the way out.
+    #[tokio::test]
+    async fn proxy_index_advertises_horts_digest_for_a_file_hort_holds() {
+        let html = serve_proxy_simple_index(
+            "requests",
+            &one_anchor("requests-2.31.0.tar.gz", UPSTREAM_SHA_A),
+            &[("requests-2.31.0.tar.gz", HORT_SHA_A)],
+        )
+        .await;
+
+        assert!(
+            html.contains(&format!("requests-2.31.0.tar.gz#sha256={HORT_SHA_A}")),
+            "a file hort holds must be advertised under hort's own digest: {html}"
+        );
+        assert!(
+            !html.contains(UPSTREAM_SHA_A),
+            "the upstream's disagreeing digest must not reach the served document: {html}"
+        );
+    }
+
+    /// hort does not hold the file: the upstream's advertisement is the
+    /// only digest anyone knows, and hort will verify the pull-through
+    /// against exactly it (ADR 0006). It is kept verbatim and no digest
+    /// of hort's own is invented.
+    #[tokio::test]
+    async fn proxy_index_keeps_the_upstream_digest_for_a_file_hort_does_not_hold() {
+        let html = serve_proxy_simple_index(
+            "requests",
+            &one_anchor("requests-2.31.0.tar.gz", UPSTREAM_SHA_A),
+            &[],
+        )
+        .await;
+
+        assert!(
+            html.contains(&format!("requests-2.31.0.tar.gz#sha256={UPSTREAM_SHA_A}")),
+            "an unheld file keeps the upstream's digest: {html}"
+        );
+    }
+
+    /// An upstream that publishes no digest for a file hort does not
+    /// hold leaves the served anchor with no fragment at all. The
+    /// failure mode this pins is the *opposite* of the one above:
+    /// inventing an advertisement for bytes hort has never seen is the
+    /// same defect one step over, and a `None` upstream value with an
+    /// empty held map is where that would show.
+    #[tokio::test]
+    async fn proxy_index_invents_no_digest_for_an_unheld_file_with_no_upstream_hash() {
+        let filename = "requests-2.31.0.tar.gz";
+        let html = serve_proxy_simple_index(
+            "requests",
+            &format!(r#"<a href="https://files.pythonhosted.org/x/y/{filename}">{filename}</a>"#),
+            &[],
+        )
+        .await;
+
+        assert!(
+            html.contains(filename),
+            "the file is still advertised: {html}"
+        );
+        assert!(
+            !html.contains("#sha256="),
+            "no digest is known for this file, so none may be advertised: {html}"
+        );
+    }
+
+    /// One version, two files, and hort holds exactly one of them: each
+    /// file is advertised from its own fact. A per-version answer would
+    /// have to pick one of the two and would be wrong about the other
+    /// either way.
+    ///
+    /// Before the fix both anchors carried their upstream value, so the
+    /// wheel's `HORT_SHA_A` assertion failed; the sdist's
+    /// `UPSTREAM_SHA_B` assertion passed before and after, which is what
+    /// makes it the per-file half of the claim rather than a repeat of
+    /// the first test.
+    #[tokio::test]
+    async fn proxy_index_decides_per_file_when_a_version_mixes_held_and_unheld() {
+        let wheel = "requests-2.31.0-py3-none-any.whl";
+        let sdist = "requests-2.31.0.tar.gz";
+        let html = serve_proxy_simple_index(
+            "requests",
+            &format!(
+                "{}\n{}",
+                one_anchor(wheel, UPSTREAM_SHA_A),
+                one_anchor(sdist, UPSTREAM_SHA_B)
+            ),
+            &[(wheel, HORT_SHA_A)],
+        )
+        .await;
+
+        assert!(
+            html.contains(&format!("{wheel}#sha256={HORT_SHA_A}")),
+            "the held wheel takes hort's digest: {html}"
+        );
+        assert!(
+            html.contains(&format!("{sdist}#sha256={UPSTREAM_SHA_B}")),
+            "the unheld sdist keeps the upstream's: {html}"
+        );
+        assert!(
+            !html.contains(UPSTREAM_SHA_A),
+            "the held wheel's upstream digest must not survive: {html}"
+        );
+    }
+
+    /// Counter-test — where the two agree, nothing about the served
+    /// document changes.
+    ///
+    /// "Unchanged" is asserted against the document the pre-fix code
+    /// produced rather than against a transcribed literal: with no held
+    /// rows at all, every advertisement is the upstream's verbatim
+    /// value, which is exactly what the old `projection_to_entries`
+    /// emitted for an agreeing digest. The two bodies must be
+    /// byte-identical.
+    #[tokio::test]
+    async fn proxy_index_is_byte_identical_when_upstream_and_hort_agree() {
+        let filename = "requests-2.31.0.tar.gz";
+        let upstream_html = one_anchor(filename, UPSTREAM_SHA_A);
+
+        let with_held =
+            serve_proxy_simple_index("requests", &upstream_html, &[(filename, UPSTREAM_SHA_A)])
+                .await;
+        let without_held = serve_proxy_simple_index("requests", &upstream_html, &[]).await;
+
+        assert_eq!(
+            with_held, without_held,
+            "an agreeing held digest must change nothing in the served document"
+        );
+        assert!(with_held.contains(&format!("{filename}#sha256={UPSTREAM_SHA_A}")));
+    }
+
+    /// The divergence itself is reported, not just corrected.
+    ///
+    /// Choosing hort's digest keeps the served document honest, but it
+    /// also silently absorbs a fact an operator needs: the upstream
+    /// index now names different bytes than hort stored under this
+    /// filename — a re-used filename upstream, a mapping repointed at a
+    /// different index, or a stale row. The counter is the signal;
+    /// the filenames ride on the accompanying `warn` because a per-file
+    /// metric label would be unbounded cardinality.
+    ///
+    /// An agreeing digest must NOT fire it, which is the half that keeps
+    /// the signal readable — so both directions are asserted here.
+    #[test]
+    fn proxy_index_digest_divergence_is_counted_only_when_the_two_disagree() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        fn divergence_count(held_sha: &'static str) -> u64 {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        serve_proxy_simple_index(
+                            "requests",
+                            &one_anchor("requests-2.31.0.tar.gz", UPSTREAM_SHA_A),
+                            &[("requests-2.31.0.tar.gz", held_sha)],
+                        )
+                        .await;
+                    });
+            });
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(ckey, _, _, _)| ckey.key().name() == "hort_index_digest_divergence_total")
+                .filter_map(|(_, _, _, value)| match value {
+                    DebugValue::Counter(n) => Some(n),
+                    _ => None,
+                })
+                .sum()
+        }
+
+        assert_eq!(
+            divergence_count(HORT_SHA_A),
+            1,
+            "a disagreeing held digest must be counted once per file"
+        );
+        assert_eq!(
+            divergence_count(UPSTREAM_SHA_A),
+            0,
+            "an agreeing held digest is not a divergence"
+        );
+    }
+
     /// A malformed upstream simple-index body must not leak its content
     /// into the client-facing response: the marker string
     /// appears only inside a `hashes` value whose type mismatch drives
@@ -7011,6 +7316,7 @@ mod tests {
             simple_index::SimpleIndexFormat::Html,
             "example",
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(entries.len(), 1);
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(payload) =
@@ -7042,6 +7348,7 @@ mod tests {
             &bytes::Bytes::from(html.to_string()),
             simple_index::SimpleIndexFormat::Html,
             "example",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert_eq!(entries.len(), 1);
@@ -7077,6 +7384,7 @@ mod tests {
             simple_index::SimpleIndexFormat::Html,
             "example",
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(payload) =
             &entries[0].payload
@@ -7108,6 +7416,7 @@ mod tests {
             &bytes::Bytes::from(bytes_body),
             simple_index::SimpleIndexFormat::Json,
             "example",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert_eq!(entries.len(), 1);
@@ -7148,6 +7457,7 @@ mod tests {
             &bytes::Bytes::from(bytes_body),
             simple_index::SimpleIndexFormat::Json,
             "example",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(payload) =
@@ -7225,6 +7535,7 @@ mod tests {
             simple_index::SimpleIndexFormat::Json,
             "requests",
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(p) = &entries[0].payload
         else {
@@ -7276,6 +7587,7 @@ mod tests {
             simple_index::SimpleIndexFormat::Json,
             "requests",
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         let html = render_proxy_html(entries);
         assert!(
@@ -7309,6 +7621,7 @@ mod tests {
             &bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
             simple_index::SimpleIndexFormat::Json,
             "requests",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(p) = &entries[0].payload
@@ -7354,6 +7667,7 @@ mod tests {
             &bytes::Bytes::from(html_upstream.to_string()),
             simple_index::SimpleIndexFormat::Html,
             "requests",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(p) = &entries[0].payload

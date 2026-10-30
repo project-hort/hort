@@ -67,6 +67,22 @@
 //! adapter's in-transaction `FOR UPDATE` re-read is the race defence
 //! and the use case's earlier read is the optimisation.
 //!
+//! Two things make that re-read load-bearing rather than merely
+//! fresher, and an implementation owes both:
+//!
+//! - **The lock has to reach every writer of the facts.** Three of the
+//!   four live outside the artifact row — the tag in the ref
+//!   projection, the two expiry facts on the artifact's stream — so a
+//!   lock the ref-write path does not take leaves the tag fact
+//!   unguarded (see [`RefLifecyclePort`](super::ref_lifecycle::RefLifecyclePort)).
+//! - **The facts have to be read after the lock is held, not while
+//!   taking it.** Under read-committed isolation a statement answers
+//!   subqueries from the snapshot it opened with, so a statement that
+//!   both acquires the lock and reads the facts reports the state at
+//!   the moment its *wait began* — a write that committed during the
+//!   wait stays invisible to the transaction that waited for it. The
+//!   lock and the read are therefore two statements.
+//!
 //! # Why a separate port (not methods on
 //! [`ContentReferenceIndex`](super::content_reference_index::ContentReferenceIndex))
 //!

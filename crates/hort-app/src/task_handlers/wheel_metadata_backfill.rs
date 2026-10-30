@@ -566,6 +566,7 @@ mod tests {
     use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
     use hort_domain::entities::repository::RepositoryFormat;
     use hort_domain::events::system_actor;
+    use hort_domain::ports::artifact_repository::PackageFileDigestRow;
     use hort_domain::ports::format_handler::FormatHandler;
     use hort_domain::ports::jobs_repository::{JobRow, JobStatus, KindFields};
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
@@ -1437,6 +1438,15 @@ mod tests {
 
     struct FailingArtifactRepo;
     impl ArtifactRepository for FailingArtifactRepo {
+        fn package_file_digests(
+            &self,
+            _r: Uuid,
+            _p: &str,
+        ) -> BoxFuture<'_, DomainResult<Vec<PackageFileDigestRow>>> {
+            // Required, not defaulted: this double holds no artifacts,
+            // so an empty answer is a statement, not a fallback.
+            Box::pin(async { Ok(Vec::new()) })
+        }
         fn find_by_id(
             &self,
             _id: Uuid,

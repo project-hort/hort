@@ -42,6 +42,24 @@ The pipeline has three stages with sharply separated knowledge:
   the whole version set — as PyPI does for `requires-python` and
   cargo does for each version's `deps` / `features`. Sources know
   where versions come from; they apply no policy.
+
+  A proxy source's served links point back at hort, so whichever
+  digest it puts in them is the one a client checks the bytes *hort*
+  hands back against. For a file hort already holds, that is hort's
+  own stored `checksum_sha256` — the digest the CAS read is verified
+  against
+  ([ADR 0003](../../adr/0003-streaming-enforced-cas.md)) — and
+  only a file hort does not hold keeps the upstream document's value,
+  which the pull-through will itself verify against
+  ([ADR 0006](../../adr/0006-mandatory-upstream-verification.md)), so
+  the two agree by construction. The decision is **per file**, from
+  `ArtifactUseCase::package_file_digests`: a version holds an sdist
+  plus N wheels and hort may hold only some of them, so a
+  per-version answer would mislabel the siblings of whichever file it
+  was derived from. Where both digests are known and disagree, hort's
+  wins (serving the other value would be a check that cannot
+  succeed) and the divergence is counted on
+  `hort_index_digest_divergence_total`.
 - A **filter pipeline** drops entries. Filters implement
   `IndexFilter` (`crates/hort-app/src/use_cases/index_serve.rs`) and
   operate only on the spine fields described below — they are pure

@@ -966,6 +966,7 @@ mod tests {
     };
     use hort_domain::error::DomainError;
     use hort_domain::events::system_actor;
+    use hort_domain::ports::artifact_repository::PackageFileDigestRow;
     use hort_domain::ports::format_handler::{DependencySpec, VersionDiscovery};
     use hort_domain::ports::jobs_repository::{JobRow, JobStatus, KindFields};
     use hort_domain::ports::repository_upstream_mapping_repository::{
@@ -1728,6 +1729,15 @@ mod tests {
     }
 
     impl ArtifactRepository for MockArtRepo {
+        fn package_file_digests(
+            &self,
+            _repository_id: Uuid,
+            _package: &str,
+        ) -> BoxFuture<'_, DomainResult<Vec<PackageFileDigestRow>>> {
+            // Required, not defaulted: this double holds no artifacts,
+            // so an empty answer is a statement, not a fallback.
+            Box::pin(async { Ok(Vec::new()) })
+        }
         fn find_by_id(
             &self,
             _id: Uuid,

@@ -980,6 +980,30 @@ impl ArtifactRepository for MockArtifactRepository {
         Box::pin(async move { Ok(rows) })
     }
 
+    fn package_file_digests(
+        &self,
+        repository_id: Uuid,
+        package: &str,
+    ) -> BoxFut<'_, DomainResult<Vec<(String, ContentHash)>>> {
+        // Per-FILE read. Mirrors the SQL adapter's
+        // `package_file_digests`: every live row for
+        // `(repository_id, name)` including null-`version` ones, keyed by
+        // the row's own `path` — row presence is the "hort holds these
+        // bytes" signal. `Self::projected` is not applied because neither
+        // field it masks is read here.
+        let pkg = package.to_owned();
+        let mut rows: Vec<(String, ContentHash)> = self
+            .artifacts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.repository_id == repository_id && a.name == pkg)
+            .map(|a| (a.path.clone(), a.sha256_checksum.clone()))
+            .collect();
+        rows.sort_by(|x, y| x.0.cmp(&y.0));
+        Box::pin(async move { Ok(rows) })
+    }
+
     /// Mock for the backfill candidacy query. Mirrors
     /// the SQL contract:
     /// - `path LIKE '%.whl'` (wheel-shaped artifacts only)

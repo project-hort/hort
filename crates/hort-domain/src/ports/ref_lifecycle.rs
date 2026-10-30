@@ -22,6 +22,20 @@
 //! mirrors the adapter-never-mutates-payloads rule for groups) and the
 //! adapter returns the winner's id. The use case retries by re-reading and
 //! dispatching as a move.
+//!
+//! **A ref write MUST exclude a concurrent purge of the artifact it is
+//! about to name.** A mutable ref resolving to an artifact is what
+//! exempts that artifact from storage GC, and the purge reads that
+//! exemption from the ref projection while holding the artifact row.
+//! An implementation that writes the projection row without taking a
+//! conflicting lock on the artifact rows its new target resolves to
+//! lets the two interleave: the purge reads "nothing points at this",
+//! the ref write commits, and the artifact a tag now names is
+//! destroyed. Locking the ref row cannot stand in for this — the
+//! purge's question is asked of a *set*, and the dangerous write is
+//! the creation of a row that does not exist to be locked. See
+//! `PurgeGcPort::purge_artifact_refs`, which also states why the
+//! purge's own read must be a statement later than its lock.
 
 use uuid::Uuid;
 
@@ -58,17 +72,23 @@ pub trait RefLifecyclePort: Send + Sync {
     /// `r` carries the desired post-state (id, repository, namespace, ref
     /// name, new target). The adapter is responsible for:
     ///
-    /// 1. Locking the existing row (if any) with `SELECT ... FOR UPDATE`
+    /// 1. Taking a lock on the artifact rows `r.target` resolves to that
+    ///    conflicts with the one a purge holds while deciding about them
+    ///    (see this module's docs), before the projection row is
+    ///    written. Only the new target needs it: a ref moving *away*
+    ///    from an artifact removes an exemption, and a purge reading the
+    ///    stale "still tagged" answer refuses — the fail-safe direction.
+    /// 2. Locking the existing row (if any) with `SELECT ... FOR UPDATE`
     ///    inside the transaction.
-    /// 2. If the current target equals `r.target`, committing WITHOUT
+    /// 3. If the current target equals `r.target`, committing WITHOUT
     ///    appending an event — this is the adapter-authoritative
     ///    idempotence check that defeats a concurrent same-target race.
-    /// 3. If no row exists, `INSERT ... ON CONFLICT (repository_id,
+    /// 4. If no row exists, `INSERT ... ON CONFLICT (repository_id,
     ///    namespace, ref_name) DO NOTHING RETURNING id`. Empty RETURNING
     ///    means a concurrent first-placement won — roll back (discarding
     ///    `batch` verbatim) and return
     ///    [`RefCommitOutcome::RefAlreadyExists`] with the winner's id.
-    /// 4. Otherwise UPDATEing the projection row and appending `batch`
+    /// 5. Otherwise UPDATEing the projection row and appending `batch`
     ///    via the event store's in-transaction append helper.
     ///
     /// The `batch` is built by the use case; the adapter does not touch

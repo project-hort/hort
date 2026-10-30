@@ -77,9 +77,10 @@
 //!
 //! For each pending work item:
 //! 1. Lock the artifact row `FOR UPDATE` and re-read the two
-//!    protection rules under that lock
-//!    ([`PendingPurge::is_gc_protected`],
-//!    [`PendingPurge::is_tag_exempt`]). Either one holding stops the
+//!    protection rules under that lock — in the statement *after* it,
+//!    not in it ([`PendingPurge::is_gc_protected`],
+//!    [`PendingPurge::is_tag_exempt`]; the port's docs carry why the
+//!    split is the mechanism). Either one holding stops the
 //!    item here with nothing deleted — see *The page is a snapshot*
 //!    below.
 //! 2. **Retire the artifact** — write `artifacts.deleted_at` — and
