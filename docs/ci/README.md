@@ -73,11 +73,61 @@ script lives at `scripts/ci/sonar-findings.sh`.
 
 Clippy findings reach Sonar via import rather than a second in-scanner run:
 `test:lint` writes `cargo clippy`'s JSON output to `clippy-report.json` and
-exports it as an artifact; `sonar-project.properties` points
-`sonar.rust.clippyReport.reportPaths` at that file and sets
-`sonar.rust.clippy.enabled=false` (the community-rust analyzer would
-otherwise try to run `cargo clippy` itself inside the scanner image, where
-there is no cargo, and fail).
+exports it as an artifact; `quality:sonar` points
+`sonar.rust.clippyReport.reportPaths` at that file at invocation, and
+`sonar-project.properties` sets `sonar.rust.clippy.enabled=false` (the
+analyzer would otherwise try to run `cargo clippy` itself inside the scanner
+image, where there is no cargo, and fail).
+
+### The GitHub twin (SonarQube Cloud)
+
+Hort has **two** Sonar targets, and `sonar-project.properties` is the single
+definition of the analysis semantics both must agree on — source layout, the
+test/production split, exclusions, and the test-key issue-ignores. The
+per-target plumbing is *not* in that file: each job passes its own
+host/token/project key and its own **report paths** at invocation, because a
+report path names a build product of one specific pipeline — and two of the
+three exist on the GitLab side only.
+
+| | GitLab (`quality:sonar`) | GitHub (`ci.yml` `sonarqube-cloud`) |
+|---|---|---|
+| Target | the in-cluster SonarQube Community | SonarQube Cloud |
+| Runs on | `develop` / `main` / `release/*` / tags, code-changed paths | pushes to `develop` and `main` |
+| Coverage report | `lcov.info` + `coverage-sonar.xml` from `test:coverage` | `lcov.info` from the `coverage` job, via artifact |
+| Clippy report | `clippy-report.json` from `test:lint` | none — nothing on that side writes one |
+
+**Do not read the two instances' coverage numbers as one number.** The
+measurement command happens to be the same on both sides today —
+`cargo llvm-cov --workspace --lib`, no Postgres service either place, so
+every DB-gated test self-skips — but that agreement is a coincidence of two
+independently maintained job definitions, not an invariant anything checks.
+Three things already differ: GitLab imports `coverage-sonar.xml` **and**
+`lcov.info` while GitHub imports `lcov.info` alone (and the generic-XML
+converter carries line hits only, no branch data); the two instances analyse
+different ref sets, so their *new code* periods are not the same window; and
+each project's quality gate is configured on its own server. Compare a
+number against earlier numbers **from the same instance**, never across.
+
+Both scans run on branch pushes only, never on an MR or a PR: the quality
+gate scores coverage and duplication on *new code*, which has no meaning for
+the many changes that touch no Rust — those score 0% and would block. On
+GitHub this is also what keeps the scan gap-free, since the `coverage` job
+builds `lcov.info` only when Rust changed, and that detection is
+unconditionally true for a push.
+
+On GitHub, `SONAR_TOKEN` is a **repository secret** (not a CI/CD variable),
+and the job skips with a one-line job-summary note when it is unset, so a
+fork or a clone without a Sonar project does not hard-fail. SonarQube Cloud
+also refuses a CI analysis while **Automatic Analysis** is enabled for the
+project — turn it off under the project's *Administration → Analysis Method*,
+or the scan step fails. Automatic Analysis is what this job replaces: it
+reads neither `sonar-project.properties` nor any coverage report, so it
+applies no test/production split and imports no coverage at all.
+
+The GitHub job is deliberately **not** in `ci-complete`'s `needs:`. It
+carries its own red/green check on the commit, but `ci-complete` is what
+`docker-publish.yml` and `release.yml` consume as their publish gate, and a
+third-party SaaS verdict must not stand between a tag and its release.
 
 ## Runner prerequisites
 

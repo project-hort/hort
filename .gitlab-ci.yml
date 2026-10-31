@@ -1611,14 +1611,15 @@ security:cargo-deny:
 # ===========================================================================
 #
 # Enforces coverage on new code >= 85% and duplication on new code <= 1%
-# via the Sonar quality gate. The STATIC analysis config — source layout
-# (`crates/`), exclusions, coverage report paths, and the test-key
-# issue-ignore rules — lives in `sonar-project.properties` at the repo root
-# (sonar-scanner auto-reads it); the job below passes only the dynamic
-# host/token/projectKey + per-MR args. Configure SONAR_HOST_URL and
-# SONAR_TOKEN as masked CI/CD variables. Optional: set SONAR_PROJECT_KEY
-# (and SONAR_ORGANIZATION) to point at a different Sonar project on a
-# local GitLab-hosted SonarQube.
+# via the Sonar quality gate. The shared analysis SEMANTICS — source layout
+# (`crates/`), the test/production split, exclusions, and the test-key
+# issue-ignore rules — live in `sonar-project.properties` at the repo root
+# (sonar-scanner auto-reads it), which the SonarQube Cloud scan on the
+# GitHub side reads too. The job below passes the dynamic host/token/
+# projectKey plus the report paths this pipeline's own jobs produced.
+# Configure SONAR_HOST_URL and SONAR_TOKEN as masked CI/CD variables.
+# Optional: set SONAR_PROJECT_KEY (and SONAR_ORGANIZATION) to point at a
+# different Sonar project on a local GitLab-hosted SonarQube.
 
 quality:sonar:
   stage: quality
@@ -1683,14 +1684,23 @@ quality:sonar:
       - .sonar/cache
   script:
     - |
-      # Static analysis config (sources, tests, exclusions, coverage report
-      # paths, and the test-key issue-ignores) lives in
-      # sonar-project.properties at the repo root and is auto-read by
-      # sonar-scanner. Only dynamic / secret args are passed here. This job runs
-      # on branch pipelines only (see rules), so there is no pull-request mode.
+      # The shared analysis semantics (sources, the test/production split,
+      # exclusions, and the test-key issue-ignores) live in
+      # sonar-project.properties at the repo root and are auto-read by
+      # sonar-scanner; that file is shared with the SonarQube Cloud scan on
+      # the GitHub side. Passed here instead: the dynamic / secret args, and
+      # the three report paths — lcov.info and coverage-sonar.xml from
+      # test:coverage, clippy-report.json from test:lint. Those paths name
+      # THIS pipeline's own build products, two of which no other pipeline
+      # produces at all, so they are plumbing of one target rather than a
+      # semantic the two targets must share. This job runs on branch
+      # pipelines only (see rules), so there is no pull-request mode.
       sonar-scanner \
         -Dsonar.host.url=${SONAR_HOST_URL} \
         -Dsonar.token=${SONAR_TOKEN} \
+        -Dsonar.rust.lcov.reportPaths=lcov.info \
+        -Dsonar.coverageReportPaths=coverage-sonar.xml \
+        -Dsonar.rust.clippyReport.reportPaths=clippy-report.json \
         ${SONAR_PROJECT_KEY:+-Dsonar.projectKey=$SONAR_PROJECT_KEY}
   artifacts:
     when: always
