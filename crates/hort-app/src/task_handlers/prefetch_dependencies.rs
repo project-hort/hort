@@ -28,6 +28,12 @@
 //! Depth-0 is the seed walk — typically scheduled hot-path-side as
 //! "the artifact I just ingested has a manifest; cascade".
 //!
+//! Cascade-spawned rows additionally carry `descendant_budget` — how
+//! many rows that child and its whole subtree may still enqueue. A
+//! seed row omits it and so starts at the full
+//! `PrefetchPolicy::max_descendants`; see
+//! `partition_descendant_budget` for how a node divides it.
+//!
 //! # Three-level dedup
 //!
 //! The cascade composes with the existing dedup layers:
@@ -56,7 +62,7 @@
 //! first. The cascade is a background warm; starving it under
 //! load is fine — the next pull re-derives.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -180,23 +186,87 @@ struct PrefetchDependenciesParams {
     /// the root walk.
     #[serde(default)]
     current_depth: u32,
-    /// Cumulative descendant count carried
-    /// across the cascade. Each child `prefetch-dependencies` row's
-    /// params receive `current + cohort_size_enqueued` so the cap
-    /// applies *cumulatively along the cascade branch*, not per-walk
-    /// (which the per-package `transitive_depth` already covers). The
-    /// running total rides in the task params (stateless-cascade
-    /// design — no progress store).
+    /// Legacy carry: the cumulative descendant count this branch of the
+    /// cascade had already enqueued. Superseded by
+    /// [`descendant_budget`](Self::descendant_budget) — a spent-so-far
+    /// counter is per-branch by construction, because siblings inherit
+    /// the same value and spend it independently.
     ///
-    /// `#[serde(default)]` for backward-compat with **in-flight jobs
-    /// enqueued before this field landed**. A worker booting after
-    /// the v2 upgrade may claim a `prefetch-dependencies` row whose
-    /// `params` JSONB pre-dates the field; the missing field
-    /// deserialises to `0` and the walk behaves like a root walk
-    /// (worst case: one extra cohort enqueued before the cap kicks
-    /// in — bounded by `max_descendants` of the next cascade level).
+    /// Still read so a row enqueued by the previous release resolves to
+    /// the headroom that release intended
+    /// (`max_descendants - current_descendants_so_far`, see
+    /// `PrefetchDependenciesParams::resolve_budget`), and still
+    /// written onto child rows so a worker still running the previous
+    /// release during a rolling deploy reads a value that bounds it at
+    /// least as tightly as the budget does. `#[serde(default)]` for the
+    /// rows that pre-date even this field: the missing field
+    /// deserialises to `0`, i.e. the full cap, which is a root walk.
     #[serde(default)]
     current_descendants_so_far: u32,
+    /// How many descendant rows this node and **its entire subtree**
+    /// may still enqueue, in total. The authoritative carry: the node
+    /// spends at most this many leaves itself and divides whatever is
+    /// left equally among the children it enqueues, so the sum over the
+    /// whole cascade is bounded by the root's budget
+    /// (`PrefetchPolicy::max_descendants`).
+    ///
+    /// `None` means the row was enqueued before the budget carry
+    /// existed; the handler then derives one from
+    /// `current_descendants_so_far` so the row is bounded by the old
+    /// release's intent rather than by nothing.
+    #[serde(default)]
+    descendant_budget: Option<u32>,
+}
+
+impl PrefetchDependenciesParams {
+    /// The budget this walk may spend over its whole subtree.
+    ///
+    /// Prefers the authoritative `descendant_budget` carry; falls back
+    /// to the headroom the legacy `current_descendants_so_far` counter
+    /// expressed (`max_descendants - spent`) for a row enqueued by the
+    /// previous release. Both arms saturate, so a cap an operator has
+    /// since lowered below a row's recorded spend yields `0` (enqueue
+    /// nothing) rather than wrapping to a huge budget.
+    fn resolve_budget(&self, max_descendants: u32) -> u32 {
+        self.descendant_budget
+            .unwrap_or_else(|| max_descendants.saturating_sub(self.current_descendants_so_far))
+            .min(max_descendants)
+    }
+}
+
+/// Split a cascade node's descendant budget into the cohort it may
+/// enqueue itself and the per-child budget each of those children
+/// carries.
+///
+/// `budget` is the total number of rows this node AND its subtree may
+/// enqueue; `candidates` is how many cold dependencies the node
+/// resolved. Returns `(cohort, per_child_budget)`:
+///
+/// - `cohort = min(candidates, budget)` — the node never enqueues more
+///   than its own budget, so the truncation happens before the insert.
+/// - `per_child_budget = (budget - cohort) / cohort` — the leftover
+///   divided EQUALLY among the children.
+///
+/// The bound this function exists to guarantee:
+/// `cohort + cohort * per_child_budget <= budget`. It holds because
+/// `cohort * ((budget - cohort) / cohort) <= budget - cohort` for every
+/// positive `cohort`. By induction over the cascade, the total number
+/// of rows a subtree rooted at `budget` enqueues is therefore at most
+/// `budget` — which is what makes the cap global rather than
+/// per-branch.
+///
+/// Integer division **without** spreading the remainder is deliberate:
+/// the cohort's order is the sorted dependency-name order, and handing
+/// the first `(budget - cohort) % cohort` children one extra row each
+/// would make a child's budget depend on where its name sorts. The
+/// forfeited rows are at most `cohort - 1` out of `budget`; a
+/// deterministic allocation is worth more than reclaiming them.
+fn partition_descendant_budget(budget: u32, candidates: u32) -> (u32, u32) {
+    let cohort = candidates.min(budget);
+    if cohort == 0 {
+        return (0, 0);
+    }
+    (cohort, (budget - cohort) / cohort)
 }
 
 // ---------------------------------------------------------------------------
@@ -444,9 +514,18 @@ struct WalkSummary {
     /// `true` when `current_depth + 1 > transitive_depth` — the
     /// child enqueue was skipped (the leaf prefetch still happened).
     child_walk_at_cap: bool,
+    /// `true` when the child cascade rows were skipped because the
+    /// per-child share of this node's descendant budget came out at
+    /// zero. Such a child could enqueue nothing, so the row would
+    /// resolve its artifact (retrying until the paired leaf lands),
+    /// read the manifest and enqueue nothing — cost with no reachable
+    /// outcome. Distinct from `child_walk_at_cap` (the
+    /// `transitive_depth` recursion cap) and from `cap_hit` (this
+    /// node's own cohort was truncated).
+    child_walk_at_budget: bool,
     /// `true` when the cohort was
-    /// truncated because the cumulative descendant count would have
-    /// exceeded `PrefetchPolicy::max_descendants`. Distinct from
+    /// truncated because it exceeded this node's share of
+    /// `PrefetchPolicy::max_descendants`. Distinct from
     /// `child_walk_at_cap` (which fires on the per-package
     /// `transitive_depth` cap). `hort_prefetch_amplification_total`
     /// reads this field to emit `result=cap_hit`.
@@ -471,6 +550,7 @@ impl WalkSummary {
             "child_walk_rows_enqueued":        self.child_walk_rows_enqueued,
             "child_walk_rows_deduped":         self.child_walk_rows_deduped,
             "child_walk_at_cap":               self.child_walk_at_cap,
+            "child_walk_at_budget":            self.child_walk_at_budget,
             "cap_hit":                         self.cap_hit,
         })
     }
@@ -613,13 +693,14 @@ impl TaskHandler for PrefetchDependenciesHandler {
             };
 
             // ----- Step 6: walk + enqueue cohort ----------------------
+            let descendant_budget = parsed.resolve_budget(repo.prefetch_policy.max_descendants);
             let summary = self
                 .plan_and_enqueue(
                     &repo,
                     &handler,
                     &specs,
                     parsed.current_depth,
-                    parsed.current_descendants_so_far,
+                    descendant_budget,
                 )
                 .await?;
 
@@ -628,7 +709,7 @@ impl TaskHandler for PrefetchDependenciesHandler {
                 repository = %repo.key,
                 current_depth = parsed.current_depth,
                 transitive_depth = repo.prefetch_policy.transitive_depth,
-                current_descendants_so_far = parsed.current_descendants_so_far,
+                descendant_budget,
                 max_descendants = repo.prefetch_policy.max_descendants,
                 deps_extracted = summary.deps_extracted,
                 deps_already_held = summary.deps_already_held,
@@ -638,6 +719,7 @@ impl TaskHandler for PrefetchDependenciesHandler {
                 child_walk_rows_enqueued = summary.child_walk_rows_enqueued,
                 child_walk_rows_deduped = summary.child_walk_rows_deduped,
                 child_walk_at_cap = summary.child_walk_at_cap,
+                child_walk_at_budget = summary.child_walk_at_budget,
                 cap_hit = summary.cap_hit,
                 "prefetch-dependencies walk complete",
             );
@@ -690,7 +772,7 @@ impl PrefetchDependenciesHandler {
     ///
     /// `PullDedup` (L1) absorbs concurrent `fetch_metadata`
     /// calls across handlers; the per-cohort dedup inside
-    /// `plan_and_enqueue` (a `HashMap<package, …>`) absorbs
+    /// `plan_and_enqueue` (a `BTreeMap<package, …>`) absorbs
     /// duplicates *within* the cohort.
     async fn plan_and_enqueue(
         &self,
@@ -698,7 +780,7 @@ impl PrefetchDependenciesHandler {
         handler: &Arc<dyn FormatHandler>,
         specs: &[DependencySpec],
         current_depth: u32,
-        current_descendants_so_far: u32,
+        descendant_budget: u32,
     ) -> DomainResult<WalkSummary> {
         let policy = &repo.prefetch_policy;
         let mut summary = WalkSummary {
@@ -736,27 +818,22 @@ impl PrefetchDependenciesHandler {
         let enqueue_child_walk = next_depth <= policy.transitive_depth;
         summary.child_walk_at_cap = !enqueue_child_walk;
 
-        // Cumulative descendants cap.
+        // Global descendants cap, as a partitioned budget.
         //
-        // `remaining` is the headroom this branch of the cascade still
-        // has under `PrefetchPolicy.max_descendants`. The cap is
-        // CUMULATIVE across the cascade — each child task carries
-        // `current + cohort_size_enqueued` in its params (see the
-        // child-row enqueue below) so the running total rides in the
-        // task params rather than a progress store. The truncation
-        // applies BEFORE we enqueue (truncating after means a single
-        // huge cohort can blow the cap by N rows before we notice).
+        // `descendant_budget` is the number of rows THIS NODE AND ITS
+        // WHOLE SUBTREE may still enqueue. The node spends at most that
+        // many leaves itself (truncating BEFORE the insert — truncating
+        // after means a single huge cohort blows the cap by N rows
+        // before we notice) and then divides the leftover equally among
+        // the children it enqueues, so sibling branches cannot each
+        // spend the full cap. See `partition_descendant_budget` for the
+        // arithmetic and the bound it guarantees.
         //
-        // `remaining == 0` collapses transitive enqueue entirely — a
-        // deliberate operator knob (`max_descendants: 0`) AND the
-        // terminal state at the cascade leaf (every parent has
-        // already added `max_descendants` rows below it). The leaf
-        // prefetch rows are bounded by this same headroom; once it
-        // reaches 0 we enqueue nothing.
-        let remaining = policy
-            .max_descendants
-            .saturating_sub(current_descendants_so_far);
-
+        // A budget of 0 collapses transitive enqueue entirely — the
+        // deliberate operator knob (`max_descendants: 0`) and also the
+        // terminal state once an ancestor's budget has been fully
+        // divided out. The leaf prefetch rows are bounded by this same
+        // budget; at 0 we enqueue nothing.
         let format_key = repo.format.to_string();
 
         // ----- Pass 1: held-set resolution --------------------------
@@ -768,11 +845,19 @@ impl PrefetchDependenciesHandler {
         // Cold cohort is bucketed by normalised package name so a
         // second spec for the same package (e.g. `lodash@^4` and
         // `lodash@>=4.17`) coalesces to one upstream fetch.
+        //
+        // `BTreeMap`, not `HashMap`: the cohort is truncated to this
+        // node's budget, so iteration order decides WHICH dependencies
+        // get warmed and which get dropped. Under a hash order that
+        // answer differs between runs of the same cascade, which makes
+        // the warmed subtree — and any test over it — irreproducible.
+        // Sorted-by-normalised-name is the one order every replica
+        // agrees on.
         struct ColdSpec<'a> {
             normalised: String,
             range: &'a str,
         }
-        let mut cold_by_package: HashMap<String, Vec<ColdSpec<'_>>> = HashMap::new();
+        let mut cold_by_package: BTreeMap<String, Vec<ColdSpec<'_>>> = BTreeMap::new();
         for spec in specs {
             let normalised = handler.normalize_name(&spec.name);
             let held = match self
@@ -1006,10 +1091,10 @@ impl PrefetchDependenciesHandler {
                         // rows sharing the same `target_key` do NOT
                         // collide across kinds.
                         //
-                        // `current_descendants_so_far`
-                        // on the child row is filled in below at
-                        // enqueue time, once we know how many rows the
-                        // post-cap-truncation cohort actually contains.
+                        // `descendant_budget` on the child row is filled
+                        // in below at enqueue time: its divisor is the
+                        // post-truncation cohort size, which is not
+                        // known until the whole cohort is built.
                         child_rows.push(PrefetchEnqueueRow {
                             kind: KIND_PREFETCH_DEPENDENCIES.to_string(),
                             params: json!({
@@ -1027,50 +1112,65 @@ impl PrefetchDependenciesHandler {
             }
         }
 
-        // ----- Apply the cumulative descendants cap -----
+        // ----- Spend and divide this node's descendant budget -----
         //
-        // Truncate the candidate cohort BEFORE the batched INSERTs.
-        // The parent task params carry `current_descendants_so_far`;
-        // this branch of the cascade has `remaining` headroom under
-        // `max_descendants`. If the cohort exceeds it, drop the tail
-        // and flag `cap_hit` for the amplification metric. The
-        // child cascade rows are truncated in lockstep with their
-        // paired prefetch leaves (they are produced one-to-one above).
+        // Truncate the candidate cohort BEFORE the batched INSERTs, to
+        // whatever this node's budget allows, then divide the leftover
+        // equally among the children. The child cascade rows are
+        // truncated in lockstep with their paired prefetch leaves (they
+        // are produced one-to-one above).
         let attempted_prefetch = prefetch_rows.len() as u64;
-        if attempted_prefetch > remaining as u64 {
+        let candidates = u32::try_from(prefetch_rows.len()).unwrap_or(u32::MAX);
+        let (cohort, per_child_budget) = partition_descendant_budget(descendant_budget, candidates);
+        if attempted_prefetch > u64::from(cohort) {
             tracing::warn!(
                 repository = %repo.key,
                 format = %format_key,
                 cap = policy.max_descendants,
-                current_descendants = current_descendants_so_far,
+                descendant_budget,
                 attempted_to_enqueue = attempted_prefetch,
-                "prefetch-dependencies cascade truncated by max_descendants cap",
+                "prefetch-dependencies cascade truncated by max_descendants budget",
             );
             summary.cap_hit = true;
-            prefetch_rows.truncate(remaining as usize);
+            prefetch_rows.truncate(cohort as usize);
             // Pair-truncate the child cohort: child rows are produced
             // 1:1 with prefetch leaves only when `enqueue_child_walk`
             // is true, so when we cap leaves at K the matching K child
             // entries are the prefix.
-            if child_rows.len() > remaining as usize {
-                child_rows.truncate(remaining as usize);
+            if child_rows.len() > cohort as usize {
+                child_rows.truncate(cohort as usize);
             }
         }
 
-        // Stamp the cumulative running total onto
-        // each child task's params *after* truncation. The new total
-        // is `current_descendants_so_far + cohort_size_enqueued`
-        // (i.e. the descendants this branch has added BY the time
-        // the child task starts). Each child re-applies the cap
-        // against this new total, preserving the per-branch cap
-        // discipline across the cascade.
-        let cohort_size_enqueued = prefetch_rows.len() as u32;
-        let next_cumulative = current_descendants_so_far.saturating_add(cohort_size_enqueued);
+        // A child holding a zero budget can enqueue nothing, so the row
+        // is cost with no reachable outcome: it would resolve its
+        // artifact (retrying until the paired leaf ingests), read the
+        // manifest and enqueue zero rows. Drop the whole child cohort
+        // instead of enqueueing work that cannot act.
+        if per_child_budget == 0 && !child_rows.is_empty() {
+            summary.child_walk_at_budget = true;
+            child_rows.clear();
+        }
+
+        // Stamp the per-child budget onto each surviving child row
+        // *after* truncation, so the divisor is the cohort that was
+        // actually enqueued.
+        //
+        // `current_descendants_so_far` rides alongside it purely for a
+        // rolling deploy: a worker still running the previous release
+        // reads only that field, and `max_descendants - per_child` is
+        // the value under which it bounds itself at least as tightly as
+        // the budget does. The budget field is the authoritative one.
+        let legacy_spent = policy.max_descendants.saturating_sub(per_child_budget);
         for row in &mut child_rows {
             if let Some(obj) = row.params.as_object_mut() {
                 obj.insert(
+                    "descendant_budget".to_string(),
+                    serde_json::Value::from(per_child_budget),
+                );
+                obj.insert(
                     "current_descendants_so_far".to_string(),
-                    serde_json::Value::from(next_cumulative),
+                    serde_json::Value::from(legacy_spent),
                 );
             }
         }
@@ -1854,6 +1954,21 @@ mod tests {
         repo_id: Uuid,
         bytes: Vec<u8>,
     ) -> Artifact {
+        seed_named_artifact_with_bytes(artifacts, storage, repo_id, "root", "1.0.0", bytes).await
+    }
+
+    /// `seed_artifact_with_bytes` with the coordinate spelled out — what
+    /// a multi-level cascade test needs, because a cascade child row
+    /// re-resolves its artifact by `(repository_id, package, version)`
+    /// rather than by id.
+    async fn seed_named_artifact_with_bytes(
+        artifacts: &Arc<MockArtifactRepository>,
+        storage: &Arc<MockStoragePort>,
+        repo_id: Uuid,
+        name: &str,
+        version: &str,
+        bytes: Vec<u8>,
+    ) -> Artifact {
         let put = storage
             .put(Box::new(std::io::Cursor::new(bytes)))
             .await
@@ -1862,10 +1977,10 @@ mod tests {
         let artifact = Artifact {
             id: Uuid::new_v4(),
             repository_id: repo_id,
-            name: "root".into(),
-            name_as_published: "root".into(),
-            version: Some("1.0.0".into()),
-            path: "root-1.0.0.tgz".into(),
+            name: name.into(),
+            name_as_published: name.into(),
+            version: Some(version.into()),
+            path: format!("{name}-{version}.tgz"),
             size_bytes: put.size_bytes as i64,
             sha256_checksum: put.hash,
             sha1_checksum: None,
@@ -3295,8 +3410,8 @@ mod tests {
             "cap NOT hit when cohort fits under max_descendants",
         );
 
-        // Child rows must carry `current_descendants_so_far = 3` (the
-        // cumulative running total after this branch enqueues 3 deps).
+        // Budget 10, cohort 3 → leftover 7, divided three ways = 2 each.
+        // `3 + 3*2 = 9 <= 10`: the whole subtree stays inside the cap.
         let batches = jobs.prefetch_batch_calls();
         let child_batch = batches
             .iter()
@@ -3304,12 +3419,21 @@ mod tests {
             .expect("child batch present");
         assert_eq!(child_batch.len(), 3);
         for row in child_batch {
-            let cur = row
+            let budget = row
+                .params
+                .get("descendant_budget")
+                .and_then(serde_json::Value::as_u64)
+                .expect("descendant_budget must be stamped on child params");
+            assert_eq!(budget, 2, "child carries its equal share of the leftover");
+            // The legacy counter rides along so a worker still running
+            // the previous release during a rolling deploy reads a value
+            // that bounds it at least as tightly.
+            let legacy = row
                 .params
                 .get("current_descendants_so_far")
                 .and_then(serde_json::Value::as_u64)
-                .expect("current_descendants_so_far must be stamped on child params");
-            assert_eq!(cur, 3, "child carries current + cohort_size_enqueued");
+                .expect("legacy carry must still be stamped");
+            assert_eq!(legacy, 8, "max_descendants(10) - per_child_budget(2)");
         }
     }
 
@@ -3374,12 +3498,18 @@ mod tests {
             "cohort truncated to cap (2 of 5)",
         );
         assert_eq!(
-            result_summary["child_walk_rows_enqueued"], 2,
-            "child rows truncated in lockstep with prefetch leaves",
+            result_summary["child_walk_rows_enqueued"], 0,
+            "budget 2 spent entirely on leaves leaves a zero per-child \
+             share, so the child rows are dropped rather than enqueued \
+             to do nothing",
+        );
+        assert_eq!(
+            result_summary["child_walk_at_budget"], true,
+            "the dropped child cohort is reported",
         );
         assert_eq!(
             result_summary["cap_hit"], true,
-            "cap_hit must be true when cohort exceeds remaining",
+            "cap_hit must be true when the cohort exceeds this node's budget",
         );
 
         // Truncation happens BEFORE the batch INSERT — the jobs port
@@ -3397,25 +3527,15 @@ mod tests {
             "leaf cohort truncated before INSERT, not after — only 2 rows reached the port",
         );
 
-        // Child rows must carry `current_descendants_so_far = 2` (the
-        // post-truncation cohort size). The cumulative count rides in
-        // the params so the next cascade level sees its own
-        // remaining = max_descendants - 2 = 0 and enqueues nothing.
-        let child_batch = batches
-            .iter()
-            .find(|b| b.iter().all(|r| r.kind == "prefetch-dependencies"))
-            .expect("child batch present");
-        for row in child_batch {
-            let cur = row
-                .params
-                .get("current_descendants_so_far")
-                .and_then(serde_json::Value::as_u64)
-                .expect("current_descendants_so_far must be stamped on child params");
-            assert_eq!(
-                cur, 2,
-                "child carries truncated cohort size, not pre-truncation count",
-            );
-        }
+        // No child batch reached the port at all: the budget was fully
+        // spent on this node's own leaves.
+        assert!(
+            !batches
+                .iter()
+                .any(|b| b.iter().any(|r| r.kind == "prefetch-dependencies")),
+            "a child with a zero budget can enqueue nothing, so no child \
+             row is written; got: {batches:?}",
+        );
     }
 
     /// `max_descendants = 0` collapses the transitive cascade to
@@ -3481,6 +3601,197 @@ mod tests {
         assert!(
             batches.is_empty(),
             "cap=0 short-circuits BEFORE any batch INSERT; got: {batches:?}",
+        );
+    }
+
+    /// `max_descendants` is a GLOBAL cap: the total number of rows one
+    /// cascade enqueues across EVERY branch is bounded by it, not the
+    /// sum along one root-to-leaf path.
+    ///
+    /// The graph: `root` declares `a`, `b`, `c`; each of those declares
+    /// two further distinct deps. Budget 6.
+    ///
+    /// - Root: cohort 3, leftover 3, per-child share 1.
+    /// - Each child: budget 1 against 2 candidates → 1 leaf, truncated,
+    ///   zero leftover so no grandchildren.
+    /// - Total leaves: `3 + 1 + 1 + 1 = 6` — exactly the budget.
+    ///
+    /// Carrying a spent-so-far counter instead gives each child
+    /// `max_descendants - 3 = 3` of headroom *independently*, so all
+    /// three spend their 2 candidates and the cascade enqueues 9 against
+    /// a documented cap of 6. That is what this test reports before the
+    /// change.
+    #[tokio::test]
+    async fn budget_holds_across_siblings_in_a_branched_graph() {
+        const BUDGET: u32 = 6;
+        let repo = make_repo_with_max_descendants(RepositoryFormat::Npm, 5, BUDGET);
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.insert(repo.clone());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let jobs = Arc::new(MockJobsRepository::new());
+
+        // Grandchild names, two per first-level branch, all distinct so
+        // the L3 dedup never collapses two branches into one row.
+        let branches: [(&str, [&str; 2]); 3] = [
+            ("a", ["a1", "a2"]),
+            ("b", ["b1", "b2"]),
+            ("c", ["c1", "c2"]),
+        ];
+
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        for (branch, grandchildren) in &branches {
+            seed_npm_packument(&proxy, branch, &["1.0.0"]);
+            for g in grandchildren {
+                seed_npm_packument(&proxy, g, &["1.0.0"]);
+            }
+        }
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        seed_catchall_mapping(&mappings, repo.id).await;
+
+        // Only the root is held at this point: a dep Hort already holds
+        // is absorbed by Pass 1 and never reaches the cohort, so the
+        // first-level artifacts must land only AFTER the root walk —
+        // which is also the real ordering (the paired leaf ingests
+        // first, then the child row resolves it).
+        let root_bytes = npm_package_json_with_deps(&[("a", "^1"), ("b", "^1"), ("c", "^1")], &[]);
+        let root = seed_artifact_with_bytes(&artifacts, &storage, repo.id, root_bytes).await;
+
+        let handler = make_handler(
+            repos,
+            artifacts.clone(),
+            storage.clone(),
+            jobs.clone(),
+            proxy,
+            mappings,
+            handlers_npm(),
+        );
+
+        let outcome = handler
+            .run(
+                &json!({"artifact_id": root.id, "current_depth": 0}),
+                make_context(),
+            )
+            .await
+            .expect("Ok");
+        let TaskOutcome::Completed { result_summary } = outcome else {
+            panic!("expected Completed, got {outcome:?}");
+        };
+        assert_eq!(result_summary["prefetch_rows_enqueued"], 3);
+        assert_eq!(result_summary["child_walk_rows_enqueued"], 3);
+
+        // The leaves landed; now run each child row the root enqueued.
+        for (branch, grandchildren) in &branches {
+            let deps: Vec<(&str, &str)> = grandchildren.iter().map(|g| (*g, "^1")).collect();
+            seed_named_artifact_with_bytes(
+                &artifacts,
+                &storage,
+                repo.id,
+                branch,
+                "1.0.0",
+                npm_package_json_with_deps(&deps, &[]),
+            )
+            .await;
+        }
+        let child_params: Vec<serde_json::Value> = jobs
+            .prefetch_batch_calls()
+            .into_iter()
+            .flatten()
+            .filter(|r| r.kind == "prefetch-dependencies")
+            .map(|r| r.params)
+            .collect();
+        assert_eq!(child_params.len(), 3, "one child row per first-level dep");
+        for params in child_params {
+            let outcome = handler.run(&params, make_context()).await.expect("Ok");
+            assert!(
+                matches!(outcome, TaskOutcome::Completed { .. }),
+                "child walk completed, got {outcome:?}",
+            );
+        }
+
+        // The whole cascade's leaf rows, counted across every batch the
+        // port saw. THIS is the assertion the per-branch carry fails.
+        let leaf_rows: usize = jobs
+            .prefetch_batch_calls()
+            .into_iter()
+            .flatten()
+            .filter(|r| r.kind == "prefetch")
+            .count();
+        assert_eq!(
+            leaf_rows, BUDGET as usize,
+            "the cascade's TOTAL leaf count must be bounded by \
+             max_descendants, summed across siblings and not along one \
+             root-to-leaf path",
+        );
+    }
+
+    /// A row enqueued by the previous release carries only the legacy
+    /// spent-so-far counter. It must resolve to the headroom that
+    /// release intended rather than to no bound at all.
+    #[test]
+    fn legacy_spent_counter_resolves_to_the_remaining_headroom() {
+        let legacy: PrefetchDependenciesParams =
+            serde_json::from_value(json!({"artifact_id": Uuid::nil(), "current_depth": 2,
+                                          "current_descendants_so_far": 150}))
+            .expect("legacy params parse");
+        assert_eq!(legacy.resolve_budget(200), 50);
+
+        // An operator who lowered the cap below a row's recorded spend
+        // gets zero, never a wrapped-around budget.
+        assert_eq!(legacy.resolve_budget(100), 0);
+
+        // The authoritative carry wins when both are present, and is
+        // itself clamped to the live cap.
+        let both: PrefetchDependenciesParams = serde_json::from_value(
+            json!({"artifact_id": Uuid::nil(), "current_descendants_so_far": 150,
+                   "descendant_budget": 40}),
+        )
+        .expect("params parse");
+        assert_eq!(both.resolve_budget(200), 40);
+        assert_eq!(both.resolve_budget(10), 10);
+
+        // A seed row carries neither and starts at the full cap.
+        let seed: PrefetchDependenciesParams =
+            serde_json::from_value(json!({"artifact_id": Uuid::nil()})).expect("seed params parse");
+        assert_eq!(seed.resolve_budget(200), 200);
+    }
+
+    /// The arithmetic the global bound rests on:
+    /// `cohort + cohort * per_child <= budget`, for every budget and
+    /// candidate count. A partition that violated it would let one
+    /// cascade level hand out more than it holds.
+    #[test]
+    fn partition_descendant_budget_never_hands_out_more_than_it_holds() {
+        for budget in 0u32..=64 {
+            for candidates in 0u32..=64 {
+                let (cohort, per_child) = partition_descendant_budget(budget, candidates);
+                assert!(cohort <= candidates, "cohort never exceeds candidates");
+                assert!(cohort <= budget, "cohort never exceeds the budget");
+                let committed = u64::from(cohort) + u64::from(cohort) * u64::from(per_child);
+                assert!(
+                    committed <= u64::from(budget),
+                    "budget {budget} with {candidates} candidates committed \
+                     {committed} (cohort {cohort}, per-child {per_child})",
+                );
+            }
+        }
+        // Spot-check the shape the cascade actually depends on.
+        assert_eq!(partition_descendant_budget(200, 3), (3, 65));
+        assert_eq!(partition_descendant_budget(6, 3), (3, 1));
+        assert_eq!(
+            partition_descendant_budget(2, 5),
+            (2, 0),
+            "a budget fully spent on leaves leaves nothing for children",
+        );
+        assert_eq!(
+            partition_descendant_budget(0, 5),
+            (0, 0),
+            "max_descendants = 0 collapses the cascade",
+        );
+        assert_eq!(
+            partition_descendant_budget(50, 0),
+            (0, 0),
+            "no candidates spends nothing",
         );
     }
 

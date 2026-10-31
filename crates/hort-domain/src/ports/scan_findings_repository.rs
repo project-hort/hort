@@ -46,6 +46,16 @@ pub struct ScanFindingsRow {
     /// findings. A Finding reconstructed from `scan_findings` reads the class
     /// back rather than defaulting to `None`.
     pub informational_class: Option<String>,
+    /// Mirrors [`crate::types::Finding::advisory_published_at`] — when the
+    /// advisory this finding names was published upstream, or `None` when
+    /// the producing backend carried no date. The projection retains it so
+    /// the retention evaluator's finding-age anchor can ask *how long has
+    /// this vulnerability been known* from stored rows; nothing about the
+    /// artifact's own scan history answers that. Rows written before the
+    /// column existed read back as `None` and fall to the anchor's own
+    /// first-observation rung, which is a strictly later and therefore
+    /// non-deleting reading.
+    pub advisory_published_at: Option<DateTime<Utc>>,
 }
 
 /// Outbound port for the `scan_findings` projection.
@@ -56,10 +66,11 @@ pub struct ScanFindingsRow {
 /// vulnerability lookup) ride a separate read-model port, not this
 /// one.
 ///
-/// The default `insert_batch` returns `Ok(())` so test mocks that
-/// don't exercise the projection write inherit a no-op without
-/// having to fabricate an empty impl manually. Production adapters
-/// override.
+/// `insert_batch` has **no default body** — an impl that does not write
+/// the rows has to say so in its own code. A projection write that
+/// silently did nothing would leave a `ScanCompleted` event with no
+/// findings behind it, which every reader of the projection reads as a
+/// clean scan.
 pub trait ScanFindingsRepository: Send + Sync {
     /// Insert a batch of scan findings.
     ///
@@ -102,6 +113,7 @@ mod tests {
             detected_at: DateTime::<Utc>::from_timestamp(0, 0).expect("ts"),
             fixed_versions: vec!["1.2.3".into()],
             informational_class: None,
+            advisory_published_at: None,
         };
         let cloned = r.clone();
         assert_eq!(r, cloned);
@@ -143,6 +155,7 @@ mod tests {
             detected_at: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
             fixed_versions: vec![],
             informational_class: None,
+            advisory_published_at: None,
         };
         repo.insert_batch(std::slice::from_ref(&row)).await.unwrap();
     }

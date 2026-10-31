@@ -10,8 +10,13 @@
 //! `scan_findings` carries `fixed_versions` from migration 029, so the
 //! retention evaluator can observe fix availability on rescanned
 //! findings. Rows written before migration 029 read as an empty array
-//! until rescan. `references` and `aliases` remain in the per-finding
-//! CAS blob (`ScanCompleted.findings_blob`) and are empty here.
+//! until rescan. It carries `advisory_published_at` from migration 034,
+//! the same way: nullable, not backfilled (nothing in this schema can
+//! derive an advisory's publication date), so a pre-034 row reads back
+//! `None` and the finding-age anchor falls to its own
+//! first-observation rung. `references` and `aliases` remain in the
+//! per-finding CAS blob (`ScanCompleted.findings_blob`) and are empty
+//! here.
 //!
 //! ## The read answers about the artifact's LAST scan
 //!
@@ -41,6 +46,26 @@
 //! `crates/hort-app/src/use_cases/retention_use_case.rs`), and is
 //! unchanged: scoping the findings to the last scan says nothing about how
 //! old that scan is.
+//!
+//! ## `first_observed_at` reads ACROSS scans, and why that is not the
+//! same defect
+//!
+//! The second findings read here is the one exception, declared at the
+//! statement with `-- HISTORY-WIDE:`. Its question is *when did we first
+//! see this named vulnerability*, and the last-scan anchor cannot narrow
+//! that question — it destroys it, because every row of one scan carries
+//! that scan's `detected_at`, so a last-scan-scoped `MIN(detected_at)`
+//! answers "when was the last scan". That is exactly the defect the
+//! retention finding-age anchor exists to fix.
+//!
+//! What keeps it safe is the **keying**, not the scope: the caller passes
+//! the vulnerability ids of the artifact's last scan, so a vulnerability
+//! a later scan no longer reports is never asked about and its history in
+//! the table reaches no retention decision. The reads an unscoped span
+//! does corrupt are the ones that *count and rank* (`finding_count`,
+//! `max_severity`, and the orderings over them); this one counts nothing.
+//! `hort-app/tests/findings_reads_are_last_scan_scoped.rs` holds that
+//! line.
 
 use std::str::FromStr;
 
@@ -51,7 +76,7 @@ use uuid::Uuid;
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::repo_security_score_repository::RepoSecurityScore;
-use hort_domain::ports::retention_scan_reader::RetentionScanReader;
+use hort_domain::ports::retention_scan_reader::{FirstObservations, RetentionScanReader};
 use hort_domain::types::{ComponentRelation, Finding, FindingStatement, SeverityBasis};
 
 use crate::BoxFuture;
@@ -79,6 +104,7 @@ struct FindingRow {
     title: String,
     fixed_versions: Vec<String>,
     informational_class: Option<String>,
+    advisory_published_at: Option<DateTime<Utc>>,
 }
 
 impl FindingRow {
@@ -135,6 +161,13 @@ impl FindingRow {
             // only consumer of this port and takes no release decision,
             // so the reading costs nothing beyond what it says.
             statement: FindingStatement::Unstated,
+            // Read from the persisted column (migration 034) rather than
+            // defaulted, because it is the only source that dates the
+            // vulnerability rather than our own scanning of it, and the
+            // retention evaluator anchors `HasFindingDetectedFor` on it.
+            // A row written before that column existed reads back `None`
+            // and falls to the anchor's first-observation rung.
+            advisory_published_at: self.advisory_published_at,
         })
     }
 }
@@ -178,6 +211,17 @@ impl ScoreRow {
     }
 }
 
+/// sqlx row shape for the first-observation read. `MIN` over a grouped
+/// set is non-NULL whenever the group exists, but sqlx types an aggregate
+/// as nullable; the mapping drops a `None` rather than substituting a
+/// date, because "never observed" and "observed at the epoch" are
+/// opposite answers to the anchor resolver.
+#[derive(sqlx::FromRow)]
+struct FirstObservedRow {
+    vulnerability_id: String,
+    first_detected_at: Option<DateTime<Utc>>,
+}
+
 impl RetentionScanReader for PgRetentionScanReader {
     fn list_findings_for_artifact(
         &self,
@@ -188,7 +232,7 @@ impl RetentionScanReader for PgRetentionScanReader {
                 r#"
                 SELECT sf.purl, sf.vulnerability_id, sf.severity, sf.cvss_score,
                        sf.source_scanner, sf.title, sf.fixed_versions,
-                       sf.informational_class
+                       sf.informational_class, sf.advisory_published_at
                 FROM scan_findings sf
                 -- DELETED-INCLUSIVE: the artifact is already named by $1
                 -- and this join only reaches `a.last_scan_at` as the scan
@@ -244,6 +288,63 @@ impl RetentionScanReader for PgRetentionScanReader {
             Ok(row.map(ScoreRow::into_domain))
         })
     }
+
+    fn first_observed_at<'a>(
+        &'a self,
+        artifact_id: Uuid,
+        vulnerability_ids: &'a [String],
+    ) -> BoxFuture<'a, DomainResult<FirstObservations>> {
+        Box::pin(async move {
+            // No ids to ask about → no query. An unbounded `= ANY('{}')`
+            // would scan the artifact's whole findings history to return
+            // nothing.
+            if vulnerability_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let keys: Vec<String> = vulnerability_ids
+                .iter()
+                .map(|id| id.to_ascii_lowercase())
+                .collect();
+            let rows = sqlx::query_as::<_, FirstObservedRow>(
+                r#"
+                SELECT lower(sf.vulnerability_id) AS vulnerability_id,
+                       MIN(sf.detected_at)        AS first_detected_at
+                -- HISTORY-WIDE: this read DATES a named vulnerability and
+                -- counts nothing, so the last-scan anchor every other
+                -- `scan_findings` reader carries would not merely narrow
+                -- it — it would destroy it. Every row of one scan shares
+                -- that scan's `detected_at`, so a last-scan-scoped MIN
+                -- answers "when was the last scan", which is the defect
+                -- this read exists to fix. The whole-history scope is
+                -- bounded by the ids in $2, which the caller takes from
+                -- the artifact's LAST scan: a vulnerability a later scan
+                -- no longer reports is never asked about, so its history
+                -- cannot reach a retention decision. The counting and
+                -- ranking reads (`finding_count`, `max_severity`, and the
+                -- orderings over them) are the ones an unscoped read
+                -- inflates, and this is not one of them.
+                FROM scan_findings sf
+                WHERE sf.artifact_id = $1
+                  -- Case-insensitive, matching the cross-backend finding
+                  -- merge's vulnerability identity: one feed spelling
+                  -- `ghsa-…` and another `GHSA-…` are one vulnerability,
+                  -- and an earlier observation under the other spelling
+                  -- is still an observation.
+                  AND lower(sf.vulnerability_id) = ANY($2)
+                GROUP BY lower(sf.vulnerability_id)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(&keys)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Invariant(format!("scan_findings first_observed_at: {e}")))?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|r| r.first_detected_at.map(|at| (r.vulnerability_id, at)))
+                .collect())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -276,6 +377,7 @@ mod tests {
             title: "t".into(),
             fixed_versions: vec!["1.2.3".into()],
             informational_class: None,
+            advisory_published_at: None,
         };
         let f = r.into_domain().unwrap();
         assert_eq!(f.severity, SeverityThreshold::High);
@@ -301,6 +403,7 @@ mod tests {
             title: "unmaintained".into(),
             fixed_versions: vec![],
             informational_class: Some("unmaintained".to_string()),
+            advisory_published_at: None,
         };
         let f = r.into_domain().unwrap();
         assert_eq!(f.informational_class.as_deref(), Some("unmaintained"));
@@ -318,6 +421,7 @@ mod tests {
             title: "t".into(),
             fixed_versions: vec![],
             informational_class: None,
+            advisory_published_at: None,
         };
         let err = r.into_domain().unwrap_err();
         assert!(matches!(err, DomainError::Invariant(_)));

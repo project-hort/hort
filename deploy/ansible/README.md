@@ -377,6 +377,18 @@ wait for the destructive-op approval workflow (GitLab issue #2; ADR 0038
 follow-on). This is the intended posture: there is zero standing destructive
 privilege.
 
+**The authority is re-checked when the job runs, not only when it is
+accepted.** `admin task invoke` enqueues a row; before the worker calls the
+handler it re-reads the live authority of the identity the row was enqueued
+under. Revoking that identity — demoting it, deactivating it, or removing its
+`admin_task_invoke` grant — therefore also stops the destructive jobs it has
+already queued: the handler is never entered, nothing is deleted or archived,
+and the row becomes a terminal `failed` job whose `last_error` begins
+`destructive task refused at execution`. Check with `hort-cli admin task get
+<job-id>`. Note the corollary: because the `task:destructive` claim resolves
+from the IdP at login and is not persisted, only an **admin** requester's
+destructive authority survives the wait.
+
 ## Role summary
 
 | Role | Task | Purpose |

@@ -2,9 +2,13 @@
 //!
 //! NIS2 Art. 21(2)(f) efficacy metric.
 //!
-//! Emitted by [`OsvAdvisoryAdapter::pull_diff_since`] once per successful
-//! per-ecosystem ingest, counting the number of advisory entries ingested in
-//! that tick.  The `category` label maps each OSV ecosystem to a bounded fixed
+//! Emitted by [`OsvAdvisoryAdapter::pull_diff_since`] once per per-ecosystem
+//! ingest that did not error, counting the number of advisory entries ingested
+//! in that tick.  An ingest whose archive walk left members unread
+//! (`hort_advisory_diff_processed_total{result="incomplete"}`) still counts
+//! what it did ingest: those are real advisories, and the undercount against
+//! the expected floor is itself the efficacy signal this metric exists to
+//! give.  The `category` label maps each OSV ecosystem to a bounded fixed
 //! set so the metric has predictable cardinality (≤ 12 series total).
 //!
 //! **Alert spec:** operators SHOULD alert when

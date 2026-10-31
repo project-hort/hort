@@ -756,13 +756,34 @@ impl ProvenanceCascade {
     /// index bytes regardless) but no blobs — `warn!` + continue.
     /// Deduplicated (a blob shared across children appears once),
     /// order-preserving.
+    ///
+    /// A child descriptor that names **no addressable content** — no `digest`,
+    /// an algorithm outside the CAS keyspace, malformed hex — is skipped and
+    /// reported. It cannot be a constituent: there is no hash to cascade a
+    /// clearance to. The skip is in the safe direction by construction, which
+    /// is why it is a skip and not a refusal: this walk only ever *grants*
+    /// clearance, so omitting a child withholds clearance rather than
+    /// extending it, and nothing is cleared on the strength of what was
+    /// skipped. Refusing instead would propagate out of here and stop the
+    /// cascade reaching the index's other children — holding a correctly
+    /// signed multi-arch image in quarantine over one platform descriptor
+    /// hort cannot address, including on indexes already in the catalog.
     pub(crate) async fn constituent_digests(
         &self,
         subject_bytes: &[u8],
     ) -> AppResult<Vec<ContentHash>> {
         let mut out: Vec<ContentHash> = Vec::new();
         if hort_domain::oci::is_image_index(subject_bytes) {
-            for child in hort_domain::oci::index_child_digests(subject_bytes)? {
+            let declared = hort_domain::oci::index_child_descriptors(subject_bytes)?;
+            let children = declared.into_resolvable(|fault| {
+                tracing::warn!(
+                    child = %fault,
+                    "provenance cascade: an index child declares no addressable content — \
+                     it is not a constituent and nothing under it is cleared",
+                );
+            });
+            for descriptor in children {
+                let child = descriptor.hash;
                 out.push(child.clone());
                 let child_bytes = match self.read_bounded(&child).await {
                     Ok(b) => b,

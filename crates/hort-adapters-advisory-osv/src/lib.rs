@@ -21,6 +21,7 @@
 
 mod bulk;
 mod cache;
+mod capped;
 mod ecosystem;
 mod extra_ca;
 mod hydrate;
@@ -46,8 +47,8 @@ use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::advisory::{AdvisoryDiffResult, AdvisoryPort};
 use hort_domain::ports::ephemeral_store::EphemeralStore;
 use hort_domain::types::{
-    collapse_alias_groups, is_informational_class, ComponentRelation, Ecosystem, Finding,
-    FindingStatement, SbomComponent, SeverityBasis,
+    collapse_alias_groups, is_informational_class, parse_advisory_published_at, ComponentRelation,
+    Ecosystem, Finding, FindingStatement, SbomComponent, SeverityBasis,
 };
 
 use crate::bulk::{osv_label_to_ecosystem, pull_one_ecosystem, BulkFetchErrorKind};
@@ -122,6 +123,41 @@ impl Default for OsvAdvisoryConfig {
 
 const DEFAULT_BATCH_SIZE: usize = 100;
 
+/// Per-query byte budget for a `/v1/querybatch` response.
+///
+/// The cap applied to one batch is this times the number of queries that
+/// batch actually sent, so it tracks what was asked rather than assuming
+/// the default `batch_size`: an operator who raises `batch_size` gets
+/// proportionally more headroom, and one who lowers it gets a tighter
+/// bound, with no second knob to keep in step.
+///
+/// 128 KiB per query. A `querybatch` result entry is a list of
+/// `{"id","modified"}` pairs at roughly 70 bytes each, so this admits on
+/// the order of 1,800 advisories for a single component — orders of
+/// magnitude past any real package, and still a bound. Exceeding it
+/// fails the batch rather than truncating it: `results[i]` corresponds
+/// to `queries[i]`, and a body cut mid-array is not a shorter answer but
+/// an unattributable one.
+const OSV_BATCH_RESPONSE_BYTES_PER_QUERY: u64 = 128 * 1024;
+
+/// Byte ceiling on one `/v1/vulns/{id}` full-record response.
+///
+/// 4 MiB. The largest real OSV records in the ecosystems this adapter
+/// queries are a few hundred kilobytes — a GHSA touching many Maven
+/// coordinates, each with a long `versions[]` array — so this is roughly
+/// an order of magnitude of headroom over the pathological case and two
+/// or three over the typical one.
+///
+/// Capping here is doubly worth it because the body is also **cached**:
+/// without the cap, one oversized response is both read into memory and
+/// then written into the ephemeral store, where it becomes a big-key
+/// problem that outlives the request. Exceeding the cap fails this one
+/// hydration, which falls back to the abbreviated `querybatch` record
+/// and therefore fails **closed** to `Critical` severity — loud and
+/// safe, which is the right direction for a bound that might be set too
+/// tight.
+pub(crate) const OSV_RECORD_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Cached payload shape
 // ---------------------------------------------------------------------------
@@ -154,6 +190,11 @@ pub struct OsvAdvisoryAdapter {
     /// Base URL for the bulk-diff path. Per-ecosystem archives live at
     /// `<bulk_url>/<ECO>/all.zip`.
     bulk_url: String,
+    /// Compressed-download ceiling for one per-ecosystem `all.zip`.
+    /// Always [`bulk::BULK_ARCHIVE_MAX_BYTES`] in production; a field
+    /// rather than a direct constant read so a test can reach the
+    /// refusal path without serving half a gigabyte.
+    bulk_archive_max_bytes: u64,
     /// Configured ecosystems for the bulk-diff path. Pre-resolved into
     /// `(label, Ecosystem)` pairs at construction so the watch tick
     /// can iterate without repeating the lookup. Unrecognised labels
@@ -206,8 +247,22 @@ impl OsvAdvisoryAdapter {
             cache_ttl: config.cache_ttl,
             batch_size: config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE),
             bulk_url: config.bulk_url,
+            bulk_archive_max_bytes: bulk::BULK_ARCHIVE_MAX_BYTES,
             bulk_ecosystems,
         })
+    }
+
+    /// Shrink the bulk-archive download ceiling.
+    ///
+    /// Test-only, and deliberately not an operator knob: the cap bounds
+    /// how much disk one untrusted response may claim, which is a
+    /// property of the process rather than a policy an operator tunes.
+    /// Tests use it to reach the refusal path with a kilobyte instead of
+    /// [`bulk::BULK_ARCHIVE_MAX_BYTES`].
+    #[cfg(test)]
+    fn with_bulk_archive_max_bytes(mut self, cap: u64) -> Self {
+        self.bulk_archive_max_bytes = cap;
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -268,7 +323,16 @@ impl OsvAdvisoryAdapter {
     // OSV batch HTTP call.
     // -----------------------------------------------------------------------
 
+    /// POST one chunk to `/v1/querybatch` and return its response.
+    ///
+    /// The returned `results` is guaranteed to carry exactly one entry
+    /// per query: `results[i]` corresponds to `queries[i]`, and that
+    /// index correspondence is the only thing that attributes an advisory
+    /// to a component, so a response that breaks it says nothing about
+    /// any component in the chunk. Enforced here rather than at the call
+    /// site so no caller can read a response that never answered it.
     async fn post_batch(&self, queries: Vec<OsvQuery>) -> DomainResult<OsvBatchResponse> {
+        let asked = queries.len();
         let req_body = OsvBatchRequest { queries };
         let resp = match self
             .http
@@ -314,16 +378,59 @@ impl OsvAdvisoryAdapter {
             )));
         }
 
-        // Use `text()` then `from_str` so we control the error path —
-        // a malformed response body surfaces as `DomainError::Validation`,
-        // which is the contract the wiremock test pins.
-        let body = resp.text().await.map_err(|e| {
-            DomainError::Invariant(format!("osv adapter: failed to read batch body: {e}"))
-        })?;
+        // Read the body under a byte cap rather than with `text()`,
+        // which buffers to EOF unconditionally. The only other bound on
+        // this read is `request_timeout`, and a timeout bounds duration:
+        // a compromised endpoint can serve more bytes than the process
+        // has memory without ever being slow.
+        //
+        // `from_str` on the capped body so a malformed response surfaces
+        // as `DomainError::Validation`, which is the contract the
+        // wiremock test pins. A cap breach is NOT that: it gets its own
+        // metric label so an operator can tell "this endpoint is serving
+        // more than we will read" from "this endpoint is broken" and
+        // from "this endpoint is unreachable".
+        let cap = OSV_BATCH_RESPONSE_BYTES_PER_QUERY.saturating_mul(asked.max(1) as u64);
+        let body = match capped::read_capped_text(resp, cap).await {
+            Ok(body) => body,
+            Err(e @ capped::CappedReadError::TooLarge { .. }) => {
+                emit_advisory_query(AdvisoryQueryResult::BodyTooLarge);
+                return Err(DomainError::Validation(format!(
+                    "osv adapter: batch response refused: {e}"
+                )));
+            }
+            Err(e) => {
+                emit_advisory_query(AdvisoryQueryResult::NetworkError);
+                return Err(DomainError::Invariant(format!(
+                    "osv adapter: failed to read batch body: {e}"
+                )));
+            }
+        };
 
         let parsed: OsvBatchResponse = serde_json::from_str(&body).map_err(|e| {
             DomainError::Validation(format!("osv adapter: malformed batch response: {e}"))
         })?;
+
+        // A result count that disagrees with the query count is a failed
+        // query, not "no advisories for the missing slots". The test is
+        // `!=`, not `<`: a longer response violates the same
+        // correspondence a shorter one does, and neither can be read
+        // component-by-component. `AdvisoryPort::query` has no partial
+        // shape to return — a caller handed findings for some components
+        // and silence for others cannot tell which is which — so the
+        // honest answer at this boundary is an error, and nothing from
+        // this response is cached. A cached empty is worse than a failed
+        // query: the failure is retried on the next scan, the cache entry
+        // is an answer later runs never re-ask.
+        if parsed.results.len() != asked {
+            emit_advisory_query(AdvisoryQueryResult::LengthMismatch);
+            return Err(DomainError::Validation(format!(
+                "osv adapter: batch response carried {} results for {asked} queries; \
+                 results[i]/queries[i] correspondence is the only attribution of an \
+                 advisory to a component, so no part of this response can be read",
+                parsed.results.len()
+            )));
+        }
         Ok(parsed)
     }
 
@@ -575,6 +682,17 @@ impl OsvAdvisoryAdapter {
             // queried one carry the same value and the posture cannot
             // depend on cache state.
             statement: FindingStatement::Unstated,
+            // The OSV entry's publication date, which dates the
+            // VULNERABILITY rather than this query — the retention
+            // grace-period anchor's primary source. Present only on a
+            // hydrated record: `querybatch` returns `id` + `modified`
+            // alone, so an advisory whose hydration failed carries no
+            // date and the anchor falls back to our own later
+            // observation of it.
+            advisory_published_at: vuln
+                .published
+                .as_deref()
+                .and_then(parse_advisory_published_at),
         }
     }
 }
@@ -668,15 +786,15 @@ impl AdvisoryPort for OsvAdvisoryAdapter {
                     .collect();
 
                 let response = self.post_batch(queries).await?;
-                let results = response.results;
 
-                // OSV's `results[i]` corresponds to `queries[i]`. If
-                // the response is shorter than the batch (the OSV API
-                // docs say it shouldn't be, but we tolerate),
-                // empty-pad missing entries so the index remains
-                // valid.
-                for (i, (comp, _key)) in chunk.iter().enumerate() {
-                    let result_for_comp = results.get(i).cloned().unwrap_or_default();
+                // `results[i]` corresponds to `queries[i]`, and
+                // `post_batch` has already refused a response whose length
+                // disagrees with the chunk's — so this zip is exact and
+                // pairs every component with the slot that answered it.
+                // There is no padding arm: an invented empty result is
+                // evidence no upstream produced, and this path writes its
+                // results to the cache.
+                for ((comp, _key), result_for_comp) in chunk.iter().zip(response.results) {
                     fetched.push((comp.clone(), result_for_comp.vulns));
                 }
             }
@@ -737,23 +855,60 @@ impl AdvisoryPort for OsvAdvisoryAdapter {
                 // the fetch + parse, mirroring the `observe_scan_duration`
                 // shape.
                 let started = std::time::Instant::now();
-                let outcome =
-                    pull_one_ecosystem(&self.http, &self.bulk_url, label, eco.clone(), since).await;
+                let outcome = pull_one_ecosystem(
+                    &self.http,
+                    &self.bulk_url,
+                    label,
+                    eco.clone(),
+                    since,
+                    self.bulk_archive_max_bytes,
+                )
+                .await;
                 observe_advisory_diff_duration(label, started.elapsed().as_secs_f64());
                 match outcome {
-                    Ok(mut got) => {
-                        emit_advisory_diff(label, AdvisoryDiffMetricResult::Ok);
+                    Ok(pull) => {
+                        // A walk that left a member out did not read the
+                        // window it was asked for, so the feed checkpoint
+                        // must not move past it: the next tick re-reads the
+                        // same window and picks up what was missed. The
+                        // advisories this walk *did* collect are real and
+                        // still enqueue their rescans — withholding the
+                        // checkpoint is the whole of the consequence.
+                        let skipped = pull.skipped;
+                        let complete = !skipped.is_incomplete();
+                        if !complete {
+                            all_ecosystems_ok = false;
+                            emit_advisory_diff(label, AdvisoryDiffMetricResult::Incomplete);
+                            tracing::warn!(
+                                feed = "osv",
+                                ecosystem = %label,
+                                ingested = pull.entries.len(),
+                                unreadable_bodies = skipped.unreadable_bodies,
+                                unparseable_records = skipped.unparseable_records,
+                                undecodable_names = skipped.undecodable_names,
+                                entry_cap_tripped = skipped.entry_cap_tripped,
+                                "advisory diff incomplete; collected advisories kept and \
+                                 checkpoint withheld so the next tick re-reads this window. \
+                                 entry_cap_tripped means the ecosystem outgrew \
+                                 MAX_ENTRIES_TRUSTED_BULK and the cap is what to raise; the \
+                                 counts mean the archive carried members this process could \
+                                 not read",
+                            );
+                        } else {
+                            emit_advisory_diff(label, AdvisoryDiffMetricResult::Ok);
+                        }
                         // Per-ecosystem advisory ingest count vs expected
                         // floor (NIS2 Art. 21(2)(f) efficacy). Uses bounded
                         // `category` label (not raw ecosystem string) to
                         // keep cardinality fixed.
-                        emit_advisory_ingest_count(label, got.len() as u64);
+                        emit_advisory_ingest_count(label, pull.entries.len() as u64);
                         tracing::info!(
                             ecosystem = %label,
-                            new_advisories = got.len(),
+                            new_advisories = pull.entries.len(),
+                            complete,
                             "advisory diff processed"
                         );
-                        entries.append(&mut got);
+                        entries.extend(pull.entries);
                     }
                     Err(e) => {
                         all_ecosystems_ok = false;
@@ -1032,6 +1187,56 @@ mod tests {
         let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, querybatch_record);
         assert_eq!(finding.cvss_score, None);
         assert_eq!(finding.severity, SeverityThreshold::Critical);
+    }
+
+    /// A hydrated `/v1/vulns/{id}` record carries `published`, and it
+    /// reaches the finding — the retention grace-period anchor's primary
+    /// source.
+    #[test]
+    fn a_hydrated_record_carries_its_publication_date_onto_the_finding() {
+        let prepared = PreparedComponent {
+            name: "rsa",
+            version: Some("0.9.6"),
+            osv_eco: "crates.io",
+            purl: "pkg:cargo/rsa@0.9.6",
+        };
+        let hydrated = OsvVuln {
+            id: "RUSTSEC-2023-0071".to_string(),
+            modified: Some("2026-04-25T06:45:06.122559Z".to_string()),
+            published: Some("2023-11-22T12:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, hydrated);
+        assert_eq!(
+            finding.advisory_published_at,
+            parse_advisory_published_at("2023-11-22T12:00:00Z")
+        );
+    }
+
+    /// `querybatch` returns `id` + `modified` and nothing else, so an
+    /// advisory whose hydration failed has no publication date. The
+    /// retention anchor then falls back to our own later observation of
+    /// it — the non-deleting direction, matching hydration's existing
+    /// fail-soft posture.
+    #[test]
+    fn a_querybatch_shaped_record_carries_no_publication_date() {
+        let prepared = PreparedComponent {
+            name: "rsa",
+            version: Some("0.9.6"),
+            osv_eco: "crates.io",
+            purl: "pkg:cargo/rsa@0.9.6",
+        };
+        let querybatch_record = OsvVuln {
+            id: "RUSTSEC-2023-0071".to_string(),
+            modified: Some("2026-04-25T06:45:06.122559Z".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            querybatch_record.published.is_none(),
+            "the querybatch wire shape carries no publication date"
+        );
+        let finding = OsvAdvisoryAdapter::vuln_to_finding(&prepared, querybatch_record);
+        assert_eq!(finding.advisory_published_at, None);
     }
 
     #[test]
@@ -1789,5 +1994,336 @@ mod tests {
         });
         let (_, _, _, v) = pypi_err.expect("PyPI/parse_error must fire");
         assert!(matches!(v, DebugValue::Counter(1)));
+    }
+
+    // -----------------------------------------------------------------------
+    // pull_diff_since — an incomplete reading is not a full success
+    // -----------------------------------------------------------------------
+
+    /// Collapse a snapshot into
+    /// `(ecosystem, result) → hort_advisory_diff_processed_total` counts.
+    /// A pair absent from the map never fired, which is what the
+    /// "and the `ok` series did not fire" assertions below rest on.
+    fn diff_counters(
+        snap: metrics_util::debugging::Snapshot,
+    ) -> std::collections::HashMap<(String, String), u64> {
+        use metrics_util::debugging::DebugValue;
+        use metrics_util::MetricKind;
+        let mut out = std::collections::HashMap::new();
+        for (key, _, _, value) in snap.into_vec() {
+            if key.kind() != MetricKind::Counter
+                || key.key().name() != "hort_advisory_diff_processed_total"
+            {
+                continue;
+            }
+            let eco = key
+                .key()
+                .labels()
+                .find(|l| l.key() == "ecosystem")
+                .map(|l| l.value().to_string());
+            let result = key
+                .key()
+                .labels()
+                .find(|l| l.key() == "result")
+                .map(|l| l.value().to_string());
+            if let (Some(eco), Some(result), DebugValue::Counter(n)) = (eco, result, value) {
+                out.insert((eco, result), n);
+            }
+        }
+        out
+    }
+
+    /// Run `f`'s future on a current-thread runtime under a scoped
+    /// `DebuggingRecorder` and return the snapshot. The adapter emits its
+    /// per-ecosystem counters from inside `pull_diff_since`, so the
+    /// recorder has to be in scope for the whole await.
+    fn capture_diff_metrics<F, Fut>(f: F) -> metrics_util::debugging::Snapshot
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(f());
+        });
+        snapshotter.snapshot()
+    }
+
+    /// Seconds past the epoch as a UTC timestamp — the `since` values in
+    /// this section are epoch-relative so the fixture bodies can carry
+    /// literal RFC-3339 strings either side of them.
+    fn ts(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(secs, 0).expect("in-range timestamp")
+    }
+
+    /// Mount one `/<eco>/all.zip` responding with `zip_bytes`.
+    async fn mount_bulk_archive(server: &wiremock::MockServer, eco: &str, zip_bytes: Vec<u8>) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{eco}/all.zip")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(zip_bytes)
+                    .insert_header("content-type", "application/zip"),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// An OSV bulk record body whose `modified` is `secs` past the epoch.
+    fn bulk_record_json(id: &str, eco: &str, name: &str, modified: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "modified": modified,
+            "affected": [{
+                "package": { "ecosystem": eco, "name": name },
+                "versions": ["1.0.0"]
+            }]
+        })
+        .to_string()
+    }
+
+    async fn adapter_against_bulk(server: &wiremock::MockServer, eco: &str) -> OsvAdvisoryAdapter {
+        use hort_adapters_ephemeral_memory::InMemoryEphemeralStore;
+        use std::sync::Arc;
+        let cache: Arc<dyn EphemeralStore> = Arc::new(InMemoryEphemeralStore::new());
+        let cfg = OsvAdvisoryConfig {
+            bulk_url: server.uri(),
+            ecosystems: vec![eco.to_string()],
+            ..OsvAdvisoryConfig::default()
+        };
+        OsvAdvisoryAdapter::new(cfg, cache, None).expect("constructor Ok")
+    }
+
+    /// A member the walk could not turn into an advisory leaves the pull
+    /// an incomplete reading of the window: the advisories it did collect
+    /// are returned, and `all_ecosystems_ok` is `false` so the handler
+    /// holds the checkpoint and the next tick re-reads the same window.
+    #[test]
+    fn pull_diff_since_reports_incomplete_when_a_member_does_not_parse() {
+        let good = bulk_record_json("GHSA-good", "npm", "lodash", "1970-01-01T00:33:20Z");
+        let zip_bytes = hort_formats::archive_bounds::build_zip_bytes(&[
+            ("GHSA-good.json", good.as_str()),
+            ("GHSA-broken.json", "{not-valid-json"),
+        ]);
+
+        let mut result: Option<AdvisoryDiffResult> = None;
+        let snap = capture_diff_metrics(|| async {
+            let server = wiremock::MockServer::start().await;
+            mount_bulk_archive(&server, "npm", zip_bytes).await;
+            let adapter = adapter_against_bulk(&server, "npm").await;
+            result = Some(
+                adapter
+                    .pull_diff_since(ts(1_000))
+                    .await
+                    .expect("one unreadable member must not abort the tick"),
+            );
+        });
+        let result = result.expect("pull_diff_since ran");
+
+        assert_eq!(
+            result.entries.len(),
+            1,
+            "the advisory that did parse is still collected and still enqueues its rescan"
+        );
+        assert_eq!(result.entries[0].id, "GHSA-good");
+        assert!(
+            !result.all_ecosystems_ok,
+            "a walk that left a member out did not read the window, so the \
+             checkpoint must not advance past it"
+        );
+
+        let counters = diff_counters(snap);
+        assert_eq!(
+            counters.get(&("npm".to_string(), "incomplete".to_string())),
+            Some(&1),
+            "the incomplete reading gets its own result label: {counters:?}"
+        );
+        assert_eq!(
+            counters.get(&("npm".to_string(), "ok".to_string())),
+            None,
+            "`ok` must not co-fire with `incomplete` — one emission per ecosystem \
+             per tick: {counters:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Byte bounds on the bulk archive download
+    // ------------------------------------------------------------------
+
+    /// A bulk archive that crosses the download byte cap is a **failed
+    /// fetch**, not an incomplete walk.
+    ///
+    /// The distinction is the whole of what an operator does next.
+    /// `SkippedMembers` counts members a *completed* walk left out, and
+    /// `entry_cap_tripped` in particular says "the ecosystem outgrew
+    /// `MAX_ENTRIES_TRUSTED_BULK`, raise that cap". A download refused on
+    /// bytes never produced a walk at all: there is no member accounting
+    /// to report, and routing it through `is_incomplete` would tell the
+    /// operator to raise an entry cap that has nothing to do with it.
+    ///
+    /// Both halves matter and both are asserted: `all_ecosystems_ok` is
+    /// `false` (so the checkpoint is withheld and the window is re-read),
+    /// and the result label is `fetch_error` rather than `incomplete`.
+    #[test]
+    fn a_bulk_download_refused_on_bytes_is_a_fetch_error_not_an_incomplete_walk() {
+        // A *valid, walkable* archive, refused purely on size. Serving
+        // half a gigabyte to trip the production cap is impractical in a
+        // test, so the cap is shrunk below the fixture instead — which is
+        // the stronger fixture anyway: the bytes that arrive would parse
+        // and would yield an advisory, so anything this test observes is
+        // the cap's doing and not a malformed body's.
+        let good = bulk_record_json("GHSA-good", "npm", "lodash", "1970-01-01T00:33:20Z");
+        let zip_bytes =
+            hort_formats::archive_bounds::build_zip_bytes(&[("GHSA-good.json", good.as_str())]);
+        let cap = (zip_bytes.len() - 1) as u64;
+
+        let mut result: Option<AdvisoryDiffResult> = None;
+        let snap = capture_diff_metrics(|| async {
+            let server = wiremock::MockServer::start().await;
+            mount_bulk_archive(&server, "npm", zip_bytes).await;
+            let adapter = adapter_against_bulk(&server, "npm")
+                .await
+                .with_bulk_archive_max_bytes(cap);
+            result = Some(
+                adapter
+                    .pull_diff_since(ts(1_000))
+                    .await
+                    .expect("a refused download must not abort the whole tick"),
+            );
+        });
+        let result = result.expect("pull_diff_since ran");
+
+        assert!(
+            result.entries.is_empty(),
+            "a refused download yields no advisories"
+        );
+        assert!(
+            !result.all_ecosystems_ok,
+            "a refused download did not read the window, so the checkpoint must \
+             not advance past it"
+        );
+
+        let counters = diff_counters(snap);
+        assert_eq!(
+            counters.get(&("npm".to_string(), "fetch_error".to_string())),
+            Some(&1),
+            "a download refused on bytes is a failed fetch: {counters:?}"
+        );
+        assert_eq!(
+            counters.get(&("npm".to_string(), "incomplete".to_string())),
+            None,
+            "`incomplete` reports members a COMPLETED walk left out; a refused \
+             download produced no walk: {counters:?}"
+        );
+    }
+
+    /// Counter-test: an ordinary-sized archive still succeeds. Without
+    /// this, a cap set to zero — or a comparison inverted — would pass
+    /// the test above and fail every real pull.
+    #[test]
+    fn a_bulk_download_within_the_cap_still_succeeds() {
+        let good = bulk_record_json("GHSA-good", "npm", "lodash", "1970-01-01T00:33:20Z");
+        let zip_bytes =
+            hort_formats::archive_bounds::build_zip_bytes(&[("GHSA-good.json", good.as_str())]);
+
+        let mut result: Option<AdvisoryDiffResult> = None;
+        let snap = capture_diff_metrics(|| async {
+            let server = wiremock::MockServer::start().await;
+            mount_bulk_archive(&server, "npm", zip_bytes).await;
+            let adapter = adapter_against_bulk(&server, "npm").await;
+            result = Some(
+                adapter
+                    .pull_diff_since(ts(1_000))
+                    .await
+                    .expect("an ordinary archive must pull"),
+            );
+        });
+        let result = result.expect("pull_diff_since ran");
+
+        assert_eq!(result.entries.len(), 1, "the advisory is collected");
+        assert!(
+            result.all_ecosystems_ok,
+            "a complete reading advances the checkpoint"
+        );
+        assert_eq!(
+            diff_counters(snap).get(&("npm".to_string(), "ok".to_string())),
+            Some(&1),
+        );
+    }
+
+    /// Counter-test for the over-correction that would freeze the watch
+    /// path forever. `bulk_record_to_advisory_entry` returns `None` for
+    /// the overwhelming majority of records in every healthy run — the
+    /// `modified <= since` window filter and the ecosystem filter. None of
+    /// those is a member the walk failed to read, so a pull made entirely
+    /// of them is complete and the checkpoint advances.
+    #[test]
+    fn pull_diff_since_window_and_ecosystem_filtered_records_are_not_incompleteness() {
+        let after = bulk_record_json("GHSA-after", "npm", "lodash", "1970-01-01T00:33:20Z");
+        // Window filter: `modified <= since`.
+        let before = bulk_record_json("GHSA-before", "npm", "old", "1970-01-01T00:08:20Z");
+        // Ecosystem filter: OSV cross-publishes an advisory into archives
+        // whose ecosystem it does not target.
+        let other_eco = bulk_record_json("GHSA-pypi", "PyPI", "django", "1970-01-01T00:33:20Z");
+        // A record carrying no `modified` at all cannot be window-tested,
+        // and is filtered here rather than counted as a drop: the counting
+        // side is reserved for a member whose *bytes* this process could
+        // not read. Widening it to record-level malformedness would hold
+        // the checkpoint back forever on one out-of-spec publisher record.
+        let undated = serde_json::json!({
+            "id": "GHSA-undated",
+            "affected": [{
+                "package": { "ecosystem": "npm", "name": "undated" },
+                "versions": ["1.0.0"]
+            }]
+        })
+        .to_string();
+        let zip_bytes = hort_formats::archive_bounds::build_zip_bytes(&[
+            ("GHSA-after.json", after.as_str()),
+            ("GHSA-before.json", before.as_str()),
+            ("GHSA-pypi.json", other_eco.as_str()),
+            ("GHSA-undated.json", undated.as_str()),
+            // A non-`.json` member is not a member the walk wanted.
+            ("README.txt", "ignored"),
+        ]);
+
+        let mut result: Option<AdvisoryDiffResult> = None;
+        let snap = capture_diff_metrics(|| async {
+            let server = wiremock::MockServer::start().await;
+            mount_bulk_archive(&server, "npm", zip_bytes).await;
+            let adapter = adapter_against_bulk(&server, "npm").await;
+            result = Some(
+                adapter
+                    .pull_diff_since(ts(1_000))
+                    .await
+                    .expect("pull_diff_since Ok"),
+            );
+        });
+        let result = result.expect("pull_diff_since ran");
+
+        assert_eq!(result.entries.len(), 1, "only the in-window npm record");
+        assert_eq!(result.entries[0].id, "GHSA-after");
+        assert!(
+            result.all_ecosystems_ok,
+            "every member parsed — the filters are not incompleteness, and \
+             counting them would stop the watch path advancing ever again"
+        );
+
+        let counters = diff_counters(snap);
+        assert_eq!(
+            counters.get(&("npm".to_string(), "ok".to_string())),
+            Some(&1),
+            "a complete reading stays `ok`: {counters:?}"
+        );
+        assert_eq!(
+            counters.get(&("npm".to_string(), "incomplete".to_string())),
+            None,
+            "the filters must not reach the `incomplete` series: {counters:?}"
+        );
     }
 }

@@ -518,6 +518,7 @@ mod tests {
             token_cap: cap.map(|permissions| TokenCap {
                 permissions,
                 repository_ids: None,
+                per_repository_permissions: None,
             }),
         }
     }

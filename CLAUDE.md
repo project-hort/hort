@@ -121,7 +121,7 @@ Rust 1.97+ with the following project configuration:
 - **MSRV:** 1.97.0 (see `.clippy.toml`)
 - **`unsafe` is forbidden workspace-wide** via `[workspace.lints.rust] unsafe_code = "forbid"` in the root `Cargo.toml`. This cannot be overridden with `#[allow]` — it is a compile error. All dependencies that need `unsafe` handle it within their own crates; no application code in this workspace has a legitimate need for it. If a future edge case requires revisiting this, the change must be made in `Cargo.toml` and reviewed as a policy change.
 - **Clippy lints** are configured in `[workspace.lints.clippy]` in the root `Cargo.toml`. Every crate inherits these via `[lints] workspace = true`. Do not override workspace lints in individual crates without justification.
-- **SonarCloud quality gate** runs on every PR and enforces >= 85% coverage on new code and <= 1% duplication on new code. PRs that fail the gate will be blocked.
+- **Sonar quality gate** runs on pushes to `develop` and `main` — never on an MR or PR: GitLab's `quality:sonar` scans the in-cluster SonarQube, GitHub's `ci.yml` `sonarqube-cloud` job scans SonarQube Cloud, and each instance's own server-side gate (coverage and duplication on new code) decides the verdict. Per-change coverage and duplication are gated instead by the `coverage` job's own thresholds.
 
 ### Test Coverage Tiers
 
@@ -141,14 +141,14 @@ Coverage requirements vary by crate layer. Core crates contain the security-crit
 
 **DB-backed test isolation (parallel-safety contract).** The DB-backed suites have **three modes**, and a reviewer has to know which one a test is in:
 
-- **`test_support::isolated_db_from`** — creates and migrates a fresh `hort_test_<epoch>_<uuid>` database per call. This is the overwhelming majority of the harness: **66 files** (58 in `hort-adapters-postgres`, 8 in `hort-server`) as measured on 2026-10-08, usually reached through a module-local `maybe_pool()`. The figure moves whenever a DB test is added or relocated, so re-measure rather than trusting it:
+- **`test_support::isolated_db_from`** — creates and migrates a fresh `hort_test_<epoch>_<uuid>` database per call. This is the overwhelming majority of the harness: **74 files** (65 in `hort-adapters-postgres`, 9 in `hort-server`) as measured on 2026-10-28, usually reached through a module-local `maybe_pool()`. The figure moves whenever a DB test is added or relocated, so re-measure rather than trusting it:
   ```bash
   grep -rl 'isolated_db_from(' crates/*/src crates/*/tests --include='*.rs' \
     | grep -v 'test_support\|db_tests_are_serialized\|db_gate_not_silent'
   ```
   (the two excluded guards name the helper as a pattern to scan for, not as a call).
 - **`test_support::shared_migrated_pool`** — connects to and migrates the shared `DATABASE_URL` target, for the few tests that deliberately exercise shared-DB behaviour (isolating them would defeat the point of the test): **4 files**, all in `hort-adapters-postgres`.
-- **A hand-rolled throwaway database on the `DATABASE_URL` target** — an `admin_pool()` (now `test_support::connect_or_panic`) plus the file's own `create_temp_db` / `drop_temp_db`, because these tests drive the migrator itself and so cannot be handed an already-migrated database: **5 files**, `hort-server/tests/migrate_{assert_current,harden_events,schema_compat,fleet_fence}.rs` and `hort-worker/tests/schema_compat_boot.rs`, 35 DB-backed tests. All 35 carry `#[serial(hort_pg_db)]`; until the sweep that added the guard below, only `migrate_fleet_fence.rs`'s 6 did, and the other 29 ran their `CREATE DATABASE` + full migration set (cluster-global `CREATE ROLE` included) unkeyed — they fell through the *wording* of the old rule, which named `hort-adapters-postgres` and so did not reach `hort-server` / `hort-worker`. There is also one test in a sixth file that hand-rolls a throwaway database inside an otherwise `isolated_db_from` file (`hort-adapters-postgres/tests/api_tokens_migration.rs::idempotent_after_rollback`, whose `DROP TABLE … CASCADE` cannot be let near a database anything else will reuse); a mode-by-file listing will not find it, which is why the guard scans functions.
+- **A hand-rolled throwaway database on the `DATABASE_URL` target** — an `admin_pool()` (now `test_support::connect_or_panic`) plus the file's own `create_temp_db` / `drop_temp_db`, because these tests drive the migrator itself and so cannot be handed an already-migrated database: **5 files**, `hort-server/tests/migrate_{assert_current,harden_events,schema_compat,fleet_fence}.rs` and `hort-worker/tests/schema_compat_boot.rs`, 37 DB-backed tests as measured on 2026-10-28. All 37 carry `#[serial(hort_pg_db)]`; at the sweep that added the guard below there were 35, of which only `migrate_fleet_fence.rs`'s 6 carried the key, and the other 29 ran their `CREATE DATABASE` + full migration set (cluster-global `CREATE ROLE` included) unkeyed — they fell through the *wording* of the old rule, which named `hort-adapters-postgres` and so did not reach `hort-server` / `hort-worker`. There is also one test in a sixth file that hand-rolls a throwaway database inside an otherwise `isolated_db_from` file (`hort-adapters-postgres/tests/api_tokens_migration.rs::idempotent_after_rollback`, whose `DROP TABLE … CASCADE` cannot be let near a database anything else will reuse); a mode-by-file listing will not find it, which is why the guard scans functions.
 
 Two tests sit outside all three modes and are worth knowing about as a reviewer: `hort-adapters-postgres/tests/api_tokens_migration.rs::idempotent_after_rollback` (above) and `hort-worker/tests/composition_smoke.rs::build_app_context_registers_seed_import_handler`, which drives the worker's composition root against the configured `DATABASE_URL` itself and so migrates that shared target through `connect_or_panic` + `migrate_or_panic` before calling in. Both carry the key.
 
@@ -237,9 +237,9 @@ The architect skill (`/.claude/commands/hort-architect.md`) maintains the canoni
 - **Adapter import inside an `hort-http-<format>` crate** — the per-format inbound-HTTP crates must not depend on `hort-adapters-*`, `sqlx`, or `reqwest`. The dep graph is load-bearing (ADR 0008): an adapter import is an unresolved-import compile error, not a review finding.
 - **`reqwest::Client::new()` in any adapter** — every adapter that opens TLS must build via `reqwest::Client::builder()` so the composition root can layer `apply_to_reqwest_builder` onto it. `Client::new()` is a *compile-time-allowed but architecturally-forbidden* pattern; the review checklist enforces it. Exception: `cfg(test)` test fixtures. (see ADR 0010)
 - **Reintroducing `*_INSECURE_TLS` knobs** — no `S3_INSECURE_TLS`, `LDAP_INSECURE_TLS`, `OIDC_INSECURE_TLS`, `HORT_TLS_INSECURE`, etc. The supported way to trust internal certs is `HORT_EXTRA_CA_BUNDLE`. If a future need genuinely requires this, it amends the decision in a new ADR first. (see ADR 0010)
-- **Re-introducing a long-default CLI session lifetime (>24 h) or removing the ≤1 h admin cap** — short-lived full-authority tokens with refresh replaced long-lived limited tokens; reversing one half without the other re-opens the blast-radius concern the trade-off was designed to prevent. (see ADR 0013)
+- **Re-introducing a long-default CLI session lifetime (>24 h) or weakening the CLI-session cap** — the enforced cap is **900 s (15 min), for both admin and non-admin sessions**. Refresh was retired rather than built (ADR 0013, amendment 2026-10-28), so the cap no longer has a paired half to trade against: it is the only bound on a leaked session, and that is now its entire justification. Lengthening it re-opens the blast-radius analysis and needs a new decision, not a config change. (see ADR 0013)
 - **`ServiceAccount` with empty `federatedIdentities[].claims`** — apply-time validation rejects this; if a code path accepts an envelope with an empty `claims` map, that's a bug. Empty claims = "any JWT from this issuer can assume me" — a privilege-escalation footgun on a misconfigured issuer. (see ADR 0018)
-- **`OidcIssuer` trusts an unverified JWKS** — JWKS must be fetched over TLS verified against the system trust store + `HORT_EXTRA_CA_BUNDLE`. No `insecure_jwks_url` knob. Mirrors the reqwest-builder rule. The HTTP client for JWKS fetches is the shared `internal::build_http_client` in `hort-adapters-oidc`, which means the no-`reqwest::Client::new()` rule applies here too. (see ADR 0018)
+- **`OidcIssuer` trusts an unverified JWKS** — JWKS must be fetched over TLS verified against the system trust store + `HORT_EXTRA_CA_BUNDLE`. No `insecure_jwks_url` knob. Mirrors the reqwest-builder rule. The HTTP client for JWKS fetches is the shared `internal::build_http_client` in `hort-adapters-oidc`, which means the no-`reqwest::Client::new()` rule applies here too. (see ADR 0010 for the statement itself; ADR 0018 for the catalog entry that records it)
 - **Policy field accepted at apply, inert at runtime** — a new field on `PrefetchPolicy` / `ScanPolicy` / `RetentionPolicy` / `RepositoryUpstreamMapping` etc. must be either enforced by the consuming use case or rejected at gitops apply. Accepting the field while the consumer silently ignores it is a hard block — operators set risk-significant values (e.g. `max_age_days: 90`) and make threat-model decisions on the assumption the field is load-bearing. Structural enforcement is an apply-time linter rejection that points the operator at the future enforcement work; `max_age_days` is the canonical exemplar (apply-time linter rejects any non-`None` value). The alternative model is to *remove* the operator surface until the feature is functional. (see ADR 0015)
 - **Destructive DDL in the same release that removed the last code reference** — a migration that drops/renames/narrows a schema identifier ships only in a release strictly *after* the last release whose code referenced it (expand/contract). `expand_contract_guard` rejects it via `migrations/CONTRACTIONS.toml` version arithmetic; the fix is to schedule the contraction one release later, never to edit the manifest into passing. New manifest entries carry a mandatory reviewer step (`git grep <identifier> v<reference_removed_in>` — the hermetic guard cannot see past releases). (see ADR 0030 amendment (c))
 - **Cross-opt-in collapse of a Gate-2-style invariant** — any new operator-opt-in that lets untrusted input influence the release-gate computation (`trust_upstream_publish_time`-shaped, `scan_backends:[]`-shaped, `IndexMode`-shaped) must enumerate its interaction with every other such opt-in in its design doc *before* implementation, via the architect doc's "Cross-opt-in interaction matrix". The canonical exemplar: `trust_upstream_publish_time = true` × `scan_backends: []` together collapse the Gate-2 observation window to ≤ sweep-tick latency (apply-time linter rejects the combination, `trust_upstream_publish_time_requires_scan_backends` rule). The structural close is fail-closed apply-time rejection of the dangerous combination, never a runtime "fallback to a degraded authority" path. (see ADR 0016)
@@ -609,8 +609,12 @@ Images are built and published **only on `v*` release tags** (and manual
   internal pre-release (see *Releases* below and
   [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md)) is
   build/published only to the internal registry via the GitLab pipeline,
-  never to ghcr. `-beta`/`-rc` are unaffected (reserved for a possible
-  future public pre-release track, not currently used).
+  never to ghcr. **`-beta` tags are not excluded and do publish**: the
+  guard is `!contains(github.ref, '-alpha.')`, so a beta builds ghcr images
+  at `:X.Y.Z-beta.N` and `release.yml` cuts a GitHub Release auto-marked
+  pre-release (`prerelease: contains(version, '-')`). `:latest` still does
+  not move — a separate `!contains(github.ref, '-')` guard holds it back.
+  `-rc` is unused naming today and would behave exactly like `-beta`.
 
 ### Releases
 
@@ -634,9 +638,11 @@ step-by-step. In short:
   `develop`'s line, so `git describe` from `develop` won't find them — fine
   for internal builds. Alpha artifacts (images + Helm chart) build and
   publish to the **internal registry only** — see *Docker image tags* above
-  and [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) D4;
-  `beta`/`rc` naming stays reserved for a possible future *public*
-  pre-release track (not in use today).
+  and [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) D4.
+  **A `beta` is the public pre-release track and is in routine use** — it
+  is pushed to `github-public` as well, which publishes ghcr images and a
+  pre-release GitHub Release; `RELEASING.md` carries the exact two-command
+  sequence. `rc` naming is unused today and would follow the same shape.
 - **Staging deploys from published artifacts only**: `test/*` alpha tags and
   `main` — never from bare `develop` merges, since `develop` publishes no
   image or chart. It is not gated on a `main` cut, but it is gated on the

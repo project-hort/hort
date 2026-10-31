@@ -128,6 +128,38 @@ impl VirtualResolutionUseCase {
         Ok(visible)
     }
 
+    /// Every member of `virtual_repo` in priority order, **without** the
+    /// per-caller Read filter [`resolve_members`](Self::resolve_members)
+    /// applies. Nested `Virtual` members are still skipped (apply-time
+    /// rejects them; this guards a stale edge).
+    ///
+    /// This is NOT a read path and must never feed one: a response
+    /// assembled from this list would leak a member the caller cannot
+    /// Read. Its one purpose is the name-ownership question
+    /// ([`name_owned_by_members`]) — "may an upstream copy of this name
+    /// be created here", which is about the repository's own integrity
+    /// rather than about what a caller may see, and whose hazard is at
+    /// its worst in exactly the case the Read filter hides: a private
+    /// hosted member owning `internal-lib` is invisible to a caller who
+    /// may prefetch into the virtual's public proxy member, so a
+    /// caller-filtered check reports the name unowned and clears the
+    /// warm.
+    #[tracing::instrument(skip(self), fields(virtual_repo = %virtual_repo.key))]
+    pub async fn unfiltered_members(
+        &self,
+        virtual_repo: &Repository,
+    ) -> AppResult<Vec<Repository>> {
+        let members = self
+            .repositories
+            .get_virtual_members(virtual_repo.id)
+            .await
+            .map_err(AppError::Domain)?;
+        Ok(members
+            .into_iter()
+            .filter(|m| !matches!(m.repo_type, RepositoryType::Virtual))
+            .collect())
+    }
+
     /// First-authoritative download resolution for a virtual repo
     /// (ADR 0031 §4.2). Two phases over the priority-ordered, access-
     /// filtered members ([`resolve_members`](Self::resolve_members)):
@@ -326,6 +358,47 @@ impl VirtualResolutionUseCase {
     }
 }
 
+/// Is a name owned by any **non-proxy** member of `members`?
+///
+/// The ownership half of ADR 0031 rule 2b, extracted so the three
+/// consumers answer it identically: proxies never own, a non-proxy
+/// member that is `Present` owns, and a non-proxy member that is
+/// `Unavailable` is a fail-closed *potential* owner — a transient
+/// outage of the trusted owner must not make its names look free.
+/// Short-circuits on the first owner.
+///
+/// `name_present` is the caller's per-member name lookup; it is invoked
+/// only for non-proxy members, so a proxy's held copy of a public
+/// package never reads as ownership.
+///
+/// The result is a bare `bool`, which is what makes it safe to answer
+/// over [`VirtualResolutionUseCase::unfiltered_members`]: no member key,
+/// id, type or count crosses the boundary, so a refusal built on it
+/// cannot name, count or characterise what owns the name. A caller does
+/// learn one bit — that the name is owned somewhere inside this virtual
+/// — and that bit is irreducible for any check that refuses at all;
+/// the alternative is ingesting an upstream artifact under a name a
+/// member owns.
+pub async fn name_owned_by_members<NP, NPF>(members: &[Repository], mut name_present: NP) -> bool
+where
+    NP: FnMut(Repository) -> NPF,
+    NPF: Future<Output = MemberNamePresence>,
+{
+    for member in members {
+        if matches!(member.repo_type, RepositoryType::Proxy) {
+            continue;
+        }
+        match name_present(member.clone()).await {
+            MemberNamePresence::Present | MemberNamePresence::Unavailable => {
+                tracing::debug!("virtual name-ownership probe: owned");
+                return true;
+            }
+            MemberNamePresence::Absent => {}
+        }
+    }
+    false
+}
+
 /// Classify a per-member index fetch outcome into a [`MemberFetch`] — the
 /// fail-closed dependency-confusion classification (ADR 0031 rule 2b):
 ///
@@ -462,6 +535,127 @@ mod tests {
         let uc = use_case(repos, RbacAccess::Disabled);
         let resolved = uc.resolve_members(&vroot, None).await.unwrap();
         assert!(resolved.is_empty());
+    }
+
+    // -- unfiltered_members + name_owned_by_members -------------------------
+
+    /// The whole point of the unfiltered listing: a member that is
+    /// invisible to every caller (private, auth enabled, anonymous
+    /// caller) is still in it. `resolve_members` skips it; this must
+    /// not.
+    #[tokio::test]
+    async fn unfiltered_members_includes_a_member_no_caller_can_read() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let vroot = repo("vroot", RepositoryType::Virtual, true);
+        let private_owner = repo("priv", RepositoryType::Hosted, false);
+        repos.insert(vroot.clone());
+        repos.insert(private_owner.clone());
+        repos.seed_virtual_member(vroot.id, private_owner.id);
+
+        let uc = use_case(repos, enabled_empty());
+        // The Read-filtered list is empty for an anonymous caller …
+        assert!(uc.resolve_members(&vroot, None).await.unwrap().is_empty());
+        // … and the unfiltered one still has the owner.
+        let all = uc.unfiltered_members(&vroot).await.unwrap();
+        let keys: Vec<&str> = all.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["priv"]);
+    }
+
+    /// A nested virtual member is skipped, exactly as
+    /// `resolve_members` skips it — apply-time rejects nested virtuals,
+    /// so this guards a stale edge.
+    #[tokio::test]
+    async fn unfiltered_members_skips_a_nested_virtual_member() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let vroot = repo("vroot", RepositoryType::Virtual, true);
+        let a = repo("a", RepositoryType::Hosted, true);
+        let nested = repo("nested", RepositoryType::Virtual, true);
+        repos.insert(vroot.clone());
+        repos.insert(a.clone());
+        repos.insert(nested.clone());
+        repos.seed_virtual_member(vroot.id, a.id);
+        repos.seed_virtual_member(vroot.id, nested.id);
+
+        let uc = use_case(repos, RbacAccess::Disabled);
+        let all = uc.unfiltered_members(&vroot).await.unwrap();
+        let keys: Vec<&str> = all.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["a"]);
+    }
+
+    /// A failure to list the members propagates — the caller must not
+    /// read the absence of an answer as "unowned".
+    #[tokio::test]
+    async fn unfiltered_members_propagates_a_listing_failure() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let vroot = repo("vroot", RepositoryType::Virtual, true);
+        repos.insert(vroot.clone());
+        repos.fail_next_get_virtual_members(DomainError::Invariant("db down".into()));
+
+        let uc = use_case(repos, RbacAccess::Disabled);
+        let err = uc.unfiltered_members(&vroot).await.unwrap_err();
+        assert!(err.to_string().contains("db down"));
+    }
+
+    /// A proxy member never owns (ADR 0031 rule 2b), and the fold does
+    /// not even ask it — otherwise the first warm of a public package
+    /// would make every later warm of it look owned.
+    #[tokio::test]
+    async fn name_ownership_never_asks_a_proxy_member() {
+        let proxy = repo("proxy", RepositoryType::Proxy, true);
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let owned = name_owned_by_members(&[proxy], |member| {
+            let asked = Arc::clone(&asked);
+            async move {
+                asked.lock().unwrap().push(member.key);
+                MemberNamePresence::Present
+            }
+        })
+        .await;
+        assert!(!owned, "a proxy's held copy is not ownership");
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "the proxy must not even be probed",
+        );
+    }
+
+    /// Absent everywhere → unowned, which is what lets an ordinary
+    /// public name be warmed.
+    #[tokio::test]
+    async fn name_ownership_is_false_when_every_member_is_absent() {
+        let members = [
+            repo("a", RepositoryType::Hosted, true),
+            repo("b", RepositoryType::Hosted, true),
+        ];
+        let owned =
+            name_owned_by_members(&members, |_m| async { MemberNamePresence::Absent }).await;
+        assert!(!owned);
+    }
+
+    /// One present non-proxy member is ownership.
+    #[tokio::test]
+    async fn name_ownership_is_true_for_a_present_non_proxy_member() {
+        let members = [repo("a", RepositoryType::Hosted, true)];
+        let owned =
+            name_owned_by_members(&members, |_m| async { MemberNamePresence::Present }).await;
+        assert!(owned);
+    }
+
+    /// Fail-closed: a non-proxy member whose name probe errored is a
+    /// *potential* owner. An outage of the trusted owner must not make
+    /// its names look free.
+    #[tokio::test]
+    async fn name_ownership_is_fail_closed_on_an_unavailable_member() {
+        let members = [repo("a", RepositoryType::Hosted, true)];
+        let owned =
+            name_owned_by_members(&members, |_m| async { MemberNamePresence::Unavailable }).await;
+        assert!(owned, "an errored non-proxy member counts as an owner");
+    }
+
+    /// Empty member set — nothing owns anything.
+    #[tokio::test]
+    async fn name_ownership_is_false_for_an_empty_member_set() {
+        let owned = name_owned_by_members(&[], |_m| async { MemberNamePresence::Present }).await;
+        assert!(!owned);
     }
 
     #[tokio::test]

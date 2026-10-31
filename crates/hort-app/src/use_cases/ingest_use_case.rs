@@ -37,7 +37,6 @@ use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::{ArtifactCoords, ContentHash, PayloadAccess};
-use tokio::io::AsyncReadExt;
 
 use crate::error::{AppError, AppResult};
 use crate::metrics::{
@@ -3255,7 +3254,9 @@ impl IngestUseCase {
     /// consumed the inbound stream, and the existing
     /// `prefetch-dependencies` task handler establishes the same
     /// precedent (read the just-ingested bytes back from CAS by
-    /// `artifact.sha256_checksum`).
+    /// `artifact.sha256_checksum`). It is, however, **spilled rather
+    /// than buffered** — see the read site below for why holding the
+    /// wheel in memory is not an option a bound can be put on.
     ///
     /// **Path-gated** — only `.whl`-suffixed paths invoke the trait
     /// method. Sdists, non-PyPI artifacts, and any other path skip the
@@ -3307,17 +3308,32 @@ impl IngestUseCase {
             return Ok(None);
         }
 
-        // Re-read the just-ingested content. The 1 MiB cap on METADATA is
-        // enforced *inside* `extract_wheel_metadata_bytes` on the ZIP
-        // entry's header — the raw wheel bytes here are bounded only by
-        // the per-format ingest cap that already applied to the primary
-        // `storage.put` above.
-        let mut wheel_bytes: Vec<u8> = Vec::new();
+        // Re-read the just-ingested content, spilled to a temporary file
+        // rather than buffered. The 1 MiB cap on METADATA is enforced
+        // *inside* `extract_wheel_metadata_bytes` on the ZIP entry's
+        // header, and it is a cap on the member — not on the wheel the
+        // member sits in.
+        //
+        // Nothing caps the wheel. There is no per-format ingest size
+        // ceiling anywhere in this use case or in `FormatHandler`: the
+        // only size bound on the artifact's own bytes is the inbound
+        // `DefaultBodyLimit` on each publish route, which does not exist
+        // on the pull-through path at all. So a buffer here would be
+        // sized by whatever an upstream chose to serve, and a `Vec` of
+        // that size cannot be given an honest bound either — a ceiling
+        // low enough to protect the process would silently stop
+        // advertising PEP 658 metadata for exactly the large wheels whose
+        // whole-wheel download it exists to avoid.
+        //
+        // A spill makes the question moot: memory is the copy buffer, and
+        // the ZIP central directory then decides how much of the file is
+        // read back (the member, not the archive). Reading the stream to
+        // EOF is also what keeps ADR 0003's read-verification in play —
+        // `StoragePort::get` compares the delivered bytes against the
+        // hash they are stored under, and only at EOF.
         let read_result = match self.storage.get(&artifact.sha256_checksum).await {
-            Ok(mut stream) => stream
-                .read_to_end(&mut wheel_bytes)
+            Ok(mut stream) => crate::seekable_spill::spill_to_seekable(&mut *stream)
                 .await
-                .map(|_| ())
                 .map_err(|e| {
                     DomainError::Invariant(format!(
                         "wheel-metadata extract: CAS re-read stream failed: {e}"
@@ -3326,9 +3342,9 @@ impl IngestUseCase {
             Err(e) => Err(e),
         };
         match read_result {
-            Ok(()) => {
+            Ok(wheel) => {
                 let extract = handler
-                    .extract_wheel_metadata_bytes(coords, PayloadAccess::Bytes(&wheel_bytes));
+                    .extract_wheel_metadata_bytes(coords, PayloadAccess::ReadSeek(Box::new(wheel)));
                 match extract {
                     Ok(Some(metadata_bytes)) => {
                         let metadata_len = metadata_bytes.len();
@@ -3337,7 +3353,7 @@ impl IngestUseCase {
                         // contract).
                         let metadata_hash = match self
                             .storage
-                            .put(Box::new(std::io::Cursor::new(metadata_bytes.to_vec())))
+                            .put(Box::new(std::io::Cursor::new(metadata_bytes)))
                             .await
                         {
                             Ok(put_result) => put_result.hash,
@@ -10449,6 +10465,52 @@ mod tests {
             legacy_md5: None,
             payload_metadata: serde_json::Value::Null,
         }
+    }
+
+    /// The extraction hook must not read the artifact back whole.
+    ///
+    /// `PayloadAccess::Bytes` can only be constructed from a slice the
+    /// caller already materialised, so the variant the hook hands the
+    /// handler *is* the observable: `Bytes` means a whole-artifact
+    /// `Vec<u8>` exists at that moment, `ReadSeek` means it does not.
+    /// A size assertion could not separate them — the buffer is the
+    /// artifact's size either way, which is the defect.
+    ///
+    /// The counter-assertion keeps the recorder honest: the stub
+    /// distinguishes all three variants, so this test fails if the hook
+    /// regresses to `Bytes` rather than passing vacuously on an empty
+    /// recording.
+    #[test]
+    fn ingest_wheel_hands_the_handler_a_seekable_payload_not_a_whole_buffer() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, _lifecycle, _storage, repos, _content_refs) =
+                make_use_case_with_content_refs(true);
+            repos.insert(repo);
+
+            let handler = StubFormatHandler::new("pypi")
+                .with_max_bytes(10 * 1024 * 1024)
+                .with_wheel_metadata(WheelMetadataStubBehaviour::EmitBytes(b"Name: x\n".to_vec()));
+            let shapes = handler.wheel_payload_shapes();
+
+            uc.ingest_direct(
+                req_wheel(repo_id),
+                content_stream(b"fake-wheel-bytes"),
+                &handler,
+            )
+            .await
+            .expect("wheel ingest must succeed");
+
+            let seen = shapes.lock().unwrap().clone();
+            assert_eq!(
+                seen,
+                vec![WheelPayloadShape::ReadSeek],
+                "the ingest hook must hand the handler a seekable payload, not a \
+                 materialised whole-artifact buffer",
+            );
+        });
     }
 
     /// Happy path — a PyPI wheel ingest whose

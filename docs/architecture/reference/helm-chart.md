@@ -105,6 +105,7 @@ flipped on).
 | CronJob — scrub (`cronjob-scrub.yaml`) | `scheduledTasks.scrub.enabled` (default **true**) | `hort-server scrub` CAS integrity sweep. **`executionPath: dsn-direct`: gated by `scheduledTasks.scrub.enabled` alone — not by `scheduledTasks.adminTasksEnabled`.** |
 | PodDisruptionBudget (`pdb.yaml`) | `replicaCount > 1` **OR** `podDisruptionBudget.enabled` | `minAvailable` guard. |
 | NetworkPolicy (`networkpolicy.yaml`) | `networkPolicy.enabled` (default **true**) | Ingress+Egress policy for server pods. |
+| NetworkPolicy — Job bootstrap egress (`networkpolicy-migrate-job.yaml`) | `networkPolicy.enabled` (default **true**) | the second half of the pair: an **additive** Egress allowance for this release's Job/CronJob pods, which run while the server policy's deny-all is already active. Narrowed to named destinations with `networkPolicy.jobEgress`; empty keeps the shipped allowance. The selector is a scope, not a credential — see the chart README. |
 | ServiceMonitor (`servicemonitor.yaml`) | `metrics.serviceMonitor.enabled` (hard-fails render if `metrics.bindAddr` empty) | Prometheus-operator scrape. |
 | Deployment — worker (`worker-deployment.yaml`) | `worker.enabled` | multi-kind poll-loop dispatcher (scanners + rescan/advisory/sweep/noop). |
 | ConfigMap — worker (`worker-configmap.yaml`) | `worker.enabled` | non-secret worker env. |

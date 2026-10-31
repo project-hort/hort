@@ -1,10 +1,18 @@
-//! Ingest-enqueue atomicity integration tests (ADR 0002/0004 no-strand).
+//! `PgArtifactLifecycle` commit-contract integration tests (ADR 0002/0004).
 //!
-//! `PgArtifactLifecycle::commit_transition_with_enqueues` must commit the
-//! transition events, the artifact projection, and the ingest-time `jobs`
+//! Two halves of the same contract, against a real database:
+//!
+//! **Atomicity (no-strand).** `commit_transition_with_enqueues` must commit
+//! the transition events, the artifact projection, and the ingest-time `jobs`
 //! rows in ONE transaction, so a failed enqueue can never leave an artifact
 //! ingested with a `ScanRequested` event but no `jobs` row (the dual-write
 //! strand the method was added to close).
+//!
+//! **Agreement.** Atomicity alone is not enough: a pair whose `AppendEvents`
+//! is not the handed-in artifact's stream would commit *atomically*, leaving
+//! the `artifacts` row and the stream it is derived from permanently
+//! contradicting each other with no intermediate state for anything to
+//! notice. Such a pair must not commit at all.
 //!
 //! Force-failure vector: an invalid `trigger_source` violates the
 //! `jobs.trigger_source` CHECK (migration 009), so the in-tx scan insert
@@ -151,6 +159,16 @@ fn ingest_events(a: &Artifact) -> AppendEvents {
     }
 }
 
+/// Rows on one stream, by its wire-form id — `count` binds a `Uuid`, and
+/// a stream id is text.
+async fn stream_rows(pool: &PgPool, stream_id: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM public.events WHERE stream_id = $1")
+        .bind(stream_id)
+        .fetch_one(pool)
+        .await
+        .expect("count events on stream")
+}
+
 async fn count(pool: &PgPool, sql: &'static str, id: Uuid) -> i64 {
     sqlx::query_scalar::<_, i64>(sql)
         .bind(id)
@@ -276,5 +294,169 @@ async fn commit_lands_artifact_and_scan_and_provenance_jobs() {
     assert_eq!(
         prov, 1,
         "the provenance-verify job is committed atomically with the transition",
+    );
+}
+
+/// A batch on another artifact's stream does not commit: no event row on
+/// the foreign stream, no artifact row, nothing.
+///
+/// The transaction is the hazard here rather than the protection — both
+/// halves would land together and stay landed. The refusal is therefore
+/// before the connection is opened, not a rollback after it.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn commit_transition_refuses_a_batch_on_another_artifacts_stream() {
+    let Some((pool, repo_id)) = maybe_setup().await else {
+        return;
+    };
+    let lc = lifecycle(&pool).await;
+    let a = artifact(repo_id);
+    let other = Uuid::new_v4();
+
+    let mut events = ingest_events(&a);
+    events.stream_id = StreamId::artifact(other);
+    let foreign_stream = events.stream_id.to_string();
+
+    let err = lc
+        .commit_transition(&a, events, None)
+        .await
+        .expect_err("a pair naming two different artifacts must not commit");
+    assert!(
+        err.to_string().contains(&a.id.to_string()) && err.to_string().contains(&other.to_string()),
+        "the refusal must name both sides: {err}"
+    );
+
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM public.artifacts WHERE id = $1",
+            a.id
+        )
+        .await,
+        0,
+        "no artifact row may survive a refused pair",
+    );
+    assert_eq!(
+        stream_rows(&pool, &foreign_stream).await,
+        0,
+        "no event may land on the stream the batch wrongly named",
+    );
+}
+
+/// Same rule on the ingest path, which carries the enqueues and the
+/// content-reference edges too — none of them may land either.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn commit_transition_with_enqueues_refuses_a_batch_on_another_artifacts_stream() {
+    let Some((pool, repo_id)) = maybe_setup().await else {
+        return;
+    };
+    let lc = lifecycle(&pool).await;
+    let a = artifact(repo_id);
+    let other = Uuid::new_v4();
+
+    let mut events = ingest_events(&a);
+    events.stream_id = StreamId::artifact(other);
+    let foreign_stream = events.stream_id.to_string();
+
+    lc.commit_transition_with_enqueues(
+        &a,
+        events,
+        None,
+        &[IngestEnqueue::Scan {
+            format: "pypi".into(),
+            priority: 0,
+            trigger_source: "ingest".into(),
+        }],
+        &[],
+    )
+    .await
+    .expect_err("a pair naming two different artifacts must not commit");
+
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM public.artifacts WHERE id = $1",
+            a.id
+        )
+        .await,
+        0,
+        "no artifact row may survive a refused pair",
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM public.jobs WHERE artifact_id = $1",
+            a.id
+        )
+        .await,
+        0,
+        "no jobs row may survive a refused pair",
+    );
+    assert_eq!(
+        stream_rows(&pool, &foreign_stream).await,
+        0,
+        "no event may land on the stream the batch wrongly named",
+    );
+}
+
+/// And the verdict path, which writes only the status column — the same
+/// refusal, in the method whose projection write is the narrowest.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn commit_provenance_verdict_refuses_a_batch_on_another_artifacts_stream() {
+    let Some((pool, repo_id)) = maybe_setup().await else {
+        return;
+    };
+    let lc = lifecycle(&pool).await;
+    let a = artifact(repo_id);
+    let other = Uuid::new_v4();
+
+    let mut events = ingest_events(&a);
+    events.stream_id = StreamId::artifact(other);
+    let foreign_stream = events.stream_id.to_string();
+
+    lc.commit_provenance_verdict(&a, events, QuarantineStatus::Quarantined)
+        .await
+        .expect_err("a pair naming two different artifacts must not commit");
+
+    assert_eq!(
+        stream_rows(&pool, &foreign_stream).await,
+        0,
+        "no event may land on the stream the batch wrongly named",
+    );
+}
+
+/// COUNTER-TEST: the matching pair commits unchanged. Both halves land,
+/// on the artifact's own stream — so the rule above refuses the
+/// mismatch and nothing else.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn commit_transition_commits_a_matching_pair_unchanged() {
+    let Some((pool, repo_id)) = maybe_setup().await else {
+        return;
+    };
+    let lc = lifecycle(&pool).await;
+    let a = artifact(repo_id);
+    let own_stream = StreamId::artifact(a.id).to_string();
+
+    lc.commit_transition(&a, ingest_events(&a), None)
+        .await
+        .expect("a matching pair commits");
+
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM public.artifacts WHERE id = $1",
+            a.id
+        )
+        .await,
+        1,
+        "the artifact row lands",
+    );
+    assert_eq!(
+        stream_rows(&pool, &own_stream).await,
+        2,
+        "both events land on the artifact's own stream",
     );
 }

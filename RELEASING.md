@@ -176,6 +176,13 @@ git push origin vX.Y.Z-alpha.N               # push the tag — triggers the int
 git checkout develop                         # do NOT merge or delete the test/* branch — it stays live for staging
 ```
 
+**Delete the *superseded* `test/*` branch once the next cut replaces it.** The
+line above is about the *current* branch. Only the newest one is live — staging
+deploys from exactly that branch — and every older one is dead weight whose
+commit the identically-named tag already holds, so deleting it costs no
+reachability. Without this step they accumulate: there were 87 on 2026-10-29,
+of which 86 were obsolete. Tags are never deleted.
+
 The tag pipeline (GitLab `.gitlab-ci.yml` `build-images:hort-server` /
 `build-images:hort-worker` / `helm:lint-and-publish`, tag-regex-gated) builds
 and publishes `:X.Y.Z-alpha.N` **to the internal registry only**

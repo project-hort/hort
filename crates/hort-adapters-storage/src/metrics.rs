@@ -25,6 +25,9 @@ pub mod labels {
     pub const OPERATION: &str = "operation";
     /// Outcome classification for a storage operation.
     pub const RESULT: &str = "result";
+    /// Why a metadata-mirror read refused the body it found. Enumerable
+    /// — see [`values::REASON_UNFRAMED`] / [`values::REASON_DIGEST_MISMATCH`].
+    pub const REASON: &str = "reason";
 }
 
 /// Enumerable label-value constants that storage adapters emit.
@@ -55,6 +58,16 @@ pub mod values {
     /// request-serving handlers do not call `delete`. Observed frequency
     /// is bounded by declared-hash violation rate.
     pub const OPERATION_DELETE: &str = "delete";
+
+    /// Mirror-read refusal: the stored body carries no frame header, so
+    /// no digest was ever recorded for it. Expected transiently after an
+    /// upgrade — every body written before the frame existed reads this
+    /// way until its next upstream refresh rewrites it — and never
+    /// afterwards.
+    pub const REASON_UNFRAMED: &str = "unframed";
+    /// Mirror-read refusal: the body did not hash to the digest recorded
+    /// with it. Corruption, truncation, or alteration at rest.
+    pub const REASON_DIGEST_MISMATCH: &str = "digest_mismatch";
 }
 
 /// Outcome of a storage operation, used as the `result` label of
@@ -152,6 +165,30 @@ pub(crate) fn emit_integrity_failure(backend: &'static str) {
     metrics::counter!(
         "hort_storage_integrity_failures_total",
         labels::BACKEND => backend,
+    )
+    .increment(1);
+}
+
+/// Emit the `hort_metadata_mirror_integrity_failures_total{backend,reason}`
+/// counter — the metadata mirror's sibling of
+/// [`emit_integrity_failure`].
+///
+/// The mirror records its body's SHA-256 in a frame header on write and
+/// verifies it on read, so a read can refuse for two distinguishable
+/// reasons and the operator needs them apart: `unframed` is the expected,
+/// self-healing post-upgrade state of a body written before the frame
+/// existed, while `digest_mismatch` is a body that changed after it was
+/// written and warrants looking at the volume. Collapsing them into one
+/// series would bury the second in the first for exactly as long as the
+/// migration takes.
+///
+/// `reason` is drawn from [`values::REASON_UNFRAMED`] /
+/// [`values::REASON_DIGEST_MISMATCH`] — bounded, like every label here.
+pub(crate) fn emit_mirror_integrity_failure(backend: &'static str, reason: &'static str) {
+    metrics::counter!(
+        "hort_metadata_mirror_integrity_failures_total",
+        labels::BACKEND => backend,
+        labels::REASON => reason,
     )
     .increment(1);
 }

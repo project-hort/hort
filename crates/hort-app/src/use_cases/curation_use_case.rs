@@ -1055,52 +1055,74 @@ impl CurationUseCase {
         // decided against — the two MUST agree on boundary semantics.
         paired.artifact_mut().quarantine_deadline = quarantine_deadline;
 
-        // 5) Resolve the cross-axis release clearances. Only the release
-        //    arm consults them (`re_evaluate`'s still-in-window branch
-        //    ignores both); mirrors the policy-mutation pass, which
-        //    resolves them ONLY on the `ResetToReleased` arm to avoid an
-        //    unnecessary read on the re-quarantine arm.
-        let (provenance, curation) = if matches!(outcome, ReEvaluationOutcome::ResetToReleased) {
+        // 5) Resolve the cross-axis release clearances. The CURATION
+        //    conjunct is resolved on both arms, because `re_evaluate`
+        //    gates both on it: a re-quarantine hands the artifact to the
+        //    timer sweep, which reads provenance and has no curation
+        //    input, and the retroactive curation pass walks only the
+        //    active population — so a curation question deferred past the
+        //    re-quarantine is never asked again. The PROVENANCE conjunct
+        //    is the release arm's alone, for the mirror-image reason: the
+        //    timer release re-applies it. Mirrors the policy-mutation
+        //    pass.
+        //
+        //    Resolved once, above the arm split, because both arms need
+        //    it; the `StillRejected` outcome returned earlier and never
+        //    reaches here.
+        let curation = match resolve_curation_clearance(
+            &*self.curation_rules,
+            &self.repository_access,
+            paired.artifact(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let result = classify_append_error(&e);
+                emit_curation_decision(
+                    CurationDecisionLabel::Reevaluate,
+                    Some(&repo_label),
+                    result,
+                );
+                return Err(e);
+            }
+        };
+        if !matches!(curation, CurationClearance::Cleared) {
+            tracing::info!(
+                artifact_id = %artifact_id,
+                actor_id = %actor.user_id,
+                curation = ?curation,
+                outcome = "held_cross_axis",
+                "curator reevaluate: an active curation rule blocks the artifact, so \
+                 neither a release nor a re-quarantine may proceed (ADR 0041 \
+                 invariant #6); artifact stays Rejected"
+            );
+            emit_curation_decision(
+                CurationDecisionLabel::Reevaluate,
+                Some(&repo_label),
+                CurationDecisionResult::Ok,
+            );
+            return Ok(still_rejected_noop());
+        }
+        let provenance = if matches!(outcome, ReEvaluationOutcome::ResetToReleased) {
             // The provenance leg came out of the derivation above, off the
             // SAME stream read the append's version came from. Resolving
             // it here from a second read would let a `ProvenanceVerified`
             // that landed after the pairing clear the gate while the
             // append still carried the pre-verification version.
             let provenance = derived_provenance;
-            let curation = match resolve_curation_clearance(
-                &*self.curation_rules,
-                &self.repository_access,
-                paired.artifact(),
-            )
-            .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    let result = classify_append_error(&e);
-                    emit_curation_decision(
-                        CurationDecisionLabel::Reevaluate,
-                        Some(&repo_label),
-                        result,
-                    );
-                    return Err(e);
-                }
-            };
-
             let provenance_clears = matches!(
                 provenance,
                 ProvenanceClearance::NotRequired | ProvenanceClearance::Cleared
             );
-            let curation_clears = matches!(curation, CurationClearance::Cleared);
-            if !provenance_clears || !curation_clears {
+            if !provenance_clears {
                 tracing::info!(
                     artifact_id = %artifact_id,
                     actor_id = %actor.user_id,
                     provenance = ?provenance,
-                    curation = ?curation,
                     outcome = "held_cross_axis",
-                    "curator reevaluate: scan passes but the cross-axis release \
-                     conjunction (curation ∧ provenance) does not currently clear \
-                     (ADR 0041 invariant #6); artifact stays Rejected"
+                    "curator reevaluate: scan passes but provenance does not currently \
+                     clear (ADR 0041 invariant #6); artifact stays Rejected"
                 );
                 emit_curation_decision(
                     CurationDecisionLabel::Reevaluate,
@@ -1109,9 +1131,11 @@ impl CurationUseCase {
                 );
                 return Ok(still_rejected_noop());
             }
-            (provenance, curation)
+            provenance
         } else {
-            (ProvenanceClearance::NotRequired, CurationClearance::Cleared)
+            // Not read on the re-quarantine arm: the timer release it
+            // defers to applies the provenance gate itself.
+            ProvenanceClearance::NotRequired
         };
 
         // 6) Commit: `Artifact::re_evaluate` re-derives the same
@@ -4217,6 +4241,7 @@ mod tests {
             Arc<MockArtifactLifecycle>,
             Arc<MockPolicyProjectionRepository>,
             Arc<MockCurationRuleRepository>,
+            Arc<MockStoragePort>,
         ) {
             let artifacts = Arc::new(MockArtifactRepository::new());
             let events = Arc::new(MockEventStore::new());
@@ -4226,6 +4251,7 @@ mod tests {
             let decisions_repo = Arc::new(MockCurationDecisionsRepository::new());
             let exclusions_repo = Arc::new(MockCurationExclusionsRepository::new());
             let curation_rules = Arc::new(MockCurationRuleRepository::new());
+            let storage = Arc::new(MockStoragePort::new());
             let uc = CurationUseCase::new(
                 crate::event_store_publisher::wrap_for_test(events.clone()),
                 artifacts.clone(),
@@ -4236,26 +4262,61 @@ mod tests {
                 exclusions_repo,
                 default_repository_access(),
                 curation_rules.clone(),
-                Arc::new(MockStoragePort::new()),
+                storage.clone(),
                 HashMap::new(),
             );
-            (uc, artifacts, events, lifecycle, policies, curation_rules)
+            (
+                uc,
+                artifacts,
+                events,
+                lifecycle,
+                policies,
+                curation_rules,
+                storage,
+            )
         }
 
         /// Seed a `Rejected` artifact whose stream carries
         /// `ArtifactRejected { Scanner }` followed by a `ScanCompleted`
-        /// with `critical` critical findings and no per-finding blob
-        /// (`derive_rejected_outcome`'s evidence load never resolves a
-        /// findings blob in this harness — every scenario below exercises
-        /// the aggregate-summary fallback, not the per-finding path).
+        /// with `critical` critical findings, **and** the per-finding blob
+        /// that `ScanCompleted` points at.
+        ///
+        /// The blob is not optional for a fixture that then asserts an
+        /// exclusion cleared the artifact: an exclusion names a CVE and is
+        /// matched against a finding's own `vulnerability_id`, so over the
+        /// recorded severity counts alone it matches nothing. The first
+        /// seeded finding carries `CVE-2024-3094`, the CVE the exclusion
+        /// tests below use.
         fn seed_rejected_with_scan(
             artifacts: &Arc<MockArtifactRepository>,
             events: &Arc<MockEventStore>,
+            storage: &Arc<MockStoragePort>,
             critical: u32,
         ) -> Uuid {
             let artifact = sample_artifact(QuarantineStatus::Rejected);
             let artifact_id = artifact.id;
             let stream_id = StreamId::artifact(artifact_id);
+            if critical > 0 {
+                // `persisted_scan_completed` points every non-clean scan
+                // at the same placeholder hash; the mock does not enforce
+                // `hash(content) == key`, so seeding under it is enough.
+                let findings: Vec<hort_domain::types::Finding> = (0..critical)
+                    .map(|i| {
+                        let cve = if i == 0 {
+                            "CVE-2024-3094".to_string()
+                        } else {
+                            format!("CVE-2024-OTHER-{i}")
+                        };
+                        reevaluate_finding(&cve)
+                    })
+                    .collect();
+                storage.insert_content(
+                    VALID_SHA256
+                        .parse::<hort_domain::types::ContentHash>()
+                        .unwrap(),
+                    serde_json::to_vec(&findings).unwrap(),
+                );
+            }
             events.set_stream(
                 &stream_id,
                 vec![
@@ -4267,6 +4328,27 @@ mod tests {
             artifact_id
         }
 
+        /// A stored Critical finding as the scan path wrote it into the
+        /// findings blob.
+        fn reevaluate_finding(vuln: &str) -> hort_domain::types::Finding {
+            hort_domain::types::Finding {
+                purl: "pkg:pypi/xz-utils@1.0.0".into(),
+                vulnerability_id: vuln.into(),
+                severity: SeverityThreshold::Critical,
+                cvss_score: None,
+                title: "test finding".into(),
+                fixed_versions: vec![],
+                source_scanner: "trivy".into(),
+                references: vec![],
+                aliases: vec![],
+                informational_class: None,
+                severity_basis: hort_domain::types::SeverityBasis::Assessed,
+                component_relation: hort_domain::types::ComponentRelation::NotEstablished,
+                statement: hort_domain::types::FindingStatement::Unstated,
+                advisory_published_at: None,
+            }
+        }
+
         /// An over-cap stream refuses the re-evaluation. The verdict rests
         /// on the latest `ScanCompleted` and the latest `ArtifactRejected`
         /// reason, both read off the paired evidence — over the oldest
@@ -4274,7 +4356,7 @@ mod tests {
         /// read happened to reach, so no verdict is derived from it.
         #[tokio::test]
         async fn reevaluate_refuses_a_stream_past_the_event_cap() {
-            let (uc, artifacts, events, lifecycle, _policies, _rules) =
+            let (uc, artifacts, events, lifecycle, _policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
             let artifact = sample_artifact(QuarantineStatus::Rejected);
             let artifact_id = artifact.id;
@@ -4301,9 +4383,9 @@ mod tests {
         /// artifact read, no commit.
         #[tokio::test]
         async fn denied_without_curator_or_admin() {
-            let (uc, artifacts, events, lifecycle, _policies, _rules) =
+            let (uc, artifacts, events, lifecycle, _policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
-            let artifact_id = seed_rejected_with_scan(&artifacts, &events, 0);
+            let artifact_id = seed_rejected_with_scan(&artifacts, &events, &_storage, 0);
             let privileges = CallerPrivileges {
                 is_admin: false,
                 is_reviewer: false,
@@ -4321,7 +4403,7 @@ mod tests {
         /// Bogus artifact id → `NotFound` (mirrors `waive`'s shape).
         #[tokio::test]
         async fn unknown_artifact_propagates_not_found() {
-            let (uc, _artifacts, _events, _lifecycle, _policies, _rules) =
+            let (uc, _artifacts, _events, _lifecycle, _policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
             let err = uc
                 .reevaluate(Uuid::new_v4(), api_actor(), curator_privileges())
@@ -4337,7 +4419,7 @@ mod tests {
         /// (ADR 0025 → 409 at the HTTP layer), no commit.
         #[tokio::test]
         async fn non_rejected_source_state_returns_invalid_state() {
-            let (uc, artifacts, _events, lifecycle, _policies, _rules) =
+            let (uc, artifacts, _events, lifecycle, _policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
             for status in [
                 QuarantineStatus::None,
@@ -4364,9 +4446,9 @@ mod tests {
         /// `block_on_critical` threshold) → `StillRejected`, no event.
         #[tokio::test]
         async fn still_rejected_when_finding_still_blocks() {
-            let (uc, artifacts, events, lifecycle, _policies, _rules) =
+            let (uc, artifacts, events, lifecycle, _policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
-            let artifact_id = seed_rejected_with_scan(&artifacts, &events, 1);
+            let artifact_id = seed_rejected_with_scan(&artifacts, &events, &_storage, 1);
             let outcome = uc
                 .reevaluate(artifact_id, api_actor(), curator_privileges())
                 .await
@@ -4377,18 +4459,14 @@ mod tests {
             assert!(lifecycle.committed_transitions().is_empty());
         }
 
-        /// Aggregate-summary fallback: two critical findings sharing one
-        /// CVE, one exclusion matching that CVE. The aggregate-summary
-        /// path decrements ONE count per exclusion (unlike per-finding
-        /// matching, which would clear all findings sharing a CVE) — one
-        /// critical remains → `StillRejected`. No findings blob is seeded
-        /// in this harness, so `derive_rejected_outcome` always falls
-        /// back to this path.
+        /// Two Critical findings under two distinct CVEs, one exclusion
+        /// matching one of them. The per-finding path drops the finding
+        /// the exclusion names and leaves the other → `StillRejected`.
         #[tokio::test]
-        async fn aggregate_fallback_leaves_one_finding_after_single_exclusion() {
-            let (uc, artifacts, events, lifecycle, policies, _rules) =
+        async fn one_exclusion_leaves_the_unexcluded_finding_blocking() {
+            let (uc, artifacts, events, lifecycle, policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
-            let artifact_id = seed_rejected_with_scan(&artifacts, &events, 2);
+            let artifact_id = seed_rejected_with_scan(&artifacts, &events, &_storage, 2);
             let policy_id = Uuid::new_v4();
             policies.insert(sample_policy_projection(
                 policy_id,
@@ -4414,12 +4492,132 @@ mod tests {
             assert!(lifecycle.committed_transitions().is_empty());
         }
 
+        /// Seed a `Rejected` artifact whose `ScanCompleted` records
+        /// `critical` Criticals and points at a findings blob that is
+        /// **not** in CAS — the at-rest-loss shape.
+        fn seed_rejected_with_unreadable_scan(
+            artifacts: &Arc<MockArtifactRepository>,
+            events: &Arc<MockEventStore>,
+            critical: u32,
+        ) -> Uuid {
+            let artifact = sample_artifact(QuarantineStatus::Rejected);
+            let artifact_id = artifact.id;
+            let stream_id = StreamId::artifact(artifact_id);
+            events.set_stream(
+                &stream_id,
+                vec![
+                    persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 0),
+                    persisted_scan_completed(artifact_id, critical, 1),
+                ],
+            );
+            artifacts.insert(artifact);
+            artifact_id
+        }
+
+        /// **An exclusion may only subtract what it is about.** The
+        /// findings blob is gone, so the recorded severity counts are the
+        /// only evidence left — and they say how many Criticals there were
+        /// without naming one. An exclusion matched against that would
+        /// remove the count some other finding contributed and un-reject
+        /// the artifact on evidence that never mentioned the excluded CVE,
+        /// so it subtracts nothing and the hold stands.
+        #[tokio::test]
+        async fn an_exclusion_does_not_loosen_an_unreadable_blob() {
+            let (uc, artifacts, events, lifecycle, policies, _rules, _storage) =
+                make_use_case_for_reevaluate();
+            let artifact_id = seed_rejected_with_unreadable_scan(&artifacts, &events, 1);
+            let policy_id = Uuid::new_v4();
+            // Elapsed window: nothing but the verdict is holding it.
+            policies.insert(sample_policy_projection(
+                policy_id,
+                SeverityThreshold::Critical,
+                0,
+            ));
+            policies.insert_exclusion(hort_domain::entities::scan_policy::ExclusionProjection {
+                exclusion_id: Uuid::new_v4(),
+                policy_id,
+                cve_id: "CVE-2024-3094".into(),
+                package_pattern: None,
+                scope: PolicyScope::Global,
+                reason: "patched upstream".into(),
+                added_by_actor_id: None,
+                expires_at: None,
+            });
+
+            let outcome = uc
+                .reevaluate(artifact_id, api_actor(), curator_privileges())
+                .await
+                .expect("still-rejected is Ok, not Err");
+            assert_eq!(outcome.outcome, ReEvaluationOutcome::StillRejected);
+            assert!(lifecycle.committed_transitions().is_empty());
+        }
+
+        /// **(c) gates the re-quarantine arm too, on the curator's path.**
+        /// Clean scan, window still OPEN (so the verdict is
+        /// `ResetToQuarantined`), and an active curation `Block` rule
+        /// matches. Re-quarantining would hand the artifact to the timer
+        /// sweep, whose release reads provenance and takes no curation
+        /// input — so the block would be dropped rather than deferred.
+        /// The artifact stays `Rejected`.
+        #[tokio::test]
+        async fn held_cross_axis_when_curation_blocks_a_re_quarantine() {
+            let (uc, artifacts, events, lifecycle, policies, curation_rules, _storage) =
+                make_use_case_for_reevaluate();
+            let artifact_id = seed_rejected_with_scan(&artifacts, &events, &_storage, 0);
+            let repository_id = artifacts
+                .find_by_id(artifact_id)
+                .await
+                .unwrap()
+                .repository_id;
+            let policy_id = Uuid::new_v4();
+            // One-hour duration against a `now` anchor → the computed
+            // deadline is still in the future.
+            policies.insert(sample_policy_projection(
+                policy_id,
+                SeverityThreshold::Critical,
+                3_600,
+            ));
+
+            curation_rules.set_rules_for_repo(
+                repository_id,
+                vec![CurationRule {
+                    id: Uuid::new_v4(),
+                    name: "block-my-pkg".into(),
+                    format: None,
+                    package_pattern: "my-pkg".into(),
+                    action: CurationRuleAction::Block,
+                    reason: "supply-chain concern".into(),
+                    managed_by: ManagedBy::GitOps,
+                    managed_by_digest: Some([0xab; 32]),
+                }],
+            );
+
+            let outcome = uc
+                .reevaluate(artifact_id, api_actor(), curator_privileges())
+                .await
+                .expect("held cross-axis is Ok, not Err");
+            assert_eq!(outcome.outcome, ReEvaluationOutcome::StillRejected);
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "a re-quarantine under an active block must not commit: {:?}",
+                lifecycle.committed_transitions(),
+            );
+            assert_eq!(
+                artifacts
+                    .find_by_id(artifact_id)
+                    .await
+                    .unwrap()
+                    .quarantine_status,
+                QuarantineStatus::Rejected,
+            );
+        }
+
         /// A non-scan-clearable rejection reason (ADR 0041 invariant
         /// #6(a)) is ineligible for a scan re-judgement → `StillRejected`,
         /// no event, no scan evidence read.
         #[tokio::test]
         async fn ineligible_reason_is_still_rejected_noop() {
-            let (uc, artifacts, events, lifecycle, _policies, _rules) =
+            let (uc, artifacts, events, lifecycle, _policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
             let artifact = sample_artifact(QuarantineStatus::Rejected);
             let artifact_id = artifact.id;
@@ -4447,7 +4645,7 @@ mod tests {
         /// (500), not a caller precondition.
         #[tokio::test]
         async fn no_scan_completed_returns_invariant_error() {
-            let (uc, artifacts, events, lifecycle, _policies, _rules) =
+            let (uc, artifacts, events, lifecycle, _policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
             let artifact = sample_artifact(QuarantineStatus::Rejected);
             let artifact_id = artifact.id;
@@ -4476,9 +4674,9 @@ mod tests {
         /// `ArtifactQuarantined` committed atomically.
         #[tokio::test]
         async fn resets_to_quarantined_when_window_open() {
-            let (uc, artifacts, events, lifecycle, policies, _rules) =
+            let (uc, artifacts, events, lifecycle, policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
-            let artifact_id = seed_rejected_with_scan(&artifacts, &events, 0);
+            let artifact_id = seed_rejected_with_scan(&artifacts, &events, &_storage, 0);
             let policy_id = Uuid::new_v4();
             // 1-hour duration; `sample_artifact`'s window anchor is `now`,
             // so the computed deadline is ~1h in the future.
@@ -4520,9 +4718,9 @@ mod tests {
         /// `ArtifactReleased` committed atomically.
         #[tokio::test]
         async fn resets_to_released_when_no_policy_and_clean() {
-            let (uc, artifacts, events, lifecycle, _policies, _rules) =
+            let (uc, artifacts, events, lifecycle, _policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
-            let artifact_id = seed_rejected_with_scan(&artifacts, &events, 0);
+            let artifact_id = seed_rejected_with_scan(&artifacts, &events, &_storage, 0);
 
             let outcome = uc
                 .reevaluate(artifact_id, api_actor(), curator_privileges())
@@ -4556,9 +4754,9 @@ mod tests {
         /// `StillRejected`, not released.
         #[tokio::test]
         async fn held_cross_axis_when_curation_rule_blocks() {
-            let (uc, artifacts, events, lifecycle, _policies, curation_rules) =
+            let (uc, artifacts, events, lifecycle, _policies, curation_rules, _storage) =
                 make_use_case_for_reevaluate();
-            let artifact_id = seed_rejected_with_scan(&artifacts, &events, 0);
+            let artifact_id = seed_rejected_with_scan(&artifacts, &events, &_storage, 0);
             let repository_id = artifacts
                 .find_by_id(artifact_id)
                 .await
@@ -4592,9 +4790,9 @@ mod tests {
         /// `Pending` (fail-closed); the artifact is held `StillRejected`.
         #[tokio::test]
         async fn held_cross_axis_when_provenance_required_and_unverified() {
-            let (uc, artifacts, events, lifecycle, policies, _rules) =
+            let (uc, artifacts, events, lifecycle, policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
-            let artifact_id = seed_rejected_with_scan(&artifacts, &events, 0);
+            let artifact_id = seed_rejected_with_scan(&artifacts, &events, &_storage, 0);
             let policy_id = Uuid::new_v4();
             let mut p = sample_policy_projection(policy_id, SeverityThreshold::Critical, 0);
             p.provenance_mode = ProvenanceMode::Required;
@@ -4613,9 +4811,9 @@ mod tests {
         /// again with no repeated events and no state churn.
         #[tokio::test]
         async fn idempotent_re_invoke_on_still_rejected() {
-            let (uc, artifacts, events, lifecycle, _policies, _rules) =
+            let (uc, artifacts, events, lifecycle, _policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
-            let artifact_id = seed_rejected_with_scan(&artifacts, &events, 1);
+            let artifact_id = seed_rejected_with_scan(&artifacts, &events, &_storage, 1);
 
             let first = uc
                 .reevaluate(artifact_id, api_actor(), curator_privileges())
@@ -4635,9 +4833,9 @@ mod tests {
         /// mirrors `waive`'s either-OR semantics.
         #[tokio::test]
         async fn admin_privilege_also_succeeds() {
-            let (uc, artifacts, events, _lifecycle, _policies, _rules) =
+            let (uc, artifacts, events, _lifecycle, _policies, _rules, _storage) =
                 make_use_case_for_reevaluate();
-            let artifact_id = seed_rejected_with_scan(&artifacts, &events, 1);
+            let artifact_id = seed_rejected_with_scan(&artifacts, &events, &_storage, 1);
             let outcome = uc
                 .reevaluate(artifact_id, api_actor(), admin_privileges())
                 .await

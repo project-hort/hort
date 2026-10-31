@@ -55,7 +55,14 @@ use hort_domain::ports::user_repository::UserRepository;
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{Page, PageRequest};
 
+use hort_adapters_ephemeral_memory::{InMemoryEphemeralStore, MeteredEphemeralStore};
+use hort_app::metrics::client_ip_bucket;
+use hort_app::use_cases::pat_validation_use_case::{
+    PAT_LOCKOUT_BY_IP_COUNTER_PREFIX, PAT_LOCKOUT_BY_IP_FLAG_PREFIX,
+};
+use hort_domain::ports::ephemeral_store::EphemeralStore;
 use hort_http_core::context::AuthContext;
+use hort_http_core::middleware::trust::{request_trust_layer, TrustConfig};
 use hort_http_core::test_support::{
     build_mock_ctx, with_api_token_use_case, with_auth, with_oci_public_base_url,
     with_oci_signing_key, with_oci_token_exchange,
@@ -163,11 +170,33 @@ struct Harness {
     repo_key: String,
     /// The image name segment under the repo (`<repo_key>/<image>`).
     image_name: String,
+    /// The DURABLE ephemeral store the PAT validator keys its
+    /// brute-force lockout into (`pat-attempt:` /
+    /// `pat-attempt-counter:`). Held so the attribution tests can read
+    /// WHICH bucket a failed `/v2/auth` credential landed in — the
+    /// wire response is a constant `401 invalid credential` for every
+    /// `PatValidationError` arm, lockout included, so the bucket key is
+    /// the only observable.
+    ephemeral_durable: Arc<MeteredEphemeralStore<InMemoryEphemeralStore>>,
 }
 
 /// Build a fully-wired `AppContext` with native tokens enabled, an
 /// OCI signing key wired, and one PAT seeded for `username = "alice"`.
 fn build_harness() -> Harness {
+    build_harness_with_lockout(PatLockoutConfig::DEFAULT)
+}
+
+/// [`build_harness`] with an operator-chosen lockout policy.
+///
+/// The attribution tests lower `threshold` because every failed
+/// validation costs one real Argon2id verify at the production
+/// parameters, which is ~9 ms in release mode but ~220 ms in the debug
+/// profile the test suite runs under. Thirty of those is seven seconds
+/// in one test for no additional coverage: the gate's arithmetic
+/// ("engages at `threshold` failures, not before") is identical at
+/// `threshold = 2`, and the threshold value itself is pinned by
+/// `PatLockoutConfig::DEFAULT`'s own unit test.
+fn build_harness_with_lockout(lockout: PatLockoutConfig) -> Harness {
     let handle = PrometheusBuilder::new().build_recorder().handle();
     let (ctx, mocks) = build_mock_ctx(handle);
 
@@ -256,7 +285,7 @@ fn build_harness() -> Harness {
         mocks.ephemeral_durable.clone(),
         pat_cache,
         Arc::new(SystemClock),
-        PatLockoutConfig::DEFAULT,
+        lockout,
     ));
 
     // -- 5. Switch the AppContext to enabled-auth + wire RBAC swap.
@@ -337,6 +366,7 @@ fn build_harness() -> Harness {
         plaintext_pat: plaintext,
         repo_key: "myrepo".into(),
         image_name: "library/nginx".into(),
+        ephemeral_durable: mocks.ephemeral_durable.clone(),
     }
 }
 
@@ -1230,4 +1260,187 @@ fn parse_challenge_param(www: &str, key: &str) -> Option<String> {
     let rest = &www[start..];
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
+}
+
+// ===========================================================================
+// Client attribution — `/v2/auth` must key the PAT brute-force lockout on
+// the proxy-trust-resolved caller, not on the socket peer.
+//
+// The handler used to read `ConnectInfo` directly, which behind a reverse
+// proxy is ONE address for every caller on earth. Thirty bad credentials
+// from anywhere then locked out every `docker login`, every authenticated
+// pull and every push for fifteen minutes, presenting as
+// `401 invalid credential` while anonymous pulls kept working.
+//
+// Both tests drive the REAL `request_trust_layer` over the REAL OCI router
+// so the whole chain is under test: socket peer → proxy-trust evaluation →
+// `RequestTrust` extension → handler → `OciTokenExchangeRequest.client_ip`
+// → `LockoutKeys`. A handler that went back to `ConnectInfo` fails them
+// both, because every request below arrives from the same peer.
+// ===========================================================================
+
+/// The trusted-proxy CIDR both attribution tests deploy behind, and a
+/// peer address inside it.
+const PROXY_CIDR: &str = "10.0.0.0/8";
+const PROXY_PEER: &str = "10.0.0.5:4444";
+
+/// A PAT-shaped plaintext whose 8-char body prefix matches no seeded
+/// row: parses, so it reaches the Argon2id sentinel verify and the
+/// failure bookkeeping, and never validates.
+const UNKNOWN_PAT: &str = "hort_pat_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+
+/// Wrap the production OCI router in the production trust layer,
+/// configured with no pinned public URL so `client_ip` comes from the
+/// `X-Forwarded-For` walk for peers inside `PROXY_CIDR`.
+fn router_behind_trusted_proxy(h: &Harness) -> axum::Router {
+    let trust = TrustConfig::new(
+        None,
+        vec![PROXY_CIDR.parse().unwrap()],
+        "http://0.0.0.0:8080/".parse().unwrap(),
+    );
+    oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone())
+        .with_state(h.ctx.clone())
+        .layer(request_trust_layer(trust))
+}
+
+/// One `/v2/auth` request carrying `pat` as the Basic password and
+/// `forwarded_for` as the proxy-supplied client chain.
+async fn v2_auth_through_proxy(
+    router: &axum::Router,
+    forwarded_for: &str,
+    pat: &str,
+) -> StatusCode {
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("oauth2:{pat}"));
+    router
+        .clone()
+        .oneshot(
+            Request::get("/v2/auth?service=hort.example.com")
+                .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                .header("x-forwarded-for", forwarded_for)
+                .extension(axum::extract::ConnectInfo(
+                    PROXY_PEER.parse::<std::net::SocketAddr>().unwrap(),
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn lockout_flag_is_set(h: &Harness, client: &str) -> bool {
+    let key = format!(
+        "{PAT_LOCKOUT_BY_IP_FLAG_PREFIX}{}",
+        client_ip_bucket(client.parse().unwrap())
+    );
+    h.ephemeral_durable.get(&key).await.unwrap().is_some()
+}
+
+async fn failure_counter(h: &Harness, client: &str) -> Option<u64> {
+    let key = format!(
+        "{PAT_LOCKOUT_BY_IP_COUNTER_PREFIX}{}",
+        client_ip_bucket(client.parse().unwrap())
+    );
+    h.ephemeral_durable
+        .get(&key)
+        .await
+        .unwrap()
+        .map(|v| u64::from_be_bytes(v.as_ref().try_into().expect("8-byte counter")))
+}
+
+#[test]
+fn v2_auth_lockout_buckets_are_per_forwarded_client_not_per_proxy() {
+    // Two callers behind ONE trusted proxy. Both reach us from the same
+    // socket peer; only `X-Forwarded-For` distinguishes them. Caller A
+    // burns its budget; caller B must be untouched — and neither bucket
+    // may be the proxy's.
+    const CLIENT_A: &str = "203.0.113.7";
+    const CLIENT_B: &str = "198.51.100.9";
+    run(async {
+        let h = build_harness_with_lockout(PatLockoutConfig {
+            threshold: 2,
+            ..PatLockoutConfig::DEFAULT
+        });
+        let router = router_behind_trusted_proxy(&h);
+
+        for _ in 0..2 {
+            let status = v2_auth_through_proxy(&router, CLIENT_A, UNKNOWN_PAT).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "an unknown PAT must 401 regardless of attribution"
+            );
+        }
+        v2_auth_through_proxy(&router, CLIENT_B, UNKNOWN_PAT).await;
+
+        assert!(
+            lockout_flag_is_set(&h, CLIENT_A).await,
+            "caller A reached the configured threshold and must be locked out"
+        );
+        assert!(
+            !lockout_flag_is_set(&h, CLIENT_B).await,
+            "caller B had one failure and must NOT be locked out: a shared \
+             bucket would have locked it out on A's traffic"
+        );
+        assert_eq!(
+            failure_counter(&h, CLIENT_B).await,
+            Some(1),
+            "caller B's own bucket must hold exactly its own one failure"
+        );
+        // The socket peer is a proxy, never a client. Attributing to it
+        // is the deployment-wide lockout this test exists to prevent —
+        // and it is what `ConnectInfo` would have produced for every
+        // request above.
+        assert!(
+            !lockout_flag_is_set(&h, "10.0.0.5").await,
+            "the proxy's own address must never carry a lockout"
+        );
+        assert_eq!(
+            failure_counter(&h, "10.0.0.5").await,
+            None,
+            "the proxy's own address must never carry a failure count"
+        );
+    });
+}
+
+#[test]
+fn v2_auth_lockout_engages_only_at_the_configured_failure_count() {
+    // The arithmetic of the gate, through the real handler: below
+    // threshold the bucket counts but does not trip; at threshold it
+    // trips. A handler threading `None` (the pre-fix
+    // `authenticate_bearer`-shaped mistake, and what `ConnectInfo`
+    // yields on a router with no `ConnectInfo`) disables the lockout
+    // entirely and leaves BOTH the counter and the flag absent, so this
+    // fails on the first assertion rather than silently passing.
+    const CLIENT: &str = "203.0.113.7";
+    run(async {
+        let h = build_harness_with_lockout(PatLockoutConfig {
+            threshold: 3,
+            ..PatLockoutConfig::DEFAULT
+        });
+        let router = router_behind_trusted_proxy(&h);
+
+        v2_auth_through_proxy(&router, CLIENT, UNKNOWN_PAT).await;
+        assert_eq!(
+            failure_counter(&h, CLIENT).await,
+            Some(1),
+            "the first failure must land in the forwarded client's bucket"
+        );
+        assert!(
+            !lockout_flag_is_set(&h, CLIENT).await,
+            "one failure of three must not trip the lockout"
+        );
+
+        v2_auth_through_proxy(&router, CLIENT, UNKNOWN_PAT).await;
+        assert!(
+            !lockout_flag_is_set(&h, CLIENT).await,
+            "two failures of three must not trip the lockout"
+        );
+
+        v2_auth_through_proxy(&router, CLIENT, UNKNOWN_PAT).await;
+        assert!(
+            lockout_flag_is_set(&h, CLIENT).await,
+            "the third failure must trip the configured threshold"
+        );
+    });
 }

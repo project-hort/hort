@@ -20,9 +20,11 @@ use super::BoxFuture;
 
 /// Maximum byte length of `TaskOutcome::Failed.reason`.
 ///
-/// The dispatcher writes `reason` to `jobs.result_summary JSONB`. A 4 KiB cap
-/// prevents unbounded column growth from pathological error messages while
-/// still accommodating full stack-trace summaries in practice.
+/// The dispatcher writes `reason` to `jobs.last_error`, which is an
+/// uncapped `text` column — so this cap is the only thing bounding it.
+/// 4 KiB keeps a pathological error message from growing the row without
+/// bound while still accommodating full stack-trace summaries in
+/// practice.
 pub const REASON_MAX_BYTES: usize = 4096;
 
 /// Per-invocation request data passed to every [`TaskHandler::run`] call.
@@ -50,8 +52,14 @@ pub struct TaskContext {
 
 /// Outcome of a single [`TaskHandler::run`] invocation.
 ///
-/// Serialised to `jobs.result_summary JSONB` by the dispatcher.
-/// The `#[serde(tag = "outcome")]` discriminant makes the DB row self-describing.
+/// The dispatcher does not serialise this type; it destructures it and
+/// writes each variant's payload to the column that variant belongs in —
+/// `Completed { result_summary }` to `jobs.result_summary JSONB`,
+/// `Failed { reason }` to `jobs.last_error` (text), with `retry`
+/// deciding only whether the row is rescheduled or failed. The
+/// `Serialize`/`Deserialize` derives and the `#[serde(tag = "outcome")]`
+/// discriminant are therefore not what any DB row carries; they exist
+/// for the type's own wire use.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum TaskOutcome {

@@ -788,10 +788,30 @@ async fn do_publish(
         .get("_attachments")
         .and_then(|v| v.as_object())
         .ok_or_else(|| validation_error("publish body missing `_attachments`"))?;
-    let (filename, _attachment) = attachments
-        .iter()
-        .next()
-        .ok_or_else(|| validation_error("publish body has no attachments"))?;
+    // The filename is the key whose `data` value the streaming decoder
+    // actually consumed, NOT `attachments.iter().next()`. `serde_json::Map`
+    // is a `BTreeMap` here (no `preserve_order` feature), so iterating the
+    // parsed object yields the lexicographically smallest key, while the
+    // decoder consumes the first attachment on the wire. On an envelope
+    // whose keys are not in lexicographic order those are different
+    // entries, and the version would then be parsed off one attachment's
+    // filename and bound to another attachment's bytes.
+    let filename = decoded.attachment_key.as_str();
+    // The decoder's key is recovered by a byte-level lexer that does not
+    // perform full JSON string unescaping, so a key carrying an escape
+    // would not round-trip. Requiring it to be present verbatim in the
+    // parsed object is what keeps the two views of the envelope in
+    // agreement: a key this handler cannot locate is one whose bytes it
+    // cannot prove it holds.
+    if !attachments.contains_key(filename) {
+        tracing::debug!(
+            filename,
+            "npm publish: consumed attachment key absent from the parsed envelope"
+        );
+        return Err(validation_error(
+            "publish body's attachment filename could not be matched to its data",
+        ));
+    }
 
     // npm's `_attachments` key is the REGISTRY filename, which for scoped
     // packages includes the scope: `@scope/pkg-{version}.tgz`. For
@@ -822,6 +842,29 @@ async fn do_publish(
     // row unvalidated. Error messages never echo the rejected input.
     hort_formats::npm::validate_npm_version(&version)
         .map_err(|e| ApiError::from(hort_app::error::AppError::Domain(e)))?;
+
+    // What the tarball declares about itself must agree with what it is
+    // being stored under, or the publish is refused. The name comes from
+    // the route and the version from the attachment key — neither from the
+    // bytes — and the SHA-1/SHA-256 the ingest computes proves byte
+    // integrity, not package identity: a tarball whose `package.json` says
+    // `evil` hashes exactly as cleanly stored under `express`. Two
+    // consumers depend on the agreement: a client reading the installed
+    // package's own manifest, and hort's own scan subjects, which are built
+    // from the stored identity while the dependency evidence is read from
+    // these bytes.
+    //
+    // Runs AFTER the name/version grammar validators so their negative
+    // paths keep hitting THEIR error first, and BEFORE `ingest_direct` so
+    // a divergence costs no CAS write.
+    match read_declared_tarball_identity(&decoded).await {
+        Ok(declared) => {
+            if let Some(divergence) = declared.check(pkg_name, &version).divergence() {
+                return Ok(identity_refusal(&divergence.message("npm tarball")));
+            }
+        }
+        Err(refusal) => return Ok(refusal),
+    }
 
     // Pull the per-version packument block — `body["versions"][version]` —
     // to hand to ingest as payload metadata. npm publish requests always
@@ -1184,6 +1227,96 @@ async fn resolve_dist_tag_write(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Read the identity the spooled publish tarball declares in its own
+/// `package/package.json`.
+///
+/// # Bounds and buffering
+///
+/// The read routes through `hort_formats::npm::read_npm_tarball_identity`,
+/// which is itself built on the audited
+/// `hort_formats::archive_bounds::read_tar_gz_entry` — bounded
+/// decompressed output (compression-ratio + ceiling), bounded entry count,
+/// nested archives rejected. A publish path that opened the client's
+/// archive with its own reader would re-create the decompression-bomb
+/// surface that module exists to close.
+///
+/// Nothing is buffered that was not already on disk: the attachment is
+/// base64 inside a JSON envelope, so `stream_decode_body` has already
+/// spooled the decoded tarball to a `NamedTempFile` in order to compute
+/// its SHA-1 at all. This opens a second handle on that same file and
+/// hands it to the bounded reader, which materialises only the matched
+/// manifest entry. ADR 0003's streaming CAS is untouched —
+/// `ingest_direct` still streams from its own handle on the same file.
+///
+/// # Blocking
+///
+/// gzip inflation plus synchronous file reads are CPU/IO-bound work on an
+/// async handler, so the whole read happens inside `spawn_blocking`
+/// (mirroring `packument`'s projector hop).
+///
+/// # Errors
+///
+/// The `Err` arm is the pre-shaped refusal response to return — the same
+/// convention `resolve_actor_user_id` uses on this handler, so the per-format
+/// error form stays under this crate's control rather than `ApiError`'s. A
+/// reopen or joined-task failure is a 503 and NOT an accept: an identity the
+/// server failed to read is not one that agreed.
+async fn read_declared_tarball_identity(
+    decoded: &streaming_publish::DecodedPublish,
+) -> Result<hort_formats::npm::NpmTarballIdentity, Response> {
+    let file = decoded.tarball_file.reopen().map_err(|e| {
+        tracing::error!(error = %e, "publish tempfile reopen-for-identity failed");
+        infrastructure_refusal()
+    })?;
+    let compressed_size = decoded.tarball_size;
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut reader = std::io::BufReader::new(file);
+        hort_formats::npm::read_npm_tarball_identity(&mut reader, compressed_size)
+    })
+    .await
+    .map_err(|join_err| {
+        tracing::error!(error = %join_err, "publish identity read task failed");
+        infrastructure_refusal()
+    })?;
+    // The archive could not be read. An identity that could not be
+    // established is not an identity that agreed — npm's package format
+    // requires `package/package.json`, so its absence or corruption is a
+    // malformed publish and not a fact to wave through.
+    joined.map_err(|domain_err| identity_refusal(&domain_err.to_string()))
+}
+
+/// The npm-shaped refusal for a publish whose archive disagrees with its
+/// coordinates.
+///
+/// **400 + `{"error": "<message>"}`.** The npm registry API carries a
+/// rejection in a top-level `error` member, which `npm-registry-fetch`
+/// reads and the CLI prints as the user-visible message; a malformed
+/// publish body is a 400. The shape coincides with `ApiError`'s own
+/// `DomainError::Validation` envelope, so this helper exists to say that
+/// the coincidence is intentional rather than relied on by accident — the
+/// per-format error form is the registry's, not this server's convenience.
+fn identity_refusal(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [(CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "error": message }).to_string(),
+    )
+        .into_response()
+}
+
+/// A 503 for a tempfile / task failure during the identity read, matching
+/// `StreamDecodeError::Infrastructure`'s shape on the same path. Not a
+/// client-bad-input case: the publish is retryable, and it is NOT accepted
+/// — an identity the server failed to read is not one that agreed.
+fn infrastructure_refusal() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "error": "publish identity check failed" }).to_string(),
+    )
+        .into_response()
+}
+
 fn extract_version(filename: &str, basename: &str) -> Option<String> {
     let prefix = format!("{basename}-");
     let stripped = filename.strip_prefix(&prefix)?.strip_suffix(".tgz")?;
@@ -1388,7 +1521,26 @@ mod tests {
     /// earlier version of this helper used the unscoped form for both,
     /// which let a matching bug in `do_publish` pass the scoped tests;
     /// real npm clients rejected the E2E uploads.
-    fn build_publish_body(pkg_name: &str, version: &str, tarball_bytes: &[u8]) -> Vec<u8> {
+    /// A publish body whose attachment is a REAL minimal npm tarball
+    /// declaring `pkg_name`/`version` in its own `package/package.json`.
+    ///
+    /// The publish path reads that declaration and refuses a disagreement,
+    /// so opaque bytes here would make every test in this module a test of
+    /// the refusal path. Use [`build_publish_body_with_tarball`] when the
+    /// attachment payload is what the test is about.
+    fn build_publish_body(pkg_name: &str, version: &str) -> Vec<u8> {
+        build_publish_body_with_tarball(
+            pkg_name,
+            version,
+            &hort_formats::test_support::build_npm_tarball(pkg_name, version),
+        )
+    }
+
+    fn build_publish_body_with_tarball(
+        pkg_name: &str,
+        version: &str,
+        tarball_bytes: &[u8],
+    ) -> Vec<u8> {
         let filename = format!("{pkg_name}-{version}.tgz");
         let b64 = base64::engine::general_purpose::STANDARD.encode(tarball_bytes);
 
@@ -1423,11 +1575,10 @@ mod tests {
     fn build_publish_body_with_tags(
         pkg_name: &str,
         version: &str,
-        tarball_bytes: &[u8],
         dist_tags: serde_json::Value,
     ) -> Vec<u8> {
         let mut body: serde_json::Value =
-            serde_json::from_slice(&build_publish_body(pkg_name, version, tarball_bytes)).unwrap();
+            serde_json::from_slice(&build_publish_body(pkg_name, version)).unwrap();
         body["dist-tags"] = dist_tags;
         serde_json::to_vec(&body).unwrap()
     }
@@ -1451,7 +1602,6 @@ mod tests {
         let body = build_publish_body_with_tags(
             "express",
             "1.0.0",
-            b"tarball-bytes",
             serde_json::json!({ "latest": "1.0.0" }),
         );
         let res = router
@@ -1493,7 +1643,6 @@ mod tests {
         let body = build_publish_body_with_tags(
             "express",
             "2.0.0-rc.1",
-            b"tarball-bytes",
             serde_json::json!({ "next": "2.0.0-rc.1" }),
         );
         let res = router
@@ -1518,7 +1667,7 @@ mod tests {
         insert_repo(&h, "npm-test");
         let router = router(h.ctx.clone());
 
-        let body = build_publish_body("express", "1.0.0", b"tarball-bytes");
+        let body = build_publish_body("express", "1.0.0");
         let res = router
             .oneshot(
                 Request::put("/npm/npm-test/express")
@@ -1544,7 +1693,6 @@ mod tests {
         let body = build_publish_body_with_tags(
             "express",
             "1.0.0",
-            b"tarball-bytes",
             serde_json::json!({
                 "latest": "1.0.0",
                 "numeric": 7,                 // not a string
@@ -1823,7 +1971,7 @@ mod tests {
         h.repositories.insert(repo);
         let router = router(h.ctx.clone());
 
-        let body = build_publish_body("express", "1.0.0", b"tarball-bytes");
+        let body = build_publish_body("express", "1.0.0");
         let res = router
             .oneshot(
                 Request::put("/npm/npm-virt/express")
@@ -1842,7 +1990,7 @@ mod tests {
         insert_repo(&h, "npm-test");
         let router = router(h.ctx.clone());
 
-        let body = build_publish_body("express", "1.0.0", b"tarball-bytes");
+        let body = build_publish_body("express", "1.0.0");
         let res = router
             .oneshot(
                 Request::put("/npm/npm-test/express")
@@ -1884,7 +2032,7 @@ mod tests {
         h.curation_rules.set_rules_for_repo(repo.id, vec![rule]);
         let router = router(h.ctx.clone());
 
-        let body = build_publish_body("event-stream", "3.3.6", b"tarball-bytes");
+        let body = build_publish_body("event-stream", "3.3.6");
         let res = router
             .oneshot(
                 Request::put("/npm/npm-test/event-stream")
@@ -1918,7 +2066,7 @@ mod tests {
         insert_repo(&h, "npm-test");
         let router = router(h.ctx.clone());
 
-        let body = build_publish_body("@types/node", "20.0.0", b"tarball-bytes");
+        let body = build_publish_body("@types/node", "20.0.0");
         let res = router
             .oneshot(
                 Request::put("/npm/npm-test/@types/node")
@@ -1952,9 +2100,10 @@ mod tests {
 
         // Hand-build the body so the assertion cannot depend on
         // `build_publish_body` masking the real wire format.
-        let tarball = b"scoped-regression-bytes";
+        let tarball =
+            hort_formats::test_support::build_npm_tarball("@test/native-package", "1.0.0");
         let attachment_filename = "@test/native-package-1.0.0.tgz"; // scope-included
-        let b64 = base64::engine::general_purpose::STANDARD.encode(tarball);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&tarball);
         let body = serde_json::to_vec(&json!({
             "name": "@test/native-package",
             "versions": {
@@ -2013,8 +2162,8 @@ mod tests {
         insert_repo(&h, "npm-test");
         let router = router(h.ctx.clone());
 
-        let tarball = b"roundtrip tarball content";
-        let body = build_publish_body("express", "1.2.3", tarball);
+        let tarball = hort_formats::test_support::build_npm_tarball("express", "1.2.3");
+        let body = build_publish_body_with_tarball("express", "1.2.3", &tarball);
 
         let pub_res = router
             .clone()
@@ -2047,8 +2196,8 @@ mod tests {
         insert_repo(&h, "npm-test");
         let router = router(h.ctx.clone());
 
-        let tarball = b"scoped roundtrip";
-        let body = build_publish_body("@types/node", "20.17.33", tarball);
+        let tarball = hort_formats::test_support::build_npm_tarball("@types/node", "20.17.33");
+        let body = build_publish_body_with_tarball("@types/node", "20.17.33", &tarball);
 
         let pub_res = router
             .clone()
@@ -2081,9 +2230,9 @@ mod tests {
         insert_repo(&h, "npm-test");
         let router = router(h.ctx.clone());
 
-        let tarball = b"compute-sha1-on-me";
-        let expected_sha1 = hex::encode(Sha1::digest(tarball));
-        let body = build_publish_body("express", "1.0.0", tarball);
+        let tarball = hort_formats::test_support::build_npm_tarball("express", "1.0.0");
+        let expected_sha1 = hex::encode(Sha1::digest(&tarball));
+        let body = build_publish_body_with_tarball("express", "1.0.0", &tarball);
 
         let res = router
             .oneshot(
@@ -2142,13 +2291,25 @@ mod tests {
         // boundaries, (b) demonstrate the streaming path scales past
         // the prior in-memory `Vec<u8>` and (c) keep the test under
         // the default `cargo test` time budget.
-        let tarball: Vec<u8> = (0..50 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        // A real gzip-tar, because the publish path reads the identity the
+        // tarball declares. `package/package.json` is the first entry, which
+        // is what keeps it reachable: `read_tar_gz_entry`'s output cap is
+        // cumulative across the sequential tar scan, so a manifest behind
+        // 50 MiB of payload would be unreachable.
+        let payload: Vec<u8> = (0..50 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let tarball = hort_formats::test_support::build_tar_gz_bytes(&[
+            (
+                "package/package.json",
+                br#"{"name":"bigpkg","version":"9.9.9"}"#.as_slice(),
+            ),
+            ("package/payload.bin", &payload),
+        ]);
         let expected_sha1 = hex::encode(Sha1::digest(&tarball));
         let expected_sha256 = {
             use sha2::Digest as _;
             hex::encode(Sha2Sha256::digest(&tarball))
         };
-        let body = build_publish_body("bigpkg", "9.9.9", &tarball);
+        let body = build_publish_body_with_tarball("bigpkg", "9.9.9", &tarball);
         // Total envelope ≈ 50 MiB * 4/3 + small overhead.
         // `npm_routes` uses DEFAULT_PUBLISH_BODY_LIMIT (300 MiB), so
         // this fits comfortably.
@@ -2311,8 +2472,10 @@ mod tests {
         let router = router_with_publish_limit(h.ctx.clone(), 1024);
 
         // ~4 KiB tarball balloons to ~5.5 KiB after base64 — well over 1 KiB.
+        // Opaque bytes are fine here: the body-limit rejection fires in the
+        // streaming decoder, before anything opens the attachment.
         let tarball = vec![0u8; 4096];
-        let body = build_publish_body("express", "1.0.0", &tarball);
+        let body = build_publish_body_with_tarball("express", "1.0.0", &tarball);
 
         let res = router
             .oneshot(
@@ -2324,6 +2487,194 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // -- the identity the tarball declares ---------------------------------
+    //
+    // npm's coordinates come from channels the client controls and never
+    // from the bytes: the name from the route, the version from the
+    // `_attachments` key. The checksum the ingest verifies proves byte
+    // integrity, not package identity — a tarball whose `package.json`
+    // says `evil` hashes as cleanly under `express` as under its own name.
+
+    /// A publish body whose attachment is a tarball declaring a DIFFERENT
+    /// name than the route it is published under.
+    #[tokio::test]
+    async fn publish_refuses_a_tarball_declaring_another_name() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let body = build_publish_body_with_tarball(
+            "express",
+            "1.0.0",
+            &hort_formats::test_support::build_npm_tarball("evil", "1.0.0"),
+        );
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(res.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The npm registry API carries a rejection in an `error` member,
+        // which `npm-registry-fetch` surfaces as the CLI's message.
+        let message = json["error"].as_str().expect("an `error` member");
+        assert!(
+            message.contains("evil") && message.contains("express"),
+            "the refusal must name BOTH identities so a publisher can tell a \
+             mis-set name in their build from a tampered artifact: {message}"
+        );
+        assert!(
+            h.lifecycle.committed_transitions().is_empty(),
+            "a refused publish commits nothing"
+        );
+    }
+
+    /// Same, for the version — which comes off the `_attachments` key.
+    #[tokio::test]
+    async fn publish_refuses_a_tarball_declaring_another_version() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let body = build_publish_body_with_tarball(
+            "express",
+            "1.0.0",
+            &hort_formats::test_support::build_npm_tarball("express", "9.9.9"),
+        );
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(res.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = json["error"].as_str().expect("an `error` member");
+        assert!(
+            message.contains("9.9.9") && message.contains("1.0.0"),
+            "the refusal must name both versions: {message}"
+        );
+        assert!(h.lifecycle.committed_transitions().is_empty());
+    }
+
+    /// The counter-test: a correct publish still succeeds, and the stored
+    /// row carries the coordinates the tarball declared.
+    #[tokio::test]
+    async fn publish_of_an_agreeing_tarball_still_succeeds() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(build_publish_body("express", "1.0.0")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let stored = h.lifecycle.committed_transitions();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].0.name, "express");
+        assert_eq!(stored[0].0.version.as_deref(), Some("1.0.0"));
+    }
+
+    /// An attachment payload that is not a tarball at all cannot show that
+    /// it declares the coordinates it is published under. An identity that
+    /// could not be read is not an identity that agreed.
+    #[tokio::test]
+    async fn publish_refuses_an_attachment_that_is_not_a_tarball() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let body = build_publish_body_with_tarball("express", "1.0.0", b"not-a-tarball");
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(h.lifecycle.committed_transitions().is_empty());
+    }
+
+    /// F11-1 — the name and the bytes must come from the SAME attachment.
+    ///
+    /// `_attachments.iter().next()` yields the lexicographically smallest
+    /// key, because `serde_json::Map` is a `BTreeMap` here (`Cargo.lock`'s
+    /// `serde_json` entry has no `indexmap` dependency, so `preserve_order`
+    /// is off). The streaming decoder consumes the FIRST attachment on the
+    /// wire. This envelope puts the lexicographically smaller key second,
+    /// so the two disagree: `next()` answers `express-1.0.0.tgz` while the
+    /// bytes on the wire are the `2.0.0` tarball.
+    #[tokio::test]
+    async fn publish_binds_the_version_to_the_attachment_whose_bytes_were_consumed() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let sent = hort_formats::test_support::build_npm_tarball("express", "2.0.0");
+        let other = hort_formats::test_support::build_npm_tarball("express", "1.0.0");
+        // Hand-built so the wire order is ours to choose — `serde_json`
+        // would re-sort the keys on serialisation.
+        let body = format!(
+            concat!(
+                r#"{{"name":"express","#,
+                r#""versions":{{"2.0.0":{{"name":"express","version":"2.0.0"}}}},"#,
+                r#""_attachments":{{"#,
+                r#""express-2.0.0.tgz":{{"content_type":"application/octet-stream","data":"{sent}"}},"#,
+                r#""express-1.0.0.tgz":{{"content_type":"application/octet-stream","data":"{other}"}}"#,
+                r#"}}}}"#,
+            ),
+            sent = base64::engine::general_purpose::STANDARD.encode(&sent),
+            other = base64::engine::general_purpose::STANDARD.encode(&other),
+        );
+        assert!(
+            body.find("express-2.0.0.tgz").unwrap() < body.find("express-1.0.0.tgz").unwrap(),
+            "the fixture only proves anything if the wire order is not the \
+             lexicographic order"
+        );
+
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "the bytes sent declare 2.0.0 and the key they arrived under says \
+             2.0.0, so this publish is coherent and must be accepted"
+        );
+        let stored = h.lifecycle.committed_transitions();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].0.version.as_deref(),
+            Some("2.0.0"),
+            "the stored version must come from the attachment whose bytes were \
+             consumed, not from the lexicographically smallest key"
+        );
     }
 
     // -- route-parameter length cap ----------------------------------------
@@ -2342,7 +2693,7 @@ mod tests {
         // The validator operates on the decoded value; axum's Path
         // extractor performs the decode.
         let huge_scope = format!("@{}", "s".repeat(1024));
-        let body = build_publish_body("@huge/pkg", "1.0.0", b"tarball-bytes");
+        let body = build_publish_body("@huge/pkg", "1.0.0");
         let res = router
             .oneshot(
                 Request::put(format!("/npm/npm-test/{huge_scope}/pkg"))
@@ -2369,7 +2720,7 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let huge = "p".repeat(1024);
-        let body = build_publish_body(&huge, "1.0.0", b"tarball-bytes");
+        let body = build_publish_body(&huge, "1.0.0");
         let res = router
             .oneshot(
                 Request::put(format!("/npm/npm-test/{huge}"))
@@ -2411,8 +2762,8 @@ mod tests {
         // comparison short-circuits before the summary step. So the
         // committed `ArtifactMetadata.metadata` carries the full
         // block verbatim, readme and all.
-        let small_tarball = b"small tarball";
-        let small_b64 = base64::engine::general_purpose::STANDARD.encode(small_tarball);
+        let small_tarball = hort_formats::test_support::build_npm_tarball("express", "1.2.3");
+        let small_b64 = base64::engine::general_purpose::STANDARD.encode(&small_tarball);
         let small_body = serde_json::json!({
             "name": "express",
             "versions": {
@@ -2480,8 +2831,8 @@ mod tests {
             // ~30 bytes per entry * 20k ≈ 600 KB, comfortably over 256 KB.
             big_deps.insert(format!("dep-{i:05}"), serde_json::json!("^1.0.0"));
         }
-        let big_tarball = b"big tarball";
-        let big_b64 = base64::engine::general_purpose::STANDARD.encode(big_tarball);
+        let big_tarball = hort_formats::test_support::build_npm_tarball("bigpkg", "9.9.9");
+        let big_b64 = base64::engine::general_purpose::STANDARD.encode(&big_tarball);
         let big_body = serde_json::json!({
             "name": "bigpkg",
             "versions": {
@@ -2545,7 +2896,9 @@ mod tests {
         insert_repo(&h, "npm-test");
         let router = router(h.ctx.clone());
 
-        let body = build_publish_body("@types/node", "1.0.0", b"x");
+        // Opaque bytes are fine here: the composed-scope name validator
+        // rejects before anything opens the attachment.
+        let body = build_publish_body_with_tarball("@types/node", "1.0.0", b"x");
         let res = router
             .oneshot(
                 Request::put("/npm/npm-test/notascope/node")
@@ -2582,7 +2935,7 @@ mod tests {
         // extractor sees the decoded value `Foo Bar`. A real client would
         // either encode this or be rejected at the wire — the validator
         // covers the post-decode path inside the handler.
-        let body = build_publish_body("Foo Bar", "1.0.0", b"tarball-bytes");
+        let body = build_publish_body("Foo Bar", "1.0.0");
         let res = router
             .oneshot(
                 Request::put("/npm/npm-test/Foo%20Bar")
@@ -2614,7 +2967,7 @@ mod tests {
         // the inner separators. The decoded scope is `@scope` and the
         // decoded "name" segment is `../../etc` — composed full name is
         // `@scope/../../etc` which the validator must reject.
-        let body = build_publish_body("@scope/etc", "1.0.0", b"tarball-bytes");
+        let body = build_publish_body("@scope/etc", "1.0.0");
         let res = router
             .oneshot(
                 Request::put("/npm/npm-test/@scope/..%2F..%2Fetc")
@@ -2643,7 +2996,7 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let version = "1.0.0\u{0}";
-        let body = build_publish_body("express", version, b"tarball-bytes");
+        let body = build_publish_body("express", version);
         let res = router
             .oneshot(
                 Request::put("/npm/npm-test/express")
@@ -2679,7 +3032,7 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let version = "../../etc/passwd";
-        let body = build_publish_body("express", version, b"tarball-bytes");
+        let body = build_publish_body("express", version);
         let res = router
             .oneshot(
                 Request::put("/npm/npm-test/express")
@@ -2706,7 +3059,7 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let version = format!("1.0.0-{}", "a".repeat(128));
-        let body = build_publish_body("express", &version, b"tarball-bytes");
+        let body = build_publish_body("express", &version);
         let res = router
             .oneshot(
                 Request::put("/npm/npm-test/express")
@@ -2733,7 +3086,7 @@ mod tests {
         insert_repo(&h, "npm-test");
         let router = router(h.ctx.clone());
 
-        let body = build_publish_body("@scope/valid-pkg", "1.0.0", b"tarball-bytes");
+        let body = build_publish_body("@scope/valid-pkg", "1.0.0");
         let res = router
             .oneshot(
                 Request::put("/npm/npm-test/@scope/valid-pkg")
@@ -3616,7 +3969,8 @@ mod tests {
         let router = router(h.ctx.clone());
 
         // Publish unscoped `foo@1.0.0`.
-        let unscoped_body = build_publish_body("foo", "1.0.0", b"unscoped-foo-bytes");
+        let unscoped_tarball = hort_formats::test_support::build_npm_tarball("foo", "1.0.0");
+        let unscoped_body = build_publish_body_with_tarball("foo", "1.0.0", &unscoped_tarball);
         let res1 = router
             .clone()
             .oneshot(
@@ -3630,7 +3984,8 @@ mod tests {
         assert_eq!(res1.status(), StatusCode::OK);
 
         // Publish scoped `@foo/bar@1.0.0`.
-        let scoped_body = build_publish_body("@foo/bar", "1.0.0", b"scoped-bar-bytes");
+        let scoped_tarball = hort_formats::test_support::build_npm_tarball("@foo/bar", "1.0.0");
+        let scoped_body = build_publish_body_with_tarball("@foo/bar", "1.0.0", &scoped_tarball);
         let res2 = router
             .clone()
             .oneshot(
@@ -3655,7 +4010,7 @@ mod tests {
             .unwrap();
         assert_eq!(dl1.status(), StatusCode::OK);
         let body1 = to_bytes(dl1.into_body(), 64 * 1024).await.unwrap();
-        assert_eq!(&body1[..], b"unscoped-foo-bytes");
+        assert_eq!(&body1[..], unscoped_tarball.as_slice());
 
         // Download scoped — must return scoped bytes.
         let dl2 = router
@@ -3668,7 +4023,11 @@ mod tests {
             .unwrap();
         assert_eq!(dl2.status(), StatusCode::OK);
         let body2 = to_bytes(dl2.into_body(), 64 * 1024).await.unwrap();
-        assert_eq!(&body2[..], b"scoped-bar-bytes");
+        assert_eq!(
+            &body2[..],
+            scoped_tarball.as_slice(),
+            "the two packages' tarballs differ in their declared name, so this              also proves the routes did not cross"
+        );
     }
 
     // -- helpers --------------------------------------------------------------
@@ -4200,7 +4559,7 @@ mod tests {
                         let h = harness();
                         insert_repo(&h, "npm-test");
                         let ctx = enabled_ctx(&h.ctx);
-                        let body = build_publish_body("express", "1.0.0", b"tarball");
+                        let body = build_publish_body("express", "1.0.0");
                         put_with_principal(
                             ctx,
                             "/npm/npm-test/express",
@@ -4232,7 +4591,7 @@ mod tests {
                         let h = harness();
                         insert_repo(&h, "npm-test");
                         let ctx = enabled_ctx(&h.ctx);
-                        let body = build_publish_body("express", "1.0.0", b"tarball");
+                        let body = build_publish_body("express", "1.0.0");
                         put_with_principal(
                             ctx,
                             "/npm/npm-test/express",
@@ -4335,7 +4694,7 @@ mod tests {
                         let h = harness();
                         insert_repo(&h, "npm-test");
                         let ctx = enabled_ctx(&h.ctx);
-                        let body = build_publish_body("@types/node", "20.0.0", b"tarball");
+                        let body = build_publish_body("@types/node", "20.0.0");
                         put_with_principal(
                             ctx,
                             "/npm/npm-test/@types/node",
@@ -4367,7 +4726,7 @@ mod tests {
                         let h = harness();
                         insert_repo(&h, "npm-test");
                         let ctx = enabled_ctx(&h.ctx);
-                        let body = build_publish_body("@types/node", "20.0.0", b"tarball");
+                        let body = build_publish_body("@types/node", "20.0.0");
                         put_with_principal(
                             ctx,
                             "/npm/npm-test/@types/node",

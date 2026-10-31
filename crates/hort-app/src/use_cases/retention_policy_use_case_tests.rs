@@ -34,6 +34,13 @@ fn gitops_actor() -> Actor {
 struct MockEventStore {
     appended: Mutex<Vec<AppendEvents>>,
     next_results: Mutex<Vec<Result<AppendResult, DomainError>>>,
+    /// Pre-seeded streams, keyed by `StreamId`. Served by `read_stream`
+    /// so the self-heal's re-base has a stream to fold.
+    seeded_streams: Mutex<HashMap<StreamId, Vec<PersistedEvent>>>,
+    /// When `Some`, the NEXT `read_stream` returns this error (consumed
+    /// on fire) — the infrastructure failure the re-base must refuse on
+    /// rather than guess past.
+    next_read_error: Mutex<Option<DomainError>>,
 }
 
 impl MockEventStore {
@@ -41,13 +48,72 @@ impl MockEventStore {
         Self {
             appended: Mutex::new(Vec::new()),
             next_results: Mutex::new(Vec::new()),
+            seeded_streams: Mutex::new(HashMap::new()),
+            next_read_error: Mutex::new(None),
         }
     }
     fn push_append_error(&self, e: DomainError) {
         self.next_results.lock().unwrap().push(Err(e));
     }
+    fn push_append_result(&self, r: AppendResult) {
+        self.next_results.lock().unwrap().push(Ok(r));
+    }
     fn appended_batches(&self) -> Vec<AppendEvents> {
         self.appended.lock().unwrap().clone()
+    }
+    fn fail_next_read_stream(&self, e: DomainError) {
+        *self.next_read_error.lock().unwrap() = Some(e);
+    }
+
+    /// Seed the retention stream a real producer would have written for
+    /// `row`: the opening `Created`, plus `extra` events after it. Returns
+    /// the tail `stream_position`.
+    ///
+    /// Every event is run through `validate()` first, for the reason the
+    /// workspace's round-tripping doubles do: the production event store
+    /// validates on append, so an event this seeding accepted and the
+    /// adapter would reject is an event no producer can write, and a test
+    /// standing on one proves a behaviour production cannot show.
+    fn seed_retention_stream(
+        &self,
+        row: &RetentionPolicyRow,
+        extra: Vec<RetentionPolicyEvent>,
+    ) -> u64 {
+        let created = RetentionPolicyEvent::Created {
+            id: row.policy_id,
+            name: row.name.clone(),
+            predicate: row.predicate.clone(),
+            scope: row.scope.clone(),
+            created_at: row.created_at,
+        };
+        let stream_id = StreamId::retention_policy(row.policy_id);
+        let persisted: Vec<PersistedEvent> = std::iter::once(created)
+            .chain(extra)
+            .enumerate()
+            .map(|(i, event)| {
+                event
+                    .validate()
+                    .expect("seeded events must be ones a producer could append");
+                PersistedEvent {
+                    event_id: Uuid::new_v4(),
+                    stream_id: stream_id.clone(),
+                    stream_position: i as u64,
+                    global_position: i as u64,
+                    event: DomainEvent::RetentionPolicyChanged(event),
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: gitops_actor(),
+                    event_version: 1,
+                    stored_at: row.created_at,
+                }
+            })
+            .collect();
+        let tail = persisted.len() as u64 - 1;
+        self.seeded_streams
+            .lock()
+            .unwrap()
+            .insert(stream_id, persisted);
+        tail
     }
 }
 
@@ -69,11 +135,21 @@ impl EventStore for MockEventStore {
     }
     fn read_stream(
         &self,
-        _s: &StreamId,
+        s: &StreamId,
         _f: ReadFrom,
         _m: u64,
     ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
-        Box::pin(async { Ok(Vec::new()) })
+        if let Some(e) = self.next_read_error.lock().unwrap().take() {
+            return Box::pin(async move { Err(e) });
+        }
+        let found = self
+            .seeded_streams
+            .lock()
+            .unwrap()
+            .get(s)
+            .cloned()
+            .unwrap_or_default();
+        Box::pin(async move { Ok(found) })
     }
     fn read_category(
         &self,
@@ -128,9 +204,7 @@ impl MockProjections {
 }
 
 impl RetentionPolicyProjectionRepository for MockProjections {
-    fn list_active(
-        &self,
-    ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::retention::RetentionPolicy>>> {
+    fn list_active(&self) -> BoxFuture<'_, DomainResult<Vec<RetentionPolicy>>> {
         let v: Vec<_> = self
             .rows
             .lock()
@@ -398,12 +472,108 @@ async fn update_archived_policy_is_rejected() {
     ));
 }
 
+/// The stale-row repair at the retention `update_policy` site: the row is
+/// behind its stream, the first append is refused, and the retry appends
+/// at the version the stream reports.
 #[tokio::test]
-async fn update_maps_append_conflict() {
+async fn update_heals_a_stale_row_and_appends_at_the_stream_version() {
     let (uc, events, projections) = make_use_case();
     let id = Uuid::new_v4();
-    projections.insert(sample_row(id, "p", 5, false));
-    events.push_append_error(DomainError::Conflict("expected_version=5".into()));
+    let stale = sample_row(id, "p", 0, false);
+    let tail = events.seed_retention_stream(
+        &stale,
+        vec![RetentionPolicyEvent::Updated {
+            id,
+            predicate: PolicyPredicate::AgeExceeds(99),
+            scope: RetentionScope::AllRepos,
+            updated_at: stale.created_at,
+        }],
+    );
+    projections.insert(stale);
+    // LIFO: the result for the SECOND append is pushed first.
+    events.push_append_result(AppendResult {
+        stream_position: 2,
+        global_positions: vec![2],
+    });
+    events.push_append_error(DomainError::Conflict("expected_version=0".into()));
+
+    uc.update_policy(
+        UpdateRetentionPolicyCommand {
+            policy_id: id,
+            predicate: PolicyPredicate::AgeExceeds(123),
+            scope: RetentionScope::AllRepos,
+        },
+        gitops_actor(),
+    )
+    .await
+    .expect("heals");
+
+    let batches = events.appended_batches();
+    assert_eq!(batches.len(), 2, "one refused attempt, one that lands");
+    assert_eq!(batches[0].expected_version, ExpectedVersion::Exact(0));
+    assert_eq!(
+        batches[1].expected_version,
+        ExpectedVersion::Exact(tail),
+        "the retry must ask with the version the stream reports"
+    );
+    let last = projections.upserts().last().cloned().expect("an upsert");
+    assert_eq!(last.predicate, PolicyPredicate::AgeExceeds(123));
+    assert_eq!(last.stream_version, 2);
+}
+
+/// A conflict whose stream already states the update is an idempotent
+/// success, and the stale row is repaired on the way out.
+#[tokio::test]
+async fn update_whose_stream_already_states_it_succeeds_and_repairs_the_row() {
+    let (uc, events, projections) = make_use_case();
+    let id = Uuid::new_v4();
+    let stale = sample_row(id, "p", 0, false);
+    let tail = events.seed_retention_stream(
+        &stale,
+        vec![RetentionPolicyEvent::Updated {
+            id,
+            predicate: PolicyPredicate::AgeExceeds(123),
+            scope: RetentionScope::AllRepos,
+            updated_at: stale.created_at,
+        }],
+    );
+    projections.insert(stale);
+    events.push_append_error(DomainError::Conflict("expected_version=0".into()));
+
+    uc.update_policy(
+        UpdateRetentionPolicyCommand {
+            policy_id: id,
+            predicate: PolicyPredicate::AgeExceeds(123),
+            scope: RetentionScope::AllRepos,
+        },
+        gitops_actor(),
+    )
+    .await
+    .expect("idempotent");
+
+    assert_eq!(
+        events.appended_batches().len(),
+        1,
+        "the re-decide found the intent already satisfied"
+    );
+    let last = projections.upserts().last().cloned().expect("an upsert");
+    assert_eq!(last.predicate, PolicyPredicate::AgeExceeds(123));
+    assert_eq!(last.stream_version, tail);
+}
+
+/// A second refusal is a genuine concurrent writer — the second attempt's
+/// expected version came off the stream — and surfaces as retryable-busy
+/// (ADR 0060 (d)).
+#[tokio::test]
+async fn update_reports_a_genuine_concurrent_writer_as_contention() {
+    let (uc, events, projections) = make_use_case();
+    let id = Uuid::new_v4();
+    let row = sample_row(id, "p", 0, false);
+    events.seed_retention_stream(&row, Vec::new());
+    projections.insert(row);
+    events.push_append_error(DomainError::Conflict("expected_version=0".into()));
+    events.push_append_error(DomainError::Conflict("expected_version=0".into()));
+
     let err = uc
         .update_policy(
             UpdateRetentionPolicyCommand {
@@ -414,8 +584,253 @@ async fn update_maps_append_conflict() {
             gitops_actor(),
         )
         .await
-        .expect_err("stale expected_version → Conflict");
-    assert!(matches!(err, AppError::Domain(DomainError::Conflict(_))));
+        .expect_err("a conflict surviving the re-base must propagate");
+    assert!(
+        matches!(err, AppError::Domain(DomainError::Contended(_))),
+        "got {err:?}"
+    );
+    assert_eq!(
+        events.appended_batches().len(),
+        2,
+        "bounded at two attempts"
+    );
+    assert!(projections.upserts().is_empty(), "nothing is written");
+}
+
+/// A concurrent archival the caller could not have seen: the row says
+/// active, the stream says archived. B1's model is terminal-archive, so
+/// the re-decide refuses rather than appending an `Updated` the replay
+/// would itself reject on the next read.
+#[tokio::test]
+async fn update_refuses_when_the_stream_says_the_policy_was_archived() {
+    let (uc, events, projections) = make_use_case();
+    let id = Uuid::new_v4();
+    let stale = sample_row(id, "p", 0, false);
+    events.seed_retention_stream(
+        &stale,
+        vec![RetentionPolicyEvent::Archived {
+            id,
+            by: Uuid::new_v4(),
+            archived_at: stale.created_at,
+        }],
+    );
+    projections.insert(stale);
+    events.push_append_error(DomainError::Conflict("expected_version=0".into()));
+
+    let err = uc
+        .update_policy(
+            UpdateRetentionPolicyCommand {
+                policy_id: id,
+                predicate: PolicyPredicate::AgeExceeds(123),
+                scope: RetentionScope::AllRepos,
+            },
+            gitops_actor(),
+        )
+        .await
+        .expect_err("an archived policy must refuse the update");
+    match err {
+        AppError::Domain(DomainError::Validation(msg)) => {
+            assert!(msg.contains("archived"), "got: {msg}");
+        }
+        other => panic!("expected Validation, got {other:?}"),
+    }
+    assert_eq!(events.appended_batches().len(), 1);
+    assert!(projections.upserts().is_empty(), "nothing is rewritten");
+}
+
+/// Fail-closed: a stream that cannot be read rewrites nothing.
+#[tokio::test]
+async fn update_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+    let (uc, events, projections) = make_use_case();
+    let id = Uuid::new_v4();
+    let row = sample_row(id, "p", 5, false);
+    events.seed_retention_stream(&row, Vec::new());
+    projections.insert(row);
+    events.push_append_error(DomainError::Conflict("expected_version=5".into()));
+    events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+    let err = uc
+        .update_policy(
+            UpdateRetentionPolicyCommand {
+                policy_id: id,
+                predicate: PolicyPredicate::AgeExceeds(123),
+                scope: RetentionScope::AllRepos,
+            },
+            gitops_actor(),
+        )
+        .await
+        .expect_err("an unreadable stream must refuse");
+    assert!(err.to_string().contains("event store down"), "got: {err}");
+    assert_eq!(events.appended_batches().len(), 1);
+    assert!(projections.upserts().is_empty(), "nothing is rewritten");
+}
+
+/// Fail-closed: a stream the replay refuses rewrites nothing. An empty
+/// stream is the shape a conflict on a policy whose events are gone takes.
+#[tokio::test]
+async fn update_refuses_and_rewrites_nothing_when_the_stream_cannot_be_replayed() {
+    let (uc, events, projections) = make_use_case();
+    let id = Uuid::new_v4();
+    projections.insert(sample_row(id, "p", 5, false));
+    events.push_append_error(DomainError::Conflict("expected_version=5".into()));
+
+    let err = uc
+        .update_policy(
+            UpdateRetentionPolicyCommand {
+                policy_id: id,
+                predicate: PolicyPredicate::AgeExceeds(123),
+                scope: RetentionScope::AllRepos,
+            },
+            gitops_actor(),
+        )
+        .await
+        .expect_err("an unreplayable stream must refuse");
+    assert!(
+        matches!(err, AppError::Domain(DomainError::Invariant(_))),
+        "RetentionPolicy::project refuses an empty stream, got {err:?}"
+    );
+    assert!(projections.upserts().is_empty(), "nothing is rewritten");
+}
+
+/// An event on the retention stream that is not a
+/// `RetentionPolicyChanged` refuses the replay rather than being skipped:
+/// a row derived from a stream the replay cannot read in full would be
+/// missing whatever that event said.
+#[tokio::test]
+async fn update_refuses_a_stream_carrying_a_foreign_event() {
+    let (uc, events, projections) = make_use_case();
+    let id = Uuid::new_v4();
+    let row = sample_row(id, "p", 0, false);
+    events.seed_retention_stream(&row, Vec::new());
+    // Append a foreign event onto the seeded stream.
+    {
+        let stream_id = StreamId::retention_policy(id);
+        let mut streams = events.seeded_streams.lock().unwrap();
+        let stream = streams.get_mut(&stream_id).expect("seeded");
+        stream.push(PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: stream_id.clone(),
+            stream_position: 1,
+            global_position: 1,
+            event: DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+                artifact_id: Uuid::new_v4(),
+                quarantine_window_start: row.created_at,
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: gitops_actor(),
+            event_version: 1,
+            stored_at: row.created_at,
+        });
+    }
+    projections.insert(row);
+    events.push_append_error(DomainError::Conflict("expected_version=0".into()));
+
+    let err = uc
+        .update_policy(
+            UpdateRetentionPolicyCommand {
+                policy_id: id,
+                predicate: PolicyPredicate::AgeExceeds(123),
+                scope: RetentionScope::AllRepos,
+            },
+            gitops_actor(),
+        )
+        .await
+        .expect_err("a foreign event must refuse the replay");
+    match err {
+        AppError::Domain(DomainError::Invariant(msg)) => assert!(
+            msg.contains("ArtifactQuarantined"),
+            "the refusal must name the foreign event: {msg}"
+        ),
+        other => panic!("expected Invariant, got {other:?}"),
+    }
+    assert!(projections.upserts().is_empty(), "nothing is rewritten");
+}
+
+/// The stale-row repair at the retention `archive_policy` site.
+#[tokio::test]
+async fn archive_heals_a_stale_row() {
+    let (uc, events, projections) = make_use_case();
+    let id = Uuid::new_v4();
+    let stale = sample_row(id, "p", 0, false);
+    let tail = events.seed_retention_stream(
+        &stale,
+        vec![RetentionPolicyEvent::Updated {
+            id,
+            predicate: PolicyPredicate::AgeExceeds(99),
+            scope: RetentionScope::AllRepos,
+            updated_at: stale.created_at,
+        }],
+    );
+    projections.insert(stale);
+    events.push_append_error(DomainError::Conflict("expected_version=0".into()));
+
+    uc.archive_policy(id, Uuid::new_v4(), gitops_actor())
+        .await
+        .expect("heals");
+
+    let batches = events.appended_batches();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[1].expected_version, ExpectedVersion::Exact(tail));
+    let last = projections.upserts().last().cloned().expect("an upsert");
+    assert!(last.archived);
+    assert_eq!(
+        last.predicate,
+        PolicyPredicate::AgeExceeds(99),
+        "the repaired row carries the predicate the stale row had missed"
+    );
+}
+
+/// A stream that already says archived satisfies the intent: the call
+/// succeeds and the stale row is repaired, rather than being answered with
+/// a `Validation` error about a state the caller could not see.
+#[tokio::test]
+async fn archive_whose_stream_already_says_archived_succeeds_and_repairs_the_row() {
+    let (uc, events, projections) = make_use_case();
+    let id = Uuid::new_v4();
+    let stale = sample_row(id, "p", 0, false);
+    let tail = events.seed_retention_stream(
+        &stale,
+        vec![RetentionPolicyEvent::Archived {
+            id,
+            by: Uuid::new_v4(),
+            archived_at: stale.created_at,
+        }],
+    );
+    projections.insert(stale);
+    events.push_append_error(DomainError::Conflict("expected_version=0".into()));
+
+    uc.archive_policy(id, Uuid::new_v4(), gitops_actor())
+        .await
+        .expect("idempotent");
+
+    assert_eq!(
+        events.appended_batches().len(),
+        1,
+        "a second Archived would be refused by the replay's terminal-archive \
+         rule anyway, and would record an archival that did not happen"
+    );
+    let last = projections.upserts().last().cloned().expect("an upsert");
+    assert!(last.archived);
+    assert_eq!(last.stream_version, tail);
+}
+
+#[tokio::test]
+async fn archive_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+    let (uc, events, projections) = make_use_case();
+    let id = Uuid::new_v4();
+    let row = sample_row(id, "p", 5, false);
+    events.seed_retention_stream(&row, Vec::new());
+    projections.insert(row);
+    events.push_append_error(DomainError::Conflict("expected_version=5".into()));
+    events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+    let err = uc
+        .archive_policy(id, Uuid::new_v4(), gitops_actor())
+        .await
+        .expect_err("an unreadable stream must refuse");
+    assert!(err.to_string().contains("event store down"), "got: {err}");
+    assert!(projections.upserts().is_empty(), "nothing is rewritten");
 }
 
 #[tokio::test]

@@ -527,6 +527,7 @@ mod tests {
         let cap = TokenCap {
             permissions: vec![Permission::Read, Permission::Write],
             repository_ids: None,
+            per_repository_permissions: None,
         };
         let principal =
             principal_with_cap(user_id, &["developer"], Some(TokenKind::Pat), Some(cap));
@@ -561,6 +562,7 @@ mod tests {
         let cap = TokenCap {
             permissions: vec![Permission::Read],
             repository_ids: None,
+            per_repository_permissions: None,
         };
         // Service accounts are signalled by the typed token-kind
         // carrier, not a "service_account" claim string.
@@ -662,6 +664,7 @@ mod tests {
         let cap = TokenCap {
             permissions: vec![Permission::Read, Permission::Write],
             repository_ids: None,
+            per_repository_permissions: None,
         };
         let principal = principal_with_cap(user_id, &[], Some(TokenKind::CliSession), Some(cap));
         let router = build_router_for_test();
@@ -1023,6 +1026,7 @@ mod tests {
         let cap = TokenCap {
             permissions: vec![Permission::Read],
             repository_ids: Some(vec![id_a]),
+            per_repository_permissions: None,
         };
         let principal = principal_with_cap(user_id, &[], Some(TokenKind::Pat), Some(cap));
 
@@ -1098,6 +1102,7 @@ mod tests {
         let cap = TokenCap {
             permissions: vec![Permission::Write],
             repository_ids: Some(vec![id_a]),
+            per_repository_permissions: None,
         };
         let principal = principal_with_cap(user_id, &["admin"], Some(TokenKind::Pat), Some(cap));
 
@@ -1122,6 +1127,7 @@ mod tests {
         let cap = TokenCap {
             permissions: vec![Permission::Read, Permission::Write],
             repository_ids: None,
+            per_repository_permissions: None,
         };
         let principal = principal_with_cap(user_id, &["admin"], Some(TokenKind::Pat), Some(cap));
 

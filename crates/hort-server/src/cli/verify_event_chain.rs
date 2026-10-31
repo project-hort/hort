@@ -105,8 +105,8 @@ use hort_adapters_storage::builders::{build_s3_object_store, S3StorageOpts};
 // this reader cannot disagree about whether an anchor exists here.
 use hort_app::event_chain_anchoring as anchoring;
 use hort_domain::events::{
-    roll_up, verify_against_checkpoint, verify_stream_chain, ChainReport, ChainRow, Checkpoint,
-    EventHash, StreamRow, StreamRows, StreamVerdict,
+    roll_up, verify_against_checkpoint, verify_stream_chain_observing, AnchoredPositionHashes,
+    ChainReport, ChainRow, Checkpoint, EventHash, StreamRow, StreamRows, StreamVerdict,
 };
 use hort_domain::ports::checkpoint_anchor::CheckpointAnchorPort;
 use hort_domain::ports::event_chain_reader::EventChainReaderPort;
@@ -621,10 +621,25 @@ fn explicit_stream_ids(streams: &[String]) -> Vec<String> {
 }
 
 /// Compose the pure core over the reads the [`EventChainReaderPort`]
-/// performs: per-stream `verify_stream_chain`, the anchor cross-check
-/// `verify_against_checkpoint` (fed the **real** `StreamSealed` records
-/// from the audit-meta stream), then `roll_up`. All `sqlx` lives behind
-/// the port; the pure verdict logic is entirely `hort-domain`.
+/// performs: per-stream `verify_stream_chain_observing`, the anchor
+/// cross-check `verify_against_checkpoint` (fed the **real**
+/// `StreamSealed` records from the audit-meta stream), then `roll_up`.
+/// All `sqlx` lives behind the port; the pure verdict logic is entirely
+/// `hort-domain`.
+///
+/// ## Why the anchors are read before the streams
+///
+/// A checkpoint's statement about a stream is not just about its final
+/// head — it names a *position*, and contradicting a wholesale rewrite
+/// that then grew the stream needs the live chain's hash **at that
+/// position**. That hash exists only while the stream's rows are in
+/// hand, so the anchored positions have to be known before the walk
+/// starts: [`AnchoredPositionHashes::from_checkpoints`] states the
+/// questions, each stream's walk answers the ones that fall inside it,
+/// and the cross-check reads them back. The paging is untouched — what
+/// survives a page is one hash per anchored position, so the footprint
+/// is bounded by the anchor store (streams × checkpoints) rather than
+/// by the event count.
 ///
 /// `cadence` is the anchor-staleness window input — from config (default
 /// hourly), not hardcoded.
@@ -652,6 +667,21 @@ async fn verify(
         explicit_stream_ids(&args.streams)
     };
 
+    // Read anchored checkpoints (read-only, signature-verified by the
+    // adapter) BEFORE the streams, so each stream's walk knows which of
+    // its positions carry an anchored statement and can record the chain
+    // hash there while the rows are still in hand. An operational
+    // failure (store unreachable) bubbles as Err → exit 1. An empty set
+    // is valid → MissingCheckpoint.
+    let checkpoints = anchor
+        .read_all()
+        .await
+        .map_err(|e| anyhow::anyhow!("reading anchored checkpoints: {e}"))?;
+
+    // The questions the anchor store poses, one slot per
+    // `(stream, anchored position)`; the stream walks below answer them.
+    let mut anchored_hashes = AnchoredPositionHashes::from_checkpoints(&checkpoints);
+
     let mut stream_verdicts = Vec::with_capacity(stream_ids.len());
     let mut live_heads: Vec<(String, u64, EventHash)> = Vec::new();
     let mut rows_read = 0usize;
@@ -664,7 +694,13 @@ async fn verify(
             .map_err(|e| anyhow::anyhow!("reading stream {sid}: {e}"))?;
         rows_read += rows.len();
         let views: Vec<StreamRow<'_>> = rows.iter().map(ChainRow::as_stream_row).collect();
-        let verdict = verify_stream_chain(&StreamRows::new(&views));
+        // The observing walk, not the plain one: the hash it records at
+        // an anchored position is the **recomputed** one. `stored_hash`
+        // is a column a rewrite writes too, so comparing the anchor
+        // against it would be satisfiable by the rewrite it is meant to
+        // catch.
+        let verdict =
+            verify_stream_chain_observing(sid, &StreamRows::new(&views), &mut anchored_hashes);
         match &verdict {
             StreamVerdict::Ok { head, position } => {
                 // Only record a real head (a non-empty stream). An empty
@@ -682,14 +718,6 @@ async fn verify(
         }
         stream_verdicts.push(verdict);
     }
-
-    // Read anchored checkpoints (read-only, signature-verified by the
-    // adapter). An operational failure (store unreachable) bubbles as
-    // Err → exit 1. An empty set is valid → MissingCheckpoint.
-    let checkpoints = anchor
-        .read_all()
-        .await
-        .map_err(|e| anyhow::anyhow!("reading anchored checkpoints: {e}"))?;
 
     // The anchor cross-check's `StreamSealed` records, read through the
     // port from `StreamId::eventstore_retention()` (the retention sweep
@@ -709,6 +737,7 @@ async fn verify(
         &live_heads,
         &sealed,
         &checkpoints,
+        &anchored_hashes,
         chrono::Utc::now(),
         cadence,
     );
@@ -1388,14 +1417,34 @@ mod tests {
         (head, pos as u64, genesis_gp as u64)
     }
 
-    fn anchor_for(stream_id: &str, head: EventHash, final_pos: u64) -> FixedAnchor {
+    /// A one-statement anchor store: this checkpoint says `stream_id`'s
+    /// chain hash at `anchored_pos` is `head`. Most tests anchor the
+    /// stream's final position; the anchored-position tests below anchor
+    /// an earlier one, which is the whole point of them.
+    fn anchor_for(stream_id: &str, head: EventHash, anchored_pos: u64) -> FixedAnchor {
         FixedAnchor(vec![Checkpoint {
             chain_format_version: "hort-evchain/v1".into(),
             checkpoint_seq: 1,
             created_at: chrono::Utc::now(),
-            stream_heads: vec![(stream_id.to_string(), final_pos, head)],
+            stream_heads: vec![(stream_id.to_string(), anchored_pos, head)],
             sealed_streams: Vec::new(),
         }])
+    }
+
+    /// The stored `event_hash` at one position of a seeded stream, so a
+    /// test anchor can state what an honest emitter would have anchored
+    /// at that cut. Reading the column is right *here* — the anchor is
+    /// the external statement; it is the verifier that must recompute.
+    async fn hash_at_position(pool: &sqlx::PgPool, stream_id: &str, position: u64) -> EventHash {
+        let bytes: Vec<u8> = sqlx::query_scalar(
+            "SELECT event_hash FROM events WHERE stream_id = $1 AND stream_position = $2",
+        )
+        .bind(stream_id)
+        .bind(position as i64)
+        .fetch_one(pool)
+        .await
+        .expect("read the row at the anchored position");
+        EventHash(bytes.try_into().expect("event_hash is 32 bytes"))
     }
 
     fn args_for(stream_id: &str, since_global: Option<u64>) -> VerifyEventChainArgs {
@@ -1442,6 +1491,81 @@ mod tests {
         );
         assert_eq!(summary.rows_read, 2);
         assert!(summary.first_broken_stream.is_none());
+    }
+
+    /// An anchor whose statement about an **earlier** position does not
+    /// match the live chain's hash there is `Broken`, even though the
+    /// stream has grown past the cut and its own chain is immaculate.
+    ///
+    /// This is the shape a wholesale rewrite leaves behind: the final
+    /// head sits at a position no checkpoint attested and differs from
+    /// everything anchored, so both final-head halves of the relation
+    /// are satisfied. Only the chain's hash *at the anchored position*
+    /// contradicts it — the read this subcommand now carries into the
+    /// stream walk.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn verify_anchor_contradicted_at_an_earlier_position_is_broken() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let sid = seed_stream(&pool, 4).await;
+        // Anchored at position 1 with a hash the chain does not carry
+        // there; the stream runs to position 3.
+        let anchor = anchor_for(&sid, EventHash([0x5a; 32]), 1);
+        let args = args_for(&sid, None);
+
+        let summary = verify(
+            &PgEventChainReader::new(pool.clone()),
+            &args,
+            &anchor,
+            TEST_CADENCE,
+            ANCHOR_EXPECTED,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            summary.report,
+            ChainReport::Broken,
+            "an anchored position the live chain contradicts is a violation",
+        );
+        assert_eq!(
+            result_label(summary.report, summary.anchor_expected),
+            "broken"
+        );
+        assert!(
+            summary.first_broken_stream.is_none(),
+            "the per-stream chain is intact — the break is on the anchor axis",
+        );
+    }
+
+    /// COUNTER-TEST to the above: the same earlier-position anchor,
+    /// stating the hash the chain really carries there, is `Ok`.
+    /// Appending past an anchored cut is what an append-only chain
+    /// does, and a verifier that reported it would be unusable — so
+    /// this also pins that the hash the walk records is the right one.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn verify_anchor_matching_an_earlier_position_is_ok() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let sid = seed_stream(&pool, 4).await;
+        let at_one = hash_at_position(&pool, &sid, 1).await;
+        let anchor = anchor_for(&sid, at_one, 1);
+        let args = args_for(&sid, None);
+
+        let summary = verify(
+            &PgEventChainReader::new(pool.clone()),
+            &args,
+            &anchor,
+            TEST_CADENCE,
+            ANCHOR_EXPECTED,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.report, ChainReport::Ok);
+        assert_eq!(summary.rows_read, 4);
     }
 
     /// A tampered stored row → `ChainReport::Broken`, exit 2,

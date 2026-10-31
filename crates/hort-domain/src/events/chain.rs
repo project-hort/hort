@@ -27,8 +27,9 @@
 //! difference normalised away, because `jsonb` does not preserve it.
 //!
 //! Scope note: the checkpoint/anchor types
-//! ([`Checkpoint`], [`AnchorFindings`], [`verify_against_checkpoint`],
-//! [`ChainReport`], [`roll_up`]) are the pure verify core that the
+//! ([`Checkpoint`], [`AnchorFindings`], [`AnchoredPositionHashes`],
+//! [`verify_against_checkpoint`], [`ChainReport`], [`roll_up`]) are the
+//! pure verify core that the
 //! `verify-event-chain` subcommand composes. They are
 //! *defined and unit-tested here* because they are pure `hort-domain`
 //! logic (the whole verify core lives in `hort-domain`); the
@@ -37,7 +38,7 @@
 //! `hort_event_chain_verify_total` metric live in the outer layers and
 //! are NOT built here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
@@ -480,7 +481,63 @@ pub enum StreamVerdict {
 /// ascending. An empty slice is `Ok` with the genesis head at a
 /// sentinel position (`u64::MAX`) — "no rows to contradict"; callers
 /// that care about absent-vs-empty use the anchor cross-check.
+///
+/// A caller that also needs the chain's hash at a position some
+/// checkpoint anchored wants [`verify_stream_chain_observing`] instead:
+/// the observation has to come out of *this* walk's recomputation, and
+/// re-deriving it from a second pass over the stored column is the one
+/// thing it must not be (see [`AnchoredPositionHashes`]).
 pub fn verify_stream_chain(rows: &StreamRows<'_>) -> StreamVerdict {
+    walk_stream_chain(rows, |_, _| {})
+}
+
+/// [`verify_stream_chain`], additionally recording the chain's hash at
+/// every position `anchored` says carries an anchored statement for
+/// `stream_id`.
+///
+/// This is the single read that closes
+/// [`contradicts_anchored_head`]'s third half: the predicate can decide
+/// a *shorter* stream and an equal-position disagreement from the final
+/// head alone, but a wholesale rewrite that also lengthens the chain is
+/// only contradicted by the live chain's hash **at the anchored
+/// position**, which no final-head triple carries.
+///
+/// The recording rides this walk rather than a second pass because the
+/// hash the comparison needs is the **recomputed** one. `stored_prev` /
+/// `stored_hash` are columns a rewrite writes too, so a comparison
+/// against the stored column is satisfiable by the very rewrite it
+/// exists to catch.
+pub fn verify_stream_chain_observing(
+    stream_id: &str,
+    rows: &StreamRows<'_>,
+    anchored: &mut AnchoredPositionHashes,
+) -> StreamVerdict {
+    // The per-stream lookup is hoisted out of the row loop: one hash
+    // lookup for the stream, then one probe per row against the handful
+    // of positions that stream has statements at.
+    let Some(slots) = anchored.slots_for(stream_id) else {
+        // No checkpoint anchored this stream — a stream created after
+        // every cut. There is no position to record and nothing for the
+        // cross-check to ask about, so the walk is the plain one.
+        return verify_stream_chain(rows);
+    };
+    walk_stream_chain(rows, |pos, recomputed| {
+        if let Some(slot) = slots.get_mut(&pos) {
+            *slot = Some(recomputed);
+        }
+    })
+}
+
+/// The one chain walk. `observe` is called with `(stream_position,
+/// recomputed_event_hash)` for every row the walk reaches, **before**
+/// the recomputation is compared against the stored column — the
+/// observation is "what this row hashes to", and it has to survive the
+/// case where the stored column disagrees, because that is exactly the
+/// case a stored-column comparison would launder.
+fn walk_stream_chain(
+    rows: &StreamRows<'_>,
+    mut observe: impl FnMut(u64, EventHash),
+) -> StreamVerdict {
     let genesis = genesis_hash();
     let mut expected_prev = genesis;
     let mut expected_position: u64 = 0;
@@ -526,6 +583,7 @@ pub fn verify_stream_chain(rows: &StreamRows<'_>) -> StreamVerdict {
         // verified that field equals the previous head, so a
         // recompute mismatch isolates a *field* mutation.
         let recomputed = compute_event_hash(&row.input);
+        observe(pos, recomputed);
         if recomputed != row.stored_hash {
             return StreamVerdict::Broken {
                 at_position: pos,
@@ -577,6 +635,87 @@ pub struct Checkpoint {
     pub sealed_streams: Vec<SealedStreamRecord>,
 }
 
+/// The live chain's hash at each position a checkpoint anchored — the
+/// read [`contradicts_anchored_head`] needs and a final-head triple
+/// cannot carry.
+///
+/// Seeded from the anchor store ([`Self::from_checkpoints`]), filled by
+/// the per-stream walk ([`verify_stream_chain_observing`]), read by
+/// [`verify_against_checkpoint`]. That order is why the checkpoints have
+/// to be read **before** the streams: a walk can only keep the hashes it
+/// was told to keep while the rows are still in hand.
+///
+/// # What it costs
+///
+/// One slot per distinct `(stream_id, anchored_position)` pair, so the
+/// footprint is bounded by the anchor store — streams × checkpoints —
+/// and not by the event count. That is what lets the stream read stay
+/// paged: the walk keeps the handful of hashes some checkpoint asked
+/// about and drops every other row as before.
+///
+/// # Why the slots are seeded rather than grown
+///
+/// A slot is created by the checkpoint that anchored the position and
+/// starts unanswered, so the structure states the question
+/// independently of whether anything answered it. A walk cannot invent
+/// an anchored position, and a position no checkpoint named cannot
+/// consume memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnchoredPositionHashes {
+    /// `stream_id -> anchored_position -> recomputed hash at that
+    /// position, once a walk reached it`.
+    by_stream: HashMap<String, BTreeMap<u64, Option<EventHash>>>,
+}
+
+impl AnchoredPositionHashes {
+    /// Seed one unanswered slot per `(stream_id, final_stream_position)`
+    /// across **every** checkpoint in the store — the same "every
+    /// anchored statement counts" scope
+    /// [`verify_against_checkpoint`]'s head loop runs on. Two
+    /// checkpoints anchoring one stream at different positions
+    /// therefore seed two slots, and two anchoring it at the same
+    /// position share one.
+    pub fn from_checkpoints(checkpoints: &[Checkpoint]) -> Self {
+        let mut by_stream: HashMap<String, BTreeMap<u64, Option<EventHash>>> = HashMap::new();
+        for cp in checkpoints {
+            for (sid, pos, _) in &cp.stream_heads {
+                // `entry(sid.clone())` would allocate on every statement;
+                // the stream id is cloned once per *stream* instead, which
+                // is what keeps the added allocation below what
+                // `CheckpointAnchorPort::read_all` already holds.
+                match by_stream.get_mut(sid.as_str()) {
+                    Some(slots) => {
+                        slots.entry(*pos).or_insert(None);
+                    }
+                    None => {
+                        by_stream.insert(sid.clone(), BTreeMap::from([(*pos, None)]));
+                    }
+                }
+            }
+        }
+        Self { by_stream }
+    }
+
+    /// How many distinct anchored positions are being asked about —
+    /// the structure's whole footprint, in slots.
+    pub fn statements(&self) -> usize {
+        self.by_stream.values().map(BTreeMap::len).sum()
+    }
+
+    /// The chain hash a walk recomputed at `position` of `stream_id`,
+    /// or `None` when no checkpoint anchored that position or no walk
+    /// reached it.
+    pub fn observed_at(&self, stream_id: &str, position: u64) -> Option<EventHash> {
+        self.by_stream.get(stream_id)?.get(&position).copied()?
+    }
+
+    /// The slots `stream_id` has statements at, for the walk to fill.
+    /// `None` when no checkpoint anchored the stream.
+    fn slots_for(&mut self, stream_id: &str) -> Option<&mut BTreeMap<u64, Option<EventHash>>> {
+        self.by_stream.get_mut(stream_id)
+    }
+}
+
 /// Why the anchor attestation is incomplete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingReason {
@@ -594,12 +733,12 @@ pub enum MissingReason {
 /// checkpoint, which is a coverage gap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnchorBreak {
-    /// A live stream's `(final_position, head)` contradicts what a
-    /// signature-verified checkpoint anchored for that stream
-    /// (rollback / tail rewrite / whole-stream truncation). Every
-    /// checkpoint's statement counts, not only the newest one's — see
-    /// [`contradicts_anchored_head`] for the relation and for the one
-    /// half of it this pure core cannot decide.
+    /// A live stream contradicts what a signature-verified checkpoint
+    /// anchored for that stream (rollback / tail rewrite / wholesale
+    /// rewrite / whole-stream truncation). Every checkpoint's statement
+    /// counts, not only the newest one's, and the comparison spans the
+    /// stream's final head **and** its recomputed hash at the anchored
+    /// position — see [`contradicts_anchored_head`] for the relation.
     HeadMismatch,
     /// A live stream is absent and there is no `StreamSealed` for it.
     UnsealedAbsentStream,
@@ -700,8 +839,8 @@ fn newest_checkpoint(checkpoints: &[Checkpoint]) -> Option<&Checkpoint> {
 /// it. The relation against an older anchor is therefore *not*
 /// equality — a head legitimately advances between checkpoints.
 ///
-/// Two halves of reachability are decidable from the final head alone,
-/// which is all this pure core is given:
+/// All three halves of reachability are decided here. Two of them need
+/// nothing but the final head:
 ///
 /// * `anchored_position > live_position` — the stream is *shorter*
 ///   than a checkpoint attested, so rows were removed from its tail.
@@ -712,23 +851,42 @@ fn newest_checkpoint(checkpoints: &[Checkpoint]) -> Option<&Checkpoint> {
 ///   positions with different heads is a tail rewrite; different
 ///   positions with the same head is a SHA-256 collision.
 ///
-/// What is **not** decidable here: when `anchored_position <
-/// live_position` and the heads differ, confirming that the anchored
-/// head really is the live chain's hash *at that position* needs the
-/// live chain's hash at `anchored_position`, and `live_heads` carries
-/// only each stream's final head. So a wholesale rewrite followed by
-/// further appends still passes this predicate, while a wholesale
-/// rewrite of a stream that has not grown since the cut does not.
-/// Closing the residual is a read this function does not have, not a
-/// weaker relation.
+/// The third is the ancestry claim the other two cannot reach: when
+/// `anchored_position < live_position`, the anchored head must be the
+/// live chain's hash **at that position**, and a final-head triple does
+/// not carry it. Without that read a wholesale rewrite that also
+/// lengthens the chain satisfied both halves above — rewrite the stream
+/// and append past the anchored cut and nothing contradicted anything.
+/// `live_hash_at_anchored_position` is that read, recomputed by
+/// [`verify_stream_chain_observing`] during the stream's own walk.
+///
+/// # When the read is absent
+///
+/// `None` is **not** read as a contradiction, and cannot launder a
+/// rewrite, because of what has to be true for a live triple to exist
+/// at all. [`verify_stream_chain`] enforces position contiguity and
+/// only answers `Ok { position }` after walking every row up to
+/// `position`, so a caller holding a live `(position, head)` for a
+/// stream necessarily walked — and therefore recorded — every anchored
+/// position at or below it. A walk that stopped earlier answers
+/// `Broken` instead, which contributes no live triple and which
+/// [`roll_up`] already ranks above every anchor finding. So the absent
+/// case is a caller asking a narrower question than the anchor store
+/// poses, not an expected observation that went missing.
 fn contradicts_anchored_head(
     live_position: u64,
     live_head: &EventHash,
     anchored_position: u64,
     anchored_head: &EventHash,
+    live_hash_at_anchored_position: Option<&EventHash>,
 ) -> bool {
-    anchored_position > live_position
-        || (anchored_position == live_position) != (anchored_head == live_head)
+    if anchored_position > live_position {
+        return true;
+    }
+    if (anchored_position == live_position) != (anchored_head == live_head) {
+        return true;
+    }
+    matches!(live_hash_at_anchored_position, Some(live) if live != anchored_head)
 }
 
 /// Cross-check live stream heads + sealed records against **every**
@@ -737,8 +895,11 @@ fn contradicts_anchored_head(
 /// `live_heads`: every present stream's `(stream_id,
 /// final_stream_position, head_hash)`. `sealed`: the `StreamSealed`
 /// records read from the audit-meta stream. `checkpoints`: all
-/// checkpoints read from the anchor store. `now` / `cadence`: for the
-/// staleness check.
+/// checkpoints read from the anchor store. `observed`: the live chain's
+/// **recomputed** hash at each anchored position, from the same walks
+/// that produced `live_heads` (see [`AnchoredPositionHashes`]) — this
+/// is what decides [`contradicts_anchored_head`]'s ancestry half.
+/// `now` / `cadence`: for the staleness check.
 ///
 /// Returns both axes of [`AnchorFindings`]; the ranking is
 /// [`roll_up`]'s. A coverage gap (stale, gapped) no longer short-
@@ -753,6 +914,7 @@ pub fn verify_against_checkpoint(
     live_heads: &[(String, u64, EventHash)],
     sealed: &[SealedStreamRecord],
     checkpoints: &[Checkpoint],
+    observed: &AnchoredPositionHashes,
     now: chrono::DateTime<chrono::Utc>,
     cadence: std::time::Duration,
 ) -> AnchorFindings {
@@ -840,8 +1002,14 @@ pub fn verify_against_checkpoint(
         for (sid, anchored_pos, anchored_head) in &cp.stream_heads {
             match live_by_id.get(sid.as_str()) {
                 Some((live_pos, live_head)) => {
-                    if contradicts_anchored_head(*live_pos, live_head, *anchored_pos, anchored_head)
-                    {
+                    let at_anchored = observed.observed_at(sid.as_str(), *anchored_pos);
+                    if contradicts_anchored_head(
+                        *live_pos,
+                        live_head,
+                        *anchored_pos,
+                        anchored_head,
+                        at_anchored.as_ref(),
+                    ) {
                         findings.record_break(AnchorBreak::HeadMismatch);
                     }
                 }
@@ -1437,12 +1605,36 @@ mod tests {
     /// The cross-check at the hourly cadence with `now` taken at call
     /// time. Factored out because fourteen anchor tests want exactly
     /// this shape and only the staleness/cadence tests want another.
+    ///
+    /// No anchored-position hashes: these tests state heads as literal
+    /// byte patterns with no rows behind them, so there is no chain to
+    /// have recomputed one from, and an empty set is the only truthful
+    /// input. The tests that *do* build real rows
+    /// ([`anchor_check_observed`]) carry the walk's own observations.
     fn anchor_check(
         live: &[(String, u64, EventHash)],
         sealed: &[SealedStreamRecord],
         cps: &[Checkpoint],
     ) -> AnchorFindings {
-        verify_against_checkpoint(live, sealed, cps, Utc::now(), HOURLY)
+        verify_against_checkpoint(
+            live,
+            sealed,
+            cps,
+            &AnchoredPositionHashes::default(),
+            Utc::now(),
+            HOURLY,
+        )
+    }
+
+    /// [`anchor_check`] with the anchored-position hashes a real stream
+    /// walk recorded.
+    fn anchor_check_observed(
+        live: &[(String, u64, EventHash)],
+        sealed: &[SealedStreamRecord],
+        cps: &[Checkpoint],
+        observed: &AnchoredPositionHashes,
+    ) -> AnchorFindings {
+        verify_against_checkpoint(live, sealed, cps, observed, Utc::now(), HOURLY)
     }
 
     /// Expected findings carrying only the coverage axis.
@@ -1506,6 +1698,7 @@ mod tests {
             &[],
             &[],
             &cps,
+            &AnchoredPositionHashes::default(),
             Utc::now(),
             std::time::Duration::from_secs(u64::MAX),
         );
@@ -1534,6 +1727,7 @@ mod tests {
             &live,
             &[],
             &cps,
+            &AnchoredPositionHashes::from_checkpoints(&cps),
             chrono::DateTime::<Utc>::MAX_UTC,
             std::time::Duration::from_secs(u64::MAX),
         );
@@ -1639,6 +1833,321 @@ mod tests {
             ("admin-new".to_string(), 0, EventHash([7u8; 32])),
         ];
         assert_eq!(anchor_check(&live, &[], &cps), AnchorFindings::default());
+    }
+
+    // ---- the anchored-position read: ancestry, not just the tail -------
+
+    /// Walk `payloads` as one stream and hand back the rows' owned
+    /// backing plus the recorded observations. The payload vector has to
+    /// outlive the borrow the rows take, so the caller owns it.
+    fn walk_observing(
+        stream_id: &str,
+        payloads: &[serde_json::Value],
+        anchored: &mut AnchoredPositionHashes,
+    ) -> StreamVerdict {
+        let rows = build_rows(payloads, stream_id);
+        verify_stream_chain_observing(stream_id, &StreamRows::new(&rows), anchored)
+    }
+
+    /// The hash a valid chain over `payloads` carries at `position`.
+    fn hash_at(stream_id: &str, payloads: &[serde_json::Value], position: usize) -> EventHash {
+        build_rows(payloads, stream_id)[position].stored_hash
+    }
+
+    /// CENTERPIECE: a wholesale rewrite that **also lengthens** the
+    /// chain past the anchored position is a `HeadMismatch`.
+    ///
+    /// Anchor at position 2, then replace the stream entirely and extend
+    /// it to position 5. The final head is at a position no checkpoint
+    /// attested and differs from every anchored head, so both
+    /// final-head halves of `contradicts_anchored_head` are satisfied by
+    /// the rewrite — the contradiction is only visible in the chain's
+    /// hash *at position 2*, which the walk recomputed.
+    #[test]
+    fn anchor_wholesale_rewrite_that_lengthens_past_the_cut_is_a_head_mismatch() {
+        let sid = "artifact-rewritten";
+        let (original, _) = valid_stream(4);
+        let anchored_head = hash_at(sid, &original, 2);
+
+        // The attacker's chain: different payloads at every position,
+        // internally valid, and two events longer than the original.
+        let rewritten: Vec<serde_json::Value> = (10..16u32).map(sample_payload).collect();
+
+        let cps = vec![cp(1, 5, vec![(sid.to_string(), 2, anchored_head)])];
+        let mut observed = AnchoredPositionHashes::from_checkpoints(&cps);
+        let verdict = walk_observing(sid, &rewritten, &mut observed);
+
+        // The rewrite is internally consistent — the per-stream chain
+        // check cannot see it, which is why the anchor is the control.
+        let StreamVerdict::Ok { head, position } = verdict else {
+            panic!("a wholesale rewrite rechains cleanly: {verdict:?}");
+        };
+        assert_eq!(position, 5, "the rewrite lengthened the stream");
+
+        let live = vec![(sid.to_string(), position, head)];
+        assert_eq!(
+            anchor_check_observed(&live, &[], &cps, &observed),
+            broke(AnchorBreak::HeadMismatch),
+            "the anchored head is not the live chain's hash at the anchored position",
+        );
+    }
+
+    /// The same shape, honest about the other direction: a rewrite that
+    /// reproduces the anchored position exactly and only appends past it
+    /// is a legitimate advance and stays clean. Without this the test
+    /// above would also pass an implementation that reported every grown
+    /// stream.
+    #[test]
+    fn anchor_appending_past_the_cut_without_rewriting_it_stays_clean() {
+        let sid = "artifact-grown";
+        let (grown, _) = valid_stream(6);
+        let anchored_head = hash_at(sid, &grown, 2);
+
+        let cps = vec![cp(1, 5, vec![(sid.to_string(), 2, anchored_head)])];
+        let mut observed = AnchoredPositionHashes::from_checkpoints(&cps);
+        let verdict = walk_observing(sid, &grown, &mut observed);
+        let StreamVerdict::Ok { head, position } = verdict else {
+            panic!("a legitimately grown stream verifies: {verdict:?}");
+        };
+
+        let live = vec![(sid.to_string(), position, head)];
+        assert_eq!(
+            anchor_check_observed(&live, &[], &cps, &observed),
+            AnchorFindings::default(),
+            "appending past an anchored cut is what the chain is for",
+        );
+    }
+
+    /// The comparison stands on the **recomputed** hash, never the
+    /// stored column.
+    ///
+    /// The attacker rewrites the row at the anchored position and writes
+    /// the anchored hash into that row's `event_hash` column, so the
+    /// stored column agrees with the anchor and the recomputation does
+    /// not. An implementation that recorded `stored_hash` would read
+    /// this as matching the anchor — the rewrite would have laundered
+    /// itself through the column it rewrote.
+    #[test]
+    fn anchored_position_hash_is_the_recomputation_not_the_stored_column() {
+        let sid = "artifact-tampered";
+        let (payloads, _) = valid_stream(6);
+        let rows_clean = build_rows(&payloads, sid);
+        let anchored_head = rows_clean[2].stored_hash;
+        let live_tail = (rows_clean[5].stored_hash, 5u64);
+
+        // Rewrite position 2's payload and leave both stored chain
+        // columns alone: `stored_hash` still carries the anchored hash,
+        // and position 3's `stored_prev` still links to it, so the rows
+        // after the tamper are untouched.
+        let forged = sample_payload(99);
+        let mut rows = rows_clean.clone();
+        rows[2].input.payload = &forged;
+        assert_eq!(
+            rows[2].stored_hash, anchored_head,
+            "the tamper leaves the stored column matching the anchor — that is the point",
+        );
+
+        let cps = vec![cp(1, 5, vec![(sid.to_string(), 2, anchored_head)])];
+        let mut observed = AnchoredPositionHashes::from_checkpoints(&cps);
+        let verdict = verify_stream_chain_observing(sid, &StreamRows::new(&rows), &mut observed);
+
+        // The recorded observation is what the row hashes to, which is
+        // not what the row says it hashes to.
+        let recorded = observed
+            .observed_at(sid, 2)
+            .expect("the walk reached the anchored position");
+        assert_eq!(
+            recorded,
+            compute_event_hash(&rows[2].input),
+            "the recorded hash must be the recomputation",
+        );
+        assert_ne!(
+            recorded, anchored_head,
+            "a recorded stored column would equal the anchored head and launder the rewrite",
+        );
+
+        // The tamper is also a per-stream break, as it has been since
+        // the chain shipped — recording the observation before the
+        // stored-column comparison is what keeps both facts available.
+        assert_eq!(
+            verdict,
+            StreamVerdict::Broken {
+                at_position: 2,
+                reason: ChainBreak::HashMismatch,
+            }
+        );
+
+        // And the anchor axis reports it independently. The live triple
+        // is the stream's present tail as the rows carry it — which is
+        // what `live_heads` is defined to be.
+        let live = vec![(sid.to_string(), live_tail.1, live_tail.0)];
+        assert_eq!(
+            anchor_check_observed(&live, &[], &cps, &observed),
+            broke(AnchorBreak::HeadMismatch),
+        );
+    }
+
+    /// COUNTER-TEST: a stream no checkpoint anchored is not visited.
+    /// The observing walk records nothing for it, returns exactly what
+    /// the plain walk returns, and leaves the slot count alone.
+    #[test]
+    fn an_unanchored_stream_is_not_visited_by_the_observing_walk() {
+        let anchored_sid = "artifact-anchored";
+        let other_sid = "artifact-after-the-cut";
+        let (payloads, _) = valid_stream(3);
+
+        let cps = vec![cp(
+            1,
+            5,
+            vec![(
+                anchored_sid.to_string(),
+                1,
+                hash_at(anchored_sid, &payloads, 1),
+            )],
+        )];
+        let mut observed = AnchoredPositionHashes::from_checkpoints(&cps);
+        let before = observed.statements();
+
+        let rows = build_rows(&payloads, other_sid);
+        let verdict =
+            verify_stream_chain_observing(other_sid, &StreamRows::new(&rows), &mut observed);
+
+        assert_eq!(
+            verdict,
+            verify_stream_chain(&StreamRows::new(&rows)),
+            "an unanchored stream's verdict is the plain walk's",
+        );
+        assert_eq!(
+            observed.statements(),
+            before,
+            "an unanchored stream cannot add a slot",
+        );
+        for pos in 0..3 {
+            assert_eq!(
+                observed.observed_at(other_sid, pos),
+                None,
+                "nothing was recorded for a stream no checkpoint named",
+            );
+        }
+    }
+
+    /// The premise the absent-observation arm of
+    /// `contradicts_anchored_head` rests on, pinned rather than
+    /// asserted in prose: a walk that answers `Ok { position }` has
+    /// answered **every** seeded slot at or below `position`, because
+    /// the walk enforces contiguity and only reaches `Ok` after visiting
+    /// every row. So a live triple can never arrive beside a missing
+    /// observation.
+    #[test]
+    fn an_ok_walk_answers_every_seeded_slot_it_reaches() {
+        let sid = "artifact-covered";
+        let (payloads, _) = valid_stream(5);
+        // Three checkpoints anchoring three different positions, plus
+        // one past the stream's tail that the walk cannot reach.
+        let cps = vec![
+            cp(
+                1,
+                30,
+                vec![(sid.to_string(), 0, hash_at(sid, &payloads, 0))],
+            ),
+            cp(
+                2,
+                20,
+                vec![(sid.to_string(), 2, hash_at(sid, &payloads, 2))],
+            ),
+            cp(
+                3,
+                10,
+                vec![(sid.to_string(), 4, hash_at(sid, &payloads, 4))],
+            ),
+            cp(4, 5, vec![(sid.to_string(), 9, EventHash([0x5a; 32]))]),
+        ];
+        let mut observed = AnchoredPositionHashes::from_checkpoints(&cps);
+        assert_eq!(observed.statements(), 4, "one slot per anchored position");
+
+        let verdict = walk_observing(sid, &payloads, &mut observed);
+        let StreamVerdict::Ok { position, .. } = verdict else {
+            panic!("a valid chain verifies: {verdict:?}");
+        };
+        assert_eq!(position, 4);
+
+        for pos in [0u64, 2, 4] {
+            assert_eq!(
+                observed.observed_at(sid, pos),
+                Some(hash_at(sid, &payloads, pos as usize)),
+                "slot {pos} is at or below the Ok position and must be answered",
+            );
+        }
+        assert_eq!(
+            observed.observed_at(sid, 9),
+            None,
+            "a position past the tail has no row to recompute — and the \
+             shorter-than-anchored half is what reports it",
+        );
+    }
+
+    /// A stream *shorter* than the anchored statement is reported from
+    /// the final head alone, with no observation to consult — the first
+    /// half of the relation, unchanged by the third.
+    #[test]
+    fn anchor_shorter_than_the_anchored_statement_is_a_head_mismatch() {
+        let sid = "artifact-truncated";
+        let (payloads, _) = valid_stream(2);
+        let cps = vec![cp(1, 5, vec![(sid.to_string(), 9, EventHash([0x5a; 32]))])];
+        let mut observed = AnchoredPositionHashes::from_checkpoints(&cps);
+        let verdict = walk_observing(sid, &payloads, &mut observed);
+        let StreamVerdict::Ok { head, position } = verdict else {
+            panic!("a valid chain verifies: {verdict:?}");
+        };
+        assert_eq!(observed.observed_at(sid, 9), None);
+        let live = vec![(sid.to_string(), position, head)];
+        assert_eq!(
+            anchor_check_observed(&live, &[], &cps, &observed),
+            broke(AnchorBreak::HeadMismatch),
+        );
+    }
+
+    /// A caller that supplies live heads but no anchored-position
+    /// hashes gets the two final-head halves and no third — the absent
+    /// read is not reported as a contradiction. This is the arm the
+    /// fourteen literal-head tests above run on, stated once directly.
+    #[test]
+    fn an_absent_anchored_position_hash_is_not_itself_a_contradiction() {
+        let sid = "admin-a".to_string();
+        let cps = vec![cp(1, 5, vec![(sid.clone(), 2, EventHash([1u8; 32]))])];
+        let live = vec![(sid, 5, EventHash([2u8; 32]))];
+        assert_eq!(
+            anchor_check_observed(&live, &[], &cps, &AnchoredPositionHashes::default()),
+            AnchorFindings::default(),
+        );
+    }
+
+    /// Slot seeding is per `(stream, position)` across the whole store:
+    /// two checkpoints anchoring one stream at one position share a
+    /// slot, at two positions seed two, and an unknown stream reads
+    /// `None`.
+    #[test]
+    fn anchored_position_slots_are_seeded_per_stream_and_position() {
+        let a = "admin-a".to_string();
+        let b = "admin-b".to_string();
+        let h = EventHash([3u8; 32]);
+        let cps = vec![
+            cp(1, 30, vec![(a.clone(), 1, h), (b.clone(), 7, h)]),
+            // Same stream, same position as above -> one slot, not two.
+            cp(2, 20, vec![(a.clone(), 1, h)]),
+            // Same stream, a later position -> a second slot.
+            cp(3, 10, vec![(a.clone(), 4, h)]),
+        ];
+        let observed = AnchoredPositionHashes::from_checkpoints(&cps);
+        assert_eq!(observed.statements(), 3);
+        assert_eq!(observed.observed_at(&a, 1), None, "seeded but unanswered");
+        assert_eq!(observed.observed_at(&a, 2), None, "never anchored");
+        assert_eq!(observed.observed_at("admin-missing", 1), None);
+        assert_eq!(
+            AnchoredPositionHashes::default().statements(),
+            0,
+            "no checkpoints, no slots",
+        );
     }
 
     // ---- both axes survive: a coverage gap no longer hides a break ------

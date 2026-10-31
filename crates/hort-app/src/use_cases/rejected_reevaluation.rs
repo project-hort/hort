@@ -123,7 +123,25 @@ pub(crate) async fn derive_rejected_outcome(
         return Ok(RejectedDerivation::NoScanCompleted);
     };
 
-    let last_findings = scan_history::last_findings(stream, storage, artifact.id).await;
+    // Per-finding rows when the blob resolved; otherwise the recorded
+    // aggregate, which `decide_rejected_transition` walks as-is.
+    //
+    // The two kinds of absence collapse to one answer **here and only
+    // here**, and the `ScanCompleted` invariant is what makes that sound:
+    // a scan that recorded no blob has `finding_count == 0`, and the
+    // event's validator requires `finding_count` to equal the sum of the
+    // severity counts — so a genuine absence reaches the domain as an
+    // all-zero summary that walks to clean, while an unreadable blob
+    // reaches it with the counts its scan actually recorded. The summary
+    // distinguishes the cases, so this caller does not have to. The
+    // tighten direction has no such summary in its verdict input and must
+    // branch on the variant itself.
+    let evidence = scan_history::last_findings(stream, storage, artifact.id).await;
+    let last_findings = match &evidence {
+        scan_history::FindingsEvidence::Resolved(findings) => Some(findings.as_slice()),
+        scan_history::FindingsEvidence::Absent
+        | scan_history::FindingsEvidence::Unreadable { .. } => None,
+    };
 
     let quarantine_deadline = policy.and_then(|p| {
         artifact.quarantine_window_start.map(|anchor| {
@@ -138,7 +156,7 @@ pub(crate) async fn derive_rejected_outcome(
         artifact,
         kind,
         &last_snapshot.summary,
-        last_findings.as_deref(),
+        last_findings,
         policy,
         exclusions,
         composite_verdict,

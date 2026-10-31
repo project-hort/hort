@@ -1533,6 +1533,7 @@ mod tests {
         p.token_cap = Some(TokenCap {
             permissions: vec![Permission::Read],
             repository_ids: Some(cap_ids),
+            per_repository_permissions: None,
         });
         p
     }
@@ -2113,6 +2114,7 @@ mod tests {
             p.token_cap = Some(TokenCap {
                 permissions: vec![Permission::Read],
                 repository_ids: Some(vec![Uuid::new_v4()]),
+                per_repository_permissions: None,
             });
             p
         };

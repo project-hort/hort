@@ -39,6 +39,15 @@ hort-config = { workspace = true }
 hort-adapters-ephemeral-memory = { workspace = true, optional = true }
 
 axum                        = { workspace = true }
+# `futures::Stream` for the one-chunk hold-back adapter in `body`, which
+# sits between `ReaderStream` and `axum::body::Body`. The adapter has to
+# name the `Stream` trait to implement it; doing the same delay at the
+# `AsyncRead` level instead would mean a second buffer and one extra
+# memcpy of every served byte, on the path whose chunk size was itself
+# picked by bench. Was a dev-dependency here (`future::join_all` in the
+# `middleware::load_shed` concurrency-cap test, which still uses it), so
+# `Cargo.lock` is unchanged by the promotion.
+futures                     = { workspace = true }
 tower                       = { workspace = true }
 tower-http                  = { workspace = true }
 governor                    = "0.10"
@@ -69,12 +78,6 @@ base64                      = "0.23"
 
 [dev-dependencies]
 tokio                        = { workspace = true, features = ["test-util"] }
-# `futures::future::join_all` for the
-# concurrency-cap acceptance test in `middleware::load_shed`. Drives N
-# requests cooperatively on a single-threaded runtime so the
-# `metrics::with_local_recorder` thread-local stays in scope for the
-# counter assertion.
-futures                      = "0.3"
 hort-app                       = { path = "../hort-app", features = ["test-support"] }
 # Needed unconditionally for the `extractors.rs` test module that
 # builds a mock `AppContext` with a live `ephemeral` port — the

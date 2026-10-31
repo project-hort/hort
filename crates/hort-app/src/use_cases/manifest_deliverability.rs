@@ -396,10 +396,39 @@ impl ManifestDeliverabilityUseCase {
 /// structural (a non-empty `manifests[]`), the same probe the write path
 /// and the provenance cascade use, so a document's closure does not
 /// depend on which of three places asked.
+///
+/// An index child whose descriptor names **no addressable content** — no
+/// `digest`, an algorithm outside the CAS keyspace, malformed hex — is left
+/// out of the closure and reported, rather than failing the read. The
+/// consequence of failing it is what decides this: `closure` treats an `Err`
+/// at depth 0 as fail-closed and refuses to serve the document, so a hard
+/// error here would make every index already in the catalog that carries one
+/// such descriptor **unservable** — withdrawing every platform it can still
+/// deliver, over one it never could.
+///
+/// Leaving it out does not make hort advertise something it will not serve,
+/// which is the rule this module exists to hold (ADR 0062). A closure entry
+/// is a question put to the catalog about a CAS hash, and this descriptor
+/// yields no hash to ask about: there is no artifact row, no bytes, and the
+/// client that tries to fetch it is answered by the digest parse at the
+/// request line before any lookup happens — a clean `UNSUPPORTED` /
+/// `DIGEST_INVALID` keyed to the digest it already holds, not a `200`
+/// followed by a `404`. The contradiction ADR 0062 closes is the second
+/// shape, not the first. The index bytes are also immutable and
+/// content-addressed, so refusal of the whole document is the only other
+/// lever available here, and it is the wrong one.
 fn node_constituents(bytes: &[u8]) -> Result<NodeConstituents, DomainError> {
     if hort_domain::oci::is_image_index(bytes) {
+        let declared = hort_domain::oci::index_child_descriptors(bytes)?;
+        let children = declared.into_resolvable(|fault| {
+            tracing::warn!(
+                child = %fault,
+                "manifest deliverability: an index child declares no addressable content, \
+                 so it is not in the closure; it was never servable from this registry"
+            );
+        });
         Ok(NodeConstituents::IndexChildren(
-            hort_domain::oci::index_child_digests(bytes)?,
+            children.into_iter().map(|c| c.hash).collect(),
         ))
     } else {
         Ok(NodeConstituents::Blobs(
@@ -785,6 +814,77 @@ mod tests {
                 content_hash: child,
                 status: QuarantineStatus::Rejected,
             })
+        );
+    }
+
+    /// A **stored** index declaring a child this registry cannot address is
+    /// still servable, and its other children are still judged.
+    ///
+    /// This is the population the admission fix is about: indexes admitted
+    /// before an unaddressable child descriptor was refused. `closure` treats
+    /// an `Err` at depth 0 as fail-closed, so making such a descriptor an
+    /// error here would make every one of those rows unservable — withdrawing
+    /// every platform the index can still deliver, over one it never could.
+    ///
+    /// Leaving the descriptor out of the closure is not hort advertising
+    /// something it will not serve: a closure entry is a question about a CAS
+    /// hash, this descriptor yields none, and the client's own fetch for it is
+    /// refused by the digest parse at the request line before any lookup.
+    #[tokio::test]
+    async fn a_stored_index_with_an_unaddressable_child_is_still_resolvable() {
+        let f = fixture();
+        let (index, child) = (hash_of("i"), hash_of("ch"));
+        f.store(
+            &index,
+            json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [
+                    { "digest": format!("sha512:{}", "a".repeat(128)), "size": 1 },
+                    { "digest": digest(&child), "size": 1 },
+                    { "size": 1 },
+                    { "digest": "sha256:not-hex", "size": 1 },
+                ],
+            })
+            .to_string()
+            .into_bytes(),
+        );
+        f.catalog(&child, QuarantineStatus::Released);
+        assert_eq!(
+            f.resolve(&index).await.expect(
+                "an unaddressable child descriptor must not make a stored index unservable"
+            ),
+            ManifestDeliverability::Deliverable
+        );
+    }
+
+    /// And the addressable sibling is genuinely still in the closure — so the
+    /// test above is not green merely because the walk stopped looking.
+    #[tokio::test]
+    async fn an_unaddressable_child_does_not_hide_a_terminal_sibling() {
+        let f = fixture();
+        let (index, child) = (hash_of("i"), hash_of("ch"));
+        f.store(
+            &index,
+            json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [
+                    { "size": 1 },
+                    { "digest": digest(&child), "size": 1 },
+                ],
+            })
+            .to_string()
+            .into_bytes(),
+        );
+        f.catalog(&child, QuarantineStatus::Rejected);
+        assert_eq!(
+            f.resolve(&index).await.expect("resolution succeeds"),
+            ManifestDeliverability::TerminalConstituent(TerminalConstituent {
+                content_hash: child,
+                status: QuarantineStatus::Rejected,
+            }),
+            "the sibling of a skipped descriptor is still judged"
         );
     }
 

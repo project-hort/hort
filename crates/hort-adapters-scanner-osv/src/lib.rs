@@ -138,17 +138,19 @@ where
 // ---------------------------------------------------------------------------
 
 /// Parse an `osv-scanner --format json` document and return the
-/// lowered [`Finding`] list, applying the same per-finding cap filter
+/// lowered [`Finding`] list, applying the same per-field bounds
 /// [`OsvScannerAdapter::scan`] applies.
 ///
 /// Exposed publicly for fixture-based testing (the adapter's own
 /// integration tests in `tests/` consume this) and for any future
 /// caller that needs to re-parse an osv-scanner report archived
-/// elsewhere. `Err(DomainError::Validation)` on malformed JSON.
+/// elsewhere. `Err(DomainError::Validation)` on malformed JSON, and on a
+/// reported finding whose identity fields exceed the domain caps — the
+/// lowering never returns a shorter finding list than the report held.
 pub fn parse_findings_from_json(stdout: &[u8]) -> DomainResult<Vec<Finding>> {
     let report = parse_osv_scanner_report(stdout)
         .map_err(|e| DomainError::Validation(format!("osv adapter: malformed JSON: {e}")))?;
-    Ok(aggregate_findings(&report))
+    aggregate_findings(&report)
 }
 
 // ---------------------------------------------------------------------------
@@ -507,10 +509,12 @@ impl ScannerPort for OsvScannerAdapter {
             // 2. Run osv-scanner.
             let report = self.run_scan(&path).await?;
 
-            // 3. Lower into Vec<Finding>. Findings that fail
-            //    Finding::validate are dropped with tracing::warn!
-            //    inside aggregate_findings.
-            let findings = aggregate_findings(&report);
+            // 3. Lower into Vec<Finding>. A finding this adapter
+            //    cannot represent refuses the whole report rather than
+            //    being dropped from it (see `aggregate_findings`), so
+            //    the `?` here is the indeterminate path — never a
+            //    shorter finding list than the scanner produced.
+            let findings = aggregate_findings(&report)?;
 
             tracing::info!(
                 scanner = "osv",

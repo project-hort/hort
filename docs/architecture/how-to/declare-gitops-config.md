@@ -612,7 +612,12 @@ a name, matches nothing and is rejected.
   `hort_gitops_events_emitted_total{kind=scan_policy,event_type=PolicyCreated}`.
 - Field edit: one `PolicyUpdated` event per changed field (the diff
   is field-level, not envelope-level); the projection row updates
-  inside the same DB transaction as the event append.
+  immediately after the event append, **not** in the same DB
+  transaction — the two stores are written in sequence, and a failed
+  projection write leaves the row one version behind its stream. The
+  next apply of that policy re-derives the row from the stream and
+  carries on, so a failed projection write costs one refused apply
+  rather than every apply that follows it.
   `hort_gitops_objects_total{kind=scan_policy,result=updated}` ticks
   once regardless of how many fields changed.
 - YAML removed: one `PolicyArchived` event;

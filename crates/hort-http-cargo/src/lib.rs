@@ -692,6 +692,28 @@ async fn publish(
     hort_formats::cargo::validate_cargo_version(&metadata.vers)
         .map_err(|e| ApiError::from(hort_app::error::AppError::Domain(e)))?;
 
+    // What the `.crate` declares about itself must agree with what it is
+    // being stored under, or the publish is refused. `name`/`vers` come
+    // from the publish frame and the archive travels to CAS as opaque
+    // bytes; the `cksum` the index serves is the SHA-256 of those bytes,
+    // which proves byte integrity and says nothing about which package
+    // they are. The archive-root `Cargo.toml` is the package's own
+    // declaration, and it is also what `extract_dependency_specs` reads to
+    // build the scan evidence — so a divergence files one crate's
+    // dependencies under another crate's name.
+    //
+    // Runs AFTER the grammar validators so their negative paths keep
+    // hitting THEIR error first, and BEFORE `ingest_direct` so a
+    // divergence costs no CAS write.
+    match read_declared_crate_identity(body.slice_ref(crate_bytes)).await {
+        Ok(declared) => {
+            if let Some(divergence) = declared.check(&metadata.name, &metadata.vers).divergence() {
+                return Ok(identity_refusal(&divergence.message("cargo .crate")));
+            }
+        }
+        Err(refusal) => return Ok(refusal),
+    }
+
     // Project the publish body onto the sparse-index entry document
     // before the name/version fields are consumed below.
     let payload_metadata = metadata.to_index_metadata();
@@ -759,6 +781,90 @@ async fn publish(
             .to_string(),
     )
         .into_response())
+}
+
+/// Read the identity the published `.crate` declares in its archive-root
+/// `Cargo.toml`.
+///
+/// # Bounds and buffering
+///
+/// The read routes through `hort_formats::cargo::read_crate_identity`,
+/// which is built on the audited
+/// `hort_formats::archive_bounds::read_tar_gz_entry` — bounded
+/// decompressed output (compression-ratio + ceiling), bounded entry count,
+/// nested archives rejected. A publish path that opened the client's
+/// archive with its own reader would re-create the decompression-bomb
+/// surface that module exists to close.
+///
+/// Nothing is buffered that was not already in hand: the cargo publish
+/// frame is length-prefixed, so the handler already holds the whole body
+/// as an owned `Bytes`, and `Bytes::slice_ref` hands this read the same
+/// allocation rather than a copy. Only the matched manifest entry, itself
+/// capped, is materialised. ADR 0003's streaming CAS is untouched —
+/// `ingest_direct` still streams from its own cursor.
+///
+/// # Blocking
+///
+/// gzip inflation is CPU-bound work on an async handler, so it happens
+/// inside `spawn_blocking` (mirroring `index_cache`'s projector hop).
+///
+/// # Errors
+///
+/// The `Err` arm is the pre-shaped refusal response to return — the same
+/// convention `resolve_actor_user_id` uses on this handler, so the Cargo
+/// error envelope stays under this crate's control rather than `ApiError`'s.
+/// A joined-task failure is a 503 and NOT an accept: an identity the server
+/// failed to read is not one that agreed.
+async fn read_declared_crate_identity(
+    crate_bytes: Bytes,
+) -> Result<hort_formats::cargo::CrateIdentity, Response> {
+    let compressed_size = crate_bytes.len() as u64;
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut reader = std::io::Cursor::new(crate_bytes);
+        hort_formats::cargo::read_crate_identity(&mut reader, compressed_size)
+    })
+    .await
+    .map_err(|join_err| {
+        tracing::error!(error = %join_err, "publish identity read task failed");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(CONTENT_TYPE, "application/json")],
+            errors_envelope("publish identity check failed"),
+        )
+            .into_response()
+    })?;
+    // The archive could not be read. An identity that could not be
+    // established is not an identity that agreed — cargo's `.crate` format
+    // requires a top-level `{name}-{version}/Cargo.toml`, so its absence or
+    // corruption is a malformed publish, not a fact to wave through.
+    joined.map_err(|domain_err| identity_refusal(&domain_err.to_string()))
+}
+
+/// The cargo-shaped refusal for a publish whose archive disagrees with its
+/// coordinates.
+///
+/// **400 + `{"errors":[{"detail": "<message>"}]}`.** The Cargo Book's
+/// *Registry Web API* specifies that a registry reports a failure with an
+/// `errors` array of objects carrying a `detail` string, and that cargo
+/// displays each `detail` to the user. A `{"error": …}` body — the shape
+/// every other rejection on this handler emits through `ApiError` — is not
+/// that envelope, so cargo falls back to printing the raw body with a
+/// generic "the remote server responded with an error" line and the reason
+/// never reaches the publisher legibly. The specification outranks the
+/// convenience of a uniform shape.
+fn identity_refusal(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [(CONTENT_TYPE, "application/json")],
+        errors_envelope(message),
+    )
+        .into_response()
+}
+
+/// The Cargo Book *Registry Web API* error envelope,
+/// `{"errors":[{"detail": "<message>"}]}`.
+fn errors_envelope(message: &str) -> String {
+    serde_json::json!({ "errors": [{ "detail": message }] }).to_string()
 }
 
 /// Parse the cargo publish binary body:
@@ -962,6 +1068,17 @@ mod tests {
     }
 
     /// Build a well-formed cargo publish body.
+    /// A REAL minimal `.crate` whose archive-root `Cargo.toml` declares
+    /// `[package] name` / `version`.
+    ///
+    /// The publish path reads that declaration and refuses a disagreement,
+    /// so opaque bytes here would make every publish test a test of the
+    /// refusal path. The directory segment is `{name}-{version}`, which is
+    /// what `cargo package` writes.
+    fn crate_for(name: &str, version: &str) -> Vec<u8> {
+        hort_formats::test_support::build_cargo_crate(&format!("{name}-{version}"), name, version)
+    }
+
     fn build_publish_body(metadata_json: &[u8], crate_bytes: &[u8]) -> Vec<u8> {
         let mut body = Vec::with_capacity(8 + metadata_json.len() + crate_bytes.len());
         body.extend_from_slice(&(metadata_json.len() as u32).to_le_bytes());
@@ -2534,8 +2651,7 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let metadata = br#"{"name":"mycrate","vers":"0.1.0"}"#;
-        let crate_bytes = b"fake crate tarball content";
-        let body = build_publish_body(metadata, crate_bytes);
+        let body = build_publish_body(metadata, &crate_for("mycrate", "0.1.0"));
 
         let res = router
             .oneshot(
@@ -2565,7 +2681,7 @@ mod tests {
             "features":{"extras":["dep:serde"]},
             "cksum":"a-publisher-supplied-digest-that-must-be-ignored"
         }"#;
-        let body = build_publish_body(metadata, b"fake crate tarball content");
+        let body = build_publish_body(metadata, &crate_for("mycrate", "0.1.0"));
 
         let res = router
             .oneshot(
@@ -2620,6 +2736,8 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let metadata = br#"{"name":"mycrate","vers":"0.1.0"}"#;
+        // Opaque bytes are fine here: the virtual-repo rejection fires
+        // before anything opens the archive.
         let body = build_publish_body(metadata, b"fake crate tarball content");
         let res = router
             .oneshot(
@@ -2658,8 +2776,7 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let metadata = br#"{"name":"mycrate","vers":"0.1.0"}"#;
-        let crate_bytes = b"fake crate tarball content";
-        let body = build_publish_body(metadata, crate_bytes);
+        let body = build_publish_body(metadata, &crate_for("mycrate", "0.1.0"));
 
         let res = router
             .oneshot(
@@ -2688,8 +2805,8 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let metadata = br#"{"name":"roundtrip","vers":"2.3.4","deps":[],"features":{}}"#;
-        let crate_bytes = b"the actual crate bytes to round-trip";
-        let body = build_publish_body(metadata, crate_bytes);
+        let crate_bytes = crate_for("roundtrip", "2.3.4");
+        let body = build_publish_body(metadata, &crate_bytes);
 
         let pub_res = router
             .clone()
@@ -2722,8 +2839,10 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let metadata = br#"{"name":"MyCrate","vers":"0.1.0"}"#;
-        let crate_bytes = b"bytes";
-        let body = build_publish_body(metadata, crate_bytes);
+        // `cargo package` writes the manifest's own spelling, pre-folding —
+        // the comparison reads the frame's raw `name`, not the normalised
+        // one the row is stored under.
+        let body = build_publish_body(metadata, &crate_for("MyCrate", "0.1.0"));
 
         let res = router
             .clone()
@@ -2806,6 +2925,154 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
+    // -- the identity the `.crate` declares --------------------------------
+    //
+    // cargo's coordinates come from the publish frame's `name`/`vers`,
+    // checked only against the grammar; the `.crate` travels to CAS as
+    // opaque bytes. The `cksum` the index serves is the SHA-256 of those
+    // bytes, which proves byte integrity and says nothing about which
+    // package they are.
+
+    #[tokio::test]
+    async fn publish_refuses_a_crate_declaring_another_name() {
+        let h = harness();
+        insert_repo(&h, "cargo-test");
+        let router = router(h.ctx.clone());
+
+        let metadata = br#"{"name":"mycrate","vers":"0.1.0"}"#;
+        let body = build_publish_body(metadata, &crate_for("evilcrate", "0.1.0"));
+
+        let res = router
+            .oneshot(
+                Request::put("/cargo/cargo-test/api/v1/crates/new")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(res.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The Cargo Book's Registry Web API specifies the error envelope
+        // `{"errors":[{"detail":"…"}]}`; cargo prints each `detail`.
+        let detail = json["errors"][0]["detail"]
+            .as_str()
+            .expect("an `errors[].detail` member");
+        assert!(
+            detail.contains("evilcrate") && detail.contains("mycrate"),
+            "the refusal must name BOTH identities: {detail}"
+        );
+        assert_eq!(
+            h.storage.put_call_count(),
+            0,
+            "the identity check must short-circuit before any storage.put"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_refuses_a_crate_declaring_another_version() {
+        let h = harness();
+        insert_repo(&h, "cargo-test");
+        let router = router(h.ctx.clone());
+
+        let metadata = br#"{"name":"mycrate","vers":"0.1.0"}"#;
+        let body = build_publish_body(metadata, &crate_for("mycrate", "9.9.9"));
+
+        let res = router
+            .oneshot(
+                Request::put("/cargo/cargo-test/api/v1/crates/new")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(res.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let detail = json["errors"][0]["detail"].as_str().expect("detail");
+        assert!(
+            detail.contains("9.9.9") && detail.contains("0.1.0"),
+            "the refusal must name both versions: {detail}"
+        );
+        assert_eq!(h.storage.put_call_count(), 0);
+    }
+
+    /// The gap `is_top_level_entry` leaves open: it already requires
+    /// exactly one directory segment before `/Cargo.toml`, but not that
+    /// the segment be `{name}-{version}` — and nothing read the manifest
+    /// inside it. The manifest is what the check stands on, so a `.crate`
+    /// whose directory segment matches the frame while its manifest does
+    /// not is still refused.
+    #[tokio::test]
+    async fn publish_refuses_a_crate_whose_manifest_disagrees_under_a_matching_directory() {
+        let h = harness();
+        insert_repo(&h, "cargo-test");
+        let router = router(h.ctx.clone());
+
+        let metadata = br#"{"name":"mycrate","vers":"0.1.0"}"#;
+        let crate_bytes = hort_formats::test_support::build_cargo_crate(
+            "mycrate-0.1.0", // the directory the frame leads a reader to expect
+            "evilcrate",     // what the manifest inside it actually declares
+            "0.1.0",
+        );
+        let body = build_publish_body(metadata, &crate_bytes);
+
+        let res = router
+            .oneshot(
+                Request::put("/cargo/cargo-test/api/v1/crates/new")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(h.storage.put_call_count(), 0);
+    }
+
+    /// The counter-test: a correct publish still succeeds.
+    #[tokio::test]
+    async fn publish_of_an_agreeing_crate_still_succeeds() {
+        let h = harness();
+        insert_repo(&h, "cargo-test");
+        let router = router(h.ctx.clone());
+
+        let metadata = br#"{"name":"mycrate","vers":"0.1.0"}"#;
+        let body = build_publish_body(metadata, &crate_for("mycrate", "0.1.0"));
+
+        let res = router
+            .oneshot(
+                Request::put("/cargo/cargo-test/api/v1/crates/new")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// A `.crate` payload that is not a gzip-tar at all cannot show that
+    /// it declares the coordinates it is published under.
+    #[tokio::test]
+    async fn publish_refuses_a_crate_payload_that_is_not_an_archive() {
+        let h = harness();
+        insert_repo(&h, "cargo-test");
+        let router = router(h.ctx.clone());
+
+        let metadata = br#"{"name":"mycrate","vers":"0.1.0"}"#;
+        let body = build_publish_body(metadata, b"fake crate tarball content");
+
+        let res = router
+            .oneshot(
+                Request::put("/cargo/cargo-test/api/v1/crates/new")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(h.storage.put_call_count(), 0);
+    }
+
     // -- publish-handler input validators ------------------------------------
     //
     // `validate_cargo_name` / `validate_cargo_version` guard both the
@@ -2826,8 +3093,9 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let metadata = br#"{"name":"../../../etc/passwd","vers":"1.0.0"}"#;
-        let crate_bytes = b"fake crate tarball content";
-        let body = build_publish_body(metadata, crate_bytes);
+        // Opaque bytes are fine here: the name grammar validator rejects
+        // before anything opens the archive.
+        let body = build_publish_body(metadata, b"fake crate tarball content");
 
         let res = router
             .oneshot(
@@ -2862,8 +3130,9 @@ mod tests {
         // `\r\n` to the actual control bytes, which is what the
         // validator must catch.
         let metadata = br#"{"name":"valid_crate","vers":"1.0\r\nInjected"}"#;
-        let crate_bytes = b"fake crate tarball content";
-        let body = build_publish_body(metadata, crate_bytes);
+        // Opaque bytes are fine here: the version grammar validator
+        // rejects before anything opens the archive.
+        let body = build_publish_body(metadata, b"fake crate tarball content");
 
         let res = router
             .oneshot(
@@ -2890,8 +3159,7 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let metadata = br#"{"name":"valid_crate","vers":"1.0.0"}"#;
-        let crate_bytes = b"fake crate tarball content";
-        let body = build_publish_body(metadata, crate_bytes);
+        let body = build_publish_body(metadata, &crate_for("valid_crate", "1.0.0"));
 
         let res = router
             .oneshot(
@@ -3296,8 +3564,7 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let metadata = br#"{"name":"precedence","vers":"1.0.0"}"#;
-        let crate_bytes = b"content";
-        let body = build_publish_body(metadata, crate_bytes);
+        let body = build_publish_body(metadata, &crate_for("precedence", "1.0.0"));
 
         let res = router
             .oneshot(
@@ -3499,7 +3766,7 @@ mod tests {
         ) -> (StatusCode, Vec<u8>) {
             let router = router(ctx);
             let metadata = br#"{"name":"authz","vers":"1.0.0"}"#;
-            let body_bytes = build_publish_body(metadata, b"crate bytes");
+            let body_bytes = build_publish_body(metadata, &crate_for("authz", "1.0.0"));
             let mut req = Request::put("/cargo/cargo-test/api/v1/crates/new")
                 .body(Body::from(body_bytes))
                 .unwrap();

@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek};
 
 use bytes::Bytes;
 use hort_domain::entities::repository::RepositoryFormat;
@@ -281,6 +281,220 @@ pub fn pypi_extract_version_from_filename(filename: &str) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// The version the distribution filename carries, against the declared one
+// ---------------------------------------------------------------------------
+
+/// Distribution-filename extensions whose stem ends with the version.
+///
+/// Longest suffixes first so `.tar.gz` does not short-circuit on `.gz` —
+/// the same ordering, for the same reason, as
+/// [`pypi_extract_version_from_filename`].
+const PYPI_SDIST_EXTENSIONS: &[&str] = &[".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip", ".egg"];
+
+/// PEP 503 name normalisation: lowercase, and collapse every run of
+/// `-`, `_` or `.` to a single `-`.
+///
+/// The body of [`PyPiFormatHandler::normalize_name`], lifted to a free
+/// function because [`check_pypi_filename_version`] needs the same
+/// normalisation to apply pip's filename rule and a second copy of it is a
+/// second answer to "are these the same project".
+#[must_use]
+pub fn pep_503_normalize(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    let mut in_separator_run = false;
+
+    for c in name.chars() {
+        if c == '-' || c == '_' || c == '.' {
+            if !in_separator_run && !result.is_empty() {
+                result.push('-');
+                in_separator_run = true;
+            }
+        } else {
+            in_separator_run = false;
+            result.extend(c.to_lowercase());
+        }
+    }
+
+    // Remove trailing separator.
+    if result.ends_with('-') {
+        result.pop();
+    }
+
+    result
+}
+
+/// Escape a version the way a distribution filename carries it.
+///
+/// The binary-distribution-format specification (PEP 427 and its successor
+/// text) defines the wheel filename's components as escaped with
+/// `re.sub("[^\w\d.]+", "_", component)` — so `1.0.0+local.1` is written
+/// `1.0.0_local.1` in the filename while the metadata still says
+/// `1.0.0+local.1`. Comparing the two spellings byte-for-byte would refuse
+/// the exact form the specification prescribes.
+///
+/// The fold is ASCII-only on the `\w` class and additionally lowercases,
+/// because a PEP 440 version compares case-insensitively and a build
+/// backend may normalise `1.0.0RC1` to `1.0.0rc1` in the filename while the
+/// metadata keeps the author's spelling. Both moves can only make two
+/// spellings of the *same* version agree; neither can make two different
+/// versions agree, because every character that survives the fold survives
+/// it identically on both sides.
+fn pypi_filename_version_key(version: &str) -> String {
+    let mut out = String::with_capacity(version.len());
+    let mut pending_underscore = false;
+    for ch in version.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
+            if pending_underscore {
+                out.push('_');
+                pending_underscore = false;
+            }
+            out.extend(ch.to_lowercase());
+        } else {
+            // A *run* of non-class characters collapses to one `_`.
+            pending_underscore = true;
+        }
+    }
+    if pending_underscore {
+        out.push('_');
+    }
+    out
+}
+
+/// What comparing a distribution filename's version against the declared
+/// one concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PypiFilenameVersion {
+    /// The filename carries the declared version, under the escaping its
+    /// own grammar defines.
+    Agrees,
+    /// The filename carries no version this grammar can read, so there is
+    /// nothing to disagree with.
+    ///
+    /// `pip` derives a candidate's version from the filename and skips a
+    /// link whose filename it cannot parse, so a filename with no readable
+    /// version produces no divergence between what hort records and what a
+    /// client resolves — it produces a file no client will install.
+    Undecidable,
+    /// The filename names a different version than the declared one.
+    Diverges {
+        /// The version the filename carries, sanitised.
+        in_filename: String,
+    },
+}
+
+/// Compare the version a PyPI distribution filename carries against the
+/// version the upload declared.
+///
+/// # Why these two can diverge at all, and why that matters
+///
+/// A legacy-API upload declares `name` and `version` as form fields, and
+/// supplies the filename separately in the `content` part's
+/// `Content-Disposition`. hort stores the declared version and serves the
+/// file at `simple/{name}/{filename}` — but a client resolving that index
+/// does **not** read hort's stored version. PEP 503 publishes only links,
+/// and `pip` recovers each candidate's version from the *filename*. So an
+/// upload declaring `1.0.0` under the filename `foo-9.9.9.tar.gz` is
+/// installed as `9.9.9` by every client while every record hort keeps of it
+/// says `1.0.0`.
+///
+/// # How the filename's version is recovered
+///
+/// `declared_name` is what makes this faithful rather than approximate, and
+/// it is the whole reason this is not just a call to
+/// [`pypi_extract_version_from_filename`]:
+///
+/// - **Wheel** — the binary-distribution-format specification fixes the
+///   filename as
+///   `{distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl`, and
+///   escapes every component so a `-` cannot survive inside one. The version
+///   is therefore the second `-`-delimited component, unambiguously, and the
+///   name is not needed to find it.
+/// - **sdist** — the version is whatever follows the project name, and the
+///   name itself may contain `-`. `pip` finds the boundary by walking the
+///   stem's `-` positions and taking the first one whose prefix
+///   PEP 503-normalises to the project it is resolving
+///   (`_find_name_version_sep`); everything after it is the version. This
+///   function applies that same rule, because a rule that disagrees with the
+///   client's is a check that can pass on a filename the client reads
+///   differently. A trailing-`-` split would read `foo-9.9.9-0.tar.gz` as
+///   version `0` where `pip` reads `9.9.9-0` — and an upload declaring `0`
+///   under that filename would then be waved through as agreeing.
+/// - If no `-` prefix normalises to `declared_name`, the filename's name
+///   component is not this project's — a *name* divergence, which is a
+///   different question and not this one. The grammar helper's answer stands
+///   so that case is neither refused here nor silently blessed.
+///
+/// # The two spellings the specifications allow
+///
+/// The comparison is not byte equality, because two spellings of one version
+/// are both legal:
+///
+/// 1. The filename escaping. The specification escapes each component with
+///    `re.sub("[^\w\d.]+", "_", component)`, so the metadata version
+///    `1.0.0+local.1` is written `1.0.0_local.1`. Both sides pass through
+///    [`pypi_filename_version_key`], which also ASCII-lowercases (a PEP 440
+///    version compares case-insensitively, and a backend may normalise
+///    `1.0.0RC1` → `1.0.0rc1` in the filename while the metadata keeps the
+///    author's spelling). Every character that survives the fold survives it
+///    identically on both sides, so the fold can make two spellings of the
+///    *same* version agree and can never make two different versions agree.
+/// 2. The unescaped spelling, compared verbatim. PEP 625 requires a
+///    normalised PEP 440 version in an sdist filename and a normalised one
+///    never contains `-`, but [`validate_pypi_version`] is a permissive
+///    charset gate that admits the legacy spelling — so `foo-1.0-1.tar.gz`
+///    declaring `1.0-1` agrees, rather than this check inventing a grammar
+///    rule the publish path does not otherwise enforce.
+#[must_use]
+pub fn check_pypi_filename_version(
+    filename: &str,
+    declared_name: &str,
+    declared_version: &str,
+) -> PypiFilenameVersion {
+    // No version this grammar can read: `pip` skips a link it cannot parse,
+    // so there is no disagreement between what hort records and what a
+    // client resolves — there is a file no client will install.
+    let Some(in_filename) = pypi_filename_version_component(filename, declared_name) else {
+        return PypiFilenameVersion::Undecidable;
+    };
+    if in_filename == declared_version
+        || pypi_filename_version_key(&in_filename) == pypi_filename_version_key(declared_version)
+    {
+        return PypiFilenameVersion::Agrees;
+    }
+    PypiFilenameVersion::Diverges {
+        in_filename: crate::publish_identity::sanitize_declared(&in_filename),
+    }
+}
+
+/// The version component of a distribution filename, by the rule the
+/// resolving client uses. See [`check_pypi_filename_version`] for why the
+/// project name is part of the sdist rule and not the wheel one.
+fn pypi_filename_version_component(filename: &str, declared_name: &str) -> Option<String> {
+    // Wheels first: the longest extension wins so `.whl` is not shadowed,
+    // and its version component is positional.
+    if filename.strip_suffix(".whl").is_some() {
+        return pypi_extract_version_from_filename(filename);
+    }
+    for ext in PYPI_SDIST_EXTENSIONS {
+        let Some(stem) = filename.strip_suffix(ext) else {
+            continue;
+        };
+        let canonical = pep_503_normalize(declared_name);
+        for (sep, _) in stem.match_indices('-') {
+            if pep_503_normalize(&stem[..sep]) == canonical {
+                let version = &stem[sep + 1..];
+                return (!version.is_empty()).then(|| version.to_string());
+            }
+        }
+        break;
+    }
+    // Not a recognised archive suffix, or an sdist whose name component is
+    // not this project's. Fall back to the shared filename grammar, which is
+    // also what the index-side readers use.
+    pypi_extract_version_from_filename(filename)
+}
+
 /// Extract the basename of an `href="…"` attribute value (the filename —
 /// the last `/`-delimited segment, with both the `?…` query and the
 /// `#…` fragment stripped). Used by the PyPI simple-index
@@ -357,15 +571,24 @@ fn pypi_scan_href_values(html: &str) -> Vec<&str> {
     out
 }
 
-/// Find the wheel's `<dist-info>/METADATA` member in a ZIP byte buffer
-/// and return its contents bounded by [`PYPI_WHEEL_METADATA_MAX_BYTES`].
+/// Find the wheel's `<dist-info>/METADATA` member in a ZIP and return
+/// its contents bounded by [`PYPI_WHEEL_METADATA_MAX_BYTES`].
 ///
-/// Separated from the `FormatHandler` impl so the bytes-in-/bytes-out
-/// kernel is testable directly without manufacturing a
-/// [`PayloadAccess`]. Lives next to the only caller; not exported.
+/// Generic over `Read + Seek` rather than taking `&[u8]`, because a ZIP
+/// is indexed at its tail: `iter_zip_entries` reads the central
+/// directory and then seeks to the one member this function wants. Given
+/// a seekable payload that is not in memory — a spill file — the bytes
+/// this reads are the central directory plus one member, so extracting a
+/// megabyte of METADATA out of a gigabyte wheel costs a megabyte. A
+/// `&[u8]` parameter would have obliged every caller to hold the whole
+/// archive first, which is the cost this signature exists to avoid.
+///
+/// Separated from the `FormatHandler` impl so the kernel is testable
+/// directly without manufacturing a [`PayloadAccess`]. Lives next to its
+/// callers; not exported.
 ///
 /// Returns:
-/// - `Ok(None)` — buffer is not a valid ZIP, or the ZIP carries zero
+/// - `Ok(None)` — the payload is not a valid ZIP, or the ZIP carries zero
 ///   `*.dist-info/METADATA` entries. Non-fatal: the wheel ingest
 ///   already succeeded; PEP 658 is simply not advertised.
 /// - `Ok(Some(bytes))` — METADATA bytes (first matching entry; the
@@ -386,16 +609,16 @@ fn pypi_scan_href_values(html: &str) -> Vec<&str> {
 /// 658 path is best-effort (a non-ZIP / corrupt buffer is `Ok(None)`,
 /// because the primary wheel ingest already succeeded and PEP 658 is
 /// merely not advertised), whereas the dependency-extraction sibling has
-/// already magic-sniffed the buffer as a zip and treats a parse failure
+/// already magic-sniffed its buffer as a zip and treats a parse failure
 /// as a corrupt-wheel `Err`. A *bounds* trip (entry cap / ratio) is fatal
 /// on BOTH paths — never silently downgraded to `Ok(None)`.
-fn extract_wheel_metadata_bytes_from_zip(buf: &[u8]) -> DomainResult<Option<Bytes>> {
+fn extract_wheel_metadata_from_zip<R: Read + Seek>(zip: R) -> DomainResult<Option<Bytes>> {
     let mut first_match: Option<Bytes> = None;
     let mut match_count: usize = 0;
     let mut read_err: Option<String> = None;
 
     let iter_result = crate::archive_bounds::iter_zip_entries(
-        Cursor::new(buf),
+        zip,
         crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
         |name, reader| {
             if read_err.is_some() || !is_wheel_metadata_path(name) {
@@ -700,27 +923,7 @@ impl FormatHandler for PyPiFormatHandler {
     /// Normalize a package name per PEP 503 §4:
     /// replace any run of `-`, `_`, or `.` with a single `-`, then lowercase.
     fn normalize_name(&self, name: &str) -> String {
-        let mut result = String::with_capacity(name.len());
-        let mut in_separator_run = false;
-
-        for c in name.chars() {
-            if c == '-' || c == '_' || c == '.' {
-                if !in_separator_run && !result.is_empty() {
-                    result.push('-');
-                    in_separator_run = true;
-                }
-            } else {
-                in_separator_run = false;
-                result.extend(c.to_lowercase());
-            }
-        }
-
-        // Remove trailing separator.
-        if result.ends_with('-') {
-            result.pop();
-        }
-
-        result
+        pep_503_normalize(name)
     }
 
     /// Build an SBOM from a PyPI per-version JSON API body. Narrowed to
@@ -731,13 +934,7 @@ impl FormatHandler for PyPiFormatHandler {
         format_metadata: &serde_json::Value,
         _payload: PayloadAccess<'_>,
     ) -> DomainResult<Option<Sbom>> {
-        // Locate `requires_dist` under either the `info` wrapper or the
-        // top level. Either way it must be an array of strings.
-        let requires_dist = format_metadata
-            .get("info")
-            .and_then(|info| info.get("requires_dist"))
-            .or_else(|| format_metadata.get("requires_dist"))
-            .and_then(|v| v.as_array());
+        let requires_dist = pypi_requires_dist(format_metadata);
 
         let licenses = extract_pypi_license_list(format_metadata);
 
@@ -762,10 +959,7 @@ impl FormatHandler for PyPiFormatHandler {
         };
 
         let mut components = Vec::new();
-        for raw in reqs {
-            let Some(req_str) = raw.as_str() else {
-                continue;
-            };
+        for req_str in reqs {
             let Some((name, version)) = parse_pep_508_requirement(req_str) else {
                 continue;
             };
@@ -836,13 +1030,24 @@ impl FormatHandler for PyPiFormatHandler {
         if !coords.path.ends_with(".whl") {
             return Ok(None);
         }
-        // Materialise the payload into memory. ZIP parsing needs
-        // `Read + Seek`; PyPI wheels rarely exceed ~100 MB and the
-        // ingest hook has already buffered the artifact for the
-        // primary-content-hash computation, so the memory cost is
-        // already paid at this point in the pipeline.
-        let buf: Vec<u8> = match payload {
-            PayloadAccess::Bytes(b) => b.to_vec(),
+        // ZIP parsing needs `Read + Seek`, and each arm supplies it
+        // without copying the payload a second time:
+        //
+        // - `Bytes` wraps the caller's slice in a `Cursor`. Copying it
+        //   into a `Vec` first would hold a second whole archive
+        //   alongside the caller's for the duration of the walk, to no
+        //   end — `Cursor<&[u8]>` is already `Read + Seek`.
+        // - `ReadSeek` is passed straight through. These bytes are not
+        //   in memory and must not be put there: the walk reads the
+        //   central directory and the one METADATA member, so peak
+        //   occupancy is the member's cap rather than the wheel's size.
+        // - `ReadStream` is forward-only, so there is no way to reach a
+        //   ZIP's tail-indexed member table other than to buffer it.
+        //   No production caller takes this arm for a wheel; it is kept
+        //   so the variant has a defined meaning rather than a panic.
+        match payload {
+            PayloadAccess::Bytes(b) => extract_wheel_metadata_from_zip(Cursor::new(b)),
+            PayloadAccess::ReadSeek(r) => extract_wheel_metadata_from_zip(r),
             PayloadAccess::ReadStream(mut r) => {
                 let mut v = Vec::new();
                 if r.read_to_end(&mut v).is_err() {
@@ -851,10 +1056,9 @@ impl FormatHandler for PyPiFormatHandler {
                     // ingest succeeded before this method is invoked.
                     return Ok(None);
                 }
-                v
+                extract_wheel_metadata_from_zip(Cursor::new(v))
             }
-        };
-        extract_wheel_metadata_bytes_from_zip(&buf)
+        }
     }
 }
 
@@ -1179,7 +1383,7 @@ impl VersionDiscovery for PyPiFormatHandler {
 /// `iter_zip_entries` reads the central directory and seeks to each entry, so
 /// reaching the METADATA member does not decompress the whole archive.
 ///
-/// Distinct from [`extract_wheel_metadata_bytes_from_zip`] (the PEP 658
+/// Distinct from [`extract_wheel_metadata_from_zip`] (the PEP 658
 /// path), which uses the `zip` crate directly and returns `Ok(None)` for
 /// a corrupt / non-ZIP buffer because that path is non-fatal at ingest. Here
 /// the buffer has already been magic-sniffed as a zip, so a parse failure is a
@@ -1512,6 +1716,48 @@ fn parse_pep_508_requirement(line: &str) -> Option<(String, Option<String>)> {
     Some((name_part, version))
 }
 
+/// The `Requires-Dist` strings in a stored PyPI metadata document, from
+/// whichever of its three shapes this artifact has.
+///
+/// The shapes are not variants of one document; they are **different
+/// documents**, one per ingest path, and a reader that knows only some of
+/// them silently reports an artifact's dependencies as absent:
+///
+/// - `info.requires_dist` — the per-version PyPI JSON API body, which is
+///   what a pull-through fetch parses.
+/// - `requires_dist` at the top level — the same body sliced to a single
+///   version.
+/// - `pkg_info.requires_dist` — a **direct upload**. `twine` sends the
+///   distribution's `METADATA` fields as multipart form fields and the
+///   publish handler stores the harvest under `pkg_info`, so a hosted
+///   repository's declared dependencies live only here. This was the
+///   one shape missing, and the consequence was not a thinner BOM: on a
+///   policy whose backend adjudicates the BOM, every hosted PyPI
+///   distribution was assessed as though it declared no dependencies at
+///   all.
+///
+/// A repeated multipart field arrives as a JSON array and a
+/// single-occurrence one as a bare string, so both are accepted — a
+/// distribution with exactly one requirement is an ordinary shape, not a
+/// malformed one. Non-string array elements are skipped rather than
+/// failing the document: the array is publisher-supplied.
+fn pypi_requires_dist(metadata: &serde_json::Value) -> Option<Vec<&str>> {
+    let raw = metadata
+        .get("info")
+        .and_then(|info| info.get("requires_dist"))
+        .or_else(|| metadata.get("requires_dist"))
+        .or_else(|| {
+            metadata
+                .get("pkg_info")
+                .and_then(|pkg_info| pkg_info.get("requires_dist"))
+        })?;
+    match raw {
+        serde_json::Value::Array(items) => Some(items.iter().filter_map(|v| v.as_str()).collect()),
+        serde_json::Value::String(one) => Some(vec![one.as_str()]),
+        _ => None,
+    }
+}
+
 /// Extract a license list from a PyPI per-release metadata JSON.
 ///
 /// Reads `info.license` as the primary source (a free-form string).
@@ -1620,6 +1866,202 @@ mod tests {
 
     fn handler() -> PyPiFormatHandler {
         PyPiFormatHandler
+    }
+
+    // -- the version the distribution filename carries ---------------------
+
+    #[test]
+    fn an_agreeing_sdist_filename_agrees() {
+        assert_eq!(
+            check_pypi_filename_version("foo-1.0.0.tar.gz", "foo", "1.0.0"),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    #[test]
+    fn an_agreeing_wheel_filename_agrees() {
+        assert_eq!(
+            check_pypi_filename_version("foo-1.0.0-py3-none-any.whl", "foo", "1.0.0"),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    #[test]
+    fn a_sdist_filename_naming_another_version_diverges() {
+        assert_eq!(
+            check_pypi_filename_version("foo-9.9.9.tar.gz", "foo", "1.0.0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_wheel_filename_naming_another_version_diverges() {
+        assert_eq!(
+            check_pypi_filename_version("foo-9.9.9-py3-none-any.whl", "foo", "1.0.0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9".into()
+            }
+        );
+    }
+
+    /// The binary-distribution-format specification escapes a filename
+    /// component with `re.sub("[^\w\d.]+", "_", component)`, so a local
+    /// version `1.0.0+local.1` is written `1.0.0_local.1`. Byte equality
+    /// would refuse the exact spelling the spec prescribes.
+    #[test]
+    fn the_wheel_filename_escaping_the_spec_prescribes_agrees() {
+        assert_eq!(
+            check_pypi_filename_version(
+                "foo-1.0.0_local.1-py3-none-any.whl",
+                "foo",
+                "1.0.0+local.1",
+            ),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    /// A PEP 440 version compares case-insensitively and a build backend
+    /// may normalise the spelling in the filename while the metadata keeps
+    /// the author's.
+    #[test]
+    fn a_case_difference_in_the_version_agrees() {
+        assert_eq!(
+            check_pypi_filename_version("foo-1.0.0rc1-py3-none-any.whl", "foo", "1.0.0RC1"),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    /// The fold collapses a RUN of out-of-class characters to one `_`, as
+    /// the specification's `+` quantifier does.
+    #[test]
+    fn a_run_of_escaped_characters_collapses_to_one_underscore() {
+        assert_eq!(pypi_filename_version_key("1.0.0+-+1"), "1.0.0_1");
+        assert_eq!(pypi_filename_version_key("1.0.0+"), "1.0.0_");
+    }
+
+    /// `validate_pypi_version` is a permissive charset gate that admits a
+    /// legacy non-normalised version containing `-`. `pip`'s rule recovers
+    /// the whole thing because it finds the boundary by the project name,
+    /// so this agrees; refusing it would be this check inventing a grammar
+    /// rule the publish path does not otherwise enforce.
+    #[test]
+    fn a_legacy_version_containing_a_hyphen_agrees_under_pips_rule() {
+        assert_eq!(
+            check_pypi_filename_version("foo-1.0-1.tar.gz", "foo", "1.0-1"),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    /// The reason the project name is part of the sdist rule. A
+    /// trailing-`-` split reads `foo-9.9.9-0.tar.gz` as version `0`, so an
+    /// upload declaring `0` under that filename would be waved through as
+    /// agreeing — while `pip`, which finds the boundary after the project
+    /// name, resolves it as `9.9.9-0` and installs that.
+    #[test]
+    fn the_sdist_version_is_everything_after_the_project_name() {
+        assert_eq!(
+            check_pypi_filename_version("foo-9.9.9-0.tar.gz", "foo", "0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9-0".into()
+            }
+        );
+        // And the same filename declaring what it actually carries agrees.
+        assert_eq!(
+            check_pypi_filename_version("foo-9.9.9-0.tar.gz", "foo", "9.9.9-0"),
+            PypiFilenameVersion::Agrees
+        );
+    }
+
+    /// The boundary is found on the PEP 503-*normalised* name, so the
+    /// `-`/`_`/`.` spelling of the filename's name component does not have
+    /// to match the declared one character for character.
+    #[test]
+    fn the_project_name_boundary_is_found_on_the_normalised_name() {
+        for (filename, name) in [
+            ("my_package-1.0.0.tar.gz", "my-package"),
+            ("My.Package-1.0.0.tar.gz", "my_package"),
+            ("my-package-1.0.0.tar.gz", "My.Package"),
+        ] {
+            assert_eq!(
+                check_pypi_filename_version(filename, name, "1.0.0"),
+                PypiFilenameVersion::Agrees,
+                "{filename} / {name}"
+            );
+        }
+    }
+
+    /// A hyphenated project name whose own `-` would otherwise be read as
+    /// the version boundary.
+    #[test]
+    fn a_hyphenated_project_name_does_not_swallow_the_version() {
+        assert_eq!(
+            check_pypi_filename_version("my-package-9.9.9.tar.gz", "my-package", "1.0.0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9".into()
+            }
+        );
+    }
+
+    /// An sdist whose name component is not this project's is a *name*
+    /// divergence, which is a different question. The grammar helper's
+    /// answer stands, so the case is neither refused here nor blessed.
+    #[test]
+    fn an_sdist_naming_another_project_falls_back_to_the_grammar() {
+        assert_eq!(
+            check_pypi_filename_version("other-1.0.0.tar.gz", "foo", "1.0.0"),
+            PypiFilenameVersion::Agrees
+        );
+        assert_eq!(
+            check_pypi_filename_version("other-9.9.9.tar.gz", "foo", "1.0.0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9".into()
+            }
+        );
+    }
+
+    /// A filename whose grammar yields no version is undecidable, not
+    /// divergent: `pip` skips a link it cannot parse, so nothing a client
+    /// resolves disagrees with what hort recorded.
+    #[test]
+    fn a_filename_with_no_readable_version_is_undecidable() {
+        for name in ["foo.tar.gz", "foo", "foo-.tar.gz", "foo.whl"] {
+            assert_eq!(
+                check_pypi_filename_version(name, "foo", "1.0.0"),
+                PypiFilenameVersion::Undecidable,
+                "{name}"
+            );
+        }
+    }
+
+    /// The stem-suffix fallback must not let a wheel through on the
+    /// strength of a tag that happens to end with the declared version.
+    #[test]
+    fn a_wheel_is_judged_on_its_version_component_alone() {
+        assert_eq!(
+            check_pypi_filename_version("foo-9.9.9-py3-none-1.0.0.whl", "foo", "1.0.0"),
+            PypiFilenameVersion::Diverges {
+                in_filename: "9.9.9".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_crafted_filename_version_is_sanitised_before_it_reaches_the_refusal() {
+        // `validate_pypi_filename` rejects control bytes before this check
+        // ever runs on the publish path; the sanitiser is the second line,
+        // for every other caller.
+        let long = "9".repeat(crate::publish_identity::DECLARED_FRAGMENT_MAX_CHARS + 50);
+        let PypiFilenameVersion::Diverges { in_filename } =
+            check_pypi_filename_version(&format!("foo-{long}.tar.gz"), "foo", "1.0.0")
+        else {
+            panic!("expected a divergence");
+        };
+        assert_eq!(
+            in_filename.chars().count(),
+            crate::publish_identity::DECLARED_FRAGMENT_MAX_CHARS
+        );
     }
 
     // -- normalize_name -------------------------------------------------------
@@ -3013,6 +3455,95 @@ mod tests {
             .expect("Some")
             .expect("Some");
         assert!(sbom.components.is_empty());
+    }
+
+    /// **The F11-3 regression.** A direct upload's `METADATA` fields are
+    /// stored under `pkg_info` (the publish handler's multipart
+    /// harvest), and the SBOM reader looked only at `info.requires_dist`
+    /// and the top level — so every hosted PyPI distribution produced a
+    /// subject-only BOM, and a BOM-adjudicating backend assessed it as
+    /// declaring no dependencies at all.
+    #[test]
+    fn extract_sbom_pypi_reads_a_hosted_uploads_pkg_info_requires_dist() {
+        let metadata = serde_json::json!({
+            "pkg_info": {
+                "metadata_version": "2.1",
+                "requires_python": ">=3.8",
+                "requires_dist": [
+                    "requests (==2.31.0)",
+                    "click >=8.0",
+                ],
+            },
+        });
+        let coords = sbom_coords("myapp", "1.0.0");
+
+        let sbom = PyPiFormatHandler
+            .extract_sbom(&coords, &metadata, PayloadAccess::Bytes(b""))
+            .expect("Some")
+            .expect("Some");
+
+        let mut names: Vec<&str> = sbom.components.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["click", "requests"],
+            "a hosted publish's declared dependencies must reach the scan subject"
+        );
+        let requests = sbom
+            .components
+            .iter()
+            .find(|c| c.name == "requests")
+            .expect("requests present");
+        assert_eq!(requests.purl, "pkg:pypi/requests@2.31.0");
+        assert!(requests.direct_dependency);
+    }
+
+    /// A distribution with exactly one requirement: the legacy upload
+    /// API has no list type, so a field that occurs once is a bare
+    /// string. Reading only the array shape would report that single
+    /// dependency as absent.
+    #[test]
+    fn extract_sbom_pypi_reads_a_single_occurrence_requires_dist_string() {
+        let metadata = serde_json::json!({
+            "pkg_info": { "requires_dist": "requests (==2.31.0)" },
+        });
+        let coords = sbom_coords("myapp", "1.0.0");
+
+        let sbom = PyPiFormatHandler
+            .extract_sbom(&coords, &metadata, PayloadAccess::Bytes(b""))
+            .expect("Some")
+            .expect("Some");
+        assert_eq!(
+            sbom.components
+                .iter()
+                .map(|c| c.purl.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pkg:pypi/requests@2.31.0"]
+        );
+    }
+
+    /// The proxied shapes keep precedence, so an artifact that carries
+    /// both documents is read from the registry body rather than from a
+    /// client-supplied harvest.
+    #[test]
+    fn extract_sbom_pypi_prefers_the_registry_body_over_the_upload_harvest() {
+        let metadata = serde_json::json!({
+            "info": { "requires_dist": ["requests (==2.31.0)"] },
+            "pkg_info": { "requires_dist": ["attrs (==1.0)"] },
+        });
+        let coords = sbom_coords("myapp", "1.0.0");
+
+        let sbom = PyPiFormatHandler
+            .extract_sbom(&coords, &metadata, PayloadAccess::Bytes(b""))
+            .expect("Some")
+            .expect("Some");
+        assert_eq!(
+            sbom.components
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["requests"]
+        );
     }
 
     #[test]

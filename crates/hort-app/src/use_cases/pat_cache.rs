@@ -356,6 +356,7 @@ mod tests {
         TokenCap {
             permissions: vec![Permission::Read],
             repository_ids: None,
+            per_repository_permissions: None,
         }
     }
 

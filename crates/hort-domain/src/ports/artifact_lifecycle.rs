@@ -2,7 +2,8 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
-use crate::error::DomainResult;
+use crate::error::{DomainError, DomainResult};
+use crate::events::StreamId;
 use crate::ports::content_reference_index::ContentReference;
 use crate::ports::event_store::{AppendEvents, AppendResult};
 use crate::ports::repo_security_score_repository::ScoreDelta;
@@ -39,12 +40,69 @@ pub enum IngestEnqueue {
     },
 }
 
+/// **The** identity rule for an artifact-lifecycle commit: the event
+/// batch must be about the artifact whose projection row the same commit
+/// writes.
+///
+/// Every method on [`ArtifactLifecyclePort`] takes an `&Artifact` and an
+/// [`AppendEvents`] that each name an artifact independently — the row's
+/// `id` and the batch's [`StreamId`] — and persists both together. The
+/// atomicity is the point of the port, and it is also what makes a
+/// mismatched pair worse than a dual write: a pair that disagrees commits
+/// **durably and in full**, leaving the `artifacts` row saying one thing
+/// and the stream it is supposed to be derived from saying another, with
+/// no intermediate state for anything to notice. Nothing downstream
+/// recovers from that — the chain verifier checks the chain against
+/// itself and against its anchors and never reads the projection, so a
+/// contradiction between them is invisible to it while both halves
+/// verify individually.
+///
+/// So the pair is refused before it is written. The comparison is
+/// two-field equality on [`StreamId`] (`category` and `entity_id`), which
+/// also rejects an artifact-id-shaped stream in the wrong category.
+///
+/// # Why this lives in the domain layer rather than in the adapter
+///
+/// The port is backend-agnostic by decision (ADR 0004: *"A backend cannot
+/// satisfy the contract by accepting the parameter and ignoring it"*), and
+/// there is exactly one implementation today. A rule written inside that
+/// implementation is a rule the second one inherits the absence of without
+/// ever seeing it — the same reason
+/// [`require_https_metadata_url`](crate::ports::format_handler::require_https_metadata_url)
+/// and [`cap_finding_title`](crate::types::finding::cap_finding_title)
+/// are single-sourced here. Every implementation calls this; a test double
+/// that round-trips the pair — one whose recorded artifact is readable
+/// back beside the events it accepted — calls it too, because a double
+/// that accepts a pair production refuses lets a test stand on a state the
+/// system cannot reach.
+///
+/// [`DomainError::Invariant`] rather than `Validation`: no caller input
+/// reaches this: the mismatch is a wiring defect in the use case that
+/// built the pair, and re-running it produces the same pair.
+pub fn require_paired_artifact_stream(
+    artifact: &Artifact,
+    events: &AppendEvents,
+) -> DomainResult<()> {
+    let expected = StreamId::artifact(artifact.id);
+    if events.stream_id == expected {
+        return Ok(());
+    }
+    Err(DomainError::Invariant(format!(
+        "artifact-lifecycle commit pairs artifact {} with event stream {}, not {expected}",
+        artifact.id, events.stream_id
+    )))
+}
+
 /// Outbound port for atomic artifact lifecycle transitions.
 ///
 /// Each call persists both the domain events and the mutated artifact state
 /// in a single transaction. This eliminates the dual-write hazard where
 /// `EventStore::append` + `ArtifactRepository::save` could leave the
 /// event log and artifact table inconsistent if a crash occurs between them.
+///
+/// Atomicity is not agreement, and every method here therefore owes the
+/// caller both: see [`require_paired_artifact_stream`], which every
+/// implementation calls before it writes anything.
 pub trait ArtifactLifecyclePort: Send + Sync {
     /// Atomically append events to the artifact's stream, persist the
     /// artifact's updated state, and optionally upsert the
@@ -303,6 +361,98 @@ pub trait ArtifactLifecyclePort: Send + Sync {
 mod tests {
     use super::*;
 
+    /// A minimal artifact at `id` in `status` — every field a test here
+    /// does not care about, which is all of them but those two. One
+    /// fixture rather than a literal per test: the struct is twenty-one
+    /// fields wide and the tests differ in two.
+    fn artifact_at(id: Uuid, status: QuarantineStatus) -> Artifact {
+        Artifact {
+            id,
+            repository_id: Uuid::nil(),
+            name: "n".into(),
+            name_as_published: "n".into(),
+            version: None,
+            path: "/".into(),
+            size_bytes: 0,
+            sha256_checksum: "a".repeat(64).parse().unwrap(),
+            sha1_checksum: None,
+            md5_checksum: None,
+            content_type: "application/octet-stream".into(),
+            quarantine_status: status,
+            rejection_reason: None,
+            quarantine_window_start: None,
+            quarantine_deadline: None,
+            provenance_hold_indefinite: false,
+            deleted_at: None,
+            upstream_published_at: None,
+            uploaded_by: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// An empty batch against `stream` — enough to carry the stream id,
+    /// which is the only field the pairing rule reads.
+    fn empty_batch_for(stream: StreamId) -> AppendEvents {
+        AppendEvents {
+            stream_id: stream,
+            expected_version: crate::ports::event_store::ExpectedVersion::NoStream,
+            events: vec![],
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: crate::events::system_actor(),
+        }
+    }
+
+    // ---- require_paired_artifact_stream --------------------------------
+
+    /// The pair that agrees is accepted — the shape every production
+    /// call site builds.
+    #[test]
+    fn a_batch_on_the_artifacts_own_stream_is_paired() {
+        let id = Uuid::from_u128(0xA11);
+        let artifact = artifact_at(id, QuarantineStatus::Quarantined);
+        let events = empty_batch_for(StreamId::artifact(id));
+        assert!(require_paired_artifact_stream(&artifact, &events).is_ok());
+    }
+
+    /// A batch on another artifact's stream is refused, and the message
+    /// names both sides so the wiring defect is locatable from a log
+    /// line alone.
+    #[test]
+    fn a_batch_on_another_artifacts_stream_is_refused() {
+        let mine = Uuid::from_u128(0xA11);
+        let theirs = Uuid::from_u128(0xB22);
+        let artifact = artifact_at(mine, QuarantineStatus::Quarantined);
+        let events = empty_batch_for(StreamId::artifact(theirs));
+        let err = require_paired_artifact_stream(&artifact, &events)
+            .expect_err("a pair naming two artifacts must not be accepted");
+        assert!(
+            matches!(err, DomainError::Invariant(_)),
+            "a mismatched pair is an internal breach, not caller input: {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&mine.to_string()) && rendered.contains(&theirs.to_string()),
+            "the message must name both sides: {rendered}"
+        );
+    }
+
+    /// The comparison is on the whole [`StreamId`], not on its
+    /// `entity_id`: a batch carrying the artifact's own id under a
+    /// different category is a different stream and is refused too.
+    #[test]
+    fn a_batch_on_the_right_id_in_the_wrong_category_is_refused() {
+        let id = Uuid::from_u128(0xA11);
+        let artifact = artifact_at(id, QuarantineStatus::None);
+        let events = empty_batch_for(StreamId::policy(id));
+        assert_eq!(StreamId::policy(id).entity_id, artifact.id);
+        assert!(
+            require_paired_artifact_stream(&artifact, &events).is_err(),
+            "the same id under another category is not the artifact's stream"
+        );
+    }
+
     /// Compile-time assertion that `ArtifactLifecyclePort` is dyn-compatible.
     #[test]
     fn port_is_dyn_compatible() {
@@ -362,38 +512,9 @@ mod tests {
             calls: calls.clone(),
         };
 
-        let artifact = Artifact {
-            id: Uuid::nil(),
-            repository_id: Uuid::nil(),
-            name: "n".into(),
-            name_as_published: "n".into(),
-            version: None,
-            path: "/".into(),
-            size_bytes: 0,
-            sha256_checksum: "a".repeat(64).parse().unwrap(),
-            sha1_checksum: None,
-            md5_checksum: None,
-            content_type: "application/octet-stream".into(),
-            quarantine_status: QuarantineStatus::None,
-            rejection_reason: None,
-            quarantine_window_start: None,
-            quarantine_deadline: None,
-            provenance_hold_indefinite: false,
-            deleted_at: None,
-            upstream_published_at: None,
-            uploaded_by: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
+        let artifact = artifact_at(Uuid::nil(), QuarantineStatus::None);
 
-        let events = AppendEvents {
-            stream_id: crate::events::StreamId::artifact(Uuid::nil()),
-            expected_version: crate::ports::event_store::ExpectedVersion::NoStream,
-            events: vec![],
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: crate::events::system_actor(),
-        };
+        let events = empty_batch_for(StreamId::artifact(Uuid::nil()));
 
         // Without score delta — forwards.
         l.commit_transition_with_score(&artifact, events.clone(), None, None)
@@ -474,37 +595,8 @@ mod tests {
             calls: calls.clone(),
         };
 
-        let artifact = Artifact {
-            id: Uuid::nil(),
-            repository_id: Uuid::nil(),
-            name: "n".into(),
-            name_as_published: "n".into(),
-            version: None,
-            path: "/".into(),
-            size_bytes: 0,
-            sha256_checksum: "a".repeat(64).parse().unwrap(),
-            sha1_checksum: None,
-            md5_checksum: None,
-            content_type: "application/octet-stream".into(),
-            quarantine_status: QuarantineStatus::None,
-            rejection_reason: None,
-            quarantine_window_start: None,
-            quarantine_deadline: None,
-            provenance_hold_indefinite: false,
-            deleted_at: None,
-            upstream_published_at: None,
-            uploaded_by: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let events = AppendEvents {
-            stream_id: crate::events::StreamId::artifact(Uuid::nil()),
-            expected_version: crate::ports::event_store::ExpectedVersion::NoStream,
-            events: vec![],
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: crate::events::system_actor(),
-        };
+        let artifact = artifact_at(Uuid::nil(), QuarantineStatus::None);
+        let events = empty_batch_for(StreamId::artifact(Uuid::nil()));
 
         let edge = ContentReference {
             source_artifact_id: artifact.id,
@@ -585,37 +677,8 @@ mod tests {
             calls: calls.clone(),
         };
 
-        let artifact = Artifact {
-            id: Uuid::nil(),
-            repository_id: Uuid::nil(),
-            name: "n".into(),
-            name_as_published: "n".into(),
-            version: None,
-            path: "/".into(),
-            size_bytes: 0,
-            sha256_checksum: "a".repeat(64).parse().unwrap(),
-            sha1_checksum: None,
-            md5_checksum: None,
-            content_type: "application/octet-stream".into(),
-            quarantine_status: QuarantineStatus::Rejected,
-            rejection_reason: None,
-            quarantine_window_start: None,
-            quarantine_deadline: None,
-            provenance_hold_indefinite: false,
-            deleted_at: None,
-            upstream_published_at: None,
-            uploaded_by: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let events = AppendEvents {
-            stream_id: crate::events::StreamId::artifact(Uuid::nil()),
-            expected_version: crate::ports::event_store::ExpectedVersion::NoStream,
-            events: vec![],
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: crate::events::system_actor(),
-        };
+        let artifact = artifact_at(Uuid::nil(), QuarantineStatus::Rejected);
+        let events = empty_batch_for(StreamId::artifact(Uuid::nil()));
 
         l.commit_provenance_verdict(&artifact, events, QuarantineStatus::None)
             .await
@@ -673,37 +736,8 @@ mod tests {
         let l = ScanResultLifecycle {
             calls: calls.clone(),
         };
-        let artifact = Artifact {
-            id: Uuid::nil(),
-            repository_id: Uuid::nil(),
-            name: "n".into(),
-            name_as_published: "n".into(),
-            version: None,
-            path: "/".into(),
-            size_bytes: 0,
-            sha256_checksum: "a".repeat(64).parse().unwrap(),
-            sha1_checksum: None,
-            md5_checksum: None,
-            content_type: "application/octet-stream".into(),
-            quarantine_status: QuarantineStatus::None,
-            rejection_reason: None,
-            quarantine_window_start: None,
-            quarantine_deadline: None,
-            provenance_hold_indefinite: false,
-            deleted_at: None,
-            upstream_published_at: None,
-            uploaded_by: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let events = AppendEvents {
-            stream_id: crate::events::StreamId::artifact(Uuid::nil()),
-            expected_version: crate::ports::event_store::ExpectedVersion::NoStream,
-            events: vec![],
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: crate::events::system_actor(),
-        };
+        let artifact = artifact_at(Uuid::nil(), QuarantineStatus::None);
+        let events = empty_batch_for(StreamId::artifact(Uuid::nil()));
         l.commit_scan_result_with_score(
             &artifact,
             events,
@@ -775,37 +809,8 @@ mod tests {
             some_empty_calls: some_empty_calls.clone(),
             some_nonempty_calls: some_nonempty_calls.clone(),
         };
-        let artifact = Artifact {
-            id: Uuid::nil(),
-            repository_id: Uuid::nil(),
-            name: "n".into(),
-            name_as_published: "n".into(),
-            version: None,
-            path: "/".into(),
-            size_bytes: 0,
-            sha256_checksum: "a".repeat(64).parse().unwrap(),
-            sha1_checksum: None,
-            md5_checksum: None,
-            content_type: "application/octet-stream".into(),
-            quarantine_status: QuarantineStatus::None,
-            rejection_reason: None,
-            quarantine_window_start: None,
-            quarantine_deadline: None,
-            provenance_hold_indefinite: false,
-            deleted_at: None,
-            upstream_published_at: None,
-            uploaded_by: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let events = AppendEvents {
-            stream_id: crate::events::StreamId::artifact(Uuid::nil()),
-            expected_version: crate::ports::event_store::ExpectedVersion::NoStream,
-            events: vec![],
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: crate::events::system_actor(),
-        };
+        let artifact = artifact_at(Uuid::nil(), QuarantineStatus::None);
+        let events = empty_batch_for(StreamId::artifact(Uuid::nil()));
 
         l.commit_scan_result_with_score(
             &artifact,

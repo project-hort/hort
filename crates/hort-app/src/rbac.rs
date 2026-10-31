@@ -605,6 +605,7 @@ impl RbacEvaluator {
             return Some(TokenCap {
                 permissions,
                 repository_ids: None,
+                per_repository_permissions: None,
             });
         }
 
@@ -622,6 +623,7 @@ impl RbacEvaluator {
             return Some(TokenCap {
                 permissions: dedup_preserving_order(requested_permissions),
                 repository_ids: None,
+                per_repository_permissions: None,
             });
         }
 
@@ -674,6 +676,7 @@ impl RbacEvaluator {
             return Some(TokenCap {
                 permissions: held_permissions,
                 repository_ids: None,
+                per_repository_permissions: None,
             });
         }
 
@@ -703,6 +706,7 @@ impl RbacEvaluator {
         Some(TokenCap {
             permissions: held_permissions,
             repository_ids: Some(repos),
+            per_repository_permissions: None,
         })
     }
 
@@ -971,6 +975,7 @@ mod tests {
         TokenCap {
             permissions: perms,
             repository_ids: repos,
+            per_repository_permissions: None,
         }
     }
 

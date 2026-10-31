@@ -70,6 +70,7 @@ use hort_adapters_scanner_trivy::{TrivyAdapter, TrivyConfig};
 use hort_adapters_storage::builders::{build_s3_object_store, build_s3_storage, S3StorageOpts};
 use hort_adapters_storage::filesystem_stateful_upload_staging::FilesystemStatefulUploadStaging;
 use hort_adapters_storage::FilesystemStorage;
+use hort_app::destructive_task_reauthorization::DestructiveTaskReauthorizer;
 // The ONE shared event-chain anchoring predicate. The worker (writer)
 // and `hort-server verify-event-chain` (reader) both derive their gate
 // from it, so the two sides cannot disagree about whether this
@@ -80,12 +81,13 @@ use hort_app::rbac::RbacEvaluator;
 use hort_app::task_dispatcher::TaskDispatcher;
 use hort_app::task_handlers::eventstore_checkpoint::BackfillBaselineConfig;
 use hort_app::task_handlers::{
-    AdvisoryWatchTickHandler, CronRescanTickHandler, EventStoreArchiveHandler,
-    EventstoreCheckpointHandler, JobsRowRetentionSweepHandler, NoopTaskHandler,
-    OciIndexChildIngestHandler, OciMembershipEdgeBackfillHandler, PrefetchDependenciesHandler,
-    PrefetchIngestHandler, PrefetchRowRetentionSweepHandler, PrefetchTickHandler,
-    ProvenanceVerifyHandler, QuarantineReleaseSweepHandler, ReplaySeenPruneHandler,
-    RetentionEvaluateHandler, RetentionPurgeHandler, ScanRowRetentionSweepHandler, ScanTaskHandler,
+    AdvisoryWatchTickHandler, CheckpointEmissionHook, CheckpointEmitterHookAdapter,
+    CronRescanTickHandler, EventStoreArchiveHandler, EventstoreCheckpointHandler,
+    JobsRowRetentionSweepHandler, NoopTaskHandler, OciIndexChildIngestHandler,
+    OciMembershipEdgeBackfillHandler, PrefetchDependenciesHandler, PrefetchIngestHandler,
+    PrefetchRowRetentionSweepHandler, PrefetchTickHandler, ProvenanceVerifyHandler,
+    QuarantineReleaseSweepHandler, ReplaySeenPruneHandler, RetentionEvaluateHandler,
+    RetentionPurgeHandler, ScanRowRetentionSweepHandler, ScanTaskHandler,
     ScannerRegistryPruneHandler, SeedImportHandler, ServiceAccountRotationHandler,
     StagingSweepHandler, WheelMetadataBackfillHandler,
 };
@@ -649,9 +651,23 @@ pub async fn build_app_context(
     // parallelism within a single worker instance is controlled by the
     // number of replicas, not by intra-process concurrency.
     // -----------------------------------------------------------------
+    // Execution-time authority for the destructive kinds. The two
+    // reads are the worker's live RBAC view: the composition-root
+    // `RbacEvaluator` this crate builds elsewhere is deliberately empty,
+    // so a destructive invocation's requester is re-checked against a
+    // per-call evaluator built from the grant table — the same shape
+    // `ServiceAccountRotationHandler` uses for its per-tick cap
+    // derivation. Required by the constructor so no worker can dispatch
+    // destructive work without it.
+    let reauthorizer = Arc::new(DestructiveTaskReauthorizer::new(
+        Arc::new(PgUserRepository::new(pool.clone())) as Arc<dyn UserRepository>,
+        Arc::new(PgPermissionGrantRepository::new(pool.clone()))
+            as Arc<dyn PermissionGrantRepository>,
+    ));
     let mut dispatcher = TaskDispatcher::new(
         jobs.clone(),
         event_publisher.clone(),
+        reauthorizer,
         cfg.worker_id.clone(),
         cfg.lock_duration,
         cfg.poll_interval.as_secs(),
@@ -1238,8 +1254,17 @@ pub async fn build_app_context(
     //       logs an `info!` and does NOT register (the admin-task route
     //       then 404s, mirroring the service-account-rotation skip
     //       pattern).
+    //
+    //       The same `Enabled` branch also yields the
+    //       `CheckpointEmissionHook` the `eventstore-archive` sweep
+    //       anchors its seals with. Producing both from one branch is
+    //       what keeps them from drifting: there is no wiring in which
+    //       the checkpoint handler is registered and the sweep still
+    //       leaves its `StreamSealed` tombstones for the next hourly
+    //       tick to pick up.
     // -----------------------------------------------------------------
-    register_eventstore_checkpoint(&mut dispatcher, &pool, cfg, extra_ca).await;
+    let checkpoint_hook =
+        register_eventstore_checkpoint(&mut dispatcher, &pool, cfg, extra_ca).await;
 
     // -----------------------------------------------------------------
     // Register the ReplaySeenPruneHandler (federated-JWT
@@ -1460,7 +1485,10 @@ pub async fn build_app_context(
             rules,
             mode,
         ));
-        dispatcher.register(Arc::new(EventStoreArchiveHandler::new(archive_uc)), 1);
+        dispatcher.register(
+            Arc::new(EventStoreArchiveHandler::new(archive_uc, checkpoint_hook)),
+            1,
+        );
 
         tracing::info!(
             "retention-evaluate / retention-purge / \
@@ -2397,12 +2425,20 @@ async fn register_service_account_rotation(
 /// `HORT_EVENT_CHAIN_MIGRATION_TIMESTAMP` (operator-provisioned — the
 /// in-migration backfill recorded these). Absent ⇒ no baseline is
 /// stamped (a green-field deploy with no pre-chain history; correct).
+///
+/// Returns the [`CheckpointEmissionHook`] the `eventstore-archive`
+/// sweep anchors its seals with — `Some` exactly when this function
+/// registered the handler, `None` on every skip path. Returning it from
+/// here rather than rebuilding it at the sweep's call site is what
+/// couples the two: the sweep cannot be wired to anchor where emission
+/// is off, and emission cannot be on while the sweep leaves its
+/// `StreamSealed` tombstones for the next hourly tick to pick up.
 async fn register_eventstore_checkpoint(
     dispatcher: &mut TaskDispatcher,
     pool: &PgPool,
     cfg: &WorkerConfig,
     extra_ca: Option<&hort_config::ExtraTrustAnchors>,
-) {
+) -> Option<Arc<dyn CheckpointEmissionHook>> {
     let read_public_key = read_anchor_key_file(anchoring::ANCHOR_PUBLIC_KEY_FILE_ENV);
     let read_signing_key = read_anchor_key_file(anchoring::ANCHOR_SIGNING_KEY_FILE_ENV);
 
@@ -2424,7 +2460,7 @@ async fn register_eventstore_checkpoint(
                  posture: `verify-event-chain` still verifies the per-stream hash \
                  chain and expects no anchor.",
             );
-            return;
+            return None;
         }
     };
 
@@ -2442,7 +2478,7 @@ async fn register_eventstore_checkpoint(
         // S3 effective backend. Written as a guard rather than an unwrap
         // so a future storage variant degrades to "handler not
         // registered" instead of panicking the worker at boot.
-        return;
+        return None;
     };
 
     let opts = S3StorageOpts {
@@ -2464,7 +2500,7 @@ async fn register_eventstore_checkpoint(
                 "EventstoreCheckpointHandler not registered: building the S3 anchor \
                  object store failed.",
             );
-            return;
+            return None;
         }
     };
 
@@ -2476,7 +2512,7 @@ async fn register_eventstore_checkpoint(
                 "EventstoreCheckpointHandler not registered: the anchor public-key \
                  PEM did not parse as an Ed25519 SPKI key.",
             );
-            return;
+            return None;
         }
     };
     let emitter = match ObjectStoreCheckpointEmitter::new(store, signing_key_pem) {
@@ -2489,7 +2525,7 @@ async fn register_eventstore_checkpoint(
                 "EventstoreCheckpointHandler not registered: the anchor signing-key \
                  PEM did not parse as an Ed25519 PKCS#8 private key.",
             );
-            return;
+            return None;
         }
     };
 
@@ -2502,21 +2538,29 @@ async fn register_eventstore_checkpoint(
     // honesty caveat is omitted, which a startup `info!` surfaces.
     let backfill_baseline = read_backfill_baseline();
 
+    // One handler instance backs both the periodic tick and the
+    // post-sweep hook, so there is exactly one emission code path (same
+    // metric, log and signature contract — an anchor written after a
+    // retention sweep is indistinguishable from a scheduled one to the
+    // verifier, which is what the seal needs).
+    let handler = Arc::new(EventstoreCheckpointHandler::new(
+        heads,
+        reader,
+        emitter,
+        backfill_baseline.clone(),
+    ));
     dispatcher.register(
-        Arc::new(EventstoreCheckpointHandler::new(
-            heads,
-            reader,
-            emitter,
-            backfill_baseline.clone(),
-        )),
+        handler.clone(),
         1, // single-active — see the call-site rationale.
     );
     tracing::info!(
         bucket = %bucket,
         backfill_baseline = backfill_baseline.is_some(),
         "EventstoreCheckpointHandler registered (single-active per worker replica) \
-         — checkpoint emission wired",
+         — checkpoint emission wired, and the eventstore-archive sweep anchors \
+         the seals it makes through the same handler",
     );
+    Some(Arc::new(CheckpointEmitterHookAdapter::new(handler)))
 }
 
 /// Read an operator-provisioned anchor key file named by `env_var`.

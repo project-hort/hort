@@ -44,6 +44,9 @@ use uuid::Uuid;
 
 use hort_adapters_postgres::event_store::PgEventStore;
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
+use hort_adapters_postgres::permission_grant_repo::PgPermissionGrantRepository;
+use hort_adapters_postgres::user_repo::PgUserRepository;
+use hort_app::destructive_task_reauthorization::DestructiveTaskReauthorizer;
 use hort_app::task_dispatcher::TaskDispatcher;
 use hort_domain::error::DomainResult;
 use hort_domain::ports::jobs_repository::JobsRepository;
@@ -155,6 +158,15 @@ async fn unregistered_kind_reproduces_the_live_row_signature() {
     let mut dispatcher = TaskDispatcher::new(
         jobs.clone(),
         publisher,
+        // Required by the constructor so no worker dispatches
+        // destructive work without a live authority re-check. This test
+        // registers only non-destructive kinds, so it is never
+        // consulted — the real adapters keep that honest rather than a
+        // stub that would stop resembling production.
+        Arc::new(DestructiveTaskReauthorizer::new(
+            Arc::new(PgUserRepository::new(pool.clone())),
+            Arc::new(PgPermissionGrantRepository::new(pool.clone())),
+        )),
         "hort-worker-v2",
         Duration::from_secs(900),
         0, // poll as fast as the test can drive it

@@ -10,16 +10,40 @@
 //! (`ApplyConfigUseCase::apply_scan_policies`). Authorization is enforced
 //! at the gitops apply boundary, not here.
 //!
-//! # Append-then-upsert trade-off
+//! # Append-then-upsert, and the repair that makes it survivable
 //!
 //! The mutation path is `events.append` first, then `projections.upsert`
 //! only on `Ok(_)`. The two writes are NOT transactionally bound across
-//! ports — a successful append followed by a failing upsert leaves the
-//! projection stale relative to the event stream. Subsequent reads will
-//! see the stale row until an out-of-band rebuild tool runs (deferred
-//! operational tooling). The reverse ordering would be worse: a
-//! successful projection write followed by a failing append would let a
-//! row claim a `stream_version` that was never persisted.
+//! ports and cannot be: `PolicyProjectionRepository` is backend-agnostic
+//! (ADR 0004), takes no transaction handle, and its Postgres
+//! implementation holds its own pool. The reverse ordering would be
+//! worse: a successful projection write followed by a failing append
+//! would let a row claim a `stream_version` that was never persisted.
+//!
+//! So "append committed, upsert failed" is reachable, and the row is then
+//! one version behind its stream. That used to be **terminal**, not
+//! merely stale: the projection carries the `stream_version` every later
+//! mutation passes as [`ExpectedVersion::Exact`], so every later mutation
+//! asked with the stale version, got `Conflict`, and returned before
+//! reaching the `upsert` that would have repaired the row. For the gitops
+//! apply — the only production writer — a `Conflict` is a strict-atomic
+//! abort, so one failed upsert stopped every subsequent apply of the
+//! whole bundle: no repository change, no new policy, no grant.
+//!
+//! Every expected-version mutation here now follows ADR 0060's
+//! read-decide-append contract through
+//! [`mutate_policy_stream`](PolicyUseCase::mutate_policy_stream): on
+//! `Conflict` it re-reads the stream, re-derives the projection from it
+//! with [`fold_scan_policy`], re-decides the mutation against that state,
+//! and appends once more. A projection that contradicts its stream is
+//! simply wrong, so the re-base never tries to work out *why* they
+//! disagreed. It is fail-closed: a stream that cannot be read, or cannot
+//! produce a projection, rewrites nothing and the call is refused.
+//!
+//! `create_policy` is deliberately not part of that: it appends with
+//! [`ExpectedVersion::NoStream`] onto a freshly minted `policy_id`, so a
+//! `Conflict` there is a stream-identity collision and there is no
+//! projection version to re-base onto. See its own doc comment.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,24 +58,30 @@ use hort_domain::entities::scan_policy::{
     CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
     ScanPolicyProjection, SeverityThreshold, SignerIdentityPattern,
 };
+use hort_domain::entities::scan_policy_fold::{
+    apply_policy_batch, diff_policy_fields, exclusion_projection, fold_scan_policy,
+    policy_config_snapshot, ScanPolicyReplay,
+};
 use hort_domain::error::DomainError;
 use hort_domain::events::{
     Actor, ArtifactReEvaluated, ArtifactRejected, DomainEvent, ExclusionAdded, ExclusionRemoved,
-    PolicyArchived, PolicyCreated, PolicyField, PolicyReactivated, PolicyScope, PolicyUpdated,
-    ReEvaluationTrigger, StreamId,
+    PolicyArchived, PolicyCreated, PolicyReactivated, PolicyScope, ReEvaluationTrigger, StreamId,
 };
-use hort_domain::policy::{evaluate_scan_result, ReEvaluationOutcome};
+use hort_domain::policy::{evaluate_scan_result, evaluate_scan_summary, ReEvaluationOutcome};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
+use hort_domain::ports::event_store::{
+    AppendEvents, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
+};
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::{ArtifactCoords, PageRequest};
 
-use crate::error::AppResult;
+use crate::append_conflict::{append_with_conflict_retry, ConflictCycleOutcome};
+use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{
     emit_curation_decision, emit_policy_evaluation, emit_policy_reevaluation_result, emit_release,
@@ -251,6 +281,64 @@ pub struct RemoveExclusionCommand {
 }
 
 // ---------------------------------------------------------------------------
+// Self-healing policy-stream mutations (ADR 0060)
+// ---------------------------------------------------------------------------
+
+/// How many read-decide-append attempts one policy mutation gets.
+///
+/// Two: the first stands on the projection the caller read, the second on
+/// the projection re-derived from the stream. A third would add nothing —
+/// the second attempt's expected version came from the stream itself, so
+/// losing it again is a genuine concurrent writer and not something a
+/// further re-base can resolve. ADR 0060 requires the bound to be small
+/// and explicit rather than a loop.
+const POLICY_APPEND_ATTEMPTS: u8 = 2;
+
+/// What a policy mutation wants, re-decided against a given state
+/// (ADR 0060 step (b)).
+///
+/// The decision is re-made per attempt because the expected version and
+/// the batch have to come from the same observation of the stream: a batch
+/// built against a version that was then refused describes a change from a
+/// state that never existed.
+enum PolicyIntent {
+    /// The state already says what the caller wanted — nothing to append.
+    /// The call succeeds and the projection is still written, which is
+    /// what repairs a row that had fallen behind its stream.
+    Satisfied,
+    /// Append these events against this state's `stream_version`.
+    Append(Vec<DomainEvent>),
+}
+
+/// A decided-but-not-yet-appended mutation: the state it was decided
+/// against and the events it decided on, kept together so the append's
+/// expected version and its batch cannot come from different observations.
+struct PendingMutation {
+    state: ScanPolicyReplay,
+    events: Vec<DomainEvent>,
+}
+
+/// What a self-healing policy mutation left behind.
+struct HealedMutation {
+    /// The projection to write: the fold of the appended batch onto the
+    /// state it was appended against, or — when the state already
+    /// satisfied the intent — that state itself. Writing it is what
+    /// repairs a row that had fallen behind.
+    projection: ScanPolicyProjection,
+    /// The batch that was actually appended — empty when nothing was.
+    /// It is the **re-decided** batch, not the caller's first attempt, so
+    /// a caller deciding something from what it emitted (the ADR 0041
+    /// gate-affecting enqueue) must read it from here.
+    events: Vec<DomainEvent>,
+    /// `false` when nothing was appended because the state already stated
+    /// the intent (ADR 0060's idempotent success).
+    appended: bool,
+    /// `true` when the caller's projection version was refused and the
+    /// projection was re-derived from the stream. Distinguishes the
+    /// stale-row repair from the ordinary first-attempt success in logs.
+    healed: bool,
+}
+// ---------------------------------------------------------------------------
 // PolicyUseCase
 // ---------------------------------------------------------------------------
 
@@ -422,6 +510,194 @@ impl PolicyUseCase {
         }
     }
 
+    /// Write the projection a mutation produced.
+    ///
+    /// A failure here is the defect this use case's repair exists for, and
+    /// the log says so: the row is left behind its stream, and the next
+    /// mutation re-derives it rather than refusing forever on the stale
+    /// version. One helper rather than a copy per site so the five
+    /// mutations cannot describe the same failure five ways.
+    async fn write_projection(
+        &self,
+        policy_id: Uuid,
+        projection: &ScanPolicyProjection,
+    ) -> AppResult<()> {
+        self.projections.upsert(projection).await.map_err(|e| {
+            tracing::error!(
+                policy_id = %policy_id,
+                error = %e,
+                "policy projection upsert failed after a successful event append \
+                 — the projection is behind its stream; the next mutation \
+                 re-derives it from the stream",
+            );
+            AppError::from(e)
+        })
+    }
+
+    /// Re-derive a policy's projection from its own event stream.
+    ///
+    /// The repair half of the append-then-upsert trade-off: the stream is
+    /// the source of truth (ADR 0002), so a projection that disagrees with
+    /// it is simply wrong and the stream's own answer replaces it. No
+    /// attempt is made to work out *why* they disagreed — a failed upsert
+    /// and a concurrent writer leave the same evidence, and the correct
+    /// response to both is the same.
+    ///
+    /// The read is unbounded (`u64::MAX`): a policy stream has no event
+    /// cap, and a budget that truncated it would hand back a projection
+    /// derived from the oldest N events while looking exactly like one
+    /// derived from the whole stream.
+    ///
+    /// **Fail-closed.** A read failure or a stream the fold refuses
+    /// propagates: the caller writes nothing rather than repairing a row
+    /// to a state the stream does not support.
+    async fn rebase_policy_from_stream(&self, policy_id: Uuid) -> AppResult<ScanPolicyReplay> {
+        let stream_id = StreamId::policy(policy_id);
+        let events = self
+            .events
+            .read_stream(&stream_id, ReadFrom::Start, u64::MAX)
+            .await?;
+        Ok(fold_scan_policy(&events)?)
+    }
+
+    /// Append one batch to a policy stream, repairing a stale projection
+    /// version on the way (ADR 0060's read-decide-append contract).
+    ///
+    /// `decide` is the mutation's intent, expressed against whatever state
+    /// the current attempt stands on. It runs on **every** attempt — on the
+    /// first against `base` (what the caller read), on the second against
+    /// the stream-derived replay — so the batch that is finally appended is
+    /// always the one the decision function produced for the version it was
+    /// appended at. The intent is a pure function of state here because the
+    /// fold is pure: re-deciding costs one stream read, not a second pass
+    /// over the ports.
+    ///
+    /// Returning [`PolicyIntent::Satisfied`] from a re-decide is ADR 0060
+    /// step (b): the stream already states what the caller wanted, so
+    /// nothing is appended and the call succeeds — writing the returned
+    /// projection still repairs the row.
+    ///
+    /// A `Conflict` that survives the re-base is a genuine concurrent
+    /// writer. It is logged as that and surfaces as
+    /// [`DomainError::Contended`] — retryable-busy, which ADR 0060 (d)
+    /// mandates and which the HTTP edge already answers with 503 +
+    /// `Retry-After`. Only the attempt-limit is spent on conflicts; every
+    /// other error propagates unretried.
+    async fn mutate_policy_stream(
+        &self,
+        policy_id: Uuid,
+        base: &ScanPolicyReplay,
+        actor: &Actor,
+        decide: impl Fn(&ScanPolicyReplay) -> AppResult<PolicyIntent>,
+    ) -> AppResult<HealedMutation> {
+        // Shared references, so the per-attempt future can capture them by
+        // copy: `append_with_conflict_retry` takes an `FnMut` and calls it
+        // once per attempt, so the future it returns must own what it
+        // touches and a `&_` is the only thing it can own twice.
+        let stream_id = &StreamId::policy(policy_id);
+        let decide = &decide;
+        append_with_conflict_retry(POLICY_APPEND_ATTEMPTS, |attempt| async move {
+            // Attempt 1 stands on what the caller read. Every later
+            // attempt re-derives the projection from the stream first —
+            // that re-derivation IS the repair, and it is also the only
+            // thing that can change the expected version the append is
+            // refused on.
+            let healed = attempt > 1;
+            let state = if healed {
+                let state = self.rebase_policy_from_stream(policy_id).await?;
+                tracing::info!(
+                    policy_id = %policy_id,
+                    projection_version = base.policy.stream_version,
+                    stream_version = state.policy.stream_version,
+                    "policy projection re-derived from its event stream after an \
+                     expected-version refusal; retrying the mutation against the \
+                     stream's state",
+                );
+                state
+            } else {
+                base.clone()
+            };
+
+            let mut pending = match decide(&state)? {
+                PolicyIntent::Satisfied => {
+                    return Ok(ConflictCycleOutcome::Satisfied(HealedMutation {
+                        projection: state.policy,
+                        events: Vec::new(),
+                        appended: false,
+                        healed,
+                    }));
+                }
+                PolicyIntent::Append(events) => PendingMutation { state, events },
+            };
+
+            let batch: Vec<EventToAppend> = pending
+                .events
+                .iter()
+                .cloned()
+                .map(EventToAppend::new)
+                .collect();
+            let result = match self
+                .events
+                .append(AppendEvents {
+                    stream_id: stream_id.clone(),
+                    expected_version: ExpectedVersion::Exact(pending.state.policy.stream_version),
+                    events: batch,
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: actor.clone(),
+                })
+                .await
+            {
+                Ok(result) => result,
+                Err(DomainError::Conflict(msg)) if healed => {
+                    // The expected version came from the stream itself a
+                    // moment ago, so this is not a stale row: somebody else
+                    // appended in between. "Concurrent modification" names
+                    // only this case.
+                    tracing::warn!(
+                        policy_id = %policy_id,
+                        expected = pending.state.policy.stream_version,
+                        conflict_message = %msg,
+                        "concurrent policy modification rejected",
+                    );
+                    return Ok(ConflictCycleOutcome::Retry);
+                }
+                Err(DomainError::Conflict(msg)) => {
+                    // The projection's version was refused. It is either
+                    // behind its stream (a failed upsert) or someone else
+                    // wrote; the next attempt re-derives from the stream
+                    // and finds out by succeeding or not.
+                    tracing::warn!(
+                        policy_id = %policy_id,
+                        expected = pending.state.policy.stream_version,
+                        conflict_message = %msg,
+                        "policy projection version refused by the event store — \
+                         re-deriving the projection from its stream",
+                    );
+                    return Ok(ConflictCycleOutcome::Retry);
+                }
+                Err(other) => return Err(other.into()),
+            };
+
+            // The projection to write is the fold of the batch that just
+            // landed — the same mapping that reads the stream back, so the
+            // row cannot drift from the events that produced it.
+            apply_policy_batch(
+                &mut pending.state,
+                &pending.events,
+                actor,
+                Utc::now(),
+                result.stream_position,
+            )?;
+            Ok(ConflictCycleOutcome::Satisfied(HealedMutation {
+                projection: pending.state.policy,
+                events: pending.events,
+                appended: true,
+                healed,
+            }))
+        })
+        .await
+    }
     /// Create a new scan policy.
     ///
     /// Mints a fresh `policy_id`, emits one `PolicyCreated` event with
@@ -433,6 +709,24 @@ impl PolicyUseCase {
     /// unique index on `name` for `archived = false` rows — migration
     /// 095). The check is performed before the append so a duplicate
     /// name cannot waste an event-stream position.
+    ///
+    /// # Why this one does not self-heal
+    ///
+    /// Every other mutation here re-derives the projection from the
+    /// stream when its expected version is refused. This one cannot, and
+    /// does not need to: the append is `ExpectedVersion::NoStream` against
+    /// a `policy_id` minted one statement earlier, so a `Conflict` means a
+    /// stream already exists at a fresh v4 UUID — an identity collision,
+    /// not a projection one version behind. There is no projection at all
+    /// yet to re-base onto.
+    ///
+    /// The failure mode this path *does* have is the mirror image and is
+    /// not a deadlock: if the append commits and the upsert then fails,
+    /// there is no row, so the next apply's name lookup misses, takes this
+    /// branch again, mints a *new* `policy_id` and succeeds — leaving the
+    /// first stream orphaned. Reclaiming an orphan stream needs a
+    /// name-to-stream index that does not exist; an operator rebuild
+    /// command is the right home for it.
     #[tracing::instrument(skip(self, cmd))]
     pub async fn create_policy(&self, cmd: CreatePolicyCommand, actor: Actor) -> AppResult<Uuid> {
         // Pre-check duplicate name. The projection has a partial unique
@@ -456,29 +750,14 @@ impl PolicyUseCase {
         let policy_id = Uuid::new_v4();
         let stream_id = StreamId::policy(policy_id);
         let correlation_id = Uuid::new_v4();
-        let config_snapshot = build_config_snapshot(&cmd);
-
-        let event = PolicyCreated {
-            policy_id,
-            name: cmd.name.clone(),
-            scope: cmd.scope.clone(),
-            config_snapshot,
-        };
-
-        let result = self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version: ExpectedVersion::NoStream,
-                events: vec![EventToAppend::new(DomainEvent::PolicyCreated(event))],
-                correlation_id,
-                causation_id: None,
-                actor,
-            })
-            .await?;
-
         let now = Utc::now();
-        let projection = ScanPolicyProjection {
+
+        // The projection is built first and the event's `config_snapshot`
+        // is derived from it, rather than the two being spelled out side
+        // by side: `policy_config_snapshot` is the fold's own encoder, so
+        // what the event records and what the row holds cannot disagree,
+        // and a later fold of this stream reproduces this exact row.
+        let mut projection = ScanPolicyProjection {
             policy_id,
             name: cmd.name,
             scope: cmd.scope,
@@ -496,17 +775,39 @@ impl PolicyUseCase {
             negligible_action: cmd.negligible_action,
             enforcement: cmd.enforcement,
             composite_verdict_mode: cmd.composite_verdict_mode,
-            stream_version: result.stream_position,
+            stream_version: 0,
             created_at: now,
             updated_at: now,
         };
+
+        let event = PolicyCreated {
+            policy_id,
+            name: projection.name.clone(),
+            scope: projection.scope.clone(),
+            config_snapshot: policy_config_snapshot(&projection),
+        };
+
+        let result = self
+            .events
+            .append(AppendEvents {
+                stream_id,
+                expected_version: ExpectedVersion::NoStream,
+                events: vec![EventToAppend::new(DomainEvent::PolicyCreated(event))],
+                correlation_id,
+                causation_id: None,
+                actor,
+            })
+            .await?;
+
+        projection.stream_version = result.stream_position;
 
         if let Err(e) = self.projections.upsert(&projection).await {
             tracing::error!(
                 policy_id = %policy_id,
                 error = %e,
                 "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
+                 — no projection row exists for this stream; the next apply of \
+                 this name mints a fresh policy_id and orphans this stream",
             );
             return Err(e.into());
         }
@@ -522,21 +823,32 @@ impl PolicyUseCase {
 
     /// Apply a partial update to an existing policy.
     ///
-    /// Reads the projection, diffs each `FieldChange::Set(_)` against
-    /// the current value, emits one `PolicyUpdated` event per actually-
-    /// changed field in a single atomic append batch, then upserts the
-    /// new projection state.
+    /// Reads the projection, builds the state the command asks for,
+    /// diffs it field-by-field against the current state, emits one
+    /// `PolicyUpdated` event per actually-changed field in a single
+    /// atomic append batch, then writes the projection **folded from
+    /// those same events**.
     ///
     /// - Same-value updates yield zero events (idempotent — no append,
     ///   no upsert, returns `Ok(())`).
-    /// - Stale `ExpectedVersion::Exact` from a concurrent writer maps to
-    ///   [`DomainError::Conflict`].
+    /// - A refused `ExpectedVersion::Exact` re-derives the projection
+    ///   from the stream, re-diffs against it and appends once more; a
+    ///   second refusal is a concurrent writer and surfaces as
+    ///   [`DomainError::Contended`].
+    /// - A re-base that finds the stream already stating the update
+    ///   appends nothing and repairs the row — and enqueues the ADR 0041
+    ///   re-evaluation pass when the row it replaced was behind on a
+    ///   gate-affecting field, because the append that landed may have
+    ///   come from a call that failed its projection write and so never
+    ///   reached its own enqueue.
     /// - Updating an archived policy is rejected as
-    ///   [`DomainError::Validation`].
+    ///   [`DomainError::Validation`] — re-checked against the
+    ///   stream-derived state too, so a policy archived concurrently is
+    ///   not updated on the retry.
     #[tracing::instrument(skip(self, cmd))]
     pub async fn update_policy(&self, cmd: UpdatePolicyCommand, actor: Actor) -> AppResult<()> {
         let policy_id = cmd.policy_id;
-        let mut projection = self
+        let projection = self
             .projections
             .find_by_id(policy_id)
             .await?
@@ -558,226 +870,42 @@ impl PolicyUseCase {
             .into());
         }
 
-        // Build the diff. Each entry contributes one PolicyUpdated event
-        // AND mutates the projection-to-write so the post-append upsert
-        // reflects the new state.
-        let mut events: Vec<EventToAppend> = Vec::new();
+        let base = ScanPolicyReplay {
+            policy: projection,
+            // Exclusions are irrelevant to a field update and are not
+            // read; the re-base reads the real set when it runs.
+            exclusions: Vec::new(),
+        };
 
-        if let FieldChange::Set(new_name) = &cmd.name {
-            if *new_name != projection.name {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::Name,
-                    serde_json::Value::String(projection.name.clone()),
-                    serde_json::Value::String(new_name.clone()),
-                ));
-                projection.name = new_name.clone();
+        // The decision, as a pure function of state: build what the
+        // command asks for, diff it against what is there. Re-run
+        // verbatim against the stream-derived state on a refused version,
+        // so the batch and the expected version always describe the same
+        // observation.
+        let decide = |state: &ScanPolicyReplay| -> AppResult<PolicyIntent> {
+            if state.policy.archived {
+                return Err(DomainError::Validation(format!(
+                    "policy '{}' is archived",
+                    state.policy.name
+                ))
+                .into());
             }
-        }
-
-        if let FieldChange::Set(new_scope) = &cmd.scope {
-            if *new_scope != projection.scope {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::Scope,
-                    serde_json::to_value(&projection.scope)
-                        .expect("PolicyScope serialises to JSON"),
-                    serde_json::to_value(new_scope).expect("PolicyScope serialises to JSON"),
-                ));
-                projection.scope = new_scope.clone();
+            let desired = desired_projection(&cmd, &state.policy);
+            let updates = diff_policy_fields(policy_id, &state.policy, &desired);
+            if updates.is_empty() {
+                return Ok(PolicyIntent::Satisfied);
             }
-        }
+            Ok(PolicyIntent::Append(
+                updates
+                    .into_iter()
+                    .map(DomainEvent::PolicyUpdated)
+                    .collect(),
+            ))
+        };
 
-        if let FieldChange::Set(new_threshold) = &cmd.severity_threshold {
-            if *new_threshold != projection.severity_threshold {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::SeverityThreshold,
-                    serde_json::to_value(projection.severity_threshold)
-                        .expect("SeverityThreshold serialises to JSON"),
-                    serde_json::to_value(*new_threshold)
-                        .expect("SeverityThreshold serialises to JSON"),
-                ));
-                projection.severity_threshold = *new_threshold;
-            }
-        }
-
-        if let FieldChange::Set(new_quar) = &cmd.quarantine_duration_secs {
-            if *new_quar != projection.quarantine_duration_secs {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::QuarantineDuration,
-                    serde_json::Value::from(projection.quarantine_duration_secs),
-                    serde_json::Value::from(*new_quar),
-                ));
-                projection.quarantine_duration_secs = *new_quar;
-            }
-        }
-
-        if let FieldChange::Set(new_approval) = &cmd.require_approval {
-            if *new_approval != projection.require_approval {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::RequireApproval,
-                    serde_json::Value::Bool(projection.require_approval),
-                    serde_json::Value::Bool(*new_approval),
-                ));
-                projection.require_approval = *new_approval;
-            }
-        }
-
-        // The provenance trio replaces requireSignature (ADR 0027).
-        if let FieldChange::Set(new_mode) = &cmd.provenance_mode {
-            if *new_mode != projection.provenance_mode {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::ProvenanceMode,
-                    serde_json::Value::String(projection.provenance_mode.to_string()),
-                    serde_json::Value::String(new_mode.to_string()),
-                ));
-                projection.provenance_mode = *new_mode;
-            }
-        }
-
-        if let FieldChange::Set(new_backends) = &cmd.provenance_backends {
-            if *new_backends != projection.provenance_backends {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::ProvenanceBackends,
-                    serde_json::to_value(&projection.provenance_backends)
-                        .expect("INVARIANT: Vec<String> serialises to JSON"),
-                    serde_json::to_value(new_backends)
-                        .expect("INVARIANT: Vec<String> serialises to JSON"),
-                ));
-                projection.provenance_backends = new_backends.clone();
-            }
-        }
-
-        if let FieldChange::Set(new_identities) = &cmd.provenance_identities {
-            if *new_identities != projection.provenance_identities {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::ProvenanceIdentities,
-                    serde_json::to_value(&projection.provenance_identities)
-                        .expect("INVARIANT: SignerIdentityPattern serialises to JSON"),
-                    serde_json::to_value(new_identities)
-                        .expect("INVARIANT: SignerIdentityPattern serialises to JSON"),
-                ));
-                projection.provenance_identities = new_identities.clone();
-            }
-        }
-
-        if let FieldChange::Set(new_age) = &cmd.max_artifact_age_secs {
-            if *new_age != projection.max_artifact_age_secs {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::MaxArtifactAge,
-                    optional_i64_to_value(projection.max_artifact_age_secs),
-                    optional_i64_to_value(*new_age),
-                ));
-                projection.max_artifact_age_secs = *new_age;
-            }
-        }
-
-        if let FieldChange::Set(new_license) = &cmd.license_policy {
-            if *new_license != projection.license_policy {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::LicensePolicy,
-                    projection.license_policy.clone(),
-                    new_license.clone(),
-                ));
-                projection.license_policy = new_license.clone();
-            }
-        }
-
-        // Same-value skip applies: an explicit
-        // `FieldChange::Set` with a value equal to the current
-        // projection produces zero events.
-        if let FieldChange::Set(new_backends) = &cmd.scan_backends {
-            if *new_backends != projection.scan_backends {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::ScanBackends,
-                    serde_json::to_value(&projection.scan_backends)
-                        .expect("INVARIANT: Vec<String> serialises to JSON"),
-                    serde_json::to_value(new_backends)
-                        .expect("INVARIANT: Vec<String> serialises to JSON"),
-                ));
-                projection.scan_backends = new_backends.clone();
-            }
-        }
-
-        // Same-value skip; `Set(0)` is a meaningful
-        // operator-supplied value distinct from `Unchanged`.
-        if let FieldChange::Set(new_interval) = &cmd.rescan_interval_hours {
-            if *new_interval != projection.rescan_interval_hours {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::RescanIntervalHours,
-                    serde_json::Value::from(projection.rescan_interval_hours),
-                    serde_json::Value::from(*new_interval),
-                ));
-                projection.rescan_interval_hours = *new_interval;
-            }
-        }
-
-        // Same-value skip; the `previous_value` / `new_value` payloads
-        // are the lowercase `NegligibleAction` wire strings (mirrors
-        // `ProvenanceMode`).
-        if let FieldChange::Set(new_action) = &cmd.negligible_action {
-            if *new_action != projection.negligible_action {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::NegligibleAction,
-                    serde_json::Value::String(projection.negligible_action.to_string()),
-                    serde_json::Value::String(new_action.to_string()),
-                ));
-                projection.negligible_action = *new_action;
-            }
-        }
-
-        // Same-value skip; the `previous_value` / `new_value` payloads are
-        // the lowercase `ScanEnforcement` wire strings (mirrors
-        // `NegligibleAction`). A change in either direction is
-        // gate-affecting, so it drives the re-evaluation enqueue below.
-        if let FieldChange::Set(new_enforcement) = &cmd.enforcement {
-            if *new_enforcement != projection.enforcement {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::Enforcement,
-                    serde_json::Value::String(projection.enforcement.to_string()),
-                    serde_json::Value::String(new_enforcement.to_string()),
-                ));
-                projection.enforcement = *new_enforcement;
-            }
-        }
-
-        // Same-value skip; the `previous_value` / `new_value` payloads are
-        // the lowercase `CompositeVerdictMode` wire strings (mirrors
-        // `ScanEnforcement`). Deliberately **not** gate-affecting in
-        // either direction (ADR 0064 D6): the re-evaluation pass
-        // re-derives verdicts from stored findings, so demoting a
-        // promoted policy that way would un-reject the population its
-        // composite verdicts had correctly rejected, with no fresh
-        // assessment — the hazard that disqualified shipping the
-        // composite verdict under `ScanEnforcement::Record` at all.
-        // Promoting changes which analysis the *next* scan's verdict
-        // comes from, and that analysis has to run.
-        if let FieldChange::Set(new_mode) = &cmd.composite_verdict_mode {
-            if *new_mode != projection.composite_verdict_mode {
-                events.push(field_event(
-                    policy_id,
-                    PolicyField::CompositeVerdictMode,
-                    serde_json::Value::String(projection.composite_verdict_mode.to_string()),
-                    serde_json::Value::String(new_mode.to_string()),
-                ));
-                projection.composite_verdict_mode = *new_mode;
-            }
-        }
-
-        if events.is_empty() {
-            // Idempotent no-op — same-value updates yield zero writes.
+        // Short-circuit the idempotent case before any append: a
+        // same-value update writes nothing at all, as it always has.
+        if matches!(decide(&base)?, PolicyIntent::Satisfied) {
             tracing::debug!(
                 policy_id = %policy_id,
                 "update_policy: no field changes — skipping append",
@@ -785,74 +913,91 @@ impl PolicyUseCase {
             return Ok(());
         }
 
-        let event_count = events.len();
+        let outcome = self
+            .mutate_policy_stream(policy_id, &base, &actor, decide)
+            .await?;
+
         // ADR 0041 Item 3: a gate-affecting field change (severity
         // threshold / license-policy classes / negligible_action /
-        // enforcement) drives
-        // ONE async re-evaluation pass over the policy's population, even
-        // when several gate fields changed in this single `update_policy`
-        // — `update_policy` emits one `PolicyUpdated` per changed field, so
-        // coalescing to a single enqueue here is the enqueue-once-per-
-        // mutation contract (not one pass per field). Computed before
-        // `events` is moved into the append batch.
-        let gate_field_changed = events.iter().any(|e| {
+        // enforcement) drives ONE async re-evaluation pass over the
+        // policy's population, even when several gate fields changed in
+        // this single `update_policy` — `update_policy` emits one
+        // `PolicyUpdated` per changed field, so coalescing to a single
+        // enqueue is the enqueue-once-per-mutation contract (not one pass
+        // per field). Read off the batch that actually landed: a re-based
+        // retry re-diffs against the stream and may emit a different set.
+        let gate_field_changed = outcome.events.iter().any(|e| {
             matches!(
-                &e.event,
+                e,
                 DomainEvent::PolicyUpdated(u) if u.field.is_gate_affecting()
             )
         });
-        let stream_id = StreamId::policy(policy_id);
-        let correlation_id = Uuid::new_v4();
-        let expected_version = ExpectedVersion::Exact(projection.stream_version);
+        let event_count = outcome.events.len();
 
-        let result = match self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
-                events,
-                correlation_id,
-                causation_id: None,
-                actor,
-            })
-            .await
-        {
-            Ok(r) => r,
-            Err(DomainError::Conflict(msg)) => {
-                tracing::warn!(
-                    policy_id = %policy_id,
-                    expected = projection.stream_version,
-                    "concurrent policy modification rejected",
-                );
-                return Err(DomainError::Conflict(msg).into());
-            }
-            Err(other) => return Err(other.into()),
+        self.write_projection(policy_id, &outcome.projection)
+            .await?;
+
+        // Is a re-evaluation pass owed? The appended path and the repair
+        // path are two readings of that one question, and exactly one of
+        // them applies per call.
+        let re_evaluation_owed = if outcome.appended {
+            tracing::info!(
+                policy_id = %policy_id,
+                event_count,
+                healed = outcome.healed,
+                "policy updated",
+            );
+            // This call's own batch. A name/scope/timer-only update emits
+            // events but owes nothing — those fields do not change a
+            // stored-findings verdict (see
+            // `PolicyField::is_gate_affecting`).
+            gate_field_changed
+        } else {
+            // A re-base found the stream already states the update, so
+            // the row was behind its stream and has just been repaired.
+            // `outcome.events` is empty here, but the question is not
+            // whether THIS call appended something gate-affecting — it is
+            // whether the append that did happen ever had its pass
+            // scheduled. It may well not have: the append and the enqueue
+            // are not atomic and the projection write sits between them,
+            // so an earlier call whose write failed returned at that
+            // write, one statement short of its enqueue. Nothing else
+            // recovers it — the repaired row no longer diffs, so no later
+            // gitops apply re-appends, and there is no sweep over policy
+            // streams. This is the only code positioned to notice.
+            //
+            // So ask the two rows instead: the stale projection the caller
+            // read against the one re-derived from the stream, through the
+            // same differ `decide` uses, so there is one rule for what
+            // counts as gate-affecting. A difference on a gate field is
+            // exactly "enforcement has been running on a stale gate", and
+            // `!appended` guarantees at least one field differs — the one
+            // the command asked for, which the stream already states and
+            // the row did not.
+            //
+            // This can schedule a second pass for an append that already
+            // had one (the repairing call cannot tell a failed write from
+            // a concurrent writer, and must not try — see
+            // `rebase_policy_from_stream`). That is safe: the pass is
+            // verdict-idempotent, re-deriving each verdict from the same
+            // stored findings and appending nothing where the verdict is
+            // unchanged, which is also why `policy-reevaluation` is
+            // requeued on lease expiry. A second walk costs one pass over
+            // the population, off the request path.
+            let behind_on_gate_field =
+                diff_policy_fields(policy_id, &base.policy, &outcome.projection)
+                    .iter()
+                    .any(|u| u.field.is_gate_affecting());
+            tracing::info!(
+                policy_id = %policy_id,
+                behind_on_gate_field,
+                "update_policy: the stream already states this update; the stale \
+                 projection has been re-derived from it",
+            );
+            behind_on_gate_field
         };
 
-        projection.stream_version = result.stream_position;
-        projection.updated_at = Utc::now();
-
-        if let Err(e) = self.projections.upsert(&projection).await {
-            tracing::error!(
-                policy_id = %policy_id,
-                error = %e,
-                "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
-            );
-            return Err(e.into());
-        }
-
-        tracing::info!(
-            policy_id = %policy_id,
-            event_count,
-            "policy updated",
-        );
-
-        // Enqueue ONE async re-evaluation pass iff a gate-affecting field
-        // changed (ADR 0041 Item 3). A name/scope/timer-only update emits
-        // events but enqueues nothing — those fields do not change a
-        // stored-findings verdict (see `PolicyField::is_gate_affecting`).
-        if gate_field_changed {
+        if re_evaluation_owed {
             self.enqueue_re_evaluation(policy_id, ReEvaluationTrigger::PolicyUpdated { policy_id })
                 .await;
         }
@@ -863,13 +1008,19 @@ impl PolicyUseCase {
     /// Archive an existing policy.
     ///
     /// Emits one `PolicyArchived` event on the policy stream and marks
-    /// the projection `archived = true`. Idempotent in the sense that
-    /// re-archival of an already-archived policy is rejected as
+    /// the projection `archived = true`. Re-archival of an
+    /// already-archived policy is rejected as
     /// [`DomainError::Validation`] — gitops apply absorbs the rejection
     /// at the diff layer (an archived policy is never re-emitted).
+    ///
+    /// A refused expected version re-derives the projection from the
+    /// stream and retries once. If the stream turns out to already say
+    /// archived, the intent is satisfied: the call succeeds and the stale
+    /// row is repaired rather than being answered with a `Validation`
+    /// error about a state the caller could not have seen.
     #[tracing::instrument(skip(self))]
     pub async fn archive_policy(&self, policy_id: Uuid, actor: Actor) -> AppResult<()> {
-        let mut projection = self
+        let projection = self
             .projections
             .find_by_id(policy_id)
             .await?
@@ -891,52 +1042,30 @@ impl PolicyUseCase {
             .into());
         }
 
-        let stream_id = StreamId::policy(policy_id);
-        let correlation_id = Uuid::new_v4();
-        let expected_version = ExpectedVersion::Exact(projection.stream_version);
-        let event = PolicyArchived { policy_id };
-
-        let result = match self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
-                events: vec![EventToAppend::new(DomainEvent::PolicyArchived(event))],
-                correlation_id,
-                causation_id: None,
-                actor,
-            })
-            .await
-        {
-            Ok(r) => r,
-            Err(DomainError::Conflict(msg)) => {
-                tracing::warn!(
-                    policy_id = %policy_id,
-                    expected = projection.stream_version,
-                    "concurrent policy modification rejected",
-                );
-                return Err(DomainError::Conflict(msg).into());
-            }
-            Err(other) => return Err(other.into()),
+        let base = ScanPolicyReplay {
+            policy: projection,
+            exclusions: Vec::new(),
         };
 
-        projection.archived = true;
-        projection.stream_version = result.stream_position;
-        projection.updated_at = Utc::now();
+        let outcome = self
+            .mutate_policy_stream(policy_id, &base, &actor, |state| {
+                if state.policy.archived {
+                    return Ok(PolicyIntent::Satisfied);
+                }
+                Ok(PolicyIntent::Append(vec![DomainEvent::PolicyArchived(
+                    PolicyArchived { policy_id },
+                )]))
+            })
+            .await?;
 
-        if let Err(e) = self.projections.upsert(&projection).await {
-            tracing::error!(
-                policy_id = %policy_id,
-                error = %e,
-                "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
-            );
-            return Err(e.into());
-        }
+        self.write_projection(policy_id, &outcome.projection)
+            .await?;
 
         tracing::info!(
             policy_id = %policy_id,
             event_type = "PolicyArchived",
+            appended = outcome.appended,
+            healed = outcome.healed,
             "policy archived",
         );
 
@@ -957,10 +1086,14 @@ impl PolicyUseCase {
     ///   gitops apply pipeline's caller picks the reactivation branch
     ///   only when `archived = true`, so calling this on an active row
     ///   indicates a bug in the pipeline; rejecting here surfaces it
-    ///   loudly rather than silently no-op'ing).
+    ///   loudly rather than silently no-op'ing). As with
+    ///   [`Self::archive_policy`], a stream that *already* says active is
+    ///   an idempotent success rather than that rejection — the caller
+    ///   read an archived row and cannot be blamed for a state only the
+    ///   stream knew.
     #[tracing::instrument(skip(self))]
     pub async fn reactivate_policy(&self, policy_id: Uuid, actor: Actor) -> AppResult<()> {
-        let mut projection = self
+        let projection = self
             .projections
             .find_by_id(policy_id)
             .await?
@@ -982,52 +1115,30 @@ impl PolicyUseCase {
             .into());
         }
 
-        let stream_id = StreamId::policy(policy_id);
-        let correlation_id = Uuid::new_v4();
-        let expected_version = ExpectedVersion::Exact(projection.stream_version);
-        let event = PolicyReactivated { policy_id };
-
-        let result = match self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
-                events: vec![EventToAppend::new(DomainEvent::PolicyReactivated(event))],
-                correlation_id,
-                causation_id: None,
-                actor,
-            })
-            .await
-        {
-            Ok(r) => r,
-            Err(DomainError::Conflict(msg)) => {
-                tracing::warn!(
-                    policy_id = %policy_id,
-                    expected = projection.stream_version,
-                    "concurrent policy modification rejected",
-                );
-                return Err(DomainError::Conflict(msg).into());
-            }
-            Err(other) => return Err(other.into()),
+        let base = ScanPolicyReplay {
+            policy: projection,
+            exclusions: Vec::new(),
         };
 
-        projection.archived = false;
-        projection.stream_version = result.stream_position;
-        projection.updated_at = Utc::now();
+        let outcome = self
+            .mutate_policy_stream(policy_id, &base, &actor, |state| {
+                if !state.policy.archived {
+                    return Ok(PolicyIntent::Satisfied);
+                }
+                Ok(PolicyIntent::Append(vec![DomainEvent::PolicyReactivated(
+                    PolicyReactivated { policy_id },
+                )]))
+            })
+            .await?;
 
-        if let Err(e) = self.projections.upsert(&projection).await {
-            tracing::error!(
-                policy_id = %policy_id,
-                error = %e,
-                "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
-            );
-            return Err(e.into());
-        }
+        self.write_projection(policy_id, &outcome.projection)
+            .await?;
 
         tracing::info!(
             policy_id = %policy_id,
             event_type = "PolicyReactivated",
+            appended = outcome.appended,
+            healed = outcome.healed,
             "policy reactivated",
         );
 
@@ -1041,7 +1152,6 @@ impl PolicyUseCase {
 
         Ok(())
     }
-
     /// Attach a new exclusion to an existing policy.
     ///
     /// Mints a fresh `exclusion_id`, appends one
@@ -1159,9 +1269,6 @@ impl PolicyUseCase {
         }
 
         let exclusion_id = Uuid::new_v4();
-        let stream_id = StreamId::policy(policy_id);
-        let correlation_id = Uuid::new_v4();
-        let expected_version = ExpectedVersion::Exact(parent.stream_version);
 
         let event = ExclusionAdded {
             policy_id,
@@ -1173,63 +1280,51 @@ impl PolicyUseCase {
             expires_at: cmd.expires_at,
         };
 
-        // Envelope-side author attribution for the
-        // active-exclusions listing. `ExclusionAdded` payload carries
-        // NO actor field (envelope is canonical); we extract the
-        // `user_id` here from `Actor::Api` and thread it into the
-        // projection write below. Non-api envelopes (system, timer,
-        // gitops) leave the projection column NULL.
-        let added_by_actor_id = match &actor {
-            Actor::Api(api) => Some(api.user_id),
-            _ => None,
+        // The row to insert comes from the fold's own
+        // `ExclusionAdded -> ExclusionProjection` mapping, so what is
+        // written here and what a later fold of this stream derives are
+        // the same value. `added_by_actor_id` is envelope-sourced inside
+        // it: the payload carries no actor field, and non-api envelopes
+        // (system / timer / gitops) leave the column NULL.
+        let new_exclusion = exclusion_projection(&event, &actor);
+
+        // An exclusion event changes no policy *field*, but it takes a
+        // stream position, so the parent projection's `stream_version`
+        // moves with it — which makes this method both a producer and a
+        // victim of a stale version, and is why it self-heals like the
+        // field mutations do.
+        let base = ScanPolicyReplay {
+            policy: parent,
+            // Not read on this path: a freshly minted `exclusion_id`
+            // cannot already be on the stream, so the intent is never
+            // already-satisfied and the set is not consulted.
+            exclusions: Vec::new(),
         };
 
-        let result = match self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
-                events: vec![EventToAppend::new(DomainEvent::ExclusionAdded(event))],
-                correlation_id,
-                causation_id: None,
-                actor,
+        let outcome = match self
+            .mutate_policy_stream(policy_id, &base, &actor, |state| {
+                if state.policy.archived {
+                    return Err(DomainError::Validation(format!(
+                        "policy '{}' is archived",
+                        state.policy.name
+                    ))
+                    .into());
+                }
+                Ok(PolicyIntent::Append(vec![DomainEvent::ExclusionAdded(
+                    event.clone(),
+                )]))
             })
             .await
         {
-            Ok(r) => r,
-            Err(DomainError::Conflict(msg)) => {
-                tracing::warn!(
-                    policy_id = %policy_id,
-                    exclusion_id = %exclusion_id,
-                    expected = parent.stream_version,
-                    "concurrent policy modification rejected",
-                );
+            Ok(outcome) => outcome,
+            Err(e) => {
                 emit_curation_decision(
                     CurationDecisionLabel::ExcludeFinding,
                     repo_label_ref,
-                    CurationDecisionResult::Conflict,
+                    curation_result_for(&e),
                 );
-                return Err(DomainError::Conflict(msg).into());
+                return Err(e);
             }
-            Err(other) => {
-                emit_curation_decision(
-                    CurationDecisionLabel::ExcludeFinding,
-                    repo_label_ref,
-                    CurationDecisionResult::Error,
-                );
-                return Err(other.into());
-            }
-        };
-
-        let new_exclusion = ExclusionProjection {
-            exclusion_id,
-            policy_id,
-            cve_id: cmd.cve_id,
-            package_pattern: cmd.package_pattern,
-            scope: cmd.scope,
-            reason: cmd.reason,
-            added_by_actor_id,
-            expires_at: cmd.expires_at,
         };
 
         if let Err(e) = self.projections.upsert_exclusion(&new_exclusion).await {
@@ -1238,7 +1333,7 @@ impl PolicyUseCase {
                 exclusion_id = %exclusion_id,
                 error = %e,
                 "exclusion projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
+                 — the exclusion row is missing; the stream still states it",
             );
             emit_curation_decision(
                 CurationDecisionLabel::ExcludeFinding,
@@ -1248,32 +1343,20 @@ impl PolicyUseCase {
             return Err(e.into());
         }
 
-        let bumped_parent = ScanPolicyProjection {
-            stream_version: result.stream_position,
-            updated_at: Utc::now(),
-            ..parent
-        };
-
-        if let Err(e) = self.projections.upsert(&bumped_parent).await {
-            tracing::error!(
-                policy_id = %policy_id,
-                exclusion_id = %exclusion_id,
-                error = %e,
-                "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
-            );
+        if let Err(e) = self.write_projection(policy_id, &outcome.projection).await {
             emit_curation_decision(
                 CurationDecisionLabel::ExcludeFinding,
                 repo_label_ref,
                 CurationDecisionResult::Error,
             );
-            return Err(e.into());
+            return Err(e);
         }
 
         tracing::info!(
             policy_id = %policy_id,
             exclusion_id = %exclusion_id,
             event_type = "ExclusionAdded",
+            healed = outcome.healed,
             "exclusion added",
         );
         emit_curation_decision(
@@ -1552,6 +1635,15 @@ impl PolicyUseCase {
     /// skipped. "No stored findings" ⇒ [`ScanOutcome::Clean`] ⇒ no-op
     /// (invariant #4 — a tighten never re-rejects an artifact with no
     /// evidence it violates).
+    ///
+    /// **"No stored findings" means there are none, not that this process
+    /// could not read them.** A `findings_blob` the CAS cannot hand back
+    /// leaves the artifact's recorded severity counts as the only evidence
+    /// about it, and those are evaluated
+    /// ([`evaluate_scan_summary`]) rather than replaced with an empty
+    /// list: an empty list is clean, clean is a no-op, and the artifact
+    /// would stay released against a threshold its own scan breached.
+    /// [`scan_history::FindingsEvidence`] is what keeps the two apart.
     #[allow(clippy::too_many_arguments)]
     async fn re_evaluate_one_active(
         &self,
@@ -1590,13 +1682,10 @@ impl PolicyUseCase {
             };
 
         // Re-derive the verdict from the paired evidence's stored
-        // findings. A missing/clean scan yields `None` (an empty finding
-        // set → Clean → no-op, invariant #4); an over-cap stream is the
-        // only error left here, and it skips.
-        let findings = match paired.evidence() {
-            Ok(stream) => scan_history::last_findings(stream, &self.storage, artifact_id)
-                .await
-                .unwrap_or_default(),
+        // findings. An over-cap stream is the only error left here, and
+        // it skips.
+        let evidence = match paired.evidence() {
+            Ok(stream) => scan_history::last_findings(stream, &self.storage, artifact_id).await,
             Err(e) => {
                 tracing::error!(
                     artifact_id = %artifact_id,
@@ -1657,7 +1746,44 @@ impl PolicyUseCase {
         // direction does, for D6's reason) would re-reject every
         // constituent a promoted policy had just let through, on the next
         // threshold change, terminally.
-        let outcome = evaluate_scan_result(&coords, kind, &findings, Some(policy), exclusions, now);
+        let outcome = match evidence {
+            scan_history::FindingsEvidence::Resolved(findings) => {
+                evaluate_scan_result(&coords, kind, &findings, Some(policy), exclusions, now)
+            }
+            // No findings exist. The empty list evaluates clean, which is
+            // invariant #4 — a tighten never re-rejects an artifact with
+            // no evidence it violates. Run it through the same evaluator
+            // rather than short-circuiting, so a verdict the policy
+            // reaches without findings (a license-policy-shape violation
+            // in a stored row) still surfaces.
+            scan_history::FindingsEvidence::Absent => {
+                evaluate_scan_result(&coords, kind, &[], Some(policy), exclusions, now)
+            }
+            // Findings exist and this process could not read them. An
+            // unreadable blob is NOT an empty finding set: substituting
+            // one evaluates clean, which `reject_from_scan_policy_retroactive`
+            // turns into a no-op, so an artifact whose recorded counts
+            // breach the bumped threshold stays released on evidence
+            // nobody could read. The recorded aggregate is what is left,
+            // and a threshold walk is exactly what counts can feed —
+            // through the same definition the loosen direction's
+            // summary arm uses, so the two cannot answer differently
+            // about one summary.
+            //
+            // The exclusion set does not reach this arm, and cannot: an
+            // exclusion names a CVE and a severity count names none. See
+            // `evaluate_scan_summary`.
+            scan_history::FindingsEvidence::Unreadable { summary } => {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    policy_id = %policy_id,
+                    trigger = ?trigger,
+                    "re-evaluation (tighten): the stored findings could not be read; \
+                     deriving the verdict from the recorded severity counts instead",
+                );
+                evaluate_scan_summary(&summary, Some(policy))
+            }
+        };
         let previous_status = paired.artifact().quarantine_status;
 
         match paired
@@ -1966,12 +2092,42 @@ impl PolicyUseCase {
                 );
             }
             ReEvaluationOutcome::ResetToQuarantined => {
-                // The re-quarantine arm keeps the artifact held
-                // (downloads blocked), so the cross-axis conjuncts do
-                // not gate it — the eventual timer release re-applies
-                // the provenance gate via `release()`. Pass the
-                // not-gating clearances; `re_evaluate` ignores them on
-                // this arm.
+                // The re-quarantine arm keeps the artifact held, so the
+                // PROVENANCE conjunct does not gate it — the timer release
+                // it hands off to re-applies that gate itself, inside
+                // `release()`. The CURATION conjunct has no such second
+                // chance: `release()` takes no curation input and the
+                // retroactive curation pass walks only the active
+                // population, so a rule applied while this artifact was
+                // `Rejected` never marked it. Deferring it here would drop
+                // it, and the timer would release the artifact past a live
+                // block (ADR 0041 invariant #6(c) — each conjunct
+                // mechanized, none proxied). So resolve it now; the
+                // artifact stays `Rejected` if it denies.
+                let Some(curation) = self
+                    .loosen_curation_clearance(paired.artifact(), policy_id)
+                    .await
+                else {
+                    return;
+                };
+                if !matches!(curation, CurationClearance::Cleared) {
+                    tallies.held_cross_axis += 1;
+                    tracing::info!(
+                        artifact_id = %artifact_id,
+                        policy_id = %policy_id,
+                        curation = ?curation,
+                        outcome = "held_cross_axis",
+                        "artifact re-evaluation held: scan passes and the window is \
+                         still open, but an active curation rule blocks the artifact \
+                         and the timer release cannot ask that question \
+                         (ADR 0041 invariant #6)",
+                    );
+                    emit_policy_evaluation(
+                        policy_decision_point::RE_EVALUATION,
+                        PolicyEvaluationResult::StillRejected,
+                    );
+                    return;
+                }
                 if self
                     .commit_re_evaluation(
                         paired,
@@ -1980,7 +2136,7 @@ impl PolicyUseCase {
                         QuarantineStatus::Rejected,
                         QuarantineStatus::Quarantined,
                         ProvenanceClearance::NotRequired,
-                        CurationClearance::Cleared,
+                        curation,
                     )
                     .await
                 {
@@ -2010,24 +2166,11 @@ impl PolicyUseCase {
                 // pairing clear the gate while the append still carried
                 // the pre-verification version.
                 let provenance = derived_provenance;
-                let curation = match release_clearance::resolve_curation_clearance(
-                    &*self.curation_rules,
-                    &self.repository_access,
-                    paired.artifact(),
-                )
-                .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            artifact_id = %artifact_id,
-                            policy_id = %policy_id,
-                            error = %e,
-                            "re-evaluation (loosen): failed to resolve curation \
-                             clearance; skipping artifact",
-                        );
-                        return;
-                    }
+                let Some(curation) = self
+                    .loosen_curation_clearance(paired.artifact(), policy_id)
+                    .await
+                else {
+                    return;
                 };
 
                 let provenance_clears = matches!(
@@ -2081,6 +2224,45 @@ impl PolicyUseCase {
         }
     }
 
+    /// Resolve the active-curation conjunct (ADR 0041 invariant #6(c))
+    /// for one loosen-direction candidate, or `None` when the read failed
+    /// — logged, so the caller returns and the pass skips the artifact
+    /// (best-effort; one bad row never aborts a pass).
+    ///
+    /// Both reset arms ask this, so it lives here rather than at each of
+    /// them: the release arm because release is the conjunction, and the
+    /// re-quarantine arm because the timer release it defers to cannot ask
+    /// the question (`Artifact::release` takes no curation input, and the
+    /// retroactive curation pass walks only the active population). The
+    /// `StillRejected` arm deliberately does not reach it — that artifact
+    /// is held by the scan verdict and the read would buy nothing, which
+    /// is why this is not hoisted above the outcome match.
+    async fn loosen_curation_clearance(
+        &self,
+        artifact: &Artifact,
+        policy_id: Uuid,
+    ) -> Option<CurationClearance> {
+        match release_clearance::resolve_curation_clearance(
+            &*self.curation_rules,
+            &self.repository_access,
+            artifact,
+        )
+        .await
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::error!(
+                    artifact_id = %artifact.id,
+                    policy_id = %policy_id,
+                    error = %e,
+                    "re-evaluation (loosen): failed to resolve curation clearance; \
+                     skipping artifact",
+                );
+                None
+            }
+        }
+    }
+
     /// Commit a re-evaluation outcome atomically: `ArtifactReEvaluated`
     /// audit event plus the companion transition event
     /// (`ArtifactQuarantined` or `ArtifactReleased`) appended in one
@@ -2089,11 +2271,12 @@ impl PolicyUseCase {
     /// `provenance` / `curation` are the cross-axis release clearances the
     /// caller computed (ADR 0041 invariant #6); they are threaded into
     /// [`Artifact::re_evaluate`], which is the domain authority for the
-    /// `Rejected → Released` conjunction. The caller has already verified
-    /// the conjunction holds on the release arm (so a denial here is a
-    /// defence-in-depth re-check, surfaced as a best-effort skip), and the
-    /// re-quarantine arm ignores both clearances (the artifact stays
-    /// held).
+    /// conjunction. The caller has already verified whichever conjuncts
+    /// apply to its arm (so a denial here is a defence-in-depth re-check,
+    /// surfaced as a best-effort skip). The re-quarantine arm carries a
+    /// resolved `curation` and a not-gating `provenance`: the timer
+    /// release it hands off to re-applies the provenance precondition and
+    /// has no curation input at all, so only the latter can be deferred.
     ///
     /// Returns `true` on success, `false` on best-effort skip
     /// (typically `DomainError::Conflict` from a parallel scan or
@@ -2321,9 +2504,12 @@ impl PolicyUseCase {
             .list_exclusions_for_policy(policy_id)
             .await?;
 
+        // Keep the list: it is the base state the removal's intent is
+        // re-decided against if the first append's version is refused.
         let Some(found) = exclusions
-            .into_iter()
+            .iter()
             .find(|e| e.exclusion_id == exclusion_id)
+            .cloned()
         else {
             tracing::info!(
                 policy_id = %policy_id,
@@ -2378,60 +2564,66 @@ impl PolicyUseCase {
             .into());
         }
 
-        let stream_id = StreamId::policy(policy_id);
-        let correlation_id = Uuid::new_v4();
-        let expected_version = ExpectedVersion::Exact(parent.stream_version);
-
         let event = ExclusionRemoved {
             policy_id,
             exclusion_id,
             reason: cmd.reason,
         };
 
-        let result = match self
-            .events
-            .append(AppendEvents {
-                stream_id,
-                expected_version,
-                events: vec![EventToAppend::new(DomainEvent::ExclusionRemoved(event))],
-                correlation_id,
-                causation_id: None,
-                actor,
+        let base = ScanPolicyReplay {
+            policy: parent,
+            exclusions,
+        };
+
+        let outcome = match self
+            .mutate_policy_stream(policy_id, &base, &actor, |state| {
+                if state.policy.archived {
+                    return Err(DomainError::Validation(format!(
+                        "policy '{}' is archived",
+                        state.policy.name
+                    ))
+                    .into());
+                }
+                if !state
+                    .exclusions
+                    .iter()
+                    .any(|e| e.exclusion_id == exclusion_id)
+                {
+                    // The stream says this exclusion is already gone. The
+                    // caller's intent is achieved, so appending a second
+                    // `ExclusionRemoved` would record a removal that did
+                    // not happen (ADR 0060 step (b)). The `delete` below
+                    // still runs and clears the row the stream contradicts.
+                    return Ok(PolicyIntent::Satisfied);
+                }
+                Ok(PolicyIntent::Append(vec![DomainEvent::ExclusionRemoved(
+                    event.clone(),
+                )]))
             })
             .await
         {
-            Ok(r) => r,
-            Err(DomainError::Conflict(msg)) => {
-                tracing::warn!(
-                    policy_id = %policy_id,
-                    exclusion_id = %exclusion_id,
-                    expected = parent.stream_version,
-                    "concurrent policy modification rejected",
-                );
+            Ok(outcome) => outcome,
+            Err(e) => {
                 emit_curation_decision(
                     CurationDecisionLabel::UnexcludeFinding,
                     repo_label_ref,
-                    CurationDecisionResult::Conflict,
+                    curation_result_for(&e),
                 );
-                return Err(DomainError::Conflict(msg).into());
-            }
-            Err(other) => {
-                emit_curation_decision(
-                    CurationDecisionLabel::UnexcludeFinding,
-                    repo_label_ref,
-                    CurationDecisionResult::Error,
-                );
-                return Err(other.into());
+                return Err(e);
             }
         };
 
+        // Unconditional, and idempotent by identity: on the appended path
+        // it drops the row the event retired, and on the already-removed
+        // path it drops a row the stream says should not exist.
         if let Err(e) = self.projections.delete_exclusion(exclusion_id).await {
             tracing::error!(
                 policy_id = %policy_id,
                 exclusion_id = %exclusion_id,
                 error = %e,
                 "exclusion projection delete failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
+                 — the exclusion row outlives its removal; the stream no longer \
+                 states it",
             );
             emit_curation_decision(
                 CurationDecisionLabel::UnexcludeFinding,
@@ -2441,32 +2633,21 @@ impl PolicyUseCase {
             return Err(e.into());
         }
 
-        let bumped_parent = ScanPolicyProjection {
-            stream_version: result.stream_position,
-            updated_at: Utc::now(),
-            ..parent
-        };
-
-        if let Err(e) = self.projections.upsert(&bumped_parent).await {
-            tracing::error!(
-                policy_id = %policy_id,
-                exclusion_id = %exclusion_id,
-                error = %e,
-                "policy projection upsert failed after successful event append \
-                 — projection will be stale until rebuild tool runs",
-            );
+        if let Err(e) = self.write_projection(policy_id, &outcome.projection).await {
             emit_curation_decision(
                 CurationDecisionLabel::UnexcludeFinding,
                 repo_label_ref,
                 CurationDecisionResult::Error,
             );
-            return Err(e.into());
+            return Err(e);
         }
 
         tracing::info!(
             policy_id = %policy_id,
             exclusion_id = %exclusion_id,
             event_type = "ExclusionRemoved",
+            appended = outcome.appended,
+            healed = outcome.healed,
             "exclusion removed",
         );
         emit_curation_decision(
@@ -2524,53 +2705,87 @@ struct TightenTallies {
     unchanged: u64,
 }
 
-/// Build the `config_snapshot` JSON payload embedded in `PolicyCreated`.
+/// The curation-decision metric label an error from a self-healing
+/// policy-stream mutation earns.
 ///
-/// The shape mirrors the projection fields one-for-one — gitops apply
-/// (14b) and the future audit-log replay tool both read from this
-/// snapshot, so any rename here is a wire change.
-fn build_config_snapshot(cmd: &CreatePolicyCommand) -> serde_json::Value {
-    serde_json::json!({
-        "name": cmd.name,
-        "scope": cmd.scope,
-        "severity_threshold": cmd.severity_threshold,
-        "quarantine_duration_secs": cmd.quarantine_duration_secs,
-        "require_approval": cmd.require_approval,
-        // The provenance trio replaces requireSignature (ADR 0027).
-        "provenance_mode": cmd.provenance_mode.to_string(),
-        "provenance_backends": cmd.provenance_backends,
-        "provenance_identities": cmd.provenance_identities,
-        "max_artifact_age_secs": cmd.max_artifact_age_secs,
-        "license_policy": cmd.license_policy,
-        "scan_backends": cmd.scan_backends,
-        "rescan_interval_hours": cmd.rescan_interval_hours,
-        "negligible_action": cmd.negligible_action.to_string(),
-        "enforcement": cmd.enforcement.to_string(),
-        "composite_verdict_mode": cmd.composite_verdict_mode.to_string(),
-    })
-}
-
-/// Build one `PolicyUpdated` event wrapped as `EventToAppend`.
-fn field_event(
-    policy_id: Uuid,
-    field: PolicyField,
-    previous_value: serde_json::Value,
-    new_value: serde_json::Value,
-) -> EventToAppend {
-    EventToAppend::new(DomainEvent::PolicyUpdated(PolicyUpdated {
-        policy_id,
-        field,
-        previous_value,
-        new_value,
-    }))
-}
-
-/// Encode `Option<i64>` as JSON: `Some(n)` → number, `None` → null.
-fn optional_i64_to_value(v: Option<i64>) -> serde_json::Value {
-    match v {
-        Some(n) => serde_json::Value::from(n),
-        None => serde_json::Value::Null,
+/// A lost version race is a `Conflict` on the first attempt and
+/// [`DomainError::Contended`] once the re-base has also lost it — both are
+/// the same thing to a curator watching
+/// `hort_curation_decisions_total{result="conflict"}`, and neither is the
+/// `error` bucket an infrastructure failure belongs in.
+fn curation_result_for(err: &AppError) -> CurationDecisionResult {
+    match err {
+        AppError::Domain(DomainError::Conflict(_) | DomainError::Contended(_)) => {
+            CurationDecisionResult::Conflict
+        }
+        _ => CurationDecisionResult::Error,
     }
+}
+
+/// Apply an [`UpdatePolicyCommand`]'s `Set` values to a projection,
+/// producing the state the caller is asking for.
+///
+/// One line per field, and **no comparison**: deciding what changed is
+/// [`diff_policy_fields`]'s job, and it compares the two projections
+/// through the same per-field encoding the `PolicyUpdated` events carry.
+///
+/// This is the half that used to be written twice — once to build the
+/// event, once to mutate the projection to be written — with nothing but
+/// adjacency holding the two spellings together. A field whose event said
+/// one thing and whose projection edit said another would have been
+/// invisible until a fold disagreed with the row, which is exactly the
+/// drift the single mapping removes.
+fn desired_projection(
+    cmd: &UpdatePolicyCommand,
+    current: &ScanPolicyProjection,
+) -> ScanPolicyProjection {
+    let mut desired = current.clone();
+    if let FieldChange::Set(v) = &cmd.name {
+        desired.name = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.scope {
+        desired.scope = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.severity_threshold {
+        desired.severity_threshold = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.quarantine_duration_secs {
+        desired.quarantine_duration_secs = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.require_approval {
+        desired.require_approval = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.provenance_mode {
+        desired.provenance_mode = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.provenance_backends {
+        desired.provenance_backends = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.provenance_identities {
+        desired.provenance_identities = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.max_artifact_age_secs {
+        desired.max_artifact_age_secs = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.license_policy {
+        desired.license_policy = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.scan_backends {
+        desired.scan_backends = v.clone();
+    }
+    if let FieldChange::Set(v) = &cmd.rescan_interval_hours {
+        desired.rescan_interval_hours = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.negligible_action {
+        desired.negligible_action = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.enforcement {
+        desired.enforcement = *v;
+    }
+    if let FieldChange::Set(v) = &cmd.composite_verdict_mode {
+        desired.composite_verdict_mode = *v;
+    }
+    desired
 }
 
 // ---------------------------------------------------------------------------
@@ -2580,6 +2795,11 @@ fn optional_i64_to_value(v: Option<i64>) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+
+    // The field vocabulary is only asserted on, never written by the
+    // production path here any more: the one place that maps a
+    // `PolicyField` to a projection field is the domain fold.
+    use hort_domain::events::PolicyField;
 
     use hort_domain::events::{ApiActor, PersistedEvent, RejectionReason};
     use hort_domain::ports::event_store::{AppendResult, ReadFrom, SubscribeFrom};
@@ -3115,6 +3335,56 @@ mod tests {
         ))
     }
 
+    /// Seed `events` with the policy stream a real producer would have
+    /// written for `projection`, plus `extra` events after the opening
+    /// `PolicyCreated`. Returns the tail `stream_position`.
+    ///
+    /// The `PolicyCreated` payload is encoded by the same
+    /// `policy_config_snapshot` the create path uses, so the seeded corpus
+    /// is something this system could actually have appended — a corpus
+    /// the fold would refuse is a premise production cannot show. Every
+    /// event is run through `DomainEvent::validate` for the same reason:
+    /// the production event store validates on append, so an event this
+    /// seeding accepted and the adapter would reject is an event no
+    /// producer can write.
+    fn seed_policy_stream(
+        events: &MockEventStore,
+        projection: &ScanPolicyProjection,
+        extra: Vec<DomainEvent>,
+    ) -> u64 {
+        let created = DomainEvent::PolicyCreated(PolicyCreated {
+            policy_id: projection.policy_id,
+            name: projection.name.clone(),
+            scope: projection.scope.clone(),
+            config_snapshot: policy_config_snapshot(projection),
+        });
+        let stream_id = StreamId::policy(projection.policy_id);
+        let persisted: Vec<PersistedEvent> = std::iter::once(created)
+            .chain(extra)
+            .enumerate()
+            .map(|(i, event)| {
+                event
+                    .validate()
+                    .expect("seeded events must be ones a producer could append");
+                PersistedEvent {
+                    event_id: Uuid::new_v4(),
+                    stream_id: stream_id.clone(),
+                    stream_position: i as u64,
+                    global_position: i as u64,
+                    event,
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: api_actor(),
+                    event_version: 1,
+                    stored_at: DateTime::from_timestamp(1_000 + i as i64, 0).expect("in range"),
+                }
+            })
+            .collect();
+        let tail = persisted.len() as u64 - 1;
+        events.seed_stream(stream_id, persisted);
+        tail
+    }
+
     fn make_use_case() -> (
         PolicyUseCase,
         Arc<MockEventStore>,
@@ -3203,12 +3473,14 @@ mod tests {
     /// [`MockArtifactRepository::seed_rejected_for_policy`], and
     /// inspect `commit_transition` calls via
     /// [`MockArtifactLifecycle::committed_transitions`].
+    #[allow(clippy::type_complexity)]
     fn make_use_case_with_re_eval_harness() -> (
         PolicyUseCase,
         Arc<MockEventStore>,
         Arc<MockPolicyProjections>,
         Arc<crate::use_cases::test_support::MockArtifactRepository>,
         Arc<crate::use_cases::test_support::MockArtifactLifecycle>,
+        Arc<crate::use_cases::test_support::MockStoragePort>,
     ) {
         let events = Arc::new(MockEventStore::new());
         let projections = Arc::new(MockPolicyProjections::new());
@@ -3216,12 +3488,12 @@ mod tests {
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
         ));
-        // The re-eval-pass tests here do not seed
-        // `findings_blob` so the per-finding path is exercised by the
-        // pure-domain unit tests in `re_evaluation.rs::tests` instead.
-        // Tests here drive the aggregate-summary fallback
-        // (the helper's `Ok(None)` short-circuit for a missing CAS
-        // blob).
+        // The storage mock is returned so `seed_rejected_with_scan` can
+        // put the artifact's findings blob in CAS. It has to: an
+        // exclusion is matched against a finding's own identity, so an
+        // artifact whose blob cannot be read is one no exclusion can
+        // clear — a loosening asserted over an unreadable blob is
+        // asserting something production does not do.
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         // No curation rules seeded → the curation precondition clears for
         // every artifact (empty `list_for_repo`); provenance clears via
@@ -3236,13 +3508,13 @@ mod tests {
             projections.clone(),
             artifacts.clone(),
             lifecycle.clone(),
-            storage,
+            storage.clone(),
             default_repository_access(),
             curation_rules,
             jobs,
             HashMap::new(),
         );
-        (uc, events, projections, artifacts, lifecycle)
+        (uc, events, projections, artifacts, lifecycle, storage)
     }
 
     /// Cross-axis (ADR 0041 invariant #6) re-evaluation harness — exposes
@@ -3259,6 +3531,7 @@ mod tests {
         Arc<crate::use_cases::test_support::MockArtifactLifecycle>,
         Arc<crate::use_cases::test_support::MockCurationRuleRepository>,
         Arc<crate::use_cases::test_support::MockRepositoryRepository>,
+        Arc<crate::use_cases::test_support::MockStoragePort>,
     ) {
         use crate::use_cases::repository_access::RbacAccess;
         let events = Arc::new(MockEventStore::new());
@@ -3282,7 +3555,7 @@ mod tests {
             projections.clone(),
             artifacts.clone(),
             lifecycle.clone(),
-            storage,
+            storage.clone(),
             repository_access,
             curation_rules.clone(),
             jobs,
@@ -3296,6 +3569,7 @@ mod tests {
             lifecycle,
             curation_rules,
             repos,
+            storage,
         )
     }
 
@@ -3817,72 +4091,87 @@ mod tests {
         assert_eq!(projection.enforcement, ScanEnforcement::Reject);
     }
 
-    /// Parity: every field `build_config_snapshot` records for the
-    /// `PolicyCreated` event must match what `create_policy` wrote into
-    /// the projection — the snapshot's `to_string()`-rendered enums
-    /// (`provenance_mode`, `negligible_action`, `enforcement`) are
-    /// compared against the same `Display` rendering on the projection
-    /// side, and the remaining fields are compared as JSON so a future
-    /// field added to `CreatePolicyCommand` but left out of the
-    /// projection literal fails here instead of shipping.
+    /// Parity: every field of `CreatePolicyCommand` reaches the
+    /// projection `create_policy` writes, **and** the `PolicyCreated`
+    /// event's `config_snapshot` is that projection's encoding.
+    ///
+    /// The two halves answer different questions, and this test used to
+    /// answer only one of them. Comparing the snapshot to the projection
+    /// is now tautological — the snapshot is *derived* from the
+    /// projection through the fold's encoder, which is the point: event
+    /// and row cannot disagree. What that derivation does NOT catch is a
+    /// command field the projection literal forgot to copy, because the
+    /// snapshot would faithfully record the default. So the command is
+    /// what the projection is checked against here, field by field, with
+    /// every value differing from its type's default so a dropped copy
+    /// cannot pass by coincidence.
     #[tokio::test]
-    async fn create_policy_projection_matches_config_snapshot_field_by_field() {
-        let (uc, _events, projections) = make_use_case();
+    async fn create_policy_projection_carries_every_command_field() {
+        let (uc, events, projections) = make_use_case();
         let mut cmd = sample_create_command("parity-check");
+        // Every field away from its default, so a forgotten copy shows
+        // up as a mismatch rather than as an accidental agreement.
+        cmd.scope = PolicyScope::Repository(Uuid::from_u128(0xFEED));
+        cmd.severity_threshold = SeverityThreshold::Low;
+        cmd.quarantine_duration_secs = 61;
+        cmd.require_approval = false;
+        cmd.provenance_mode = ProvenanceMode::Required;
+        cmd.provenance_backends = vec!["cosign".into(), "cosign-key".into()];
+        cmd.provenance_identities =
+            vec![SignerIdentityPattern::new("iss", "san").expect("valid pattern")];
+        cmd.max_artifact_age_secs = Some(999);
+        cmd.license_policy = serde_json::json!({"denied": ["GPL-2.0"]});
+        cmd.scan_backends = vec!["osv".into()];
+        cmd.rescan_interval_hours = 7;
+        cmd.negligible_action = NegligibleAction::Block;
         cmd.enforcement = ScanEnforcement::Record;
-        let snapshot = build_config_snapshot(&cmd);
+        cmd.composite_verdict_mode = CompositeVerdictMode::Promoted;
+        let expected = cmd.clone();
 
         let policy_id = uc.create_policy(cmd, api_actor()).await.unwrap();
-
         let projection = projections.find_by_id(policy_id).await.unwrap().unwrap();
 
-        assert_eq!(snapshot["name"], serde_json::json!(projection.name));
-        assert_eq!(snapshot["scope"], serde_json::json!(projection.scope));
+        assert_eq!(projection.name, expected.name);
+        assert_eq!(projection.scope, expected.scope);
+        assert_eq!(projection.severity_threshold, expected.severity_threshold);
         assert_eq!(
-            snapshot["severity_threshold"],
-            serde_json::json!(projection.severity_threshold)
+            projection.quarantine_duration_secs,
+            expected.quarantine_duration_secs
+        );
+        assert_eq!(projection.require_approval, expected.require_approval);
+        assert_eq!(projection.provenance_mode, expected.provenance_mode);
+        assert_eq!(projection.provenance_backends, expected.provenance_backends);
+        assert_eq!(
+            projection.provenance_identities,
+            expected.provenance_identities
         );
         assert_eq!(
-            snapshot["quarantine_duration_secs"],
-            serde_json::json!(projection.quarantine_duration_secs)
+            projection.max_artifact_age_secs,
+            expected.max_artifact_age_secs
         );
+        assert_eq!(projection.license_policy, expected.license_policy);
+        assert_eq!(projection.scan_backends, expected.scan_backends);
         assert_eq!(
-            snapshot["require_approval"],
-            serde_json::json!(projection.require_approval)
+            projection.rescan_interval_hours,
+            expected.rescan_interval_hours
         );
+        assert_eq!(projection.negligible_action, expected.negligible_action);
+        assert_eq!(projection.enforcement, expected.enforcement);
         assert_eq!(
-            snapshot["provenance_mode"],
-            projection.provenance_mode.to_string()
+            projection.composite_verdict_mode,
+            expected.composite_verdict_mode
         );
+        assert!(!projection.archived);
+
+        // The event records the row, encoded once.
+        let batches = events.appended_batches();
+        let DomainEvent::PolicyCreated(created) = &batches[0].events[0].event else {
+            panic!("create_policy appends PolicyCreated");
+        };
         assert_eq!(
-            snapshot["provenance_backends"],
-            serde_json::json!(projection.provenance_backends)
-        );
-        assert_eq!(
-            snapshot["provenance_identities"],
-            serde_json::json!(projection.provenance_identities)
-        );
-        assert_eq!(
-            snapshot["max_artifact_age_secs"],
-            serde_json::json!(projection.max_artifact_age_secs)
-        );
-        assert_eq!(snapshot["license_policy"], projection.license_policy);
-        assert_eq!(
-            snapshot["scan_backends"],
-            serde_json::json!(projection.scan_backends)
-        );
-        assert_eq!(
-            snapshot["rescan_interval_hours"],
-            serde_json::json!(projection.rescan_interval_hours)
-        );
-        assert_eq!(
-            snapshot["negligible_action"],
-            projection.negligible_action.to_string()
-        );
-        assert_eq!(snapshot["enforcement"], projection.enforcement.to_string());
-        assert_eq!(
-            snapshot["composite_verdict_mode"],
-            projection.composite_verdict_mode.to_string()
+            created.config_snapshot,
+            policy_config_snapshot(&projection),
+            "the event's snapshot must be the projection's own encoding"
         );
     }
 
@@ -4201,8 +4490,195 @@ mod tests {
         );
     }
 
+    /// The stale-projection repair, at the `update_policy` site: the row
+    /// is one version behind its stream (a failed upsert), the first
+    /// append is refused, and the retry appends at the version the stream
+    /// actually reports.
     #[tokio::test]
-    async fn update_policy_stale_version_maps_conflict_to_domain_conflict() {
+    async fn update_policy_heals_a_stale_projection_and_appends_at_the_stream_version() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        // The stream is at 2; the row claims 0 — exactly what a committed
+        // append followed by a failed upsert leaves behind.
+        let mut stale = sample_projection(id, 0);
+        stale.name = "prod-default".into();
+        let tail = seed_policy_stream(
+            &events,
+            &stale,
+            vec![
+                DomainEvent::PolicyArchived(PolicyArchived { policy_id: id }),
+                DomainEvent::PolicyReactivated(PolicyReactivated { policy_id: id }),
+            ],
+        );
+        assert_eq!(tail, 2);
+        projections.insert(stale);
+        // LIFO: the result for the SECOND append is pushed first.
+        events.push_append_result(AppendResult {
+            stream_position: 3,
+            global_positions: vec![3],
+        });
+        events.push_append_error(DomainError::Conflict("expected version 0, found 2".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        uc.update_policy(cmd, api_actor()).await.expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2, "one refused attempt, one that lands");
+        assert_eq!(batches[0].expected_version, ExpectedVersion::Exact(0));
+        assert_eq!(
+            batches[1].expected_version,
+            ExpectedVersion::Exact(tail),
+            "the retry must ask with the version the stream reports"
+        );
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(last.name, "renamed");
+        assert_eq!(last.stream_version, 3);
+        assert!(
+            !last.archived,
+            "the re-based row must carry the stream's archived state, not the \
+             stale row's"
+        );
+    }
+
+    /// A conflict whose stream says the update already happened is an
+    /// idempotent success (ADR 0060 step (b)) — and the stale row is
+    /// repaired on the way out.
+    #[tokio::test]
+    async fn update_policy_whose_stream_already_states_it_succeeds_and_repairs_the_row() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        let mut renamed = stale.clone();
+        renamed.name = "renamed".into();
+        let rename = diff_policy_fields(id, &stale, &renamed)
+            .pop()
+            .expect("one changed field");
+        let tail = seed_policy_stream(&events, &stale, vec![DomainEvent::PolicyUpdated(rename)]);
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        uc.update_policy(cmd, api_actor())
+            .await
+            .expect("idempotent");
+
+        assert_eq!(
+            events.appended_batches().len(),
+            1,
+            "the re-decide found the intent already satisfied — nothing more is \
+             appended"
+        );
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(last.name, "renamed");
+        assert_eq!(
+            last.stream_version, tail,
+            "the repaired row carries the stream's version"
+        );
+    }
+
+    /// A second refusal is a genuine concurrent writer, not a stale row —
+    /// the second attempt's expected version came from the stream itself.
+    /// It surfaces as retryable-busy (ADR 0060 (d)), which the HTTP edge
+    /// already answers with 503 + `Retry-After`.
+    #[tokio::test]
+    async fn update_policy_reports_a_genuine_concurrent_writer_as_contention() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 4".into()));
+        events.push_append_error(DomainError::Conflict("expected version 0, found 7".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        let err = uc.update_policy(cmd, api_actor()).await.unwrap_err();
+
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Contended(_))),
+            "a conflict surviving the re-base is contention, got {err:?}"
+        );
+        assert_eq!(
+            events.appended_batches().len(),
+            2,
+            "bounded at two attempts"
+        );
+        assert!(
+            projections.upserts().is_empty(),
+            "nothing is written when the mutation never landed"
+        );
+    }
+
+    /// A concurrent archival the caller could not have seen: the row says
+    /// active, the stream says archived. The re-decide re-checks the
+    /// precondition against the stream and refuses, rather than appending
+    /// a `PolicyUpdated` to an archived policy.
+    #[tokio::test]
+    async fn update_policy_refuses_when_the_stream_says_the_policy_was_archived() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        seed_policy_stream(
+            &events,
+            &stale,
+            vec![DomainEvent::PolicyArchived(PolicyArchived {
+                policy_id: id,
+            })],
+        );
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        let err = uc.update_policy(cmd, api_actor()).await.unwrap_err();
+
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(msg.contains("archived"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert_eq!(
+            events.appended_batches().len(),
+            1,
+            "the re-decide refused before appending"
+        );
+        assert!(projections.upserts().is_empty(), "nothing is rewritten");
+    }
+
+    /// Fail-closed: a stream that cannot be READ rewrites nothing. The
+    /// refusal is the read's own error, not a `Conflict` the caller might
+    /// retry into.
+    #[tokio::test]
+    async fn update_policy_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 2".into()));
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        let err = uc.update_policy(cmd, api_actor()).await.unwrap_err();
+
+        assert!(err.to_string().contains("event store down"), "got: {err}");
+        assert_eq!(
+            events.appended_batches().len(),
+            1,
+            "the re-base failed before it could decide, so nothing is appended"
+        );
+        assert!(projections.upserts().is_empty(), "nothing is rewritten");
+    }
+
+    /// Fail-closed: a stream that cannot produce a projection rewrites
+    /// nothing either. Here the stream is empty — the shape a conflict on
+    /// a policy whose events are gone would take.
+    #[tokio::test]
+    async fn update_policy_refuses_and_rewrites_nothing_when_the_stream_cannot_be_folded() {
         let (uc, events, projections) = make_use_case();
         let id = Uuid::new_v4();
         projections.insert(sample_projection(id, 5));
@@ -4210,9 +4686,13 @@ mod tests {
 
         let mut cmd = UpdatePolicyCommand::new(id);
         cmd.name = FieldChange::Set("changed".into());
-
         let err = uc.update_policy(cmd, api_actor()).await.unwrap_err();
-        assert!(err.to_string().contains("conflict"), "got: {err}");
+
+        assert!(
+            matches!(err, AppError::Domain(DomainError::NotFound { .. })),
+            "an unfoldable stream refuses, got {err:?}"
+        );
+        assert!(projections.upserts().is_empty(), "nothing is rewritten");
     }
 
     #[tokio::test]
@@ -4300,15 +4780,101 @@ mod tests {
         assert_eq!(last.stream_version, 5);
     }
 
+    /// The stale-projection repair at the `archive_policy` site.
     #[tokio::test]
-    async fn archive_policy_stale_version_maps_conflict_to_domain_conflict() {
+    async fn archive_policy_heals_a_stale_projection() {
         let (uc, events, projections) = make_use_case();
         let id = Uuid::new_v4();
-        projections.insert(sample_projection(id, 9));
-        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        let stale = sample_projection(id, 0);
+        let mut renamed = stale.clone();
+        renamed.rescan_interval_hours = 48;
+        let bump = diff_policy_fields(id, &stale, &renamed)
+            .pop()
+            .expect("one changed field");
+        let tail = seed_policy_stream(&events, &stale, vec![DomainEvent::PolicyUpdated(bump)]);
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        uc.archive_policy(id, api_actor()).await.expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].expected_version, ExpectedVersion::Exact(tail));
+        assert!(matches!(
+            batches[1].events[0].event,
+            DomainEvent::PolicyArchived(_)
+        ));
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert!(last.archived);
+        assert_eq!(
+            last.rescan_interval_hours, 48,
+            "the repaired row carries the field the stale row had missed"
+        );
+    }
+
+    /// A stream that already says archived satisfies the intent: the call
+    /// succeeds and the stale row is repaired, rather than being answered
+    /// with a `Validation` error about a state the caller could not see.
+    #[tokio::test]
+    async fn archive_policy_whose_stream_already_says_archived_succeeds_and_repairs_the_row() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        let tail = seed_policy_stream(
+            &events,
+            &stale,
+            vec![DomainEvent::PolicyArchived(PolicyArchived {
+                policy_id: id,
+            })],
+        );
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        uc.archive_policy(id, api_actor())
+            .await
+            .expect("idempotent");
+
+        assert_eq!(
+            events.appended_batches().len(),
+            1,
+            "a second PolicyArchived would record an archival that did not happen"
+        );
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert!(last.archived);
+        assert_eq!(last.stream_version, tail);
+    }
+
+    #[tokio::test]
+    async fn archive_policy_reports_a_genuine_concurrent_writer_as_contention() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected 0, found 4".into()));
+        events.push_append_error(DomainError::Conflict("expected 0, found 7".into()));
 
         let err = uc.archive_policy(id, api_actor()).await.unwrap_err();
-        assert!(err.to_string().contains("conflict"), "got: {err}");
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Contended(_))),
+            "got {err:?}"
+        );
+        assert!(projections.upserts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn archive_policy_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 9);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+        let err = uc.archive_policy(id, api_actor()).await.unwrap_err();
+        assert!(err.to_string().contains("event store down"), "got: {err}");
+        assert!(projections.upserts().is_empty(), "nothing is rewritten");
     }
 
     #[tokio::test]
@@ -4393,7 +4959,7 @@ mod tests {
         let err = uc.reactivate_policy(id, api_actor()).await.unwrap_err();
         assert!(matches!(
             err,
-            crate::error::AppError::Domain(DomainError::NotFound {
+            AppError::Domain(DomainError::NotFound {
                 entity: "ScanPolicy",
                 ..
             })
@@ -4401,17 +4967,84 @@ mod tests {
         assert!(events.appended_batches().is_empty());
     }
 
+    /// The stale-projection repair at the `reactivate_policy` site — the
+    /// seventh expected-version site on this stream, and the one the
+    /// directive's census of six did not name. Its conflict handling was
+    /// byte-identical to `archive_policy`'s, so leaving it out would have
+    /// left the same deadlock reachable through the gitops
+    /// reactivation branch.
     #[tokio::test]
-    async fn reactivate_policy_stale_version_maps_conflict_to_domain_conflict() {
+    async fn reactivate_policy_heals_a_stale_projection() {
         let (uc, events, projections) = make_use_case();
         let id = Uuid::new_v4();
-        let mut p = sample_projection(id, 9);
-        p.archived = true;
-        projections.insert(p);
+        let mut stale = sample_projection(id, 0);
+        stale.archived = true;
+        // The stream opens active and is archived at position 1; the row
+        // is archived but claims version 0.
+        let mut active = stale.clone();
+        active.archived = false;
+        let tail = seed_policy_stream(
+            &events,
+            &active,
+            vec![DomainEvent::PolicyArchived(PolicyArchived {
+                policy_id: id,
+            })],
+        );
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        uc.reactivate_policy(id, api_actor()).await.expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].expected_version, ExpectedVersion::Exact(tail));
+        assert!(matches!(
+            batches[1].events[0].event,
+            DomainEvent::PolicyReactivated(_)
+        ));
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert!(!last.archived);
+    }
+
+    /// A stream that already says active satisfies the intent.
+    #[tokio::test]
+    async fn reactivate_policy_whose_stream_already_says_active_succeeds_and_repairs_the_row() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let mut stale = sample_projection(id, 0);
+        stale.archived = true;
+        let mut active = stale.clone();
+        active.archived = false;
+        let tail = seed_policy_stream(&events, &active, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 0".into()));
+
+        uc.reactivate_policy(id, api_actor())
+            .await
+            .expect("idempotent");
+
+        assert_eq!(events.appended_batches().len(), 1);
+        let last = projections.upserts().last().cloned().expect("an upsert");
+        assert!(!last.archived);
+        assert_eq!(last.stream_version, tail);
+    }
+
+    #[tokio::test]
+    async fn reactivate_policy_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let mut stale = sample_projection(id, 9);
+        stale.archived = true;
+        let mut active = stale.clone();
+        active.archived = false;
+        seed_policy_stream(&events, &active, Vec::new());
+        projections.insert(stale);
         events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
 
         let err = uc.reactivate_policy(id, api_actor()).await.unwrap_err();
-        assert!(err.to_string().contains("conflict"), "got: {err}");
+        assert!(err.to_string().contains("event store down"), "got: {err}");
+        assert!(projections.upserts().is_empty(), "nothing is rewritten");
     }
 
     #[tokio::test]
@@ -4653,20 +5286,126 @@ mod tests {
         assert_eq!(upserts[0].stream_version, 5);
     }
 
+    /// The stale-projection repair at the `add_exclusion` site.
+    ///
+    /// An exclusion event changes no policy *field*, but it takes a stream
+    /// position and the parent row's `stream_version` moves with it — so
+    /// this method is both a producer of the stale version and a victim of
+    /// it, and the gitops exclusions stage reaches it with no field diff
+    /// to heal the row first.
     #[tokio::test]
-    async fn add_exclusion_stale_version_maps_conflict_to_domain_conflict() {
+    async fn add_exclusion_heals_a_stale_projection() {
         let (uc, events, projections) = make_use_case();
         let policy_id = Uuid::new_v4();
-        projections.insert(sample_projection(policy_id, 9));
-        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        let stale = sample_projection(policy_id, 0);
+        let existing = Uuid::new_v4();
+        let tail = seed_policy_stream(
+            &events,
+            &stale,
+            vec![DomainEvent::ExclusionAdded(ExclusionAdded {
+                policy_id,
+                exclusion_id: existing,
+                cve_id: "CVE-2026-1111".into(),
+                package_pattern: None,
+                scope: PolicyScope::Global,
+                reason: "already waived".into(),
+                expires_at: None,
+            })],
+        );
+        projections.insert(stale);
+        events.push_append_result(AppendResult {
+            stream_position: 2,
+            global_positions: vec![2],
+        });
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let new_id = uc
+            .add_exclusion(sample_add_exclusion_command(policy_id), api_actor())
+            .await
+            .expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].expected_version, ExpectedVersion::Exact(tail));
+        match &batches[1].events[0].event {
+            DomainEvent::ExclusionAdded(a) => assert_eq!(a.exclusion_id, new_id),
+            other => panic!("expected ExclusionAdded, got {other:?}"),
+        }
+        assert_eq!(projections.exclusion_upserts().len(), 1);
+        let parent = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(parent.stream_version, 2);
+    }
+
+    /// A conflict surviving the re-base is contention, and nothing is
+    /// written — neither the exclusion row nor the parent.
+    #[tokio::test]
+    async fn add_exclusion_reports_a_genuine_concurrent_writer_as_contention() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 0);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected 0, found 4".into()));
+        events.push_append_error(DomainError::Conflict("expected 0, found 7".into()));
 
         let err = uc
             .add_exclusion(sample_add_exclusion_command(policy_id), api_actor())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("conflict"), "got: {err}");
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Contended(_))),
+            "got {err:?}"
+        );
+        assert!(projections.exclusion_upserts().is_empty());
+        assert!(projections.upserts().is_empty());
+    }
 
-        // No projection writes after a conflict.
+    /// A concurrent archival the caller could not have seen, at the
+    /// `add_exclusion` site: an exclusion must not be attached to a
+    /// policy the stream says is archived.
+    #[tokio::test]
+    async fn add_exclusion_refuses_when_the_stream_says_the_policy_was_archived() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 0);
+        seed_policy_stream(
+            &events,
+            &stale,
+            vec![DomainEvent::PolicyArchived(PolicyArchived { policy_id })],
+        );
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let err = uc
+            .add_exclusion(sample_add_exclusion_command(policy_id), api_actor())
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(msg.contains("archived"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert!(projections.exclusion_upserts().is_empty());
+        assert!(projections.upserts().is_empty());
+    }
+
+    /// Fail-closed: an unreadable stream refuses and writes nothing.
+    #[tokio::test]
+    async fn add_exclusion_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 9);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+        let err = uc
+            .add_exclusion(sample_add_exclusion_command(policy_id), api_actor())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("event store down"), "got: {err}");
         assert!(projections.exclusion_upserts().is_empty());
         assert!(projections.upserts().is_empty());
     }
@@ -4834,6 +5573,49 @@ mod tests {
         }
     }
 
+    /// Put the per-finding blob a
+    /// [`persisted_scan_completed`]-shaped `ScanCompleted` points at into
+    /// the storage mock: `critical` Critical findings, the first carrying
+    /// [`re_eval_exclusion_command`]'s CVE so one exclusion clears exactly
+    /// one of them.
+    ///
+    /// Every loosen-direction fixture needs this, because an exclusion is
+    /// matched against a finding's own `vulnerability_id` and a severity
+    /// count carries none: without the blob the pass reads the recorded
+    /// aggregate as-is and no exclusion can clear anything, so a test
+    /// asserting a release would be asserting an outcome production does
+    /// not reach.
+    ///
+    /// `persisted_scan_completed` references a fixed placeholder hash for
+    /// any non-clean scan, so the blob is seeded under that hash. The mock
+    /// does not enforce `hash(content) == key`, which is what lets the two
+    /// stay in step here. A clean scan (`critical == 0`) carries no blob
+    /// and seeds nothing.
+    fn seed_placeholder_findings_blob(
+        storage: &Arc<crate::use_cases::test_support::MockStoragePort>,
+        critical: u32,
+    ) {
+        if critical == 0 {
+            return;
+        }
+        let findings: Vec<Finding> = (0..critical)
+            .map(|i| {
+                let cve = if i == 0 {
+                    "CVE-2024-3094".to_string()
+                } else {
+                    format!("CVE-2024-OTHER-{i}")
+                };
+                sample_finding(&cve, SeverityThreshold::Critical)
+            })
+            .collect();
+        storage.insert_content(
+            crate::use_cases::test_support::VALID_SHA256
+                .parse::<ContentHash>()
+                .unwrap(),
+            serde_json::to_vec(&findings).unwrap(),
+        );
+    }
+
     /// Inserts the seeded `ScanCompleted` + `ArtifactRejected { Scanner }`
     /// and rejected artifact and returns the artifact id. The artifact is
     /// inserted into the shared `MockArtifactRepository`; the
@@ -4842,15 +5624,31 @@ mod tests {
     /// (the scan summary + the scan-clearable rejection reason). Caller is
     /// responsible for seeding the per-policy `repository_id` filter via
     /// [`MockArtifactRepository::seed_rejected_for_policy`].
+    ///
+    /// **The per-finding blob goes into CAS too, and it has to.** The
+    /// loosen direction asks the exclusion set about each finding's own
+    /// `vulnerability_id`; a severity count carries none, so an exclusion
+    /// cannot clear an artifact whose blob the pass could not read. A test
+    /// that seeds the `ScanCompleted` alone and then asserts the exclusion
+    /// released the artifact is asserting an outcome production does not
+    /// reach.
+    ///
+    /// The first seeded finding carries
+    /// [`re_eval_exclusion_command`]'s CVE, so one exclusion clears
+    /// exactly one Critical: `critical = 1` becomes clean, `critical = 2`
+    /// leaves one blocking finding behind, which is what the callers'
+    /// assertions are built on.
     fn seed_rejected_with_scan(
         artifacts: &Arc<crate::use_cases::test_support::MockArtifactRepository>,
         events: &Arc<MockEventStore>,
+        storage: &Arc<crate::use_cases::test_support::MockStoragePort>,
         repo_id: Uuid,
         critical: u32,
     ) -> Uuid {
         let artifact = rejected_artifact_for_repo(repo_id, "xz-utils");
         let artifact_id = artifact.id;
         artifacts.insert(artifact);
+        seed_placeholder_findings_blob(storage, critical);
         events.seed_stream(
             StreamId::artifact(artifact_id),
             vec![
@@ -4864,7 +5662,8 @@ mod tests {
     #[tokio::test]
     async fn add_exclusion_re_eval_pass_no_op_when_no_rejected_artifacts() {
         // Pass-complete log fires with all-zero counts. No state mutation.
-        let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, _storage) =
+            make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         projections.insert(sample_projection(policy_id, 4));
         // Seed the policy filter — even though it's empty, the mock
@@ -4887,7 +5686,8 @@ mod tests {
     #[tokio::test]
     async fn add_exclusion_re_eval_pass_resets_artifact_to_released_when_clean_and_window_elapsed()
     {
-        let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         // Severity threshold = Low so a single critical finding would
@@ -4896,7 +5696,7 @@ mod tests {
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
 
-        let artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        let artifact_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
 
         let exclusion_id = add_exclusion_then_run_pass(&uc, policy_id).await;
@@ -4957,14 +5757,15 @@ mod tests {
     /// `ArtifactReEvaluated + ArtifactReleased` append).
     #[tokio::test]
     async fn add_exclusion_re_eval_reset_to_released_threads_score_delta() {
-        let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         let mut p = sample_projection(policy_id, 4);
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
 
-        let _artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        let _artifact_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
 
         add_exclusion_then_run_pass(&uc, policy_id).await;
@@ -4982,7 +5783,8 @@ mod tests {
     #[tokio::test]
     async fn add_exclusion_re_eval_pass_resets_artifact_to_quarantined_when_clean_and_window_in_future(
     ) {
-        let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         let mut p = sample_projection(policy_id, 4);
@@ -4995,6 +5797,7 @@ mod tests {
         artifact.quarantine_window_start = Some(Utc::now());
         let artifact_id = artifact.id;
         artifacts.insert(artifact);
+        seed_placeholder_findings_blob(&storage, 1);
         events.seed_stream(
             StreamId::artifact(artifact_id),
             vec![
@@ -5038,14 +5841,14 @@ mod tests {
         // -- StillRejected: two findings, one excluded → still rejected.
         let snap_still = capture_metrics(|| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let (uc, events, projections, artifacts, _lifecycle) =
+                let (uc, events, projections, artifacts, _lifecycle, storage) =
                     make_use_case_with_re_eval_harness();
                 let policy_id = Uuid::new_v4();
                 let repo_id = Uuid::new_v4();
                 let mut p = sample_projection(policy_id, 4);
                 p.severity_threshold = SeverityThreshold::Low;
                 projections.insert(p);
-                let _ = seed_rejected_with_scan(&artifacts, &events, repo_id, 2);
+                let _ = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 2);
                 artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
                 add_exclusion_then_run_pass(&uc, policy_id).await;
             });
@@ -5069,14 +5872,14 @@ mod tests {
         // -- ResetToReleased: window elapsed + Clean.
         let snap_released = capture_metrics(|| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let (uc, events, projections, artifacts, _lifecycle) =
+                let (uc, events, projections, artifacts, _lifecycle, storage) =
                     make_use_case_with_re_eval_harness();
                 let policy_id = Uuid::new_v4();
                 let repo_id = Uuid::new_v4();
                 let mut p = sample_projection(policy_id, 4);
                 p.severity_threshold = SeverityThreshold::Low;
                 projections.insert(p);
-                let _ = seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+                let _ = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
                 artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
                 add_exclusion_then_run_pass(&uc, policy_id).await;
             });
@@ -5097,14 +5900,15 @@ mod tests {
     #[tokio::test]
     async fn add_exclusion_re_eval_pass_no_event_when_still_rejected() {
         // Two critical findings, one exclusion → still rejected.
-        let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         let mut p = sample_projection(policy_id, 4);
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
 
-        let _artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 2);
+        let _artifact_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 2);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
 
         add_exclusion_then_run_pass(&uc, policy_id).await;
@@ -5120,7 +5924,8 @@ mod tests {
         // Best-effort: artifact with no ScanCompleted on its stream
         // is logged + skipped, and the pass continues for any other
         // rejected artifact.
-        let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         let mut p = sample_projection(policy_id, 4);
@@ -5142,7 +5947,7 @@ mod tests {
 
         // Seed artifact B with a real ScanCompleted — pass continues
         // and clears it.
-        let b_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        let b_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
 
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
 
@@ -5159,7 +5964,8 @@ mod tests {
         // Best-effort concurrency conflict: when commit_transition
         // returns DomainError::Conflict for one artifact, the pass
         // logs warn + continues for the other.
-        let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         let mut p = sample_projection(policy_id, 4);
@@ -5167,8 +5973,8 @@ mod tests {
         projections.insert(p);
 
         // Seed two rejected artifacts both with one critical finding.
-        let a_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
-        let b_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        let a_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
+        let b_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
 
         // Inject a Conflict on the next commit_transition (the first
@@ -5198,7 +6004,8 @@ mod tests {
         // and produces no errors. The success contract is "always Ok
         // when the projection-upsert succeeds" — verify the use case
         // returns Ok.
-        let (uc, events, projections, _artifacts, lifecycle) = make_use_case_with_re_eval_harness();
+        let (uc, events, projections, _artifacts, lifecycle, _storage) =
+            make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         projections.insert(sample_projection(policy_id, 4));
 
@@ -5258,7 +6065,7 @@ mod tests {
             },
         ];
         for reason in non_scanner {
-            let (uc, events, projections, artifacts, lifecycle) =
+            let (uc, events, projections, artifacts, lifecycle, _storage) =
                 make_use_case_with_re_eval_harness();
             let policy_id = Uuid::new_v4();
             let repo_id = Uuid::new_v4();
@@ -5285,7 +6092,7 @@ mod tests {
     /// held).
     #[tokio::test]
     async fn re_eval_provenance_pending_is_not_released() {
-        let (uc, events, projections, artifacts, lifecycle, _cur, _repos) =
+        let (uc, events, projections, artifacts, lifecycle, _cur, _repos, storage) =
             make_cross_axis_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
@@ -5295,7 +6102,7 @@ mod tests {
         p.provenance_mode = ProvenanceMode::Required;
         projections.insert(p);
 
-        seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
 
         add_exclusion_then_run_pass(&uc, policy_id).await;
@@ -5311,7 +6118,7 @@ mod tests {
     /// provenance state, not a blanket Required-mode block.
     #[tokio::test]
     async fn re_eval_provenance_verified_under_required_is_released() {
-        let (uc, events, projections, artifacts, lifecycle, _cur, _repos) =
+        let (uc, events, projections, artifacts, lifecycle, _cur, _repos, storage) =
             make_cross_axis_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
@@ -5323,6 +6130,7 @@ mod tests {
         let artifact = rejected_artifact_for_repo(repo_id, "xz-utils");
         let artifact_id = artifact.id;
         artifacts.insert(artifact);
+        seed_placeholder_findings_blob(&storage, 1);
         events.seed_stream(
             StreamId::artifact(artifact_id),
             vec![
@@ -5353,7 +6161,7 @@ mod tests {
         use hort_domain::entities::curation_rule::{CurationRule, CurationRuleAction};
         use hort_domain::entities::managed_by::ManagedBy;
         use hort_domain::entities::repository::RepositoryFormat;
-        let (uc, events, projections, artifacts, lifecycle, curation, repos) =
+        let (uc, events, projections, artifacts, lifecycle, curation, repos, storage) =
             make_cross_axis_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
@@ -5362,7 +6170,7 @@ mod tests {
         projections.insert(p);
 
         // The artifact is "xz-utils"; seed an active Block rule matching it.
-        seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
 
         // Repository format (the curation format gate input).
@@ -5393,6 +6201,131 @@ mod tests {
         );
     }
 
+    /// **(c) reaches the re-quarantine arm too, and must.** Same
+    /// artifact and same active `Block` rule as the test above, except the
+    /// observation window is still open — so the verdict is
+    /// `ResetToQuarantined` rather than `ResetToReleased`.
+    ///
+    /// Re-quarantining it would hand it to the timer sweep, and the timer
+    /// release asks only the provenance question: `Artifact::release`
+    /// takes `(reason, authz, provenance)` and `QuarantineUseCase` holds
+    /// no curation port. Nothing else reaches the row either — the
+    /// retroactive curation pass walks `list_active_for_repo`, which
+    /// excluded this artifact while it was `Rejected`, which is why the
+    /// rule never marked it in the first place. So the block would be
+    /// dropped rather than deferred, and the window's expiry alone would
+    /// release the artifact past it.
+    ///
+    /// The artifact therefore stays `Rejected`: held either way at this
+    /// moment, and still held when the window ends.
+    #[tokio::test]
+    async fn re_eval_active_curation_block_is_not_re_quarantined_either() {
+        use hort_domain::entities::curation_rule::{CurationRule, CurationRuleAction};
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::repository::RepositoryFormat;
+        let (uc, events, projections, artifacts, lifecycle, curation, repos, storage) =
+            make_cross_axis_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        projections.insert(p);
+
+        // Anchor = now → the computed deadline (anchor + the 24h policy
+        // duration) is still in the future, so the scan-clean verdict
+        // lands on the re-quarantine arm.
+        let mut artifact = rejected_artifact_for_repo(repo_id, "xz-utils");
+        artifact.quarantine_window_start = Some(Utc::now());
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        seed_placeholder_findings_blob(&storage, 1);
+        events.seed_stream(
+            StreamId::artifact(artifact_id),
+            vec![
+                persisted_scan_completed(artifact_id, 1, 0),
+                persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 1),
+            ],
+        );
+        artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+
+        let mut repo = crate::use_cases::test_support::sample_repository();
+        repo.id = repo_id;
+        repo.format = RepositoryFormat::Pypi;
+        repos.insert(repo);
+
+        curation.set_rules_for_repo(
+            repo_id,
+            vec![CurationRule {
+                id: Uuid::new_v4(),
+                name: "block-xz".into(),
+                format: None,
+                package_pattern: "xz-*".into(),
+                action: CurationRuleAction::Block,
+                reason: "supply-chain backdoor".into(),
+                managed_by: ManagedBy::GitOps,
+                managed_by_digest: Some([0xab; 32]),
+            }],
+        );
+
+        add_exclusion_then_run_pass(&uc, policy_id).await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "an active curation Block must keep the artifact Rejected rather \
+             than re-quarantining it into the timer's candidate population: \
+             {:?}",
+            lifecycle.committed_transitions(),
+        );
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Rejected,
+        );
+    }
+
+    /// The counter to the test above: the re-quarantine arm still works.
+    /// Same future window, no curation rules — the artifact returns to
+    /// `Quarantined`. Without this, "always refuse on the re-quarantine
+    /// arm" would pass the test above and strand the whole
+    /// still-in-window population.
+    #[tokio::test]
+    async fn re_eval_re_quarantine_still_fires_when_curation_clears() {
+        let (uc, events, projections, artifacts, lifecycle, _curation, repos, storage) =
+            make_cross_axis_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        projections.insert(p);
+
+        let mut artifact = rejected_artifact_for_repo(repo_id, "xz-utils");
+        artifact.quarantine_window_start = Some(Utc::now());
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        seed_placeholder_findings_blob(&storage, 1);
+        events.seed_stream(
+            StreamId::artifact(artifact_id),
+            vec![
+                persisted_scan_completed(artifact_id, 1, 0),
+                persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 1),
+            ],
+        );
+        artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+
+        let mut repo = crate::use_cases::test_support::sample_repository();
+        repo.id = repo_id;
+        repo.format = hort_domain::entities::repository::RepositoryFormat::Pypi;
+        repos.insert(repo);
+
+        add_exclusion_then_run_pass(&uc, policy_id).await;
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1, "the re-quarantine still commits");
+        assert_eq!(
+            transitions[0].0.quarantine_status,
+            QuarantineStatus::Quarantined
+        );
+    }
+
     /// (c) symmetric: a curation `Warn` rule (NOT a Block) does not hold
     /// the release — the artifact still releases. Exercises the
     /// `Warn → Cleared` mapping + the repository-format resolution path.
@@ -5401,7 +6334,7 @@ mod tests {
         use hort_domain::entities::curation_rule::{CurationRule, CurationRuleAction};
         use hort_domain::entities::managed_by::ManagedBy;
         use hort_domain::entities::repository::RepositoryFormat;
-        let (uc, events, projections, artifacts, lifecycle, curation, repos) =
+        let (uc, events, projections, artifacts, lifecycle, curation, repos, storage) =
             make_cross_axis_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
@@ -5409,7 +6342,7 @@ mod tests {
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
 
-        seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
 
         let mut repo = crate::use_cases::test_support::sample_repository();
@@ -5447,7 +6380,7 @@ mod tests {
     /// the conjunction does not over-block the previously-passing case.
     #[tokio::test]
     async fn re_eval_clean_eligible_artifact_is_released() {
-        let (uc, events, projections, artifacts, lifecycle, _cur, _repos) =
+        let (uc, events, projections, artifacts, lifecycle, _cur, _repos, storage) =
             make_cross_axis_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
@@ -5455,7 +6388,7 @@ mod tests {
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
 
-        seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
 
         add_exclusion_then_run_pass(&uc, policy_id).await;
@@ -5472,7 +6405,8 @@ mod tests {
     /// unknown reason) is ineligible by default — held, not released.
     #[tokio::test]
     async fn re_eval_unknown_reason_no_rejection_event_is_not_released() {
-        let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, _storage) =
+            make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         let mut p = sample_projection(policy_id, 4);
@@ -5502,14 +6436,15 @@ mod tests {
     /// abort the pass nor release the artifact.
     #[tokio::test]
     async fn re_eval_hydrate_reason_read_error_skips_artifact() {
-        let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         let mut p = sample_projection(policy_id, 4);
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
 
-        seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
         // The one read_stream in the loop is the `ArtifactAtVersion`
         // pairing's — the single observation the whole derivation and the
@@ -5543,7 +6478,8 @@ mod tests {
     /// without conflicting.
     #[tokio::test]
     async fn re_eval_provenance_is_answered_from_the_paired_stream() {
-        let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, _storage) =
+            make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         let mut p = sample_projection(policy_id, 4);
@@ -5595,7 +6531,7 @@ mod tests {
     /// (`list_for_repo`) fails on the release arm → skip.
     #[tokio::test]
     async fn re_eval_curation_resolve_error_skips_artifact() {
-        let (uc, events, projections, artifacts, lifecycle, curation, _repos) =
+        let (uc, events, projections, artifacts, lifecycle, curation, _repos, storage) =
             make_cross_axis_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
@@ -5603,7 +6539,7 @@ mod tests {
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
 
-        seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
         // The curation precondition's `list_for_repo` fails.
         curation.fail_next_list_for_repo(DomainError::Invariant("curation lookup down".into()));
@@ -5622,7 +6558,7 @@ mod tests {
     /// harness (no rules seeded, repo seeded but format lookup skipped).
     #[tokio::test]
     async fn re_eval_curation_empty_rules_clears_and_releases() {
-        let (uc, events, projections, artifacts, lifecycle, _curation, repos) =
+        let (uc, events, projections, artifacts, lifecycle, _curation, repos, storage) =
             make_cross_axis_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
@@ -5630,7 +6566,7 @@ mod tests {
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
 
-        seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
         // Repo seeded but NO curation rules → fast-path Cleared (the
         // format lookup is skipped). The artifact releases.
@@ -5656,7 +6592,7 @@ mod tests {
     async fn re_eval_curation_missing_repo_falls_back_to_generic() {
         use hort_domain::entities::curation_rule::{CurationRule, CurationRuleAction};
         use hort_domain::entities::managed_by::ManagedBy;
-        let (uc, events, projections, artifacts, lifecycle, curation, _repos) =
+        let (uc, events, projections, artifacts, lifecycle, curation, _repos, storage) =
             make_cross_axis_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
@@ -5664,7 +6600,7 @@ mod tests {
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
 
-        seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
         // No repository row seeded → `repository_format` returns None →
         // coords.format = Generic. An any-format Block still matches.
@@ -5821,14 +6757,129 @@ mod tests {
         assert_eq!(upserts[0].stream_version, 5);
     }
 
+    /// The stale-projection repair at the `remove_exclusion` site.
     #[tokio::test]
-    async fn remove_exclusion_stale_version_maps_conflict_to_domain_conflict() {
+    async fn remove_exclusion_heals_a_stale_projection() {
         let (uc, events, projections) = make_use_case();
         let policy_id = Uuid::new_v4();
         let exclusion_id = Uuid::new_v4();
-        projections.insert(sample_projection(policy_id, 9));
+        let stale = sample_projection(policy_id, 0);
+        let tail = seed_policy_stream(
+            &events,
+            &stale,
+            vec![DomainEvent::ExclusionAdded(ExclusionAdded {
+                policy_id,
+                exclusion_id,
+                cve_id: "CVE-2024-3094".into(),
+                package_pattern: Some("xz-utils@<5.6.2".into()),
+                scope: PolicyScope::Global,
+                reason: "patched in container layer".into(),
+                expires_at: None,
+            })],
+        );
+        projections.insert(stale);
         projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
-        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        events.push_append_result(AppendResult {
+            stream_position: 2,
+            global_positions: vec![2],
+        });
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        uc.remove_exclusion(
+            sample_remove_exclusion_command(policy_id, exclusion_id),
+            api_actor(),
+        )
+        .await
+        .expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].expected_version, ExpectedVersion::Exact(tail));
+        assert_eq!(projections.exclusion_deletes(), vec![exclusion_id]);
+        let parent = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(parent.stream_version, 2);
+    }
+
+    /// A stream that no longer carries the exclusion satisfies the intent:
+    /// appending a second `ExclusionRemoved` would record a removal that
+    /// did not happen. The orphaned row is still deleted and the stale
+    /// parent repaired.
+    #[tokio::test]
+    async fn remove_exclusion_whose_stream_already_removed_it_succeeds_and_repairs_the_row() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let exclusion_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 0);
+        let tail = seed_policy_stream(
+            &events,
+            &stale,
+            vec![
+                DomainEvent::ExclusionAdded(ExclusionAdded {
+                    policy_id,
+                    exclusion_id,
+                    cve_id: "CVE-2024-3094".into(),
+                    package_pattern: None,
+                    scope: PolicyScope::Global,
+                    reason: "patched in container layer".into(),
+                    expires_at: None,
+                }),
+                DomainEvent::ExclusionRemoved(ExclusionRemoved {
+                    policy_id,
+                    exclusion_id,
+                    reason: "re-triaged".into(),
+                }),
+            ],
+        );
+        projections.insert(stale);
+        projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
+        events.push_append_error(DomainError::Conflict("expected version 0, found 2".into()));
+
+        uc.remove_exclusion(
+            sample_remove_exclusion_command(policy_id, exclusion_id),
+            api_actor(),
+        )
+        .await
+        .expect("idempotent");
+
+        assert_eq!(events.appended_batches().len(), 1);
+        assert_eq!(
+            projections.exclusion_deletes(),
+            vec![exclusion_id],
+            "the row the stream contradicts is still dropped"
+        );
+        let parent = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(parent.stream_version, tail);
+    }
+
+    /// A concurrent archival the caller could not have seen, at the
+    /// `remove_exclusion` site. The archived check runs before the
+    /// already-removed check, so an archived parent refuses rather than
+    /// silently draining the row.
+    #[tokio::test]
+    async fn remove_exclusion_refuses_when_the_stream_says_the_policy_was_archived() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let exclusion_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 0);
+        seed_policy_stream(
+            &events,
+            &stale,
+            vec![
+                DomainEvent::ExclusionAdded(ExclusionAdded {
+                    policy_id,
+                    exclusion_id,
+                    cve_id: "CVE-2024-3094".into(),
+                    package_pattern: None,
+                    scope: PolicyScope::Global,
+                    reason: "patched in container layer".into(),
+                    expires_at: None,
+                }),
+                DomainEvent::PolicyArchived(PolicyArchived { policy_id }),
+            ],
+        );
+        projections.insert(stale);
+        projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
+        events.push_append_error(DomainError::Conflict("expected version 0, found 2".into()));
 
         let err = uc
             .remove_exclusion(
@@ -5837,9 +6888,38 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("conflict"), "got: {err}");
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(msg.contains("archived"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert!(projections.exclusion_deletes().is_empty());
+        assert!(projections.upserts().is_empty());
+    }
 
-        // No projection writes after a conflict.
+    /// Fail-closed: an unreadable stream refuses and writes nothing — not
+    /// the delete, not the parent.
+    #[tokio::test]
+    async fn remove_exclusion_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let exclusion_id = Uuid::new_v4();
+        let stale = sample_projection(policy_id, 9);
+        seed_policy_stream(&events, &stale, Vec::new());
+        projections.insert(stale);
+        projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
+        events.push_append_error(DomainError::Conflict("expected version 9, found 10".into()));
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+        let err = uc
+            .remove_exclusion(
+                sample_remove_exclusion_command(policy_id, exclusion_id),
+                api_actor(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("event store down"), "got: {err}");
         assert!(projections.exclusion_deletes().is_empty());
         assert!(projections.upserts().is_empty());
     }
@@ -6027,16 +7107,6 @@ mod tests {
     }
 
     #[test]
-    fn optional_i64_to_value_some_returns_number() {
-        assert_eq!(optional_i64_to_value(Some(42)), serde_json::Value::from(42));
-    }
-
-    #[test]
-    fn optional_i64_to_value_none_returns_null() {
-        assert_eq!(optional_i64_to_value(None), serde_json::Value::Null);
-    }
-
-    #[test]
     fn create_policy_command_clone_preserves_fields() {
         let cmd = sample_create_command("x");
         let cloned = cmd.clone();
@@ -6144,7 +7214,7 @@ mod tests {
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let mut captured: Option<crate::error::AppError> = None;
+        let mut captured: Option<AppError> = None;
         metrics::with_local_recorder(&recorder, || {
             captured = Some(
                 tokio::runtime::Builder::new_current_thread()
@@ -6157,7 +7227,7 @@ mod tests {
         });
 
         match captured.expect("add_exclusion must have errored") {
-            crate::error::AppError::Domain(DomainError::Validation(msg)) => assert!(
+            AppError::Domain(DomainError::Validation(msg)) => assert!(
                 msg.contains("not enforced") && msg.contains(&repo_id.to_string()),
                 "the refusal must state why the scope cannot be honoured and name the \
                  requested repository, got: {msg}"
@@ -6248,14 +7318,24 @@ mod tests {
 
     /// `add_exclusion` event-store conflict emits `result=conflict`.
     /// The 4xx-like signal operators alert on for contention.
+    ///
+    /// Both appends lose: the first on the row's version, the second on
+    /// the version read straight off the stream. That second loss is a
+    /// genuine concurrent writer, which `curation_result_for` must still
+    /// label `conflict` even though it now arrives as
+    /// `DomainError::Contended` (ADR 0060's retryable-busy outcome)
+    /// rather than as `Conflict`.
     #[test]
     fn add_exclusion_event_store_conflict_emits_conflict_metric() {
         use metrics_util::debugging::DebuggingRecorder;
 
         let (uc, events, projections) = make_use_case();
         let policy_id = Uuid::new_v4();
-        projections.insert(sample_projection(policy_id, 9));
+        let projection = sample_projection(policy_id, 9);
+        seed_policy_stream(&events, &projection, Vec::new());
+        projections.insert(projection);
         events.push_append_error(DomainError::Conflict("expected 9, found 10".into()));
+        events.push_append_error(DomainError::Conflict("expected 0, found 10".into()));
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -6366,9 +7446,27 @@ mod tests {
         let (uc, events, projections) = make_use_case();
         let policy_id = Uuid::new_v4();
         let exclusion_id = Uuid::new_v4();
-        projections.insert(sample_projection(policy_id, 9));
+        let projection = sample_projection(policy_id, 9);
+        // The exclusion is on the stream too, so the re-decide still
+        // wants to remove it and the second append is a real race rather
+        // than an already-satisfied intent.
+        seed_policy_stream(
+            &events,
+            &projection,
+            vec![DomainEvent::ExclusionAdded(ExclusionAdded {
+                policy_id,
+                exclusion_id,
+                cve_id: "CVE-2024-3094".into(),
+                package_pattern: Some("xz-utils@<5.6.2".into()),
+                scope: PolicyScope::Global,
+                reason: "patched in container layer".into(),
+                expires_at: None,
+            })],
+        );
+        projections.insert(projection);
         projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
         events.push_append_error(DomainError::Conflict("stale".into()));
+        events.push_append_error(DomainError::Conflict("raced".into()));
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -6381,7 +7479,7 @@ mod tests {
                     sample_remove_exclusion_command(policy_id, exclusion_id),
                     api_actor(),
                 ))
-                .expect_err("conflict must propagate");
+                .expect_err("a conflict surviving the re-base must propagate");
         });
 
         let hits = read_curation_decisions(snapshotter.snapshot());
@@ -6442,6 +7540,7 @@ mod tests {
             severity_basis: hort_domain::types::SeverityBasis::Assessed,
             component_relation: ComponentRelation::NotEstablished,
             statement: hort_domain::types::FindingStatement::Unstated,
+            advisory_published_at: None,
         }
     }
 
@@ -6518,11 +7617,11 @@ mod tests {
     /// pass threads the loosen body and stamps the `PolicyUpdated` trigger.
     #[tokio::test]
     async fn run_pass_loosen_releases_clean_artifact() {
-        let (uc, events, projections, artifacts, lifecycle, _storage) = make_full_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_full_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         // Threshold Low so a single critical would block; the exclusion
-        // zeroes it on re-eval (aggregate-summary path, no blob seeded).
+        // matches the seeded finding's CVE and drops it on re-eval.
         let mut p = sample_projection(policy_id, 4);
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
@@ -6538,7 +7637,7 @@ mod tests {
             expires_at: None,
         });
 
-        let artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        let artifact_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
         // No active artifacts for the tighten direction.
         artifacts.seed_active_for_policy(policy_id, vec![]);
@@ -6571,7 +7670,7 @@ mod tests {
     /// the bumped policy, through release authority #5.
     #[tokio::test]
     async fn run_pass_loosen_un_rejects_when_enforcement_flips_to_record() {
-        let (uc, events, projections, artifacts, lifecycle, _storage) = make_full_re_eval_harness();
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_full_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         // Threshold Low: the seeded critical finding blocks under
@@ -6581,7 +7680,7 @@ mod tests {
         p.enforcement = ScanEnforcement::Record;
         projections.insert(p);
 
-        let artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        let artifact_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
         artifacts.seed_active_for_policy(policy_id, vec![]);
 
@@ -6708,6 +7807,207 @@ mod tests {
             }
             other => panic!("expected ArtifactRejected, got {other:?}"),
         }
+    }
+
+    /// Seed an active artifact whose stored `ScanCompleted` records
+    /// `critical` Critical findings and a `findings_blob` hash that is
+    /// **not** in CAS — the shape a tighten pass meets after at-rest loss
+    /// of the blob. Returns the artifact id.
+    fn seed_active_with_unreadable_findings(
+        artifacts: &Arc<crate::use_cases::test_support::MockArtifactRepository>,
+        events: &Arc<MockEventStore>,
+        repo_id: Uuid,
+        status: QuarantineStatus,
+        critical: u32,
+    ) -> Uuid {
+        let artifact = active_artifact_for_repo(repo_id, "xz-utils", status);
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        // `persisted_scan_completed` points at the placeholder hash; the
+        // storage mock is left empty, so `StoragePort::get` misses.
+        events.seed_stream(
+            StreamId::artifact(artifact_id),
+            vec![persisted_scan_completed(artifact_id, critical, 0)],
+        );
+        artifact_id
+    }
+
+    /// **An unreadable findings blob is not an empty finding set.** The
+    /// artifact's own `ScanCompleted` records a Critical; the blob that
+    /// detailed it is gone from CAS. Substituting an empty list evaluates
+    /// clean, `reject_from_scan_policy_retroactive` turns clean into a
+    /// no-op, and the artifact stays `Released` against a threshold its
+    /// own scan breached. The recorded counts are evidence, and the
+    /// tighten walk judges them.
+    #[tokio::test]
+    async fn run_pass_tighten_re_holds_when_the_findings_blob_is_unreadable() {
+        let (uc, events, projections, artifacts, lifecycle, _storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        projections.insert(p);
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+
+        let artifact_id = seed_active_with_unreadable_findings(
+            &artifacts,
+            &events,
+            repo_id,
+            QuarantineStatus::Released,
+            1,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "a Critical nobody could read must not leave the artifact released"
+        );
+        let (committed_artifact, committed_events, _meta) = &transitions[0];
+        assert_eq!(committed_artifact.id, artifact_id);
+        assert_eq!(
+            committed_artifact.quarantine_status,
+            QuarantineStatus::Rejected
+        );
+        assert_eq!(
+            committed_artifact.rejection_reason,
+            Some(RejectionReason::ScanPolicyRetroactive)
+        );
+        match &committed_events.events[1].event {
+            DomainEvent::ArtifactRejected(r) => {
+                assert_eq!(r.rejected_by, RejectionReason::ScanPolicyRetroactive);
+            }
+            other => panic!("expected ArtifactRejected, got {other:?}"),
+        }
+    }
+
+    /// The exclusion set does not reach the unreadable arm. Same fixture
+    /// as above plus an active exclusion: the summary records a count and
+    /// no vulnerability id, so there is nothing for the exclusion to be
+    /// matched against and the artifact is still re-held. Without this
+    /// the obvious shape of the fix — route the unreadable arm through the
+    /// summary filter the loosen path once used — would subtract the
+    /// Critical for an exclusion that may be about a different CVE
+    /// entirely.
+    #[tokio::test]
+    async fn run_pass_tighten_unreadable_blob_ignores_the_exclusion_set() {
+        let (uc, events, projections, artifacts, lifecycle, _storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        projections.insert(p);
+        projections.insert_exclusion(ExclusionProjection {
+            exclusion_id: Uuid::new_v4(),
+            policy_id,
+            cve_id: "CVE-2024-UNRELATED".into(),
+            package_pattern: None,
+            scope: PolicyScope::Global,
+            reason: "about a different vulnerability".into(),
+            added_by_actor_id: None,
+            expires_at: None,
+        });
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+
+        seed_active_with_unreadable_findings(
+            &artifacts,
+            &events,
+            repo_id,
+            QuarantineStatus::Released,
+            1,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "an exclusion the counts cannot be matched against must not \
+             subtract one of them"
+        );
+        assert_eq!(
+            transitions[0].0.quarantine_status,
+            QuarantineStatus::Rejected
+        );
+    }
+
+    /// **Invariant #4 survives the fix.** The over-correction to guard
+    /// against is reading every absence as unreadable: an artifact with no
+    /// `ScanCompleted` at all has no evidence it violates anything, and a
+    /// tighten must leave it exactly as it is. This is the whole
+    /// never-scanned population, so getting it wrong re-holds the estate.
+    #[tokio::test]
+    async fn run_pass_tighten_over_an_unscanned_artifact_is_still_a_noop() {
+        let (uc, events, projections, artifacts, lifecycle, _storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        // The strictest posture available: if anything could re-hold an
+        // artifact with no evidence, this policy would.
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        p.negligible_action = NegligibleAction::Block;
+        projections.insert(p);
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+
+        let artifact =
+            active_artifact_for_repo(repo_id, "never-scanned", QuarantineStatus::Released);
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        // Deliberately no stream at all: no `ScanCompleted`, no blob.
+        events.seed_stream(StreamId::artifact(artifact_id), vec![]);
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "a tighten never re-rejects an artifact with no evidence it \
+             violates (ADR 0041 invariant #4)"
+        );
+    }
+
+    /// The same no-op for the other genuine absence: a scan that ran and
+    /// found nothing records no `findings_blob`, and its summary is all
+    /// zeros by the `ScanCompleted` validator's own rule. Pinned
+    /// separately from the test above because it is a different reason
+    /// reaching the same arm.
+    #[tokio::test]
+    async fn run_pass_tighten_over_a_clean_scan_is_still_a_noop() {
+        let (uc, events, projections, artifacts, lifecycle, _storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        p.negligible_action = NegligibleAction::Block;
+        projections.insert(p);
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+
+        seed_active_with_unreadable_findings(
+            &artifacts,
+            &events,
+            repo_id,
+            QuarantineStatus::Released,
+            // `critical = 0` ⇒ `persisted_scan_completed` records no
+            // blob, which is the clean-scan shape rather than a loss.
+            0,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "a clean scan records no blob; that absence is not a failed read"
+        );
     }
 
     /// No-op branch: an active artifact whose stored findings stay clean
@@ -7110,6 +8410,222 @@ mod tests {
         }
     }
 
+    /// How many `policy-reevaluation` tasks have been enqueued so far.
+    /// The repair tests count across TWO `update_policy` calls, where
+    /// [`assert_one_reeval_enqueue`]'s single-call assertion is the wrong
+    /// shape — "none yet" and "exactly one by the end" are two readings of
+    /// the same counter.
+    fn reeval_enqueue_count(jobs: &crate::use_cases::test_support::MockJobsRepository) -> usize {
+        jobs.enqueue_calls()
+            .iter()
+            .filter(|(kind, _, _)| kind == "policy-reevaluation")
+            .count()
+    }
+
+    /// Re-seed the stream the mock serves from the batches it has already
+    /// accepted, as a store that kept what it was given would.
+    ///
+    /// The mock records appends but answers `read_stream` only from
+    /// `seed_stream`, so a test driving two calls over one store has to
+    /// carry the first call's committed batch forward itself — otherwise
+    /// the second call's re-base folds a stream that forgot the append the
+    /// test is about. The events come out of `appended_batches()` rather
+    /// than a hand-written copy, so the stream the re-base reads is the one
+    /// the first call actually produced. `created_from` is the projection
+    /// as it was BEFORE those appends, because `PolicyCreated`'s snapshot
+    /// is the stream's starting state.
+    fn reseed_stream_from_committed_appends(
+        events: &MockEventStore,
+        created_from: &ScanPolicyProjection,
+    ) -> u64 {
+        let committed: Vec<DomainEvent> = events
+            .appended_batches()
+            .iter()
+            .flat_map(|batch| batch.events.iter().map(|e| e.event.clone()))
+            .collect();
+        seed_policy_stream(events, created_from, committed)
+    }
+
+    /// **The pass a failed projection write drops.** A gate-affecting
+    /// update commits its append and then fails its projection write, so
+    /// `update_policy` returns at the write — before the enqueue. The
+    /// retry's re-base finds the stream already stating the update and
+    /// appends nothing, which makes the repair the only code in the system
+    /// still positioned to notice that the committed change never had its
+    /// re-evaluation pass scheduled. Exactly ONE pass across the two
+    /// calls: none from the first (it never reached its enqueue), one from
+    /// the repair.
+    #[tokio::test]
+    async fn update_policy_repair_enqueues_the_pass_the_failed_projection_write_dropped() {
+        let (uc, events, projections, jobs) = make_use_case_with_jobs();
+        let id = Uuid::new_v4();
+        let original = sample_projection(id, 0);
+        seed_policy_stream(&events, &original, Vec::new());
+        projections.insert(original.clone());
+
+        // Call 1: the append lands at version 1; the projection write
+        // fails, leaving the row at version 0 with the old threshold.
+        events.push_append_result(AppendResult {
+            stream_position: 1,
+            global_positions: vec![1],
+        });
+        projections.fail_next_upsert(DomainError::Invariant("projection write failed".into()));
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.severity_threshold = FieldChange::Set(SeverityThreshold::Critical);
+        uc.update_policy(cmd, api_actor())
+            .await
+            .expect_err("the projection write fails, so the call fails");
+        assert_eq!(
+            reeval_enqueue_count(&jobs),
+            0,
+            "the first call returns at the failed projection write, before its \
+             enqueue — this is the pass that goes missing",
+        );
+
+        let tail = reseed_stream_from_committed_appends(&events, &original);
+        assert_eq!(tail, 1, "PolicyCreated plus the committed PolicyUpdated");
+
+        // Call 2 (the retry): the stale row's version is refused, the
+        // re-base finds the stream already states the update, so nothing
+        // is appended — and the owed pass is enqueued anyway.
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.severity_threshold = FieldChange::Set(SeverityThreshold::Critical);
+        uc.update_policy(cmd, api_actor()).await.expect("repairs");
+
+        let repaired = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(
+            repaired.severity_threshold,
+            SeverityThreshold::Critical,
+            "the row is repaired from the stream",
+        );
+        assert_eq!(repaired.stream_version, tail);
+        let (policy_id, trigger) = assert_one_reeval_enqueue(&jobs);
+        assert_eq!(policy_id, id);
+        assert_eq!(
+            trigger,
+            ReEvaluationTrigger::PolicyUpdated { policy_id: id }
+        );
+    }
+
+    /// The same failed-write-then-retry shape with a **name-only** update:
+    /// the repair writes the row and enqueues nothing. The repair's
+    /// question is "was the row behind on a gate-affecting value", not
+    /// "was the row behind" — otherwise every repair becomes a population
+    /// pass.
+    #[tokio::test]
+    async fn update_policy_repair_of_a_name_only_update_enqueues_nothing() {
+        let (uc, events, projections, jobs) = make_use_case_with_jobs();
+        let id = Uuid::new_v4();
+        let original = sample_projection(id, 0);
+        seed_policy_stream(&events, &original, Vec::new());
+        projections.insert(original.clone());
+
+        events.push_append_result(AppendResult {
+            stream_position: 1,
+            global_positions: vec![1],
+        });
+        projections.fail_next_upsert(DomainError::Invariant("projection write failed".into()));
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        uc.update_policy(cmd, api_actor())
+            .await
+            .expect_err("the projection write fails, so the call fails");
+
+        let tail = reseed_stream_from_committed_appends(&events, &original);
+        assert_eq!(tail, 1);
+
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        uc.update_policy(cmd, api_actor()).await.expect("repairs");
+
+        let repaired = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(repaired.name, "renamed", "the row is still repaired");
+        assert_eq!(
+            reeval_enqueue_count(&jobs),
+            0,
+            "a name-only repair alters no stored-findings verdict — no pass",
+        );
+    }
+
+    /// A repair whose stale row was behind only on a **non-gate** field
+    /// enqueues nothing. Reached without a second call: the row sat one
+    /// version behind its stream already, and the update it is asked for
+    /// is the one the stream states.
+    #[tokio::test]
+    async fn update_policy_repair_not_behind_on_a_gate_field_enqueues_nothing() {
+        let (uc, events, projections, jobs) = make_use_case_with_jobs();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        let mut rescanned = stale.clone();
+        rescanned.rescan_interval_hours = 48;
+        let bump = diff_policy_fields(id, &stale, &rescanned)
+            .pop()
+            .expect("one changed field");
+        assert!(
+            !bump.field.is_gate_affecting(),
+            "the premise: rescan interval is not a gate field",
+        );
+        let tail = seed_policy_stream(&events, &stale, vec![DomainEvent::PolicyUpdated(bump)]);
+        projections.insert(stale);
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.rescan_interval_hours = FieldChange::Set(48);
+        uc.update_policy(cmd, api_actor()).await.expect("repairs");
+
+        let repaired = projections.upserts().last().cloned().expect("an upsert");
+        assert_eq!(repaired.rescan_interval_hours, 48);
+        assert_eq!(repaired.stream_version, tail);
+        assert_eq!(
+            reeval_enqueue_count(&jobs),
+            0,
+            "the row was behind, but not on a gate-affecting value",
+        );
+    }
+
+    /// A re-base that DOES append a gate-affecting field enqueues once,
+    /// not twice. The appended path reads the batch that landed and the
+    /// repair path reads the two rows; they are two answers to one
+    /// question and never both fire for one call.
+    #[tokio::test]
+    async fn update_policy_healed_append_of_a_gate_field_enqueues_exactly_once() {
+        let (uc, events, projections, jobs) = make_use_case_with_jobs();
+        let id = Uuid::new_v4();
+        let stale = sample_projection(id, 0);
+        // The stream is one event ahead of the row on a non-gate field,
+        // so the first append is refused and the re-base appends the
+        // gate change the command asks for.
+        let mut rescanned = stale.clone();
+        rescanned.rescan_interval_hours = 48;
+        let bump = diff_policy_fields(id, &stale, &rescanned)
+            .pop()
+            .expect("one changed field");
+        let tail = seed_policy_stream(&events, &stale, vec![DomainEvent::PolicyUpdated(bump)]);
+        projections.insert(stale);
+        // LIFO: the result for the SECOND append is pushed first.
+        events.push_append_result(AppendResult {
+            stream_position: 2,
+            global_positions: vec![2],
+        });
+        events.push_append_error(DomainError::Conflict("expected version 0, found 1".into()));
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.severity_threshold = FieldChange::Set(SeverityThreshold::Critical);
+        uc.update_policy(cmd, api_actor()).await.expect("heals");
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 2, "one refused attempt, one that lands");
+        assert_eq!(batches[1].expected_version, ExpectedVersion::Exact(tail));
+        let (policy_id, trigger) = assert_one_reeval_enqueue(&jobs);
+        assert_eq!(policy_id, id);
+        assert_eq!(
+            trigger,
+            ReEvaluationTrigger::PolicyUpdated { policy_id: id }
+        );
+    }
+
     /// The `FieldChange::Set` branch emits exactly one
     /// `PolicyField::Enforcement` event carrying the lowercase wire
     /// strings, and mutates the upserted projection. Same-value is a
@@ -7488,7 +9004,7 @@ mod tests {
 
         let snap = capture_metrics(|| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let (uc, events, projections, artifacts, _lifecycle) =
+                let (uc, events, projections, artifacts, _lifecycle, storage) =
                     make_use_case_with_re_eval_harness();
                 let policy_id = Uuid::new_v4();
                 let repo_id = Uuid::new_v4();
@@ -7499,7 +9015,7 @@ mod tests {
                 // the fixture window is elapsed (25h ago) and the
                 // cross-axis conjunction clears (no curation rules,
                 // VerifyIfPresent provenance with no events) → Released.
-                let _ = seed_rejected_with_scan(&artifacts, &events, repo_id, 0);
+                let _ = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 0);
                 artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
                 artifacts.seed_active_for_policy(policy_id, vec![]);
                 uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
@@ -7789,13 +9305,13 @@ mod tests {
     #[tokio::test]
     async fn loosen_release_does_not_commit_over_a_scan_verdict_that_landed_mid_derivation() {
         // -- Serial control: the derivation does decide to release.
-        let (uc, events, projections, artifacts, lifecycle, _storage) = make_interleaving_harness();
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_interleaving_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         let mut p = sample_projection(policy_id, 4);
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
-        let artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 0);
+        let artifact_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 0);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
         artifacts.seed_active_for_policy(policy_id, vec![]);
 
@@ -7808,11 +9324,11 @@ mod tests {
 
         // -- Same fixture, with a blocking verdict committing between the
         //    pairing's read and the release append.
-        let (uc, events, projections, artifacts, lifecycle, _storage) = make_interleaving_harness();
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_interleaving_harness();
         let mut p = sample_projection(policy_id, 4);
         p.severity_threshold = SeverityThreshold::Low;
         projections.insert(p);
-        let artifact_id_2 = seed_rejected_with_scan(&artifacts, &events, repo_id, 0);
+        let artifact_id_2 = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 0);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
         artifacts.seed_active_for_policy(policy_id, vec![]);
 
@@ -8008,14 +9524,15 @@ mod tests {
         let mut committed = 0usize;
         let snap = capture_metrics(|| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let (uc, events, projections, artifacts, lifecycle, _storage) =
+                let (uc, events, projections, artifacts, lifecycle, storage) =
                     make_interleaving_harness();
                 let policy_id = Uuid::new_v4();
                 let repo_id = Uuid::new_v4();
                 let mut p = sample_projection(policy_id, 4);
                 p.severity_threshold = SeverityThreshold::Low;
                 projections.insert(p);
-                let _artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 0);
+                let _artifact_id =
+                    seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 0);
                 artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
                 artifacts.seed_active_for_policy(policy_id, vec![]);
 
@@ -8049,7 +9566,7 @@ mod tests {
         let mut companion = None;
         let snap = capture_metrics(|| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let (uc, events, projections, artifacts, lifecycle) =
+                let (uc, events, projections, artifacts, lifecycle, storage) =
                     make_use_case_with_re_eval_harness();
                 let policy_id = Uuid::new_v4();
                 let repo_id = Uuid::new_v4();
@@ -8064,6 +9581,7 @@ mod tests {
                 artifact.quarantine_window_start = Some(Utc::now());
                 let artifact_id = artifact.id;
                 artifacts.insert(artifact);
+                seed_placeholder_findings_blob(&storage, 1);
                 events.seed_stream(
                     StreamId::artifact(artifact_id),
                     vec![
@@ -8112,14 +9630,15 @@ mod tests {
         let mut status = None;
         let snap = capture_metrics(|| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let (uc, events, projections, artifacts, lifecycle, _storage) =
+                let (uc, events, projections, artifacts, lifecycle, storage) =
                     make_interleaving_harness();
                 let policy_id = Uuid::new_v4();
                 let repo_id = Uuid::new_v4();
                 let mut p = sample_projection(policy_id, 4);
                 p.severity_threshold = SeverityThreshold::Low;
                 projections.insert(p);
-                let artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 0);
+                let artifact_id =
+                    seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 0);
                 artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
                 artifacts.seed_active_for_policy(policy_id, vec![]);
 

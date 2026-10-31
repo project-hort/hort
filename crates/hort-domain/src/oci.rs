@@ -14,6 +14,14 @@
 //! cleared), while [`strict_manifest_nomination`] refuses and names the
 //! offender (safe for a scan input — a skipped layer is a strict subset of the
 //! image that gets analysed and reported as the image). See ADR 0064 D1.
+//!
+//! [`index_child_descriptors`] needs **both** postures over one document, and
+//! so resolves the choice differently: it reports every unresolvable child
+//! rather than deciding, and [`IndexChildren`] makes each caller name which
+//! posture it is taking. An admission gate refuses the index; a reader of an
+//! already-stored index skips the child and says so. Returning bare hashes —
+//! which this parse once did — is what let both callers take the skipping
+//! posture without either of them choosing it.
 
 use std::fmt;
 use std::time::Duration;
@@ -77,15 +85,15 @@ pub const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manif
 pub const DOCKER_MANIFEST_LIST_MEDIA_TYPE: &str =
     "application/vnd.docker.distribution.manifest.list.v2+json";
 
-/// Upper bound on the number of child manifest hashes [`index_child_digests`]
+/// Upper bound on the number of child descriptors [`index_child_descriptors`]
 /// returns from a single image index. Mirrors the write-path
 /// `MAX_BLOB_REFERENCES` cap (`hort-http-oci`) so a pathological
 /// `manifests[]` array cannot force the caller to hold an unbounded reference
 /// set. A real multi-arch index has a handful of children; 1024 is a generous
 /// ceiling. An index declaring more than the cap is **rejected**
-/// ([`DomainError::Validation`] from [`index_child_digests`]), never truncated —
-/// an over-cap index is refused rather than silently accepted with un-linked
-/// children.
+/// ([`DomainError::Validation`] from [`index_child_descriptors`]), never
+/// truncated — an over-cap index is refused rather than silently accepted with
+/// un-linked children.
 const MAX_INDEX_CHILDREN: usize = 1024;
 
 /// Minimal OCI image-manifest projection — only the fields bundle-layer
@@ -392,7 +400,7 @@ pub fn simplesigning_signature_layers(
 /// so a pathological manifest cannot force the provenance cascade to hold an
 /// unbounded reference set. A manifest declaring more is **rejected**
 /// ([`DomainError::Validation`]), never truncated — mirroring
-/// [`index_child_digests`]'s over-cap posture.
+/// [`index_child_descriptors`]'s over-cap posture.
 const MAX_MANIFEST_BLOBS: usize = 1024;
 
 /// Minimal single-image-manifest projection for
@@ -425,7 +433,12 @@ struct OciBlobDescriptor {
 ///
 /// `sha256`-only: a descriptor whose digest uses another algorithm or is
 /// malformed hex is **skipped** (not an error), mirroring
-/// [`index_child_digests`]. A descriptor with no `digest`, a missing `config`,
+/// [`sigstore_bundle_layers`]. It does **not** mirror
+/// [`index_child_descriptors`], which reports such a descriptor instead: an
+/// index child's `digest` is a REQUIRED descriptor property and an index that
+/// does not name one is refused at admission, while this parse feeds the
+/// provenance-clearance cascade, where an unresolved constituent is simply one
+/// that does not get cleared. A descriptor with no `digest`, a missing `config`,
 /// or an absent `layers` key are likewise skipped/empty. An image index (no
 /// `config`/`layers`) yields `Ok(vec![])`. A manifest declaring more than
 /// [`MAX_MANIFEST_BLOBS`] config+layer descriptors is **rejected** as
@@ -640,13 +653,39 @@ pub enum DescriptorProblem {
     MissingMediaType,
     /// No `digest` — the descriptor names no content at all.
     MissingDigest,
-    /// The `digest` does not name the `sha256` algorithm. Covers another
-    /// algorithm (`sha512:…`) and a digest with no `<algorithm>:` prefix alike:
-    /// in both cases nothing identifies a CAS object.
-    NotSha256,
+    /// An `<algorithm>:<encoded>` digest whose algorithm is not `sha256` —
+    /// `sha512:…`, `blake3:…`. The declaration is **well-formed**: the OCI
+    /// image spec's descriptor grammar admits any algorithm and says
+    /// "Implementations SHOULD allow digests with unrecognized algorithms to
+    /// pass validation if they comply with the above grammar". So this is not
+    /// a malformed document — it is a document naming content hort's CAS
+    /// keyspace cannot address, which is a different answer and belongs to a
+    /// different wire code.
+    UnsupportedAlgorithm,
+    /// No `<algorithm>:` separator at all, so nothing identifies an algorithm.
+    /// Unlike [`Self::UnsupportedAlgorithm`] this does not comply with the
+    /// descriptor digest grammar, so it is a malformed declaration rather than
+    /// an unsupported one.
+    NoAlgorithmPrefix,
     /// A `sha256:` digest whose body is not 64 lowercase hex characters
     /// (short, over-long, non-hex, or upper-case).
     MalformedSha256,
+}
+
+impl DescriptorProblem {
+    /// Whether the declaration **complies with the descriptor digest grammar**
+    /// and is refused only because hort cannot address what it names.
+    ///
+    /// The split is the one the OCI spec draws: an unrecognised algorithm
+    /// "SHOULD pass validation" and so does not make the document invalid,
+    /// while a digest that matches no grammar does. A caller at a protocol
+    /// boundary needs exactly this bit in order to pick between an
+    /// invalid-document code and an unsupported-operation code, and deriving
+    /// it here rather than re-matching per call site is what keeps the two
+    /// from drifting apart.
+    pub fn is_well_formed_but_unsupported(&self) -> bool {
+        matches!(self, Self::UnsupportedAlgorithm)
+    }
 }
 
 /// One layer of a composed image: the CAS hash of the layer blob plus the
@@ -1211,17 +1250,30 @@ pub fn strict_manifest_nomination(
 /// Resolve a descriptor's declared `digest` into a CAS [`ContentHash`], or name
 /// why it does not resolve.
 ///
-/// The strict counterpart of [`parse_sha256_digest`], which collapses all three
-/// failures into `None` because its callers skip. Here the three are distinct
-/// because the caller must be able to say which one it refused for.
+/// The strict counterpart of [`parse_sha256_digest`], which collapses every
+/// failure into `None` because its callers skip. Here they are distinct because
+/// the caller must be able to say which one it refused for — and, at a protocol
+/// boundary, because an unrecognised algorithm and an ungrammatical digest are
+/// two different answers (see [`DescriptorProblem::is_well_formed_but_unsupported`]).
+///
+/// The three-way split — no `<algorithm>:` prefix, a prefix naming an algorithm
+/// other than `sha256`, and a `sha256:` body that is not 64 lowercase hex —
+/// is the same split the OCI HTTP adapter draws on a **request-line** digest
+/// (`hort-http-oci`'s `digest::parse_digest`). Two boundaries, two inputs; one
+/// rule. This is the copy that applies to a digest read out of a *document*.
 fn strict_sha256_digest(digest: Option<&str>) -> Result<ContentHash, DescriptorProblem> {
     let Some(digest) = digest else {
         return Err(DescriptorProblem::MissingDigest);
     };
-    let Some(hex) = digest.strip_prefix("sha256:") else {
-        return Err(DescriptorProblem::NotSha256);
+    let Some((algorithm, encoded)) = digest.split_once(':') else {
+        return Err(DescriptorProblem::NoAlgorithmPrefix);
     };
-    hex.parse().map_err(|_| DescriptorProblem::MalformedSha256)
+    if algorithm != "sha256" {
+        return Err(DescriptorProblem::UnsupportedAlgorithm);
+    }
+    encoded
+        .parse()
+        .map_err(|_| DescriptorProblem::MalformedSha256)
 }
 
 /// Minimal projection for [`manifest_subject_digest`] — only the
@@ -1250,8 +1302,11 @@ struct OciManifestSubject {
 /// subject's preimage.
 ///
 /// `sha256`-only: a `subject.digest` using another algorithm or malformed
-/// hex yields `Ok(None)`, mirroring [`manifest_blob_digests`] and
-/// [`index_child_digests`]. A manifest with no `subject` key, a `subject`
+/// hex yields `Ok(None)`, mirroring [`manifest_blob_digests`] (and **not**
+/// [`index_child_descriptors`], which reports the offender — a `subject` is an
+/// OPTIONAL descriptor stating what a referrer is about, so an unreadable one
+/// leaves a claim unmade rather than making the document invalid). A manifest
+/// with no `subject` key, a `subject`
 /// with no `digest`, or a `null` subject likewise yields `Ok(None)` — a
 /// plain image manifest and an index both do. Malformed / non-object JSON
 /// is [`DomainError::Validation`] — the same error shape
@@ -1288,6 +1343,151 @@ struct OciImageIndex {
 struct OciIndexChild {
     #[serde(default)]
     digest: Option<String>,
+    /// The descriptor's declared `size` in bytes — a REQUIRED descriptor
+    /// property per the OCI image spec, which is also why it is read here and
+    /// not inferred: "This REQUIRED property specifies the size, in bytes, of
+    /// the raw content. […] If the length of the retrieved content does not
+    /// match the specified length, the content SHOULD NOT be trusted."
+    ///
+    /// Read **leniently** — any JSON value that is not an exact `i64` lands as
+    /// `None` rather than failing the parse of the whole document. That
+    /// tolerance is load-bearing rather than lazy: this projection is also how
+    /// four readers of *already-stored* indexes enumerate children, and an
+    /// index admitted before this field was read at all may carry a `size`
+    /// that is a float, a string or out of `i64` range. Making such a document
+    /// unparseable would newly break the provenance cascade and the
+    /// deliverability walk over rows that are already in the catalog, for a
+    /// field that is only ever used to *refuse* — so a value hort cannot read
+    /// is one it declines to compare against, never one that fails the read.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    size: Option<i64>,
+}
+
+/// Deserialize any JSON value, yielding `Some` only for an exact `i64`.
+///
+/// Used for a declarant-supplied numeric field whose unreadability must not
+/// fail the surrounding document — see [`OciIndexChild::size`] for why that is
+/// the requirement here.
+fn lenient_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)?.as_i64())
+}
+
+/// One child an image index declares, with the parts of its descriptor hort
+/// can hold the stored child against.
+///
+/// Carries the `position` because a refusal has to name the offending child,
+/// and the only name that does not mean echoing declarant-controlled bytes
+/// back is its zero-based slot in `manifests[]` — the same reasoning
+/// [`ImageDescriptorSlot`] records for a single-image manifest's descriptors.
+///
+/// It deliberately does **not** carry the descriptor's `mediaType`, and the
+/// asymmetry with `size` is the reason: `size` is a property of the **bytes**,
+/// so every stored row for one content hash agrees on it and a comparison
+/// against one is well defined. The stored counterpart of `mediaType` is
+/// `Artifact::content_type`, which is a **header** whoever wrote that row
+/// supplied — a different kind of statement about the same content, and not
+/// one the index's declarant made. Why that makes it uncomparable in practice
+/// belongs where the comparison would happen and is recorded there, on
+/// `hort-http-oci`'s `check_child_against_descriptor`; a domain type is the
+/// wrong place to pin facts about the relational adapter, which can change
+/// without this file being re-read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexChildDescriptor {
+    /// Zero-based slot in the index's `manifests[]`.
+    pub position: usize,
+    /// CAS content hash the descriptor's `digest` names.
+    pub hash: ContentHash,
+    /// The declared `size` in bytes, when the descriptor carried one that is
+    /// readable as an `i64`. `None` is a non-conformant descriptor (`size` is
+    /// REQUIRED) and means there is no declaration to hold the stored bytes
+    /// against — not that the sizes agree.
+    pub declared_size: Option<i64>,
+}
+
+/// A declared index child that does not name content in hort's CAS keyspace,
+/// and why.
+///
+/// Carries no declarant-supplied value, for the reason
+/// [`DescriptorProblem`] records: the `position` says which child and the
+/// `problem` says what is wrong with it, which is everything a caller needs in
+/// order to refuse and name the offender, while the offending digest string is
+/// declarant-controlled and unbounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexChildFault {
+    /// Zero-based slot in the index's `manifests[]`.
+    pub position: usize,
+    /// What is wrong with the descriptor.
+    pub problem: DescriptorProblem,
+}
+
+impl fmt::Display for IndexChildFault {
+    /// `manifests[N]: <Problem>` — names the slot a reader can find in the
+    /// index bytes, and the problem, without reproducing the declaration.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "manifests[{}]: {:?}", self.position, self.problem)
+    }
+}
+
+/// Every entry of an image index's `manifests[]`, split into the children that
+/// resolve to a CAS hash and the ones that do not.
+///
+/// **The fields are private and there is no accessor that hands back only the
+/// resolvable half.** That is the point of the type. A declared child that
+/// does not resolve means one of two materially different things — the index is
+/// invalid (a REQUIRED `digest` is absent, or the digest matches no grammar) or
+/// the index is valid and names content hort cannot address — and the right
+/// answer differs by caller: an **admission** gate must refuse the document,
+/// while a reader of an already-stored index must not, or a single
+/// unaddressable child would withdraw every platform the index can still
+/// serve. Both callers used to get the same answer silently, because the
+/// projection returned bare hashes and the unresolvable children were simply
+/// not in the list. So the two intents are the two constructors out of this
+/// type, and neither can be reached without naming which one it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexChildren {
+    resolved: Vec<IndexChildDescriptor>,
+    faults: Vec<IndexChildFault>,
+}
+
+impl IndexChildren {
+    /// How many children the index declared — resolvable or not. The count the
+    /// index claims, which is what a log line about a partial enumeration has
+    /// to state in order to be a report of anything.
+    pub fn declared(&self) -> usize {
+        self.resolved.len() + self.faults.len()
+    }
+
+    /// Every declared child, or the **first** fault in `manifests[]` order.
+    ///
+    /// The accessor for a gate that admits the index: a child it cannot
+    /// resolve is a refusal, so enumerating the rest buys nothing and the
+    /// first offender is the one the refusal names.
+    pub fn into_all_declared(self) -> Result<Vec<IndexChildDescriptor>, IndexChildFault> {
+        match self.faults.first() {
+            Some(fault) => Err(*fault),
+            None => Ok(self.resolved),
+        }
+    }
+
+    /// The children that resolve, with every fault handed to `report`.
+    ///
+    /// The accessor for a reader of an already-stored index. `report` is not
+    /// optional and not a default: a caller on this path skips what it cannot
+    /// resolve *by design*, and requiring the skip to be written down here is
+    /// the only thing standing between that design and the silent drop this
+    /// type replaced.
+    pub fn into_resolvable(
+        self,
+        mut report: impl FnMut(IndexChildFault),
+    ) -> Vec<IndexChildDescriptor> {
+        for fault in self.faults {
+            report(fault);
+        }
+        self.resolved
+    }
 }
 
 /// Returns `true` iff `manifest_json` parses as a JSON object carrying a
@@ -1308,25 +1508,47 @@ pub fn is_image_index(manifest_json: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Returns the CAS content hash of every child manifest an image index
-/// references via `manifests[*].digest`.
+/// Projects an image index's `manifests[]` into [`IndexChildren`]: one
+/// [`IndexChildDescriptor`] per child whose `digest` names a CAS object, one
+/// [`IndexChildFault`] per child whose does not.
 ///
-/// `sha256`-only: a child whose digest uses another algorithm or is malformed
-/// hex is **skipped** (not an error), mirroring how [`sigstore_bundle_layers`]
-/// treats a non-CAS layer digest — the domain's uniform sha256-only digest
-/// handling. A child descriptor with no `digest` is likewise skipped.
+/// **A child is a descriptor, not a hash, and an unresolvable one is not a
+/// child to skip.** This parse used to return bare `Vec<ContentHash>` and drop
+/// a child with no `digest`, a non-`sha256` algorithm or malformed hex —
+/// mirroring how [`sigstore_bundle_layers`] treats a non-CAS *layer* digest.
+/// The two are not alike, and that is the correction here. A sigstore bundle
+/// layer whose digest is not a CAS digest is a legitimate layer that is none of
+/// hort's business. A child descriptor is governed by the OCI image spec's
+/// Content Descriptor rules, under which `digest` is a REQUIRED property —
+/// "This REQUIRED property is the _digest_ of the targeted content, conforming
+/// to the requirements outlined in Digests" — so an index whose `manifests[]`
+/// holds an entry with no usable digest is not an index that failed to describe
+/// one child, it is an index that does not say what it claims to say.
+///
+/// So this parse **reports** rather than drops, and the caller decides. It does
+/// not itself refuse: the right answer differs by caller and [`IndexChildren`]
+/// is the type that makes each one state which it is.
+///
+/// A fault is classified by [`strict_sha256_digest`], which separates a
+/// well-formed digest naming an algorithm hort cannot address
+/// ([`DescriptorProblem::UnsupportedAlgorithm`] — the spec says such a digest
+/// SHOULD pass validation, so the document is valid and only unservable) from
+/// one that matches no digest grammar at all
+/// ([`DescriptorProblem::NoAlgorithmPrefix`] /
+/// [`DescriptorProblem::MalformedSha256`], an invalid document).
 ///
 /// An index declaring more than [`MAX_INDEX_CHILDREN`] children is **rejected**
 /// as [`crate::error::DomainError::Validation`] — never silently truncated —
 /// mirroring the single-image reference-count cap the write path enforces
 /// (`manifests_write.rs` `MAX_BLOB_REFERENCES`), so an over-cap index is refused
-/// rather than accepted with un-linked children.
+/// rather than accepted with un-linked children. Unchanged by the correction
+/// above: it is a statement about the array, not about one descriptor.
 ///
 /// A single-image manifest (no `manifests[]`) or an empty `manifests: []`
-/// yields `Ok(vec![])`. Malformed / non-object JSON is
-/// [`crate::error::DomainError::Validation`] — the same error shape
+/// yields an empty [`IndexChildren`] with no faults. Malformed / non-object
+/// JSON is [`crate::error::DomainError::Validation`] — the same error shape
 /// [`sigstore_bundle_layers`] produces.
-pub fn index_child_digests(manifest_json: &[u8]) -> DomainResult<Vec<ContentHash>> {
+pub fn index_child_descriptors(manifest_json: &[u8]) -> DomainResult<IndexChildren> {
     let index: OciImageIndex = serde_json::from_slice(manifest_json)
         .map_err(|e| DomainError::Validation(format!("not a valid OCI image index: {e}")))?;
 
@@ -1338,11 +1560,19 @@ pub fn index_child_digests(manifest_json: &[u8]) -> DomainResult<Vec<ContentHash
         )));
     }
 
-    Ok(index
-        .manifests
-        .iter()
-        .filter_map(|child| child.digest.as_deref().and_then(parse_sha256_digest))
-        .collect())
+    let mut resolved = Vec::new();
+    let mut faults = Vec::new();
+    for (position, child) in index.manifests.iter().enumerate() {
+        match strict_sha256_digest(child.digest.as_deref()) {
+            Ok(hash) => resolved.push(IndexChildDescriptor {
+                position,
+                hash,
+                declared_size: child.size,
+            }),
+            Err(problem) => faults.push(IndexChildFault { position, problem }),
+        }
+    }
+    Ok(IndexChildren { resolved, faults })
 }
 
 /// Parse an OCI `<algorithm>:<hex>` digest into a CAS [`ContentHash`]. Only
@@ -1908,9 +2138,10 @@ mod tests {
     // ----------------------------------------------------------------
     //
     // `is_image_index` is a structural shape probe (non-empty `manifests[]`);
-    // `index_child_digests` extracts the sha256 child manifest hashes,
-    // sha256-only + bounded, skipping malformed children (mirroring
-    // `sigstore_bundle_layers`) and erroring only on malformed JSON.
+    // `index_child_descriptors` projects every child descriptor, splitting the
+    // ones whose `digest` names a CAS object from the ones that do not and
+    // leaving the verdict to the caller. Bounded by `MAX_INDEX_CHILDREN`;
+    // malformed JSON is the only document-level error.
 
     fn index(children: &serde_json::Value) -> Vec<u8> {
         manifest(&serde_json::json!({
@@ -1975,55 +2206,285 @@ mod tests {
         assert!(!is_image_index(b"[1, 2, 3]"));
     }
 
+    /// `sha512:<128 hex>` — a digest that complies with the descriptor digest
+    /// grammar and names an algorithm hort cannot address. The spec says such
+    /// a digest SHOULD pass validation, which is why it is a different answer
+    /// from an ungrammatical one.
+    fn sha512_digest() -> String {
+        format!("sha512:{}", "a".repeat(128))
+    }
+
     #[test]
-    fn index_child_digests_returns_all_sha256_children_in_order() {
+    fn index_child_descriptors_returns_all_sha256_children_in_order() {
         let (ha, hb) = (hex64('a'), hex64('b'));
         let m = index(&serde_json::json!([
-            { "digest": format!("sha256:{ha}") },
-            { "digest": format!("sha256:{hb}") }
+            { "digest": format!("sha256:{ha}"), "size": 11 },
+            { "digest": format!("sha256:{hb}"), "size": 22 }
         ]));
-        let got = index_child_digests(&m).expect("valid index");
-        let hashes: Vec<&str> = got.iter().map(AsRef::as_ref).collect();
-        assert_eq!(hashes, vec![ha.as_str(), hb.as_str()]);
+        let children = index_child_descriptors(&m).expect("valid index");
+        assert_eq!(children.declared(), 2);
+        let got = children.into_all_declared().expect("no faults");
+        assert_eq!(
+            got,
+            vec![
+                IndexChildDescriptor {
+                    position: 0,
+                    hash: ha.parse().expect("hex"),
+                    declared_size: Some(11),
+                },
+                IndexChildDescriptor {
+                    position: 1,
+                    hash: hb.parse().expect("hex"),
+                    declared_size: Some(22),
+                },
+            ]
+        );
     }
 
     #[test]
-    fn index_child_digests_skips_non_sha256_child() {
+    fn index_child_descriptors_reports_a_non_sha256_child_as_unsupported() {
         let hex = hex64('a');
         let m = index(&serde_json::json!([
-            { "digest": format!("sha256:{hex}") },
-            { "digest": format!("sha512:{}", "a".repeat(128)) }
+            { "digest": format!("sha256:{hex}"), "size": 1 },
+            { "digest": sha512_digest(), "size": 1 }
         ]));
-        let got = index_child_digests(&m).expect("valid index");
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].as_ref(), hex.as_str());
+        let children = index_child_descriptors(&m).expect("valid index");
+        assert_eq!(children.declared(), 2);
+        let fault = children
+            .into_all_declared()
+            .expect_err("a child hort cannot address must be reported, never dropped");
+        assert_eq!(
+            fault,
+            IndexChildFault {
+                position: 1,
+                problem: DescriptorProblem::UnsupportedAlgorithm,
+            }
+        );
+        assert!(
+            fault.problem.is_well_formed_but_unsupported(),
+            "a grammatical sha512 digest makes the index unservable, not invalid"
+        );
     }
 
     #[test]
-    fn index_child_digests_skips_malformed_hex_child() {
+    fn index_child_descriptors_reports_malformed_hex_as_invalid_not_unsupported() {
         let m = index(&serde_json::json!([
-            { "digest": "sha256:not-valid-hex" }
+            { "digest": "sha256:not-valid-hex", "size": 1 }
         ]));
-        assert!(index_child_digests(&m).expect("valid index").is_empty());
+        let fault = index_child_descriptors(&m)
+            .expect("valid index")
+            .into_all_declared()
+            .expect_err("a malformed child digest must be reported");
+        assert_eq!(fault.problem, DescriptorProblem::MalformedSha256);
+        assert!(!fault.problem.is_well_formed_but_unsupported());
     }
 
     #[test]
-    fn index_child_digests_skips_child_missing_digest() {
+    fn index_child_descriptors_reports_an_unprefixed_digest_as_invalid() {
+        let m = index(&serde_json::json!([
+            { "digest": hex64('a'), "size": 1 }
+        ]));
+        let fault = index_child_descriptors(&m)
+            .expect("valid index")
+            .into_all_declared()
+            .expect_err("a digest with no `<algorithm>:` prefix must be reported");
+        assert_eq!(fault.problem, DescriptorProblem::NoAlgorithmPrefix);
+        assert!(
+            !fault.problem.is_well_formed_but_unsupported(),
+            "a digest matching no grammar is an invalid document, not an unsupported one"
+        );
+    }
+
+    #[test]
+    fn index_child_descriptors_reports_a_child_with_no_digest() {
         let m = index(&serde_json::json!([
             { "mediaType": "application/vnd.oci.image.manifest.v1+json",
+              "size": 1,
               "platform": { "architecture": "amd64", "os": "linux" } }
         ]));
-        assert!(index_child_digests(&m).expect("valid index").is_empty());
+        let fault = index_child_descriptors(&m)
+            .expect("valid index")
+            .into_all_declared()
+            .expect_err("`digest` is a REQUIRED descriptor property");
+        assert_eq!(
+            fault,
+            IndexChildFault {
+                position: 0,
+                problem: DescriptorProblem::MissingDigest,
+            }
+        );
     }
 
     #[test]
-    fn index_child_digests_empty_manifests_is_empty() {
+    fn index_child_descriptors_fault_position_is_the_manifests_slot() {
+        let (ha, hb) = (hex64('a'), hex64('b'));
+        let m = index(&serde_json::json!([
+            { "digest": format!("sha256:{ha}"), "size": 1 },
+            { "digest": format!("sha256:{hb}"), "size": 1 },
+            { "size": 1 }
+        ]));
+        let fault = index_child_descriptors(&m)
+            .expect("valid index")
+            .into_all_declared()
+            .expect_err("third child has no digest");
+        assert_eq!(fault.position, 2);
+        // The rendering names a slot a reader can find in the index bytes and
+        // reproduces nothing the declarant supplied.
+        assert_eq!(fault.to_string(), "manifests[2]: MissingDigest");
+    }
+
+    #[test]
+    fn index_child_descriptors_into_all_declared_reports_the_first_fault_in_order() {
+        let m = index(&serde_json::json!([
+            { "digest": format!("sha256:{}", hex64('a')), "size": 1 },
+            { "digest": sha512_digest(), "size": 1 },
+            { "size": 1 }
+        ]));
+        let fault = index_child_descriptors(&m)
+            .expect("valid index")
+            .into_all_declared()
+            .expect_err("two faults");
+        assert_eq!(fault.position, 1, "the first offender in manifests[] order");
+    }
+
+    #[test]
+    fn index_child_descriptors_into_resolvable_keeps_the_rest_and_reports_each_fault() {
+        let (ha, hb) = (hex64('a'), hex64('b'));
+        let m = index(&serde_json::json!([
+            { "digest": format!("sha256:{ha}"), "size": 1 },
+            { "digest": sha512_digest(), "size": 1 },
+            { "digest": format!("sha256:{hb}"), "size": 1 },
+            { "size": 1 }
+        ]));
+        let children = index_child_descriptors(&m).expect("valid index");
+        assert_eq!(children.declared(), 4);
+        let mut reported = Vec::new();
+        let got = children.into_resolvable(|fault| reported.push(fault));
+        let hashes: Vec<&str> = got.iter().map(|c| c.hash.as_ref()).collect();
+        assert_eq!(hashes, vec![ha.as_str(), hb.as_str()]);
+        assert_eq!(
+            reported,
+            vec![
+                IndexChildFault {
+                    position: 1,
+                    problem: DescriptorProblem::UnsupportedAlgorithm,
+                },
+                IndexChildFault {
+                    position: 3,
+                    problem: DescriptorProblem::MissingDigest,
+                },
+            ],
+            "every skipped child is handed to the report hook"
+        );
+    }
+
+    #[test]
+    fn index_child_descriptors_position_survives_a_preceding_fault() {
+        // The position is the slot in `manifests[]`, not the index into the
+        // resolvable subset: a reader that reported a fault at 0 must still be
+        // able to point at the right descriptor for the child at 1.
+        let hb = hex64('b');
+        let m = index(&serde_json::json!([
+            { "size": 1 },
+            { "digest": format!("sha256:{hb}"), "size": 7 }
+        ]));
+        let got = index_child_descriptors(&m)
+            .expect("valid index")
+            .into_resolvable(|_| {});
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].position, 1);
+        assert_eq!(got[0].declared_size, Some(7));
+    }
+
+    #[test]
+    fn index_child_descriptors_reads_the_declared_size() {
+        let hex = hex64('a');
+        let m = index(&serde_json::json!([
+            { "digest": format!("sha256:{hex}"), "size": 528 }
+        ]));
+        let got = index_child_descriptors(&m)
+            .expect("valid index")
+            .into_all_declared()
+            .expect("no faults");
+        assert_eq!(got[0].declared_size, Some(528));
+    }
+
+    #[test]
+    fn index_child_descriptors_absent_size_is_none_not_a_refusal() {
+        // `size` is REQUIRED per the spec, but a descriptor that omits it
+        // declares nothing to hold the stored bytes against — the parse says
+        // `None` and the caller decides. It is deliberately NOT a fault:
+        // faults are about the digest, which is what identifies the child.
+        let hex = hex64('a');
+        let m = index(&serde_json::json!([
+            { "digest": format!("sha256:{hex}") }
+        ]));
+        let got = index_child_descriptors(&m)
+            .expect("valid index")
+            .into_all_declared()
+            .expect("no faults");
+        assert_eq!(got[0].declared_size, None);
+    }
+
+    #[test]
+    fn index_child_descriptors_unreadable_size_is_none_not_a_document_error() {
+        // A `size` that is not an exact i64 must not make the document
+        // unparseable: four readers of ALREADY-STORED indexes go through this
+        // projection, and an index admitted before `size` was read at all may
+        // carry any of these. Each yields `None` — nothing to compare — not a
+        // parse failure that would break the provenance cascade and the
+        // deliverability walk over rows already in the catalog.
+        let hex = hex64('a');
+        for weird in [
+            serde_json::json!(1.5),
+            serde_json::json!("528"),
+            serde_json::json!(null),
+            serde_json::json!(99999999999999999999_u128
+                .to_string()
+                .parse::<f64>()
+                .expect("f64")),
+            serde_json::json!({ "bytes": 1 }),
+            serde_json::json!([1, 2]),
+        ] {
+            let m = index(&serde_json::json!([
+                { "digest": format!("sha256:{hex}"), "size": weird }
+            ]));
+            let got = index_child_descriptors(&m)
+                .unwrap_or_else(|e| panic!("`size: {weird}` must still parse, got {e:?}"))
+                .into_all_declared()
+                .expect("no faults");
+            assert_eq!(got[0].declared_size, None, "`size: {weird}`");
+        }
+    }
+
+    #[test]
+    fn index_child_descriptors_negative_size_is_read_verbatim() {
+        // The spec says `size` MUST NOT be negative. It is read verbatim
+        // rather than normalised to `None`, because a negative declaration is
+        // a declaration: it can never equal a stored byte count, so the
+        // comparison at the admission gate refuses it on its own. Mapping it
+        // to `None` would turn a refusable lie into "nothing to compare".
+        let hex = hex64('a');
+        let m = index(&serde_json::json!([
+            { "digest": format!("sha256:{hex}"), "size": -1 }
+        ]));
+        let got = index_child_descriptors(&m)
+            .expect("valid index")
+            .into_all_declared()
+            .expect("no faults");
+        assert_eq!(got[0].declared_size, Some(-1));
+    }
+
+    #[test]
+    fn index_child_descriptors_empty_manifests_is_empty() {
         let m = index(&serde_json::json!([]));
-        assert!(index_child_digests(&m).expect("valid index").is_empty());
+        let children = index_child_descriptors(&m).expect("valid index");
+        assert_eq!(children.declared(), 0);
+        assert!(children.into_all_declared().expect("no faults").is_empty());
     }
 
     #[test]
-    fn index_child_digests_single_image_manifest_is_empty() {
+    fn index_child_descriptors_single_image_manifest_is_empty() {
         // A single-image manifest has no `manifests[]` → empty (not an error).
         let m = manifest(&serde_json::json!({
             "schemaVersion": 2,
@@ -2031,17 +2492,21 @@ mod tests {
             "config": { "digest": format!("sha256:{}", hex64('c')) },
             "layers": [ { "digest": format!("sha256:{}", hex64('d')) } ]
         }));
-        assert!(index_child_digests(&m).expect("valid manifest").is_empty());
+        assert!(index_child_descriptors(&m)
+            .expect("valid manifest")
+            .into_all_declared()
+            .expect("no faults")
+            .is_empty());
     }
 
     #[test]
-    fn index_child_digests_over_cap_is_rejected() {
+    fn index_child_descriptors_over_cap_is_rejected() {
         // Declaring MORE than the cap is REJECTED (never silently truncated),
         // mirroring the single-image reference-count rejection in the write path.
         let over: Vec<serde_json::Value> = (0..MAX_INDEX_CHILDREN + 5)
             .map(|i| serde_json::json!({ "digest": format!("sha256:{i:064x}") }))
             .collect();
-        let err = index_child_digests(&index(&serde_json::json!(over))).unwrap_err();
+        let err = index_child_descriptors(&index(&serde_json::json!(over))).unwrap_err();
         assert!(
             matches!(err, DomainError::Validation(_)),
             "over-cap index must be a Validation error, got {err:?}"
@@ -2051,13 +2516,59 @@ mod tests {
         let at_cap: Vec<serde_json::Value> = (0..MAX_INDEX_CHILDREN)
             .map(|i| serde_json::json!({ "digest": format!("sha256:{i:064x}") }))
             .collect();
-        let got = index_child_digests(&index(&serde_json::json!(at_cap))).expect("at-cap index");
+        let got = index_child_descriptors(&index(&serde_json::json!(at_cap)))
+            .expect("at-cap index")
+            .into_all_declared()
+            .expect("no faults");
         assert_eq!(got.len(), MAX_INDEX_CHILDREN);
     }
 
     #[test]
-    fn index_child_digests_malformed_json_is_validation_error() {
-        let err = index_child_digests(b"not json at all").unwrap_err();
+    fn index_child_descriptors_over_cap_is_rejected_before_any_child_is_classified() {
+        // The cap is a statement about the array, so it answers ahead of the
+        // per-descriptor verdict: an over-cap index whose children are ALSO
+        // faulty is still the over-cap `Validation`, not a fault.
+        let over: Vec<serde_json::Value> = (0..MAX_INDEX_CHILDREN + 1)
+            .map(|_| serde_json::json!({}))
+            .collect();
+        let err = index_child_descriptors(&index(&serde_json::json!(over))).unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_index_child_types_are_inspectable_and_cloneable() {
+        // Same reflex as `the_composition_types_are_inspectable_and_cloneable`:
+        // these travel through four callers' log lines and one HTTP envelope,
+        // so the derives are part of the contract rather than decoration.
+        let hex = hex64('a');
+        let children = index_child_descriptors(&index(&serde_json::json!([
+            { "digest": format!("sha256:{hex}"), "size": 3 },
+            { "size": 3 }
+        ])))
+        .expect("valid index");
+        assert_eq!(children.clone(), children);
+        assert!(format!("{children:?}").contains("IndexChildren"));
+        assert_eq!(children.declared(), 2);
+
+        let fault = children
+            .clone()
+            .into_all_declared()
+            .expect_err("the second child has no digest");
+        assert_eq!(fault, fault);
+        assert!(format!("{fault:?}").contains("MissingDigest"));
+
+        let descriptor = children
+            .into_resolvable(|_| {})
+            .into_iter()
+            .next()
+            .expect("one resolvable child");
+        assert_eq!(descriptor.clone(), descriptor);
+        assert!(format!("{descriptor:?}").contains("IndexChildDescriptor"));
+    }
+
+    #[test]
+    fn index_child_descriptors_malformed_json_is_validation_error() {
+        let err = index_child_descriptors(b"not json at all").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
     }
 
@@ -2068,8 +2579,8 @@ mod tests {
     //
     // config digest first, then layer digests in manifest order;
     // sha256-only + bounded, skipping malformed descriptors (mirroring
-    // `index_child_digests`) and erroring only on malformed JSON or an
-    // over-cap declaration.
+    // `sigstore_bundle_layers`, NOT `index_child_descriptors`) and erroring
+    // only on malformed JSON or an over-cap declaration.
 
     #[test]
     fn manifest_blob_digests_returns_config_then_layers_in_order() {
@@ -2137,7 +2648,7 @@ mod tests {
     #[test]
     fn manifest_blob_digests_over_cap_is_rejected() {
         // config + layers together over the cap is REJECTED (never
-        // truncated), mirroring `index_child_digests`. The config
+        // truncated), mirroring `index_child_descriptors`. The config
         // descriptor counts toward the total: exactly MAX layers + a
         // config is one over.
         let at_cap_layers: Vec<serde_json::Value> = (0..MAX_MANIFEST_BLOBS)
@@ -2234,8 +2745,8 @@ mod tests {
     }
 
     #[test]
-    fn index_child_digests_non_object_json_is_validation_error() {
-        let err = index_child_digests(b"[1, 2, 3]").unwrap_err();
+    fn index_child_descriptors_non_object_json_is_validation_error() {
+        let err = index_child_descriptors(b"[1, 2, 3]").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
     }
 
@@ -2548,15 +3059,18 @@ mod tests {
             manifest_refusal(&m),
             ManifestRefusal::MalformedDescriptor {
                 slot: ImageDescriptorSlot::Layer(1),
-                problem: DescriptorProblem::NotSha256,
+                problem: DescriptorProblem::UnsupportedAlgorithm,
             }
         );
     }
 
     #[test]
-    fn a_digest_without_an_algorithm_prefix_is_not_sha256() {
+    fn a_digest_without_an_algorithm_prefix_is_distinct_from_an_unsupported_one() {
         // A bare hex body names no algorithm, so it identifies no CAS object —
-        // the same refusal as another algorithm, deliberately.
+        // the same REFUSAL as another algorithm, but not the same problem: a
+        // grammatical `sha512:` digest is a valid declaration hort cannot
+        // address, while this one matches no digest grammar at all. The
+        // composition refuses both; a protocol boundary must not.
         let m = image_manifest(&serde_json::json!([
             { "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE, "digest": hex64('a') },
         ]));
@@ -2564,9 +3078,11 @@ mod tests {
             manifest_refusal(&m),
             ManifestRefusal::MalformedDescriptor {
                 slot: ImageDescriptorSlot::Layer(0),
-                problem: DescriptorProblem::NotSha256,
+                problem: DescriptorProblem::NoAlgorithmPrefix,
             }
         );
+        assert!(!DescriptorProblem::NoAlgorithmPrefix.is_well_formed_but_unsupported());
+        assert!(DescriptorProblem::UnsupportedAlgorithm.is_well_formed_but_unsupported());
     }
 
     #[test]
@@ -2889,7 +3405,7 @@ mod tests {
             manifest_refusal(&bad_layer),
             ManifestRefusal::MalformedDescriptor {
                 slot: ImageDescriptorSlot::Layer(0),
-                problem: DescriptorProblem::NotSha256,
+                problem: DescriptorProblem::UnsupportedAlgorithm,
             }
         );
         assert_eq!(
@@ -2962,7 +3478,7 @@ mod tests {
             manifest_refusal(&m),
             ManifestRefusal::MalformedDescriptor {
                 slot: ImageDescriptorSlot::Layer(1),
-                problem: DescriptorProblem::NotSha256,
+                problem: DescriptorProblem::UnsupportedAlgorithm,
             },
             "the same descriptor must be NAMED by the strict parse"
         );

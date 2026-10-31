@@ -11,9 +11,13 @@
 //! # Control plane — [`admin_token_routes`]:
 //! POST   /admin/users/:user_id/tokens — admin-mint for service account
 //! DELETE /admin/tokens/:id            — admin-revoke any token
+//! POST   /admin/cli-sessions/revoke   — revoke ONE CliSession by jti
+//! POST   /admin/users/:user_id/cli-sessions/revoke
+//!                                     — revoke EVERY CliSession of a
+//!                                       subject issued before now
 //! ```
 //!
-//! The two admin routes live in a
+//! The admin routes live in a
 //! separate [`admin_token_routes`] tree so the composition root in
 //! `hort-server` can place them on the internal control-plane listener
 //! (with the rest of `/api/v1/admin/*`) rather than the public listener
@@ -138,13 +142,12 @@ impl FromRequestParts<Arc<AppContext>> for AuthenticatedCaller {
 /// Build the PUBLIC self-service native-API-token route tree
 /// (`/users/me/tokens*`). Caller `nest`s under `/api/v1`.
 ///
-/// The two ADMIN routes
-/// (`POST /admin/users/:user_id/tokens`,
-/// `DELETE /admin/tokens/:id`) are NOT here — they live in
-/// [`admin_token_routes`] so the composition root can place them on the
-/// internal control-plane listener with the rest of `/api/v1/admin/*`.
-/// Every authenticated user can self-mint / list / revoke their own
-/// tokens, so this tree is public by requirement.
+/// The ADMIN routes (service-account mint, admin-revoke, and the two
+/// CliSession emergency-revocation surfaces) are NOT here — they live
+/// in [`admin_token_routes`] so the composition root can place them on
+/// the internal control-plane listener with the rest of
+/// `/api/v1/admin/*`. Every authenticated user can self-mint / list /
+/// revoke their own tokens, so this tree is public by requirement.
 pub fn api_token_routes() -> Router<Arc<AppContext>> {
     Router::new()
         .route("/users/me/tokens", post(post_self_token))
@@ -158,14 +161,31 @@ pub fn api_token_routes() -> Router<Arc<AppContext>> {
 /// ```text
 /// POST   /admin/users/:user_id/tokens — admin-mint for service account
 /// DELETE /admin/tokens/:id            — admin-revoke any token
+/// POST   /admin/cli-sessions/revoke   — revoke ONE CliSession by jti
+/// POST   /admin/users/:user_id/cli-sessions/revoke
+///                                     — revoke EVERY CliSession of a
+///                                       subject issued before now
 /// ```
 ///
-/// Both routes are gated by the [`AdminPrincipal`] extractor (unchanged
-/// by this split). They are mounted onto the internal control listener
-/// by `hort_server::http::control_plane_routes` so they leave the
-/// public listener when `HORT_CONTROL_BIND` is set — completing the
+/// Every route here is gated by the [`AdminPrincipal`] extractor
+/// (unchanged by the control-plane split). They are mounted onto the
+/// internal control listener by
+/// `hort_server::http::control_plane_routes` so they leave the public
+/// listener when `HORT_CONTROL_BIND` is set — completing the
 /// tier-(iii) `/api/v1/admin/*`-is-control-plane segmentation the
 /// hardening checklist already claims.
+///
+/// # Why the CliSession revocation pair is admin-gated, not curator-gated
+///
+/// `AdminPrincipal`, deliberately. Service accounts are strictly
+/// non-admin (ADR 0038), so neither route can be driven from a
+/// pipeline — cutting a human's interactive sessions is an action a
+/// human with an IdP-assumed admin session takes. The curator gate
+/// ([`CurateOrAdminPrincipal`](crate::authz::CurateOrAdminPrincipal))
+/// is the day-to-day authority over *artifacts*; it is not an
+/// identity authority, and mounting these here because the path starts
+/// `/admin/` would be exactly the accidental broadening that
+/// extractor's doc warns about, in reverse.
 pub fn admin_token_routes() -> Router<Arc<AppContext>> {
     Router::new()
         .route(
@@ -173,6 +193,14 @@ pub fn admin_token_routes() -> Router<Arc<AppContext>> {
             post(post_admin_service_account_token),
         )
         .route("/admin/tokens/{id}", delete(delete_admin_token))
+        .route(
+            "/admin/cli-sessions/revoke",
+            post(post_admin_revoke_cli_session),
+        )
+        .route(
+            "/admin/users/{user_id}/cli-sessions/revoke",
+            post(post_admin_revoke_user_cli_sessions),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +223,49 @@ pub struct IssueTokenRequestBody {
     pub repository_ids: Option<Vec<Uuid>>,
     #[serde(default)]
     pub expires_in_days: Option<u32>,
+}
+
+/// Request body for `POST /admin/cli-sessions/revoke`.
+///
+/// Both fields are read out of the token the operator is holding — a
+/// CliSession JWT's payload is base64url, so `jti` and `exp` are
+/// recoverable from a token pasted into a ticket or found in a log
+/// without the signing key. **The token itself is deliberately not
+/// the request body**: it is a live credential, and a surface that
+/// accepted one would invite copying it into request logs and shell
+/// history on the way to revoking it.
+#[derive(Debug, Deserialize)]
+pub struct RevokeCliSessionRequestBody {
+    /// The `jti` claim of the session to deny.
+    pub jti: Uuid,
+    /// The `exp` claim of that same session. The denylist entry
+    /// self-expires here, because after `exp` the token is refused by
+    /// signature validation anyway and the entry has nothing left to
+    /// deny. A value in the past is accepted and floors to a
+    /// one-second entry (the session is already dead).
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Response body for `POST /admin/users/:user_id/cli-sessions/revoke`.
+///
+/// Carries what the operator did NOT supply: the instant sessions are
+/// judged against and the instant the cutoff lapses. Both matter
+/// mid-incident, which is why this route answers with a body where
+/// the single-session route answers `204` (there, every field would
+/// echo the request).
+#[derive(Debug, Serialize)]
+pub struct CliSessionCutoffResponse {
+    /// The subject cut off, echoed back. The use case does not read
+    /// the user row — the kill switch must not inherit the
+    /// availability of a backend it does not need — so this is the
+    /// operator's confirmation of *which* subject they named.
+    pub user_id: Uuid,
+    /// Every CliSession token for `user_id` with `iat` at or before
+    /// this instant is now refused, as is any carrying no `iat`.
+    pub cutoff: DateTime<Utc>,
+    /// When the cutoff entry self-expires. By then no session issued
+    /// before `cutoff` can still be live.
+    pub cutoff_expires_at: DateTime<Utc>,
 }
 
 /// Response body for `POST` issuance. The `token` plaintext appears
@@ -327,6 +398,77 @@ async fn delete_admin_token(
         .await
         .map_err(ApiTokenWireError::from)?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /admin/cli-sessions/revoke` — deny ONE CliSession by `jti`.
+///
+/// The single-session half of the emergency-revocation pair. It stays
+/// meaningful whenever the token itself is in hand, because then the
+/// operator can cut exactly that session instead of the whole person
+/// — a human whose laptop is fine but whose one pasted token is not
+/// keeps working.
+///
+/// `204` on success: every field of a response body would echo the
+/// request. Its subject-scoped sibling
+/// ([`post_admin_revoke_user_cli_sessions`]) answers with a body
+/// because the cutoff instant and window are derived, not supplied.
+#[tracing::instrument(skip(ctx))]
+async fn post_admin_revoke_cli_session(
+    admin: AdminPrincipal,
+    State(ctx): State<Arc<AppContext>>,
+    Json(body): Json<RevokeCliSessionRequestBody>,
+) -> Result<Response, ApiTokenWireError> {
+    ctx.api_token_use_case
+        .revoke_cli_session(body.jti, body.expires_at)
+        .await
+        .map_err(ApiTokenWireError::from)?;
+    // Attribution, after the write. The use case's own audit line
+    // names the `jti` but not who asked for it (its signature predates
+    // this route and takes no actor), and an attribution line emitted
+    // *before* the call would record revocations that never landed.
+    tracing::info!(
+        actor_user_id = %admin.0.user_id,
+        jti = %body.jti,
+        "admin revoked a single cli session"
+    );
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /admin/users/:user_id/cli-sessions/revoke` — deny EVERY
+/// CliSession of one subject issued at or before now.
+///
+/// The surface the `jti` denylist alone cannot be. Nothing persists a
+/// live CliSession (no row, no hash — the claims ride in the signed
+/// token), so an operator who does not hold the token has no `jti` to
+/// name, and the emergency this exists for is "the device is gone,
+/// cut this person off now".
+///
+/// It is **not** an account lockout: the human can re-run mediated
+/// login immediately and the new session — issued after the cutoff —
+/// is admitted. Deactivating the user is the separate, deliberate
+/// action.
+#[tracing::instrument(skip(ctx))]
+async fn post_admin_revoke_user_cli_sessions(
+    admin: AdminPrincipal,
+    State(ctx): State<Arc<AppContext>>,
+    Path(user_id): Path<Uuid>,
+) -> Result<Response, ApiTokenWireError> {
+    let cutoff = ctx
+        .api_token_use_case
+        .revoke_cli_sessions_for_user(
+            ApiActor {
+                user_id: admin.0.user_id,
+            },
+            user_id,
+        )
+        .await
+        .map_err(ApiTokenWireError::from)?;
+    Ok(Json(CliSessionCutoffResponse {
+        user_id: cutoff.user_id,
+        cutoff: cutoff.cutoff,
+        cutoff_expires_at: cutoff.expires_at,
+    })
+    .into_response())
 }
 
 #[tracing::instrument(skip(ctx))]
@@ -598,6 +740,23 @@ mod tests {
         }
     }
 
+    /// A CliSession JWT signer over a throwaway Ed25519 key, built
+    /// via PEM so no `ed25519-dalek` dev-dep is needed. Same helper
+    /// shape as `handlers::exchange`'s.
+    fn cli_session_signer() -> Arc<hort_app::cli_session_signing::CliSessionTokenSigner> {
+        const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
+-----END PRIVATE KEY-----\n";
+        let key = Arc::new(
+            hort_app::oci_token_signing::OciTokenSigningKey::from_pem(TEST_KEY_PEM, None)
+                .expect("parse test signing key"),
+        );
+        Arc::new(hort_app::cli_session_signing::CliSessionTokenSigner::new(
+            key,
+            "https://hort.test".to_string(),
+        ))
+    }
+
     fn router_with_principal(principal: &CallerPrincipal) -> (Router, MockPorts, Arc<AppContext>) {
         router_with_principal_and_config(principal, ApiTokenIssuanceConfig::default())
     }
@@ -674,13 +833,22 @@ mod tests {
         // `build_mock_ctx`'s empty default and every non-admin
         // issuance would fail with CapExceedsAuthority.
         let rbac_swap = Arc::new(arc_swap::ArcSwap::from_pointee(rbac_eval));
-        let api_token_uc = Arc::new(ApiTokenUseCase::new(
-            mocks.api_tokens.clone(),
-            mocks.users.clone(),
-            base.event_store.clone(),
-            rbac_swap.clone(),
-            issuance_config,
-        ));
+        let api_token_uc = Arc::new(
+            ApiTokenUseCase::new(
+                mocks.api_tokens.clone(),
+                mocks.users.clone(),
+                base.event_store.clone(),
+                rbac_swap.clone(),
+                issuance_config,
+            )
+            // Mirrors the composition root, which wires the CliSession
+            // signer and its revocation denylist together whenever auth
+            // is enabled. The signer is inert on every route these tests
+            // exercise; the denylist is what the two CliSession
+            // revocation routes write to, and without it they would fail
+            // closed with a 500.
+            .with_cli_session_signing(cli_session_signer(), mocks.ephemeral_durable.clone()),
+        );
         let ctx_with_auth = with_auth(
             &base,
             crate::context::AuthContext::Enabled {
@@ -1144,5 +1312,147 @@ mod tests {
         inject(&mut req, &principal);
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // -- CliSession emergency revocation ------------------------------------
+
+    /// Read the denylist the router's use case writes to.
+    async fn denylist_has(mocks: &MockPorts, key: &str) -> bool {
+        use hort_domain::ports::ephemeral_store::EphemeralStore;
+        mocks
+            .ephemeral_durable
+            .get(key)
+            .await
+            .expect("denylist read")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn post_admin_revoke_cli_session_denies_the_named_jti() {
+        let admin_id = Uuid::new_v4();
+        let principal = principal_with_claims(admin_id, &["admin"]);
+        let (router, mocks, _) = router_with_principal(&principal);
+        let jti = Uuid::new_v4();
+        let exp = Utc::now() + chrono::Duration::seconds(600);
+
+        let mut req = Request::post("/admin/cli-sessions/revoke")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "jti": jti, "expires_at": exp }).to_string(),
+            ))
+            .unwrap();
+        inject(&mut req, &principal);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(denylist_has(&mocks, &format!("cli-session-revoked:{jti}")).await);
+        // Exactly one session: no subject-wide cutoff was raised.
+        assert!(!denylist_has(&mocks, &format!("cli-session-cutoff:{admin_id}")).await);
+    }
+
+    #[tokio::test]
+    async fn post_admin_revoke_cli_session_requires_admin() {
+        // The AdminPrincipal extractor short-circuits before the
+        // handler runs. ADR 0038 keeps service accounts non-admin, so
+        // this surface cannot be driven from a pipeline.
+        let principal = principal_with_claims(Uuid::new_v4(), &["developer"]);
+        let (router, mocks, _) = router_with_principal(&principal);
+        let jti = Uuid::new_v4();
+        let mut req = Request::post("/admin/cli-sessions/revoke")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "jti": jti,
+                    "expires_at": Utc::now() + chrono::Duration::seconds(600),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        inject(&mut req, &principal);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !denylist_has(&mocks, &format!("cli-session-revoked:{jti}")).await,
+            "a refused request must write nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_admin_revoke_user_cli_sessions_raises_the_subject_cutoff() {
+        let admin_id = Uuid::new_v4();
+        let subject = Uuid::new_v4();
+        let principal = principal_with_claims(admin_id, &["admin"]);
+        let (router, mocks, _) = router_with_principal(&principal);
+
+        let before = Utc::now();
+        let mut req = Request::post(format!("/admin/users/{subject}/cli-sessions/revoke"))
+            .body(Body::empty())
+            .unwrap();
+        inject(&mut req, &principal);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(v["user_id"], subject.to_string());
+        let cutoff: DateTime<Utc> = v["cutoff"]
+            .as_str()
+            .expect("cutoff")
+            .parse()
+            .expect("rfc3339");
+        let lapses: DateTime<Utc> = v["cutoff_expires_at"]
+            .as_str()
+            .expect("cutoff_expires_at")
+            .parse()
+            .expect("rfc3339");
+        assert!(cutoff >= before && cutoff <= Utc::now());
+        // The reported window is the derived lifetime cap, not a
+        // literal typed into the handler.
+        assert_eq!(
+            (lapses - cutoff).num_seconds() as u64,
+            hort_app::use_cases::api_token_use_case::max_cli_session_lifetime().as_secs(),
+        );
+
+        // Keyed on the SUBJECT, not the admin who ran it.
+        assert!(denylist_has(&mocks, &format!("cli-session-cutoff:{subject}")).await);
+        assert!(!denylist_has(&mocks, &format!("cli-session-cutoff:{admin_id}")).await);
+    }
+
+    #[tokio::test]
+    async fn post_admin_revoke_user_cli_sessions_requires_admin() {
+        let principal = principal_with_claims(Uuid::new_v4(), &["developer"]);
+        let (router, mocks, _) = router_with_principal(&principal);
+        let subject = Uuid::new_v4();
+        let mut req = Request::post(format!("/admin/users/{subject}/cli-sessions/revoke"))
+            .body(Body::empty())
+            .unwrap();
+        inject(&mut req, &principal);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !denylist_has(&mocks, &format!("cli-session-cutoff:{subject}")).await,
+            "a refused request must write nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_routes_do_not_collide_with_the_admin_token_routes() {
+        // `/admin/users/{user_id}/cli-sessions/revoke` sits beside
+        // `/admin/users/{user_id}/tokens` in the same route tree; a
+        // path-parameter overlap that swallowed one would be invisible
+        // until an operator needed it.
+        let admin_id = Uuid::new_v4();
+        let subject = Uuid::new_v4();
+        let principal = principal_with_claims(admin_id, &["admin"]);
+        let (router, _, _) = router_with_principal(&principal);
+        // The mint route still answers on its own path (400/403 here is
+        // fine — what matters is that it is NOT a 404 from the new
+        // route having shadowed it).
+        let mut req = Request::post(format!("/admin/users/{subject}/tokens"))
+            .header("content-type", "application/json")
+            .body(Body::from(happy_request_body()))
+            .unwrap();
+        inject(&mut req, &principal);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -68,7 +68,10 @@ pub enum GrantSubjectSpec {
     /// and by the `claims_nonempty` DB CHECK).
     Claims { required: Vec<String> },
     /// Direct user-id binding. `userId` is an unresolved string here;
-    /// the apply pipeline parses it to a `Uuid`.
+    /// the apply pipeline parses it to a `Uuid`. Its UUID *syntax* is
+    /// checked by `validate_permission_grant`, before the apply's first
+    /// write; whether it names an existing user is not a static property
+    /// of the bundle and is not checked anywhere pre-write.
     #[serde(rename_all = "camelCase")]
     User { user_id: String },
     /// Gitops-spec sugar naming a declared `ServiceAccount`. The apply
@@ -212,8 +215,9 @@ pub fn parse_permission_grant(
 /// Per-spec validation. Confirms `permission` parses through
 /// `Permission::FromStr`; the subject is well-formed (a `Claims`
 /// subject has a non-empty `required` set with no blank entries; a
-/// `User` subject has a non-blank `userId`); `repository` (when
-/// present) is non-blank; plus the standard non-blank-name guard.
+/// `User` subject has a non-blank `userId` that is UUID syntax);
+/// `repository` (when present) is non-blank; plus the standard
+/// non-blank-name guard.
 ///
 /// The `repository` reference is checked cross-spec in
 /// `crate::desired::validate`.
@@ -250,11 +254,37 @@ pub fn validate_permission_grant(env: &Envelope<PermissionGrantSpec>) -> Vec<Val
             }
         }
         GrantSubjectSpec::User { user_id } => {
-            if user_id.trim().is_empty() {
+            // UUID *syntax*, decidable from this one envelope, so this is
+            // the earliest place the verdict exists — and the only one
+            // provably before the bundle's first write. The apply
+            // pipeline's consolidated grant reconcile runs LAST, after
+            // the repository, policy and mapping writes, and ships no
+            // rollback: a typo caught there aborts an apply that has
+            // already committed the rest of the same bundle. Whether the
+            // UUID names a user that EXISTS is deliberately not asked —
+            // that is not a static property of the bundle.
+            //
+            // The trim mirrors `Uuid::parse_str(user_id.trim())` at the
+            // consumption site. The two must accept exactly the same set,
+            // because the consumption site's parse failure is a
+            // `DomainError::Invariant` that this rule is what makes
+            // unreachable.
+            let candidate = user_id.trim();
+            if candidate.is_empty() {
                 errors.push(ValidationError::Invalid {
                     kind: Kind::PermissionGrant,
                     name: env.metadata.name.clone(),
                     detail: "subject.userId must not be blank".into(),
+                });
+            } else if uuid::Uuid::parse_str(candidate).is_err() {
+                errors.push(ValidationError::Invalid {
+                    kind: Kind::PermissionGrant,
+                    name: env.metadata.name.clone(),
+                    detail: format!(
+                        "subject.userId `{user_id}` is not a valid UUID — it must be \
+                         a concrete users.id (use `subject: {{ kind: serviceAccount, \
+                         name: ... }}` to name a service account instead)"
+                    ),
                 });
             }
         }
@@ -727,6 +757,104 @@ mod tests {
         assert!(errors
             .iter()
             .any(|e| e.to_string().contains("subject.userId")));
+    }
+
+    #[test]
+    fn validate_rejects_a_user_id_that_is_not_uuid_syntax() {
+        let body = "
+  subject: { kind: user, userId: 0f8fad5b-d9cb-469f-a165-70867728950X }
+  permission: read
+  repository: pypi-alpha
+";
+        let env = parse_permission_grant(&p(), yaml("typo", body).as_bytes()).unwrap();
+        let errors = validate_permission_grant(&env);
+        // The operator gets the grant by `metadata.name`, the field, and
+        // the value they typed — the three things needed to fix the file.
+        let rendered = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("PermissionGrant `typo`")
+                && rendered.contains("subject.userId")
+                && rendered.contains("0f8fad5b-d9cb-469f-a165-70867728950X"),
+            "{rendered}"
+        );
+    }
+
+    /// Surrounding whitespace is accepted, because the apply stage
+    /// parses `user_id.trim()`. The two must agree on trimming or the
+    /// stage's `Invariant` becomes reachable — see
+    /// [`user_id_verdict_is_exactly_what_the_apply_stage_can_parse`].
+    #[test]
+    fn validate_accepts_a_user_id_with_surrounding_whitespace() {
+        let body = "
+  subject: { kind: user, userId: '  11111111-2222-3333-4444-555555555555  ' }
+  permission: read
+  repository: pypi-alpha
+";
+        let env = parse_permission_grant(&p(), yaml("padded", body).as_bytes()).unwrap();
+        assert!(
+            validate_permission_grant(&env).is_empty(),
+            "a padded but well-formed userId is the shape the apply stage \
+             accepts, so this validator must accept it too"
+        );
+    }
+
+    /// The agreement the grant stage's `DomainError::Invariant` rests on:
+    /// this validator accepts a `subject.userId` **exactly** when
+    /// `Uuid::parse_str(user_id.trim())` succeeds — the expression the
+    /// apply stage runs. A stricter validator would reject a bundle the
+    /// stage could have applied; a laxer one would let a value through
+    /// that the stage can only fail on, after the earlier stages have
+    /// already written.
+    ///
+    /// The corpus spans every form `Uuid::parse_str` accepts (hyphenated,
+    /// simple, braced, URN) plus the padding and the malformations, so a
+    /// hand-rolled hex/length check in place of the parse fails here.
+    #[test]
+    fn user_id_verdict_is_exactly_what_the_apply_stage_can_parse() {
+        let corpus = [
+            "11111111-2222-3333-4444-555555555555",
+            "  11111111-2222-3333-4444-555555555555  ",
+            "11111111222233334444555555555555",
+            "{11111111-2222-3333-4444-555555555555}",
+            "urn:uuid:11111111-2222-3333-4444-555555555555",
+            "11111111-2222-3333-4444-555555555555\t",
+            "0f8fad5b-d9cb-469f-a165-70867728950X",
+            "not-a-uuid",
+            "11111111-2222-3333-4444-55555555555",
+            "11111111-2222-3333-4444-5555555555555",
+            "11111111_2222_3333_4444_555555555555",
+            "11111111-2222-3333-4444-555555555555 extra",
+            "",
+            "   ",
+        ];
+        for candidate in corpus {
+            let env = Envelope {
+                api_version: crate::envelope::ApiVersion::V1,
+                kind: Kind::PermissionGrant,
+                metadata: crate::envelope::Metadata {
+                    name: "agreement".into(),
+                },
+                spec: PermissionGrantSpec {
+                    subject: GrantSubjectSpec::User {
+                        user_id: candidate.to_string(),
+                    },
+                    permission: "read".into(),
+                    repository: None,
+                },
+            };
+            let accepted = validate_permission_grant(&env).is_empty();
+            let stage_can_parse = uuid::Uuid::parse_str(candidate.trim()).is_ok();
+            assert_eq!(
+                accepted, stage_can_parse,
+                "`{candidate}`: this validator accepted={accepted}, the apply \
+                 stage's `Uuid::parse_str(trim())` accepted={stage_can_parse} \
+                 — the two must agree, or the stage's `Invariant` is reachable"
+            );
+        }
     }
 
     #[test]

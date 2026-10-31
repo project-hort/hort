@@ -12,6 +12,7 @@
 //! with `hort-http-admin-tasks::dto::{JobRowDto, TaskListDto}`. The wire
 //! format (field names, JSON serialisation) is the contract.
 
+pub mod cli_session;
 pub mod quarantine;
 pub mod rbac;
 pub mod rescan;
@@ -58,6 +59,17 @@ pub enum AdminCommand {
     /// manual release (ADR 0007).
     /// See `docs/architecture/how-to/quarantine-patch-release.md`.
     Quarantine(quarantine::QuarantineArgs),
+
+    /// CliSession emergency revocation.
+    ///
+    /// `cli-session revoke --token <JWT>` cuts exactly the session
+    /// that token names (reading `jti` + `exp` out of it locally);
+    /// `cli-session revoke-user <user_id>` cuts every session that
+    /// human holds. The second is the one that works when the device
+    /// is gone — nothing persists a live CliSession, so there is no
+    /// listing and no `jti` to look up. Both need an admin session
+    /// (service accounts are strictly non-admin, ADR 0038).
+    CliSession(cli_session::CliSessionArgs),
 
     /// Per-user admin reads.
     ///
@@ -147,6 +159,9 @@ pub async fn run(
         }
         AdminCommand::Quarantine(quarantine_args) => {
             run_quarantine(quarantine_args, output, cli_server, cli_token).await
+        }
+        AdminCommand::CliSession(cs_args) => {
+            run_cli_session(cs_args, output, cli_server, cli_token).await
         }
         AdminCommand::Users(users_args) => {
             run_users(users_args, output, cli_server, cli_token).await
@@ -302,6 +317,33 @@ async fn run_workers(
 
     let client = AkClient::new(&cfg)?;
     workers::run(client, args, output).await?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Dispatch for `admin cli-session`.
+///
+/// Mirrors `run_users` — loads config, builds the HTTP client, hands
+/// off to the `cli_session` module's per-subcommand dispatcher.
+async fn run_cli_session(
+    args: cli_session::CliSessionArgs,
+    output: OutputFormat,
+    cli_server: Option<String>,
+    cli_token: Option<String>,
+) -> anyhow::Result<std::process::ExitCode> {
+    use crate::client::AkClient;
+    use crate::config::load_effective_config;
+
+    let cfg = match load_effective_config(cli_server, cli_token) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hort-cli: config error: {e}");
+            eprintln!("Hint: run `hort-cli auth login` to set up credentials.");
+            return Ok(std::process::ExitCode::from(2));
+        }
+    };
+
+    let client = AkClient::new(&cfg)?;
+    cli_session::run(client, args, output).await?;
     Ok(std::process::ExitCode::SUCCESS)
 }
 

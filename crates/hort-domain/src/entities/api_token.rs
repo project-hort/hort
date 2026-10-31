@@ -39,6 +39,8 @@
 //! part — re-resolving user grants on every call — is the caller's
 //! responsibility; here we are pure.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -81,16 +83,55 @@ pub enum TokenKind {
 /// The cap a token carries — an upper bound on its effective permissions.
 ///
 /// - `permissions` is the typed subset of [`Permission`] the token is
-///   allowed to exercise.
+///   allowed to exercise. It is the cap's flat upper bound and stays
+///   meaningful on every cap shape: when `per_repository_permissions` is
+///   `Some`, `permissions` is the union of its values.
 /// - `repository_ids = None` means "inherit user grants" — the cap places
 ///   no per-repository restriction. `Some(vec![…])` locks the token to
 ///   exactly those repos. `Some(vec![])` is rejected at issuance but is
 ///   structurally allowed for forward-compat with `kind = CliSession`'s
 ///   transient empty-set state.
+/// - `per_repository_permissions = None` means "not a per-resource cap":
+///   the two fields above are the whole cap. This is every native-token
+///   (PAT / service-account / CLI-session) cap.
+///
+/// # Why a per-resource map and not just a narrower `repository_ids`
+///
+/// `permissions × repository_ids` is a **cross product**: it can say
+/// "`Read` and `Write`, on repos A and B", which authorises `Write` on B.
+/// It cannot say "`Write` on A, `Read` on B". A credential that was
+/// *issued* with exactly that asymmetric shape — an OCI
+/// Distribution-Spec bearer, whose `access[]` claim is an array of
+/// per-resource entries each carrying "the actions authorized on **this
+/// resource**" — therefore cannot be expressed by narrowing
+/// `repository_ids`, and folding it into one flat set hands the
+/// bearer the strongest action on every resource it names.
+/// `per_repository_permissions` is that asymmetric shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenCap {
     pub permissions: Vec<Permission>,
     pub repository_ids: Option<Vec<Uuid>>,
+    /// Per-repository action map — the actions the credential was issued
+    /// for, each bound to the repository it was issued against.
+    ///
+    /// `Some(map)` makes the cap **per-resource**: an action is permitted
+    /// on a repository only if that repository is a key AND the action is
+    /// in its value. A key that is absent is outside the cap, and a
+    /// `repository_id = None` (system-level) authorization is outside it
+    /// too — same reasoning as the `repository_ids` / `None` arm of
+    /// [`cap_allows_optional_repo`]: a credential bounded to named
+    /// resources has nothing to say about an operation that names none.
+    ///
+    /// The value is a set in first-seen order, mirroring `permissions`.
+    ///
+    /// **Granularity.** The key is a hort repository id, which is the
+    /// finest unit authorization has: every consume-side gate resolves a
+    /// repository and asks `authorize(…, Some(repo_id))`. A credential
+    /// issued for two differently-named resources that live in the *same*
+    /// repository therefore binds to the union of their actions — there
+    /// is nothing finer to enforce against. That is not a gap this field
+    /// opens; it is the granularity of the authorization model, named.
+    pub per_repository_permissions: Option<BTreeMap<Uuid, Vec<Permission>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +202,9 @@ pub struct ApiToken {
 /// 2. The token cap, if present, permits the action:
 ///    - `cap.permissions.contains(requested)` AND
 ///    - `cap.repository_ids` is `None` (no per-repo restriction) OR
-///      contains `repo`.
+///      contains `repo` AND
+///    - `cap.per_repository_permissions` is `None` (not a per-resource
+///      cap) OR binds `requested` to `repo` specifically.
 ///
 /// `token_cap = None` means an OIDC bearer / non-tokenised principal —
 /// no cap, only the user's grants gate access.
@@ -233,6 +276,21 @@ fn cap_allows(cap: Option<&TokenCap>, requested: Permission, repo: Uuid) -> bool
 ///   cannot authorize a system-level op; the cap explicitly bounds the
 ///   token to a finite set of repos and "no repo" is outside that set.
 ///
+/// On top of those, when `c.per_repository_permissions = Some(map)` the
+/// cap is **per-resource** and one further leg applies:
+///
+/// - `repository_id = Some(repo)` → allow iff `map` has `repo` as a key
+///   AND that key's actions contain `requested`. An absent key is
+///   outside the cap.
+/// - `repository_id = None` → **deny**, for the same reason the
+///   `repository_ids = Some(_)` / `None` arm denies: the credential is
+///   bounded to named resources and a system-level op names none.
+///
+/// The per-resource leg only ever **narrows** — it is a conjunct, so a
+/// cap carrying it can never allow something the flat legs denied, and a
+/// cap with `per_repository_permissions = None` evaluates exactly as it
+/// did before the field existed.
+///
 /// This is the same logic the [`effective_permission`] cap leg uses,
 /// extracted here so the AppContext-level [`RbacEvaluator::authorize`]
 /// can call it without materialising a synthetic `Vec<PermissionGrant>`
@@ -253,7 +311,7 @@ pub fn cap_allows_optional_repo(
             if !cap.permissions.contains(&requested) {
                 return false;
             }
-            match (&cap.repository_ids, repository_id) {
+            let repository_ids_leg = match (&cap.repository_ids, repository_id) {
                 // No per-repo restriction on the cap → allow on either
                 // a repo-scoped or a system-level op.
                 (None, _) => true,
@@ -261,6 +319,21 @@ pub fn cap_allows_optional_repo(
                 (Some(ids), Some(repo)) => ids.contains(&repo),
                 // Per-repo cap + system-level op → deny. The cap bounds
                 // the token to specific repos; "no repo" is outside it.
+                (Some(_), None) => false,
+            };
+            if !repository_ids_leg {
+                return false;
+            }
+            match (&cap.per_repository_permissions, repository_id) {
+                // Not a per-resource cap → this leg does not exist.
+                (None, _) => true,
+                // Per-resource cap + concrete repo → the action must be
+                // bound to THAT repo. An absent key is outside the cap:
+                // the credential was never issued anything on it.
+                (Some(per_repo), Some(repo)) => per_repo
+                    .get(&repo)
+                    .is_some_and(|actions| actions.contains(&requested)),
+                // Per-resource cap + system-level op → deny (see doc).
                 (Some(_), None) => false,
             }
         }
@@ -303,6 +376,7 @@ mod tests {
         TokenCap {
             permissions: perms,
             repository_ids: repos,
+            per_repository_permissions: None,
         }
     }
 
@@ -884,5 +958,193 @@ mod tests {
             cap_allows(None, Permission::Read, repo_a()),
             cap_allows_optional_repo(None, Permission::Read, Some(repo_a()))
         );
+    }
+
+    // -- Per-resource cap (`per_repository_permissions`) ------------------
+
+    /// Build a per-resource cap. `permissions` is derived as the union of
+    /// the map's values, which is the shape the only producer
+    /// (`hort_app::use_cases::oci_token_exchange_use_case::synthesize_principal_from_jwt`)
+    /// builds.
+    fn per_resource_cap(bindings: Vec<(Uuid, Vec<Permission>)>) -> TokenCap {
+        let mut permissions: Vec<Permission> = Vec::new();
+        for (_repo, perms) in &bindings {
+            for p in perms {
+                if !permissions.contains(p) {
+                    permissions.push(*p);
+                }
+            }
+        }
+        TokenCap {
+            permissions,
+            repository_ids: None,
+            per_repository_permissions: Some(bindings.into_iter().collect()),
+        }
+    }
+
+    /// The finding, at the cap leg: a credential issued `Write` on A and
+    /// `Read` on B authorises the write on A, the read on B, and NOT the
+    /// write on B. A flat `permissions: [Read, Write]` cap with no
+    /// repository restriction — which is what the union produced —
+    /// allows all three.
+    #[test]
+    fn per_resource_cap_binds_each_action_to_its_own_repo() {
+        let c = per_resource_cap(vec![
+            (repo_a(), vec![Permission::Read, Permission::Write]),
+            (repo_b(), vec![Permission::Read]),
+        ]);
+        assert!(
+            cap_allows_optional_repo(Some(&c), Permission::Write, Some(repo_a())),
+            "write was issued on A and must still be permitted there"
+        );
+        assert!(
+            cap_allows_optional_repo(Some(&c), Permission::Read, Some(repo_b())),
+            "read was issued on B and must still be permitted there"
+        );
+        assert!(
+            !cap_allows_optional_repo(Some(&c), Permission::Write, Some(repo_b())),
+            "write was issued on A, not on B — the cap must not carry it across"
+        );
+        // Control: the flat cap the union used to produce permits it.
+        let flat = cap(vec![Permission::Read, Permission::Write], None);
+        assert!(cap_allows_optional_repo(
+            Some(&flat),
+            Permission::Write,
+            Some(repo_b())
+        ));
+    }
+
+    /// A repository that is not a key in the map is outside the cap —
+    /// the credential was issued nothing on it.
+    #[test]
+    fn per_resource_cap_denies_a_repo_it_does_not_name() {
+        let c = per_resource_cap(vec![(repo_a(), vec![Permission::Read])]);
+        assert!(!cap_allows_optional_repo(
+            Some(&c),
+            Permission::Read,
+            Some(repo_b())
+        ));
+    }
+
+    /// A system-level authorization (`repository_id = None`) against a
+    /// per-resource cap denies, for the same reason the
+    /// `repository_ids = Some(_)` / `None` arm denies.
+    #[test]
+    fn per_resource_cap_denies_a_system_level_op() {
+        let c = per_resource_cap(vec![(repo_a(), vec![Permission::Read])]);
+        assert!(!cap_allows_optional_repo(Some(&c), Permission::Read, None));
+    }
+
+    /// An empty map is a credential that was granted nothing: every
+    /// repository is absent, so nothing is permitted.
+    #[test]
+    fn per_resource_cap_with_an_empty_map_permits_nothing() {
+        let c = TokenCap {
+            permissions: vec![Permission::Read, Permission::Write],
+            repository_ids: None,
+            per_repository_permissions: Some(BTreeMap::new()),
+        };
+        assert!(!cap_allows_optional_repo(
+            Some(&c),
+            Permission::Read,
+            Some(repo_a())
+        ));
+        assert!(!cap_allows_optional_repo(Some(&c), Permission::Read, None));
+    }
+
+    /// The per-resource leg only ever narrows: it is a conjunct with the
+    /// `repository_ids` leg, never a replacement for it. Asserted in
+    /// both directions, because either leg denying has to be enough.
+    #[test]
+    fn per_resource_leg_is_a_conjunct_not_a_replacement() {
+        // `repository_ids` excludes A while the per-repo map permits it:
+        // the AND must deny.
+        let mut ids_deny = per_resource_cap(vec![(repo_a(), vec![Permission::Read])]);
+        ids_deny.repository_ids = Some(vec![repo_b()]);
+        assert!(!cap_allows_optional_repo(
+            Some(&ids_deny),
+            Permission::Read,
+            Some(repo_a())
+        ));
+        // `repository_ids` admits A while the per-repo map does not name
+        // it: the AND must deny on the other leg.
+        let mut map_deny = per_resource_cap(vec![(repo_b(), vec![Permission::Read])]);
+        map_deny.repository_ids = Some(vec![repo_a(), repo_b()]);
+        assert!(!cap_allows_optional_repo(
+            Some(&map_deny),
+            Permission::Read,
+            Some(repo_a())
+        ));
+    }
+
+    /// Counter-test for the native-token (PAT / service-account /
+    /// CLI-session) path: with `per_repository_permissions = None` the
+    /// cap leg answers exactly as it did before the field existed, for
+    /// all four `(repository_ids, repository_id)` combinations the
+    /// function's doc enumerates.
+    #[test]
+    fn pat_path_cap_leg_is_unchanged_when_the_field_is_none() {
+        // (cap, requested, repository_id, expected)
+        let scenarios: Vec<(TokenCap, Permission, Option<Uuid>, bool)> = vec![
+            // repository_ids = None, repository_id = Some → allow.
+            (
+                cap(vec![Permission::Read], None),
+                Permission::Read,
+                Some(repo_a()),
+                true,
+            ),
+            // repository_ids = None, repository_id = None → allow.
+            (
+                cap(vec![Permission::Read], None),
+                Permission::Read,
+                None,
+                true,
+            ),
+            // repository_ids = Some(ids), repository_id = Some(member).
+            (
+                cap(vec![Permission::Read], Some(vec![repo_a()])),
+                Permission::Read,
+                Some(repo_a()),
+                true,
+            ),
+            // repository_ids = Some(ids), repository_id = Some(non-member).
+            (
+                cap(vec![Permission::Read], Some(vec![repo_a()])),
+                Permission::Read,
+                Some(repo_b()),
+                false,
+            ),
+            // repository_ids = Some(_), repository_id = None → deny.
+            (
+                cap(vec![Permission::Read], Some(vec![repo_a()])),
+                Permission::Read,
+                None,
+                false,
+            ),
+            // Permission not in the cap → deny on either repo shape.
+            (
+                cap(vec![Permission::Read], None),
+                Permission::Write,
+                Some(repo_a()),
+                false,
+            ),
+            (
+                cap(vec![Permission::Read], None),
+                Permission::Write,
+                None,
+                false,
+            ),
+        ];
+        for (c, perm, repo, expected) in scenarios {
+            assert!(
+                c.per_repository_permissions.is_none(),
+                "fixture must build a non-per-resource cap"
+            );
+            assert_eq!(
+                cap_allows_optional_repo(Some(&c), perm, repo),
+                expected,
+                "native-token cap leg changed for {c:?} {perm:?} {repo:?}"
+            );
+        }
     }
 }

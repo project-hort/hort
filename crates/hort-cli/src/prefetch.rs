@@ -12,10 +12,12 @@
 //! - `skipped_already_held` — HORT already holds this `(package, version)`
 //!   at `Released` ∨ `Quarantined` ∨ `QuarantinedAwaitingRelease`; the
 //!   ingest is a no-op.
-//! - `rejected_packages` — terminal HORT status (`ScanRejected` ∨
-//!   `ScanIndeterminate`) for the requested version; re-prefetch refused —
-//!   operator uses curator-waive (see
-//!   `docs/architecture/how-to/curator-workflow.md`) or admin override.
+//! - `rejected_packages` — the coordinate is refused. Either a terminal
+//!   HORT status (`ScanRejected` ∨ `ScanIndeterminate`) for the
+//!   requested version, where the operator uses curator-waive (see
+//!   `docs/architecture/how-to/curator-workflow.md`) or admin override;
+//!   or `NameOwnedByMember`, where a member of the target virtual
+//!   repository owns the name and no upstream copy is warmed under it.
 //! - `failed` — per-item upstream-fetch / parse / network failure
 //!   (per `PrefetchItemError` taxonomy).
 //!
@@ -125,6 +127,9 @@ pub struct RejectedItemDto {
 pub enum RejectionReasonDto {
     ScanRejected,
     ScanIndeterminate,
+    /// A non-proxy member of the target virtual repository owns the
+    /// requested name, so no upstream copy is warmed under it.
+    NameOwnedByMember,
 }
 
 /// Mirror of `hort_domain::entities::discovery::FailedItem`.
@@ -437,6 +442,7 @@ fn format_rejection_reason(r: RejectionReasonDto) -> String {
     match r {
         RejectionReasonDto::ScanRejected => "scan-rejected".to_string(),
         RejectionReasonDto::ScanIndeterminate => "scan-indeterminate".to_string(),
+        RejectionReasonDto::NameOwnedByMember => "name-owned-by-member".to_string(),
     }
 }
 
@@ -656,7 +662,7 @@ mod tests {
     // ----- Label formatters — every arm ------------------------------------
 
     #[test]
-    fn format_rejection_reason_both_arms() {
+    fn format_rejection_reason_every_arm() {
         assert_eq!(
             format_rejection_reason(RejectionReasonDto::ScanRejected),
             "scan-rejected"
@@ -664,6 +670,10 @@ mod tests {
         assert_eq!(
             format_rejection_reason(RejectionReasonDto::ScanIndeterminate),
             "scan-indeterminate"
+        );
+        assert_eq!(
+            format_rejection_reason(RejectionReasonDto::NameOwnedByMember),
+            "name-owned-by-member"
         );
     }
 

@@ -288,6 +288,76 @@ struct ScanSubject {
     coords: ArtifactCoords,
 }
 
+/// What the SBOM step produced — three facts rather than one `Option`,
+/// because the scan axis reads them differently.
+///
+/// A bare `Option<Sbom>` merged "this format declares no dependencies"
+/// with "the declaration could not be read", and a backend whose entire
+/// input is the BOM ([`EvidenceBasis::SuppliedSbom`]) is handed only
+/// that `Option`: it answers `NotApplicable` to both, which does not
+/// gate. On a policy where such a backend is the only one configured,
+/// the BOM **is** the subject, so an unreadable declaration recorded
+/// `ScanCompleted(0, not_applicable)` over an artifact nothing had
+/// examined. The orchestrator performed the extraction and is the only
+/// place that knows which happened, so the distinction is kept here and
+/// spent in `run_scan`'s abstention arm.
+///
+/// [`EvidenceBasis::SuppliedSbom`]: hort_domain::ports::scanner::EvidenceBasis::SuppliedSbom
+enum SbomExtraction {
+    /// A BOM came out of the handler.
+    Extracted(Sbom),
+    /// No BOM, for the reason carried.
+    Absent(SbomAbsence),
+}
+
+/// Why no BOM came out of the SBOM step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SbomAbsence {
+    /// A completed fact about the artifact: no handler is registered for
+    /// the format, or the handler declares these bytes carry no
+    /// dependency information. Nothing was expected, so nothing went
+    /// unassessed.
+    NotDeclared,
+    /// A dependency declaration was expected and could not be read: the
+    /// handler errored over the payload, or the extraction task did not
+    /// complete. Deterministic — the same bytes read the same way on the
+    /// next attempt, so a backend that had only this to go on earns a
+    /// terminal no-verdict rather than a retry.
+    Unreadable,
+    /// The stored payload could not be reached at all. A property of the
+    /// machine rather than of the artifact, and it may clear — so a
+    /// backend that had only this to go on earns the scan job's existing
+    /// attempt budget, the same answer the adapters' transient
+    /// composition refusal takes.
+    Unavailable,
+}
+
+impl SbomExtraction {
+    /// The BOM, for the consumers that only need "is there one".
+    fn sbom(&self) -> Option<&Sbom> {
+        match self {
+            Self::Extracted(sbom) => Some(sbom),
+            Self::Absent(_) => None,
+        }
+    }
+
+    /// The BOM, by value, for the outcome that carries it onward.
+    fn into_sbom(self) -> Option<Sbom> {
+        match self {
+            Self::Extracted(sbom) => Some(sbom),
+            Self::Absent(_) => None,
+        }
+    }
+
+    /// Why no BOM exists, or `None` when one does.
+    fn absence(&self) -> Option<SbomAbsence> {
+        match self {
+            Self::Extracted(_) => None,
+            Self::Absent(why) => Some(*why),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Use case
 // ---------------------------------------------------------------------------
@@ -510,14 +580,17 @@ impl ScanOrchestrationUseCase {
         // constituent.
         let composite_verdict = composite_verdict_mode_of(policy.as_ref());
 
-        // Step 3-5: extract SBOM via the format handler (best-effort).
+        // Step 3-5: extract SBOM via the format handler (best-effort for
+        // the run, but the *reason* no BOM came out is kept — see
+        // `SbomExtraction` and the abstention arm below).
         let subject = self.subject_for_artifact(&artifact).await?;
-        let sbom = self
+        let extraction = self
             .try_extract_sbom(&artifact, &subject, &job.format)
             .await;
+        let sbom_absence = extraction.absence();
 
         let relations = ComponentRelations {
-            sbom: sbom.as_ref(),
+            sbom: extraction.sbom(),
             payload_contains_components: handler.is_none_or(|h| h.payload_contains_components()),
             format: &job.format,
         };
@@ -528,7 +601,7 @@ impl ScanOrchestrationUseCase {
         // itself, e.g. lodash@4.17.20) and every dependency in
         // `components`. Iterating only over `components` is the bug
         // that would leave leaf packages undetected.
-        let advisory_findings: Vec<Finding> = match sbom.as_ref() {
+        let advisory_findings: Vec<Finding> = match extraction.sbom() {
             Some(s) => {
                 let all = s.all_components_owned();
                 match self.advisory.query(&all).await {
@@ -627,7 +700,7 @@ impl ScanOrchestrationUseCase {
                 continue;
             }
             let started = Instant::now();
-            let scan_result = scanner.scan(&target, sbom.as_ref()).await;
+            let scan_result = scanner.scan(&target, extraction.sbom()).await;
             observe_scan_duration(backend, started.elapsed());
             match scan_result {
                 Ok(ScanAnalysis::Analysed(findings)) => {
@@ -650,6 +723,60 @@ impl ScanOrchestrationUseCase {
                     // release authority an unexamined artifact must not
                     // earn (ADR 0007).
                     //
+                    // **First, read the abstention against what this run
+                    // actually handed the backend.** A backend whose
+                    // entire input is the supplied BOM
+                    // (`EvidenceBasis::SuppliedSbom`) receives an
+                    // `Option` and nothing else, so its `NotApplicable`
+                    // means "I was given no component list" — which is
+                    // the absence of a surface only when the handler
+                    // *declared* there is none. Where the declaration
+                    // existed and could not be read, the surface was
+                    // expected and went unassessed, and where the
+                    // payload could not be reached the machine failed
+                    // rather than the artifact. The extraction step
+                    // cannot make this call (a payload-reading backend
+                    // on the same policy assesses the artifact
+                    // regardless, and must not lose its scan to a CAS
+                    // hiccup) and the backend cannot see it, so it is
+                    // made here, per backend, from the two facts only
+                    // this scope holds.
+                    let why = match (scanner.evidence_basis(), why, sbom_absence) {
+                        (
+                            EvidenceBasis::SuppliedSbom,
+                            NotAnalysable::NotApplicable,
+                            Some(SbomAbsence::Unreadable),
+                        ) => NotAnalysable::UnusableArchive,
+                        (
+                            EvidenceBasis::SuppliedSbom,
+                            NotAnalysable::NotApplicable,
+                            Some(SbomAbsence::Unavailable),
+                        ) => {
+                            // Counted as a backend failure, not an
+                            // abstention: the condition may clear, and
+                            // `Failed` is the path this orchestrator
+                            // already uses for a retryable scan failure
+                            // — the job's own `max_attempts` bounds it,
+                            // and exhausting the budget lands on the
+                            // fail-closed terminal arm. A backend that
+                            // succeeded on this run still carries the
+                            // outcome, so a payload-reading sibling's
+                            // verdict is not thrown away.
+                            tracing::warn!(
+                                artifact_id = %artifact.id,
+                                scanner = backend,
+                                format = %job.format,
+                                kind = kind.as_str(),
+                                "this backend's whole input is the artifact's component list \
+                                 and the stored payload it is derived from could not be read \
+                                 — no verdict from this backend on this attempt",
+                            );
+                            total_failed += 1;
+                            continue;
+                        }
+                        (_, why, _) => why,
+                    };
+
                     // The log level follows `gates_release`, because the
                     // two abstention classes ask different things of an
                     // operator. An unassessed *expected* surface is
@@ -764,7 +891,7 @@ impl ScanOrchestrationUseCase {
             coords: &subject.coords,
             kind,
             backends: &backends,
-            sbom: sbom.as_ref(),
+            sbom: extraction.sbom(),
             observations: &self.observations,
             policy: policy.as_ref(),
             exclusions: composite_exclusions.as_deref(),
@@ -964,7 +1091,7 @@ impl ScanOrchestrationUseCase {
                     kind,
                     findings: Vec::new(),
                     assessment: ScanAssessment::NotApplicable,
-                    sbom,
+                    sbom: extraction.into_sbom(),
                 });
             }
 
@@ -1019,7 +1146,7 @@ impl ScanOrchestrationUseCase {
             kind,
             findings: merged,
             assessment: ScanAssessment::Analysed,
-            sbom,
+            sbom: extraction.into_sbom(),
         })
     }
 
@@ -1368,22 +1495,31 @@ impl ScanOrchestrationUseCase {
     /// both surface to operators as "this format does not produce an
     /// SBOM" with no actionable distinction.
     ///
-    /// **Fail-soft.** Nothing here can fail the scan run. A storage read
-    /// that fails degrades to the same no-SBOM path a format with no
-    /// handler takes, with the metric saying which happened. ADR 0007's
-    /// fail-closed rule governs release *authority*; SBOM enrichment is
-    /// not authority, and letting a CAS hiccup abort a scan would trade a
-    /// thinner BOM for no scan at all.
+    /// **Fail-soft, and that is a statement about this step rather than
+    /// about the run.** Nothing here can fail the scan: a storage read
+    /// that fails degrades to the no-SBOM path a format with no handler
+    /// takes, with the metric saying which happened, because letting a
+    /// CAS hiccup abort a scan a payload-reading backend could have
+    /// performed would trade a thinner BOM for no scan at all.
+    ///
+    /// What it must not do is *erase the reason*. ADR 0007's fail-closed
+    /// rule governs release authority, and for a backend whose entire
+    /// input is this BOM the BOM **is** the authority — so an absence
+    /// the handler declared and an absence the machine caused are
+    /// different facts, and the return type keeps them apart
+    /// ([`SbomExtraction`]). Which of them gates is decided in
+    /// `run_scan`, where the configured backends are known; nothing is
+    /// decided here.
     async fn try_extract_sbom(
         &self,
         artifact: &Artifact,
         subject: &ScanSubject,
         format_key: &str,
-    ) -> Option<Sbom> {
+    ) -> SbomExtraction {
         let Some(handler) = self.handlers.get(format_key) else {
             emit_sbom_extraction(format_key, SbomExtractionResult::UnsupportedFormat);
             emit_sbom_resolution(format_key, SbomResolutionResult::NotApplicable);
-            return None;
+            return SbomExtraction::Absent(SbomAbsence::NotDeclared);
         };
 
         if handler.payload_sbom().is_some() {
@@ -1405,11 +1541,11 @@ impl ScanOrchestrationUseCase {
         ) {
             Ok(Some(sbom)) => {
                 emit_sbom_extraction(format_key, SbomExtractionResult::Success);
-                Some(sbom)
+                SbomExtraction::Extracted(sbom)
             }
             Ok(None) => {
                 emit_sbom_extraction(format_key, SbomExtractionResult::UnsupportedFormat);
-                None
+                SbomExtraction::Absent(SbomAbsence::NotDeclared)
             }
             Err(e) => {
                 emit_sbom_extraction(format_key, SbomExtractionResult::ParseError);
@@ -1418,7 +1554,7 @@ impl ScanOrchestrationUseCase {
                     error = %e,
                     "extract_sbom failed; proceeding with no SBOM",
                 );
-                None
+                SbomExtraction::Absent(SbomAbsence::Unreadable)
             }
         }
     }
@@ -1442,7 +1578,7 @@ impl ScanOrchestrationUseCase {
         artifact: &Artifact,
         coords: &ArtifactCoords,
         format_key: &str,
-    ) -> Option<Sbom> {
+    ) -> SbomExtraction {
         let stream = match self.storage.get(&artifact.sha256_checksum).await {
             Ok(stream) => stream,
             Err(e) => {
@@ -1454,7 +1590,7 @@ impl ScanOrchestrationUseCase {
                 );
                 emit_sbom_extraction(format_key, SbomExtractionResult::PayloadUnavailable);
                 emit_sbom_resolution(format_key, SbomResolutionResult::PayloadUnavailable);
-                return None;
+                return SbomExtraction::Absent(SbomAbsence::Unavailable);
             }
         };
 
@@ -1480,7 +1616,9 @@ impl ScanOrchestrationUseCase {
         // A handler error and a panicked extraction task are the same
         // fact to an operator — the payload was reachable and no usable
         // component list came out of it — so they are normalised to one
-        // reason string and share one degradation arm.
+        // reason string and share one degradation arm. Both are
+        // deterministic over the same bytes, which is what puts them on
+        // `Unreadable` rather than on the retryable arm above.
         let extraction = match joined {
             Ok(inner) => inner.map_err(|e| e.to_string()),
             Err(join) => Err(format!("extraction task did not complete: {join}")),
@@ -1496,7 +1634,7 @@ impl ScanOrchestrationUseCase {
                 );
                 emit_sbom_extraction(format_key, SbomExtractionResult::ParseError);
                 emit_sbom_resolution(format_key, SbomResolutionResult::UnusableLockfile);
-                return None;
+                return SbomExtraction::Absent(SbomAbsence::Unreadable);
             }
         };
 
@@ -1507,11 +1645,14 @@ impl ScanOrchestrationUseCase {
         match extraction.sbom {
             Some(sbom) => {
                 emit_sbom_extraction(format_key, SbomExtractionResult::Success);
-                Some(sbom)
+                SbomExtraction::Extracted(sbom)
             }
+            // The handler reached the payload and declares it carries no
+            // dependency information — the same answer an opaque format
+            // gives, and a completed fact rather than a failure.
             None => {
                 emit_sbom_extraction(format_key, SbomExtractionResult::UnsupportedFormat);
-                None
+                SbomExtraction::Absent(SbomAbsence::NotDeclared)
             }
         }
     }

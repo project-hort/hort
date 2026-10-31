@@ -311,6 +311,24 @@ Authority: `preview` needs only the ordinary admin-task permission;
 which the `--admin` session above carries. Nothing here introduces a new
 permission, claim, or token lifetime.
 
+**That authority is checked twice: once when the job is accepted, and
+again when the worker is about to run it.** A destructive job is queued,
+not executed inline, so the second check reads the live authority of the
+user the job was enqueued under. If it was revoked in between — the
+account demoted or deactivated, or its `admin_task_invoke` grant removed
+— the handler is never called, nothing is destroyed, and the job becomes
+a terminal `failed` row whose `last_error` begins `destructive task
+refused at execution`. It reaches a scheduled run the same way, where a
+deployment drives a destructive kind on a schedule: the CronJob invokes
+through this same surface, so revoking the identity it authenticates as
+stops scheduled retention too. See
+[`enable-admin-task-cronjobs.md`](deploy/enable-admin-task-cronjobs.md)
+§5.1 for the operator-facing detail. One consequence worth knowing
+before you grant: the claim is resolved from your IdP at login and is not
+persisted, so only an `admin` requester's destructive authority survives
+the wait — a non-admin holder of a `task:destructive` `ClaimMapping` can
+submit a job that is then refused at execution.
+
 Exit codes worth scripting against: `0` ran and the result was read, `3`
 the job outlived `--wait-timeout` (the job id is printed and nothing is
 reported about its outcome), `4` the operator declined and nothing was
@@ -381,15 +399,54 @@ per-repo grant gaps. Try `hort-cli auth login --admin` first; if the
 operation still fails, the underlying problem is a missing
 `PermissionGrant` rather than a missing scope.
 
-### Active sessions never expire on a single laptop
+### Cutting a CLI session off before it expires
 
 Admin authority revocation propagates to the user's grants but not to
 already-issued tokens until they expire. Bounded 15 min lifetimes make
 this near-instant: a revoked admin's existing session is gone within
-15 minutes. If you need immediate revocation (e.g. laptop theft), use
-`DELETE /api/v1/users/me/tokens/:id` — both the access token and
-(once Phase 2 lands) the refresh token are in the same `api_tokens`
-table.
+15 minutes.
+
+When 15 minutes is too long — a stolen laptop, a token pasted into the
+wrong window — revoke the session directly. A CliSession is a signed
+JWT with **no `api_tokens` row**, so `DELETE /api/v1/users/me/tokens/:id`
+does not reach one (it answers `404 token_not_found`), and there is
+nothing to list: hort keeps no registry of live sessions. Use one of
+the two admin-gated revocation surfaces instead.
+
+**You have the token** (pasted into a ticket, found in a log) — cut
+exactly that session and leave the person's other sessions working:
+
+```bash
+# The token is read locally; only its `jti` and `exp` are sent.
+# `--token -` keeps the credential out of shell history.
+pbpaste | hort-cli admin cli-session revoke --token -
+```
+
+**You do not have the token** (the device is gone) — cut every session
+that human holds:
+
+```bash
+hort-cli admin cli-session revoke-user <user_id>
+```
+
+This raises a cutoff: every CliSession for that user issued at or
+before now is refused, and the cutoff lapses one session lifetime
+later, by which point none of them could still be live. It is **not**
+an account lockout — the user runs `hort-cli auth login` again and the
+new session works immediately. To stop them logging back in at all,
+deactivate the user; that is a separate, deliberate action.
+
+Both commands need an admin session (`hort-cli auth login --admin`).
+Service accounts are strictly non-admin
+([ADR 0038](../../adr/0038-admin-identity-model.md)), so neither can be
+driven from a pipeline. The underlying routes are
+`POST /api/v1/admin/cli-sessions/revoke` and
+`POST /api/v1/admin/users/{user_id}/cli-sessions/revoke`; both live on
+the control plane, so they answer on `HORT_CONTROL_BIND` when the split
+is on.
+
+`DELETE /api/v1/users/me/tokens/:id` remains the self-revoke path for
+PATs and service-account tokens, which *do* have rows.
 
 ---
 

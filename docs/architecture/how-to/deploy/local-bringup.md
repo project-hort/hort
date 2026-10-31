@@ -408,7 +408,7 @@ canonical cadence (matches the Helm chart's CronJob defaults — see
 | `cron-rescan-tick` | `*-*-* 02:00:00` (nightly) | Re-scans artifacts against current advisory DB |
 | `advisory-watch-tick` | `*-*-* 03:00:00` (nightly) | Pulls fresh advisory feed |
 
-> **Destructive tasks** (`eventstore-archive`, `retention-purge`, `retention-evaluate`) are **not** set up as unattended timers — an `admin_task_invoke` svc-token cannot run them (they need the `task:destructive` claim — see §5.2). Run them by hand with the bootstrap-session admin token (§5.1), or track the approval-workflow follow-on (GitLab issue #2).
+> **Destructive tasks** (`eventstore-archive`, `retention-purge`, `retention-evaluate`) are **not** set up as unattended timers — an `admin_task_invoke` svc-token cannot run them (they need the `task:destructive` claim — see §5.2). Run them by hand with the bootstrap-session admin token (§5.1), or track the approval-workflow follow-on (GitLab issue #2). The invoking identity's authority is re-checked again when the worker runs the job, so revoking it (deactivating the `bootstrap-admin` user, or clearing its `is_admin`) also stops the destructive jobs it already queued — they land as terminal `failed` rows whose `last_error` begins `destructive task refused at execution`.
 
 Enable:
 

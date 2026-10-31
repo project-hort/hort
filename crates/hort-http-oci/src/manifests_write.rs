@@ -146,8 +146,9 @@ use super::name::validate_oci_name;
 ///
 /// Both single-image manifests and multi-arch indexes / manifest lists
 /// are accepted. The blob/child parse branches on the media type: an
-/// index / list media type routes to [`index_child_digests`] (child
-/// **manifest** resolution); every other media type routes to the
+/// index / list media type routes to
+/// [`parse_index_children_for_admission`] (child **manifest**
+/// resolution); every other media type routes to the
 /// single-image [`parse_manifest_blobs`] (`config` + `layers[]`).
 const SUPPORTED_MANIFEST_MEDIA_TYPES: &[&str] = &[
     "application/vnd.oci.image.manifest.v1+json",
@@ -844,7 +845,14 @@ async fn run_manifest_ingest(
 ///   rejection.
 /// - Single-image manifest: the unchanged `config` + `layers[]` parse.
 ///
-/// On either path a parse failure lands as `MANIFEST_INVALID`.
+/// A single-image parse failure lands as `MANIFEST_INVALID`. The index path
+/// picks its own code: an index child whose digest matches the descriptor
+/// grammar but names an algorithm hort cannot address is a valid index this
+/// registry cannot store, so it answers `UNSUPPORTED` rather than
+/// `MANIFEST_INVALID` — see [`parse_index_children_for_admission`]. That is
+/// why this function forwards the index branch's error instead of wrapping
+/// every failure in one envelope: wrapping is how the two answers used to
+/// collapse into one.
 /// `media_type_is_index` was computed up front (declared-vs-shape
 /// cross-check); reused here to dispatch the blob/child parse.
 ///
@@ -864,21 +872,18 @@ fn parse_referenced_blobs(
     manifest_digest: &ContentHash,
 ) -> Result<Vec<ReferencedBlob>, Box<Response>> {
     let result = if media_type_is_index {
-        parse_index_children(body_bytes)
+        parse_index_children_for_admission(body_bytes)
     } else {
-        parse_manifest_blobs(parsed_manifest)
+        parse_manifest_blobs(parsed_manifest).map_err(|detail| OciError::ManifestInvalid {
+            detail: Some(detail),
+        })
     };
-    result.map_err(|detail| {
+    result.map_err(|err| {
         tracing::warn!(
             manifest_digest = %manifest_digest,
             "manifest parse failed pre-ingest; nothing minted"
         );
-        Box::new(
-            OciError::ManifestInvalid {
-                detail: Some(detail),
-            }
-            .into_response(),
-        )
+        Box::new(err.into_response())
     })
 }
 
@@ -1287,7 +1292,7 @@ pub(crate) fn membership_claims(
     referenced
         .iter()
         .map(|blob| match blob.role {
-            BlobRole::ChildManifest => ContentReferenceClaim {
+            BlobRole::ChildManifest { .. } => ContentReferenceClaim {
                 target_content_hash: blob.hash.clone(),
                 kind: "oci_index_member".into(),
                 metadata: serde_json::json!({
@@ -1793,7 +1798,25 @@ pub(crate) enum BlobRole {
     /// not attached as a group member — the index lands as a plain
     /// primary `manifest` member; the index→child linkage is an
     /// `oci_index_member` content-reference edge, not a group role.
-    ChildManifest,
+    ///
+    /// **Existence is not identity**, which is why this variant carries
+    /// data and the other two do not: a present row is also held against
+    /// what the index's descriptor said about it. The declared `size` lives
+    /// on the variant rather than beside `role` so there is no field that
+    /// is meaningful for one role and inert for the others — the check site
+    /// gets the value by destructuring the only role that has one.
+    ChildManifest {
+        /// Zero-based slot in the index's `manifests[]`. Carried so a refusal
+        /// over this child names `manifests[N]` — the same thing the parse
+        /// refusals name, and for the same reason: it is the only name for a
+        /// descriptor that is not a reflection of what the declarant wrote.
+        position: usize,
+        /// The descriptor's declared `size` in bytes, when it declared one
+        /// readable as an `i64`. `None` is a descriptor that stated nothing
+        /// to compare (`size` is REQUIRED by the image spec, so this is a
+        /// non-conformant child), never "the sizes agree".
+        declared_size: Option<i64>,
+    },
 }
 
 /// Parse the single-image manifest shape:
@@ -1886,36 +1909,149 @@ pub(crate) fn parse_manifest_blobs(
 /// }
 /// ```
 ///
-/// Delegates the JSON parse + bound + sha256-only filtering to the domain
-/// helper [`index_child_digests`](hort_domain::oci::index_child_digests):
-/// a non-sha256 / malformed child digest is skipped, and an index
-/// declaring more than the domain cap is a
+/// Delegates the JSON parse + bound + descriptor classification to the
+/// domain helper
+/// [`index_child_descriptors`](hort_domain::oci::index_child_descriptors).
+/// An index declaring more than the domain cap is a
 /// [`DomainError::Validation`](hort_domain::error::DomainError::Validation).
 ///
-/// Each resolved child becomes a [`ReferencedBlob`] with role
+/// Each child becomes a [`ReferencedBlob`] with role
 /// [`BlobRole::ChildManifest`], so the shared [`resolve_referenced_blobs`]
 /// same-repo existence check treats a missing child exactly like a missing
 /// layer — a `MANIFEST_BLOB_UNKNOWN`. Clients push the platform child
 /// manifests before the index, so an unresolved child is the expected
-/// out-of-order case, not a hard error.
+/// out-of-order case, not a hard error. The descriptor's declared `size`
+/// rides along on the role, because existence alone is not identity — see
+/// [`resolve_referenced_blobs`].
 ///
-/// Error shape mirrors [`parse_manifest_blobs`]: an `Err(serde_json::Value)`
-/// carrying the `detail` object for a 400 `MANIFEST_INVALID`. An over-cap
-/// index (the domain `Validation`) maps here to the same envelope the
-/// single-image over-cap rejection produces.
-pub(crate) fn parse_index_children(body: &[u8]) -> Result<Vec<ReferencedBlob>, serde_json::Value> {
-    let children = hort_domain::oci::index_child_digests(body).map_err(|e| {
+/// # A child with no usable digest is a refusal, not a skip
+///
+/// This parse used to hand the domain's bare-hash projection straight
+/// through, which meant a child descriptor with **no `digest`**, a
+/// **non-`sha256` algorithm** or **malformed hex** simply was not in the
+/// list: the index was admitted with a `201` and one graph edge fewer than
+/// it claimed. `digest` is a REQUIRED property of an OCI Content
+/// Descriptor, so such an entry does not describe a child this registry
+/// failed to resolve — it is an index that does not say what it claims to
+/// say, and the admission gate refuses it.
+///
+/// Which refusal depends on the descriptor, and the spec draws the line:
+/// an unrecognised **algorithm** "SHOULD pass validation" if it matches the
+/// digest grammar, so `sha512:<hex>` is a *valid* index naming content
+/// hort's CAS keyspace cannot address — [`OciError::Unsupported`]
+/// (`UNSUPPORTED`). A digest matching no grammar, or an absent one, is a
+/// malformed manifest — [`OciError::ManifestInvalid`] (`MANIFEST_INVALID`).
+/// This is the same three-way split [`parse_digest`] applies to a
+/// request-line digest in this crate; the classification itself is the
+/// domain's ([`DescriptorProblem`]), because the projection that reads the
+/// field lives there and `hort-app`'s readers of stored indexes need the
+/// same vocabulary (ADR 0008 — nothing in `hort-domain` or `hort-app` can
+/// reach into this crate for it).
+///
+/// # Never-echo
+///
+/// Neither refusal reflects any part of the declaration — not the digest,
+/// not the algorithm, not an inner message. All three are
+/// attacker-controlled manifest-JSON content and reflecting them in a
+/// response body is a response-reflection vector (the contract
+/// [`parse_blob_digest`] and [`parse_digest`] record). What the client gets
+/// is a constant reason plus `manifests[N]`, hort's own zero-based slot
+/// number, so a publisher is not left searching for which child was
+/// refused. The declaration itself goes to `tracing` server-side.
+pub(crate) fn parse_index_children_for_admission(
+    body: &[u8],
+) -> Result<Vec<ReferencedBlob>, OciError> {
+    let declared =
+        hort_domain::oci::index_child_descriptors(body).map_err(|e| OciError::ManifestInvalid {
+            detail: Some(serde_json::json!({
+                "reason": format!("invalid image index: {e}"),
+            })),
+        })?;
+
+    let children = declared.into_all_declared().map_err(|fault| {
+        tracing::debug!(
+            child = %fault,
+            "OCI image index declares a child whose descriptor names no addressable content"
+        );
+        let descriptor = format!("manifests[{}]", fault.position);
+        if fault.problem.is_well_formed_but_unsupported() {
+            // A valid index this registry cannot store: the descriptor's
+            // digest complies with the spec grammar and names an algorithm
+            // outside hort's CAS keyspace. `UNSUPPORTED` carries no
+            // `detail`, so the slot rides in the message — which stays a
+            // constant plus hort's own integer.
+            OciError::Unsupported {
+                message: format!("{UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE} in {descriptor}"),
+            }
+        } else {
+            OciError::ManifestInvalid {
+                detail: Some(serde_json::json!({
+                    "reason": "image index child descriptor does not name addressable content",
+                    "descriptor": descriptor,
+                })),
+            }
+        }
+    })?;
+
+    Ok(children
+        .into_iter()
+        .map(|child| ReferencedBlob {
+            digest_raw: format!("sha256:{}", child.hash.as_ref()),
+            hash: child.hash,
+            role: BlobRole::ChildManifest {
+                position: child.position,
+                declared_size: child.declared_size,
+            },
+        })
+        .collect())
+}
+
+/// The same projection for the **pull-through membership** derivation, which
+/// skips what it cannot address instead of refusing.
+///
+/// Separate from [`parse_index_children_for_admission`] rather than a flag on
+/// it, because the two answers are not configuration — they are two different
+/// questions, and a reader of either call site can see which one is being
+/// asked. The hosted `PUT` is an admission gate: hort decides whether these
+/// bytes enter the registry at all. This path runs over bytes that are already
+/// stored, fetched from an upstream and verified against the digest the
+/// upstream declared, and its only job is to derive the `content_references`
+/// edges those bytes imply. Refusing here would not un-store the manifest —
+/// it would mint it with **no** membership edges at all, which is the
+/// un-keepalived state `oci_membership_edge_backfill` exists to repair, and it
+/// would do so over a child the index's siblings have nothing to do with.
+///
+/// The claim set is therefore exactly what this path produced before — the
+/// addressable children, no more and no fewer — with each skipped descriptor
+/// now named in the log instead of vanishing. The existence check this path
+/// deliberately does not perform is unchanged; see
+/// [`pull_membership_claims`].
+fn parse_index_children_for_membership(
+    body: &[u8],
+) -> Result<Vec<ReferencedBlob>, serde_json::Value> {
+    let declared = hort_domain::oci::index_child_descriptors(body).map_err(|e| {
         serde_json::json!({
             "reason": format!("invalid image index: {e}"),
         })
     })?;
 
+    let children = declared.into_resolvable(|fault| {
+        tracing::warn!(
+            child = %fault,
+            "OCI pull-through: an image-index child declares no addressable content; no \
+             membership edge for it (its siblings are unaffected)"
+        );
+    });
+
     Ok(children
         .into_iter()
-        .map(|hash| ReferencedBlob {
-            digest_raw: format!("sha256:{}", hash.as_ref()),
-            hash,
-            role: BlobRole::ChildManifest,
+        .map(|child| ReferencedBlob {
+            digest_raw: format!("sha256:{}", child.hash.as_ref()),
+            hash: child.hash,
+            role: BlobRole::ChildManifest {
+                position: child.position,
+                declared_size: child.declared_size,
+            },
         })
         .collect())
 }
@@ -2054,15 +2190,21 @@ async fn resolve_referenced_blobs(
                     }
                 }
                 BlobRole::Layer => layers.push(a),
-                // A child manifest of an image index is resolved for
-                // existence only — it is NOT attached as a group member
-                // (the index lands as a plain primary `manifest`; the
-                // index→child linkage is a content-reference edge, Item
-                // 3). A present child is simply confirmed and dropped.
-                BlobRole::ChildManifest => {}
+                // A child manifest of an image index is not attached as a
+                // group member (the index lands as a plain primary
+                // `manifest`; the index→child linkage is a
+                // content-reference edge, Item 3) — but it IS held against
+                // the descriptor that named it before being dropped.
+                BlobRole::ChildManifest {
+                    position,
+                    declared_size,
+                } => {
+                    check_child_against_descriptor(r, position, declared_size, &a)
+                        .map_err(|e| *e)?;
+                }
             },
             None => {
-                if r.role == BlobRole::ChildManifest {
+                if matches!(r.role, BlobRole::ChildManifest { .. }) {
                     // Mirror the layer-missing path: a child pushed
                     // out-of-order (index before its platform manifests)
                     // is the expected retry case, surfaced as
@@ -2078,6 +2220,98 @@ async fn resolve_referenced_blobs(
     }
 
     Ok((config, layers, missing))
+}
+
+/// Hold a **present** index child against the descriptor that named it.
+///
+/// Existence used to be the whole check: a row under the child's digest was
+/// confirmed and dropped, so the descriptor's own statements about that
+/// content were never read. The descriptor spec says they must be: "Before
+/// consuming content targeted by a descriptor from untrusted sources, the byte
+/// content SHOULD be verified against the digest string. Before calculating
+/// the digest, the size of the content SHOULD be verified to reduce hash
+/// collision space." — and of `size` itself, "If the length of the retrieved
+/// content does not match the specified length, the content SHOULD NOT be
+/// trusted."
+///
+/// Hort already has the digest half for free, and more strongly than the spec
+/// asks: a stored row's `sha256_checksum` IS the lookup key, and CAS reads are
+/// hash-verified on the way out (ADR 0003). What it did not have is the size
+/// half — so that is what this adds, and it is cheap: `size_bytes` arrives on
+/// the row `find_in_repo_by_hash` already returned, so the check costs no port
+/// call and no I/O.
+///
+/// # What is compared, and what is not
+///
+/// **`size`**: compared when the descriptor declared one. A disagreement is a
+/// `MANIFEST_INVALID` refusal of the index, before anything is minted — the
+/// index is making a false statement about content this registry would then
+/// serve under it. A descriptor that declared no readable `size` is
+/// non-conformant (`size` is REQUIRED) but states nothing to disagree with, so
+/// it is logged and admitted; tightening that into a refusal is a decision
+/// about rejecting indexes hort accepts today, not a consequence of this one.
+///
+/// **`mediaType`**: deliberately NOT compared. The apparent counterpart is
+/// `Artifact::content_type`, and it is not the descriptor's `mediaType` — it
+/// is the `Content-Type` header whoever wrote that row supplied: a pusher's
+/// manifest `PUT`, an upstream's response, or `application/octet-stream` when
+/// the same bytes entered through a blob upload. `artifacts` is unique on
+/// `(repository_id, path)` and not on the checksum, so one repository can hold
+/// several rows for one hash, and the repo-scoped checksum lookup behind
+/// `find_in_repo_by_hash` is a `LIMIT 1` with no `ORDER BY`. Comparing against
+/// it would make the admission verdict depend on which duplicate row the
+/// database happened to return. `size_bytes` has no such exposure: it is a
+/// property of the bytes, so every row for one hash agrees on it.
+///
+/// The one sound `mediaType` check would be against the child's **own stored
+/// bytes** (`is_image_index` over them) rather than against a header — the
+/// same "the body decides, never the declared media type" rule
+/// [`pull_membership_claims`] records. It is not done here because it would
+/// put one CAS read per child on the manifest `PUT` path, and this resolution
+/// being a pure catalog read is what lets it run ahead of the mint at all.
+///
+/// Returns the refusal `Box`ed, the same reflex as this module's other
+/// `Box<Response>` returns: an `axum` `Response` dwarfs the `()` success here.
+fn check_child_against_descriptor(
+    r: &ReferencedBlob,
+    position: usize,
+    declared_size: Option<i64>,
+    stored: &Artifact,
+) -> Result<(), Box<Response>> {
+    let Some(declared) = declared_size else {
+        tracing::warn!(
+            child_digest = %r.digest_raw,
+            descriptor = %format_args!("manifests[{position}]"),
+            "image index child descriptor declares no readable `size`, which the image \
+             spec requires; nothing to hold the stored child against"
+        );
+        return Ok(());
+    };
+    if declared == stored.size_bytes {
+        return Ok(());
+    }
+    tracing::warn!(
+        child_digest = %r.digest_raw,
+        descriptor = %format_args!("manifests[{position}]"),
+        declared_size = declared,
+        stored_size = stored.size_bytes,
+        "image index child descriptor disagrees with the stored child's size; refusing \
+         the index"
+    );
+    // Never-echo: both sizes are a declaration and a stored fact about the
+    // client's own content, so they stay in the log line above and out of the
+    // response. What the client gets is a constant reason plus hort's own slot
+    // number — the publisher of the index is the publisher of the child, so it
+    // can compare the two itself once it knows which child.
+    Err(Box::new(
+        OciError::ManifestInvalid {
+            detail: Some(serde_json::json!({
+                "reason": "image index child descriptor disagrees with the stored child's size",
+                "descriptor": format!("manifests[{position}]"),
+            })),
+        }
+        .into_response(),
+    ))
 }
 
 /// The `content_references` membership claims a **pull-through** manifest
@@ -2151,7 +2385,7 @@ pub(crate) fn pull_membership_claims(
         );
     }
     let referenced = if body_is_index {
-        match parse_index_children(body) {
+        match parse_index_children_for_membership(body) {
             Ok(r) => r,
             Err(detail) => {
                 tracing::warn!(
@@ -2419,6 +2653,37 @@ mod tests {
         let hash = seed_blob_row_without_content(artifacts, repo_id, content, status);
         storage.insert_content(hash.clone(), content.to_vec());
         hash
+    }
+
+    /// A seeded child manifest as an index fixture needs to declare it: the
+    /// row's hash **and** the byte count that row carries.
+    ///
+    /// The two travel together from the seeding site rather than being
+    /// re-derived where the index JSON is built, because the admission gate
+    /// holds the descriptor's `size` against the stored row's. A fixture that
+    /// builds the two independently can declare a size the child does not
+    /// have — which is a refusal test, and must be written as one on purpose
+    /// rather than reached by accident. (The fixture declared `"size": 0` for
+    /// every child before that check existed, so every index in this corpus
+    /// was non-conformant and nothing noticed.)
+    #[derive(Clone, Debug)]
+    struct SeededIndexChild {
+        hash: ContentHash,
+        size: i64,
+    }
+
+    /// [`seed_blob`] for a child manifest, carrying the stored byte count out
+    /// alongside the hash so the index declaring it can be conformant.
+    fn seed_index_child(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        content: &[u8],
+    ) -> SeededIndexChild {
+        SeededIndexChild {
+            hash: seed_blob(artifacts, storage, repo_id, content),
+            size: content.len() as i64,
+        }
     }
 
     /// An artifact **row** for `content`'s hash with **no CAS object behind
@@ -3394,7 +3659,8 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let child = seed_blob(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
+            let child =
+                seed_index_child(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
             let media = "application/vnd.oci.image.index.v1+json";
             let body = build_index_json(std::slice::from_ref(&child), media);
             let index_hex = hex::encode(Sha256::digest(&body));
@@ -3415,7 +3681,7 @@ mod tests {
 
             let member_rows = h
                 .content_references
-                .find_by_target(repo_id, &child, Some("oci_index_member"))
+                .find_by_target(repo_id, &child.hash, Some("oci_index_member"))
                 .await
                 .unwrap()
                 .len();
@@ -3452,8 +3718,10 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let child_a = seed_blob(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
-            let child_b = seed_blob(&h.artifacts, &h.storage, repo_id, b"arm64-child-manifest");
+            let child_a =
+                seed_index_child(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
+            let child_b =
+                seed_index_child(&h.artifacts, &h.storage, repo_id, b"arm64-child-manifest");
             let media = "application/vnd.oci.image.index.v1+json";
             let body = build_index_json(&[child_a.clone(), child_b.clone()], media);
             let index_hex = hex::encode(Sha256::digest(&body));
@@ -3487,8 +3755,14 @@ mod tests {
                         "primary_content".to_string(),
                         index.sha256_checksum.as_ref().to_owned()
                     ),
-                    ("oci_index_member".to_string(), child_a.as_ref().to_owned()),
-                    ("oci_index_member".to_string(), child_b.as_ref().to_owned()),
+                    (
+                        "oci_index_member".to_string(),
+                        child_a.hash.as_ref().to_owned()
+                    ),
+                    (
+                        "oci_index_member".to_string(),
+                        child_b.hash.as_ref().to_owned()
+                    ),
                 ],
                 "the index's claim on its own bytes and on both children's, in one call"
             );
@@ -4655,14 +4929,18 @@ mod tests {
                     )
                 }
                 SeededRole::IndexChild => {
-                    let present = seed_blob(&h.artifacts, &h.storage, repo_id, b"present-child");
-                    let seeded = seed_blob_with_status(
-                        &h.artifacts,
-                        &h.storage,
-                        repo_id,
-                        b"seeded-child",
-                        status,
-                    );
+                    let present =
+                        seed_index_child(&h.artifacts, &h.storage, repo_id, b"present-child");
+                    let seeded = SeededIndexChild {
+                        hash: seed_blob_with_status(
+                            &h.artifacts,
+                            &h.storage,
+                            repo_id,
+                            b"seeded-child",
+                            status,
+                        ),
+                        size: b"seeded-child".len() as i64,
+                    };
                     (
                         build_index_json(
                             &[present, seeded],
@@ -4993,14 +5271,14 @@ mod tests {
     /// Build a minimal image-index JSON referencing the supplied child
     /// **manifest** digests via `manifests[*]`. `media_type` selects the
     /// OCI-index or Docker-manifest-list shape.
-    fn build_index_json(child_hashes: &[ContentHash], media_type: &str) -> Vec<u8> {
-        let manifests: Vec<serde_json::Value> = child_hashes
+    fn build_index_json(children: &[SeededIndexChild], media_type: &str) -> Vec<u8> {
+        let manifests: Vec<serde_json::Value> = children
             .iter()
-            .map(|h| {
+            .map(|c| {
                 serde_json::json!({
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": format!("sha256:{}", h.as_ref()),
-                    "size": 0,
+                    "digest": format!("sha256:{}", c.hash.as_ref()),
+                    "size": c.size,
                     "platform": { "architecture": "amd64", "os": "linux" },
                 })
             })
@@ -5011,6 +5289,34 @@ mod tests {
             "manifests": manifests,
         });
         serde_json::to_vec(&body).unwrap()
+    }
+
+    /// Build an index declaring exactly `manifests`, verbatim — for the cases
+    /// whose subject IS a descriptor [`build_index_json`] cannot express: a
+    /// child with no `digest`, a digest hort cannot address, a `size` that
+    /// disagrees with the stored child.
+    fn build_index_json_from_descriptors(
+        manifests: &[serde_json::Value],
+        media_type: &str,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": media_type,
+            "manifests": manifests,
+        }))
+        .unwrap()
+    }
+
+    /// A child descriptor in [`build_index_json_from_descriptors`] form whose
+    /// `digest` and `size` both agree with a seeded row — the conformant
+    /// baseline a one-bad-descriptor fixture puts its good siblings in.
+    fn good_child_descriptor(child: &SeededIndexChild) -> serde_json::Value {
+        serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": format!("sha256:{}", child.hash.as_ref()),
+            "size": child.size,
+            "platform": { "architecture": "amd64", "os": "linux" },
+        })
     }
 
     /// Build a PUT request with an image-index Content-Type + body.
@@ -5033,8 +5339,10 @@ mod tests {
             let repo_id = repo.id;
             h.repositories.insert(repo);
             // Seed the two platform child manifests as artifacts in-repo.
-            let child_a = seed_blob(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
-            let child_b = seed_blob(&h.artifacts, &h.storage, repo_id, b"arm64-child-manifest");
+            let child_a =
+                seed_index_child(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
+            let child_b =
+                seed_index_child(&h.artifacts, &h.storage, repo_id, b"arm64-child-manifest");
             let body = build_index_json(
                 &[child_a, child_b],
                 "application/vnd.oci.image.index.v1+json",
@@ -5119,8 +5427,10 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let child_a = seed_blob(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
-            let child_b = seed_blob(&h.artifacts, &h.storage, repo_id, b"arm64-child-manifest");
+            let child_a =
+                seed_index_child(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
+            let child_b =
+                seed_index_child(&h.artifacts, &h.storage, repo_id, b"arm64-child-manifest");
             let body = build_index_json(
                 &[child_a.clone(), child_b.clone()],
                 "application/vnd.oci.image.index.v1+json",
@@ -5153,12 +5463,12 @@ mod tests {
             // own content hash as the target.
             let rows_a = h
                 .content_references
-                .find_by_target(repo_id, &child_a, Some("oci_index_member"))
+                .find_by_target(repo_id, &child_a.hash, Some("oci_index_member"))
                 .await
                 .unwrap();
             let rows_b = h
                 .content_references
-                .find_by_target(repo_id, &child_b, Some("oci_index_member"))
+                .find_by_target(repo_id, &child_b.hash, Some("oci_index_member"))
                 .await
                 .unwrap();
             let source_a = rows_a.first().map(|r| r.source_artifact_id);
@@ -5562,7 +5872,8 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let child = seed_blob(&h.artifacts, &h.storage, repo_id, b"child-manifest-bytes");
+            let child =
+                seed_index_child(&h.artifacts, &h.storage, repo_id, b"child-manifest-bytes");
             let body = build_index_json(
                 std::slice::from_ref(&child),
                 "application/vnd.oci.image.index.v1+json",
@@ -5586,12 +5897,12 @@ mod tests {
             // `ChildManifest` entries there).
             let config_rows = h
                 .content_references
-                .find_by_target(repo_id, &child, Some("oci_config"))
+                .find_by_target(repo_id, &child.hash, Some("oci_config"))
                 .await
                 .unwrap();
             let layer_rows = h
                 .content_references
-                .find_by_target(repo_id, &child, Some("oci_layer"))
+                .find_by_target(repo_id, &child.hash, Some("oci_layer"))
                 .await
                 .unwrap();
             (status, config_rows.len(), layer_rows.len())
@@ -5721,7 +6032,8 @@ mod tests {
     }
 
     /// A body that fails to parse — malformed JSON, or a body neither
-    /// `parse_manifest_blobs` nor `parse_index_children` can enumerate —
+    /// `parse_manifest_blobs` nor `parse_index_children_for_admission` can
+    /// enumerate —
     /// yields an EMPTY claim set rather than an error. The bytes matched
     /// the digest the upstream declared, so the manifest is legitimately
     /// servable and is minted with its own `primary_content` edge and no
@@ -5752,7 +6064,13 @@ mod tests {
     /// verification cannot catch that — the bytes match, the header lies.
     #[test]
     fn pull_membership_claims_index_body_under_image_media_type_yields_member_claims() {
-        let child: ContentHash = hex::encode(Sha256::digest(b"pull-child")).parse().unwrap();
+        // Nothing is seeded on the pull-through path: it registers edges by
+        // digest with no existence check, so the declared size has nothing to
+        // be held against here. It still states the truth about the bytes.
+        let child = SeededIndexChild {
+            hash: hex::encode(Sha256::digest(b"pull-child")).parse().unwrap(),
+            size: b"pull-child".len() as i64,
+        };
         let body = build_index_json(
             std::slice::from_ref(&child),
             "application/vnd.oci.image.index.v1+json",
@@ -5768,14 +6086,17 @@ mod tests {
 
         assert_eq!(
             claim_kinds(&claims),
-            vec![("oci_index_member".to_string(), child.as_ref().to_owned())],
+            vec![(
+                "oci_index_member".to_string(),
+                child.hash.as_ref().to_owned()
+            )],
             "the body's shape decides: an index body yields oci_index_member claims \
              whatever Content-Type the upstream declared, and nothing else — the \
              single-image parse must not have run"
         );
         assert_eq!(
             claims[0].metadata["child_digest"],
-            format!("sha256:{}", child.as_ref()),
+            format!("sha256:{}", child.hash.as_ref()),
             "an index member's metadata key is `child_digest`, not `digest`"
         );
     }
@@ -5813,7 +6134,8 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let child = seed_blob(&h.artifacts, &h.storage, repo_id, b"child-manifest-bytes");
+            let child =
+                seed_index_child(&h.artifacts, &h.storage, repo_id, b"child-manifest-bytes");
             let media = "application/vnd.docker.distribution.manifest.list.v2+json";
             let body = build_index_json(std::slice::from_ref(&child), media);
 
@@ -5885,7 +6207,7 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let child = seed_blob(&h.artifacts, &h.storage, repo_id, b"a-child-manifest");
+            let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"a-child-manifest");
             // Index bytes (non-empty manifests[]) ...
             let index_body = build_index_json(
                 std::slice::from_ref(&child),
@@ -5945,7 +6267,7 @@ mod tests {
                 .status();
 
             // Index bytes under the index Content-Type.
-            let child = seed_blob(&h.artifacts, &h.storage, repo_id, b"child-match");
+            let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"child-match");
             let media = "application/vnd.oci.image.index.v1+json";
             let index_body = build_index_json(std::slice::from_ref(&child), media);
             let index_router = router().with_state(h.ctx.clone());
@@ -5984,9 +6306,12 @@ mod tests {
             let repo_id = repo.id;
             h.repositories.insert(repo);
             // A present child + a NEVER-seeded child.
-            let present = seed_blob(&h.artifacts, &h.storage, repo_id, b"present-child");
+            let present = seed_index_child(&h.artifacts, &h.storage, repo_id, b"present-child");
             let missing_hex = hex::encode(Sha256::digest(b"never-pushed-child"));
-            let missing: ContentHash = missing_hex.parse().unwrap();
+            let missing = SeededIndexChild {
+                hash: missing_hex.parse().unwrap(),
+                size: b"never-pushed-child".len() as i64,
+            };
             let body = build_index_json(
                 &[present, missing],
                 "application/vnd.oci.image.index.v1+json",
@@ -6046,7 +6371,8 @@ mod tests {
             h.repositories.insert(repo_a);
             h.repositories.insert(repo_b);
             // Seed the child ONLY in repo_b.
-            let child = seed_blob(&h.artifacts, &h.storage, repo_b_id, b"child-in-other-repo");
+            let child =
+                seed_index_child(&h.artifacts, &h.storage, repo_b_id, b"child-in-other-repo");
             let body = build_index_json(
                 std::slice::from_ref(&child),
                 "application/vnd.oci.image.index.v1+json",
@@ -6069,7 +6395,7 @@ mod tests {
     }
 
     /// An index declaring MORE than the domain cap of children →
-    /// `MANIFEST_INVALID` (the domain `index_child_digests` returns
+    /// `MANIFEST_INVALID` (the domain `index_child_descriptors` returns
     /// `Validation`; the handler maps it to the same shape the
     /// single-image over-cap rejection produces). No group is created.
     ///
@@ -6149,6 +6475,571 @@ mod tests {
         );
     }
 
+    // -------------------- PUT — an index child is a descriptor --------------
+    //
+    // `digest` is a REQUIRED property of an OCI Content Descriptor, so a
+    // `manifests[]` entry with no usable digest is not a child the registry
+    // failed to resolve — it is an index that does not say what it claims to
+    // say. Admission refuses it. Which refusal depends on the descriptor, and
+    // the image spec draws the line: a digest complying with the digest
+    // grammar but naming an unrecognised algorithm "SHOULD pass validation",
+    // so `sha512:<hex>` is a VALID index hort cannot store (`UNSUPPORTED`),
+    // while a digest matching no grammar, or an absent one, is a malformed
+    // manifest (`MANIFEST_INVALID`).
+    //
+    // Before this, all three were dropped inside the domain projection's
+    // `filter_map`: the index was admitted `201` carrying one `oci_index_member`
+    // edge fewer than it declared, and nothing said so.
+
+    /// Outcome of a PUT of an index carrying `manifests`, verbatim.
+    struct IndexRefusal {
+        status: StatusCode,
+        body: Vec<u8>,
+        index_minted: bool,
+        member_edges: usize,
+    }
+
+    /// PUT an index declaring exactly `manifests` alongside one good child,
+    /// and report what came back and what it left behind.
+    ///
+    /// The good sibling is the point: a refusal has to be the refusal of the
+    /// *index*, not an empty enumeration. Before the correction the sibling's
+    /// edge was written and the index was `201` — the bad descriptor simply
+    /// was not there.
+    fn put_index_with_descriptors(
+        extra: impl Fn(&SeededIndexChild) -> Vec<serde_json::Value>,
+    ) -> IndexRefusal {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let good = seed_index_child(&h.artifacts, &h.storage, repo_id, b"good-child-manifest");
+            let mut manifests = vec![good_child_descriptor(&good)];
+            manifests.extend(extra(&good));
+            let body = build_index_json_from_descriptors(
+                &manifests,
+                "application/vnd.oci.image.index.v1+json",
+            );
+            let index_hex = hex::encode(Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_index_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let index_minted = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            let member_edges = h
+                .content_references
+                .find_by_target(repo_id, &good.hash, Some("oci_index_member"))
+                .await
+                .unwrap()
+                .len();
+            IndexRefusal {
+                status,
+                body,
+                index_minted,
+                member_edges,
+            }
+        })
+    }
+
+    /// The wire envelope's `code`, for an assertion that names the spec code
+    /// rather than a message.
+    fn envelope_code(body: &[u8]) -> String {
+        let parsed: serde_json::Value = serde_json::from_slice(body).unwrap();
+        parsed["errors"][0]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn a_body_that_cannot_project_as_an_index_never_reaches_the_child_parse() {
+        // `parse_index_children_for_admission` interpolates the domain error
+        // into `detail.reason` for a `Validation`, and one of the two
+        // `Validation` shapes carries a serde message ABOUT the body — which
+        // would be declarant content in a response body if it could get here.
+        // It cannot, and this test is why: the index branch is only entered
+        // when the declared media type agrees with `is_image_index(body)`, and
+        // `is_image_index` is the same `from_slice::<OciImageIndex>` over the
+        // same bytes. A body whose projection fails makes that probe `false`,
+        // so `check_declared_media_type_matches_shape` refuses first with its
+        // own envelope, which names only the media type the client sent in a
+        // header and hort's own `shape_is_index` verdict.
+        //
+        // That leaves exactly one reachable `Validation` behind the
+        // interpolation — the over-cap refusal, whose message is hort's own
+        // counts (asserted below). Reorder these two checks and the serde
+        // message becomes reflectable; that is what this pins.
+        for body in [
+            br#"{"schemaVersion":2,"manifests":"CANARY-abc123"}"#.to_vec(),
+            br#"{"schemaVersion":2,"manifests":[{"digest":"CANARY-abc123"}],"#.to_vec(),
+            br#"{"schemaVersion":2,"manifests":[{"digest":42}]}"#.to_vec(),
+        ] {
+            let (status, rbody) = run(async {
+                let h = harness();
+                h.repositories.insert(oci_repo("myrepo"));
+                let router = router().with_state(h.ctx.clone());
+                let resp = router
+                    .oneshot(put_index_request(
+                        "/v2/myrepo/library/nginx/manifests/v1",
+                        body.clone(),
+                        "application/vnd.oci.image.index.v1+json",
+                    ))
+                    .await
+                    .unwrap();
+                let st = resp.status();
+                let b = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+                (st, b)
+            });
+            let text = String::from_utf8_lossy(&rbody);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+            assert!(
+                !text.contains("CANARY"),
+                "a response reflected declarant manifest content: {text}"
+            );
+        }
+
+        // The counter-half: the one `Validation` that IS reachable behind the
+        // interpolation, carrying hort's own numbers and nothing of the body's.
+        let over_cap = 1025usize;
+        let (status, rbody) = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("myrepo"));
+            let manifests: Vec<serde_json::Value> = (0..over_cap)
+                .map(|i| serde_json::json!({ "digest": format!("sha256:{i:064x}"), "size": 1 }))
+                .collect();
+            let body = build_index_json_from_descriptors(
+                &manifests,
+                "application/vnd.oci.image.index.v1+json",
+            );
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_index_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
+            let st = resp.status();
+            let b = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (st, b)
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_slice(&rbody).unwrap();
+        let reason = parsed["errors"][0]["detail"]["reason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("invalid image index") && reason.contains(&over_cap.to_string()),
+            "the over-cap refusal reaches the interpolation and states hort's own \
+             counts: {reason}"
+        );
+    }
+
+    #[test]
+    fn put_index_with_a_child_carrying_no_digest_is_refused_not_swept_up() {
+        let out = put_index_with_descriptors(|_| {
+            vec![serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "size": 7,
+                "platform": { "architecture": "arm64", "os": "linux" },
+            })]
+        });
+        assert_eq!(out.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            envelope_code(&out.body),
+            "MANIFEST_INVALID",
+            "`digest` is a REQUIRED descriptor property, so its absence is a malformed \
+             manifest"
+        );
+        assert!(
+            !out.index_minted,
+            "the parse runs ahead of the ingest: a refused index leaves no artifact row"
+        );
+        assert_eq!(
+            out.member_edges, 0,
+            "and no edge for the sibling either — this used to be a 201 carrying exactly \
+             this one edge and claiming two children"
+        );
+    }
+
+    #[test]
+    fn put_index_with_a_malformed_child_digest_is_refused() {
+        for bad in [
+            "sha256:not-valid-hex",
+            "sha256:dead",
+            &format!("sha256:{}", "A".repeat(64)),
+        ] {
+            let out = put_index_with_descriptors(|_| {
+                vec![serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": bad,
+                    "size": 7,
+                })]
+            });
+            assert_eq!(out.status, StatusCode::BAD_REQUEST, "digest {bad}");
+            assert_eq!(
+                envelope_code(&out.body),
+                "MANIFEST_INVALID",
+                "a `sha256:` body that is not 64 lowercase hex matches no digest hort can \
+                 read: digest {bad}"
+            );
+            assert!(!out.index_minted, "digest {bad}");
+            assert_eq!(out.member_edges, 0, "digest {bad}");
+        }
+    }
+
+    #[test]
+    fn put_index_with_an_unprefixed_child_digest_is_refused_as_manifest_invalid() {
+        // No `<algorithm>:` at all — ungrammatical, so malformed rather than
+        // unsupported. This is the half of the old `NotSha256` collapse that
+        // must NOT answer `UNSUPPORTED`.
+        let out = put_index_with_descriptors(|_| {
+            vec![serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "a".repeat(64),
+                "size": 7,
+            })]
+        });
+        assert_eq!(out.status, StatusCode::BAD_REQUEST);
+        assert_eq!(envelope_code(&out.body), "MANIFEST_INVALID");
+        assert!(!out.index_minted);
+    }
+
+    #[test]
+    fn put_index_with_a_sha512_child_is_refused_as_unsupported() {
+        let out = put_index_with_descriptors(|_| {
+            vec![serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": format!("sha512:{}", "a".repeat(128)),
+                "size": 7,
+            })]
+        });
+        assert_eq!(out.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            envelope_code(&out.body),
+            "UNSUPPORTED",
+            "a `sha512:` child digest complies with the descriptor digest grammar, which \
+             the image spec says SHOULD pass validation — the index is valid and hort \
+             cannot store it, which is not the same answer as a malformed manifest"
+        );
+        assert!(!out.index_minted);
+        assert_eq!(out.member_edges, 0);
+    }
+
+    #[test]
+    fn the_unsupported_and_invalid_index_child_codes_are_not_the_same_value() {
+        // Counter-assertion to the pair above: the whole point of the split is
+        // that a client can tell "invalid index" from "valid index this
+        // registry cannot store". A later refactor that routed both through
+        // one envelope would leave both tests above green if they only
+        // asserted 400, and green against each other if the two codes were
+        // ever made equal.
+        let unsupported = put_index_with_descriptors(|_| {
+            vec![serde_json::json!({
+                "digest": format!("sha512:{}", "a".repeat(128)),
+                "size": 7,
+            })]
+        });
+        let invalid = put_index_with_descriptors(|_| vec![serde_json::json!({ "size": 7 })]);
+        let (a, b) = (
+            envelope_code(&unsupported.body),
+            envelope_code(&invalid.body),
+        );
+        assert_ne!(
+            a, b,
+            "the two refusals must stay distinguishable on the wire; both were {a}"
+        );
+        assert_eq!(
+            (a.as_str(), b.as_str()),
+            ("UNSUPPORTED", "MANIFEST_INVALID")
+        );
+    }
+
+    #[test]
+    fn an_index_child_refusal_never_echoes_the_declaration() {
+        // Every refusal above is driven by declarant-controlled manifest JSON,
+        // and the `detail` payload is the one place it could be reflected
+        // back. The marker strings here are unique enough that a substring
+        // search over the whole body is a real test of the contract.
+        let algorithm = "sha512";
+        let hex = "ab7dfa".repeat(10);
+        for descriptor in [
+            serde_json::json!({ "digest": format!("{algorithm}:{hex}"), "size": 7 }),
+            serde_json::json!({ "digest": format!("sha256:{hex}"), "size": 7 }),
+            serde_json::json!({ "digest": hex.clone(), "size": 7 }),
+            serde_json::json!({ "mediaType": format!("application/{hex}"), "size": 7 }),
+        ] {
+            let out = put_index_with_descriptors(|_| vec![descriptor.clone()]);
+            let body = String::from_utf8_lossy(&out.body);
+            assert_eq!(out.status, StatusCode::BAD_REQUEST, "{descriptor}");
+            assert!(
+                !body.contains(&hex),
+                "the refusal reflected the client-supplied digest body: {body}"
+            );
+            assert!(
+                !body.contains(algorithm),
+                "the refusal reflected the client-supplied algorithm: {body}"
+            );
+            // It still names WHICH child, by hort's own slot number, so a
+            // publisher is not left searching a 50-platform index.
+            assert!(
+                body.contains("manifests[1]"),
+                "the refusal must name the offending descriptor's slot: {body}"
+            );
+        }
+    }
+
+    // -------------------- PUT — existence is not identity -------------------
+    //
+    // A present child was confirmed and dropped, so the descriptor's own
+    // statements about that content were never read. The descriptor spec:
+    // "Before calculating the digest, the size of the content SHOULD be
+    // verified to reduce hash collision space", and of `size`, "If the length
+    // of the retrieved content does not match the specified length, the
+    // content SHOULD NOT be trusted."
+
+    #[test]
+    fn put_index_whose_child_descriptor_lies_about_the_size_is_refused() {
+        let out = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"the-child-manifest");
+            // Present, same repo, non-terminal — everything the existence
+            // check asks. The descriptor declares a size the row does not have.
+            let mut descriptor = good_child_descriptor(&child);
+            descriptor["size"] = serde_json::json!(child.size + 1);
+            let body = build_index_json_from_descriptors(
+                &[descriptor],
+                "application/vnd.oci.image.index.v1+json",
+            );
+            let index_hex = hex::encode(Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_index_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let index_minted = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            (status, rbody, index_minted, child.size)
+        });
+        let (status, body, index_minted, stored_size) = out;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a present child is not a satisfied reference if the descriptor disagrees \
+             with it: body = {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(envelope_code(&body), "MANIFEST_INVALID");
+        assert!(
+            !index_minted,
+            "the descriptor check runs in the pre-mint resolution, so nothing is left behind"
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(&(stored_size + 1).to_string()),
+            "the declared size is declarant-supplied and must not be reflected: {text}"
+        );
+    }
+
+    #[test]
+    fn the_descriptor_check_is_not_gated_on_every_other_child_resolving() {
+        // ORDER, which is what this issue is about. A missing reference is NOT
+        // an error on this path — it is the `Missing` outcome, answered with
+        // `MANIFEST_BLOB_UNKNOWN` AFTER the mint, because the client's
+        // retry-after-pushing-the-blob has to be idempotent. A descriptor that
+        // disagrees with a child the repository DOES hold is a different thing:
+        // it is an invalid document, and it must be refused before the mint
+        // even when a sibling has not arrived yet. Putting the size check
+        // behind "did everything resolve" would let one un-pushed child carry
+        // a lying descriptor past the gate on the same request.
+        let (status, body, index_minted) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let present = seed_index_child(&h.artifacts, &h.storage, repo_id, b"present-child");
+            let absent_hex = hex::encode(Sha256::digest(b"never-pushed-child"));
+            let mut liar = good_child_descriptor(&present);
+            liar["size"] = serde_json::json!(present.size + 1);
+            let body = build_index_json_from_descriptors(
+                &[
+                    serde_json::json!({
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": format!("sha256:{absent_hex}"),
+                        "size": 7,
+                    }),
+                    liar,
+                ],
+                "application/vnd.oci.image.index.v1+json",
+            );
+            let index_hex = hex::encode(Sha256::digest(&body));
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_index_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let minted = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            (status, rbody, minted)
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            envelope_code(&body),
+            "MANIFEST_INVALID",
+            "the invalid descriptor answers, not the unknown blob: body = {}",
+            String::from_utf8_lossy(&body)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["errors"][0]["detail"]["descriptor"], "manifests[1]",
+            "and it names the offending slot, not the absent sibling's"
+        );
+        assert!(
+            !index_minted,
+            "a MANIFEST_BLOB_UNKNOWN commits the manifest; this refusal must not — the \
+             document is invalid, which is decided before the mint"
+        );
+    }
+
+    #[test]
+    fn put_index_whose_child_descriptor_agrees_on_the_size_is_admitted() {
+        // The counterpart: the check refuses a disagreement and nothing else.
+        // Without this, making the comparison always-fail would pass the test
+        // above.
+        let (status, child_size) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"the-child-manifest");
+            let body = build_index_json_from_descriptors(
+                &[good_child_descriptor(&child)],
+                "application/vnd.oci.image.index.v1+json",
+            );
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_index_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
+            (resp.status(), child.size)
+        });
+        assert!(child_size > 0, "the fixture must declare a real byte count");
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[test]
+    fn put_index_whose_child_descriptor_omits_the_size_is_admitted() {
+        // `size` is REQUIRED by the spec, so such an index is non-conformant —
+        // but it declares nothing to disagree with, and refusing it would
+        // reject indexes hort accepts today over a field this change does not
+        // decide. Admitted, with the non-conformance logged.
+        let status = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"the-child-manifest");
+            let body = build_index_json_from_descriptors(
+                &[serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": format!("sha256:{}", child.hash.as_ref()),
+                })],
+                "application/vnd.oci.image.index.v1+json",
+            );
+            let router = router().with_state(h.ctx.clone());
+            router
+                .oneshot(put_index_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap()
+                .status()
+        });
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[test]
+    fn pull_membership_claims_skips_an_unaddressable_child_and_keeps_the_rest() {
+        // The pull-through membership derivation is the other side of the
+        // split: these bytes are already stored and digest-verified, so a
+        // descriptor hort cannot address costs that child its edge and
+        // nothing else. Refusing here would mint the manifest with NO
+        // membership edges at all — the un-keepalived state the backfill
+        // handler exists to repair.
+        let good = SeededIndexChild {
+            hash: hex::encode(Sha256::digest(b"upstream-child"))
+                .parse()
+                .unwrap(),
+            size: b"upstream-child".len() as i64,
+        };
+        let media = "application/vnd.oci.image.index.v1+json";
+        let body = build_index_json_from_descriptors(
+            &[
+                good_child_descriptor(&good),
+                serde_json::json!({ "digest": format!("sha512:{}", "a".repeat(128)), "size": 7 }),
+                serde_json::json!({ "size": 7 }),
+            ],
+            media,
+        );
+
+        let claims = pull_membership_claims(Uuid::new_v4(), &compute_sha256(&body), media, &body);
+
+        assert_eq!(
+            claim_kinds(&claims),
+            vec![(
+                "oci_index_member".to_string(),
+                good.hash.as_ref().to_owned()
+            )],
+            "the addressable child keeps its edge; the two that name no CAS object get \
+             none, and the pull is unaffected"
+        );
+    }
+
     /// §3.5 red test: an image index — even one carrying a `subject`
     /// (defensively) — is NOT routed to `ingest_signature_manifest`.
     /// The `is_pure_*` predicates key on layer media types, and an index
@@ -6163,20 +7054,17 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let child = seed_blob(&h.artifacts, &h.storage, repo_id, b"index-child-manifest");
+            let child =
+                seed_index_child(&h.artifacts, &h.storage, repo_id, b"index-child-manifest");
             let subject = seed_blob(&h.artifacts, &h.storage, repo_id, b"the-subject-image");
-            // An index shape WITH a defensive `subject` and NO layers.
+            // An index shape WITH a defensive `subject` and NO layers. The
+            // child descriptor declares the stored child's real size: this
+            // test is about ingest routing, and a descriptor disagreeing with
+            // its child is refused before routing is reached.
             let index = serde_json::json!({
                 "schemaVersion": 2,
                 "mediaType": "application/vnd.oci.image.index.v1+json",
-                "manifests": [
-                    {
-                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                        "digest": format!("sha256:{}", child.as_ref()),
-                        "size": 0,
-                        "platform": { "architecture": "amd64", "os": "linux" },
-                    }
-                ],
+                "manifests": [ good_child_descriptor(&child) ],
                 "subject": {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "digest": format!("sha256:{}", subject.as_ref()),

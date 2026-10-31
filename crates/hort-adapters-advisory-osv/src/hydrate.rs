@@ -196,8 +196,23 @@ async fn cache_store(ctx: &HydrationContext<'_>, id: &str, modified: Option<&str
     }
 }
 
-/// `GET {vulns_url}/{id}` → response body. `Err` carries a short reason
-/// for the warn log; the caller turns it into a fail-soft skip.
+/// `GET {vulns_url}/{id}` → response body, read under
+/// [`OSV_RECORD_MAX_BYTES`](crate::OSV_RECORD_MAX_BYTES). `Err` carries
+/// a short reason for the warn log; the caller turns it into a fail-soft
+/// skip.
+///
+/// Capped rather than `resp.text()`, which buffers to EOF
+/// unconditionally. This read fires once per **distinct advisory id** in
+/// a batch, so an unbounded one multiplies: a compromised endpoint does
+/// not have to serve one enormous body, only many. The body is cached
+/// too, so an uncapped oversized response would also be written into the
+/// ephemeral store and outlive the request that fetched it.
+///
+/// The returned reason distinguishes a refused body from a transport
+/// failure (see [`crate::capped::CappedReadError`]) so the warn log says
+/// which happened; both are the same fail-soft skip to the caller, and
+/// that skip falls back to the abbreviated record, which carries no
+/// severity and therefore fails closed to `Critical`.
 async fn fetch_record(ctx: &HydrationContext<'_>, id: &str) -> Result<String, String> {
     let url = record_url(ctx.vulns_url, id)?;
     let resp = ctx
@@ -210,9 +225,12 @@ async fn fetch_record(ctx: &HydrationContext<'_>, id: &str) -> Result<String, St
     if !status.is_success() {
         return Err(format!("upstream returned status {status}"));
     }
-    resp.text()
+    crate::capped::read_capped_text(resp, crate::OSV_RECORD_MAX_BYTES)
         .await
-        .map_err(|e| format!("failed to read body: {e}"))
+        .map_err(|e| match e {
+            crate::capped::CappedReadError::TooLarge { .. } => format!("body refused: {e}"),
+            crate::capped::CappedReadError::Stream(msg) => format!("failed to read body: {msg}"),
+        })
 }
 
 /// Build the single-record URL, rejecting any id that is not safe to

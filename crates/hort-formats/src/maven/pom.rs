@@ -70,6 +70,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 
 use super::xml::{decode_text, local_name_of, resolve_reference, MAX_ELEMENT_DEPTH};
+use crate::publish_identity::IdentityCheck;
 
 /// Ceiling on the POM bytes this reader will buffer. Maven Central's
 /// largest published POMs are a few hundred kilobytes; 4 MiB leaves an
@@ -108,12 +109,6 @@ const DEFAULT_SCOPE: &str = "compile";
 /// - `import` — only meaningful inside `<dependencyManagement>` as a BOM
 ///   import, which this reader deliberately does not resolve.
 const EMITTED_SCOPES: [&str; 2] = ["compile", "runtime"];
-
-/// Cap on the coordinate recorded alongside a skip. The coordinate comes
-/// from artifact bytes and reaches logs and metric labels, so it is
-/// truncated and stripped of control characters before it leaves this
-/// module.
-const SKIP_COORDINATE_MAX_CHARS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -191,7 +186,9 @@ impl PomSkipReason {
 pub struct PomSkip {
     /// Best-effort `groupId:artifactId` of the skipped dependency, as far
     /// as it could be resolved. Sanitised (control characters removed,
-    /// truncated to [`SKIP_COORDINATE_MAX_CHARS`]) because it originates
+    /// truncated to
+    /// [`DECLARED_FRAGMENT_MAX_CHARS`](crate::publish_identity::DECLARED_FRAGMENT_MAX_CHARS))
+    /// because it originates
     /// in artifact bytes.
     pub coordinate: String,
     /// The coverage gap this skip represents.
@@ -249,6 +246,128 @@ pub fn parse_pom_dependencies(content: &mut dyn Read) -> DomainResult<PomDepende
 }
 
 // ---------------------------------------------------------------------------
+// The identity the POM declares about itself
+// ---------------------------------------------------------------------------
+
+/// The effective `groupId:artifactId:version` a POM declares about itself.
+///
+/// Every field is optional, and `None` means *this POM does not say* rather
+/// than *this POM is wrong*:
+///
+/// - `groupId` and `version` are absent when the POM inherits them and the
+///   `<parent>` block does not spell them out either — which is not a valid
+///   deployable POM, but is a fact about the bytes rather than a divergence
+///   to refuse over.
+/// - any of the three is absent when its text is a `${...}` placeholder
+///   this POM's own `<properties>` cannot resolve. Maven's CI-friendly
+///   `<version>${revision}</version>` is the common case; the
+///   `flatten-maven-plugin` normally resolves it before deploy, but an
+///   unflattened POM reaches a repository occasionally and its version is
+///   genuinely undecidable from these bytes alone.
+///
+/// See [`crate::publish_identity`] for why undeclared and divergent are
+/// different answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PomIdentity {
+    /// `<project><groupId>`, falling back to `<project><parent><groupId>`.
+    pub group_id: Option<String>,
+    /// `<project><artifactId>`. Never inherited — Maven requires every POM
+    /// to spell its own artifactId out.
+    pub artifact_id: Option<String>,
+    /// `<project><version>`, falling back to `<project><parent><version>`.
+    pub version: Option<String>,
+}
+
+/// Read the effective coordinate a stored Maven POM declares about itself.
+///
+/// Applies Maven's own inheritance rule as far as one document reaches:
+/// `groupId` and `version` fall back to the `<parent>` block (which is
+/// written in *this* document, so the fallback needs no parent fetch),
+/// `artifactId` never does. `${...}` placeholders are expanded through this
+/// POM's own `<properties>` plus the model built-ins; a placeholder that
+/// does not resolve from these bytes leaves the field `None`.
+///
+/// **Streaming.** `content` is a `&mut dyn Read`, read under
+/// [`POM_MAX_BYTES`] via
+/// [`read_to_capped_vec`](crate::stream_helpers::read_to_capped_vec) —
+/// the same bound and the same shape as [`parse_pom_dependencies`], which
+/// reads the same document for its dependencies.
+///
+/// # Errors
+///
+/// `Validation` only for **structurally invalid input** — bytes over
+/// [`POM_MAX_BYTES`], bytes that do not parse as XML, or an XML document
+/// whose root element is not `<project>`. A well-formed POM always
+/// succeeds, however little of its own coordinate it could resolve.
+pub fn parse_pom_identity(content: &mut dyn Read) -> DomainResult<PomIdentity> {
+    let body = crate::stream_helpers::read_to_capped_vec(content, POM_MAX_BYTES, |len, max| {
+        format!("maven pom is {len} bytes; maven pom max is {max}")
+    })?;
+    let raw = read_pom_document(&body)?;
+    Ok(resolve_identity(&raw))
+}
+
+/// Apply Maven's inheritance + this POM's own property interpolation to the
+/// raw model's own coordinate.
+fn resolve_identity(pom: &RawPom) -> PomIdentity {
+    let project_version = present(&pom.version).or_else(|| present(&pom.parent_version));
+    let project_group_id = present(&pom.group_id).or_else(|| present(&pom.parent_group_id));
+    let interpolator = Interpolator {
+        properties: &pom.properties,
+        project_version,
+        project_group_id,
+    };
+    // Interpolate each field through the POM's own properties. A field
+    // whose placeholder does not resolve stays `None`: the POM has not
+    // told us what it is, and guessing would turn a literal `${revision}`
+    // into a refusal against every unflattened CI-friendly POM.
+    let resolved = |raw: Option<&str>| {
+        let raw = raw?;
+        let expanded = interpolator.interpolate(raw)?;
+        let trimmed = expanded.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    PomIdentity {
+        group_id: resolved(project_group_id),
+        artifact_id: resolved(present(&pom.artifact_id)),
+        version: resolved(project_version),
+    }
+}
+
+impl PomIdentity {
+    /// Compare this declaration against the coordinate the PUT path is
+    /// storing the POM under.
+    ///
+    /// `stored_version` is the **version directory segment** of the request
+    /// path, not the version embedded in the filename. That is what makes
+    /// the comparison SNAPSHOT-safe: a timestamped snapshot deploy PUTs
+    /// `.../1.0-SNAPSHOT/app-1.0-20260101.120000-1.pom`, and the POM inside
+    /// still says `1.0-SNAPSHOT` — comparing against the filename's
+    /// timestamped form would refuse every correct snapshot deploy.
+    ///
+    /// Maven is case-sensitive and folds no separators
+    /// (`normalize_name` is the identity function — ADR 0032), so the
+    /// comparison is byte-exact.
+    #[must_use]
+    pub fn check(
+        &self,
+        stored_group_id: &str,
+        stored_artifact_id: &str,
+        stored_version: &str,
+    ) -> IdentityCheck {
+        IdentityCheck::first_divergence([
+            IdentityCheck::compare("groupId", self.group_id.as_deref(), stored_group_id),
+            IdentityCheck::compare(
+                "artifactId",
+                self.artifact_id.as_deref(),
+                stored_artifact_id,
+            ),
+            IdentityCheck::compare("version", self.version.as_deref(), stored_version),
+        ])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stage 1 — read the document into its raw (uninterpolated) model
 // ---------------------------------------------------------------------------
 
@@ -279,6 +398,10 @@ impl RawDependency {
 #[derive(Debug, Default)]
 struct RawPom {
     group_id: Option<String>,
+    /// `<project><artifactId>`. Maven never inherits an artifactId from a
+    /// `<parent>` — it is the one coordinate every POM must spell out
+    /// itself — so there is no parent counterpart to this field.
+    artifact_id: Option<String>,
     version: Option<String>,
     parent_group_id: Option<String>,
     parent_version: Option<String>,
@@ -294,6 +417,7 @@ struct RawPom {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leaf {
     ProjectGroupId,
+    ProjectArtifactId,
     ProjectVersion,
     ParentGroupId,
     ParentVersion,
@@ -310,6 +434,7 @@ fn leaf_at(path: &[String]) -> Option<Leaf> {
     match path {
         [project, field] if project == "project" => match field.as_str() {
             "groupId" => Some(Leaf::ProjectGroupId),
+            "artifactId" => Some(Leaf::ProjectArtifactId),
             "version" => Some(Leaf::ProjectVersion),
             _ => None,
         },
@@ -484,6 +609,7 @@ fn record_leaf(path: &[String], text: &str, pom: &mut RawPom, current: Option<&m
     let value = text.trim();
     match leaf {
         Leaf::ProjectGroupId => pom.group_id = Some(value.to_string()),
+        Leaf::ProjectArtifactId => pom.artifact_id = Some(value.to_string()),
         Leaf::ProjectVersion => pom.version = Some(value.to_string()),
         Leaf::ParentGroupId => pom.parent_group_id = Some(value.to_string()),
         Leaf::ParentVersion => pom.parent_version = Some(value.to_string()),
@@ -577,12 +703,13 @@ fn present(value: &Option<String>) -> Option<&str> {
 
 /// Strip control characters and truncate — applied to every fragment of
 /// artifact-supplied text that reaches an error message or a skip record.
+///
+/// Delegates to [`crate::publish_identity::sanitize_declared`], which
+/// states the same rule for the identity a publish refusal names. One
+/// definition, because the constraint is one constraint: artifact bytes
+/// reaching an operator-visible string.
 fn sanitize(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(SKIP_COORDINATE_MAX_CHARS)
-        .collect()
+    crate::publish_identity::sanitize_declared(value)
 }
 
 /// Turn the raw model into resolved specs plus counted skips.
@@ -742,6 +869,201 @@ mod tests {
 
     fn reasons(result: &PomDependencies) -> Vec<PomSkipReason> {
         result.skipped.iter().map(|s| s.reason).collect()
+    }
+
+    // -- the identity the POM declares about itself ------------------------
+
+    fn identity(xml: &str) -> PomIdentity {
+        parse_pom_identity(&mut Cursor::new(xml.as_bytes())).expect("well-formed POM parses")
+    }
+
+    #[test]
+    fn reads_the_gav_the_pom_declares() {
+        let pom = identity(
+            r#"<project>
+                 <groupId>com.example</groupId>
+                 <artifactId>foo</artifactId>
+                 <version>1.0</version>
+               </project>"#,
+        );
+        assert_eq!(pom.group_id.as_deref(), Some("com.example"));
+        assert_eq!(pom.artifact_id.as_deref(), Some("foo"));
+        assert_eq!(pom.version.as_deref(), Some("1.0"));
+        assert_eq!(
+            pom.check("com.example", "foo", "1.0"),
+            IdentityCheck::Agrees
+        );
+    }
+
+    /// Maven inherits `groupId` and `version` from `<parent>`, and the
+    /// parent block is written in *this* document — so the fallback needs
+    /// no parent fetch. `artifactId` is never inherited.
+    #[test]
+    fn group_id_and_version_fall_back_to_the_parent_block() {
+        let pom = identity(
+            r#"<project>
+                 <parent>
+                   <groupId>com.example</groupId>
+                   <artifactId>parent</artifactId>
+                   <version>2.5</version>
+                 </parent>
+                 <artifactId>child</artifactId>
+               </project>"#,
+        );
+        assert_eq!(pom.group_id.as_deref(), Some("com.example"));
+        assert_eq!(pom.artifact_id.as_deref(), Some("child"));
+        assert_eq!(pom.version.as_deref(), Some("2.5"));
+    }
+
+    #[test]
+    fn a_pom_declaring_another_group_id_diverges() {
+        let pom = identity(
+            r#"<project>
+                 <groupId>org.evil</groupId>
+                 <artifactId>foo</artifactId>
+                 <version>1.0</version>
+               </project>"#,
+        );
+        let check = pom.check("com.example", "foo", "1.0");
+        let divergence = check.divergence().expect("diverges");
+        assert_eq!(divergence.field, "groupId");
+        assert_eq!(divergence.declared, "org.evil");
+        assert_eq!(divergence.stored, "com.example");
+    }
+
+    #[test]
+    fn a_pom_declaring_another_artifact_id_diverges() {
+        let pom = identity(
+            r#"<project>
+                 <groupId>com.example</groupId>
+                 <artifactId>other</artifactId>
+                 <version>1.0</version>
+               </project>"#,
+        );
+        let check = pom.check("com.example", "foo", "1.0");
+        assert_eq!(check.divergence().expect("diverges").field, "artifactId");
+    }
+
+    #[test]
+    fn a_pom_declaring_another_version_diverges() {
+        let pom = identity(
+            r#"<project>
+                 <groupId>com.example</groupId>
+                 <artifactId>foo</artifactId>
+                 <version>9.9.9</version>
+               </project>"#,
+        );
+        let check = pom.check("com.example", "foo", "1.0");
+        assert_eq!(check.divergence().expect("diverges").field, "version");
+    }
+
+    /// A version written through a property the POM itself declares IS
+    /// resolvable from these bytes, so it is compared.
+    #[test]
+    fn a_version_from_this_poms_own_properties_resolves_and_is_compared() {
+        let pom = identity(
+            r#"<project>
+                 <groupId>com.example</groupId>
+                 <artifactId>foo</artifactId>
+                 <version>${rev}</version>
+                 <properties><rev>9.9.9</rev></properties>
+               </project>"#,
+        );
+        assert_eq!(pom.version.as_deref(), Some("9.9.9"));
+        assert_eq!(
+            pom.check("com.example", "foo", "1.0")
+                .divergence()
+                .map(|d| d.field),
+            Some("version")
+        );
+    }
+
+    /// Maven's CI-friendly `${revision}` with no `<properties>` entry does
+    /// not resolve from these bytes. `flatten-maven-plugin` normally
+    /// resolves it before deploy, but an unflattened POM reaches a
+    /// repository occasionally — its version is genuinely undecidable, so
+    /// it is reported as undeclared rather than refused.
+    #[test]
+    fn an_unresolved_version_property_is_undeclared_not_divergent() {
+        let pom = identity(
+            r#"<project>
+                 <groupId>com.example</groupId>
+                 <artifactId>foo</artifactId>
+                 <version>${revision}</version>
+               </project>"#,
+        );
+        assert_eq!(pom.version, None);
+        assert!(pom
+            .check("com.example", "foo", "1.0")
+            .divergence()
+            .is_none());
+    }
+
+    #[test]
+    fn a_self_closing_project_declares_nothing() {
+        let pom = identity("<project/>");
+        assert_eq!(pom, PomIdentity::default());
+        assert!(pom
+            .check("com.example", "foo", "1.0")
+            .divergence()
+            .is_none());
+    }
+
+    #[test]
+    fn an_empty_version_element_is_undeclared() {
+        let pom = identity(
+            r#"<project>
+                 <groupId>com.example</groupId>
+                 <artifactId>foo</artifactId>
+                 <version>   </version>
+               </project>"#,
+        );
+        assert_eq!(pom.version, None);
+    }
+
+    #[test]
+    fn a_snapshot_version_compares_against_the_version_directory_segment() {
+        let pom = identity(
+            r#"<project>
+                 <groupId>com.example</groupId>
+                 <artifactId>foo</artifactId>
+                 <version>1.0-SNAPSHOT</version>
+               </project>"#,
+        );
+        // The stored version is the directory segment, which keeps the
+        // `-SNAPSHOT` form even when the deployed filename is timestamped.
+        assert_eq!(
+            pom.check("com.example", "foo", "1.0-SNAPSHOT"),
+            IdentityCheck::Agrees
+        );
+    }
+
+    #[test]
+    fn a_document_that_is_not_a_project_is_an_error() {
+        let err =
+            parse_pom_identity(&mut Cursor::new(b"<settings/>".as_slice())).expect_err("not a POM");
+        assert!(err.to_string().contains("expected <project>"), "{err}");
+    }
+
+    #[test]
+    fn a_document_that_is_not_xml_is_an_error() {
+        let err =
+            parse_pom_identity(&mut Cursor::new(b"JARBYTES".as_slice())).expect_err("not XML");
+        assert!(err.to_string().contains("maven.pom"), "{err}");
+    }
+
+    #[test]
+    fn a_crafted_declaration_is_sanitised_before_it_reaches_the_refusal() {
+        let pom = identity(
+            "<project><groupId>org.evil\nFATAL</groupId><artifactId>foo</artifactId>\
+             <version>1.0</version></project>",
+        );
+        let check = pom.check("com.example", "foo", "1.0");
+        assert!(!check
+            .divergence()
+            .expect("diverges")
+            .declared
+            .contains('\n'));
     }
 
     /// A POM with a `<dependencies>` block wrapped in the usual preamble.
@@ -1412,13 +1734,16 @@ mod tests {
 
     #[test]
     fn a_skip_coordinate_is_stripped_of_control_characters_and_truncated() {
-        let long = "a".repeat(SKIP_COORDINATE_MAX_CHARS + 50);
+        let long = "a".repeat(crate::publish_identity::DECLARED_FRAGMENT_MAX_CHARS + 50);
         let result = parse(&pom_with(&format!(
             "<dependencies><dependency><groupId>g</groupId>
              <artifactId>{long}</artifactId></dependency></dependencies>"
         )));
         let coordinate = &result.skipped[0].coordinate;
-        assert_eq!(coordinate.chars().count(), SKIP_COORDINATE_MAX_CHARS);
+        assert_eq!(
+            coordinate.chars().count(),
+            crate::publish_identity::DECLARED_FRAGMENT_MAX_CHARS
+        );
         assert!(!coordinate.chars().any(char::is_control));
     }
 

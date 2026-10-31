@@ -74,7 +74,12 @@ struct MockPurgeGc {
     purge_calls: Mutex<Vec<Uuid>>,
     complete_calls: AtomicUsize,
     completed_batches: Mutex<Vec<AppendEvents>>,
-    retired: Mutex<HashSet<Uuid>>,
+    purged: Mutex<HashSet<Uuid>>,
+    /// `artifacts.deleted_at`, as written by `purge_artifact_refs` —
+    /// the retirement the preparation transaction performs, keyed by
+    /// artifact and holding the timestamp so a retry can be shown to
+    /// keep the first one (the adapter's `COALESCE`).
+    retired: Mutex<HashMap<Uuid, DateTime<Utc>>>,
     list_calls: AtomicUsize,
     /// Per-artifact script for `purge_artifact_refs`. Absent ⇒
     /// `Prepared` with whatever [`Self::refs`] holds. Present ⇒ the
@@ -208,8 +213,24 @@ impl MockPurgeGc {
         self.complete_calls.load(Ordering::SeqCst)
     }
 
+    /// Did the terminal transition run — `ArtifactPurged` appended and
+    /// the work item ended? Distinct from [`Self::is_retired`], which
+    /// is the `deleted_at` write the *preparation* performs: an aborted
+    /// run leaves an artifact retired and not purged, and the whole
+    /// safety argument for that order rests on telling the two apart.
+    fn is_purged(&self, artifact_id: Uuid) -> bool {
+        self.purged.lock().unwrap().contains(&artifact_id)
+    }
+
+    /// Did the preparation retire the row (`artifacts.deleted_at`)?
     fn is_retired(&self, artifact_id: Uuid) -> bool {
-        self.retired.lock().unwrap().contains(&artifact_id)
+        self.retired.lock().unwrap().contains_key(&artifact_id)
+    }
+
+    /// The timestamp the preparation retired with, so a test can prove
+    /// a retry re-asserts rather than rewrites it.
+    fn retired_at(&self, artifact_id: Uuid) -> Option<DateTime<Utc>> {
+        self.retired.lock().unwrap().get(&artifact_id).copied()
     }
 
     fn completed_batches(&self) -> Vec<AppendEvents> {
@@ -241,13 +262,18 @@ impl PurgeGcPort for MockPurgeGc {
     ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
         let fail = self.list_err.load(Ordering::SeqCst);
-        let retired = self.retired.lock().unwrap().clone();
+        // Membership is the event rule — a work item with no
+        // `ArtifactPurged` — and deliberately NOT `deleted_at`: the
+        // adapter's query is declared `DELETED-INCLUSIVE` for exactly
+        // this reason, and it is what lets an aborted run (retired, not
+        // purged) be resumed by the next sweep.
+        let purged = self.purged.lock().unwrap().clone();
         let mut rows: Vec<PendingPurge> = self
             .pending
             .lock()
             .unwrap()
             .iter()
-            .filter(|item| !retired.contains(&item.artifact_id))
+            .filter(|item| !purged.contains(&item.artifact_id))
             .filter(|item| after_artifact_id.is_none_or(|a| item.artifact_id > a))
             .cloned()
             .collect();
@@ -307,6 +333,7 @@ impl PurgeGcPort for MockPurgeGc {
     fn purge_artifact_refs(
         &self,
         artifact_id: Uuid,
+        retired_at: DateTime<Utc>,
     ) -> BoxFuture<'_, DomainResult<PurgePreparation>> {
         self.purge_calls.lock().unwrap().push(artifact_id);
         let fail = self.purge_err_for.lock().unwrap().contains(&artifact_id);
@@ -323,11 +350,31 @@ impl PurgeGcPort for MockPurgeGc {
             .get(&artifact_id)
             .cloned()
             .unwrap_or_default();
+        let outcome = if fail {
+            None
+        } else {
+            Some(scripted.unwrap_or(PurgePreparation::Prepared(refs)))
+        };
+
+        // The adapter retires the row in this transaction, on the
+        // `Prepared` paths and only those — a refusal leaves the
+        // artifact in service. `COALESCE` keeps the earlier timestamp,
+        // so a retry re-asserts rather than rewrites. The retirement
+        // also lands in the shared trace, which is the only way a test
+        // can assert it precedes the storage delete.
+        if matches!(outcome, Some(PurgePreparation::Prepared(_))) {
+            self.retired
+                .lock()
+                .unwrap()
+                .entry(artifact_id)
+                .or_insert(retired_at);
+            self.trace.lock().unwrap().push("retire".to_owned());
+        }
+
         Box::pin(async move {
-            if fail {
-                Err(DomainError::Invariant("prepare failed".into()))
-            } else {
-                Ok(scripted.unwrap_or(PurgePreparation::Prepared(refs)))
+            match outcome {
+                None => Err(DomainError::Invariant("prepare failed".into())),
+                Some(outcome) => Ok(outcome),
             }
         })
     }
@@ -374,7 +421,7 @@ impl PurgeGcPort for MockPurgeGc {
                 .get(&artifact_id)
                 .is_some_and(|refs| refs.iter().all(|item| item.completed)));
             self.completed_batches.lock().unwrap().push(events);
-            self.retired.lock().unwrap().insert(artifact_id);
+            self.purged.lock().unwrap().insert(artifact_id);
         }
         Box::pin(async move {
             if fail {
@@ -538,6 +585,31 @@ fn sorted_ids(n: usize) -> Vec<Uuid> {
     ids
 }
 
+/// One artifact with two refcount-0 hashes whose **second** delete
+/// fails once: the mid-sweep abort shape. The first blob is really
+/// gone, the second is not, and the terminal transition never runs — so
+/// the artifact ends the run with its bytes partly destroyed and its
+/// work item still pending.
+fn aborting_two_hash_harness(
+    artifact_id: Uuid,
+    first: &ContentHash,
+    second: &ContentHash,
+) -> Harness {
+    build(
+        MockPurgeGc::new()
+            .with_pending(vec![plain_pending(artifact_id)])
+            .with_refs(
+                artifact_id,
+                vec![work(first.clone(), 0), work(second.clone(), 0)],
+            ),
+        MockStorage::new()
+            .with_present(first.clone())
+            .with_present(second.clone())
+            .fail_delete_once(second.clone()),
+        MockReconcileGate::converged(),
+    )
+}
+
 fn purged_events(gc: &MockPurgeGc) -> Vec<ArtifactPurged> {
     gc.completed_batches()
         .into_iter()
@@ -607,7 +679,7 @@ async fn zero_refcount_deletes_blob_then_retires_with_terminal_event() {
     assert_eq!(summary.blobs_deleted, 1);
     assert_eq!(summary.purged_events, 1);
     assert_eq!(summary.errors, 0);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
     let batches = h.gc.completed_batches();
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].events.len(), 1);
@@ -641,7 +713,7 @@ async fn shared_blob_is_kept_but_artifact_is_retired() {
     assert_eq!(summary.blobs_kept, 1);
     assert_eq!(summary.purged_events, 1);
     assert!(h.storage.delete_attempts().is_empty());
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
     assert_eq!(purged_events(&h.gc)[0].refs_remaining, 3);
 }
 
@@ -685,37 +757,19 @@ async fn second_hash_failure_withholds_entire_terminal_transition_then_retries()
     let artifact_id = Uuid::new_v4();
     let first = hash(HASH_PRIMARY);
     let second = hash(HASH_CHILD);
-    let h = build(
-        MockPurgeGc::new()
-            .with_pending(vec![PendingPurge {
-                artifact_id,
-                quarantine_status: QuarantineStatus::None,
-                tag_targeted: false,
-                expired_only_by_keep_last_n: false,
-                user_deleted: false,
-            }])
-            .with_refs(
-                artifact_id,
-                vec![work(first.clone(), 0), work(second.clone(), 0)],
-            ),
-        MockStorage::new()
-            .with_present(first.clone())
-            .with_present(second.clone())
-            .fail_delete_once(second.clone()),
-        MockReconcileGate::converged(),
-    );
+    let h = aborting_two_hash_harness(artifact_id, &first, &second);
 
     let first_run = h.uc.process_expired(ts(5000)).await.unwrap();
     assert_eq!(first_run.errors, 1);
     assert_eq!(first_run.purged_events, 0);
     assert_eq!(h.gc.complete_call_count(), 0);
-    assert!(!h.gc.is_retired(artifact_id));
+    assert!(!h.gc.is_purged(artifact_id));
     assert!(purged_events(&h.gc).is_empty());
 
     let retry = h.uc.process_expired(ts(6000)).await.unwrap();
     assert_eq!(retry.errors, 0);
     assert_eq!(retry.purged_events, 2);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
     assert_eq!(purged_events(&h.gc).len(), 2);
     assert_eq!(
         h.storage.delete_attempts(),
@@ -750,7 +804,7 @@ async fn completed_primary_does_not_hide_outstanding_oci_child() {
     let summary = h.uc.process_expired(ts(6100)).await.unwrap();
     assert_eq!(summary.purged_events, 2);
     assert_eq!(h.storage.delete_attempts(), vec![child]);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
 }
 
 #[tokio::test]
@@ -799,7 +853,7 @@ async fn protected_artifacts_are_never_prepared() {
         let summary = h.uc.process_expired(ts(8000)).await.unwrap();
         assert_eq!(summary.skipped_protected, 1);
         assert_eq!(h.gc.purge_call_count(), 0);
-        assert!(!h.gc.is_retired(artifact_id));
+        assert!(!h.gc.is_purged(artifact_id));
     }
 }
 
@@ -845,8 +899,8 @@ async fn prepare_failure_is_per_artifact_and_sweep_continues() {
     let summary = h.uc.process_expired(ts(9100)).await.unwrap();
     assert_eq!(summary.errors, 1);
     assert_eq!(summary.purged_events, 1);
-    assert!(!h.gc.is_retired(bad));
-    assert!(h.gc.is_retired(good));
+    assert!(!h.gc.is_purged(bad));
+    assert!(h.gc.is_purged(good));
 }
 
 #[tokio::test]
@@ -894,12 +948,12 @@ async fn checkpoint_failure_withholds_terminal_transition_and_retries() {
     let first = h.uc.process_expired(ts(9200)).await.unwrap();
     assert_eq!(first.errors, 1);
     assert_eq!(first.purged_events, 0);
-    assert!(!h.gc.is_retired(artifact_id));
+    assert!(!h.gc.is_purged(artifact_id));
 
     let retry = h.uc.process_expired(ts(9300)).await.unwrap();
     assert_eq!(retry.errors, 0);
     assert_eq!(retry.purged_events, 1);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
 }
 
 #[tokio::test]
@@ -924,13 +978,13 @@ async fn terminal_transition_failure_retries_without_repeating_storage() {
     let first = h.uc.process_expired(ts(9400)).await.unwrap();
     assert_eq!(first.errors, 1);
     assert_eq!(first.purged_events, 0);
-    assert!(!h.gc.is_retired(artifact_id));
+    assert!(!h.gc.is_purged(artifact_id));
 
     let retry = h.uc.process_expired(ts(9500)).await.unwrap();
     assert_eq!(retry.errors, 0);
     assert_eq!(retry.purged_events, 1);
     assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
 }
 
 mod metrics_emission_tests {
@@ -1078,7 +1132,7 @@ async fn a_tag_set_between_expiry_and_purge_saves_the_artifact() {
     // artifact is purged on a later sweep once the tag moves.
     assert_eq!(h.gc.purge_call_count(), 0);
     assert!(h.storage.delete_attempts().is_empty());
-    assert!(!h.gc.is_retired(artifact_id));
+    assert!(!h.gc.is_purged(artifact_id));
 }
 
 #[tokio::test]
@@ -1096,7 +1150,7 @@ async fn an_untagged_keep_last_n_expiry_is_purged_normally() {
 
     assert_eq!(summary.skipped_tag_exempt, 0);
     assert_eq!(summary.blobs_deleted, 1);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
 }
 
 #[tokio::test]
@@ -1117,7 +1171,7 @@ async fn a_tagged_artifact_expired_by_another_predicate_is_still_purged() {
 
     assert_eq!(summary.skipped_tag_exempt, 0);
     assert_eq!(summary.blobs_deleted, 1);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
 }
 
 // ===========================================================================
@@ -1170,7 +1224,7 @@ async fn a_protection_refusal_under_the_lock_stops_the_artifact_and_is_counted_a
         assert!(h.gc.reclaim_calls().is_empty(), "{status}");
         assert!(h.storage.delete_attempts().is_empty(), "{status}");
         assert_eq!(h.gc.complete_call_count(), 0, "{status}");
-        assert!(!h.gc.is_retired(artifact_id), "{status}");
+        assert!(!h.gc.is_purged(artifact_id), "{status}");
     }
 }
 
@@ -1200,7 +1254,7 @@ async fn a_tag_exemption_under_the_lock_stops_the_artifact_and_is_counted_apart(
     assert_eq!(summary.purged_events, 0);
     assert_eq!(h.gc.purge_call_count(), 1);
     assert!(h.storage.delete_attempts().is_empty());
-    assert!(!h.gc.is_retired(artifact_id));
+    assert!(!h.gc.is_purged(artifact_id));
 }
 
 /// `NoArtifact` is neither of the refusals and neither is it an error:
@@ -1255,7 +1309,7 @@ async fn an_artifact_the_fresh_read_still_clears_is_purged_normally() {
     assert_eq!(summary.skipped_protected, 0);
     assert_eq!(summary.skipped_tag_exempt, 0);
     assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
 }
 
 /// A refusal is per-artifact: the sweep keeps walking the page and
@@ -1288,8 +1342,8 @@ async fn a_refusal_does_not_stop_the_rest_of_the_page() {
     assert_eq!(summary.skipped_tag_exempt_under_lock, 1);
     assert_eq!(summary.blobs_deleted, 1);
     assert_eq!(h.storage.delete_attempts(), vec![other_hash]);
-    assert!(!h.gc.is_retired(refused));
-    assert!(h.gc.is_retired(collected));
+    assert!(!h.gc.is_purged(refused));
+    assert!(h.gc.is_purged(collected));
 }
 
 // ===========================================================================
@@ -1321,7 +1375,7 @@ async fn a_user_deleted_artifact_releases_its_refs_and_its_blob() {
     assert_eq!(summary.errors, 0);
     assert_eq!(h.gc.purge_call_count(), 1);
     assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
     let purged = purged_events(&h.gc);
     assert_eq!(purged.len(), 1);
     assert_eq!(purged[0].refs_remaining, 0);
@@ -1373,7 +1427,7 @@ async fn a_tagged_user_delete_is_not_tag_exempt() {
     assert_eq!(summary.skipped_tag_exempt, 0);
     assert_eq!(summary.blobs_deleted, 1);
     assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
 }
 
 /// A `KeepLastN` expiry a delete then joined is purged: the delete is the
@@ -1399,7 +1453,7 @@ async fn a_tagged_keep_last_n_expiry_that_was_also_deleted_is_purged() {
 
     assert_eq!(summary.skipped_tag_exempt, 0);
     assert_eq!(summary.blobs_deleted, 1);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
 }
 
 /// Invariant 1 does not bend for a delete. An artifact is deletable
@@ -1434,7 +1488,7 @@ async fn a_user_deleted_evidence_artifact_is_still_not_collected() {
         assert_eq!(summary.blobs_deleted, 0);
         assert_eq!(h.gc.purge_call_count(), 0);
         assert!(h.storage.delete_attempts().is_empty());
-        assert!(!h.gc.is_retired(artifact_id));
+        assert!(!h.gc.is_purged(artifact_id));
     }
 }
 
@@ -1494,11 +1548,13 @@ async fn the_delete_happens_between_taking_the_lease_and_releasing_it() {
     assert_eq!(
         h.gc.trace(),
         vec![
+            "retire".to_owned(),
             "lease".to_owned(),
             "delete".to_owned(),
             "release".to_owned()
         ],
-        "the delete must be inside the lease, not before or after it"
+        "the delete must be inside the lease, not before or after it — \
+         and the retirement ahead of all three"
     );
     assert_eq!(h.gc.reclaim_calls(), vec![(artifact_id, content_hash)]);
     assert_eq!(
@@ -1527,7 +1583,10 @@ async fn a_blob_with_live_references_is_never_leased() {
     let summary = h.uc.process_expired(ts(2000)).await.unwrap();
     assert_eq!(summary.blobs_kept, 1);
     assert!(h.gc.reclaim_calls().is_empty());
-    assert!(h.gc.trace().is_empty());
+    // The retirement is the preparation's, not the lease's: it happens
+    // on every collected artifact, including one whose bytes a live
+    // reference keeps.
+    assert_eq!(h.gc.trace(), vec!["retire".to_owned()]);
 }
 
 /// Contention is a deferral, not a failure and not a delete: nothing is
@@ -1555,7 +1614,7 @@ async fn a_contended_lease_defers_the_blob_and_leaves_the_work_standing() {
         "a deferral is the mechanism working, not an error"
     );
     assert!(h.storage.delete_attempts().is_empty());
-    assert!(!h.gc.is_retired(artifact_id));
+    assert!(!h.gc.is_purged(artifact_id));
     assert_eq!(h.gc.complete_call_count(), 0);
 }
 
@@ -1586,7 +1645,7 @@ async fn a_deferred_blob_is_retried_by_the_next_run() {
     assert_eq!(second.blobs_deleted, 1);
     assert_eq!(second.purged_events, 1);
     assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
 }
 
 /// The worklist's zero was a snapshot, and under the lock it turns out
@@ -1616,7 +1675,7 @@ async fn a_recount_that_is_no_longer_zero_keeps_the_blob_and_states_the_count() 
         h.storage.delete_attempts().is_empty(),
         "bytes something references must not be deleted"
     );
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
     assert_eq!(purged_events(&h.gc)[0].refs_remaining, 2);
 }
 
@@ -1653,7 +1712,7 @@ async fn a_protected_claim_on_the_shared_bytes_keeps_the_blob_and_states_the_cou
         h.storage.delete_attempts().is_empty(),
         "bytes retained evidence claims must not be deleted"
     );
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
     assert_eq!(purged_events(&h.gc)[0].refs_remaining, 1);
 }
 
@@ -1677,7 +1736,7 @@ async fn a_failing_lease_deletes_nothing_and_is_counted_as_an_error() {
     assert_eq!(summary.blobs_deleted, 0);
     assert_eq!(summary.blobs_deferred, 0);
     assert!(h.storage.delete_attempts().is_empty());
-    assert!(!h.gc.is_retired(artifact_id));
+    assert!(!h.gc.is_purged(artifact_id));
 }
 
 /// The release is best-effort reporting, not part of the decision: the
@@ -1703,7 +1762,7 @@ async fn a_release_failure_does_not_undo_a_completed_delete() {
     assert_eq!(summary.errors, 0);
     assert_eq!(summary.purged_events, 1);
     assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
-    assert!(h.gc.is_retired(artifact_id));
+    assert!(h.gc.is_purged(artifact_id));
 }
 
 /// A storage failure inside a granted lease still releases it. Without
@@ -1734,12 +1793,245 @@ async fn a_storage_failure_inside_the_lease_still_releases_it() {
     assert_eq!(
         h.gc.trace(),
         vec![
+            "retire".to_owned(),
             "lease".to_owned(),
             "delete".to_owned(),
             "release".to_owned()
         ]
     );
     assert_eq!(h.gc.outstanding_leases(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The retirement leads the destruction
+// ---------------------------------------------------------------------------
+
+/// The ordering this unit exists for: `artifacts.deleted_at` is durable
+/// before the first byte is destroyed, not after the last. Asserted on
+/// the shared trace, because the only way to be wrong about this is to
+/// have the two writes in the wrong order, and a trace is the only
+/// thing that can see an order.
+#[tokio::test]
+async fn the_retirement_lands_before_the_first_storage_delete() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let gc = MockPurgeGc::new()
+        .with_pending(vec![plain_pending(artifact_id)])
+        .with_refs(artifact_id, vec![work(content_hash.clone(), 0)]);
+    let trace = Arc::clone(&gc.trace);
+    let h = build(
+        gc,
+        MockStorage::new()
+            .with_present(content_hash)
+            .tracing_into(trace),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.blobs_deleted, 1);
+    assert_eq!(summary.purged_events, 1);
+    let trace = h.gc.trace();
+    assert_eq!(
+        trace.iter().position(|step| step == "retire"),
+        Some(0),
+        "the retirement is the first thing the sweep does to this artifact: {trace:?}"
+    );
+    assert!(
+        trace.iter().position(|step| step == "delete").unwrap()
+            > trace.iter().position(|step| step == "retire").unwrap(),
+        "a delete ahead of the retirement is the defect: {trace:?}"
+    );
+    // The retirement carries the sweep's injected clock, so a retry is
+    // coherent with the `ArtifactPurged` it eventually emits.
+    assert_eq!(h.gc.retired_at(artifact_id), Some(ts(2000)));
+    assert!(h.gc.is_purged(artifact_id));
+}
+
+/// The load-bearing safety claim for the order above: an aborted run
+/// leaves a **retired artifact with intact bytes**, and the next sweep
+/// finishes it with no operator step.
+///
+/// The abort is driven by failing the second hash's storage delete
+/// once, so the first blob is genuinely gone when the run ends — the
+/// exact state the old order served a `500` from. The resume works
+/// because work-item membership is the event rule and never
+/// `deleted_at`: `list_pending_purge` offers the retired artifact
+/// again, and the second sweep terminates it.
+#[tokio::test]
+async fn an_aborted_run_leaves_the_artifact_retired_and_the_next_sweep_finishes_it() {
+    let artifact_id = Uuid::new_v4();
+    let first = hash(HASH_PRIMARY);
+    let second = hash(HASH_CHILD);
+    let h = aborting_two_hash_harness(artifact_id, &first, &second);
+
+    let aborted = h.uc.process_expired(ts(5000)).await.unwrap();
+    assert_eq!(aborted.errors, 1);
+    assert_eq!(aborted.purged_events, 0);
+    assert_eq!(
+        h.storage.delete_attempts(),
+        vec![first.clone(), second.clone()]
+    );
+    assert!(
+        h.gc.is_retired(artifact_id),
+        "the first blob is gone, so the row must already be out of service"
+    );
+    assert!(
+        !h.gc.is_purged(artifact_id),
+        "the work item is not terminated — that is what makes the resume possible"
+    );
+
+    // The retired artifact is still the work set. This is the whole
+    // reason retiring early is safe, so it is asserted on the port and
+    // not inferred from the sweep succeeding.
+    let still_pending = h.gc.list_pending_purge(10, None).await.unwrap();
+    assert_eq!(
+        still_pending
+            .iter()
+            .map(|item| item.artifact_id)
+            .collect::<Vec<_>>(),
+        vec![artifact_id]
+    );
+
+    let resumed = h.uc.process_expired(ts(6000)).await.unwrap();
+    assert_eq!(resumed.errors, 0);
+    assert_eq!(resumed.artifacts_visited, 1);
+    assert_eq!(resumed.purged_events, 2);
+    assert!(h.gc.is_purged(artifact_id));
+    // The second sweep re-asserts the retirement rather than rewriting
+    // it: the moment the artifact left service is an audit fact, and
+    // the adapter's `COALESCE` keeps the earlier timestamp.
+    assert_eq!(h.gc.retired_at(artifact_id), Some(ts(5000)));
+    assert!(h.gc.list_pending_purge(10, None).await.unwrap().is_empty());
+}
+
+/// A deferral is the other aborted shape, and it reaches the same
+/// state: the artifact is retired by the preparation, nothing was
+/// deleted, no terminal event was emitted, and the work stands. Pins
+/// that `blobs_deferred` is unchanged by the new order.
+#[tokio::test]
+async fn a_deferred_blob_leaves_a_retired_artifact_with_its_bytes_intact() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![plain_pending(artifact_id)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+            .reclaim(content_hash.clone(), Reclaim::Contended),
+        MockStorage::new().with_present(content_hash),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.blobs_deferred, 1);
+    assert_eq!(summary.blobs_deleted, 0);
+    assert_eq!(summary.purged_events, 0);
+    assert!(h.storage.delete_attempts().is_empty());
+    assert!(h.gc.is_retired(artifact_id));
+    assert!(!h.gc.is_purged(artifact_id));
+    assert_eq!(h.gc.list_pending_purge(10, None).await.unwrap().len(), 1);
+}
+
+/// A blob kept because something still claims it is not a declined
+/// purge: the artifact's retention decision stands, so it retires and
+/// its work item terminates. Only the *bytes* survive. Both keep
+/// outcomes are covered because they are reached by different
+/// questions (a live refcount, a claim the refcount cannot show).
+#[tokio::test]
+async fn a_kept_blob_still_retires_and_terminates_the_artifact() {
+    for keep in [Reclaim::Referenced(2), Reclaim::ProtectedClaim(1)] {
+        let artifact_id = Uuid::new_v4();
+        let content_hash = hash(HASH_PRIMARY);
+        let h = build(
+            MockPurgeGc::new()
+                .with_pending(vec![plain_pending(artifact_id)])
+                .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+                .reclaim(content_hash.clone(), keep.clone()),
+            MockStorage::new().with_present(content_hash),
+            MockReconcileGate::converged(),
+        );
+
+        let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+        assert_eq!(summary.blobs_kept, 1, "{keep:?}");
+        assert_eq!(summary.blobs_deleted, 0, "{keep:?}");
+        assert!(h.storage.delete_attempts().is_empty(), "{keep:?}");
+        assert!(h.gc.is_retired(artifact_id), "{keep:?}");
+        assert!(h.gc.is_purged(artifact_id), "{keep:?}");
+    }
+}
+
+/// **A purge that declines to act retires nothing.** This is the guard
+/// on the new order: `deleted_at` is the artifact's exit from service,
+/// so writing it earlier must not let a *refusal* — a protection
+/// holding, a tag landing, a row vanishing, a failing preparation —
+/// take an artifact out of service as a side effect of being
+/// considered.
+///
+/// Every refusal the sweep can reach is covered: the two page-row
+/// pre-exits, the three under-lock outcomes, and the preparation error.
+#[tokio::test]
+async fn no_refusal_retires_the_artifact() {
+    // The two page-row pre-exits: refused before the port is called at
+    // all, so there is nothing to script.
+    let evidence = Uuid::new_v4();
+    let tagged = Uuid::new_v4();
+    let h = build(
+        MockPurgeGc::new().with_pending(vec![
+            PendingPurge {
+                artifact_id: evidence,
+                quarantine_status: QuarantineStatus::Quarantined,
+                tag_targeted: false,
+                expired_only_by_keep_last_n: false,
+                user_deleted: false,
+            },
+            pending(tagged, true, true),
+        ]),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.skipped_protected, 1);
+    assert_eq!(summary.skipped_tag_exempt, 1);
+    assert_eq!(h.gc.purge_call_count(), 0);
+    assert!(!h.gc.is_retired(evidence));
+    assert!(!h.gc.is_retired(tagged));
+
+    // The three under-lock outcomes, plus a preparation that fails
+    // outright: the port was called, and none of them may retire.
+    let refusals = [
+        PurgePreparation::Protected {
+            status: QuarantineStatus::Rejected,
+        },
+        PurgePreparation::TagExempt,
+        PurgePreparation::NoArtifact,
+    ];
+    for refusal in refusals {
+        let artifact_id = Uuid::new_v4();
+        let h = build(
+            MockPurgeGc::new()
+                .with_pending(vec![plain_pending(artifact_id)])
+                .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 0)])
+                .prepares(artifact_id, refusal.clone()),
+            MockStorage::new().with_present(hash(HASH_PRIMARY)),
+            MockReconcileGate::converged(),
+        );
+        h.uc.process_expired(ts(2000)).await.unwrap();
+        assert_eq!(h.gc.purge_call_count(), 1, "{refusal:?}");
+        assert!(h.storage.delete_attempts().is_empty(), "{refusal:?}");
+        assert!(!h.gc.is_retired(artifact_id), "{refusal:?}");
+        assert!(!h.gc.is_purged(artifact_id), "{refusal:?}");
+    }
+
+    let failing = Uuid::new_v4();
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![plain_pending(failing)])
+            .with_refs(failing, vec![work(hash(HASH_PRIMARY), 0)])
+            .fail_purge_for(failing),
+        MockStorage::new().with_present(hash(HASH_PRIMARY)),
+        MockReconcileGate::converged(),
+    );
+    assert_eq!(h.uc.process_expired(ts(2000)).await.unwrap().errors, 1);
+    assert!(!h.gc.is_retired(failing));
 }
 
 // ---------------------------------------------------------------------------

@@ -37,13 +37,13 @@
 //!
 //! # HTTP client layering
 //!
-//! The HTTP client (extra-CA layering, the same-host redirect policy —
-//! per-hop host binding plus the 3-hop cap — timeout, TLS version pin)
-//! and the body-capped GET helper are shared with `OidcProvider` via
-//! `crate::internal`. One client serves every configured issuer; the
-//! redirect binding is per request, so that sharing is safe (see
-//! `internal::same_host_redirect_policy`). The full discovery +
-//! key-rotation audit flow lives on `OidcProvider`; this validator
+//! The HTTP client (extra-CA layering, the same-origin redirect policy —
+//! per-hop scheme + host binding plus the 3-hop cap — timeout, TLS
+//! version pin) and the body-capped GET helper are shared with
+//! `OidcProvider` via `crate::internal`. One client serves every
+//! configured issuer; the redirect binding is per request, so that
+//! sharing is safe (see `internal::same_origin_redirect_policy`). The
+//! full discovery + key-rotation audit flow lives on `OidcProvider`; this validator
 //! does NOT emit `OidcKeyRotated` events — rotation observation is the
 //! user-login adapter's job; the federation path lives on the issuer's
 //! published JWKS without per-rotation audit.
@@ -533,13 +533,14 @@ impl MultiIssuerJwksValidator {
                 FederationDenyReason::UnknownKid
             })?;
 
-        // Bind the discovery-supplied `jwks_uri` to the issuer's own host
-        // (same-host binding) BEFORE the fetch. The check is additive:
-        // the TLS pin + the same-host redirect policy on `self.http`
-        // (built by `internal::build_http_client`) are unchanged. This
-        // check owns the DECLARED url; `internal::same_host_redirect_policy`
-        // owns every hop the fetch then takes, per request — which is why
-        // one shared `http` is correct for all configured issuers. A
+        // Bind the discovery-supplied `jwks_uri` to the issuer's own
+        // origin (host and scheme) BEFORE the fetch. The check is
+        // additive: the TLS pin + the same-origin redirect policy on
+        // `self.http` (built by `internal::build_http_client`) are
+        // unchanged. This check owns the DECLARED url;
+        // `internal::same_origin_redirect_policy` owns every hop the
+        // fetch then takes, per request — which is why one shared `http`
+        // is correct for all configured issuers. A
         // rejection collapses to the same deny reason + metric as any
         // other JWKS-fetch failure on this path (`UnknownKid` /
         // `fetch_failed`); no new wire error or metric. The routability

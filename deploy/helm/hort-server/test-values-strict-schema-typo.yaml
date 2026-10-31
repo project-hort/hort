@@ -15,6 +15,10 @@
 #     (`worker.scanner.osvv`)
 #   - retired grouped key (`http.ociUploadTimeoutSeconds`, now
 #     `oci.uploadTimeoutSeconds`)
+#   - nested typo on a key whose silent acceptance would be fail-OPEN
+#     (`networkPolicy.jobEgres`): an ignored narrowing list leaves the Job
+#     pods on the unrestricted default while the operator believes they
+#     narrowed it, so rejection at render time is the whole protection
 #
 # A VALID counterpart (every key correct) is the default values.yaml +
 # the other test-values-*.yaml fixtures, all of which still render.
@@ -39,6 +43,9 @@ replicaCountt: 1                       # top-level typo
 apiBindAddr: "0.0.0.0:8080"            # retired pre-078 key (now api.bindAddr)
 http:
   ociUploadTimeoutSeconds: 3600        # retired pre-078 key (now oci.uploadTimeoutSeconds)
+networkPolicy:
+  jobEgres: []                         # nested typo (jobEgress); accepting it would
+                                       # silently leave the Job allowance unrestricted
 worker:
   enabled: true
   scanner:

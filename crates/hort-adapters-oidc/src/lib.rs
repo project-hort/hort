@@ -55,7 +55,7 @@
 //! Tokens, claim payloads, and email addresses never appear in tracing
 //! output. Only non-secret metadata (issuer URL, kid, error kind) does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -126,7 +126,10 @@ pub struct OidcProvider {
     /// 2. Kid-miss refresh cooldown (see [`JwksCache::last_refresh_completed`]).
     ///    A fresh-cache kid-miss (the cache itself is not TTL-stale, but
     ///    the requested kid is absent) within this window of the last
-    ///    completed refresh is denied outright — zero network I/O.
+    ///    completed refresh is denied outright — zero network I/O. A kid
+    ///    absent *because mechanism 1 evicted it* is exempt for one
+    ///    refresh (see [`JwksCache::refresh_owed`]); the exemption is per
+    ///    kid, so it never widens the gate for the flood.
     ///
     /// Both preserve the key-rotation invariant: a genuinely new kid
     /// still triggers exactly one refresh per window (mechanism 2) and
@@ -492,12 +495,13 @@ impl OidcProvider {
         // leader's result instead of firing its own fetch.
         let _refresh_permit = self.refresh_mutex.lock().await;
 
-        let (is_fresh, cached, last_refresh_completed) = {
+        let (is_fresh, cached, last_refresh_completed, refresh_owed) = {
             let guard = self.jwks.read().await;
             (
                 guard.is_fresh(Instant::now()),
                 guard.get(kid).cloned(),
                 guard.last_refresh_completed,
+                guard.is_refresh_owed(kid),
             )
         };
         if is_fresh {
@@ -515,7 +519,15 @@ impl OidcProvider {
         // the whole class instead. TTL/staleness-driven refreshes are
         // NOT gated — they are time-driven (at most one per TTL) and
         // must stay live for legitimate rotation.
-        if is_fresh {
+        //
+        // A kid evicted since the last completed refresh is exempt, for
+        // exactly one refresh (`JwksCache::refresh_owed`): its entry was
+        // removed on purpose, so denying the refetch here would strand it
+        // until the TTL expired. The exemption is per kid — an eviction
+        // does not open this gate for any other kid, which is what keeps a
+        // kid flood inside the throttle even while one key is being
+        // re-fetched.
+        if is_fresh && !refresh_owed {
             if let Some(last) = last_refresh_completed {
                 if now.saturating_duration_since(last) < self.eviction_backoff {
                     warn!(%kid, "jwks kid-miss refresh denied by cooldown");
@@ -525,8 +537,8 @@ impl OidcProvider {
             }
         }
 
-        // Kid not in cache (or cache stale) — benign first-seen OR
-        // legitimate key rotation past the cooldown. Fetch the fresh
+        // Kid not in cache (or cache stale, or this kid owed a refresh) —
+        // benign first-seen OR legitimate key rotation. Fetch the fresh
         // JWKS with NO cache lock held so concurrent validations against
         // already-cached kids proceed while this refresh is in flight.
         let fresh = self.fetch_jwks().await?;
@@ -676,11 +688,11 @@ impl OidcProvider {
                 OidcValidationError::IdpUnavailable
             })?;
 
-        // Bind the discovery-supplied `jwks_uri` to the issuer's own host
-        // (same-host binding) BEFORE the fetch. Additive: the TLS pin +
-        // the same-host redirect policy on `self.http` (built by
+        // Bind the discovery-supplied `jwks_uri` to the issuer's own
+        // origin (host and scheme) BEFORE the fetch. Additive: the TLS
+        // pin + the same-origin redirect policy on `self.http` (built by
         // `internal::build_http_client`) are unchanged. This check owns
-        // the DECLARED url; `internal::same_host_redirect_policy` owns
+        // the DECLARED url; `internal::same_origin_redirect_policy` owns
         // every hop the fetch then takes — neither reaches the other's
         // half. A rejection surfaces as the SAME error + metric as any
         // other JWKS-fetch failure on this path (`IdpUnavailable` /
@@ -851,6 +863,11 @@ pub(crate) struct JwksRotationObservation {
 /// `KidNotInCache` evictions never touch the map — they represent benign
 /// first-seen kids, and blocking them by backoff would prevent legitimate
 /// key rotation from recovering.
+///
+/// Eviction is per kid in its effect as well as its target: it removes one
+/// entry and marks that one kid in `refresh_owed`, and leaves
+/// `fetched_at` — the whole document's freshness — standing. See
+/// `refresh_owed`.
 struct JwksCache {
     keys: HashMap<String, jsonwebtoken::jwk::Jwk>,
     fetched_at: Option<Instant>,
@@ -868,6 +885,36 @@ struct JwksCache {
     /// cooldown regardless of TTL, and both are updated together on
     /// every replace.
     last_refresh_completed: Option<Instant>,
+    /// Kids evicted since the last completed refresh, each owed exactly
+    /// one refresh that the kid-miss cooldown must not deny.
+    ///
+    /// Why this exists rather than clearing `fetched_at`: an eviction
+    /// invalidates ONE key and says nothing about the freshness of the
+    /// others, but `fetched_at` is the freshness marker of the WHOLE
+    /// document. Clearing it made every other kid read as stale, and —
+    /// weighing more than the extra fetches — moved their next miss out of
+    /// the throttled class into the unthrottled one, because
+    /// [`OidcProvider::resolve_jwk`] gates a fresh-cache kid-miss by
+    /// cooldown and deliberately leaves a stale-cache refresh ungated for
+    /// legitimate rotation. One forged signature on a known kid therefore
+    /// routed a kid flood around the very throttle built to contain it.
+    /// This set keeps the evicted kid's own refresh reachable without that
+    /// collateral: it carries exactly that kid past the cooldown, and
+    /// nothing else.
+    ///
+    /// Discharged wholesale by [`Self::replace`] — a completed refresh
+    /// fetched the entire document, so no kid is still owed one. A refresh
+    /// that FAILS leaves the marker standing and the kid retries on its
+    /// next request, which is strictly narrower than the pre-marker
+    /// behaviour where a failed refresh left the whole cache stale and
+    /// every kid retrying.
+    ///
+    /// Bounded by [`EVICTION_MAP_MAX_ENTRIES`], the same cap as
+    /// `evictions`: at the cap further kids are evicted but not marked, so
+    /// their refresh falls back *under* the cooldown. That is the
+    /// fail-closed direction — an unmarked kid is throttled, never
+    /// exempted.
+    refresh_owed: HashSet<String>,
 }
 
 impl JwksCache {
@@ -878,6 +925,7 @@ impl JwksCache {
             ttl,
             evictions: HashMap::new(),
             last_refresh_completed: None,
+            refresh_owed: HashSet::new(),
         }
     }
 
@@ -927,6 +975,11 @@ impl JwksCache {
         let completed_at = Instant::now();
         self.fetched_at = Some(completed_at);
         self.last_refresh_completed = Some(completed_at);
+        // A completed refresh fetched the whole document, so every kid
+        // that was owed one has had it. Clearing here is what makes the
+        // marker worth exactly one refresh rather than a standing
+        // cooldown exemption.
+        self.refresh_owed.clear();
 
         // Diff the new kid set against the previous one. Use BTreeSet
         // so "smallest" is well-defined (lexicographic on the kid
@@ -955,15 +1008,20 @@ impl JwksCache {
     /// apply the per-kid backoff.
     ///
     /// Returns `true` if the eviction actually took effect (cache entry
-    /// removed, `fetched_at` cleared so the next `resolve_jwk` refetches)
-    /// and `false` if throttled (signature-mismatch within the backoff
-    /// window; cache untouched).
+    /// removed and the kid marked in [`Self::refresh_owed`], so the next
+    /// `resolve_jwk` for THAT kid refetches) and `false` if throttled
+    /// (signature-mismatch within the backoff window; cache untouched).
     ///
     /// Invariants:
     /// - `KidNotInCache` ALWAYS evicts (legitimate key rotation must still
     ///   trigger a refresh — this invariant must not be blocked by backoff).
     /// - `SignatureMismatch` evicts only if the previous same-kid
     ///   mismatch was > `backoff` ago (or first-ever).
+    /// - Evicting one kid leaves the freshness of the others untouched:
+    ///   `fetched_at` is the whole document's TTL marker and is NOT
+    ///   cleared here. The refresh the eviction owes is reached through
+    ///   the per-kid marker instead; `refresh_owed` records why the two
+    ///   are not interchangeable.
     /// - The per-kid eviction map is bounded by
     ///   [`EVICTION_MAP_MAX_ENTRIES`]; overflow drops the oldest timestamp
     ///   so a forged-kid flood cannot grow memory without bound.
@@ -982,11 +1040,33 @@ impl JwksCache {
             self.record_eviction_timestamp(kid.to_string(), now);
         }
         self.keys.remove(kid);
-        // Leave `fetched_at` cleared — a kid eviction forces the next
-        // `resolve_jwk` for this kid to miss, re-fetch the full JWKS,
-        // and (on legitimate key rotation) pick up the new key.
-        self.fetched_at = None;
+        // Removing the entry is already enough to make the next
+        // `resolve_jwk` for this kid miss (`get` is the lookup). What the
+        // marker adds is that the refresh the miss triggers is not denied
+        // by the kid-miss cooldown, so legitimate key rotation still picks
+        // up the new key — without `fetched_at` falling and taking every
+        // other kid's throttle with it.
+        self.mark_refresh_owed(kid);
         true
+    }
+
+    /// Mark `kid` as owed one cooldown-exempt refresh, unless
+    /// [`Self::refresh_owed`] already holds [`EVICTION_MAP_MAX_ENTRIES`]
+    /// distinct kids. At the cap the kid is still evicted from `keys`;
+    /// only the exemption is withheld, so its refresh falls under the
+    /// kid-miss cooldown instead of past it — the fail-closed direction.
+    fn mark_refresh_owed(&mut self, kid: &str) {
+        if self.refresh_owed.contains(kid) || self.refresh_owed.len() < EVICTION_MAP_MAX_ENTRIES {
+            self.refresh_owed.insert(kid.to_string());
+        }
+    }
+
+    /// Whether `kid` was evicted since the last completed refresh and so
+    /// is owed one the kid-miss cooldown must not deny. Per kid: an
+    /// eviction never exempts any OTHER kid, which is what keeps a
+    /// forged-kid flood inside the throttle.
+    fn is_refresh_owed(&self, kid: &str) -> bool {
+        self.refresh_owed.contains(kid)
     }
 
     /// Insert `ts` under `kid`, dropping the oldest timestamp if the map
@@ -2119,16 +2199,96 @@ FtBmFfStik03XAfEPVCRWBMc
     }
 
     #[test]
-    fn jwks_cache_evict_clears_fetched_at() {
+    fn jwks_cache_evict_leaves_whole_cache_freshness_standing() {
+        // An eviction invalidates ONE key. `fetched_at` is the freshness
+        // of the whole document, so it must not fall: clearing it made
+        // every other kid read as stale AND moved their next miss out of
+        // the cooldown-gated class into the ungated one — the escalation
+        // one forged signature on a known kid used to buy.
         let mut cache = JwksCache::new(Duration::from_secs(60));
-        cache.fetched_at = Some(Instant::now());
+        let fetched = Instant::now();
+        cache.fetched_at = Some(fetched);
+        cache.keys.insert("kid-a".into(), jwk_with_kid("kid-a"));
+        cache.keys.insert("kid-b".into(), jwk_with_kid("kid-b"));
+
         let actually_evicted = cache.evict(
-            "nonexistent",
+            "kid-a",
             EvictionReason::KidNotInCache,
             Duration::from_secs(10),
         );
+
         assert!(actually_evicted);
-        assert!(cache.fetched_at.is_none());
+        assert_eq!(
+            cache.fetched_at,
+            Some(fetched),
+            "evicting one kid must not touch the whole document's freshness"
+        );
+        assert!(
+            cache.is_fresh(Instant::now()),
+            "the cache must still read as fresh after a single eviction"
+        );
+        assert!(cache.get("kid-a").is_none(), "the evicted kid must be gone");
+        assert!(
+            cache.get("kid-b").is_some(),
+            "an untouched kid must still be served"
+        );
+        assert!(
+            cache.is_refresh_owed("kid-a"),
+            "the evicted kid is owed the refresh its removal triggers"
+        );
+        assert!(
+            !cache.is_refresh_owed("kid-b"),
+            "an eviction must not owe a refresh to any other kid — that is \
+             what keeps a kid flood inside the cooldown"
+        );
+    }
+
+    #[test]
+    fn jwks_cache_replace_discharges_every_owed_refresh() {
+        // The marker is worth exactly one refresh, not a standing
+        // exemption from the cooldown: a completed replace fetched the
+        // whole document, so nothing is still owed one.
+        let mut cache = JwksCache::new(Duration::from_secs(60));
+        cache.fetched_at = Some(Instant::now());
+        cache.keys.insert("kid-a".into(), jwk_with_kid("kid-a"));
+        assert!(cache.evict(
+            "kid-a",
+            EvictionReason::SignatureMismatch,
+            Duration::from_secs(60)
+        ));
+        assert!(cache.is_refresh_owed("kid-a"));
+
+        cache.replace(vec![jwk_with_kid("kid-a")]);
+
+        assert!(
+            !cache.is_refresh_owed("kid-a"),
+            "a completed refresh must discharge the marker, or the kid would \
+             be permanently exempt from the kid-miss cooldown"
+        );
+    }
+
+    #[test]
+    fn jwks_cache_refresh_owed_set_is_bounded_at_the_eviction_map_cap() {
+        // Same bound as `evictions`, and withholding the exemption at the
+        // cap is the fail-closed direction: an unmarked kid's refresh
+        // falls UNDER the cooldown, never past it.
+        let mut cache = JwksCache::new(Duration::from_secs(60));
+        for i in 0..(EVICTION_MAP_MAX_ENTRIES + 50) {
+            cache.mark_refresh_owed(&format!("kid-{i}"));
+        }
+        assert_eq!(
+            cache.refresh_owed.len(),
+            EVICTION_MAP_MAX_ENTRIES,
+            "the owed set must not grow past the cap"
+        );
+        assert!(
+            !cache.is_refresh_owed(&format!("kid-{}", EVICTION_MAP_MAX_ENTRIES + 10)),
+            "beyond the cap the kid is not exempted"
+        );
+        // Re-marking a kid already in the set stays idempotent at the cap.
+        cache.mark_refresh_owed("kid-0");
+        assert!(cache.is_refresh_owed("kid-0"));
+        assert_eq!(cache.refresh_owed.len(), EVICTION_MAP_MAX_ENTRIES);
     }
 
     #[test]
@@ -2502,6 +2662,251 @@ FtBmFfStik03XAfEPVCRWBMc
             after_flood - after_warmup <= 1,
             "forged-kid flood must produce at most one extra JWKS fetch, \
              got {after_flood} (warmup was {after_warmup})"
+        );
+    }
+
+    // -- Eviction is per kid, over the wire -------------------------------
+    //
+    // One eviction must not become a whole-cache event. Each test below
+    // fixes a long TTL (600 s) and a long cooldown so neither clock can
+    // be the thing that explains the outcome, warms the cache with one
+    // legitimate validation, then forces a `SignatureMismatch` eviction
+    // with a token carrying a kid the IdP DOES publish and a signature
+    // from a key it does not. `jwks_hit_count` is the discriminator: the
+    // error variants are the same either way, and the fetch count is what
+    // says whether the throttle held.
+
+    /// Two keys in the cache; one is evicted. The other must keep being
+    /// served from the cache it was already in — no refetch, because the
+    /// eviction said nothing about its freshness.
+    #[tokio::test]
+    async fn an_eviction_leaves_the_other_kids_served_from_cache() {
+        let two_keys = json!({
+            "keys": [
+                { "kty": "RSA", "use": "sig", "alg": "RS256",
+                  "kid": DEFAULT_KID, "n": TEST_N, "e": TEST_E },
+                { "kty": "RSA", "use": "sig", "alg": "RS256",
+                  "kid": OTHER_KID, "n": OTHER_N, "e": TEST_E },
+            ]
+        });
+        let (server, issuer) = start_idp(two_keys).await;
+        let provider = OidcProvider::with_resilience(
+            issuer.clone(),
+            "hort-server".into(),
+            "groups".into(),
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            DEFAULT_BODY_MAX_BYTES,
+            None,
+        )
+        .expect("with_resilience must succeed with None anchors");
+
+        let claims = TestClaims::defaults(&issuer, "hort-server");
+        let good_default = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+        provider
+            .validate_token_impl(&good_default)
+            .await
+            .expect("warmup should succeed");
+        let after_warmup = jwks_hit_count(&server).await;
+        assert_eq!(after_warmup, 1);
+
+        // Forged signature on a kid the IdP really publishes → evicts
+        // DEFAULT_KID, and nothing else.
+        let forged_default = sign(&claims, Algorithm::RS256, DEFAULT_KID, OTHER_PRIV_PEM);
+        assert!(
+            matches!(
+                provider.validate_token_impl(&forged_default).await,
+                Err(OidcValidationError::SignatureInvalid)
+            ),
+            "a forged signature must still reject"
+        );
+        assert_eq!(
+            jwks_hit_count(&server).await,
+            after_warmup,
+            "the eviction itself must not fetch"
+        );
+
+        // The untouched kid: served from cache, no refresh triggered.
+        let good_other = sign(&claims, Algorithm::RS256, OTHER_KID, OTHER_PRIV_PEM);
+        provider
+            .validate_token_impl(&good_other)
+            .await
+            .expect("an untouched kid must still validate after a sibling eviction");
+        assert_eq!(
+            jwks_hit_count(&server).await,
+            after_warmup,
+            "resolving an untouched kid must not refetch — one eviction is not \
+             a whole-cache staleness event"
+        );
+    }
+
+    /// The second half, which weighs more than the extra fetches: an
+    /// eviction must not move an UNRELATED kid-miss out of the throttled
+    /// class. The cooldown gates a fresh-cache miss and deliberately
+    /// leaves a stale-cache refresh ungated for legitimate rotation, so a
+    /// cache the eviction marked stale routed a kid flood around the very
+    /// throttle built to contain it.
+    #[tokio::test]
+    async fn an_eviction_does_not_exempt_an_unrelated_kid_from_the_cooldown() {
+        let (server, issuer) = start_idp(jwks_body_for(DEFAULT_KID, TEST_N)).await;
+        let provider = OidcProvider::with_resilience(
+            issuer.clone(),
+            "hort-server".into(),
+            "groups".into(),
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            DEFAULT_BODY_MAX_BYTES,
+            None,
+        )
+        .expect("with_resilience must succeed with None anchors");
+
+        let claims = TestClaims::defaults(&issuer, "hort-server");
+        let good = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+        provider
+            .validate_token_impl(&good)
+            .await
+            .expect("warmup should succeed");
+        let after_warmup = jwks_hit_count(&server).await;
+        assert_eq!(after_warmup, 1);
+
+        let forged = sign(&claims, Algorithm::RS256, DEFAULT_KID, OTHER_PRIV_PEM);
+        let _ = provider.validate_token_impl(&forged).await;
+
+        // A kid that was never in the cache, well inside the cooldown
+        // window. The eviction above is the only thing that could have
+        // opened this gate.
+        let unknown_kid = sign(&claims, Algorithm::RS256, OTHER_KID, OTHER_PRIV_PEM);
+        let denied = provider.validate_token_impl(&unknown_kid).await;
+        assert!(
+            matches!(denied, Err(OidcValidationError::SignatureInvalid)),
+            "an unknown kid inside the cooldown must be denied: {denied:?}"
+        );
+        assert_eq!(
+            jwks_hit_count(&server).await,
+            after_warmup,
+            "an unrelated kid-miss must stay inside the cooldown after an \
+             eviction — zero network I/O"
+        );
+    }
+
+    /// The other half of the same invariant: the EVICTED kid is not
+    /// stranded by the cooldown it now sits inside. Its entry was removed
+    /// on purpose, so its refresh is owed and must fire immediately.
+    #[tokio::test]
+    async fn the_evicted_kid_is_refetched_despite_the_cooldown() {
+        let (server, issuer) = start_idp(jwks_body_for(DEFAULT_KID, TEST_N)).await;
+        let provider = OidcProvider::with_resilience(
+            issuer.clone(),
+            "hort-server".into(),
+            "groups".into(),
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            DEFAULT_BODY_MAX_BYTES,
+            None,
+        )
+        .expect("with_resilience must succeed with None anchors");
+
+        let claims = TestClaims::defaults(&issuer, "hort-server");
+        let good = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+        provider
+            .validate_token_impl(&good)
+            .await
+            .expect("warmup should succeed");
+        let after_warmup = jwks_hit_count(&server).await;
+        assert_eq!(after_warmup, 1);
+
+        let forged = sign(&claims, Algorithm::RS256, DEFAULT_KID, OTHER_PRIV_PEM);
+        let _ = provider.validate_token_impl(&forged).await;
+
+        provider
+            .validate_token_impl(&good)
+            .await
+            .expect("the evicted kid must be refetched, not stranded by the cooldown");
+        assert_eq!(
+            jwks_hit_count(&server).await,
+            after_warmup + 1,
+            "exactly one refresh, owed to the evicted kid"
+        );
+    }
+
+    /// Counter-test for the whole mechanism: a real rotation — the IdP
+    /// re-keys under the SAME kid — still recovers, inside the cooldown
+    /// window, through the owed refresh. This is what the eviction exists
+    /// to make possible, and it is why the marker must bypass the
+    /// cooldown rather than the cooldown simply applying to everything.
+    #[tokio::test]
+    async fn rotation_under_the_same_kid_recovers_through_the_owed_refresh() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": base,
+                "jwks_uri": format!("{base}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+        let before_rotation = Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body_for(DEFAULT_KID, TEST_N)),
+            )
+            .up_to_n_times(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let provider = OidcProvider::with_resilience(
+            base.clone(),
+            "hort-server".into(),
+            "groups".into(),
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            DEFAULT_BODY_MAX_BYTES,
+            None,
+        )
+        .expect("with_resilience must succeed with None anchors");
+
+        let claims = TestClaims::defaults(&base, "hort-server");
+        let old_token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+        provider
+            .validate_token_impl(&old_token)
+            .await
+            .expect("warmup against the pre-rotation key should succeed");
+        let after_warmup = jwks_hit_count(&server).await;
+        assert_eq!(after_warmup, 1);
+
+        // The IdP re-keys: same kid, new modulus.
+        drop(before_rotation);
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body_for(DEFAULT_KID, OTHER_N)),
+            )
+            .mount(&server)
+            .await;
+
+        // First token signed by the new key: the cache still holds the old
+        // one, so the signature mismatches and the entry is evicted. The
+        // rejection is correct — the key in hand IS wrong.
+        let new_token = sign(&claims, Algorithm::RS256, DEFAULT_KID, OTHER_PRIV_PEM);
+        assert!(
+            matches!(
+                provider.validate_token_impl(&new_token).await,
+                Err(OidcValidationError::SignatureInvalid)
+            ),
+            "the first post-rotation token cannot validate against the old key"
+        );
+
+        // The next one picks up the rotated key through the owed refresh,
+        // without waiting out the 600 s cooldown.
+        provider
+            .validate_token_impl(&new_token)
+            .await
+            .expect("a rotated key must be picked up by the owed refresh");
+        assert_eq!(
+            jwks_hit_count(&server).await,
+            after_warmup + 1,
+            "the rotation costs exactly one refresh"
         );
     }
 
@@ -3267,8 +3672,18 @@ FtBmFfStik03XAfEPVCRWBMc
     }
 
     /// Stand up a minimal HTTPS server that serves a discovery document and
-    /// JWKS endpoint. Returns the bound `SocketAddr` and the test JWK body.
-    async fn https_jwks_server(leaf_pem: &str, leaf_key_pem: &str) -> std::net::SocketAddr {
+    /// JWKS endpoint. Returns the bound `SocketAddr`.
+    ///
+    /// `jwks_redirect`: when `Some(location)`, `/jwks` answers a `302` to
+    /// `location` instead of serving keys — the only way to put a redirect
+    /// hop on an `https` *requested* URL, since wiremock does not speak
+    /// TLS. One server helper rather than a near-copy, so the TLS material
+    /// and the discovery document cannot drift between the two shapes.
+    async fn https_jwks_server(
+        leaf_pem: &str,
+        leaf_key_pem: &str,
+        jwks_redirect: Option<String>,
+    ) -> std::net::SocketAddr {
         // Install the aws-lc-rs crypto provider (idempotent).
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -3312,9 +3727,22 @@ FtBmFfStik03XAfEPVCRWBMc
                 "/jwks",
                 axum::routing::get({
                     let j = jwks_json.clone();
+                    let redirect = jwks_redirect.clone();
                     move || {
                         let j = j.clone();
-                        async move { axum::Json(j) }
+                        let redirect = redirect.clone();
+                        async move {
+                            use axum::response::IntoResponse;
+                            match redirect {
+                                Some(location) => axum::response::Response::builder()
+                                    .status(302)
+                                    .header("Location", location)
+                                    .body(axum::body::Body::empty())
+                                    .expect("302 with a Location header builds")
+                                    .into_response(),
+                                None => axum::Json(j).into_response(),
+                            }
+                        }
                     }
                 }),
             );
@@ -3337,7 +3765,7 @@ FtBmFfStik03XAfEPVCRWBMc
     #[tokio::test]
     async fn extra_ca_anchors_allows_tls_to_private_ca_jwks_server() {
         let (ca_pem, leaf_pem, leaf_key_pem) = make_ca_and_leaf();
-        let addr = https_jwks_server(&leaf_pem, &leaf_key_pem).await;
+        let addr = https_jwks_server(&leaf_pem, &leaf_key_pem, None).await;
         let base = format!("https://127.0.0.1:{}", addr.port());
 
         // Parse the CA PEM into ExtraTrustAnchors — this is the only cert
@@ -3379,7 +3807,7 @@ FtBmFfStik03XAfEPVCRWBMc
     #[tokio::test]
     async fn no_extra_ca_anchors_fails_tls_to_private_ca_jwks_server() {
         let (_ca_pem, leaf_pem, leaf_key_pem) = make_ca_and_leaf();
-        let addr = https_jwks_server(&leaf_pem, &leaf_key_pem).await;
+        let addr = https_jwks_server(&leaf_pem, &leaf_key_pem, None).await;
         let base = format!("https://127.0.0.1:{}", addr.port());
 
         // Build the provider WITHOUT the extra CA — the server's CA is not
@@ -3412,12 +3840,15 @@ FtBmFfStik03XAfEPVCRWBMc
     // -- Redirect hardening tests --------------------------------------------
     //
     // Two properties on the OIDC fetch client, both layered in
-    // `internal::build_http_client` via `internal::same_host_redirect_policy`:
+    // `internal::build_http_client` via
+    // `internal::same_origin_redirect_policy`:
     //
-    //   1. every redirect hop stays on the host of the URL the fetch was
-    //      asked for — discovery as well as JWKS, since a discovery
-    //      document fetched from a foreign host is an attacker-authored
-    //      description of the issuer; and
+    //   1. every redirect hop stays on the ORIGIN — scheme and host — of
+    //      the URL the fetch was asked for. Discovery as well as JWKS,
+    //      since a discovery document fetched from a foreign host is an
+    //      attacker-authored description of the issuer; and on the scheme
+    //      leg because a hop to `http://` on the bound host reads the
+    //      keys that decide every token's validity in cleartext; and
     //   2. the chain gives up after `internal::HTTP_MAX_REDIRECTS` (3) hops.
     //
     // The operator pins the IdP URL, so the *first* request of a fetch has
@@ -3738,6 +4169,84 @@ FtBmFfStik03XAfEPVCRWBMc
         assert_eq!(out.subject, "subject-abc");
         keys.verify().await;
         server.verify().await;
+    }
+
+    /// The scheme leg of the per-hop origin binding, over the wire and in
+    /// the direction that matters: an `https` issuer whose `/jwks`
+    /// answers a `302` to `http://` on its OWN host.
+    ///
+    /// The host leg cannot refuse this hop — the host literal is
+    /// `127.0.0.1` on both sides — and the pre-fetch `jwks_uri` scheme
+    /// binding in `internal::check_jwks_uri_bound` cannot either, because
+    /// the declared `jwks_uri` is the issuer's own `https` URL and the
+    /// `Location` header arrives after that check has passed. So the
+    /// scheme leg of the hop binding is the only thing standing between
+    /// the keys that decide every token's validity and a cleartext read.
+    ///
+    /// The cleartext target is a LIVE wiremock serving a usable JWKS, so
+    /// the refusal is not an accident of the target being broken, and it
+    /// carries `.expect(0)`: "the keys were never read in cleartext" is
+    /// asserted at the target rather than inferred from an error. Its
+    /// port differs from the issuer's, which the binding deliberately
+    /// tolerates (see `internal::check_hop_bound_to_origin`) — leaving the
+    /// scheme as the single difference under test.
+    #[tokio::test]
+    async fn jwks_fetch_refuses_a_same_host_https_to_http_downgrade_hop() {
+        let cleartext = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(jwks_body_for(DEFAULT_KID, TEST_N)),
+            )
+            .expect(0)
+            .mount(&cleartext)
+            .await;
+
+        let (ca_pem, leaf_pem, leaf_key_pem) = make_ca_and_leaf();
+        let addr = https_jwks_server(
+            &leaf_pem,
+            &leaf_key_pem,
+            Some(format!("{}/jwks", cleartext.uri())),
+        )
+        .await;
+        let base = format!("https://127.0.0.1:{}", addr.port());
+        assert_eq!(
+            host_of(&cleartext.uri()),
+            host_of(&base),
+            "the downgrade target must sit on the issuer's OWN host, or this \
+             test silently becomes an off-host test"
+        );
+        assert_ne!(
+            cleartext.uri(),
+            base,
+            "the two listeners must be distinct, so the hop really leaves the \
+             TLS listener"
+        );
+
+        let anchors = ExtraTrustAnchors::parse_pem(ca_pem.as_bytes()).expect("parse rcgen CA PEM");
+        let provider = OidcProvider::new(
+            base.clone(),
+            "hort-server".into(),
+            "groups".into(),
+            Duration::from_secs(60),
+            Some(&anchors),
+        )
+        .expect("OidcProvider::new with extra CA must succeed");
+
+        let claims = TestClaims::defaults(&base, "hort-server");
+        let token = sign(&claims, Algorithm::RS256, DEFAULT_KID, TEST_PRIV_PEM);
+
+        let err = provider
+            .validate_token_impl(&token)
+            .await
+            .expect_err("a same-host https→http jwks hop must be refused");
+        assert_eq!(
+            err,
+            OidcValidationError::IdpUnavailable,
+            "a refused hop is a fetch failure, not a forged signature"
+        );
+        // The assertion that matters: nothing was read over cleartext.
+        cleartext.verify().await;
     }
 
     /// Companion to `jwks_uri_redirect_chain_exceeding_three_hops_is_blocked`:

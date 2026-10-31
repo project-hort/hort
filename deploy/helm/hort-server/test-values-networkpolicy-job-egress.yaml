@@ -1,0 +1,62 @@
+# Narrowed-Job-egress fixture. `networkPolicy.jobEgress` populated MUST
+# replace the Job-scoped bootstrap policy's unrestricted `- {}` rule with
+# the operator's own entries, while the chart-owned DNS rule survives and
+# the policy's podSelector is untouched.
+#
+# Paired default state: test-values-cronjobs.yaml (jobEgress unset → the
+# unrestricted rule renders). That pairing is the regression that matters:
+# an upgrade must not stop letting the pre-install `migrate` hook through,
+# so the harness locks BOTH states.
+#
+# The destinations below are RFC 5737 documentation CIDRs — placeholders
+# standing in for "the operator's Postgres subnet" and "the
+# kube-apiserver", never an address from any real deployment.
+#
+# Usage:
+#   helm template hort deploy/helm/hort-server/ \
+#     -f deploy/helm/hort-server/test-values-networkpolicy-job-egress.yaml
+publicBaseUrl: http://hort.internal.example
+requireHttps: false
+
+# The `basic` provider is retired; this fixture (which only exercises
+# networkPolicy.jobEgress) uses the supported minimal-setup shape:
+# provider=disabled + nativeTokens.enabled.
+auth:
+  provider: disabled
+  nativeTokens:
+    enabled: true
+    signingKey:
+      existingSecret: hort-oci-signing-key
+      secretKey: hort-oci-token-signing-key.pem
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+ephemeralStore:
+  backend: memory
+
+networkPolicy:
+  # enabled left at the chart default (true) — both policies render.
+  #
+  # The operator's bootstrap destinations: Postgres for the migrate and
+  # svc-token-bootstrap Jobs, the kube-apiserver for the pre-pull wait Job
+  # and the svc-token-bootstrap main container.
+  jobEgress:
+    - to:
+        - ipBlock:
+            cidr: 198.51.100.0/24
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.10/32
+      ports:
+        - protocol: TCP
+          port: 443

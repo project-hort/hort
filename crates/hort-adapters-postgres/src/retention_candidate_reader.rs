@@ -981,7 +981,10 @@ mod tests {
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn keep_last_n_keeps_usable_siblings_when_the_newest_are_quarantined() {
-        use hort_domain::retention::{matches_bool, EvaluationInputs, PolicyPredicate};
+        use hort_domain::retention::{
+            matches_bool, EvaluationInputs, FindingAgeAnchor, FindingAgeAnchorSource,
+            PolicyPredicate,
+        };
 
         let Some(pool) = maybe_pool().await else {
             return;
@@ -1040,7 +1043,10 @@ mod tests {
                         keep_rank: row.keep_rank,
                         tag_targeted: row.tag_targeted,
                         findings: &[],
-                        first_detected_at: row.artifact.created_at,
+                        finding_age_anchor: Some(FindingAgeAnchor {
+                            known_since: row.artifact.created_at,
+                            source: FindingAgeAnchorSource::FirstObservation,
+                        }),
                         latest_scan_at: row.artifact.created_at,
                     },
                 ),
@@ -1057,7 +1063,10 @@ mod tests {
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn releasing_a_quarantined_sibling_pushes_the_oldest_released_one_out() {
-        use hort_domain::retention::{matches_bool, EvaluationInputs, PolicyPredicate};
+        use hort_domain::retention::{
+            matches_bool, EvaluationInputs, FindingAgeAnchor, FindingAgeAnchorSource,
+            PolicyPredicate,
+        };
 
         let Some(pool) = maybe_pool().await else {
             return;
@@ -1111,7 +1120,10 @@ mod tests {
                     keep_rank: row.keep_rank,
                     tag_targeted: row.tag_targeted,
                     findings: &[],
-                    first_detected_at: row.artifact.created_at,
+                    finding_age_anchor: Some(FindingAgeAnchor {
+                        known_since: row.artifact.created_at,
+                        source: FindingAgeAnchorSource::FirstObservation,
+                    }),
                     latest_scan_at: row.artifact.created_at,
                 },
             )
@@ -1329,7 +1341,10 @@ mod tests {
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn identical_content_tagged_in_another_repository_still_expires() {
-        use hort_domain::retention::{matches_bool, EvaluationInputs, PolicyPredicate};
+        use hort_domain::retention::{
+            matches_bool, EvaluationInputs, FindingAgeAnchor, FindingAgeAnchorSource,
+            PolicyPredicate,
+        };
 
         let Some(pool) = maybe_pool().await else {
             return;
@@ -1397,7 +1412,10 @@ mod tests {
                     keep_rank: row.keep_rank,
                     tag_targeted: row.tag_targeted,
                     findings: &[],
-                    first_detected_at: row.artifact.created_at,
+                    finding_age_anchor: Some(FindingAgeAnchor {
+                        known_since: row.artifact.created_at,
+                        source: FindingAgeAnchorSource::FirstObservation,
+                    }),
                     latest_scan_at: row.artifact.created_at,
                 },
             )
@@ -1418,7 +1436,10 @@ mod tests {
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn keep_last_n_marks_every_sibling_past_the_window_except_a_tag_target() {
-        use hort_domain::retention::{matches_bool, EvaluationInputs, PolicyPredicate};
+        use hort_domain::retention::{
+            matches_bool, EvaluationInputs, FindingAgeAnchor, FindingAgeAnchorSource,
+            PolicyPredicate,
+        };
 
         let Some(pool) = maybe_pool().await else {
             return;
@@ -1458,7 +1479,10 @@ mod tests {
                     keep_rank: row.keep_rank,
                     tag_targeted: row.tag_targeted,
                     findings: &[],
-                    first_detected_at: row.artifact.created_at,
+                    finding_age_anchor: Some(FindingAgeAnchor {
+                        known_since: row.artifact.created_at,
+                        source: FindingAgeAnchorSource::FirstObservation,
+                    }),
                     latest_scan_at: row.artifact.created_at,
                 };
                 matches_bool(&predicate, &inputs)

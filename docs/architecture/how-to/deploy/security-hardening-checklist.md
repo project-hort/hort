@@ -654,11 +654,13 @@ Several are in-binary correctness gates with no operator-tunable surface.
 - **Control:** The trust middleware
   (`crates/hort-http-core/src/middleware/trust.rs`) replaces the
   leftmost-XFF reading with `rightmost_untrusted_forwarded_for(headers,
-  peer_ip, trusted_cidrs)`. Walks the comma-separated header
-  right-to-left and returns the rightmost hop **not** in
-  `HORT_TRUSTED_PROXY_CIDRS`. The leftmost reading is forgeable — a
-  client can prepend an arbitrary IP — and produced the wrong
-  `client_ip` in any chain longer than one trusted proxy. Folded with
+  trusted_cidrs)`. Walks the comma-separated header right-to-left and
+  returns the rightmost hop **not** in `HORT_TRUSTED_PROXY_CIDRS`. The
+  leftmost reading is forgeable — a client can prepend an arbitrary IP
+  — and produced the wrong `client_ip` in any chain longer than one
+  trusted proxy. The predicate is per entry: an entry is a proxy hop
+  iff its own address is in the allowlist, so a prepended entry naming
+  an internal address is stepped over rather than attributed to. Folded with
   IPv4-mapped IPv6 normalisation: `Ipv6Addr::to_canonical()` runs
   before `IpNet::contains` so `::ffff:10.0.0.5` matches the same
   allowlist entry as `10.0.0.5`.
@@ -697,6 +699,44 @@ Several are in-binary correctness gates with no operator-tunable surface.
   chain with a known external client IP; assert the auth-attempt log
   records the external IP, not a proxy-hop IP.
 - **Relaxation:** none.
+
+### Client-IP attribution must be declared at boot
+
+- **Control:** `Config::from_env` refuses to start when
+  `HORT_TRUSTED_PROXY_CIDRS` is empty and
+  `HORT_CLIENT_IP_FROM_SOCKET_PEER` is not `true`
+  (`ConfigError::ClientIpAttributionUnconfigured`). An empty allowlist
+  attributes every request to its TCP peer, which behind a proxy,
+  ingress or LB is one address for every caller in the world — so the
+  PAT brute-force lockout, the auth-failure rate limit, the per-IP
+  concurrency cap and any fail2ban rule keyed on `client_ip` all
+  collapse onto a single bucket, and thirty failed credential
+  presentations from anywhere deny credentialed access deployment-wide.
+  Nothing observable at boot tells a proxied deployment from a direct
+  one, and no runtime test can (an untrusted peer sending
+  `X-Forwarded-For` would be a directly-connected attacker opting out
+  of its own bucket), so the operator declares it and the undeclared
+  case fails closed.
+- **Chart default:** `clientIpFromSocketPeer: false`. The chart renders
+  it only when `trustedProxyCidrs` is empty — set one or the other.
+- **Operator action required:** **yes, on upgrade.** A deployment with
+  an empty `trustedProxyCidrs` will not start. If anything at all sits
+  in front of hort — and in a Kubernetes install something always does
+  — set `trustedProxyCidrs` to the edge's source ranges; that is also
+  the fix for the collapsed attribution the check exists to surface.
+  Only a server clients dial directly should set
+  `clientIpFromSocketPeer: true`. **Never** satisfy it with
+  `trustedProxyCidrs: ["0.0.0.0/0"]`: that trusts `X-Forwarded-For`
+  from everyone, which lets any caller choose its own attribution — see
+  the CIDR-scoping action above.
+- **Verify post-install:** the boot log line `trust configuration
+  loaded` carries `client_ip_source`
+  (`forwarded_for_behind_trusted_proxy` or `socket_peer`); confirm it
+  matches your topology, then drive a request through the full chain
+  and assert the auth-attempt log's `client_ip` is the external
+  address.
+- **Relaxation:** none. There is no value that means "decide at
+  runtime".
 
 ### `GroupMappingUpdated` audit event
 

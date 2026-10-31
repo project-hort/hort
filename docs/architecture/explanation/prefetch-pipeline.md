@@ -27,8 +27,9 @@ upstream traffic.
   non-transitive triggers. Serde-defaulted to `3`.
 - **`transitive_depth`** — cascade depth cap. Serde-defaulted to `5`.
 - **`max_age_days`** — optional age filter, defaulted to `None`.
-- **`max_descendants`** — cumulative breadth cap on the transitive
-  cascade. Serde-defaulted to `200`; `0` collapses transitive
+- **`max_descendants`** — global breadth cap on the transitive cascade:
+  the total number of rows one cascade may enqueue, summed over every
+  branch. Serde-defaulted to `200`; `0` collapses transitive
   enqueueing entirely while leaving the trigger configured.
 
 The serde posture is deliberate and asymmetric. The numeric knobs carry
@@ -74,12 +75,22 @@ surface sits outside it:
   `Read ∧ Prefetch` permission gate and the token-kind gate live inside
   the use case.
 
-Anonymous reads never trigger prefetch. An earlier implicit
+Anonymous reads must never trigger prefetch. An earlier implicit
 trigger-on-index-fetch pathway was removed precisely because it let
 unauthenticated traffic drive upstream fetches; the self-service
 endpoint is its explicit, authenticated replacement (see the removal
 note on `PrefetchTrigger` in
 `crates/hort-domain/src/entities/repository.rs`).
+
+Removing that trigger only removed the *unconditional* case, though.
+`on_dist_tag_move` and PyPI's Mode-2 `transitive_deps` gate both fire
+from an index serve, which on a public proxy is reachable with no
+credential — so the rule holds only where the trigger is actually
+handed the serve's caller and returns on a `None` one. **The PyPI
+hot-path trigger does that** (`fire_prefetch_trigger_pypi` takes
+`Option<&CallerPrincipal>`). The npm, cargo and OCI hot-path triggers
+do not yet consult theirs, and until they do the rule is a statement
+about PyPI alone on those surfaces.
 
 ## The planner
 
@@ -149,7 +160,15 @@ pull-through uses, so prefetch and serve-site cannot diverge:
 - **PyPI** — the multi-distribution special case: one version maps to
   many files (sdist + wheels) with per-file checksums, so the leaf fans
   out over the per-version JSON manifest's `urls[]` array, one verified
-  ingest per distribution.
+  ingest per distribution. That fan-out is bounded by
+  `MAX_METADATA_FILES_PER_VERSION` (128,
+  `hort_domain::ports::format_handler`): nothing in the protocol bounds
+  how many entries the manifest carries, so without a ceiling the only
+  limit is the metadata body's storage backstop — 64 MiB by default, on
+  the order of a million entries. The same ceiling bounds the hot-path
+  trigger's per-version file fan-out. A version over it warms its
+  admitted prefix and reports the refused tail
+  (`urls_refused_over_cap`); it is not skipped whole.
 - **Maven** — no resolution method at all: the repository layout IS the
   URL, so the leaf composes the GAV path directly (POM always, jar when
   present) and verifies each file against its strongest upstream
@@ -210,12 +229,28 @@ leaf ingests), so it carries the `(repository_id, package, version)`
 coordinate and the handler re-resolves the artifact on claim; if the
 leaf has not landed yet, the claim retries.
 
-Breadth is bounded by `max_descendants`, carried cumulatively in the
-task params (`current_descendants_so_far`) rather than a progress
-store. The cohort is truncated to the remaining headroom *before* the
-insert, child rows truncated in lockstep, and the new running total
-stamped onto each child — so the cap holds per cascade branch no
-matter how wide a single manifest fans out.
+Breadth is bounded by `max_descendants`, carried in the task params
+(`descendant_budget`) rather than a progress store. A node's budget is
+how many rows it *and its whole subtree* may enqueue: the cohort is
+truncated to that budget *before* the insert, child rows truncated in
+lockstep, and the leftover divided **equally** among the children, so
+the sum over the whole cascade — every branch, not one root-to-leaf
+path — is bounded by the root's budget.
+
+The alternative carry, a cumulative spent-so-far counter, is what makes
+the cap per-branch: siblings inherit the same counter and each spends
+the full remaining headroom, so the cascade amplifies as the branching
+factor to the depth rather than as the cap. The budget is divided by
+integer division with no remainder spread: the at-most-`cohort - 1`
+rows that forfeits buy a deterministic allocation, so two runs of the
+same cascade warm the same subtree. A child whose share comes out at
+zero is not enqueued at all — it could enqueue nothing, so the row
+would only resolve its artifact, read its manifest and stop.
+
+A rolling deploy is covered from both sides: a row carrying only the
+old counter resolves to the headroom the previous release intended, and
+a child row still carries that counter alongside the budget so a worker
+on the previous release bounds itself at least as tightly.
 
 ### Seed suppression
 

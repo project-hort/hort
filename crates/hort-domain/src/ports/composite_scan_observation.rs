@@ -476,6 +476,7 @@ mod tests {
             severity_basis: SeverityBasis::Assessed,
             component_relation: ComponentRelation::Contained,
             statement: crate::types::FindingStatement::Unstated,
+            advisory_published_at: None,
         }
     }
 

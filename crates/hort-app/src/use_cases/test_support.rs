@@ -40,7 +40,9 @@ use hort_domain::ports::artifact_group_lifecycle::{
     ArtifactGroupLifecyclePort, GroupCommitOutcome, GroupMemberCommit,
 };
 use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
-use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
+use hort_domain::ports::artifact_lifecycle::{
+    require_paired_artifact_stream, ArtifactLifecyclePort, IngestEnqueue,
+};
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::composite_scan_observation::{
@@ -973,6 +975,30 @@ impl ArtifactRepository for MockArtifactRepository {
                     .clone()
                     .map(|v| (v, a.created_at, a.upstream_published_at))
             })
+            .collect();
+        rows.sort_by(|x, y| x.0.cmp(&y.0));
+        Box::pin(async move { Ok(rows) })
+    }
+
+    fn package_file_digests(
+        &self,
+        repository_id: Uuid,
+        package: &str,
+    ) -> BoxFut<'_, DomainResult<Vec<(String, ContentHash)>>> {
+        // Per-FILE read. Mirrors the SQL adapter's
+        // `package_file_digests`: every live row for
+        // `(repository_id, name)` including null-`version` ones, keyed by
+        // the row's own `path` — row presence is the "hort holds these
+        // bytes" signal. `Self::projected` is not applied because neither
+        // field it masks is read here.
+        let pkg = package.to_owned();
+        let mut rows: Vec<(String, ContentHash)> = self
+            .artifacts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.repository_id == repository_id && a.name == pkg)
+            .map(|a| (a.path.clone(), a.sha256_checksum.clone()))
             .collect();
         rows.sort_by(|x, y| x.0.cmp(&y.0));
         Box::pin(async move { Ok(rows) })
@@ -2385,6 +2411,14 @@ pub struct MockEventStore {
     /// (issue #87: `ExpectedVersion::Any` appends need no
     /// client-side expected-version read at all).
     read_stream_calls: AtomicUsize,
+    /// `(stream_id, authority.final_stream_position)` per
+    /// `delete_stream` call, in call order. The position is recorded
+    /// and not just the id so a test can pin *which* proof authorized
+    /// the seal.
+    deleted_streams: Mutex<Vec<(String, u64)>>,
+    /// `(stream_id, target, authority.final_stream_position)` per
+    /// `archive_stream` call, in call order.
+    archived_streams: Mutex<Vec<(String, String, u64)>>,
 }
 
 impl MockEventStore {
@@ -2400,6 +2434,8 @@ impl MockEventStore {
             fail_next_read_stream: Mutex::new(None),
             fail_read_stream_at: Mutex::new(None),
             read_stream_calls: AtomicUsize::new(0),
+            deleted_streams: Mutex::new(Vec::new()),
+            archived_streams: Mutex::new(Vec::new()),
         }
     }
 
@@ -2512,6 +2548,23 @@ impl MockEventStore {
             .lock()
             .unwrap()
             .push(trigger_after_global_position);
+    }
+
+    /// `(stream_id, seal authority position)` per `delete_stream` call,
+    /// in call order.
+    ///
+    /// Reading this from inside a collaborator — e.g. a
+    /// `CheckpointEmissionHook` double — is how a test pins
+    /// *ordering* rather than just counts: a hook that observes one
+    /// recorded delete was called after the seal committed, not before.
+    pub fn deleted_streams(&self) -> Vec<(String, u64)> {
+        self.deleted_streams.lock().unwrap().clone()
+    }
+
+    /// `(stream_id, target, seal authority position)` per
+    /// `archive_stream` call, in call order.
+    pub fn archived_streams(&self) -> Vec<(String, String, u64)> {
+        self.archived_streams.lock().unwrap().clone()
     }
 }
 
@@ -2673,24 +2726,43 @@ impl EventStore for MockEventStore {
         Box::pin(async move { Ok(truncated) })
     }
 
-    // Retention stubs: this is the workhorse mock for hort-app tests. No
-    // current test reaches the retention paths, so a panic flags
-    // accidental misuse rather than silently masking a coverage hole.
+    // Retention chokepoints: record the call and answer `Sealed`. The
+    // `eventstore-archive` handler tests reach these — a sweep has to
+    // actually seal a stream for the post-sweep checkpoint emission to
+    // have anything to anchor — and read them back through
+    // [`Self::deleted_streams`] / [`Self::archived_streams`].
+    //
+    // Deliberately no failure or `NotAtProvenVersion` injection here:
+    // the tests that pin *which* chokepoint fired with which target,
+    // and the fail-safe and stream-moved answers, drive the use case
+    // directly through the file-local mock in
+    // `eventstore_retention_use_case_tests.rs`, which already carries
+    // that injection surface. Adding a second copy here would let the
+    // two drift.
     fn delete_stream(
         &self,
-        _stream_id: StreamId,
-        _authority: SealAuthority,
+        stream_id: StreamId,
+        authority: SealAuthority,
     ) -> BoxFut<'_, DomainResult<SealOutcome>> {
-        Box::pin(async { unimplemented!("retention path not exercised by these tests") })
+        self.deleted_streams
+            .lock()
+            .unwrap()
+            .push((stream_id.to_string(), authority.final_stream_position));
+        Box::pin(async { Ok(SealOutcome::Sealed) })
     }
 
     fn archive_stream(
         &self,
-        _stream_id: StreamId,
-        _target: &str,
-        _authority: SealAuthority,
+        stream_id: StreamId,
+        target: &str,
+        authority: SealAuthority,
     ) -> BoxFut<'_, DomainResult<SealOutcome>> {
-        Box::pin(async { unimplemented!("retention path not exercised by these tests") })
+        self.archived_streams.lock().unwrap().push((
+            stream_id.to_string(),
+            target.to_owned(),
+            authority.final_stream_position,
+        ));
+        Box::pin(async { Ok(SealOutcome::Sealed) })
     }
 }
 
@@ -2704,6 +2776,14 @@ impl EventStore for MockEventStore {
 /// The recorded tuple carries the optional `ArtifactMetadata` too.
 /// Existing tests destructure with `(artifact, events, _)` or read
 /// the first two tuple fields directly.
+///
+/// This double **round-trips the pair**: the artifact it accepts is
+/// readable back from the paired artifact repository, and the events it
+/// accepts are readable back from the paired [`MockEventStore`]. So it
+/// refuses what the adapter refuses — every method calls
+/// [`require_paired_artifact_stream`] first. A double that accepted a
+/// pair naming two different artifacts would let a test assert over a
+/// projection/stream disagreement no producer in the system can write.
 pub struct MockArtifactLifecycle {
     transitions: Mutex<Vec<(Artifact, AppendEvents, Option<ArtifactMetadata>)>>,
     artifacts: Arc<MockArtifactRepository>,
@@ -3094,6 +3174,11 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         events: AppendEvents,
         metadata: Option<ArtifactMetadata>,
     ) -> BoxFut<'_, DomainResult<AppendResult>> {
+        // First, as in the adapter: the pair's identity is a
+        // precondition on the arguments, not an outcome of the write.
+        if let Err(e) = require_paired_artifact_stream(artifact, &events) {
+            return Box::pin(async move { Err(e) });
+        }
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
@@ -3141,6 +3226,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         events: AppendEvents,
         prior_status: QuarantineStatus,
     ) -> BoxFut<'a, DomainResult<AppendResult>> {
+        if let Err(e) = require_paired_artifact_stream(artifact, &events) {
+            return Box::pin(async move { Err(e) });
+        }
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
@@ -3193,6 +3281,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         let recorded = enqueues.to_vec();
         let recorded_edges = edges.to_vec();
         Box::pin(async move {
+            require_paired_artifact_stream(artifact, &events)?;
             // Failure-injection up front (mirrors `commit_transition`), before
             // recording anything, so a forced error leaves no stray enqueue.
             if let Some(err) = self.next_error.lock().unwrap().pop_front() {
@@ -3249,6 +3338,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         // applies BEFORE the score delta is recorded so a forced
         // error doesn't leave a stray delta in the snapshot.
         Box::pin(async move {
+            require_paired_artifact_stream(artifact, &events)?;
             // Replicate the failure check up front (mirrors the
             // legacy `commit_transition` path).
             if let Some(err) = self.next_error.lock().unwrap().pop_front() {
@@ -3298,6 +3388,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         let count = events_clone.events.len() as u64;
         let sbom_owned: Option<Vec<SbomComponent>> = sbom_components.map(<[_]>::to_vec);
 
+        if let Err(e) = require_paired_artifact_stream(artifact, &events_clone) {
+            return Box::pin(async move { Err(e) });
+        }
         // Failure injection guard. Mirrors the `commit_transition`
         // path: the failure fires BEFORE any state is recorded, so a
         // forced error doesn't leave a stray entry in the snapshot.
@@ -4546,6 +4639,32 @@ pub struct StubFormatHandler {
     /// stand in for an OCI blob row without pulling `hort-formats` into
     /// `hort-app` (the dependency direction forbids it).
     pub provenance_constituent: bool,
+    /// The [`PayloadAccess`](hort_domain::types::PayloadAccess) variant
+    /// each `extract_wheel_metadata_bytes` call was handed, in call
+    /// order — read back through
+    /// [`StubFormatHandler::wheel_payload_shapes`].
+    ///
+    /// Which variant arrives is the whole of whether the caller holds
+    /// the artifact in memory: `Bytes` can only be built from a slice
+    /// somebody already materialised, so observing it *is* observing a
+    /// whole-artifact buffer, and observing `ReadSeek` is observing its
+    /// absence. A byte count could not tell the two apart.
+    wheel_payload_shapes: Arc<Mutex<Vec<WheelPayloadShape>>>,
+}
+
+/// Which [`PayloadAccess`](hort_domain::types::PayloadAccess) variant a
+/// caller handed [`FormatHandler::extract_wheel_metadata_bytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelPayloadShape {
+    /// `PayloadAccess::Bytes` — the caller materialised the whole
+    /// artifact before calling.
+    Bytes,
+    /// `PayloadAccess::ReadStream` — forward-only; the handler has to
+    /// buffer it to reach a ZIP's tail-indexed member table.
+    ReadStream,
+    /// `PayloadAccess::ReadSeek` — seekable and not resident, so the
+    /// handler reads the central directory plus one member.
+    ReadSeek,
 }
 
 /// Canned response shapes for the
@@ -4607,7 +4726,14 @@ impl StubFormatHandler {
             oci_membership_edges: None,
             collision_fold: false,
             provenance_constituent: false,
+            wheel_payload_shapes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Handle onto the recorded payload shapes, cloneable before the
+    /// stub is moved into an `Arc<dyn FormatHandler>`.
+    pub fn wheel_payload_shapes(&self) -> Arc<Mutex<Vec<WheelPayloadShape>>> {
+        Arc::clone(&self.wheel_payload_shapes)
     }
 
     /// Make this stub classify every artifact as a provenance
@@ -4722,8 +4848,16 @@ impl FormatHandler for StubFormatHandler {
     fn extract_wheel_metadata_bytes(
         &self,
         _coords: &ArtifactCoords,
-        _payload: hort_domain::types::PayloadAccess<'_>,
+        payload: hort_domain::types::PayloadAccess<'_>,
     ) -> DomainResult<Option<bytes::Bytes>> {
+        self.wheel_payload_shapes
+            .lock()
+            .unwrap()
+            .push(match payload {
+                hort_domain::types::PayloadAccess::Bytes(_) => WheelPayloadShape::Bytes,
+                hort_domain::types::PayloadAccess::ReadStream(_) => WheelPayloadShape::ReadStream,
+                hort_domain::types::PayloadAccess::ReadSeek(_) => WheelPayloadShape::ReadSeek,
+            });
         // No override → trait default (Ok(None)). Mirrors every
         // non-PyPI production handler.
         match &self.wheel_metadata {
@@ -8857,6 +8991,56 @@ mod tests {
     const VALID_SHA256_A: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const VALID_SHA256_B: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
     const VALID_SHA256_C: &str = "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae";
+
+    /// The lifecycle mock refuses a pair whose batch is not the
+    /// handed-in artifact's stream, exactly as the adapter does — and
+    /// that mirroring is load-bearing for the same reason as the one
+    /// below: this double round-trips the pair (the artifact is
+    /// readable back from the paired repository, the events from the
+    /// paired event store), so a double that accepted the mismatch
+    /// would let an app-layer test assert over a projection/stream
+    /// disagreement no production path can write.
+    ///
+    /// Nothing is recorded either: the refusal precedes the record, so a
+    /// test cannot find the rejected transition in the snapshot.
+    #[tokio::test]
+    async fn mock_lifecycle_refuses_a_pair_naming_two_artifacts() {
+        use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort as _;
+
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let lc = MockArtifactLifecycle::new(artifacts.clone());
+        let a = sample_artifact(QuarantineStatus::Quarantined);
+        let other = Uuid::new_v4();
+
+        // Only the batch's stream id matters to the rule, so the batch
+        // carries nothing else.
+        let events = AppendEvents {
+            stream_id: StreamId::artifact(other),
+            expected_version: ExpectedVersion::Any,
+            events: Vec::new(),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: hort_domain::events::system_actor(),
+        };
+        assert_ne!(events.stream_id, StreamId::artifact(a.id));
+
+        let err = lc
+            .commit_transition(&a, events, None)
+            .await
+            .expect_err("the double must refuse what the adapter refuses");
+        assert!(matches!(err, DomainError::Invariant(_)), "{err:?}");
+        assert!(
+            lc.committed_transitions().is_empty(),
+            "a refused pair must leave no recorded transition",
+        );
+        assert!(
+            matches!(
+                artifacts.find_by_id(a.id).await,
+                Err(DomainError::NotFound { .. })
+            ),
+            "a refused pair must leave no artifact row",
+        );
+    }
 
     /// The upstream-mapping mock's gitops-write guard mirrors the
     /// adapter's, and that mirroring is load-bearing: the app-layer

@@ -15,6 +15,8 @@ use uuid::Uuid;
 use crate::entities::scan_policy::SeverityThreshold;
 use crate::error::{DomainError, DomainResult};
 
+use super::anchor::FindingAgeAnchorSource;
+
 /// Upper bound on a free-text manual-expiry reason. Mirrors the
 /// scan-policy `MAX_REASON_LEN` so the two operator-reason surfaces
 /// share one
@@ -66,7 +68,34 @@ pub enum ExpirationReason {
         max_cvss: Option<f32>,
         finding_count: u32,
         fix_available: bool,
-        first_detected_at: DateTime<Utc>,
+        /// How long the **vulnerability** had been known at the moment
+        /// of the decision — the resolved
+        /// [`FindingAgeAnchor`](super::FindingAgeAnchor)'s
+        /// `known_since`. `None` when no source
+        /// dated any of the artifact's vulnerabilities (then
+        /// `HasFindingDetectedFor` did not fire and some other
+        /// security-driven leg of the predicate did).
+        ///
+        /// **The wire key stays `first_detected_at`.** It is what every
+        /// `ArtifactExpired` already in the event store spells, and
+        /// renaming it would orphan them — the same reasoning that keeps
+        /// [`Self::KeepLastN`]'s `total` under its plain name. The Rust
+        /// name is the honest one, because the value is no longer a
+        /// detection: a publication date is an upstream fact about the
+        /// advisory, and nothing about this artifact's scan history.
+        #[serde(rename = "first_detected_at", default)]
+        known_since: Option<DateTime<Utc>>,
+        /// Which source supplied [`Self::SecurityFinding::known_since`].
+        /// `None` on a reason written before the anchor carried
+        /// provenance, and on one that resolved no anchor at all.
+        ///
+        /// A minimum across disagreeing feeds is not robust — one
+        /// dating systematically early drags every anchor forward — so
+        /// the chosen date never travels without the source that
+        /// supplied it. This is where that stays readable once the
+        /// projection rows behind the decision have moved on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        known_since_source: Option<FindingAgeAnchorSource>,
         latest_scan_at: DateTime<Utc>,
     },
 }
@@ -100,8 +129,16 @@ impl ExpirationReason {
     /// - `SecurityFinding.max_cvss`, when present, must be a finite
     ///   in-range `[0.0, 10.0]` score.
     /// - `SecurityFinding.latest_scan_at` must be at-or-after
-    ///   `first_detected_at` (the finding cannot be detected after the
-    ///   most recent scan that observed it).
+    ///   `known_since` **only when that date is our own observation**
+    ///   (we cannot have observed a finding after the most recent scan
+    ///   that reported it). An advisory publication date is upstream's
+    ///   fact about the advisory and nothing orders it against a scan of
+    ///   ours: a feed whose record postdates our last scan is odd but
+    ///   not a contradiction, and rejecting the reason would turn it
+    ///   into a sweep error instead of a decision.
+    /// - `SecurityFinding.known_since_source` requires
+    ///   `known_since` — a provenance for a date that is not there
+    ///   describes nothing.
     pub fn validate(&self) -> DomainResult<()> {
         match self {
             Self::Manual { reason, .. } => {
@@ -141,7 +178,8 @@ impl ExpirationReason {
             Self::SecurityFinding {
                 max_cvss,
                 finding_count,
-                first_detected_at,
+                known_since,
+                known_since_source,
                 latest_scan_at,
                 ..
             } => {
@@ -158,10 +196,23 @@ impl ExpirationReason {
                         )));
                     }
                 }
-                if latest_scan_at < first_detected_at {
+                if known_since.is_none() && known_since_source.is_some() {
+                    return Err(DomainError::Validation(
+                        "ExpirationReason::SecurityFinding carries a known_since_source \
+                         without a known_since date"
+                            .into(),
+                    ));
+                }
+                // Ordering is only an invariant for a date that is our
+                // own observation; see the doc comment above.
+                let observed_anchor = matches!(
+                    known_since_source,
+                    None | Some(FindingAgeAnchorSource::FirstObservation)
+                );
+                if observed_anchor && known_since.is_some_and(|k| *latest_scan_at < k) {
                     return Err(DomainError::Validation(
                         "ExpirationReason::SecurityFinding latest_scan_at precedes \
-                         first_detected_at"
+                         known_since"
                             .into(),
                     ));
                 }
@@ -226,7 +277,8 @@ mod tests {
             max_cvss: Some(9.0),
             finding_count: 1,
             fix_available: true,
-            first_detected_at: ts(0),
+            known_since: Some(ts(0)),
+            known_since_source: None,
             latest_scan_at: ts(10),
         };
         assert_eq!(r.metric_label(), "security_finding");
@@ -375,7 +427,8 @@ mod tests {
             max_cvss: Some(9.8),
             finding_count: 2,
             fix_available: true,
-            first_detected_at: ts(0),
+            known_since: Some(ts(0)),
+            known_since_source: None,
             latest_scan_at: ts(100),
         }
         .validate()
@@ -389,7 +442,8 @@ mod tests {
             max_cvss: None,
             finding_count: 1,
             fix_available: false,
-            first_detected_at: ts(0),
+            known_since: Some(ts(0)),
+            known_since_source: None,
             latest_scan_at: ts(0),
         }
         .validate()
@@ -403,7 +457,8 @@ mod tests {
             max_cvss: None,
             finding_count: 0,
             fix_available: false,
-            first_detected_at: ts(0),
+            known_since: Some(ts(0)),
+            known_since_source: None,
             latest_scan_at: ts(0),
         }
         .validate()
@@ -418,7 +473,8 @@ mod tests {
             max_cvss: Some(f32::NAN),
             finding_count: 1,
             fix_available: true,
-            first_detected_at: ts(0),
+            known_since: Some(ts(0)),
+            known_since_source: None,
             latest_scan_at: ts(0),
         }
         .validate()
@@ -433,7 +489,8 @@ mod tests {
             max_cvss: Some(-1.0),
             finding_count: 1,
             fix_available: true,
-            first_detected_at: ts(0),
+            known_since: Some(ts(0)),
+            known_since_source: None,
             latest_scan_at: ts(0),
         }
         .validate()
@@ -448,7 +505,8 @@ mod tests {
             max_cvss: Some(10.5),
             finding_count: 1,
             fix_available: true,
-            first_detected_at: ts(0),
+            known_since: Some(ts(0)),
+            known_since_source: None,
             latest_scan_at: ts(0),
         }
         .validate()
@@ -463,7 +521,8 @@ mod tests {
             max_cvss: Some(9.0),
             finding_count: 1,
             fix_available: true,
-            first_detected_at: ts(100),
+            known_since: Some(ts(100)),
+            known_since_source: None,
             latest_scan_at: ts(50),
         }
         .validate()
@@ -478,14 +537,138 @@ mod tests {
             max_cvss: Some(0.0),
             finding_count: 1,
             fix_available: true,
-            first_detected_at: ts(42),
+            known_since: Some(ts(42)),
+            known_since_source: None,
             latest_scan_at: ts(42),
         }
         .validate()
         .unwrap();
     }
 
+    /// A `FirstObservation` anchor keeps the ordering invariant: we
+    /// cannot have observed a finding after the most recent scan that
+    /// reported it.
+    #[test]
+    fn validate_security_finding_observed_anchor_after_scan_rejected() {
+        let err = ExpirationReason::SecurityFinding {
+            max_severity: SeverityThreshold::High,
+            max_cvss: Some(9.0),
+            finding_count: 1,
+            fix_available: true,
+            known_since: Some(ts(100)),
+            known_since_source: Some(FindingAgeAnchorSource::FirstObservation),
+            latest_scan_at: ts(50),
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("precedes"));
+    }
+
+    /// A publication date does not: it is upstream's fact about the
+    /// advisory and nothing orders it against a scan of ours. Rejecting
+    /// it would turn a feed whose record postdates our last scan into a
+    /// sweep error rather than a decision.
+    #[test]
+    fn validate_security_finding_published_anchor_after_scan_is_accepted() {
+        ExpirationReason::SecurityFinding {
+            max_severity: SeverityThreshold::High,
+            max_cvss: Some(9.0),
+            finding_count: 1,
+            fix_available: true,
+            known_since: Some(ts(100)),
+            known_since_source: Some(FindingAgeAnchorSource::AdvisoryPublication("osv".into())),
+            latest_scan_at: ts(50),
+        }
+        .validate()
+        .unwrap();
+    }
+
+    /// No anchor at all is a legitimate snapshot — a security-driven
+    /// predicate that does not read the anchor can still fire.
+    #[test]
+    fn validate_security_finding_without_known_since_ok() {
+        ExpirationReason::SecurityFinding {
+            max_severity: SeverityThreshold::High,
+            max_cvss: None,
+            finding_count: 1,
+            fix_available: false,
+            known_since: None,
+            known_since_source: None,
+            latest_scan_at: ts(50),
+        }
+        .validate()
+        .unwrap();
+    }
+
+    /// A provenance for a date that is not there describes nothing.
+    #[test]
+    fn validate_security_finding_source_without_date_rejected() {
+        let err = ExpirationReason::SecurityFinding {
+            max_severity: SeverityThreshold::High,
+            max_cvss: None,
+            finding_count: 1,
+            fix_available: false,
+            known_since: None,
+            known_since_source: Some(FindingAgeAnchorSource::FirstObservation),
+            latest_scan_at: ts(50),
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("without a known_since"));
+    }
+
     // -- serde round-trip (wire stability) ----------------------------------
+
+    /// The wire key for the anchor stays `first_detected_at`: every
+    /// `ArtifactExpired` already in the event store spells it that way,
+    /// and a reason that no longer parses is an artifact whose expiry
+    /// record cannot be read.
+    #[test]
+    fn security_finding_anchor_keeps_its_legacy_wire_key() {
+        let json = serde_json::to_value(ExpirationReason::SecurityFinding {
+            max_severity: SeverityThreshold::High,
+            max_cvss: None,
+            finding_count: 1,
+            fix_available: false,
+            known_since: Some(ts(7)),
+            known_since_source: None,
+            latest_scan_at: ts(50),
+        })
+        .expect("serialize");
+        let payload = &json["SecurityFinding"];
+        assert!(
+            payload.get("first_detected_at").is_some(),
+            "anchor must serialise under its legacy key: {json}"
+        );
+        assert!(payload.get("known_since").is_none());
+        assert!(
+            payload.get("known_since_source").is_none(),
+            "an absent provenance adds no key, so a legacy payload \
+             re-serialises unchanged: {json}"
+        );
+    }
+
+    /// A reason written before the anchor carried provenance still
+    /// parses, with the date under its old key and no source.
+    #[test]
+    fn legacy_security_finding_payload_still_deserialises() {
+        let raw = r#"{"SecurityFinding":{"max_severity":"High","max_cvss":null,
+            "finding_count":1,"fix_available":false,
+            "first_detected_at":"1970-01-01T00:00:07Z",
+            "latest_scan_at":"1970-01-01T00:00:50Z"}}"#;
+        let parsed: ExpirationReason = serde_json::from_str(raw).expect("deserialize");
+        match parsed {
+            ExpirationReason::SecurityFinding {
+                known_since,
+                known_since_source,
+                ..
+            } => {
+                assert_eq!(known_since, Some(ts(7)));
+                assert_eq!(known_since_source, None);
+            }
+            other => panic!("expected SecurityFinding, got {other:?}"),
+        }
+    }
 
     #[test]
     fn serde_round_trip_every_variant() {
@@ -516,7 +699,8 @@ mod tests {
                 max_cvss: Some(9.8),
                 finding_count: 4,
                 fix_available: true,
-                first_detected_at: ts(0),
+                known_since: Some(ts(0)),
+                known_since_source: None,
                 latest_scan_at: ts(1000),
             },
             ExpirationReason::SecurityFinding {
@@ -524,7 +708,8 @@ mod tests {
                 max_cvss: None,
                 finding_count: 1,
                 fix_available: false,
-                first_detected_at: ts(0),
+                known_since: Some(ts(0)),
+                known_since_source: None,
                 latest_scan_at: ts(0),
             },
         ];

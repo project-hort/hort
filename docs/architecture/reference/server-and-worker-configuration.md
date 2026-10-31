@@ -227,13 +227,23 @@ for the timeout knobs in depth.
 | Variable | Type | Default | Required? | Semantics |
 |---|---|---|---|---|
 | `HORT_PUBLIC_BASE_URL` | URL | _unset → none_ | Cond. | Public-facing base URL (scheme+authority only; must be `http`/`https` with a host). |
-| `HORT_TRUSTED_PROXY_CIDRS` | CSV of CIDRs | _empty_ | Cond. | Reverse-proxy allowlist for trusting `X-Forwarded-*`. |
+| `HORT_TRUSTED_PROXY_CIDRS` | CSV of CIDRs | _empty_ | Cond. | Reverse-proxy allowlist for trusting `X-Forwarded-*`, **and the sole input to client-IP attribution** — with it empty every request is attributed to its TCP peer. Never `0.0.0.0/0`: that trusts `X-Forwarded-For` from everyone, letting any caller pick its own attribution. |
+| `HORT_CLIENT_IP_FROM_SOCKET_PEER` | bool | `false` | Cond. | Declares that clients reach this server **directly** (no proxy, ingress or LB), so the TCP peer *is* the client. Required `true` when `HORT_TRUSTED_PROXY_CIDRS` is empty; not read when it is set. |
 | `HORT_REQUIRE_HTTPS` | bool | `false` | No | Refuse to boot without positive TLS evidence (see interlocks). |
 | `HORT_EXTRA_CA_BUNDLE` | path | _unset → system trust only_ | No | Extra CA PEM bundle, layered onto the system store for **all four** outbound TLS surfaces (upstream proxy, S3/MinIO, OIDC discovery+JWKS, outbound webhook delivery). **Fail-closed**: set-but-unreadable / bad PEM / zero certs aborts boot. See [extra-ca-bundle.md](../how-to/deploy/extra-ca-bundle.md). |
 
 > One of `HORT_PUBLIC_BASE_URL` or a non-empty `HORT_TRUSTED_PROXY_CIDRS`
 > is mandatory — with neither set the binary fails at startup
 > (`ConfigError::TrustUnconfigured`).
+>
+> **These two settings answer different questions, and both must be
+> answered.** `HORT_PUBLIC_BASE_URL` governs the URLs hort emits;
+> `HORT_TRUSTED_PROXY_CIDRS` governs *who the per-IP controls think the
+> caller is*. A pinned public URL does nothing for attribution. So a
+> second, independent startup rule applies: with
+> `HORT_TRUSTED_PROXY_CIDRS` empty, `HORT_CLIENT_IP_FROM_SOCKET_PEER=true`
+> is mandatory (`ConfigError::ClientIpAttributionUnconfigured`) —
+> see interlock 1b.
 
 ### Authentication provider (OIDC)
 
@@ -268,12 +278,19 @@ The `HORT_AUTH_LOCKOUT_*` env vars are removed — they powered the
 now-deleted
 `authenticate_local` HTTP-Basic-against-local-admin-row path. The
 `HORT_PAT_LOCKOUT_*` env vars (a distinct mechanism — bearer-path
-per-IP / per-token-prefix brute-force protection inside
-`PatValidationUseCase`) are unchanged.
+brute-force protection inside `PatValidationUseCase`) are unchanged.
+That lockout is keyed on the **bucketed client IP only** (a /24 for
+IPv4, a /48 for IPv6); there is no per-token-prefix leg, so a campaign
+spread widely enough across source addresses is bounded by the
+rate-limit buckets below and by nothing else. It engages on a
+credential *presentation* — the write-path auth middleware, the OCI
+bearer middleware, `POST /api/v1/auth/exchange` and `GET /v2/auth` —
+and deliberately not on the read path, whose cost is bounded by
+`HORT_RATELIMIT_AUTH_PER_MIN` instead.
 
 | Variable | Type | Default | Required? | Semantics |
 |---|---|---|---|---|
-| `HORT_RATELIMIT_AUTH_PER_MIN` | u32 | `60` | No | Per-IP auth-attempt rate cap. |
+| `HORT_RATELIMIT_AUTH_PER_MIN` | u32 | `60` | No | Per-IP auth-**failure** budget per minute (not an attempt cap — a valid principal's traffic never draws it down). Counts every write and every read that *presents* a credential, consuming only on failure; an anonymous read is out of scope. |
 | `HORT_RATELIMIT_WRITE_PER_MIN` | u32 | `300` | No | Per-IP write-path rate cap. |
 | `HORT_MAX_INFLIGHT` | usize | `512` | No | Workspace-wide concurrent-request cap. |
 | `HORT_MAX_INFLIGHT_PER_IP` | usize | `32` | No | Per-IP concurrent-request cap. |
@@ -513,7 +530,30 @@ rather than run misconfigured.
 
 1. **Trust unconfigured (unconditional).** `HORT_PUBLIC_BASE_URL` unset
    **and** `HORT_TRUSTED_PROXY_CIDRS` empty → boot fails
-   (`TrustUnconfigured`). One of the two is mandatory.
+   (`TrustUnconfigured`). One of the two is mandatory. This rule is
+   about **URL emission** (`X-Forwarded-Host` injection poisoning
+   package download URLs).
+1b. **Client-IP attribution unconfigured (unconditional).**
+   `HORT_TRUSTED_PROXY_CIDRS` empty **and**
+   `HORT_CLIENT_IP_FROM_SOCKET_PEER` not `true` → boot fails
+   (`ClientIpAttributionUnconfigured`). Independent of rule 1 and of
+   `HORT_PUBLIC_BASE_URL`, because attribution reads the CIDR list
+   alone: with it empty, every request is attributed to its TCP peer,
+   which behind a proxy is one address for every caller in the world
+   and collapses the PAT brute-force lockout, the auth-failure rate
+   limit, the per-IP concurrency cap and fail2ban onto a single bucket.
+   Nothing observable at boot distinguishes a directly-exposed
+   deployment from a proxied one, and no runtime heuristic can (“an
+   untrusted peer sent `X-Forwarded-For`” would let a
+   directly-connected attacker opt out of its own bucket by adding a
+   header), so the operator declares the shape and the undeclared case
+   fails closed.
+
+   **Upgrading:** an existing deployment with an empty
+   `HORT_TRUSTED_PROXY_CIDRS` will not start until one of the two is
+   set. If anything at all sits in front of hort, set the allowlist —
+   that is also the fix for the attribution bug the rule exists to
+   surface.
 2. **`HORT_REQUIRE_HTTPS=true`.** Fails if `HORT_PUBLIC_BASE_URL` is `http`
    **and** `HORT_TRUSTED_PROXY_CIDRS` is empty (no positive TLS
    evidence). An `https://` base URL **or** a non-empty CIDR list

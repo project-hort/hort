@@ -7,6 +7,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-31
+
+### Added
+
+- An admin can cut a CLI session off before it expires — `hort-cli admin
+  cli-session revoke` with the token in hand, or `revoke-user <user_id>` for
+  every session a user holds when the device is gone. Not a lockout: the user
+  can log in again immediately, and it needs an admin session rather than a
+  service account (#363).
+
+### Fixed
+
+- The retention purge now takes an artifact out of service before it deletes
+  any of its bytes. A download attempted while the sweep is working through its
+  batch answers `404` instead of `500` (#364).
+- A policy whose projection row fell behind its event stream no longer refuses
+  every later change: the write re-derives the row from the stream and retries,
+  so one failed projection update stops wedging the whole gitops apply. The
+  retry also schedules the policy re-evaluation pass a dropped gate change
+  never got, so the population stops being judged under the superseded gate.
+  Only a real concurrent writer is refused, as `503` with `Retry-After` (#362).
+
+### Security
+
+- **Checks that arrived after the write, and a Job allowance wider than it had
+  to be.** An OCI image index whose `manifests[]` carries a descriptor with no
+  usable digest — or a child whose stored size disagrees with the size declared
+  for it — is now refused rather than accepted with a graph edge missing, and a
+  malformed `subject.userId` in a gitops `PermissionGrant` is rejected before
+  the apply's first write instead of after it. The chart's Job-egress allowance
+  can now be narrowed to destinations you name, via the opt-in
+  `networkPolicy.jobEgress`; left empty it keeps the shipped allowance, so an
+  upgrade changes nothing (#382).
+- **A boundary drawn when something is issued now holds when it is consumed.**
+  An OCI `/v2/auth` bearer minted for `push` on one repository no longer
+  authorises a write on another repository it was granted only `pull` on; a
+  JWKS fetch redirected from `https` to `http` on the issuer's own host is
+  refused; and one forged signature no longer makes every other signing key
+  read as stale. OCI clients holding a token minted before this release are
+  challenged and re-mint (#381).
+- **A digest hort recorded is now the digest hort checks, and a fact is re-read
+  before it is acted on.** A same-length corrupted CAS read fails the download
+  instead of completing as a successful `200`, the metadata mirror refuses a
+  body altered at rest rather than becoming the checksum authority for a later
+  pull and no longer exposes its staging writes as keys of their own, a PyPI
+  Simple index advertises hort's own digest for a file hort holds, and a
+  retention purge can no longer delete an artifact a mutable ref was repointed
+  at concurrently (#380).
+- **The event chain and the row derived from it can no longer drift apart
+  unnoticed.** `verify-event-chain` now checks each stream's recomputed hash at
+  every position a checkpoint anchored, so a wholesale rewrite that also
+  extends the stream is reported instead of passing; and an artifact-lifecycle
+  commit whose event batch is not the artifact's own stream is refused rather
+  than committed atomically against the wrong artifact (#379).
+- **Prefetch fan-out is now bounded where it claimed to be, and a prefetch
+  target asks who owns the name.** `prefetchPolicy.maxDescendants` caps a
+  cascade's total rows across every branch instead of per branch, so a wide
+  dependency graph warms fewer packages than before; a PyPI version warms at
+  most 128 distribution files; an index read carrying no credential no longer
+  fires the PyPI prefetch triggers; self-service prefetch into a virtual
+  repository refuses a name one of its members owns; and a PyPI version with a
+  quarantined file is no longer advertised because a sibling file was released
+  (#378).
+- **Three bounds that were bypassed after being checked now hold.** Wheel
+  PEP 658 metadata extraction no longer holds the whole wheel in memory,
+  releasing an upload session no longer discards one admitted concurrently
+  (which let a principal exceed the upload-session cap), and OSV advisory
+  responses are now read under byte ceilings — refused, never truncated, with a
+  new `hort_advisory_query_total{result="body_too_large"}` label (#377).
+- **A publish whose archive disagrees with its coordinates is now refused.**
+  npm, Cargo and Maven hosted publishes read the identity the uploaded
+  archive declares about itself and reject a disagreement in each format's
+  own error shape, and a PyPI upload whose filename names a different
+  version than the form field is rejected. A Maven jar with no embedded
+  `pom.properties` still publishes (#376).
+- **Scan evidence a release decision could not read no longer reads as clean.**
+  An artifact whose stored findings are unreadable is judged on its recorded
+  severity counts instead of released, a CVE exclusion no longer clears a hold
+  it cannot be matched against (rescan to restore exact matching), and an
+  artifact under an active curation block is no longer handed to the release
+  timer (#375).
+- **An incomplete answer from the advisory feed is no longer booked as a
+  complete one.** A bulk-diff tick that could not read part of an ecosystem
+  archive holds the feed checkpoint and re-reads that window, and a batch
+  reply with the wrong result count fails instead of caching an invented
+  "no advisories" (#374).
+- **An input a scanner could not read no longer records a passing scan.**
+  Artifacts that such paths released as "nothing to assess" now stay held
+  until they are assessed, and a hosted PyPI publish's declared dependencies
+  reach the scan (#373).
+- **The failed-credential controls (PAT brute-force lockout, auth rate limit)
+  now key on the real caller, and a deployment that cannot identify one
+  refuses to start.** Set `HORT_TRUSTED_PROXY_CIDRS` to your edge's source
+  ranges, or `HORT_CLIENT_IP_FROM_SOCKET_PEER=true` (chart
+  `clientIpFromSocketPeer`) if clients reach hort directly (#372).
+- **`HasFindingDetectedFor` now measures how long the vulnerability has been
+  known, not how long the artifact has been scanned** — the advisory's
+  publication date where a scanner reports one, else our own first observation
+  of that vulnerability, and no match at all where neither exists. A retention
+  policy using this predicate previously expired an artifact as soon as a
+  finding appeared, if the artifact had been scanned for longer than the grace
+  period; it now waits out the grace period. Migration 034 adds a nullable
+  `scan_findings.advisory_published_at`, populated on rescan (#369).
+- The runtime role can no longer write either migration-bookkeeping table:
+  `hort-server migrate` revokes every write privilege on `_sqlx_migrations`
+  and `schema_compat_register` from `hort_app_role` on every run, leaving
+  `SELECT` for the boot gates. Operators who retrofit grants with
+  `GRANT … ON ALL TABLES IN SCHEMA public` must re-run the migrate Job
+  (#366).
+- **A queued destructive admin task re-checks its requester's authority before
+  it runs** and fails, naming the cause, if it no longer holds — so revoking an
+  identity also stops the destructive work it already queued. Destructive tasks
+  now require an `admin` user: a non-admin holding a `task:destructive` claim
+  mapping can still submit one, but it is refused at execution (#367).
+- The event-store retention sweep now anchors the seals it makes, so
+  `verify-event-chain` no longer reports them unanchored until the next
+  scheduled checkpoint. A sweep whose anchoring fails reports a failed job
+  naming the affected streams (#332).
+
 ## [0.16.0] - 2026-10-26
 
 ### Added

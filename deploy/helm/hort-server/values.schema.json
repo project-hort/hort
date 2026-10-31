@@ -645,6 +645,7 @@
     },
     "requireHttps": {"type": "boolean"},
     "trustedProxyCidrs": {"type": "array", "items": {"type": "string"}},
+    "clientIpFromSocketPeer": {"type": "boolean"},
     "rateLimitExemptCidrs": {"type": "array", "items": {"type": "string"}},
     "http": {
       "type": "object",
@@ -829,7 +830,8 @@
       "properties": {
         "enabled": {"type": "boolean"},
         "ingress": {"type": "array"},
-        "egress": {"type": "array"}
+        "egress": {"type": "array"},
+        "jobEgress": {"type": "array"}
       }
     },
     "extraEnv": {"type": "array"},

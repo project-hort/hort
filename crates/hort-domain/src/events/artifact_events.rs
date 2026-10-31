@@ -1701,7 +1701,8 @@ mod retention_event_tests {
             max_cvss: Some(9.0),
             finding_count: 0,
             fix_available: true,
-            first_detected_at: ts(0),
+            known_since: Some(ts(0)),
+            known_since_source: None,
             latest_scan_at: ts(10),
         };
         let err = e.validate().unwrap_err();
@@ -1754,7 +1755,8 @@ mod retention_event_tests {
                 max_cvss: Some(9.8),
                 finding_count: 4,
                 fix_available: true,
-                first_detected_at: ts(0),
+                known_since: Some(ts(0)),
+                known_since_source: None,
                 latest_scan_at: ts(1000),
             },
         ];

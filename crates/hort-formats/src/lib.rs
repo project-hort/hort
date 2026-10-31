@@ -61,6 +61,10 @@ pub mod index_serve;
 pub mod maven;
 pub mod npm;
 pub mod oci;
+// What a published archive declares about its own identity, compared with
+// the identity it is being stored under — the shared vocabulary every
+// hosted publish path's divergence refusal is built from.
+pub mod publish_identity;
 pub mod pypi;
 pub(crate) mod range_resolvers;
 pub(crate) mod sbom_helpers;

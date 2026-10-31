@@ -5,9 +5,9 @@ true` — the umbrella toggle that renders the svc-token bootstrap Job plus
 the `executionPath: admin-task` CronJobs (`staging-sweep`,
 `cron-rescan-tick`, `advisory-watch-tick`, `service-account-rotation`,
 `noop`, `replay-seen-prune`, `scanner-registry-prune`,
-`verify-event-chain`, and the destructive trio). It covers the
-**gitops prerequisite** the chart deliberately does
-not provision, the **two ways getting it wrong fails**, and the
+`eventstore-checkpoint`, `verify-event-chain`, and the destructive
+trio). It covers the **gitops prerequisite** the chart deliberately
+does not provision, the **two ways getting it wrong fails**, and the
 **destructive-task caveat**.
 
 For the full rendered-resource matrix and hook ordering see
@@ -246,11 +246,83 @@ for the `--admin` login flow and its ≤15 min session cap.
 
 **Do not** attempt to work around this by pointing the destructive
 CronJobs' `HORT_TOKEN` at a hand-minted `task:destructive`-carrying
-Secret — the chart has no values knob for that today (the destructive
-templates' `secretKeyRef` is hardcoded to the bootstrap Secret), and
-wiring one is explicitly deferred to a future
+Secret — no such token exists. A native token (PAT, svc-token,
+CliSession-kind) resolves no IdP claims at all, so the claim cannot be
+put on one; the only token that satisfies the gate is an **admin** user's,
+which satisfies it by the admin short-circuit rather than by carrying
+the claim. The chart also has no values knob for repointing those
+templates (their `secretKeyRef` is hardcoded to the bootstrap Secret),
+and wiring one is explicitly deferred to a future
 cron-proposes/admin-confirms approval workflow, not a supported
 workaround. Run the destructive kinds by hand until that workflow ships.
+
+### 5.1 The authority is re-checked again when the job runs
+
+Accepting a destructive invocation does not confer the authority to
+execute it. The `POST` enqueues a `jobs` row; the worker claims it some
+time later, and **before calling the handler it re-checks the requester
+named on that row against the live authority state**. If the authority no
+longer holds, the handler is never called — nothing is deleted or
+archived — and the row becomes a terminal `failed` job whose
+`last_error` names the cause, e.g.:
+
+```text
+destructive task refused at execution: the requester's "task:destructive"
+claim was revoked before execution
+```
+
+Read it off the row or the worker log:
+
+```bash
+hort-cli admin task get <job-id>
+kubectl --namespace <ns> logs deploy/<release>-worker | grep 'refusing to execute'
+```
+
+**What this means in practice — plan for it before you revoke anything:**
+
+- **Revoking an identity's destructive authority also stops the
+  destructive work it has already queued.** On the supported path (§5)
+  that identity is the admin who ran `hort-cli admin task invoke` by
+  hand, so the purge they queued minutes ago stops too — not only their
+  next attempt. It reaches a *scheduled* run for the same reason: the
+  k8s CronJobs invoke through the same operator surface as a human
+  (`hort-cli admin task invoke …` → `POST /api/v1/admin/tasks/…`), so if
+  a deployment ever drives a destructive kind on a schedule under an
+  admin-authenticated identity, revoking that identity stops the nightly
+  run — silently as far as the CronJob pod is concerned, because the
+  pod's `POST` already succeeded. **Storage reclamation stops with it**
+  (see the callout above). Look for the terminal `failed` jobs rows, not
+  for a CronJob failure.
+- **Three revocations have this effect**, and they are the three the
+  registry persists: `users.is_admin = false`, `users.is_active = false`,
+  and removing the `admin_task_invoke` `PermissionGrant`.
+- **A destructive task must be invoked by an `admin` user.** The
+  `task:destructive` claim is resolved from your IdP's `groups` claim at
+  authentication and is not persisted anywhere, so a *non-admin* holder
+  of a group → `task:destructive` `ClaimMapping` can enqueue a
+  destructive task and will then have it refused at execution. If you
+  have such a mapping, grant those operators `admin` (the documented path
+  — see §5 above) rather than relying on the claim alone.
+- **An unreachable database is not a revocation.** If the authority
+  tables cannot be read, the job is held rather than condemned: the
+  handler still does not run, the row keeps its retry budget, and the
+  next claim re-asks. Only once the budget is spent does it become a
+  terminal row.
+- **A refused job still holds the day's single-flight claim**, so
+  restoring the authority is not enough to make it run today. Every
+  destructive invocation takes a server-derived per-UTC-day idempotency
+  claim at enqueue
+  ([ADR 0028](../../../adr/0028-destructive-task-idempotency.md)), and
+  that claim is not scoped to a status — it survives the terminal row.
+  Re-invoking the same kind the same day therefore returns `200` with
+  the **refused** job's id instead of enqueuing a fresh one. Recovering
+  inside the day is the same explicit, audited path as for any other
+  failed destructive job: `DELETE FROM jobs WHERE id = <refused-id>`,
+  then re-invoke. Otherwise the next day's run picks it up.
+
+The re-check applies to the destructive invocations only — a
+`retention-evaluate` dry run, and every non-destructive kind, is
+unaffected and pays nothing for it.
 
 ---
 
@@ -290,6 +362,8 @@ applies today.
 | Bootstrap hook Job fails, log ends `exists but is not a service account` | A user named `sa:cronjob-tasks` already exists and is not a service account (naming collision) | Rename the `ServiceAccount` envelope, or resolve the collision on the existing user row |
 | Admin-task CronJob pod exits non-zero with `Permission::AdminTaskInvoke required` | Grant exists but is repository-scoped, or targets the wrong subject | Re-check the grant is `subject: {kind: serviceAccount, name: cronjob-tasks}` with **no** `repository:` field |
 | Destructive CronJob (if force-enabled) fails with `requires the "task:destructive" claim` | Expected — destructive kinds can never run under the claimless bootstrap svc-token | Leave disabled; run by hand per §5 |
+| A destructive task reports success at invoke time but nothing was purged/archived, and `hort-cli admin task get` shows a `failed` row whose `last_error` starts `destructive task refused at execution` | The requester's authority was revoked between enqueue and execution — demoted, deactivated, or its `admin_task_invoke` grant removed (§5.1) | Restore the authority (or use an identity that still holds it). The refused row is terminal, is not retried, and still owns the day's idempotency claim — so to re-run inside the same day, delete that row first (§5.1) |
+| Same shape but `last_error` starts `destructive task authority could not be re-checked` | The authority tables could not be read; the job was held, not refused | Fix database reachability — the row re-asks on its next claim until its retry budget is spent |
 | Routine `helm upgrade` starts failing with the grant-missing message after previously succeeding | The `PermissionGrant` was removed/revoked from gitops since the last upgrade | Re-add the grant, or intentionally leave `adminTasksEnabled: false` if admin tasks are no longer wanted |
 
 ---

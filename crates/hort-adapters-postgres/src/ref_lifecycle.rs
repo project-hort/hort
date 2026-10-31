@@ -20,6 +20,14 @@
 //! the use case can retry as a move. Previously this path used
 //! `ON CONFLICT DO UPDATE` and two concurrent first-placement calls left
 //! one RefMoved event orphaned on the loser's tentative `ref-<id>` stream.
+//!
+//! **The target artifact is locked before the ref row is written.** A
+//! mutable ref resolving to an artifact is what exempts that artifact
+//! from storage GC, and the storage-GC sweep reads that fact out of
+//! `mutable_refs` while holding `FOR UPDATE` on the artifact row. So
+//! `move_ref` takes `FOR SHARE` on the artifact rows its new target
+//! names, first thing in the transaction — see
+//! [`lock_target_artifacts`].
 
 use std::sync::Arc;
 
@@ -33,6 +41,7 @@ use hort_domain::ports::ref_lifecycle::{RefCommitOutcome, RefLifecyclePort};
 use hort_domain::ports::BoxFuture;
 
 use crate::event_store::PgEventStore;
+use crate::map_sqlx_error;
 
 /// PostgreSQL implementation of [`RefLifecyclePort`].
 pub struct PgRefLifecycle {
@@ -77,6 +86,114 @@ impl CurrentTarget {
     }
 }
 
+/// Take a **shared** lock on every artifact row this ref's new target
+/// resolves to, inside the write transaction and before `mutable_refs`
+/// is touched.
+///
+/// # What it protects
+///
+/// A mutable ref resolving to an artifact is what exempts that artifact
+/// from the storage-GC sweep, and the sweep reads that fact out of
+/// `mutable_refs` (`ARTIFACT_IS_TAG_TARGETED_SQL`) while holding
+/// `SELECT … FROM artifacts WHERE id = $1 FOR UPDATE`. Without this
+/// statement a ref write reaches that fact without touching `artifacts`
+/// at all: the two transactions lock disjoint rows and interleave
+/// freely, so the sweep reads "untagged", the ref write commits, and
+/// the artifact a tag now names is destroyed under it.
+///
+/// # Why the artifact row, and not the ref row
+///
+/// `move_ref` already locks the `mutable_refs` row, and that lock
+/// cannot carry this. The sweep's predicate is an `EXISTS` over a
+/// *set*, and the dangerous write is the **INSERT** of a ref row that
+/// does not exist yet — `FOR UPDATE` locks rows, not predicates, and
+/// there is no row to lock. The artifact row is the one row both sides
+/// can name, which is what makes it the common point: `FOR SHARE` here
+/// is incompatible with the sweep's `FOR UPDATE`, so a tag write and
+/// the purge of the artifact it names cannot overlap, and whichever
+/// runs second observes the other.
+///
+/// Shared rather than exclusive because the lock exists only to
+/// exclude the purge: two ref writes resolving to the same artifact are
+/// not in conflict, and must not queue behind each other.
+///
+/// Only the ref's **new** target needs this. A ref moving *away* from an
+/// artifact removes an exemption, and a sweep reading the stale "still
+/// tagged" answer refuses to purge — the fail-safe direction, which
+/// costs one sweep interval and nothing else. That is also why
+/// `retire_ref` does not take this lock.
+///
+/// # The row set
+///
+/// The inverse of `ARTIFACT_IS_TAG_TARGETED_SQL`'s join, read from the
+/// ref's side: `'hash'` → `(repository_id, checksum_sha256)`,
+/// `'version'` → `(repository_id, name = the ref's namespace, version)`.
+/// The two must stay the same join — locking a narrower set than that
+/// predicate can find would leave exactly the row whose answer this
+/// write changes unprotected. The pair of arms is pinned by
+/// `purge_gc`'s exclusion tests, one per `target_kind`.
+///
+/// Matching no row is the ordinary case for a target whose artifact is
+/// not in this repository, and locks nothing: there is no artifact for
+/// a sweep to be destroying.
+///
+/// # Lock ordering
+///
+/// This introduces one new wait edge, `ref writer → artifacts row`, and
+/// it cannot close a cycle. A cycle needs an `artifacts`-row holder to
+/// wait on something a ref writer holds, and a ref writer holds only
+/// `mutable_refs` rows and `ref-<id>` event rows. Nothing that locks an
+/// `artifacts` row writes `mutable_refs` (this file is its only
+/// production writer) and nothing else appends to a `ref-<id>` stream,
+/// so no `artifacts`-row holder can ever be waiting on a ref writer.
+/// Should that ever stop being true, a cycle surfaces as a deadlock
+/// abort, which `map_sqlx_error` classifies as contention and the
+/// caller retries — not as a failed tag write.
+async fn lock_target_artifacts(conn: &mut sqlx::PgConnection, r: &MutableRef) -> DomainResult<()> {
+    let outcome = match &r.target {
+        RefTarget::ContentHash(hash) => {
+            sqlx::query(
+                r#"SELECT 1
+                   -- DELETED-INCLUSIVE: a lock, not a read. It has to cover
+                   -- every row the purge's own `FOR UPDATE` can name, and
+                   -- that statement admits soft-deleted rows on purpose; a
+                   -- liveness predicate here would leave a row the purge is
+                   -- about to act on unlocked on this side.
+                     FROM artifacts a
+                    WHERE a.repository_id = $1
+                      AND a.checksum_sha256 = $2
+                      FOR SHARE"#,
+            )
+            .bind(r.repository_id)
+            .bind(hash.as_ref())
+            .execute(&mut *conn)
+            .await
+        }
+        RefTarget::Version(version) => {
+            sqlx::query(
+                r#"SELECT 1
+                   -- DELETED-INCLUSIVE: a lock, not a read. It has to cover
+                   -- every row the purge's own `FOR UPDATE` can name, and
+                   -- that statement admits soft-deleted rows on purpose; a
+                   -- liveness predicate here would leave a row the purge is
+                   -- about to act on unlocked on this side.
+                     FROM artifacts a
+                    WHERE a.repository_id = $1
+                      AND a.name = $2
+                      AND a.version = $3
+                      FOR SHARE"#,
+            )
+            .bind(r.repository_id)
+            .bind(&r.namespace)
+            .bind(version)
+            .execute(&mut *conn)
+            .await
+        }
+    };
+    outcome.map_err(|e| map_sqlx_error(&e, "artifacts", "tag_target_lock"))?;
+    Ok(())
+}
+
 impl RefLifecyclePort for PgRefLifecycle {
     fn move_ref(
         &self,
@@ -85,6 +202,13 @@ impl RefLifecyclePort for PgRefLifecycle {
     ) -> BoxFuture<'_, DomainResult<RefCommitOutcome>> {
         Box::pin(async move {
             let mut uow = self.event_store.begin_unit_of_work().await?;
+
+            // Before anything in `mutable_refs` is read or written: the
+            // artifact rows this ref is about to resolve to. Taken
+            // unconditionally and in one place so no branch below — the
+            // in-place UPDATE, the first-placement INSERT, or a third one
+            // added later — can reach `mutable_refs` without it.
+            lock_target_artifacts(uow.conn(), &r).await?;
 
             // Lock the existing row (if any) and read its current target.
             // When the row is absent the lock is a no-op and we fall into

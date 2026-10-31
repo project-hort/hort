@@ -82,9 +82,18 @@ pub enum PolicyPredicate {
     /// array on its source advisory (an upgrade exists somewhere
     /// upstream — does NOT require the fix to be in this repository).
     HasFixAvailable,
-    /// Match only after a finding has been present for the given
-    /// duration (seconds). The grace-period anchor for
+    /// Match only after the artifact's vulnerability has been **known**
+    /// for the given duration (seconds) — the grace-period leg of
     /// "vulnerable for ≥ N days with a fix" composite policies.
+    ///
+    /// The duration is measured from the advisory's publication date
+    /// where a backend reported one, and from our own first observation
+    /// of the vulnerability otherwise; where nothing dates it, this
+    /// predicate does **not** match. It is deliberately not measured
+    /// from anything in the artifact's own scan history, which dates
+    /// when we started looking rather than how long the vulnerability
+    /// has been public. See
+    /// [`resolve_finding_age_anchor`](super::resolve_finding_age_anchor).
     HasFindingDetectedFor(u64),
 }
 

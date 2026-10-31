@@ -342,7 +342,7 @@ fn materialise_a_level(
         per_version
             .entry(version)
             .and_modify(|(status, created)| {
-                *status = worst_status(*status, artifact.quarantine_status);
+                *status = status.worst_of(artifact.quarantine_status);
                 if artifact.created_at > *created {
                     *created = artifact.created_at;
                 }
@@ -451,31 +451,6 @@ fn materialise_v_level(
     MavenSourceOutput {
         entries,
         last_updated_fallback,
-    }
-}
-
-/// The most-restrictive of two quarantine statuses, so an A-level version
-/// is dropped by `NonServableStatusFilter` when ANY of its files is
-/// non-servable. Ordering (most → least restrictive):
-/// `Rejected` > `Quarantined` > `ScanIndeterminate` > `Released` > `None`.
-fn worst_status(
-    a: hort_domain::entities::artifact::QuarantineStatus,
-    b: hort_domain::entities::artifact::QuarantineStatus,
-) -> hort_domain::entities::artifact::QuarantineStatus {
-    use hort_domain::entities::artifact::QuarantineStatus as Q;
-    fn rank(s: Q) -> u8 {
-        match s {
-            Q::Rejected => 4,
-            Q::Quarantined => 3,
-            Q::ScanIndeterminate => 2,
-            Q::Released => 1,
-            Q::None => 0,
-        }
-    }
-    if rank(a) >= rank(b) {
-        a
-    } else {
-        b
     }
 }
 

@@ -47,6 +47,34 @@ pub type PackageVersionStatusRow = (String, QuarantineStatus, Option<DateTime<Ut
 /// lower-QPS read exercised only by the cargo sparse-index proxy source.
 pub type PackageVersionPublishTimeRow = (String, DateTime<Utc>, Option<DateTime<Utc>>);
 
+/// Per-`(repository, package)` stored-file row: `(path,
+/// checksum_sha256)` — one row per `artifacts` row hort actually holds
+/// under that `(repository_id, name)`, live rows only.
+///
+/// `path` is the row's full logical projection path, not a basename:
+/// which segment of it is the client-visible filename is a per-format
+/// fact (pypi's `build_artifact_logical_path` puts the filename last and
+/// verbatim; maven's does not), and the port does not know the format.
+/// The consuming format crate derives its own key.
+///
+/// Row presence means "hort holds these bytes under this path", and the
+/// hash is the digest a read of them is verified against
+/// (`VerifyingReader`, ADR 0003). An index serve uses it to advertise
+/// the digest of the bytes it will itself hand back, rather than the
+/// digest some other party claims for that filename. Absence means hort
+/// does not hold the file, which is NOT the same as "no digest" — the
+/// caller keeps whatever the upstream advertised and must never
+/// substitute one of its own.
+///
+/// **Unlike [`PackageVersionStatusRow`], null-`version` rows are
+/// included.** That filter exists because a null-version row has no
+/// versioned advertisement to gate; it has a filename and a digest all
+/// the same. For pypi in particular the download path carries no version
+/// segment at all (`parse_download_path` yields `version: None`), so
+/// excluding those rows would silently drop exactly the files this read
+/// exists to find.
+pub type PackageFileDigestRow = (String, ContentHash);
+
 /// Outbound port for artifact persistence (read-only + delete).
 ///
 /// Artifact writes go through [`ArtifactLifecyclePort::commit_transition`],
@@ -410,6 +438,36 @@ pub trait ArtifactRepository: Send + Sync {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    /// Per-`(repository, package)` `(path, checksum_sha256)` for every
+    /// live `artifacts` row — the "what does hort actually hold, per
+    /// file" read behind a proxy index serve's own digest advertisement
+    /// (see [`PackageFileDigestRow`]).
+    ///
+    /// Separate from [`Self::package_version_status`] for the two
+    /// reasons that method's own doc gives for staying narrow: it reads
+    /// columns outside the covering index `artifacts (repository_id,
+    /// name) INCLUDE (version, quarantine_status)`, so folding them in
+    /// would force a heap fetch onto the highest-QPS serve read for
+    /// every format; and its key is the **file**, not the version, which
+    /// a `(version, …)` row shape cannot carry — a version holds several
+    /// files and hort may hold only some of them.
+    ///
+    /// **Required, not defaulted**, unlike
+    /// [`Self::package_version_anchors`] /
+    /// [`Self::package_version_publish_times`] / `first_seen_for_checksum`.
+    /// Those three degrade to an omitted field (no deadline, no
+    /// `pubtime`, no age evidence). An empty answer here does not omit
+    /// anything: the caller falls back to the digest the *upstream*
+    /// claims for bytes hort is about to serve from its own store, which
+    /// is the defect this read exists to close. So an implementation
+    /// that cannot answer is a compile error rather than a silent
+    /// revert.
+    fn package_file_digests(
+        &self,
+        repository_id: Uuid,
+        package: &str,
+    ) -> BoxFuture<'_, DomainResult<Vec<PackageFileDigestRow>>>;
+
     /// The earliest ingest observation hort holds for this content hash —
     /// `MIN(created_at)` over every `artifacts` row carrying
     /// `checksum_sha256 = $1`, across **all** repositories of this
@@ -577,6 +635,16 @@ mod tests {
     struct Stub;
 
     impl ArtifactRepository for Stub {
+        /// Required, not defaulted — so this stub has to state it. It
+        /// holds no artifacts, so "no files held" is the honest answer
+        /// rather than a fallback.
+        fn package_file_digests(
+            &self,
+            _repository_id: Uuid,
+            _package: &str,
+        ) -> BoxFuture<'_, DomainResult<Vec<PackageFileDigestRow>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
         fn find_by_id(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<Artifact>> {
             Box::pin(async {
                 Err(DomainError::NotFound {
@@ -798,6 +866,20 @@ mod tests {
         let fut = repo.first_seen_for_checksum(&hash);
         let result = futures::executor::block_on(fut).expect("default impl returns Ok");
         assert_eq!(result, None, "absent evidence, not an invented instant");
+    }
+
+    /// `package_file_digests` is REQUIRED, unlike its three defaulted
+    /// neighbours, so this exercises the stub's own hand-written answer
+    /// rather than a trait default. The distinction is the point: an
+    /// empty answer here does not omit a field, it hands the caller back
+    /// to the upstream's claim about bytes hort stores, so a new
+    /// implementation that cannot answer has to say so at compile time.
+    #[test]
+    fn package_file_digests_is_required_and_the_stub_holds_nothing() {
+        let repo = stub();
+        let rows = futures::executor::block_on(repo.package_file_digests(Uuid::nil(), "left-pad"))
+            .expect("stub returns Ok");
+        assert!(rows.is_empty());
     }
 
     /// The other two defaulted reads answer conservatively too:

@@ -1567,6 +1567,25 @@ spec:
   repository: ghost-repo
 ";
 
+    /// A `User`-subject grant whose `userId` is one character off a
+    /// well-formed UUID. Repo-scoped and `read`, so the row-8 grant
+    /// linter only *warns* about it (the direct-user rule's reject arm
+    /// needs `admin`, or a global grant of a write-or-above
+    /// permission) — the syntax defect is the whole reason the tree is
+    /// refused, and nothing in the static rows refuses it.
+    const GRANT_USER_ID_NOT_A_UUID: &str = "\
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: read-typo-uid
+spec:
+  subject:
+    kind: user
+    userId: 0f8fad5b-d9cb-469f-a165-70867728950X
+  permission: read
+  repository: oci-hosted
+";
+
     /// `metadata.name` that is blank but not empty. The empty string is
     /// a *parse* error (`ParseError::EmptyMetadataName`) the command
     /// already rejected before row 0 was wired; whitespace gets past the
@@ -1642,6 +1661,14 @@ spec:
             files: &[
                 ("repositories/oci.yaml", REPO_OCI_HOSTED),
                 ("policies/p.yaml", SCAN_POLICY_SCOPE_GHOST),
+            ],
+            row0_rejects: true,
+        },
+        Row0Case {
+            label: "grant-subject-user-id-not-a-uuid",
+            files: &[
+                ("repositories/oci.yaml", REPO_OCI_HOSTED),
+                ("auth/g.yaml", GRANT_USER_ID_NOT_A_UUID),
             ],
             row0_rejects: true,
         },
@@ -1842,6 +1869,24 @@ spec:
             row0_exit(row0_case(
                 "scan-policy-scope-references-undeclared-repository"
             )),
+            exit(1)
+        );
+    }
+
+    /// A `PermissionGrant` whose `subject.userId` is not UUID syntax →
+    /// exit 1.
+    ///
+    /// The offline gate has to reject this one for the same reason the
+    /// boot preflight does, and the reason is the apply's ordering: the
+    /// consolidated grant reconcile runs LAST, so before the per-spec
+    /// rule existed a one-character typo in a UUID failed the apply only
+    /// after the repository, policy and mapping writes of the same bundle
+    /// had committed — and this command, which an operator runs to find
+    /// exactly that typo before applying, reported the tree clean.
+    #[test]
+    fn validate_tree_row_0_grant_subject_user_id_not_a_uuid_is_exit_1() {
+        assert_eq!(
+            row0_exit(row0_case("grant-subject-user-id-not-a-uuid")),
             exit(1)
         );
     }

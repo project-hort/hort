@@ -107,6 +107,16 @@ a **fresh admin CliSession** — there is intentionally no unattended machine ad
 workflow lands (ADR 0038 follow-on), run destructive housekeeping by hand with a
 Dex CliSession, or keep those CronJobs disabled (the deploy default).
 
+The authority is also re-checked when the worker runs the job, against the
+live state of the user it was enqueued under — so revoking that user's admin
+(or deactivating them) stops the destructive jobs they already queued, which
+land as terminal `failed` rows naming the cause. The corollary for a
+`ClaimMapping` you might be tempted to add: a group → `task:destructive`
+mapping on a **non-admin** group lets its members enqueue a destructive task
+that is then refused at execution, because the claim resolves from the IdP at
+login and nothing persists it. Map such groups to `admin`
+([`enable-admin-task-cronjobs.md`](enable-admin-task-cronjobs.md) §5.1).
+
 ## See also
 
 - ADR 0038 — admin-identity model (the standing decision).

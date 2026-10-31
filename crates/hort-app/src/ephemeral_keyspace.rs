@@ -200,6 +200,32 @@ pub const KEYSPACE_REGISTRY: &[(&str, EphemeralKeyspaceClass)] = &[
     // Source: `crates/hort-app/src/use_cases/api_token_use_case.rs`
     // (`revoke_cli_session`) + `.../authenticate_use_case.rs` (check).
     ("cli-session-revoked:", EphemeralKeyspaceClass::Durable),
+    // CliSession **subject-scoped** revocation cutoff. `put` on
+    // `cli-session-cutoff:{user_id}` with the cutoff instant (Unix
+    // seconds, ASCII decimal) as the value and TTL = the CliSession
+    // lifetime cap (`max_cli_session_lifetime`), after which no token
+    // issued at or before the cutoff can still be live, so the entry
+    // has nothing left to deny. The validate path rejects (401) any
+    // CliSession JWT for that subject whose `iat` is at or before the
+    // cutoff — and any that carries no `iat`, which cannot prove it
+    // postdates the cutoff.
+    //
+    // A SIBLING of `cli-session-revoked:` above, not a sub-prefix
+    // (position 12: `c` vs `r`), so both must be registered — same
+    // gotcha as the `pat-attempt:` pair.
+    //
+    // **Durable**, for the reason `cli-session-revoked:` is: loss
+    // re-permits every not-yet-expired session of a subject an
+    // operator has already cut off. It is also the *only* reachable
+    // revocation surface for the emergency the denylist exists for —
+    // nothing persists a live CliSession, so an operator who does not
+    // hold the token has no `jti` to deny — which makes an
+    // LRU-evictable backend here strictly worse than for the `jti`
+    // set. Source:
+    // `crates/hort-app/src/use_cases/api_token_use_case.rs`
+    // (`revoke_cli_sessions_for_user`) +
+    // `.../authenticate_use_case.rs` (check).
+    ("cli-session-cutoff:", EphemeralKeyspaceClass::Durable),
 ];
 
 /// Look up the class of the keyspace a key belongs to. Returns
@@ -442,10 +468,10 @@ mod tests {
         // Guards against accidental additions / deletions; if the
         // count changes, this assertion must be updated together with
         // the registry edit (and the change reviewed deliberately).
-        // Current shape: 15 entries — 8 durable, 7 evictable (the
-        // Maven on-demand sidecar-digest cache `mavensum:` added the
-        // 7th evictable entry).
-        assert_eq!(KEYSPACE_REGISTRY.len(), 15);
+        // Current shape: 16 entries — 9 durable, 7 evictable (the
+        // CliSession subject cutoff `cli-session-cutoff:` added the
+        // 9th durable entry).
+        assert_eq!(KEYSPACE_REGISTRY.len(), 16);
 
         let evictable = KEYSPACE_REGISTRY
             .iter()
@@ -456,7 +482,7 @@ mod tests {
             .filter(|(_, c)| *c == EphemeralKeyspaceClass::Durable)
             .count();
         assert_eq!(evictable, 7, "expected 7 evictable entries");
-        assert_eq!(durable, 8, "expected 8 durable entries");
+        assert_eq!(durable, 9, "expected 9 durable entries");
     }
 
     #[test]
@@ -468,6 +494,26 @@ mod tests {
         assert_eq!(
             keyspace_class("cli-session-revoked:00000000-0000-0000-0000-000000000000"),
             Some(EphemeralKeyspaceClass::Durable),
+        );
+    }
+
+    /// Boundary test (load-bearing, same shape as the
+    /// `cargo_index_config:` / `pat-attempt-counter:` pairs).
+    /// `cli-session-cutoff:` is a SIBLING of `cli-session-revoked:`,
+    /// not a sub-prefix — position 12 is `c` here and `r` there — so
+    /// `starts_with` would return `false` if only the `revoked` entry
+    /// were registered. This exists to stop a future contributor
+    /// "simplifying" the registry down to one `cli-session-` entry,
+    /// which would also silently relabel both keyspaces.
+    #[test]
+    fn cli_session_cutoff_resolves_via_its_own_entry_not_cli_session_revoked() {
+        assert_eq!(
+            keyspace_class("cli-session-cutoff:00000000-0000-0000-0000-000000000000"),
+            Some(EphemeralKeyspaceClass::Durable),
+        );
+        assert!(
+            !"cli-session-cutoff:x".starts_with("cli-session-revoked:"),
+            "the two CliSession keyspaces are siblings, not nested"
         );
     }
 }

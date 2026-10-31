@@ -941,4 +941,128 @@ mod tests {
                 .expect_err("empty virtual must 404");
         assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
     }
+
+    // -----------------------------------------------------------------
+    // Per-version status across a MULTI-FILE version: the worst file
+    // decides the version, whatever order the rows arrive in.
+    // -----------------------------------------------------------------
+
+    /// Drive the hosted serve for a package holding one single-file
+    /// `Released` version plus a `1.1.0` whose files are `files`,
+    /// returning the rendered HTML.
+    ///
+    /// Each call builds a fresh repository and fresh artifact ids, so
+    /// the order the artifact read returns `1.1.0`'s files in is not
+    /// fixed between calls — `MockArtifactRepository` sorts by `version`
+    /// and nothing else, exactly as the SQL reader does, so files
+    /// *within* a version come back in whatever order the store yields.
+    /// That is the property the fold must not depend on, so the test
+    /// below repeats this call rather than asserting once.
+    async fn served_html_for_version_with_files(files: &[(&str, QuarantineStatus)]) -> String {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "pypi-test", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "requests",
+            "1.0.0",
+            "requests-1.0.0.tar.gz",
+            &fake_sha256(1),
+            QuarantineStatus::Released,
+        );
+        for (seed, (filename, status)) in files.iter().enumerate() {
+            insert_artifact(
+                &mocks,
+                repo.id,
+                "requests",
+                "1.1.0",
+                filename,
+                &fake_sha256(2 + seed as u8),
+                *status,
+            );
+        }
+
+        let res = serve_simple_index_unified(
+            &ctx,
+            "pypi-test",
+            "requests",
+            SimpleIndexFormat::Html,
+            None,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("unified serve must succeed"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        std::str::from_utf8(&body).unwrap().to_string()
+    }
+
+    /// A version whose sdist is `Released` and whose wheel is
+    /// `Quarantined` is non-servable AS A VERSION — neither file is
+    /// advertised, on every seeding.
+    ///
+    /// The repetition is the assertion. Before the fix the version
+    /// inherited whichever file the read happened to return first, so
+    /// the quarantined wheel was advertised — and then `503`d on
+    /// download — on roughly half of these seedings, with nothing in
+    /// the read's `ORDER BY version` making it the other half. A fold
+    /// that is order-independent passes all of them.
+    #[tokio::test]
+    async fn mixed_status_version_is_non_servable_on_every_seeding() {
+        for attempt in 0..24 {
+            let html = served_html_for_version_with_files(&[
+                ("requests-1.1.0.tar.gz", QuarantineStatus::Released),
+                (
+                    "requests-1.1.0-py3-none-any.whl",
+                    QuarantineStatus::Quarantined,
+                ),
+            ])
+            .await;
+            assert!(
+                html.contains("requests-1.0.0.tar.gz"),
+                "attempt {attempt}: the single-file Released version is \
+                 unaffected: {html}"
+            );
+            assert!(
+                !html.contains("requests-1.1.0-py3-none-any.whl"),
+                "attempt {attempt}: the quarantined wheel must not be \
+                 advertised: {html}"
+            );
+            assert!(
+                !html.contains("requests-1.1.0.tar.gz"),
+                "attempt {attempt}: nor its sibling sdist — a version is in \
+                 or out as a whole: {html}"
+            );
+        }
+    }
+
+    /// Counter-test: a multi-file version whose files all share one
+    /// status is unchanged — every file is advertised, every seeding.
+    #[tokio::test]
+    async fn uniform_status_multi_file_version_is_served_whole() {
+        for attempt in 0..24 {
+            let html = served_html_for_version_with_files(&[
+                ("requests-1.1.0.tar.gz", QuarantineStatus::Released),
+                (
+                    "requests-1.1.0-py3-none-any.whl",
+                    QuarantineStatus::Released,
+                ),
+            ])
+            .await;
+            assert!(
+                html.contains("requests-1.0.0.tar.gz"),
+                "attempt {attempt}: {html}"
+            );
+            assert!(
+                html.contains("requests-1.1.0.tar.gz"),
+                "attempt {attempt}: {html}"
+            );
+            assert!(
+                html.contains("requests-1.1.0-py3-none-any.whl"),
+                "attempt {attempt}: {html}"
+            );
+        }
+    }
 }

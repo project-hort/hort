@@ -13,6 +13,7 @@ use hort_domain::types::{
 use hort_domain::ports::upstream_proxy::MetadataProjector;
 
 use crate::npm::projection::NpmPackumentProjector;
+use crate::publish_identity::IdentityCheck;
 use crate::range_resolvers::resolve_semver_range_max;
 use crate::sbom_helpers::{build_subject_component, strip_version_constraint};
 
@@ -291,6 +292,122 @@ pub fn validate_npm_version(version: &str) -> DomainResult<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The identity the tarball declares about itself
+// ---------------------------------------------------------------------------
+
+/// The `name` / `version` an npm tarball declares in its own
+/// `package/package.json`.
+///
+/// Both fields are optional because this reader reports what the manifest
+/// said rather than what npm requires it to say: a field the manifest does
+/// not carry is `None`, which the publish path treats as
+/// [`IdentityCheck::Undeclared`] rather than a refusal. See
+/// [`crate::publish_identity`] for why undeclared and divergent are
+/// different answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NpmTarballIdentity {
+    /// `package.json`'s `name`, or `None` when absent or not a string.
+    pub name: Option<String>,
+    /// `package.json`'s `version`, or `None` when absent or not a string.
+    pub version: Option<String>,
+}
+
+/// Read the identity an npm tarball declares in `package/package.json`.
+///
+/// `tgz` is the **decompressed-on-read, still-gzipped** tarball byte
+/// stream; `compressed_size` is its length, which the compression-ratio
+/// bound needs because gzip carries no reliable decompressed-size header.
+///
+/// **Archive bounds.** The read routes through the audited
+/// [`crate::archive_bounds::read_tar_gz_entry`] — the gzip decompressor is
+/// wrapped in a `BoundedReader` (compression-ratio + cumulative-output cap),
+/// entry count is bounded, and nested archives are rejected. The cap is
+/// cumulative across the sequential tar scan, so `package/package.json` has
+/// to be an early entry; `npm pack` writes it first.
+///
+/// **Streaming.** The caller passes a reader, not a buffer: the npm publish
+/// path has already spooled the base64-decoded tarball to a temp file (the
+/// attachment is base64 inside a JSON envelope, so that spool is forced by
+/// the wire format and not by this read), and only the matched manifest
+/// entry — itself capped — is materialised here.
+///
+/// # Errors
+///
+/// `Validation` when the bytes are not a gzip-tar, when
+/// `package/package.json` is absent, when the manifest is not valid JSON,
+/// or on any `archive_bounds` guard trip. An identity that could not be
+/// read is **not** an identity that agreed: a tarball whose own manifest is
+/// unreachable cannot show that it declares the coordinates it is being
+/// published under, and npm's package format requires that manifest to be
+/// there.
+pub fn read_npm_tarball_identity(
+    tgz: &mut dyn std::io::Read,
+    compressed_size: u64,
+) -> DomainResult<NpmTarballIdentity> {
+    let manifest = crate::archive_bounds::read_tar_gz_entry(
+        tgz,
+        compressed_size,
+        crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
+        |path| path == "package/package.json",
+    )?
+    .ok_or_else(|| {
+        DomainError::Validation(
+            "npm tarball is missing package/package.json, so the identity it \
+             declares cannot be read"
+                .to_string(),
+        )
+    })?;
+    parse_npm_tarball_identity(&manifest)
+}
+
+/// Parse `name` / `version` out of a `package.json` body.
+///
+/// Bounded by [`NPM_MANIFEST_MAX_BYTES`] as a parser-input sanity cap, the
+/// same bound [`parse_npm_runtime_dependencies`] applies to the same bytes.
+fn parse_npm_tarball_identity(manifest: &[u8]) -> DomainResult<NpmTarballIdentity> {
+    if manifest.len() > NPM_MANIFEST_MAX_BYTES {
+        return Err(DomainError::Validation(format!(
+            "npm manifest body is {} bytes; npm manifest max is {NPM_MANIFEST_MAX_BYTES}",
+            manifest.len()
+        )));
+    }
+    let doc: serde_json::Value = serde_json::from_slice(manifest).map_err(|e| {
+        DomainError::Validation(format!("npm manifest body is not valid JSON: {e}"))
+    })?;
+    let Some(obj) = doc.as_object() else {
+        return Ok(NpmTarballIdentity::default());
+    };
+    let field = |key: &str| {
+        obj.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    Ok(NpmTarballIdentity {
+        name: field("name"),
+        version: field("version"),
+    })
+}
+
+impl NpmTarballIdentity {
+    /// Compare this declaration against the coordinates the publish path is
+    /// storing the tarball under.
+    ///
+    /// `stored_name` is the route-derived package name and `stored_version`
+    /// the one parsed off the `_attachments` key whose bytes were actually
+    /// consumed. Both are byte-exact comparisons: a real `npm publish`
+    /// derives the route, the attachment key and the manifest from one
+    /// `package.json`, so the three spellings are the same string and any
+    /// tolerance here would only widen what passes.
+    #[must_use]
+    pub fn check(&self, stored_name: &str, stored_version: &str) -> IdentityCheck {
+        IdentityCheck::first_divergence([
+            IdentityCheck::compare("name", self.name.as_deref(), stored_name),
+            IdentityCheck::compare("version", self.version.as_deref(), stored_version),
+        ])
+    }
 }
 
 /// Keys preserved from the per-version packument block when building the
@@ -1586,6 +1703,168 @@ mod tests {
 
     fn handler() -> NpmFormatHandler {
         NpmFormatHandler
+    }
+
+    // -- the identity the tarball declares ---------------------------------
+
+    fn npm_identity_of(tarball: &[u8]) -> DomainResult<NpmTarballIdentity> {
+        read_npm_tarball_identity(&mut &tarball[..], tarball.len() as u64)
+    }
+
+    #[test]
+    fn reads_the_name_and_version_the_manifest_declares() {
+        let tarball = crate::test_support::build_npm_tarball("express", "1.0.0");
+        let identity = npm_identity_of(&tarball).expect("a well-formed tarball reads");
+        assert_eq!(identity.name.as_deref(), Some("express"));
+        assert_eq!(identity.version.as_deref(), Some("1.0.0"));
+        assert_eq!(identity.check("express", "1.0.0"), IdentityCheck::Agrees);
+    }
+
+    #[test]
+    fn a_declared_name_that_differs_from_the_stored_one_diverges() {
+        let tarball = crate::test_support::build_npm_tarball("evil", "1.0.0");
+        let identity = npm_identity_of(&tarball).expect("reads");
+        let check = identity.check("express", "1.0.0");
+        let divergence = check.divergence().expect("diverges");
+        assert_eq!(divergence.field, "name");
+        assert_eq!(divergence.declared, "evil");
+        assert_eq!(divergence.stored, "express");
+    }
+
+    #[test]
+    fn a_declared_version_that_differs_from_the_stored_one_diverges() {
+        let tarball = crate::test_support::build_npm_tarball("express", "9.9.9");
+        let identity = npm_identity_of(&tarball).expect("reads");
+        let check = identity.check("express", "1.0.0");
+        let divergence = check.divergence().expect("diverges");
+        assert_eq!(divergence.field, "version");
+    }
+
+    #[test]
+    fn a_manifest_declaring_neither_field_is_undeclared_not_divergent() {
+        // A `package.json` without `name`/`version` is not a publishable
+        // npm package, but it does not CLAIM to be another one — and
+        // nothing a client reads off it names a different package.
+        let tarball = crate::test_support::build_tar_gz_bytes(&[(
+            "package/package.json",
+            br#"{"description":"no identity here"}"#.as_slice(),
+        )]);
+        let identity = npm_identity_of(&tarball).expect("reads");
+        assert!(identity.check("express", "1.0.0").divergence().is_none());
+    }
+
+    #[test]
+    fn a_non_string_name_is_undeclared_rather_than_stringified() {
+        let tarball = crate::test_support::build_tar_gz_bytes(&[(
+            "package/package.json",
+            br#"{"name":7,"version":"1.0.0"}"#.as_slice(),
+        )]);
+        let identity = npm_identity_of(&tarball).expect("reads");
+        assert_eq!(identity.name, None);
+        // The version agrees; the name was never declared. Neither is a
+        // divergence, so the publish is not refused.
+        assert!(identity.check("express", "1.0.0").divergence().is_none());
+    }
+
+    #[test]
+    fn a_tarball_without_a_manifest_is_an_error_not_an_agreement() {
+        // Padded out so the whole scan stays inside the cumulative output
+        // cap — otherwise the cap trips first and the test would assert
+        // the wrong rejection. See
+        // `a_late_manifest_in_a_tiny_tarball_trips_the_cumulative_cap`.
+        // Incompressible filler, so the whole scan fits in
+        // `10 x compressed` — a run of identical bytes would compress far
+        // better than 10:1 and trip the cap instead.
+        let filler: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let tarball = crate::test_support::build_tar_gz_bytes(&[
+            ("package/index.js", b"module.exports = {};"),
+            ("package/filler.txt", &filler),
+        ]);
+        let err = npm_identity_of(&tarball).expect_err("a missing manifest cannot agree");
+        assert!(
+            err.to_string().contains("package/package.json"),
+            "the error must name the entry it could not find: {err}"
+        );
+    }
+
+    /// The documented constraint `archive_bounds::read_tar_gz_entry` states
+    /// in its own doc comment, pinned here because this reader now stands on
+    /// a publish admission path: the output cap is **cumulative** across the
+    /// sequential tar scan, so reaching a late entry means decompressing
+    /// everything physically before it, and on a *tiny* archive — where
+    /// tar's zero padding compresses far better than 10:1 — the
+    /// compression-ratio bound can trip before the manifest is reached.
+    ///
+    /// `npm pack` places `package/package.json` first (npm-packlist sorts it
+    /// to the head, which is what lets a registry read the manifest off the
+    /// stream head at all) and `cargo package` writes `Cargo.toml` second,
+    /// so the real publishing tools do not land here. A hand-assembled
+    /// tarball of a near-empty package can, and it is refused rather than
+    /// silently accepted — which is the fail-closed direction, but it is a
+    /// refusal of a correct artifact and so is recorded, not hidden.
+    #[test]
+    fn a_late_manifest_in_a_tiny_tarball_trips_the_cumulative_cap() {
+        let manifest = br#"{"name":"express","version":"1.0.0"}"#;
+        let tarball = crate::test_support::build_tar_gz_bytes(&[
+            ("package/LICENSE", b"MIT"),
+            ("package/README.md", b"# hi"),
+            ("package/index.js", b"module.exports = {};"),
+            ("package/package.json", manifest.as_slice()),
+        ]);
+        let err = npm_identity_of(&tarball).expect_err("the cumulative cap trips");
+        assert!(
+            err.to_string().contains("output cap exceeded"),
+            "the refusal must say the bound it hit, not invent a missing \
+             manifest: {err}"
+        );
+    }
+
+    #[test]
+    fn a_payload_that_is_not_a_gzip_tar_is_an_error() {
+        let err = npm_identity_of(b"not-a-tarball").expect_err("not an archive");
+        assert!(err.to_string().contains("gzip-tar"), "{err}");
+    }
+
+    #[test]
+    fn a_manifest_that_is_not_json_is_an_error() {
+        let tarball = crate::test_support::build_tar_gz_bytes(&[(
+            "package/package.json",
+            b"this is not json".as_slice(),
+        )]);
+        let err = npm_identity_of(&tarball).expect_err("unparseable manifest");
+        assert!(err.to_string().contains("not valid JSON"), "{err}");
+    }
+
+    #[test]
+    fn an_oversized_manifest_trips_the_parser_input_cap() {
+        let body = vec![b' '; NPM_MANIFEST_MAX_BYTES + 1];
+        let err = parse_npm_tarball_identity(&body).expect_err("over the cap");
+        assert!(
+            err.to_string()
+                .contains(&NPM_MANIFEST_MAX_BYTES.to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_is_not_a_json_object_declares_nothing() {
+        let identity = parse_npm_tarball_identity(b"[1,2,3]").expect("valid JSON");
+        assert_eq!(identity, NpmTarballIdentity::default());
+    }
+
+    #[test]
+    fn a_crafted_declaration_is_sanitised_before_it_reaches_the_refusal() {
+        let crafted = serde_json::json!({ "name": "evil\nFATAL", "version": "1.0.0" }).to_string();
+        let tarball = crate::test_support::build_tar_gz_bytes(&[(
+            "package/package.json",
+            crafted.as_bytes(),
+        )]);
+        let identity = npm_identity_of(&tarball).expect("reads");
+        let check = identity.check("express", "1.0.0");
+        let divergence = check.divergence().expect("diverges");
+        assert!(!divergence.declared.contains('\n'));
     }
 
     // -- format_key -----------------------------------------------------------

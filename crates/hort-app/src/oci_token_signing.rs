@@ -34,7 +34,9 @@
 //! # Public surface
 //!
 //! - [`OciAccessClaims`] — the JWT payload shape. Distribution-Spec
-//!   wire form: `iss`, `sub`, `aud`, `exp`, `access[]`. Both
+//!   wire form: `iss`, `sub`, `aud`, `exp`, `access[]`, plus the
+//!   private `hort_repo_scope` claim that binds each granted action to
+//!   the repository id it was granted on. Both
 //!   `Serialize` AND `Deserialize` are derived because the JWT
 //!   library round-trips the payload through JSON during sign / verify
 //!   — this is OK because `OciAccessClaims` is a JWT payload, not a
@@ -94,6 +96,67 @@ pub struct OciAccessClaims {
     /// `(resource_type, resource_name, actions)` tuple per the
     /// Distribution Spec.
     pub access: Vec<AccessEntry>,
+    /// `hort_repo_scope` — PRIVATE claim (not Distribution-Spec):
+    /// the same grant `access` carries, keyed by the hort repository id
+    /// the mint authorised each entry against.
+    ///
+    /// # Why a second view of the same grant
+    ///
+    /// The spec's `access[]` names resources by NAME, and the
+    /// consume-side authorization gate decides against a repository
+    /// ID. Re-resolving names to ids at consume time would be a second,
+    /// independent derivation of the binding — the mint/consume
+    /// divergence ADR 0036 records. The ids are already in hand at mint
+    /// (every granted entry was authorised against a resolved repo id),
+    /// so the mint carries them and the consume side reads them. Both
+    /// views are built by one function
+    /// (`oci_token_exchange_use_case::project_granted_scopes`) from one
+    /// structure, so a change cannot add to one without the other.
+    ///
+    /// `access[]` stays spec-shaped and spec-named; this claim is
+    /// additive and ignored by any third party that does not know it.
+    ///
+    /// # `None` is not "no grant"
+    ///
+    /// `Some(vec![])` is a token that was granted nothing — the
+    /// Distribution-Spec "anonymous ping" token. `None` means the claim
+    /// was **never written**, which only a token minted before this
+    /// claim existed can be. The consume side rejects that rather than
+    /// guessing a binding (see
+    /// `oci_token_exchange_use_case::OciVerifyRejection`).
+    ///
+    /// # Add fields here; never retype one
+    ///
+    /// Only an ABSENT claim reaches that rejection, because
+    /// `#[serde(default)] Option<…>` decodes absence to `None`. A claim
+    /// whose shape changed incompatibly fails the JSON decode instead,
+    /// which classifies as `VerificationError::Malformed` → `NotOurToken`
+    /// → fall-through to the IdP validator — on a token this server
+    /// signed. Extending [`RepoScopeEntry`] with a further optional field
+    /// keeps that property; changing the type of `r` or `a`, or making
+    /// the claim a bare `Vec`, loses it. If a shape change is ever
+    /// unavoidable, route the decode failure explicitly before it reaches
+    /// the `Malformed` arm.
+    #[serde(default)]
+    pub hort_repo_scope: Option<Vec<RepoScopeEntry>>,
+}
+
+/// One entry in the private `hort_repo_scope` claim: the actions the
+/// mint granted on one hort repository.
+///
+/// Field names are short on the wire because a JWT is a header on every
+/// `/v2/*` request and this claim scales with the scope count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoScopeEntry {
+    /// `r` — the hort repository id the actions are bound to.
+    #[serde(rename = "r")]
+    pub repo: Uuid,
+    /// `a` — Distribution-Spec action strings (`pull` / `push` /
+    /// `delete`) granted on that repository. The union across every
+    /// `access[]` entry that resolved to this repository: the id is the
+    /// finest unit the consume-side gate can enforce against.
+    #[serde(rename = "a")]
+    pub actions: Vec<String>,
 }
 
 /// One entry in the `access[]` array.
@@ -425,6 +488,10 @@ mod tests {
                 name: "library/nginx".into(),
                 actions: vec!["pull".into(), "push".into()],
             }],
+            hort_repo_scope: Some(vec![RepoScopeEntry {
+                repo: Uuid::from_u128(0x5EED),
+                actions: vec!["pull".into(), "push".into()],
+            }]),
         }
     }
 

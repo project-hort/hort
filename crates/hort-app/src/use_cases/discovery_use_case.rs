@@ -557,6 +557,7 @@ mod tests {
         c.token_cap = Some(TokenCap {
             permissions: cap,
             repository_ids: None,
+            per_repository_permissions: None,
         });
         c
     }
@@ -2016,6 +2017,18 @@ mod tests {
     struct FailingArtifactsRepo;
 
     impl ArtifactRepository for FailingArtifactsRepo {
+        fn package_file_digests(
+            &self,
+            _r: Uuid,
+            _p: &str,
+        ) -> hort_domain::ports::BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<
+                Vec<hort_domain::ports::artifact_repository::PackageFileDigestRow>,
+            >,
+        > {
+            unimplemented!("not used by discovery test")
+        }
         fn find_by_id(
             &self,
             _id: Uuid,

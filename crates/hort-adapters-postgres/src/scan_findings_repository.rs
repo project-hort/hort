@@ -28,10 +28,13 @@ impl PgScanFindingsRepository {
 }
 
 /// Render a [`SeverityThreshold`] into the `severity` enum literal the
-/// migration 009 CHECK constraint expects (`'critical' | 'high' |
-/// 'medium' | 'low' | 'negligible'`). `Finding` carries
-/// `SeverityThreshold` which has no `Negligible` variant; the column
-/// supports it for symmetry with the aggregate severity catalog.
+/// migration 009 CHECK constraint expects — exactly
+/// `'critical' | 'high' | 'medium' | 'low'`. `'negligible'` is NOT in
+/// that set: the informational / negligible lane is a routing decision
+/// taken over [`hort_domain::types::Finding::is_informational`] at
+/// decision time, and the column stores the four-value `SeverityThreshold`
+/// taxonomy the domain enum has. The Trivy adapter folds an incoming
+/// `NEGLIGIBLE` to `Low` for the same reason.
 pub(crate) fn severity_to_sql(s: SeverityThreshold) -> &'static str {
     match s {
         SeverityThreshold::Critical => "critical",
@@ -58,7 +61,8 @@ pub(crate) async fn insert_findings_in_tx(
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "INSERT INTO scan_findings (\
             artifact_id, scan_id, purl, vulnerability_id, severity, \
-            cvss_score, source_scanner, title, detected_at, fixed_versions, informational_class\
+            cvss_score, source_scanner, title, detected_at, fixed_versions, \
+            informational_class, advisory_published_at\
         ) ",
     );
     qb.push_values(rows, |mut b, row| {
@@ -72,7 +76,8 @@ pub(crate) async fn insert_findings_in_tx(
             .push_bind(&row.title)
             .push_bind(row.detected_at)
             .push_bind(&row.fixed_versions)
-            .push_bind(row.informational_class.as_deref());
+            .push_bind(row.informational_class.as_deref())
+            .push_bind(row.advisory_published_at);
     });
     let query = qb.build();
     query
@@ -103,9 +108,11 @@ impl ScanFindingsRepository for PgScanFindingsRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use hort_domain::ports::retention_scan_reader::RetentionScanReader;
-    use hort_domain::retention::{matches_bool, EvaluationInputs, PolicyPredicate};
+    use hort_domain::retention::{
+        matches_bool, EvaluationInputs, FindingAgeAnchor, FindingAgeAnchorSource, PolicyPredicate,
+    };
     use serial_test::serial;
     use sqlx::PgPool;
     use uuid::Uuid;
@@ -233,6 +240,7 @@ mod tests {
             detected_at: Utc::now(),
             fixed_versions: vec![],
             informational_class: None,
+            advisory_published_at: None,
         };
         let info = ScanFindingsRow {
             artifact_id,
@@ -246,6 +254,7 @@ mod tests {
             detected_at: Utc::now(),
             fixed_versions: vec![],
             informational_class: Some("unmaintained".to_string()),
+            advisory_published_at: None,
         };
 
         let repo = PgScanFindingsRepository::new(pool.clone());
@@ -325,6 +334,7 @@ mod tests {
             detected_at: now,
             fixed_versions: fixed_versions.clone(),
             informational_class: None,
+            advisory_published_at: None,
         };
         let without_fix = ScanFindingsRow {
             purl: format!("pkg:pypi/unfixed-{}@1", artifact_id.simple()),
@@ -380,10 +390,98 @@ mod tests {
             keep_rank: None,
             tag_targeted: false,
             findings: &findings,
-            first_detected_at: now,
+            finding_age_anchor: Some(FindingAgeAnchor {
+                known_since: now,
+                source: FindingAgeAnchorSource::FirstObservation,
+            }),
             latest_scan_at: now,
         };
         assert!(matches_bool(&PolicyPredicate::HasFixAvailable, &inputs));
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+
+    /// The advisory publication date must survive the production write
+    /// adapter. Without that round trip the retention finding-age anchor
+    /// has only our own first observation to go on, and the question it
+    /// asks — how long has the *vulnerability* been known — has no
+    /// source at all.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn advisory_published_at_round_trips_through_the_write_adapter() {
+        let Some(pool) = crate::test_support::shared_migrated_pool().await else {
+            return;
+        };
+
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = Uuid::new_v4();
+        let now = Utc::now();
+        // Microsecond precision: Postgres' `timestamptz` does not carry
+        // Rust's nanoseconds, so compare against a truncated value
+        // rather than asserting a round trip the column cannot make.
+        let published = DateTime::<Utc>::from_timestamp_micros(
+            (now - chrono::Duration::days(45)).timestamp_micros(),
+        )
+        .expect("microsecond round-trip");
+        let dated = ScanFindingsRow {
+            artifact_id,
+            scan_id,
+            purl: format!("pkg:pypi/dated-{}@1", artifact_id.simple()),
+            vulnerability_id: "CVE-PUB-1".into(),
+            severity: SeverityThreshold::High,
+            cvss_score: Some(7.0),
+            source_scanner: "osv".into(),
+            title: "published upstream".into(),
+            detected_at: now,
+            fixed_versions: Vec::new(),
+            informational_class: None,
+            advisory_published_at: Some(published),
+        };
+        let undated = ScanFindingsRow {
+            purl: format!("pkg:pypi/undated-{}@1", artifact_id.simple()),
+            vulnerability_id: "CVE-PUB-2".into(),
+            advisory_published_at: None,
+            ..dated.clone()
+        };
+
+        PgScanFindingsRepository::new(pool.clone())
+            .insert_batch(&[dated, undated])
+            .await
+            .expect("write projected findings");
+        sqlx::query("UPDATE artifacts SET last_scan_at = $1 WHERE id = $2")
+            .bind(now)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .expect("pair the rows with the last-scan anchor");
+
+        let findings = crate::retention_scan_reader::PgRetentionScanReader::new(pool.clone())
+            .list_findings_for_artifact(artifact_id)
+            .await
+            .expect("read projected findings");
+        assert_eq!(
+            findings
+                .iter()
+                .find(|f| f.vulnerability_id == "CVE-PUB-1")
+                .expect("dated finding")
+                .advisory_published_at,
+            Some(published)
+        );
+        assert_eq!(
+            findings
+                .iter()
+                .find(|f| f.vulnerability_id == "CVE-PUB-2")
+                .expect("undated finding")
+                .advisory_published_at,
+            None,
+            "a finding no backend dated reads back as undated, not as the \
+             epoch and not as the scan time"
+        );
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
             .bind(repo_id)
@@ -416,6 +514,7 @@ mod tests {
             detected_at: Utc::now(),
             fixed_versions: vec![],
             informational_class: None,
+            advisory_published_at: None,
         };
 
         let repo = PgScanFindingsRepository::new(pool.clone());

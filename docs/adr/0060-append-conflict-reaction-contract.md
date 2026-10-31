@@ -6,15 +6,34 @@
   below, with 100%-covered unit tests pinning immediate success,
   satisfied-on-recheck, retry-then-success, exhaustion at the bound (attempt
   count asserted), non-`Conflict` passthrough, and the bound-of-one edge
-  case. No call site adopts the combinator yet — that is a follow-up
-  change; today the contract is a design rule this ADR states and the two
-  sanctioned exceptions it names, checked at review rather than compile
-  time.
+  case. **Adopted at nine call sites.** `ArtifactGroupUseCase::add_member`
+  and `RefUseCase::set` took it in the change that landed this ADR, and the
+  OCI edge's `group_attach_*` / `ref_set` sites classify
+  `DomainError::Contended` into `503` + `Retry-After` through
+  `manifest_write_contention` before falling back to `500` — so evidence
+  class 3 below is closed, and this line's earlier claim that "no call site
+  adopts the combinator yet" was already false when it was written. The
+  **seven expected-version policy-stream mutations** —
+  `PolicyUseCase::{update_policy, archive_policy, reactivate_policy,
+  add_exclusion, remove_exclusion}` and
+  `RetentionPolicyUseCase::{update_policy, archive_policy}` — followed,
+  each through one per-use-case `mutate_policy_stream` helper that owns the
+  read + re-decide + re-append cycle. Their step (a) re-read is a
+  projection **re-derivation from the stream** rather than a re-read of the
+  projection row, because the row is the thing that was wrong (see
+  *Consequences*). Still outside the combinator by construction: the two
+  `create_policy` paths, which append with `ExpectedVersion::NoStream` onto
+  a freshly minted id and so have no version to re-base onto; evidence
+  class 1 and the two sanctioned exceptions, for the reasons given below;
+  and evidence class 4, where the swallow survives deliberately because
+  `add_member` now does the retrying. For those the contract is a design
+  rule checked at review rather than compile time.
 - **Supersedes:** —
 - **Relates:** [0004](0004-pluggable-eventstore-port.md) (the loud
   optimistic-concurrency append this ADR defines the reaction to —
-  unchanged); issue #221 (this ADR + the primitive; adoption at the two
-  broken call sites is a separate change against the same issue).
+  unchanged); issue #221 (this ADR + the primitive + the group/ref
+  adoption); issue #362 (the policy-projection adoption, and the fifth
+  evidence class under *Consequences*).
 
 ## Context
 
@@ -155,12 +174,40 @@ of this contract:
 
 ## Consequences
 
-- Evidence classes 3 and 4 above are contract violations today. Fixing
-  them — `add_member` and `RefUseCase::set` adopting the primitive, and
-  the OCI edge's `group_attach_*` / `ref_set` mappings moving from `500` to
-  the `Contended` → `503` + `Retry-After` path — is deliberately **out of
-  scope for this change** (no use-case behavior changes here; `add_member`
-  and `RefUseCase::set` stay untouched) and is the immediate follow-up.
+- **The policy-projection adoption found a fifth evidence class the
+  context above did not name: the conflicting writer can be *the same
+  writer*, one call earlier.** A policy's projection carries the
+  `stream_version` the next mutation passes as
+  `ExpectedVersion::Exact`, and the projection upsert is not
+  transactionally bound to the append that preceded it (it cannot be —
+  the port is backend-agnostic, ADR 0004). So an append that committed
+  with a failing upsert leaves a row one version behind its stream, and
+  every later mutation asks with a version the stream has passed. That
+  is not contention: re-reading the *projection* returns the same wrong
+  version forever, and the `upsert` that would have corrected it sits
+  after the append that keeps failing. It never heals.
+
+  Step (a) is therefore read-the-stream, not read-the-aggregate-row, at
+  these call sites: the repair is re-deriving the projection from its
+  own events (`fold_scan_policy`,
+  `RetentionPolicy::project` + `RetentionPolicyRow::from_policy`). Step
+  (b)'s idempotent success does real work here rather than merely
+  returning early — it writes the re-derived row, which is what ends the
+  deadlock. And step (d)'s exhaustion keeps its meaning precisely
+  because of step (a): the second attempt's expected version came off
+  the stream, so losing that one *is* a concurrent writer and
+  `Contended` is the honest answer. A writer that cannot tell the two
+  cases apart logs the wrong diagnosis for the common one and invites a
+  retry that cannot work.
+- Evidence class 3 is closed: `add_member` and `RefUseCase::set` adopted
+  the primitive and the OCI edge's `group_attach_*` / `ref_set` sites route
+  `Contended` to `503` + `Retry-After` before their `500` fallback. (This
+  bullet, and the *Enforced by* line above, both described that work as
+  still-pending for longer than it was — see *Enforced by*.) Evidence class
+  4 remains as described, now deliberately: the post-commit ingest hook
+  still logs `warn!` and returns `Ok`, because the `add_member` underneath
+  it does the bounded retrying and the artifact is durably persisted either
+  way.
 - Evidence class 1 (token-exchange) is not migrated to the new primitive.
   Its `ExpectedVersion::Any` shape genuinely has no read-decide step to
   express — migrating it would force a vacuous re-read onto a call site

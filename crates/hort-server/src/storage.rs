@@ -112,7 +112,7 @@ pub fn build_with_mirror(
             let cas: Arc<dyn StoragePort> =
                 Arc::new(ObjectStoreStorage::new(store.clone(), values::BACKEND_S3));
             let mirror: Arc<dyn MetadataMirrorStore> =
-                Arc::new(ObjectStoreMetadataMirror::new(store));
+                Arc::new(ObjectStoreMetadataMirror::new(store, values::BACKEND_S3));
             Ok((cas, mirror))
         }
     }

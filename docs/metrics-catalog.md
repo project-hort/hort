@@ -1203,7 +1203,8 @@ grant evaluation, which is precisely why it has no
   validated, no JWT minted. The requested/expected hosts are in the
   structured audit log (`event="oci_v2_auth_denied"`), never a label.
 - `denied` — mint path: PAT invalid / scope invalid / mint failure.
-  Consume path: `OciVerifyOutcome::Rejected` (expired / wrong aud).
+  Consume path: `OciVerifyOutcome::Rejected` (expired / wrong aud /
+  no `hort_repo_scope` claim — see `docs/auth-catalog.md` Entry 7).
   `OciVerifyOutcome::NotOurToken` is **NOT** counted `denied` — it is
   a fall-through to the IdP validator, not a denial (counting it
   would double-count against the IdP path's own telemetry).
@@ -1971,6 +1972,27 @@ No per-version or per-package label — those would explode cardinality per the 
 
 The metric is emitted at the per-format serve site (npm: `hort-http-npm/src/packument.rs::rewrite_packument`; pypi/cargo/maven: their analogues), each with `format` set to the format literal. The `hort-app` `filter_served_versions` helper is format-agnostic and intentionally does NOT emit — the format is a per-call-site fact, mirroring the established `hort_ingest_*` / `hort_download_*` pattern.
 
+### Advertised-digest divergence on a proxy index serve
+
+| Metric | Type | Labels | Unit | `result` values |
+|--------|------|--------|------|-----------------|
+| `hort_index_digest_divergence_total` | counter | `format`, `repository` | — | — |
+
+**`hort_index_digest_divergence_total` semantics:**
+
+Emitted by a proxy index source when the upstream index document advertises a SHA-256 for a filename that **disagrees** with the digest hort has stored for that same filename. The increment is the **count of divergent files** in that served document, not "1 per serve"; a document where every advertisement agrees emits nothing (steady state).
+
+A proxy serve rewrites every download link to point back at hort, so the served digest is the one a client checks hort's own bytes against. The serve therefore advertises hort's stored digest and keeps serving — the upstream's value would be a check that can only fail — and this counter is the signal that the two parties disagree about what the filename means. Non-zero means one of: an upstream that re-used a filename for different bytes, an upstream mapping repointed at a different index, or a stale stored row. It is a supply-chain signal, not an error rate: no request fails on it.
+
+Labels:
+
+- `format` — the format key (`pypi` today; the other proxy index sources join the set as they gain the per-file digest read).
+- `repository` — the served repository key, subject to `METRICS_INCLUDE_REPOSITORY_LABEL` (falls back to the `_all` sentinel per the global rules).
+
+No `package` or `filename` label — that is unbounded cardinality per the *Forbidden labels* rule. The divergent filenames, the package and the repository key ride on the accompanying `tracing::warn!` on the same code path, which is what an operator reads to identify the files.
+
+Emission site: `crates/hort-http-pypi/src/index_source.rs::ProxyPypiSource::fetch`, from the per-file decision in `advertised_digest`.
+
 ### Prefetch triggers
 
 | Metric | Type | Labels | Unit | Label values |
@@ -2135,15 +2157,19 @@ Adding a variant requires updating this catalog in the same PR
   cap AND every cold-cohort upstream resolution succeeded
   (`summary.cap_hit == false && summary.no_upstream_mapping == 0`).
   The happy path; the steady-state value on a healthy deployment.
-- `cap_hit` — walk truncated by the cumulative-cap safety net
-  (`summary.cap_hit == true`). The accompanying `tracing::warn!` at
-  the truncation site carries `cap` / `current_descendants` /
-  `attempted_to_enqueue` for per-instance diagnosis; the metric is
-  the dashboard signal operators alert on. Used to surface runaway
-  amplification — either an attacker (or an unlucky manifest)
-  producing N distinct package coordinates per ingest, or an
-  operator-misconfigured `max_descendants` value that legitimate
-  traffic outgrows.
+- `cap_hit` — this walk's cohort was truncated to the node's share of
+  the `max_descendants` budget (`summary.cap_hit == true`). The
+  accompanying `tracing::warn!` at the truncation site carries `cap` /
+  `descendant_budget` / `attempted_to_enqueue` for per-instance
+  diagnosis; the metric is the dashboard signal operators alert on.
+  Used to surface runaway amplification — either an attacker (or an
+  unlucky manifest) producing N distinct package coordinates per
+  ingest, or an operator-misconfigured `max_descendants` value that
+  legitimate traffic outgrows. Because the budget is **global** across
+  the cascade rather than per branch, a dependency graph wider than the
+  budget trips this at the levels where the budget runs out, so a
+  non-zero steady-state rate on a wide graph is the cap working rather
+  than a misconfiguration on its own.
 - `resolver_failed` — cold-cohort upstream resolution failed
   (`summary.no_upstream_mapping > 0`). Today this fires when the
   repo has no catch-all upstream mapping (`path_prefix=""`) — the
@@ -2791,7 +2817,7 @@ intentionally NOT operator-tunable.
 | `hort_scan_findings_total` | counter | `scanner`, `severity` | — | `scanner ∈ {trivy, osv, advisory, …registered backend names}`; `severity ∈ {critical, high, medium, low}` |
 | `hort_scan_duration_seconds` | histogram | `scanner` | seconds | — |
 | `hort_scan_queue_depth` | gauge | (none) | rows | — |
-| `hort_advisory_query_total` | counter | `result` | — | `cache_hit`, `cache_miss`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout` |
+| `hort_advisory_query_total` | counter | `result` | — | `cache_hit`, `cache_miss`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout`, `length_mismatch`, `body_too_large` |
 | `hort_advisory_hydration_total` | counter | `result` | — | `cache_hit`, `fetched`, `failed` |
 | `hort_sbom_extraction_total` | counter | `format`, `result` | — | `result ∈ {success, unsupported_format, parse_error, payload_unavailable}` |
 | `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, unusable_lockfile, payload_unavailable, not_applicable}` |
@@ -2906,7 +2932,7 @@ each replica; gauge semantics handle the replication so dashboards
 need no aggregation. No labels — the depth is a single global
 signal.
 
-**`hort_advisory_query_total.result` semantics** (closed taxonomy of 6;
+**`hort_advisory_query_total.result` semantics** (closed taxonomy of 8;
 emitted by `OsvAdvisoryAdapter`):
 
 - `cache_hit` — per-component lookup short-circuited on the
@@ -2926,6 +2952,40 @@ emitted by `OsvAdvisoryAdapter`):
   status code was observed (DNS, TCP, TLS). One tick per failed batch.
 - `timeout` — the per-request deadline elapsed before the batch
   responded. One tick per timed-out batch.
+- `length_mismatch` — `/v1/querybatch` answered 2xx with a well-formed
+  body whose `results` count disagrees with the number of queries sent.
+  One tick per such batch. `results[i]` corresponds to `queries[i]`, so
+  a count mismatch leaves no component attributable: the whole batch
+  fails rather than being read slot-by-slot, and nothing from it is
+  cached. A failed query is retried by the next scan; a cached empty
+  result is an answer later runs never re-ask, which is why this is a
+  failure rather than a tolerance. Its own label rather than folded into
+  `upstream_4xx` / `upstream_5xx` because the request *succeeded* — a
+  non-zero rate points at the upstream's batch semantics, not at its
+  availability.
+- `body_too_large` — `/v1/querybatch` answered 2xx with a body that
+  crossed the adapter's byte cap (128 KiB per query sent), so none of it
+  was read. One tick per such batch. The cap exists because the only
+  other bound on that read is `request_timeout`, which bounds duration
+  rather than bytes. Its own label for the same reason as
+  `length_mismatch`: the endpoint was reached and answered, so neither
+  availability nor batch semantics is the thing to look at — the
+  response is larger than this adapter will read, which points at the
+  configured endpoint. The body is refused, never truncated.
+
+**Alert spec:** `body_too_large` SHOULD be zero at all times against
+`api.osv.dev`. Sustained non-zero means advisory enrichment is
+contributing nothing for the affected components (same fail-open
+posture as `length_mismatch`) and the configured endpoint is serving
+more than the cap admits — investigate the endpoint before raising the
+cap.
+
+**Alert spec:** `length_mismatch` SHOULD be zero at all times — the OSV
+API documents one result per query. Alert on
+`rate(hort_advisory_query_total{result="length_mismatch"}[15m]) > 0`:
+sustained non-zero means advisory enrichment is contributing nothing for
+the affected components, and the enrichment path is fail-open (the scan
+proceeds with an empty advisory contribution, logged at warn level).
 
 **`hort_advisory_hydration_total.result` semantics** (closed taxonomy of
 3; emitted by `OsvAdvisoryAdapter`, one tick per **distinct advisory
@@ -3156,7 +3216,7 @@ Cardinality:
   histograms in the v1 default deployment. Operators that register
   additional backends extend the axis.
 - `hort_scan_queue_depth`: 1 series (no labels).
-- `hort_advisory_query_total`: 6 result values → 6 series.
+- `hort_advisory_query_total`: 8 result values → 8 series.
 - `hort_advisory_hydration_total`: 3 result values → 3 series.
 - `hort_sbom_extraction_total`: ~15 formats × 4 results → 60 series.
 - `hort_sbom_resolution_total`: ~15 formats × 5 results → 75 series.
@@ -3415,7 +3475,7 @@ the OSV bulk diff).
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
 | `hort_scan_jobs_enqueued_total` | counter | `trigger_source` | — | `trigger_source ∈ {ingest, cron, advisory, manual}` — exact mirror of the SQL CHECK on `jobs.trigger_source` |
-| `hort_advisory_diff_processed_total` | counter | `ecosystem`, `result` | — | OSV bulk-archive ecosystem labels (`npm`, `PyPI`, `crates.io`, `Maven`, `Go`, `RubyGems`, `NuGet`, `Packagist`, `Hex`, `Pub`, `Conda`); `result ∈ {ok, fetch_error, parse_error, timeout}` |
+| `hort_advisory_diff_processed_total` | counter | `ecosystem`, `result` | — | OSV bulk-archive ecosystem labels (`npm`, `PyPI`, `crates.io`, `Maven`, `Go`, `RubyGems`, `NuGet`, `Packagist`, `Hex`, `Pub`, `Conda`); `result ∈ {ok, fetch_error, parse_error, timeout, incomplete}` |
 | `hort_advisory_diff_duration_seconds` | histogram | `ecosystem` | seconds | per OSV bulk-archive ecosystem label |
 | `hort_cron_rescan_eligible_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation; operator alarms on sustained `> batch_size` (cron loop can't keep up) |
 | `hort_cron_rescan_stranded_eligible_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation to the count `RescanCandidatesRepository::select_stranded` returned (issue #6) — `quarantine_status='quarantined'` artifacts whose last scan attempt errored (every backend failed to run) and exhausted retries, with no in-flight scan job. Distinct operational signal from the row above: non-zero here means artifacts are stuck because a scanner backend is down, not that the routine interval-based sweep is falling behind. Operators alarm on sustained `> 0` — a recovered scanner drains this to zero every tick as the sweep re-enqueues each stranded artifact. |
@@ -3499,7 +3559,7 @@ counter):
   (jumps the queue ahead of cron and advisory).
 
 **`hort_advisory_diff_processed_total` result semantics** (closed
-taxonomy of 4; one emission per ecosystem per advisory-watch tick from
+taxonomy of 5; one emission per ecosystem per advisory-watch tick from
 inside the OSV adapter's bulk loop —
 [`OsvAdvisoryAdapter::pull_diff_since`](../crates/hort-adapters-advisory-osv/src/lib.rs)):
 
@@ -3520,11 +3580,31 @@ inside the OSV adapter's bulk loop —
 - `timeout` — the per-request deadline elapsed before the bulk archive
   responded. Surfaced separately from `fetch_error` so operators can
   split slow-upstream from upstream-broken on dashboards.
+- `incomplete` — fetch and archive parse both succeeded, but the walk
+  left at least one member unread: a record whose body could not be
+  read (non-UTF-8, or past the per-entry decompression cap), a record
+  that did not deserialise as OSV, a member whose name could not be
+  decoded, or an entry-count cap trip that stopped the walk early. The
+  advisories the walk did collect are kept and still enqueue their
+  rescans; what is withheld is the checkpoint. Distinct from `ok`
+  because the window was not read in full, and from `parse_error`
+  because the archive itself parsed. The `warn` line emitted alongside
+  carries a count per reason — `entry_cap_tripped` means the ecosystem
+  outgrew `MAX_ENTRIES_TRUSTED_BULK` and the cap is what to raise; the
+  other counts mean the archive carried members this process could not
+  read, which has no cap to raise.
+
+**Alert spec:** `incomplete` holds the `advisory_sync_state.last_sync_at`
+checkpoint still, so a *sustained* non-zero rate means the watch window
+is no longer advancing and the same span is being re-read every tick.
+Alert on `rate(hort_advisory_diff_processed_total{result="incomplete"}[6h]) > 0`
+sustained across several ticks. A single occurrence is self-healing: the
+next tick re-reads the same window and advances if it reads it whole.
 
 The handler aggregates per-ecosystem results into
 `AdvisoryDiffResult.all_ecosystems_ok` for the checkpoint-advance
-gate; the counter and histogram below are the operator-visible
-breakdown.
+gate — `ok` is the only result that leaves it `true`; the counter and
+histogram below are the operator-visible breakdown.
 
 **`hort_patch_candidates_listed_total` result semantics** (closed
 taxonomy of 4; one emission per call to
@@ -3599,7 +3679,7 @@ expose CronJob single-active enforcement; we don't reinvent it.
 Cardinality:
 - `hort_scan_jobs_enqueued_total`: 4 trigger_source values → 4 series.
 - `hort_advisory_diff_processed_total`: ≤ 11 ecosystems (default 8) ×
-  4 results = ≤ 44 series ceiling. Default deployment 8 × 4 = 32.
+  5 results = ≤ 55 series ceiling. Default deployment 8 × 5 = 40.
 - `hort_advisory_diff_duration_seconds`: ≤ 11 histograms (one per
   configured ecosystem). Default deployment 8 histograms.
 - `hort_cron_rescan_eligible_artifacts`: 1 gauge (no labels).
@@ -3634,7 +3714,7 @@ advisory database (and by extension that `ArtifactBecameVulnerable` /
 
 | Metric | Type | Labels | Unit | Notes |
 |--------|------|--------|------|-------|
-| `hort_advisory_ingest_count` | counter | `category` | advisories | Per-ecosystem count of `AdvisoryEntry` values ingested in each `pull_diff_since` tick. `category` is a bounded fixed set (see below). **Only incremented on successful per-ecosystem ingest** — zero increments indicate the pipeline is silent. |
+| `hort_advisory_ingest_count` | counter | `category` | advisories | Per-ecosystem count of `AdvisoryEntry` values ingested in each `pull_diff_since` tick. `category` is a bounded fixed set (see below). **Only incremented on a per-ecosystem ingest that did not error** — zero increments indicate the pipeline is silent. An ingest whose archive walk left members unread (`hort_advisory_diff_processed_total{result="incomplete"}`) counts what it did ingest; the resulting undercount against the expected floor is the efficacy signal, and the two series are read together. |
 
 **`category` label semantics** (closed taxonomy of 11 + `other`):
 
@@ -4174,16 +4254,34 @@ with the per-kind reason.
   that attempt (`hort_app::retry_backoff::compute_backoff` — 1, 5, 30,
   then 60 minutes, the scan pipeline's own schedule). A five-attempt
   budget therefore spans **96 minutes** from the first failure to the
-  terminal row.
+  terminal row. A **destructive** row whose requester's authority could
+  not be *read* at execution time also lands here with no handler run at
+  all (see below).
 - `result="failed_terminal"` — `mark_failed` was called, so the row is
-  a terminal `failed` row carrying its last error. Two triggers reach
-  it: the handler returned `TaskOutcome::Failed { retry: false }`, or
-  it asked to be retried on a row whose `attempts` had reached the
+  a terminal `failed` row carrying its last error. Three triggers reach
+  it: the handler returned `TaskOutcome::Failed { retry: false }`; it
+  asked to be retried on a row whose `attempts` had reached the
   dispatcher's attempt cap (`JOB_ATTEMPT_CAP`, 5 — the same number the
-  abandoned-lease sweep spends). The label reports what the dispatcher
-  did to the row, not what the handler asked for: a job that keeps
-  failing the same way counts `failed_retry` four times and
-  `failed_terminal` once, then stops being claimed.
+  abandoned-lease sweep spends); or the row is a **destructive**
+  invocation whose requester's authority no longer holds, which the
+  dispatcher refuses before calling the handler (below). The label
+  reports what the dispatcher did to the row, not what the handler asked
+  for: a job that keeps failing the same way counts `failed_retry` four
+  times and `failed_terminal` once, then stops being claimed.
+
+**Destructive-task execution-time authority.** Before invoking a
+handler, the dispatcher re-checks the requester named by `jobs.actor_id`
+for the invocations that destroy something (`retention-purge`,
+`eventstore-archive`, `retention-evaluate` in execute mode). The refusal
+and the could-not-read cases are counted on the two labels above rather
+than on a metric of their own, and are told apart by the `last_error`
+text on the row: `destructive task refused at execution: …`
+(`failed_terminal`, never retried) versus `destructive task authority
+could not be re-checked: …` (`failed_retry` while budget remains). In
+both cases `TaskHandler::run` is never entered, so the row contributes
+**no** `hort_admin_tasks_duration_seconds` sample and never moves
+`hort_admin_tasks_in_flight` — those two describe handler execution, and
+there was none. Non-destructive kinds are unaffected.
 
 Note: for `kind="scan"`, `ScanTaskHandler::run` also calls
 `ScanOrchestrationUseCase::record_outcome` internally, which emits the
@@ -4580,9 +4678,15 @@ decision; an empty pending set emits nothing):
   names which claim held.
 - `storage_error` — `StoragePort::delete` failed transiently for a
   refcount-0 blob. **The `ArtifactExpired` decision is not lost**: no
-  `ArtifactPurged` is emitted, the `content_references` rows are not
-  removed (the deletion is rolled back with the failed transaction),
-  and the next sweep retries this artifact (two-stage idempotency).
+  `ArtifactPurged` is emitted, the durable purge worklist retains every
+  hash and its recorded count, and the next sweep retries this artifact
+  from it (two-stage idempotency). The artifact is already retired
+  (`artifacts.deleted_at`) and its `content_references` source edges are
+  already gone — both are written by the preparation transaction, which
+  commits before any storage delete is attempted, so neither is rolled
+  back by this failure. That order is deliberate: an artifact whose
+  bytes are partly gone must not still be servable, and the worklist is
+  what makes the half-finished state resumable.
 - `deferred` — the hash-scoped blob-reclamation lock was held by
   another session, so the refcount-0 decision could not be re-verified
   under it and **no delete was attempted**. Something is writing a
@@ -4949,7 +5053,9 @@ caveat), Ed25519-signs the shared `SignedBody` (the byte-identical
 verifier↔emitter contract pin), and writes it to the S3-Object-Lock-WORM
 anchor prefix. `hort_event_chain_checkpoint_total` is the emission
 evidence — emitted exactly once per emission cycle (a periodic tick
-**or** the pre-purge hook the retention purge calls).
+**or** the post-sweep hook the `eventstore-archive` audit-retention
+sweep calls once per sweep, after its seals have committed, to anchor
+them).
 
 | Metric | Type | Labels | Unit | Notes |
 |--------|------|--------|------|-------|
@@ -4967,7 +5073,7 @@ evidence — emitted exactly once per emission cycle (a periodic tick
 emitted **only** at the `hort-app` emission-task layer
 (`crates/hort-app/src/task_handlers/eventstore_checkpoint.rs::emit_metric`),
 once per emission cycle (both the periodic `TaskHandler::run` tick and
-the pre-purge `CheckpointEmissionHook` calls route
+the post-sweep `CheckpointEmissionHook` calls route
 through the same single `emit_metric`). The pure `hort-domain`
 checkpoint-build core and the `hort-adapters-checkpoint-anchor` write
 adapter emit nothing. `result` is a per-metric schema label holding
@@ -5048,6 +5154,7 @@ series (absence vs `0.0` is ambiguous to dashboards).
 | `hort_storage_operation_duration_seconds` | histogram | `backend`, `operation` | seconds | — |
 | `hort_storage_dedup_total` | counter | `backend` | — | content already present during `put` |
 | `hort_storage_integrity_failures_total` | counter | `backend` | — | streaming SHA-256 verification failed on a `get` read (ADR 0003) |
+| `hort_metadata_mirror_integrity_failures_total` | counter | `backend`, `reason` | — | a metadata-mirror `get` refused the stored body: `unframed`, `digest_mismatch` |
 
 **`hort_storage_integrity_failures_total` semantics:**
 
@@ -5066,6 +5173,30 @@ series (absence vs `0.0` is ambiguous to dashboards).
   backend, bit rot on underlying media, or a bug in the CAS write path.
   Operator response: inspect backend health and cross-check with the
   background integrity sweep (when available).
+
+**`hort_metadata_mirror_integrity_failures_total` semantics:**
+
+The metadata mirror (ADR 0026) records its body's SHA-256 in a frame
+header on `put` and verifies the body against it on `get`. This counter
+is the mirror's sibling of the CAS counter above, and its `reason` label
+separates two states an operator must not confuse:
+
+- `digest_mismatch` — the body did not hash to the digest recorded with
+  it. Corruption, truncation, or alteration at rest. The read fails and
+  the body is not handed out, so the affected package falls back to the
+  upstream error rather than re-projecting from bytes whose per-version
+  checksums can no longer be trusted. A sustained non-zero rate is the
+  same class of signal as the CAS counter: inspect the volume.
+- `unframed` — the stored body carries no frame header, so no digest was
+  ever recorded for it and there is nothing to verify against. Expected
+  for a bounded window after upgrading from a release that predates the
+  frame: every already-mirrored body reads this way until its next
+  upstream refresh rewrites it, and the hot serve path (which renders the
+  cached projection and never reads the mirror) is unaffected. What it
+  costs meanwhile is the outage / air-gapped fallback for packages not
+  yet refreshed. A rate that does **not** decay toward zero means bodies
+  are not being refreshed — an air-gapped deployment, or a mapping whose
+  upstream is unreachable.
 
 ### CAS integrity scrub
 

@@ -2413,13 +2413,17 @@ mod tests {
     /// Cap-format string this adapter uses with the generic primitive.
     const CAP_FORMAT: &str = "oci";
 
-    /// True when the per-`(oci, repo, principal)` cap set key is present
-    /// (i.e. at least one live member). The primitive drops the key when
-    /// the set empties, so absence == zero live members. Test-only
-    /// observability that stays on the primitive's PUBLIC key surface.
+    /// True when the per-`(oci, repo, principal)` cap set holds at least
+    /// one live member.
+    ///
+    /// Counts members rather than testing the key's presence: a release
+    /// that empties the set writes the empty set instead of deleting the
+    /// key, so presence no longer implies a live member and a
+    /// presence-based probe would read "cancel released nothing" as a
+    /// pass. Uses the primitive's own test-support count so this crate
+    /// still touches no private decoder.
     async fn cap_set_present(ctx: &AppContext, repo_id: Uuid, principal_id: Uuid) -> bool {
-        let key = upload_session_cap::session_set_key(CAP_FORMAT, repo_id, principal_id);
-        ctx.ephemeral_durable.get(&key).await.unwrap().is_some()
+        upload_session_cap::live_member_count(ctx, CAP_FORMAT, repo_id, principal_id).await > 0
     }
 
     #[test]
@@ -2591,7 +2595,7 @@ mod tests {
             cancel(&ctx, sid, repo_id, TEST_MAX_AGE).await.unwrap();
             assert!(
                 !cap_set_present(&ctx, repo_id, principal_id).await,
-                "cancel must release the set member (set drops when empty)"
+                "cancel must release the set member, leaving the set with none"
             );
             assert!(
                 ctx.ephemeral_durable
@@ -2778,7 +2782,7 @@ mod tests {
             let _ = s3;
             assert!(
                 cap_set_present(&ctx, repo_id, principal_id).await,
-                "double-cancel must not underflow / drop the set while s3 + the last \
+                "double-cancel must not underflow the set while s3 + the last \
                  admit are still live"
             );
         });

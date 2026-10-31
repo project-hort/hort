@@ -24,7 +24,9 @@ use chrono::Utc;
 use hort_adapters_ephemeral_memory::InMemoryEphemeralStore;
 use hort_app::cli_session_signing::CliSessionTokenSigner;
 use hort_app::error::AppError;
-use hort_app::oci_token_signing::{AccessEntry, OciAccessClaims, OciTokenSigningKey};
+use hort_app::oci_token_signing::{
+    AccessEntry, OciAccessClaims, OciTokenSigningKey, RepoScopeEntry,
+};
 use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
 use hort_app::use_cases::test_support::{MockIdentityProvider, MockUserRepository};
 use hort_domain::entities::user::{AuthProvider, User};
@@ -98,6 +100,10 @@ async fn oci_v2_auth_token_is_rejected_on_the_cli_session_bearer_path() {
             name: "library/nginx".into(),
             actions: vec!["pull".into(), "push".into()],
         }],
+        hort_repo_scope: Some(vec![RepoScopeEntry {
+            repo: Uuid::from_u128(0x5E_12),
+            actions: vec!["pull".into(), "push".into()],
+        }]),
     };
     let oci_jwt = shared_key.mint(&oci_claims).expect("mint oci token");
 

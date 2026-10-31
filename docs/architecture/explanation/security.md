@@ -222,13 +222,48 @@ runs. Every downstream consumer (auth attempt logs, `UrlResolver`, the
 rate-limiter's key extractor) reads from extensions — none
 re-implement peer-IP or proxy-trust logic.
 
-Three legal configurations:
+**The two fields read different inputs.** `HORT_PUBLIC_BASE_URL`
+governs `public_url`; `HORT_TRUSTED_PROXY_CIDRS` governs `client_ip`.
+A pinned public base URL does **not** switch off `X-Forwarded-For`
+attribution — `evaluate_trust` never reads `public_base_url` when
+computing `client_ip`. (This document and the middleware's own policy
+table both used to say it did; no code path implemented that, and the
+claim is why a deployment attributing every caller to its ingress
+looked correctly configured.)
+
+`public_url`:
 
 | `HORT_PUBLIC_BASE_URL` | `HORT_TRUSTED_PROXY_CIDRS` | Behaviour |
 |---|---|---|
-| set | (ignored) | Use verbatim; `X-Forwarded-*` and `Host` ignored. |
-| unset | set | Trust `X-Forwarded-Proto/Host/For` only when the peer IP is in the allowlist. Otherwise synthesise `public_url` from `Host` + `https`, `client_ip` from the socket peer. |
+| set | (not read for this) | Use verbatim; `X-Forwarded-*` and `Host` ignored. |
+| unset | set, peer trusted | `X-Forwarded-Proto`/`-Host`, falling back to `Host`. |
+| unset | peer not trusted | Synthesise from `Host` + `https`; bind-address default when `Host` is absent. |
 | unset | unset | **Unconditional startup failure.** `X-Forwarded-Host` injection poisons PyPI/npm/cargo download URLs regardless of auth state, so the check is not auth-gated. |
+
+`client_ip`:
+
+| `HORT_TRUSTED_PROXY_CIDRS` | Peer | Behaviour |
+|---|---|---|
+| set | in the allowlist | Rightmost-untrusted `X-Forwarded-For` entry (below); `0.0.0.0` sentinel + throttled `warn!` when XFF is absent or entirely internal. |
+| set | not in the allowlist | The socket peer. |
+| empty | (any) | The socket peer — **and the operator must declare that shape** with `HORT_CLIENT_IP_FROM_SOCKET_PEER=true`, or the binary refuses to start (`ClientIpAttributionUnconfigured`). |
+
+**Why the empty-allowlist case is an admission check, not a default.**
+With no allowlist, attribution is the TCP peer. For a directly-exposed
+server that is right. Behind a proxy, ingress or LB it is the edge's
+address for every caller in the world, so everything keyed on
+`client_ip` — the PAT brute-force lockout, the auth-failure rate-limit
+bucket, the per-IP concurrency cap, fail2ban — collapses onto a single
+bucket, and thirty failed credential presentations from anywhere deny
+credentialed access deployment-wide. Nothing observable at boot
+distinguishes the two deployments. A runtime heuristic cannot either:
+"an untrusted peer sent `X-Forwarded-For`" would let a
+directly-connected attacker opt out of its own bucket by adding a
+header. So the operator declares the deployment shape and the
+undeclared case fails closed at admission, never degrades to a
+best-guess authority at runtime (ADR 0016). `0.0.0.0/0` is not a way
+to satisfy it: that trusts `X-Forwarded-For` from everyone, which is
+the forgeable-attribution hole in a different shape.
 
 `main.rs` wraps the axum listener with
 `into_make_service_with_connect_info::<SocketAddr>()` so `ConnectInfo`
@@ -243,13 +278,53 @@ walks the comma-separated `X-Forwarded-For` header **right-to-left**
 and returns the rightmost hop that is **not** in the trusted-CIDRs
 allowlist (`rightmost_untrusted_forwarded_for` in
 `crates/hort-http-core/src/middleware/trust.rs`). The naive "leftmost"
-reading is forgeable — any client can prepend an arbitrary IP. The rightmost-untrusted reading walks
-the proxy chain backwards and stops at the first hop your trust
-configuration says could be a client, which is the only honest
-answer when the chain length isn't fixed. CIDR membership uses
-`Ipv6Addr::to_canonical()` before `IpNet::contains` so an
-IPv4-mapped IPv6 peer (`::ffff:10.0.0.5`) matches the same
-allowlist entry as the bare IPv4 form.
+reading is forgeable — any client can prepend an arbitrary IP, and an
+appending proxy (nginx's `$proxy_add_x_forwarded_for`) tacks the real
+client on the right without stripping it. The rightmost-untrusted
+reading walks the proxy chain backwards and stops at the first hop your
+trust configuration says could be a client, which is the only honest
+answer when the chain length isn't fixed.
+
+The predicate is **per entry and local**: an entry is a proxy hop iff
+its own address is in the allowlist. Nothing about an entry's
+neighbours can make it attributable — in particular a prepended entry
+naming an address inside the allowlist is stepped over as the hop it
+claims to be, never returned, because naming an internal address costs
+a caller nothing. A walk that instead stopped at the first entry whose
+right-hand neighbour was untrusted stops one entry too early and
+returns the caller's own chosen string; that is the shape this walk had
+until the attribution audit, and the two unit tests it passed were the
+two chains with no prepended entry, where leftmost-untrusted and
+rightmost-untrusted coincide.
+
+CIDR membership uses `Ipv6Addr::to_canonical()` before
+`IpNet::contains` so an IPv4-mapped IPv6 peer (`::ffff:10.0.0.5`)
+matches the same allowlist entry as the bare IPv4 form.
+
+**Every credential path reads `client_ip` from the extension.** The
+three inbound credential presentations — the write-path auth middleware
+(`require_principal`), the OCI consume-side bearer middleware, and
+`POST /api/v1/auth/exchange` — thread `RequestTrust.client_ip` into
+`AuthenticateUseCase::authenticate_bearer_with_client_ip`, which is
+what arms the PAT per-IP brute-force lockout; the Distribution-Spec
+mint endpoint `GET /v2/auth` reads the same extension rather than
+`ConnectInfo`. `crates/hort-app/tests/bearer_auth_threads_client_ip.rs`
+is a source guard that fails the build if a production call site drops
+it, because dropping it changes no response, metric or log — it only
+disarms the lockout.
+
+The one deliberate exception is the **read path**
+(`extract_optional_principal`), which calls the named
+`authenticate_bearer_read_path_without_ip_lockout`. A lockout there
+would let an unauthenticated reader with a bad token deny its whole
+/24's *writes* for fifteen minutes — reads need no credential at all
+(ADR 0021), so a bad token on a read is not a step towards access. Its
+exposure is **cost**: a PAT-cache miss buys an Argon2id verify at
+`m=19456, t=2, p=1`. That is bounded by the auth-scope rate-limit
+bucket instead, whose method filter admits a read **only when the
+request presents a credential** — an anonymous read stays out of the
+bucket entirely, a failed credentialed read counts, and a successful
+one does not.
 
 ## Egress and SSRF posture
 
@@ -282,10 +357,11 @@ compromised.
 
 Additional layers, each small and focused:
 
-- **Rate limiting.** `tower-governor` at `middleware/rate_limit.rs`.
-  Auth-attempt layer (default 60/min) wraps `require_principal`;
-  write-path layer (default 300/min) wraps POST/PUT/DELETE routes.
-  Keyed on `RequestTrust::client_ip`. Emits
+- **Rate limiting.** `middleware/rate_limit.rs`. Auth-failure layer
+  (default 60 **failures**/min) counts every write and every read that
+  *presents a credential*, consuming only on failure; write-path layer
+  (`tower-governor`, default 300/min) consumes on every POST/PUT/DELETE
+  regardless of outcome. Both keyed on `RequestTrust::client_ip`. Emits
   `hort_rate_limit_rejects_total{path, scope}` with
   `path=MatchedPath` (never a raw URI).
 - **Body + field caps.** `crates/hort-http-core/src/limits.rs` exports

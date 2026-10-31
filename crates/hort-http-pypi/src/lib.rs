@@ -261,7 +261,29 @@ async fn upload(
             }
             _ => {
                 if let Ok(text) = field.text().await {
-                    metadata_fields.insert(name, serde_json::Value::String(text));
+                    // A `METADATA` header that may appear more than once
+                    // arrives as a repeated multipart field, which is
+                    // the only shape the legacy upload API has for a
+                    // list — `Requires-Dist`, `Classifier`,
+                    // `Project-URL`, `Provides-Extra`. Last-writer-wins
+                    // would keep one requirement out of N and report the
+                    // rest as undeclared, and a BOM-adjudicating scan
+                    // backend reads an undeclared dependency as one that
+                    // is not there. So a second occurrence promotes the
+                    // value to an array and appends; a field that occurs
+                    // once stays a bare string, which is the shape the
+                    // scalar readers (`pkg_info.requires_python`) expect.
+                    let value = serde_json::Value::String(text);
+                    match metadata_fields.get_mut(&name) {
+                        Some(serde_json::Value::Array(existing)) => existing.push(value),
+                        Some(slot) => {
+                            let first = std::mem::replace(slot, serde_json::Value::Null);
+                            *slot = serde_json::Value::Array(vec![first, value]);
+                        }
+                        None => {
+                            metadata_fields.insert(name, value);
+                        }
+                    }
                 }
             }
         }
@@ -319,6 +341,30 @@ async fn upload(
     });
     hort_formats::pypi::validate_pypi_filename(&file_name)
         .map_err(|e| ApiError::from(hort_app::error::AppError::Domain(e)))?;
+
+    // The version the filename carries must agree with the declared one,
+    // or the upload is refused. hort stores the declared `version` and
+    // serves the file at `simple/{name}/{filename}` — but a client
+    // resolving the PEP 503 index does not read hort's stored version:
+    // PEP 503 publishes only links, and `pip` recovers each candidate's
+    // version from the filename. An upload declaring `1.0.0` under the
+    // filename `foo-9.9.9.tar.gz` is therefore installed as `9.9.9` by
+    // every client while every record hort keeps of it says `1.0.0`.
+    //
+    // `pkg_name` is passed because the version's boundary in an sdist
+    // filename is "whatever follows the project name" — the rule `pip`
+    // itself applies — and a rule that disagrees with the resolving
+    // client's is a check that can pass on a filename the client reads
+    // differently.
+    //
+    // Runs AFTER the name/version/filename grammar validators so their
+    // negative paths keep hitting THEIR error first, and BEFORE
+    // `coords`/ingest so a divergence costs no storage write.
+    if let hort_formats::pypi::PypiFilenameVersion::Diverges { in_filename } =
+        hort_formats::pypi::check_pypi_filename_version(&file_name, &pkg_name, &pkg_version)
+    {
+        return Ok(filename_version_refusal(&in_filename, &pkg_version));
+    }
 
     // Require the client-declared `sha256_digest` and route the upload
     // through the verified-ingest framework (ADR 0006). The maintainer
@@ -926,6 +972,34 @@ async fn pypi_member_coord_fetch(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The PyPI-shaped refusal for an upload whose filename carries a
+/// different version than the one it declared.
+///
+/// **400 + a `text/plain` body.** The legacy upload API (the endpoint
+/// twine posts to) reports a rejection as a 4xx status with a
+/// human-readable message body, which twine prints to the publisher
+/// verbatim; it has no JSON error envelope. The message names BOTH
+/// versions, because a publisher told only "version mismatch" cannot tell
+/// a stale filename from their build system apart from a tampered upload,
+/// and the two call for opposite responses.
+///
+/// `in_filename` has already been through
+/// `hort_formats::publish_identity::sanitize_declared` — it comes from a
+/// client-supplied filename and reaches a log line.
+fn filename_version_refusal(in_filename: &str, declared: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!(
+            "filename carries version '{in_filename}' but the upload declares \
+             version '{declared}'; a PEP 503 index publishes links only, so a \
+             client resolves the version from the filename and would install \
+             something other than what was declared"
+        ),
+    )
+        .into_response()
+}
 
 fn validation_error(msg: &str) -> ApiError {
     ApiError::from(hort_app::error::AppError::Domain(
@@ -3569,6 +3643,168 @@ mod tests {
         );
     }
 
+    // -- the version the filename carries ------------------------------------
+    //
+    // An upload declares `name`/`version` as form fields and supplies the
+    // filename separately on the `content` part. hort stores the declared
+    // version and serves the file at `simple/{name}/{filename}` — but a
+    // client resolving a PEP 503 index does NOT read hort's stored
+    // version: PEP 503 publishes only links, and `pip` recovers each
+    // candidate's version from the filename. So the two can diverge, and
+    // when they do every client installs one version while every record
+    // hort keeps says another.
+
+    /// Drive an upload with a caller-chosen `filename` and return the
+    /// status plus the body, so a refusal's text can be asserted.
+    async fn post_upload_with_filename_capturing_body(filename: &str) -> (StatusCode, Vec<u8>) {
+        let h = harness();
+        insert_repo(&h, "pypi-test");
+        let router = router(h.ctx.clone());
+        let boundary = "----hortversiontest";
+        let body = build_publish_multipart_with_filename(boundary, filename, b"payload");
+        let res = router
+            .oneshot(
+                Request::post("/pypi/pypi-test/")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = to_bytes(res.into_body(), 8192).await.unwrap().to_vec();
+        (status, body)
+    }
+
+    /// The builder declares `version = 1.0`; the filename says `9.9.9`.
+    #[tokio::test]
+    async fn upload_refuses_a_filename_carrying_another_version() {
+        let (status, body) =
+            post_upload_with_filename_capturing_body("evil_pkg-9.9.9.tar.gz").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // The legacy upload API reports a rejection as a 4xx with a
+        // human-readable body, which twine prints verbatim.
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("9.9.9") && text.contains("1.0"),
+            "the refusal must name BOTH versions: {text}"
+        );
+    }
+
+    /// Same for a wheel, whose version is the second `-`-delimited
+    /// component of the stem.
+    #[tokio::test]
+    async fn upload_refuses_a_wheel_filename_carrying_another_version() {
+        let (status, _) =
+            post_upload_with_filename_capturing_body("evil_pkg-9.9.9-py3-none-any.whl").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The counter-test: an agreeing wheel filename still uploads.
+    #[tokio::test]
+    async fn upload_of_an_agreeing_wheel_filename_still_succeeds() {
+        assert_eq!(
+            post_upload_with_filename("evil_pkg-1.0-py3-none-any.whl").await,
+            StatusCode::OK
+        );
+    }
+
+    /// A filename whose version component is the escaped spelling the
+    /// binary-distribution-format specification prescribes (`+` → `_`)
+    /// still uploads — byte equality would refuse the exact form the spec
+    /// requires.
+    #[tokio::test]
+    async fn upload_accepts_the_filename_escaping_the_wheel_spec_prescribes() {
+        let h = harness();
+        insert_repo(&h, "pypi-test");
+        let router = router(h.ctx.clone());
+        let boundary = "----horthescapetest";
+        let mut body = build_publish_multipart_with_filename(
+            boundary,
+            "evil_pkg-1.0_local.1-py3-none-any.whl",
+            b"payload",
+        );
+        // Re-declare `version` as the un-escaped metadata spelling.
+        body = replace_multipart_field(&body, "version", "1.0+local.1");
+        let res = router
+            .oneshot(
+                Request::post("/pypi/pypi-test/")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    /// The sdist version boundary is found after the project name, which
+    /// is `pip`'s own rule. A trailing-`-` split would read
+    /// `evil_pkg-9.9.9-0.tar.gz` as version `0` and wave through an upload
+    /// declaring `0` — while `pip` resolves `9.9.9-0` and installs that.
+    #[tokio::test]
+    async fn upload_refuses_a_filename_whose_version_only_looks_like_the_declared_one() {
+        let h = harness();
+        insert_repo(&h, "pypi-test");
+        let router = router(h.ctx.clone());
+        let boundary = "----hortpipruletest";
+        let mut body =
+            build_publish_multipart_with_filename(boundary, "evil_pkg-9.9.9-0.tar.gz", b"payload");
+        body = replace_multipart_field(&body, "version", "0");
+        let res = router
+            .oneshot(
+                Request::post("/pypi/pypi-test/")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = to_bytes(res.into_body(), 8192).await.unwrap();
+        let text = String::from_utf8_lossy(&text);
+        assert!(
+            text.contains("9.9.9-0"),
+            "the refusal must name the version a client would resolve: {text}"
+        );
+    }
+
+    /// A filename whose grammar yields no version at all is not a
+    /// divergence — `pip` skips a link it cannot parse, so there is no
+    /// disagreement between what hort records and what a client resolves.
+    /// It is also not this ticket's business to validate the file list.
+    #[tokio::test]
+    async fn upload_with_an_unparseable_filename_is_not_refused_for_its_version() {
+        assert_eq!(
+            post_upload_with_filename("evil_pkg.tar.gz").await,
+            StatusCode::OK,
+            "no version in the filename means nothing to disagree with"
+        );
+    }
+
+    /// Overwrite the value of a multipart text field in an already-built
+    /// body. Used to make the declared version and the filename's version
+    /// differ in their *spelling* rather than their value.
+    fn replace_multipart_field(body: &[u8], name: &str, value: &str) -> Vec<u8> {
+        let text = String::from_utf8(body.to_vec()).expect("fixture body is UTF-8");
+        let header = format!("name=\"{name}\"\r\n\r\n");
+        let start = text.find(&header).expect("field present") + header.len();
+        let end = start + text[start..].find("\r\n").expect("value terminator");
+        let mut out = text[..start].to_string();
+        out.push_str(value);
+        out.push_str(&text[end..]);
+        out.into_bytes()
+    }
+
     // -- publish-handler validators (name / version / filename) ---------------
     //
     // The PyPI download path calls `validate_pep_503_name` /
@@ -3910,6 +4146,114 @@ mod tests {
         assert!(
             kinds.contains(&"ArtifactIngested") && kinds.contains(&"ChecksumVerified"),
             "ArtifactIngested + ChecksumVerified must ride atomically in the same batch; got {kinds:?}"
+        );
+    }
+
+    /// **The F11-3 regression, publish half.** The legacy upload API's
+    /// only list shape is a repeated multipart field, which is how
+    /// `twine` sends a distribution's several `Requires-Dist` headers.
+    /// The harvest was last-writer-wins, so N declared dependencies
+    /// reached the stored metadata as one — and under a policy whose
+    /// scan backend adjudicates the component list, the other N-1 were
+    /// assessed as not declared at all.
+    #[tokio::test]
+    async fn publish_keeps_every_occurrence_of_a_repeated_metadata_field() {
+        use hort_domain::events::DomainEvent;
+        use sha2::{Digest, Sha256};
+
+        let h = harness();
+        insert_repo(&h, "pypi-test");
+
+        let content = b"repeated-field-upload".to_vec();
+        let sha = hex::encode(Sha256::digest(&content));
+        let boundary = "----hortrepeated";
+
+        let mut body: Vec<u8> = Vec::new();
+        let push_field = |buf: &mut Vec<u8>, name: &str, value: &str| {
+            buf.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            buf.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        };
+        push_field(&mut body, "name", "e2e_pkg");
+        push_field(&mut body, "version", "1.0");
+        push_field(&mut body, ":action", "file_upload");
+        push_field(&mut body, "sha256_digest", &sha);
+        // The scalar field a reader already depends on, to prove it is
+        // not promoted to an array by the repeated-field handling.
+        push_field(&mut body, "requires_python", ">=3.8");
+        push_field(&mut body, "requires_dist", "requests (==2.31.0)");
+        push_field(&mut body, "requires_dist", "click (>=8.0)");
+        push_field(&mut body, "requires_dist", "urllib3 (==2.0.7)");
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"content\"; filename=\"e2e-pkg-1.0.tar.gz\"\r\n",
+        );
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(&content);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let res = post_publish(&h, boundary, body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let transitions = h.lifecycle.committed_transitions();
+        let (_artifact, batch, _meta) = &transitions[0];
+        let ingested = batch
+            .events
+            .iter()
+            .find_map(|e| match &e.event {
+                DomainEvent::ArtifactIngested(i) => Some(i),
+                _ => None,
+            })
+            .expect("ArtifactIngested carries the multipart harvest");
+        let pkg_info = ingested
+            .metadata
+            .get("pkg_info")
+            .expect("the harvest lands under pkg_info");
+
+        assert_eq!(
+            pkg_info.get("requires_dist"),
+            Some(&serde_json::json!([
+                "requests (==2.31.0)",
+                "click (>=8.0)",
+                "urllib3 (==2.0.7)"
+            ])),
+            "every declared dependency must survive the harvest, in order"
+        );
+        assert_eq!(
+            pkg_info.get("requires_python"),
+            Some(&serde_json::json!(">=3.8")),
+            "a field that occurs once stays a bare string — the simple-index reader \
+             consumes this one as a scalar"
+        );
+
+        // And the whole point: the handler turns that harvest into the
+        // component list a scan backend adjudicates.
+        let coords = ArtifactCoords {
+            name: "e2e-pkg".to_string(),
+            name_as_published: "e2e_pkg".to_string(),
+            version: Some("1.0".to_string()),
+            path: "simple/e2e-pkg/e2e-pkg-1.0.tar.gz".to_string(),
+            format: RepositoryFormat::Pypi,
+            metadata: serde_json::Value::Null,
+        };
+        let sbom = PyPiFormatHandler
+            .extract_sbom(
+                &coords,
+                &ingested.metadata,
+                hort_domain::types::PayloadAccess::Bytes(b""),
+            )
+            .expect("extract_sbom")
+            .expect("a BOM");
+        let mut names: Vec<&str> = sbom.components.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["click", "requests", "urllib3"],
+            "all three declared dependencies reach the scan subject"
         );
     }
 
@@ -4518,6 +4862,311 @@ mod tests {
         assert!(
             !html.contains("https://files.pythonhosted.org"),
             "no upstream URLs should remain after rewrite"
+        );
+    }
+
+    // --- Advertised digest vs. the digest hort would verify -----------
+    //
+    // A proxy serve rewrites every `href` to point back at hort, so the
+    // digest in the served document is the one a client checks the bytes
+    // *hort* hands back against. For a file hort holds, that is hort's
+    // own `sha256_checksum`; only a file hort does not hold keeps the
+    // upstream's advertisement (which is also what the pull-through will
+    // verify against, so the two agree by construction). The decision is
+    // per FILE: a version holds an sdist plus N wheels and hort may hold
+    // only some of them.
+
+    /// Stand up a pypi proxy repo with an upstream mapping and one
+    /// seeded upstream simple-index HTML body, serve
+    /// `/simple/{project}/`, and hand back the served document.
+    ///
+    /// `held` seeds one artifact row per `(filename, sha256-hex)` pair at
+    /// the pypi logical path `simple/{project}/{filename}` — i.e. "hort
+    /// holds this file under this digest". The seeded row's `version`
+    /// field is deliberately left at the `sample_artifact` default and
+    /// does NOT match the version in the filename: the digest decision is
+    /// keyed by filename alone, and a test that quietly aligned the two
+    /// could not tell that apart from a version-keyed lookup. `IndexMode::IncludePending`
+    /// because the seeded rows carry `QuarantineStatus::None` and the
+    /// default `ReleasedOnly` would filter the version out of the
+    /// document these tests read.
+    async fn serve_proxy_simple_index(
+        project: &str,
+        upstream_html: &str,
+        held: &[(&str, &str)],
+    ) -> String {
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::repository::RepositoryType;
+        use hort_domain::ports::repository_upstream_mapping_repository::{
+            RepositoryUpstreamMapping, UpstreamAuth,
+        };
+        use hort_http_core::test_support::build_mock_ctx;
+
+        let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        let (ctx, mocks) = build_mock_ctx(metrics_handle);
+
+        let mut repo = sample_repository();
+        repo.key = "pypi-mirror".into();
+        repo.format = RepositoryFormat::Pypi;
+        repo.repo_type = RepositoryType::Proxy;
+        repo.upstream_url = Some("https://pypi.org".into());
+        repo.index_mode = hort_domain::entities::repository::IndexMode::IncludePending;
+        mocks.repositories.insert(repo.clone());
+
+        let now = Utc::now();
+        mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
+            id: Uuid::new_v4(),
+            repository_id: repo.id,
+            path_prefix: "".into(),
+            upstream_url: "https://pypi.org".into(),
+            upstream_name_prefix: None,
+            upstream_auth: UpstreamAuth::Anonymous,
+            secret_ref: None,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+            insecure_upstream_url: false,
+            trust_upstream_publish_time: false,
+            mtls_cert_ref: None,
+            mtls_key_ref: None,
+            ca_bundle_ref: None,
+            pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        });
+
+        for (filename, sha_hex) in held {
+            let mut artifact = sample_artifact(QuarantineStatus::None);
+            artifact.repository_id = repo.id;
+            artifact.name = project.to_string();
+            artifact.name_as_published = project.to_string();
+            artifact.path = format!("simple/{project}/{filename}");
+            artifact.sha256_checksum = sha_hex.parse().expect("64 lowercase hex");
+            mocks.artifacts.insert(artifact);
+        }
+
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("/simple/{project}/"),
+            upstream_html.as_bytes().to_vec(),
+        );
+
+        let res = router(ctx)
+            .oneshot(
+                Request::get(format!("/pypi/pypi-mirror/simple/{project}/"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 65536).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    const UPSTREAM_SHA_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const HORT_SHA_A: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const UPSTREAM_SHA_B: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn one_anchor(filename: &str, sha_hex: &str) -> String {
+        format!(
+            r#"<a href="https://files.pythonhosted.org/x/y/{filename}#sha256={sha_hex}">{filename}</a>"#
+        )
+    }
+
+    /// hort holds the file and its stored digest DISAGREES with the
+    /// upstream index's: the served fragment is hort's, because hort is
+    /// what will serve the bytes.
+    ///
+    /// Before the fix this emitted `#sha256={UPSTREAM_SHA_A}` — the
+    /// upstream's value, for bytes hort would never hand back — so the
+    /// `HORT_SHA_A` assertion failed and the `UPSTREAM_SHA_A` one caught
+    /// it on the way out.
+    #[tokio::test]
+    async fn proxy_index_advertises_horts_digest_for_a_file_hort_holds() {
+        let html = serve_proxy_simple_index(
+            "requests",
+            &one_anchor("requests-2.31.0.tar.gz", UPSTREAM_SHA_A),
+            &[("requests-2.31.0.tar.gz", HORT_SHA_A)],
+        )
+        .await;
+
+        assert!(
+            html.contains(&format!("requests-2.31.0.tar.gz#sha256={HORT_SHA_A}")),
+            "a file hort holds must be advertised under hort's own digest: {html}"
+        );
+        assert!(
+            !html.contains(UPSTREAM_SHA_A),
+            "the upstream's disagreeing digest must not reach the served document: {html}"
+        );
+    }
+
+    /// hort does not hold the file: the upstream's advertisement is the
+    /// only digest anyone knows, and hort will verify the pull-through
+    /// against exactly it (ADR 0006). It is kept verbatim and no digest
+    /// of hort's own is invented.
+    #[tokio::test]
+    async fn proxy_index_keeps_the_upstream_digest_for_a_file_hort_does_not_hold() {
+        let html = serve_proxy_simple_index(
+            "requests",
+            &one_anchor("requests-2.31.0.tar.gz", UPSTREAM_SHA_A),
+            &[],
+        )
+        .await;
+
+        assert!(
+            html.contains(&format!("requests-2.31.0.tar.gz#sha256={UPSTREAM_SHA_A}")),
+            "an unheld file keeps the upstream's digest: {html}"
+        );
+    }
+
+    /// An upstream that publishes no digest for a file hort does not
+    /// hold leaves the served anchor with no fragment at all. The
+    /// failure mode this pins is the *opposite* of the one above:
+    /// inventing an advertisement for bytes hort has never seen is the
+    /// same defect one step over, and a `None` upstream value with an
+    /// empty held map is where that would show.
+    #[tokio::test]
+    async fn proxy_index_invents_no_digest_for_an_unheld_file_with_no_upstream_hash() {
+        let filename = "requests-2.31.0.tar.gz";
+        let html = serve_proxy_simple_index(
+            "requests",
+            &format!(r#"<a href="https://files.pythonhosted.org/x/y/{filename}">{filename}</a>"#),
+            &[],
+        )
+        .await;
+
+        assert!(
+            html.contains(filename),
+            "the file is still advertised: {html}"
+        );
+        assert!(
+            !html.contains("#sha256="),
+            "no digest is known for this file, so none may be advertised: {html}"
+        );
+    }
+
+    /// One version, two files, and hort holds exactly one of them: each
+    /// file is advertised from its own fact. A per-version answer would
+    /// have to pick one of the two and would be wrong about the other
+    /// either way.
+    ///
+    /// Before the fix both anchors carried their upstream value, so the
+    /// wheel's `HORT_SHA_A` assertion failed; the sdist's
+    /// `UPSTREAM_SHA_B` assertion passed before and after, which is what
+    /// makes it the per-file half of the claim rather than a repeat of
+    /// the first test.
+    #[tokio::test]
+    async fn proxy_index_decides_per_file_when_a_version_mixes_held_and_unheld() {
+        let wheel = "requests-2.31.0-py3-none-any.whl";
+        let sdist = "requests-2.31.0.tar.gz";
+        let html = serve_proxy_simple_index(
+            "requests",
+            &format!(
+                "{}\n{}",
+                one_anchor(wheel, UPSTREAM_SHA_A),
+                one_anchor(sdist, UPSTREAM_SHA_B)
+            ),
+            &[(wheel, HORT_SHA_A)],
+        )
+        .await;
+
+        assert!(
+            html.contains(&format!("{wheel}#sha256={HORT_SHA_A}")),
+            "the held wheel takes hort's digest: {html}"
+        );
+        assert!(
+            html.contains(&format!("{sdist}#sha256={UPSTREAM_SHA_B}")),
+            "the unheld sdist keeps the upstream's: {html}"
+        );
+        assert!(
+            !html.contains(UPSTREAM_SHA_A),
+            "the held wheel's upstream digest must not survive: {html}"
+        );
+    }
+
+    /// Counter-test — where the two agree, nothing about the served
+    /// document changes.
+    ///
+    /// "Unchanged" is asserted against the document the pre-fix code
+    /// produced rather than against a transcribed literal: with no held
+    /// rows at all, every advertisement is the upstream's verbatim
+    /// value, which is exactly what the old `projection_to_entries`
+    /// emitted for an agreeing digest. The two bodies must be
+    /// byte-identical.
+    #[tokio::test]
+    async fn proxy_index_is_byte_identical_when_upstream_and_hort_agree() {
+        let filename = "requests-2.31.0.tar.gz";
+        let upstream_html = one_anchor(filename, UPSTREAM_SHA_A);
+
+        let with_held =
+            serve_proxy_simple_index("requests", &upstream_html, &[(filename, UPSTREAM_SHA_A)])
+                .await;
+        let without_held = serve_proxy_simple_index("requests", &upstream_html, &[]).await;
+
+        assert_eq!(
+            with_held, without_held,
+            "an agreeing held digest must change nothing in the served document"
+        );
+        assert!(with_held.contains(&format!("{filename}#sha256={UPSTREAM_SHA_A}")));
+    }
+
+    /// The divergence itself is reported, not just corrected.
+    ///
+    /// Choosing hort's digest keeps the served document honest, but it
+    /// also silently absorbs a fact an operator needs: the upstream
+    /// index now names different bytes than hort stored under this
+    /// filename — a re-used filename upstream, a mapping repointed at a
+    /// different index, or a stale row. The counter is the signal;
+    /// the filenames ride on the accompanying `warn` because a per-file
+    /// metric label would be unbounded cardinality.
+    ///
+    /// An agreeing digest must NOT fire it, which is the half that keeps
+    /// the signal readable — so both directions are asserted here.
+    #[test]
+    fn proxy_index_digest_divergence_is_counted_only_when_the_two_disagree() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        fn divergence_count(held_sha: &'static str) -> u64 {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        serve_proxy_simple_index(
+                            "requests",
+                            &one_anchor("requests-2.31.0.tar.gz", UPSTREAM_SHA_A),
+                            &[("requests-2.31.0.tar.gz", held_sha)],
+                        )
+                        .await;
+                    });
+            });
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(ckey, _, _, _)| ckey.key().name() == "hort_index_digest_divergence_total")
+                .filter_map(|(_, _, _, value)| match value {
+                    DebugValue::Counter(n) => Some(n),
+                    _ => None,
+                })
+                .sum()
+        }
+
+        assert_eq!(
+            divergence_count(HORT_SHA_A),
+            1,
+            "a disagreeing held digest must be counted once per file"
+        );
+        assert_eq!(
+            divergence_count(UPSTREAM_SHA_A),
+            0,
+            "an agreeing held digest is not a divergence"
         );
     }
 
@@ -6667,6 +7316,7 @@ mod tests {
             simple_index::SimpleIndexFormat::Html,
             "example",
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(entries.len(), 1);
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(payload) =
@@ -6698,6 +7348,7 @@ mod tests {
             &bytes::Bytes::from(html.to_string()),
             simple_index::SimpleIndexFormat::Html,
             "example",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert_eq!(entries.len(), 1);
@@ -6733,6 +7384,7 @@ mod tests {
             simple_index::SimpleIndexFormat::Html,
             "example",
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(payload) =
             &entries[0].payload
@@ -6764,6 +7416,7 @@ mod tests {
             &bytes::Bytes::from(bytes_body),
             simple_index::SimpleIndexFormat::Json,
             "example",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         assert_eq!(entries.len(), 1);
@@ -6804,6 +7457,7 @@ mod tests {
             &bytes::Bytes::from(bytes_body),
             simple_index::SimpleIndexFormat::Json,
             "example",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(payload) =
@@ -6881,6 +7535,7 @@ mod tests {
             simple_index::SimpleIndexFormat::Json,
             "requests",
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(p) = &entries[0].payload
         else {
@@ -6932,6 +7587,7 @@ mod tests {
             simple_index::SimpleIndexFormat::Json,
             "requests",
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         );
         let html = render_proxy_html(entries);
         assert!(
@@ -6965,6 +7621,7 @@ mod tests {
             &bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
             simple_index::SimpleIndexFormat::Json,
             "requests",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(p) = &entries[0].payload
@@ -7010,6 +7667,7 @@ mod tests {
             &bytes::Bytes::from(html_upstream.to_string()),
             simple_index::SimpleIndexFormat::Html,
             "requests",
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         );
         let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(p) = &entries[0].payload

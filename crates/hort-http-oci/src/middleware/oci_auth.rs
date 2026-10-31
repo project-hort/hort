@@ -127,6 +127,18 @@ pub async fn oci_bearer_auth(
         return next.run(req).await;
     }
 
+    // Client attribution for the PAT validator's per-IP brute-force
+    // lockout, which `authenticate_bearer_with_client_ip` arms and a
+    // `None` disables. Read from the `RequestTrust` extension — never
+    // from `ConnectInfo`, which behind a proxy is one address for every
+    // caller. `None` only on a router with no trust layer (the
+    // standalone-router tests), which disarms the lockout rather than
+    // mis-attributing it.
+    let client_ip = req
+        .extensions()
+        .get::<hort_http_core::middleware::trust::RequestTrust>()
+        .map(|t| t.client_ip);
+
     // Resolve a token from `Authorization`. Bearer or Basic-as-JWT
     // both supply the same string; absent → anonymous pass-through.
     let token = extract_token(&req);
@@ -213,7 +225,10 @@ pub async fn oci_bearer_auth(
                     );
                     return unauthorized_response(&ctx, &method, &path);
                 };
-                match authenticate.authenticate_bearer(&token).await {
+                match authenticate
+                    .authenticate_bearer_with_client_ip(&token, client_ip)
+                    .await
+                {
                     Ok(p) => Some(p),
                     Err(err) => {
                         tracing::info!(
@@ -771,6 +786,18 @@ mod tests {
     /// a live principal carrying `token_kind: Some(kind)` and
     /// `token_cap: Some(..)`.
     fn bearer_only_ctx_with_pat(kind: TokenKind, verify_ok: bool) -> Arc<AppContext> {
+        bearer_only_ctx_with_pat_lockout(kind, verify_ok, PatLockoutConfig::DEFAULT).0
+    }
+
+    /// [`bearer_only_ctx_with_pat`] with an operator-chosen lockout
+    /// policy, also handing back the durable ephemeral store the
+    /// lockout keys into — the only observable, since every
+    /// `PatValidationError` arm reaches the wire as the same `401`.
+    fn bearer_only_ctx_with_pat_lockout(
+        kind: TokenKind,
+        verify_ok: bool,
+        lockout: PatLockoutConfig,
+    ) -> (Arc<AppContext>, Arc<dyn EphemeralStore>) {
         let handle = PrometheusBuilder::new().build_recorder().handle();
         let (ctx, mocks) = build_mock_ctx(handle);
 
@@ -817,7 +844,7 @@ mod tests {
             pat_cache,
             Arc::new(StubVerifier(verify_ok)) as Arc<dyn Argon2Verifier>,
             Arc::new(SystemClock),
-            PatLockoutConfig::DEFAULT,
+            lockout,
         ));
 
         let idp = Arc::new(MockIdentityProvider::new());
@@ -832,13 +859,109 @@ mod tests {
         let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(
             Vec::new(),
         )));
-        with_auth(
+        let ctx = with_auth(
             &ctx,
             AuthContext::BearerOnly {
                 authenticate: auth,
                 rbac,
             },
+        );
+        (
+            ctx,
+            mocks.ephemeral_durable.clone() as Arc<dyn EphemeralStore>,
         )
+    }
+
+    // -------------------- 0. Client attribution --------------------------
+    //
+    // The consume-side bearer middleware is a credential presentation
+    // too: a directly-presented native `hort_pat_*` reaches the PAT
+    // validator through `authenticate_bearer_with_client_ip`, and the
+    // per-IP brute-force lockout only exists if the IP gets there. This
+    // middleware previously called the two-argument form, which
+    // delegates with `None` and disarms the gate.
+    //
+    // The request carries a `RequestTrust` with the real caller AND a
+    // different `ConnectInfo` peer, so attributing to the socket peer
+    // (or to nothing) fails here.
+
+    #[test]
+    fn oci_bearer_failure_counts_against_the_trust_resolved_client() {
+        use hort_app::metrics::client_ip_bucket;
+        use hort_app::use_cases::pat_validation_use_case::{
+            PAT_LOCKOUT_BY_IP_COUNTER_PREFIX, PAT_LOCKOUT_BY_IP_FLAG_PREFIX,
+        };
+        use hort_http_core::middleware::trust::RequestTrust;
+
+        let client: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let peer: std::net::SocketAddr = "10.0.0.5:4444".parse().unwrap();
+        let (counter, flag, proxy_counter) = run(async {
+            let (ctx, store) = bearer_only_ctx_with_pat_lockout(
+                TokenKind::Pat,
+                // The planted row's hash never matches: the validator
+                // runs, fails, and books the failure.
+                false,
+                PatLockoutConfig {
+                    threshold: 2,
+                    ..PatLockoutConfig::DEFAULT
+                },
+            );
+            let trust = RequestTrust {
+                client_ip: client,
+                public_url: url::Url::parse("https://hort.example.com/").unwrap(),
+            };
+            let router = build_test_router(&ctx).layer(axum::Extension(trust));
+            for _ in 0..2 {
+                let resp = router
+                    .clone()
+                    .oneshot(
+                        HttpRequest::get("/v2/probe")
+                            .header(header::AUTHORIZATION, format!("Bearer {VALID_PAT}"))
+                            .extension(axum::extract::ConnectInfo(peer))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "a PAT whose hash does not match must 401"
+                );
+            }
+            let bucket = client_ip_bucket(client);
+            let counter = store
+                .get(&format!("{PAT_LOCKOUT_BY_IP_COUNTER_PREFIX}{bucket}"))
+                .await
+                .unwrap();
+            let flag = store
+                .get(&format!("{PAT_LOCKOUT_BY_IP_FLAG_PREFIX}{bucket}"))
+                .await
+                .unwrap();
+            let proxy_counter = store
+                .get(&format!(
+                    "{PAT_LOCKOUT_BY_IP_COUNTER_PREFIX}{}",
+                    client_ip_bucket(peer.ip())
+                ))
+                .await
+                .unwrap();
+            (counter, flag, proxy_counter)
+        });
+        assert!(
+            counter.is_some(),
+            "a failed native-token presentation on /v2/* must count against \
+             the caller's bucket; absent means the middleware threaded None \
+             and the lockout is disarmed"
+        );
+        assert!(
+            flag.is_some(),
+            "two failures at threshold 2 must trip the lockout flag"
+        );
+        assert!(
+            proxy_counter.is_none(),
+            "nothing may be attributed to the socket peer: behind a proxy \
+             that is one address for every caller"
+        );
     }
 
     // -------------------- 1. Anonymous (no header) -----------------------
@@ -1226,7 +1349,7 @@ mod tests {
     /// typed `OciVerifyOutcome::Verified` mapping.
     #[test]
     fn inbound_oci_jwt_validates_via_signing_key() {
-        use hort_app::oci_token_signing::{AccessEntry, OciAccessClaims};
+        use hort_app::oci_token_signing::{AccessEntry, OciAccessClaims, RepoScopeEntry};
         use hort_http_core::test_support::with_oci_public_base_url;
         let parsed = run(async {
             let (ctx, mocks) = enabled_auth_ctx_no_tokens_with_mocks();
@@ -1247,6 +1370,10 @@ mod tests {
                     name: "foo/bar".into(),
                     actions: vec!["pull".into()],
                 }],
+                hort_repo_scope: Some(vec![RepoScopeEntry {
+                    repo: uuid::Uuid::from_u128(0xF00),
+                    actions: vec!["pull".into()],
+                }]),
             };
             let jwt = signing.mint(&claims).expect("mint");
 
@@ -1301,6 +1428,7 @@ mod tests {
                 aud: "hort.example.com".into(),
                 exp: Utc::now() + chrono::Duration::seconds(300),
                 access: vec![],
+                hort_repo_scope: Some(vec![]),
             };
             let jwt = attacker_signing.mint(&claims).expect("mint");
             let ctx = with_native_oci_tokens(&ctx, &mocks, active_signing, "hort.example.com");
@@ -1319,6 +1447,108 @@ mod tests {
         // Falls through to the legacy IdP path which has no JWKS for
         // this fake; still 401.
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A correctly-signed, right-`aud` OCI JWT carrying NO
+    /// `hort_repo_scope` claim is refused at the middleware. Only a
+    /// token minted before that claim existed can be in this state, and
+    /// honouring it would mean reconstituting its cap as a flat union
+    /// across `access[]` — the boundary this surface exists to keep.
+    ///
+    /// The `hort-app` test
+    /// `verify_inbound_token_without_scope_claim_is_rejected_not_fallen_through`
+    /// pins that this is a `Rejected` and not a `NotOurToken`
+    /// fall-through; this one pins what the client sees.
+    #[test]
+    fn inbound_oci_jwt_without_repo_scope_claim_is_refused() {
+        let status = run(async {
+            let (ctx, mocks) = enabled_auth_ctx_no_tokens_with_mocks();
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                rand::rngs::SysRng,
+            ));
+            let signing = OciTokenSigningKey::new(sk, None);
+            let claims = hort_app::oci_token_signing::OciAccessClaims {
+                iss: "https://hort.example.com/v2/auth".into(),
+                sub: uuid::Uuid::from_u128(0xC0FFEE),
+                aud: "hort.example.com".into(),
+                exp: Utc::now() + chrono::Duration::seconds(300),
+                access: vec![hort_app::oci_token_signing::AccessEntry {
+                    resource_type: "repository".into(),
+                    name: "foo/bar".into(),
+                    actions: vec!["pull".into(), "push".into()],
+                }],
+                hort_repo_scope: None,
+            };
+            let jwt = signing.mint(&claims).expect("mint");
+            let ctx = with_native_oci_tokens(&ctx, &mocks, Arc::new(signing), "hort.example.com");
+            let router = build_test_router(&ctx);
+            let resp = router
+                .oneshot(
+                    HttpRequest::get("/v2/probe")
+                        .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            resp.status()
+        });
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The per-resource binding survives the
+    /// `mint_authenticated_principal_for_format_middleware` seam and
+    /// reaches the handler on the principal's cap — so every downstream
+    /// `/v2/*` gate evaluates against it, not against a flat union.
+    #[test]
+    fn inbound_oci_jwt_carries_its_per_repository_binding_to_the_handler() {
+        let repo = uuid::Uuid::from_u128(0xBEEF);
+        let parsed = run(async {
+            let (ctx, mocks) = enabled_auth_ctx_no_tokens_with_mocks();
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                rand::rngs::SysRng,
+            ));
+            let signing = OciTokenSigningKey::new(sk, None);
+            let claims = hort_app::oci_token_signing::OciAccessClaims {
+                iss: "https://hort.example.com/v2/auth".into(),
+                sub: uuid::Uuid::from_u128(0xC0FFEE),
+                aud: "hort.example.com".into(),
+                exp: Utc::now() + chrono::Duration::seconds(300),
+                access: vec![hort_app::oci_token_signing::AccessEntry {
+                    resource_type: "repository".into(),
+                    name: "foo/bar".into(),
+                    actions: vec!["pull".into()],
+                }],
+                hort_repo_scope: Some(vec![hort_app::oci_token_signing::RepoScopeEntry {
+                    repo,
+                    actions: vec!["pull".into()],
+                }]),
+            };
+            let jwt = signing.mint(&claims).expect("mint");
+            let ctx = with_native_oci_tokens(&ctx, &mocks, Arc::new(signing), "hort.example.com");
+            let router = build_test_router(&ctx);
+            let resp = router
+                .oneshot(
+                    HttpRequest::get("/v2/probe")
+                        .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        });
+        let cap = parsed["token_cap"].as_str().expect("token_cap echoed");
+        assert!(
+            cap.contains("per_repository_permissions: Some("),
+            "the consumed cap must be per-resource: {cap}"
+        );
+        assert!(
+            cap.contains(&repo.to_string()),
+            "the cap must name the repository the grant was bound to: {cap}"
+        );
     }
 
     // -------------------- 6. BearerOnly native-token parity (D3) ---------

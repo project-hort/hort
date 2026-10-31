@@ -1096,15 +1096,25 @@ fn expected_re_evaluate(
     if !is_scan_clearable(reason) {
         return ReEvalOutcome::Denied;
     }
+    // (c) is checked before the window branch, so it denies both targets.
+    // A re-quarantine hands the artifact to the timer sweep, and
+    // `Artifact::release` takes no curation input — nor does anything
+    // between the two, since the retroactive curation pass walks only the
+    // active population. Deferring (c) past here drops it.
+    let curation_clears = matches!(curation, CurationClearance::Cleared);
+    if !curation_clears {
+        return ReEvalOutcome::Denied;
+    }
     if window_open {
         return ReEvalOutcome::ReQuarantined;
     }
+    // (b) is the release arm's alone: the timer release the re-quarantine
+    // arm defers to re-applies the provenance AND-precondition itself.
     let provenance_clears = matches!(
         provenance,
         ProvenanceClearance::NotRequired | ProvenanceClearance::Cleared
     );
-    let curation_clears = matches!(curation, CurationClearance::Cleared);
-    if provenance_clears && curation_clears {
+    if provenance_clears {
         ReEvalOutcome::Released
     } else {
         ReEvalOutcome::Denied

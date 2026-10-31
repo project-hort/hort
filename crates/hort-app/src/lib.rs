@@ -35,6 +35,11 @@ pub mod cli_session_signing;
 // near-real-time cache invalidation. See
 // `docs/architecture/explanation/event-notifications.md`.
 pub mod dispatcher;
+// Execution-time re-authorization of a destructive admin task. The
+// enqueue gate decides whether a request may be *accepted*; this decides
+// whether the accepted row may still *run*, because authority revoked
+// while a row waited in the queue must stop it.
+pub mod destructive_task_reauthorization;
 pub mod ephemeral_keyspace;
 pub mod error;
 // The one shared predicate deciding whether an event-chain checkpoint
@@ -109,6 +114,10 @@ pub mod retry_backoff;
 // (sibling of `crate::provenance`). Static, not the live worker registry:
 // see the module docs (regression H20).
 pub mod scanning;
+// Spill a forward-only CAS stream to a temporary file so a tail-indexed
+// container (a ZIP's central directory) can be read without holding the
+// whole artifact in memory. See ADR 0026.
+pub mod seekable_spill;
 // The deployment's effective global storage backend as a pure value
 // type (zero-I/O, sibling of `crate::lint::LintConfig`). Threaded into
 // `ApplyConfigUseCase` via the additive `with_effective_storage_backend`

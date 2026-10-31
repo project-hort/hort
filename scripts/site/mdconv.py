@@ -50,8 +50,15 @@ def strip_inline_markup(text):
 
 
 def slugify(text, seen):
-    """GitHub-compatible heading slug, de-duplicated against `seen` (a dict
-    mapping slug -> next suffix to use, mutated in place)."""
+    r"""Heading slug, de-duplicated against `seen` (a dict mapping slug ->
+    next suffix to use, mutated in place).
+
+    GitHub-shaped but NOT GitHub-identical: the strip set is
+    `[^a-z0-9\s-]`, so an underscore is **removed** where GitHub keeps it
+    (`## What about \`_sqlx_migrations\`?` -> `what-about-sqlxmigrations`,
+    not `what-about-_sqlx_migrations`). Hand-writing a same-page anchor from
+    GitHub habit is therefore a broken link that only `linkcheck.py` catches.
+    """
     plain = strip_inline_markup(text).lower()
     plain = _SLUG_STRIP_RE.sub("", plain)
     plain = _SLUG_WS_RE.sub("-", plain).strip("-")

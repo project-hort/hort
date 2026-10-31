@@ -950,8 +950,12 @@ impl TaskInvoked {
 /// without appending any event (the denial itself IS the audit fact, visible
 /// in the RBAC evaluator metrics).
 ///
-/// **`reason`** is capped at 4,096 bytes to mirror the
-/// `jobs.last_error` column cap and prevent unbounded payloads.
+/// **`reason`** is capped at 4,096 bytes to match
+/// [`REASON_MAX_BYTES`](super::super::ports::task_handler::REASON_MAX_BYTES),
+/// the cap the dispatcher applies before writing the same text to
+/// `jobs.last_error`. That column is uncapped `text`, so the two caps
+/// are the whole bound on either payload; they are one number so the
+/// event and the row cannot disagree about what was truncated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskFailed {
     /// `jobs.id` of the failed row.

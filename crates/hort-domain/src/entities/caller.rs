@@ -182,6 +182,7 @@ mod tests {
         b.token_cap = Some(TokenCap {
             permissions: vec![Permission::Read],
             repository_ids: None,
+            per_repository_permissions: None,
         });
         assert_ne!(a, b);
 
@@ -189,6 +190,7 @@ mod tests {
         let cap = TokenCap {
             permissions: vec![Permission::Read, Permission::Write],
             repository_ids: Some(vec![Uuid::from_u128(0xA)]),
+            per_repository_permissions: None,
         };
         let mut c = template.clone();
         c.token_cap = Some(cap.clone());

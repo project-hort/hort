@@ -316,7 +316,7 @@ fn collect_reads() -> Vec<Read> {
 /// hole in it. A stance that flips in either direction fails here too,
 /// which is the point: a reader going from filtered to declared is a
 /// review conversation, not an edit made on the way past.
-const CENSUS: [(&str, usize, usize, usize, usize); 15] = [
+const CENSUS: [(&str, usize, usize, usize, usize); 16] = [
     // -- the two proven defects, now filtered -----------------------------
     //
     // One literal, two legs: the `effective_policy_duration` CTE's
@@ -389,16 +389,33 @@ const CENSUS: [(&str, usize, usize, usize, usize); 15] = [
     // verdict write's existence probe; `list_active_for_policy` and its
     // count twin used to reach the predicate through an interpolated
     // `const` and now spell it themselves (see this module's blind spots).
+    // The 24th filtered statement is `package_file_digests`: a proxy index
+    // serve asks it which files hort holds so it can advertise its own
+    // digest for them, and a soft-deleted row is not a file hort serves.
     (
         "crates/hort-adapters-postgres/src/artifact_repo.rs",
-        26,
-        26,
-        23,
+        27,
+        27,
+        24,
         3,
     ),
-    // `protected_claimants` is a live read (both legs); the purge worklist
-    // and the pre-purge row lock exist to act on deleted rows.
-    ("crates/hort-adapters-postgres/src/purge_gc.rs", 3, 4, 1, 2),
+    // `protected_claimants` is a live read (both legs); the purge worklist,
+    // the pre-purge row lock and the protection-fact read taken under that
+    // lock all exist to act on deleted rows. The lock and the facts are two
+    // statements because a subquery answers from its own statement's
+    // snapshot — see `purge_artifact_refs` — so the declaration travels
+    // with both.
+    ("crates/hort-adapters-postgres/src/purge_gc.rs", 4, 5, 1, 3),
+    // The tag write's `FOR SHARE` on the artifact rows its target names,
+    // one statement per `target_kind`. A lock, not a read: it has to cover
+    // every row the purge's own deleted-inclusive `FOR UPDATE` can name.
+    (
+        "crates/hort-adapters-postgres/src/ref_lifecycle.rs",
+        2,
+        2,
+        0,
+        2,
+    ),
     // The two refcount-drift scans filter; the repository enumeration and
     // the rejected-source edge sweep are deliberately inclusive.
     (
@@ -451,7 +468,7 @@ const CENSUS: [(&str, usize, usize, usize, usize); 15] = [
 /// not an equality: a new reader is expected and is already covered by the
 /// main assertion, whereas a *shrinking* corpus means the scan stopped
 /// seeing things. [`CENSUS`] is what pins the per-file detail.
-const CENSUS_FLOOR: usize = 47;
+const CENSUS_FLOOR: usize = 48;
 
 // ---------------------------------------------------------------------------
 // The property.

@@ -75,6 +75,38 @@ pub fn session_set_key(format: &str, repo_id: Uuid, principal_id: Uuid) -> Strin
     format!("upload_sessions:{format}:{repo_id}:{principal_id}")
 }
 
+/// Count the live members in the per-`(format, repo, principal)`
+/// session set — the authoritative cap accounting — returning `0` for an
+/// absent set.
+///
+/// Test observability, exposed because the question callers actually
+/// have is "how many sessions does this principal hold?" and the key's
+/// mere presence does not answer it: [`release`] writes an **empty** set
+/// rather than deleting the key, so a present key can mean zero
+/// members. A test that reads presence would pass on a set holding
+/// nothing, and the decoder it would need instead is `pub(crate)`.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn live_member_count(
+    ctx: &AppContext,
+    format: &str,
+    repo_id: Uuid,
+    principal_id: Uuid,
+) -> usize {
+    let key = session_set_key(format, repo_id, principal_id);
+    match ctx
+        .ephemeral_durable
+        .get(&key)
+        .await
+        .expect("ephemeral get must succeed for a cap-accounting probe")
+    {
+        None => 0,
+        Some(bytes) => decode_session_set(&bytes)
+            .expect("a stored session set must decode")
+            .members
+            .len(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Set + member
 // ---------------------------------------------------------------------------
@@ -344,9 +376,25 @@ fn emit_reconcile_metric(format: &str, repo_id: Uuid, repo_label: &str, pruned_c
 ///
 /// `get → remove-by-id → compare_and_swap` (retry on a version race).
 /// The member already being absent (aged out by a prior admit's prune,
-/// or the whole set TTL-expired) is a no-op — never an underflow. When
-/// the removal empties the set the key is dropped so the next admit
-/// takes the clean absent-key branch.
+/// or the whole set TTL-expired) is a no-op — never an underflow.
+///
+/// **A removal that empties the set writes the empty set; it does not
+/// delete the key.** Deleting would be the tidier representation and is
+/// the wrong operation: `EphemeralStore::delete` takes no version, so it
+/// cannot express "remove the state I read". A concurrent admission that
+/// won its own CAS between this release's `get` and its write would be
+/// erased by it — and that admission is a live upload session, so the
+/// cap it no longer counts against lets the same principal open one
+/// more. Writing the empty set through `compare_and_swap` puts the
+/// emptying write under the same version check every other write to this
+/// key already passes: the raced CAS misses, the loop retries, and the
+/// second pass sees the new member and keeps it.
+///
+/// Nothing needs to reap the empty set. A successful CAS resets the
+/// entry's TTL (`EphemeralStore::compare_and_swap`), so an emptied set
+/// lives at most `max_age` — the same bound a full one has — and
+/// `admit`'s present-set branch handles it identically to any other
+/// set, pruning nothing and CASing the first member in.
 ///
 /// Best-effort: an infrastructure error is logged at `warn!` and does
 /// NOT propagate. The set is max-age-bounded, so a leaked slot
@@ -398,29 +446,12 @@ pub async fn release(
         if !set.members.iter().any(|m| m.id == target) {
             return;
         }
+        // Emptying the set is not a special case: it takes the same
+        // version-checked write as any other removal, so a concurrent
+        // admission cannot be written over. See this function's doc
+        // comment for why the key is not deleted here.
         let remaining: Vec<SessionMember> =
             set.members.into_iter().filter(|m| m.id != target).collect();
-
-        if remaining.is_empty() {
-            // Cleanest representation of "no live sessions" is to drop
-            // the key; the next admit recreates it via the absent-key
-            // branch. `delete` is idempotent so a TTL race is harmless.
-            // A concurrent admit that CAS-created a NEW version between
-            // our `get` and this `delete` would be clobbered — but the
-            // set is per-`(format, repo, principal)`, single-user
-            // contention is low, and the next admit's age-prune repairs
-            // any lost slot.
-            if let Err(err) = ctx.ephemeral_durable.delete(&key).await {
-                tracing::warn!(
-                    target: "hort::upload_session_cap",
-                    format = format,
-                    repository_id = %repo_id,
-                    error = %err,
-                    "upload session-set release: delete failed; set will age-prune / TTL out",
-                );
-            }
-            return;
-        }
 
         let next = SessionSet {
             version: set.version + 1,
@@ -481,6 +512,7 @@ mod tests {
     use metrics_util::{CompositeKey, MetricKind};
 
     use crate::test_support::build_mock_ctx;
+    use hort_domain::error::DomainResult;
 
     // -------------------- Harness --------------------
 
@@ -531,22 +563,6 @@ mod tests {
                 .all(|(k, v)| ck.key().labels().any(|l| l.key() == *k && l.value() == *v));
             ok.then_some(dv)
         })
-    }
-
-    /// Count the live members currently in the per-`(format, repo,
-    /// principal)` session set (0 when the set is absent). Test-only
-    /// observability into the authoritative cap accounting.
-    async fn live_member_count(
-        ctx: &AppContext,
-        format: &str,
-        repo_id: Uuid,
-        principal_id: Uuid,
-    ) -> usize {
-        let key = session_set_key(format, repo_id, principal_id);
-        match ctx.ephemeral_durable.get(&key).await.unwrap() {
-            None => 0,
-            Some(bytes) => decode_session_set(&bytes).unwrap().members.len(),
-        }
     }
 
     /// Test wrapper: resolve the `repo` label the way the production
@@ -856,6 +872,229 @@ mod tests {
 
     // -------------------- release --------------------
 
+    /// An [`EphemeralStore`] decorator that performs one concurrent
+    /// admission's write **between** another caller's `get` and that
+    /// caller's own write, then hands the caller the pre-race value it
+    /// read.
+    ///
+    /// The interleaving is not reachable from outside: [`release`] is a
+    /// single `await` from a test's point of view, so there is nowhere
+    /// to slip a second caller in. The store is the only seam, which is
+    /// why the double sits here rather than two futures racing — a race
+    /// that is *scheduled* rather than *constructed* would pass or fail
+    /// on timing and prove nothing either way.
+    ///
+    /// The intruding write is not invented: it decodes what it read,
+    /// appends a member and CASes on the observed version, which is
+    /// exactly [`admit`]'s present-set branch. A double that wrote
+    /// something `admit` could not would make the test's premise
+    /// unreachable in production.
+    struct AdmitBetweenGetAndWrite {
+        inner: Arc<dyn hort_domain::ports::ephemeral_store::EphemeralStore>,
+        key: String,
+        intruder: u128,
+        ttl: Duration,
+        /// Set by the test once the setup admits are done, so the
+        /// intrusion lands during `release` and not during them.
+        armed: std::sync::atomic::AtomicBool,
+        /// Fires once. The retry that `release` performs after a lost
+        /// CAS must see the real current state, or the loop could never
+        /// converge and the test would be measuring the retry budget.
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl hort_domain::ports::ephemeral_store::EphemeralStore for AdmitBetweenGetAndWrite {
+        fn get(&self, key: &str) -> hort_domain::ports::BoxFuture<'_, DomainResult<Option<Bytes>>> {
+            let key = key.to_owned();
+            Box::pin(async move {
+                let stored = self.inner.get(&key).await?;
+                let arm = std::sync::atomic::Ordering::SeqCst;
+                if key == self.key && self.armed.load(arm) && !self.fired.swap(true, arm) {
+                    if let Some(bytes) = &stored {
+                        let mut set = decode_session_set(bytes)?;
+                        let observed = set.version;
+                        set.version += 1;
+                        set.members.push(SessionMember {
+                            id: self.intruder,
+                            created_at_ms: Utc::now().timestamp_millis(),
+                        });
+                        let encoded = encode_session_set(&set)?;
+                        let won = self
+                            .inner
+                            .compare_and_swap(&key, observed, encoded, self.ttl)
+                            .await?;
+                        assert!(
+                            won.is_some(),
+                            "the intruding admission must win its CAS, or the race \
+                             under test was never set up"
+                        );
+                    }
+                }
+                Ok(stored)
+            })
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: Bytes,
+            ttl: Duration,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<()>> {
+            self.inner.put(key, value, ttl)
+        }
+
+        fn put_if_absent(
+            &self,
+            key: &str,
+            value: Bytes,
+            ttl: Duration,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<bool>> {
+            self.inner.put_if_absent(key, value, ttl)
+        }
+
+        fn compare_and_swap(
+            &self,
+            key: &str,
+            expected_version: u64,
+            new_value: Bytes,
+            ttl: Duration,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Option<u64>>> {
+            self.inner
+                .compare_and_swap(key, expected_version, new_value, ttl)
+        }
+
+        fn delete(&self, key: &str) -> hort_domain::ports::BoxFuture<'_, DomainResult<()>> {
+            self.inner.delete(key)
+        }
+
+        fn extend_ttl(
+            &self,
+            key: &str,
+            ttl: Duration,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<()>> {
+            self.inner.extend_ttl(key, ttl)
+        }
+    }
+
+    /// Releasing the last member must not discard a concurrent
+    /// admission.
+    ///
+    /// The set is the authoritative cap accounting, so a lost member is
+    /// a live upload session that counts against nobody: the principal
+    /// holding it can open another, and the cap — a DoS guard — admits
+    /// one more session than it is configured for, per occurrence.
+    ///
+    /// The race is constructed, not awaited on: the intruding admission
+    /// lands between `release`'s `get` and its write. The old code wrote
+    /// an unconditional, version-less `delete` there and wiped it.
+    #[test]
+    fn releasing_the_last_member_does_not_discard_a_concurrent_admission() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let repo_id = Uuid::new_v4();
+            let principal = Uuid::new_v4();
+            let leaving = Uuid::new_v4();
+            let arriving = Uuid::new_v4();
+            let key = session_set_key("oci", repo_id, principal);
+
+            let inner: Arc<dyn hort_domain::ports::ephemeral_store::EphemeralStore> =
+                Arc::new(hort_adapters_ephemeral_memory::InMemoryEphemeralStore::new());
+            let racing = Arc::new(AdmitBetweenGetAndWrite {
+                inner: Arc::clone(&inner),
+                key: key.clone(),
+                intruder: arriving.as_u128(),
+                ttl: TEST_MAX_AGE,
+                armed: std::sync::atomic::AtomicBool::new(false),
+                fired: std::sync::atomic::AtomicBool::new(false),
+            });
+            let durable: Arc<dyn hort_domain::ports::ephemeral_store::EphemeralStore> =
+                Arc::clone(&racing) as Arc<_>;
+            let (ctx, _mocks) =
+                crate::test_support::build_mock_ctx_with_ephemeral_durable(handle, &durable);
+
+            admit_t(&ctx, "oci", repo_id, principal, leaving, 2, TEST_MAX_AGE)
+                .await
+                .unwrap();
+            assert_eq!(
+                live_member_count(&ctx, "oci", repo_id, principal).await,
+                1,
+                "setup: exactly the leaving session is live"
+            );
+
+            racing
+                .armed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            release(&ctx, "oci", repo_id, principal, leaving, TEST_MAX_AGE).await;
+            assert!(
+                racing.fired.load(std::sync::atomic::Ordering::SeqCst),
+                "the intrusion never fired, so this test did not exercise the race"
+            );
+
+            let stored = inner
+                .get(&key)
+                .await
+                .unwrap()
+                .expect("the set must survive the release that emptied it of its own member");
+            let set = decode_session_set(&stored).unwrap();
+            assert_eq!(
+                set.members.len(),
+                1,
+                "the concurrently-admitted session must still be counted; members: {:?}",
+                set.members
+            );
+            assert_eq!(
+                set.members[0].id,
+                arriving.as_u128(),
+                "the surviving member must be the one that was admitted during the release"
+            );
+        });
+    }
+
+    /// Emptying the set leaves a live key, and nothing has to come
+    /// along and reap it: the CAS that writes the empty set applies
+    /// `max_age` as a fresh TTL, exactly as every other write to this
+    /// key does. An empty set is therefore as short-lived as a full one
+    /// and shorter-lived than the sessions it used to hold.
+    ///
+    /// Pinned because the alternative reading — "CASing instead of
+    /// deleting leaks a key forever" — is the obvious objection to the
+    /// fix, and it is answered by the store's own contract rather than
+    /// by a sweeper.
+    #[test]
+    fn an_emptied_set_is_ttl_bounded_and_needs_no_sweeper() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, _mocks) = build_mock_ctx(handle);
+            let repo_id = Uuid::new_v4();
+            let principal = Uuid::new_v4();
+            let session = Uuid::new_v4();
+            let key = session_set_key("oci", repo_id, principal);
+            let short = Duration::from_millis(40);
+
+            admit_t(&ctx, "oci", repo_id, principal, session, 2, short)
+                .await
+                .unwrap();
+            release(&ctx, "oci", repo_id, principal, session, short).await;
+
+            let stored = ctx
+                .ephemeral_durable
+                .get(&key)
+                .await
+                .unwrap()
+                .expect("the emptied set is present, not deleted");
+            assert!(
+                decode_session_set(&stored).unwrap().members.is_empty(),
+                "an emptied set holds no members"
+            );
+
+            tokio::time::sleep(short * 3).await;
+            assert!(
+                ctx.ephemeral_durable.get(&key).await.unwrap().is_none(),
+                "the emptied set must expire on its own TTL — nothing else reaps it"
+            );
+        });
+    }
+
     #[test]
     fn release_frees_a_slot_and_double_release_is_noop() {
         run(async {
@@ -877,9 +1116,19 @@ mod tests {
                     .unwrap(),
                 AdmitOutcome::Admitted
             ));
-            release(&ctx, "oci", repo_id, principal, session, TEST_MAX_AGE).await; // empties → key dropped
+            release(&ctx, "oci", repo_id, principal, session, TEST_MAX_AGE).await; // empties the set
             release(&ctx, "oci", repo_id, principal, session, TEST_MAX_AGE).await; // double-release
-            assert!(ctx.ephemeral_durable.get(&key).await.unwrap().is_none());
+                                                                                   // The emptied set is written, not deleted — the key is live
+                                                                                   // and holds no members, and its own TTL reaps it. What a
+                                                                                   // caller must see is zero live sessions, which both the
+                                                                                   // absent-key and the empty-set representations give.
+            let stored = ctx
+                .ephemeral_durable
+                .get(&key)
+                .await
+                .unwrap()
+                .expect("emptying the set writes it; it is not deleted");
+            assert!(decode_session_set(&stored).unwrap().members.is_empty());
             assert_eq!(live_member_count(&ctx, "oci", repo_id, principal).await, 0);
         });
     }

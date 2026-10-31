@@ -749,6 +749,108 @@ async fn an_artifact_with_no_inbound_edges_clears_nothing() {
     assert!(f.committed().is_empty());
 }
 
+/// A stored index carrying a child this registry cannot address still
+/// cascades to the children it CAN.
+///
+/// This is the population the admission fix is about: indexes admitted
+/// before an unaddressable child descriptor was refused. If the cascade
+/// treated such a descriptor as an error it would propagate out of
+/// `constituent_digests` and stop the walk reaching the index's other
+/// children — holding a correctly signed multi-arch image in quarantine
+/// over one platform descriptor hort could never fetch.
+///
+/// The skip is in the safe direction by construction: this walk only ever
+/// grants clearance, so omitting a child withholds clearance rather than
+/// extending it.
+#[tokio::test]
+async fn a_signed_index_with_an_unaddressable_child_still_clears_its_other_children() {
+    let f = Fixture::new();
+    let (index_hash, child_hash) = (hexhash('1'), hexhash('2'));
+
+    let index = f.seed_artifact(&index_hash, QuarantineStatus::Released);
+    // One addressable child plus three descriptors that name no CAS object:
+    // another algorithm, no `digest` at all, and malformed hex.
+    f.seed_bytes(
+        &index_hash,
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE,
+            "manifests": [
+                { "digest": format!("sha512:{}", "a".repeat(128)), "size": 528 },
+                { "digest": format!("sha256:{child_hash}"), "size": 528 },
+                { "size": 528 },
+                { "digest": "sha256:not-hex", "size": 528 },
+            ],
+        }))
+        .expect("index json"),
+    );
+    f.seed_clearance(index.id, None);
+
+    let child = f.seed_artifact(&child_hash, QuarantineStatus::Quarantined);
+    f.seed_edge(index.id, &child_hash, "oci_index_member").await;
+
+    let cleared = f
+        .cascade
+        .resolve_late_joiner_clearance(&child)
+        .await
+        .expect(
+            "an unaddressable sibling descriptor must not stop the cascade reaching this child",
+        );
+    assert_eq!(cleared.subject, index_hash);
+}
+
+/// `constituent_digests` over the same index: the addressable children, in
+/// `manifests[]` order, and no error.
+#[tokio::test]
+async fn constituent_digests_skips_unaddressable_children_without_failing() {
+    let f = Fixture::new();
+    let (good_a, good_b) = (hexhash('2'), hexhash('3'));
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE,
+        "manifests": [
+            { "digest": format!("sha256:{good_a}"), "size": 528 },
+            { "digest": format!("sha512:{}", "a".repeat(128)), "size": 528 },
+            { "size": 528 },
+            { "digest": format!("sha256:{good_b}"), "size": 528 },
+        ],
+    }))
+    .expect("index json");
+
+    let digests = f
+        .cascade
+        .constituent_digests(&bytes)
+        .await
+        .expect("an unaddressable child descriptor is not an error on a stored index");
+    assert_eq!(
+        digests,
+        vec![good_a, good_b],
+        "both addressable children are constituents; the two that name no CAS object \
+         are not — there is no hash to cascade a clearance to"
+    );
+}
+
+/// The over-cap refusal is NOT softened by the per-child skip: it is a
+/// statement about the array, so it still propagates.
+#[tokio::test]
+async fn constituent_digests_still_fails_on_an_over_cap_index() {
+    let f = Fixture::new();
+    let manifests: Vec<serde_json::Value> = (0..1_025u32)
+        .map(|i| serde_json::json!({ "digest": format!("sha256:{i:064x}"), "size": 1 }))
+        .collect();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE,
+        "manifests": manifests,
+    }))
+    .expect("index json");
+
+    assert!(
+        f.cascade.constituent_digests(&bytes).await.is_err(),
+        "an over-cap index is refused outright, never enumerated in part"
+    );
+}
+
 /// A single-image (non-index) signed manifest is authority for its own
 /// config/layer blobs — the late-joiner walk handles the non-index shape
 /// through the same `constituent_digests` branch.
