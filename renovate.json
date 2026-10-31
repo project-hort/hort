@@ -30,6 +30,12 @@
       "enabled": false
     },
     {
+      "description": "Hold k8s-openapi at the major kube compiles against: the two must move as one change, and k8s-openapi enforces that itself. kube/kube-client/kube-core 4.2.x all require k8s-openapi 0.28, so a solo bump splits the graph across two majors - and k8s-openapi's build script rejects that outright rather than merely producing type mismatches: the `features = [\"latest\"]` declaration travels to the new entry and leaves the old copy featureless, which panics with 'None of the v1_* features are enabled on the k8s-openapi crate'. Measured, not assumed: !767 (0.28 -> 0.29) failed test:lint on exactly that panic, and the crate's own message says to check Cargo.lock 'to ensure that this version of k8s-openapi is the only one being used in your project'. The invariant is already written on the dependency in Cargo.toml ('Pinned to 0.28.x (the major used by kube 4.2.x)'); this rule is what keeps a bot from editing that line without reading it. Unpark when kube's own k8s-openapi requirement reaches the next major - and then move both in ONE change, never one at a time.",
+      "matchPackageNames": ["k8s-openapi"],
+      "matchUpdateTypes": ["minor", "major"],
+      "enabled": false
+    },
+    {
       "description": "Hold cvss below 3.0: 3.0 removes or renames cvss::v3::Base - measured, not assumed (test:lint fails with 'cannot find type Base in module cvss::v3') - and both call sites, crates/hort-adapters-scanner-osv/src/severity.rs and crates/hort-adapters-advisory-osv/src/severity.rs, parse a CVSS v3 vector into the base score that drives severity classification, which is what the scan-policy gates act on. 2.2.0 carries no advisory, so the bump buys nothing functional while costing a port on the path that decides what gets quarantined. Unlike the other holds here this one waits on no upstream: unpark when the port is deliberately scheduled, or when an advisory against 2.2.0 forces it.",
       "matchPackageNames": ["cvss"],
       "matchUpdateTypes": ["minor", "major"],
