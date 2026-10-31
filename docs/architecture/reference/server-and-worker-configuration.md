@@ -412,8 +412,11 @@ wiring the alarm.
 (the claim loop is `FOR UPDATE SKIP LOCKED`, so additional replicas
 drain cooperatively without coordination), and/or raise `priority` on
 the latency-sensitive trigger sources via admin so ingest first-scans
-stay ahead of routine cron rescans. Lengthening the cron-rescan schedule
-(`scheduledTasks.cronRescanTick.schedule`) reduces the batch-injection rate.
+stay ahead of the routine cron rescans that a *scheduled*
+`scheduledTasks.cronRescanTick` injects. Lengthening that schedule
+(`scheduledTasks.cronRescanTick.schedule`) reduces the batch-injection
+rate; the tick is off by default, so a deployment that never enabled it
+contributes no cron rescans to this queue at all.
 The structural fix — a per-(principal, repository) manual-rescan enqueue
 rate cap with an HTTP 429 response — is **deferred** (it requires a
 `KEYSPACE_REGISTRY` durable prefix and an `hort-http-core`
@@ -519,6 +522,7 @@ it is referenced, not scheduled here.
 | `HORT_EVENT_CHAIN_CHECKPOINT_CADENCE_SECS` | u64 | `3600` | No | Signed-checkpoint cadence for the tamper-evident event chain (ADR 0002). Read by the always-on `eventstore-checkpoint` `dsn-direct` task. |
 | `HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS` | u64 | `86400` | No | Expected cadence of the `verify-event-chain` CronJob, used only to derive the staleness gauge (matches the chart's default `verifyEventChain` schedule). A query failure is logged and treated as "unknown" — never blocks boot. |
 | `HORT_EVENT_CHAIN_VERIFY_STALENESS_MULTIPLIER` | u32 | `3` | No | Multiplier on the expected interval above before the last-run gauge is considered stale (tolerates missed ticks before alarming). |
+| `HORT_RESCAN_DRIVE_STALENESS_MULTIPLIER` | u32 | `3` | No | Multiplier on the **shortest `rescanIntervalHours` any active `ScanPolicy` declares** before `hort-server`'s boot-time rescan-drive signal reports the cadence undriven (`hort_rescan_drive_undriven` + a `warn!` naming `scheduledTasks.cronRescanTick.enabled`). No paired interval knob: the expected cadence comes from the policies themselves, not from the environment. A query failure is logged and treated as "unknown" — never blocks boot. |
 
 ---
 

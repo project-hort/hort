@@ -12,7 +12,11 @@
 //! - `record_outcome` — SkippedNoBackends, Completed first-ever scan,
 //!   Completed with prior clean, Completed with prior partial overlap,
 //!   Completed with identical findings, Failed before max attempts,
-//!   Failed at max attempts.
+//!   Failed at max attempts. Each arm asserts the returned
+//!   [`ScanRowDisposition`] **and** that the `jobs` row was not written
+//!   (see [`assert_no_row_write`]): the row has exactly one owner, the
+//!   task dispatcher, and that owner's own writes are pinned in
+//!   `crate::task_dispatcher`'s tests.
 //! - Path B regression: a Completed outcome with a prior produces TWO
 //!   separate event-store appends before the fold was introduced.
 
@@ -66,6 +70,39 @@ use crate::use_cases::test_support::*;
 /// it, which is the path that matters for them.
 const TEST_SCAN_KIND: ArtifactKind = ArtifactKind::NpmTarball;
 
+/// Assert `record_outcome` left the `jobs` row alone.
+///
+/// The dispatcher is the row's only writer (see
+/// [`ScanRowDisposition`]); an arm that reached one of the three fenced
+/// writes would be the two-owner defect back, and the second write won
+/// — it turned a scheduled scan retry into `status='completed'` with no
+/// verdict behind it. Asserted per arm rather than once, because the
+/// defect was per arm: of the six removed writes, four were on arms the
+/// dispatcher then overwrote.
+///
+/// The `write_log` check is the part a rename cannot dodge: the three
+/// call-vector lists only see a call spelled through those methods,
+/// while every fenced write — however it is reached — records its
+/// attempt here.
+fn assert_no_row_write(jobs: &MockJobsRepository) {
+    assert!(
+        jobs.completed_calls().is_empty(),
+        "record_outcome must not mark the row completed; the dispatcher owns the row"
+    );
+    assert!(
+        jobs.rescheduled_calls().is_empty(),
+        "record_outcome must not reschedule the row; it returns ScanRowDisposition::Retry          and the dispatcher decides"
+    );
+    assert!(
+        jobs.failed_calls().is_empty(),
+        "record_outcome must not fail the row; it returns ScanRowDisposition::Failed          and the dispatcher writes it"
+    );
+    assert!(
+        jobs.write_log.attempts().is_empty(),
+        "no fenced result write may originate in the scan path, by any route"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Mock JobsRepository
 // ---------------------------------------------------------------------------
@@ -82,9 +119,13 @@ struct MockJobsRepository {
     /// hand-built `ScanJob` values, so claim_scan_jobs is rarely used.
     claim_response: Mutex<Vec<ScanJob>>,
     /// The fence every result write arrived with, and what they
-    /// answer. The orchestrator has to hand the row's own `attempts`
-    /// to each of the three — a write carrying any other number is a
-    /// write no execution can own. See [`ResultWriteLog`].
+    /// answer.
+    ///
+    /// Kept after the orchestrator stopped writing the row, because
+    /// what it now records is *that it did not*: an empty log is the
+    /// counter-assertion [`assert_no_row_write`] reads, and it catches
+    /// a reintroduced write reached through a helper that bypasses the
+    /// three per-method call vectors. See [`ResultWriteLog`].
     write_log: ResultWriteLog,
 }
 
@@ -1703,16 +1744,18 @@ async fn record_outcome_skipped_no_backends_calls_record_scan_result_with_zeros(
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 1);
 
-    uc.record_outcome(
-        &job,
-        ScanRunOutcome::SkippedNoBackends {
-            kind: TEST_SCAN_KIND,
-        },
-    )
-    .await
-    .expect("record_outcome");
+    let disposition = uc
+        .record_outcome(
+            &job,
+            ScanRunOutcome::SkippedNoBackends {
+                kind: TEST_SCAN_KIND,
+            },
+        )
+        .await
+        .expect("record_outcome");
 
-    assert_eq!(jobs.completed_calls(), vec![job.id]);
+    assert_eq!(disposition, ScanRowDisposition::Completed);
+    assert_no_row_write(&jobs);
     let batches = events.appended_batches();
     assert_eq!(
         batches.len(),
@@ -1755,11 +1798,13 @@ async fn record_outcome_completed_first_ever_scan_emits_no_artifact_became_vulne
         sbom: None,
     };
 
-    uc.record_outcome(&job, outcome)
+    let disposition = uc
+        .record_outcome(&job, outcome)
         .await
         .expect("record_outcome");
 
-    assert_eq!(jobs.completed_calls(), vec![job.id]);
+    assert_eq!(disposition, ScanRowDisposition::Completed);
+    assert_no_row_write(&jobs);
     let batches = events.appended_batches();
     let became_vulnerable = batches
         .iter()
@@ -1810,11 +1855,13 @@ async fn record_outcome_completed_with_prior_clean_emits_artifact_became_vulnera
         sbom: None,
     };
 
-    uc.record_outcome(&job, outcome)
+    let disposition = uc
+        .record_outcome(&job, outcome)
         .await
         .expect("record_outcome");
 
-    assert_eq!(jobs.completed_calls(), vec![job.id]);
+    assert_eq!(disposition, ScanRowDisposition::Completed);
+    assert_no_row_write(&jobs);
     let batches = events.appended_batches();
     let became_vulnerable =
         batches
@@ -1886,7 +1933,8 @@ async fn record_outcome_completed_with_prior_partial_overlap_emits_only_new_find
         sbom: None,
     };
 
-    uc.record_outcome(&job, outcome)
+    let disposition = uc
+        .record_outcome(&job, outcome)
         .await
         .expect("record_outcome");
 
@@ -1901,7 +1949,8 @@ async fn record_outcome_completed_with_prior_partial_overlap_emits_only_new_find
         .expect("ArtifactBecameVulnerable must be appended");
     assert_eq!(new_findings.len(), 1);
     assert_eq!(new_findings[0].vulnerability_id, "CVE-B");
-    assert_eq!(jobs.completed_calls(), vec![job.id]);
+    assert_eq!(disposition, ScanRowDisposition::Completed);
+    assert_no_row_write(&jobs);
 }
 
 #[tokio::test]
@@ -1963,125 +2012,126 @@ async fn record_outcome_completed_identical_findings_emits_no_artifact_became_vu
     );
 }
 
-/// Every `record_outcome` arm writes under the row's own `attempts`
-/// — the identity the adapter's result-write fence compares against.
+/// No `record_outcome` arm writes the `jobs` row — on any of the four
+/// outcomes, at either side of the attempt budget.
 ///
-/// A write carrying any other number is a write no execution owns, and
-/// the fence refuses it. The arms reach three different methods and
-/// the orchestrator closes the row out itself (the dispatcher's own
-/// write comes after), so each arm is checked rather than one standing
-/// in for the others.
+/// This is the table that used to assert the opposite: three arms, the
+/// three fenced writes, each under the row's own `attempts`. It became
+/// the wrong assertion when the row got a single owner, and it is kept
+/// in this shape — the same four-case matrix — because the defect was
+/// per arm rather than global. The identity question it used to ask
+/// (does a write carry the attempt the fence compares against?) now
+/// belongs entirely to the dispatcher and is pinned there, in
+/// `task_dispatcher::tests::every_outcome_path_writes_under_the_rows_own_attempt`.
 #[tokio::test]
-async fn record_outcome_writes_under_the_rows_own_attempt() {
-    let cases: Vec<(&str, u32, ScanRunOutcome)> = vec![
+async fn no_record_outcome_arm_writes_the_jobs_row() {
+    let cases: Vec<(&str, u32, ScanRunOutcome, ScanRowDisposition)> = vec![
         (
-            "mark_completed",
+            "skipped-no-backends",
             1,
             ScanRunOutcome::SkippedNoBackends {
                 kind: TEST_SCAN_KIND,
             },
+            ScanRowDisposition::Completed,
         ),
-        ("reschedule", 2, ScanRunOutcome::Failed("transient".into())),
         (
-            "mark_failed",
+            "transient, budget left",
+            2,
+            ScanRunOutcome::Failed("transient".into()),
+            ScanRowDisposition::Retry("transient".into()),
+        ),
+        (
+            "transient, budget spent",
             5, // == default max_attempts → terminal.
             ScanRunOutcome::Failed("dead".into()),
+            ScanRowDisposition::Failed("dead".into()),
+        ),
+        (
+            "nothing analysable",
+            1,
+            ScanRunOutcome::NothingAnalysable {
+                scanner: "trivy".into(),
+                reason: "trivy=no_analyzer_matched".into(),
+            },
+            ScanRowDisposition::Failed("trivy=no_analyzer_matched".into()),
         ),
     ];
-    for (write, attempts, outcome) in cases {
+    for (arm, attempts, outcome, expected) in cases {
         let (uc, jobs, _events, _storage, artifacts, repositories, _policy) =
             make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
         let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
         let job = sample_scan_job(artifact_id, attempts);
 
-        uc.record_outcome(&job, outcome)
+        let disposition = uc
+            .record_outcome(&job, outcome)
             .await
             .expect("record_outcome");
 
-        assert_eq!(
-            jobs.write_log.attempts(),
-            vec![attempts],
-            "{write} must write under the row's own attempt",
-        );
+        assert_eq!(disposition, expected, "{arm}: wrong disposition");
+        assert_no_row_write(&jobs);
     }
 }
 
-/// A refused result write is not an error.
-///
-/// If the orchestrator propagated it, `ScanTaskHandler` would return a
-/// retryable failure, the dispatcher would answer with a `reschedule`,
-/// and a row that already belongs to a sibling would be written to a
-/// second time — turning one discarded result into the `pending`
-/// clobber the fence exists to prevent. The refusal is logged and the
-/// arm completes.
 #[tokio::test]
-async fn a_refused_result_write_does_not_become_a_retryable_failure() {
-    let (uc, jobs, _events, _storage, _artifacts, _repositories, _policy) =
-        make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
-    jobs.write_log
-        .refuse(ResultWriteOutcome::Superseded { current_attempt: 9 });
-    let job = sample_scan_job(Uuid::new_v4(), 2);
-
-    uc.record_outcome(&job, ScanRunOutcome::Failed("transient".into()))
-        .await
-        .expect("a refused write is an outcome, not an error");
-
-    assert_eq!(
-        jobs.write_log.attempts(),
-        vec![2],
-        "the write is attempted exactly once and not retried under another identity"
-    );
-    assert!(
-        jobs.failed_calls().is_empty(),
-        "and it is not answered with a different write"
-    );
-}
-
-#[tokio::test]
-async fn record_outcome_failed_below_max_attempts_reschedules_with_backoff() {
+async fn record_outcome_failed_below_max_attempts_asks_for_a_retry() {
     let (uc, jobs, _events, _storage, _artifacts, _repositories, _policy) =
         make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
     let artifact_id = Uuid::new_v4();
     let job = sample_scan_job(artifact_id, 2); // attempts=2 → backoff 5min.
 
-    uc.record_outcome(&job, ScanRunOutcome::Failed("transient".into()))
+    let disposition = uc
+        .record_outcome(&job, ScanRunOutcome::Failed("transient".into()))
         .await
         .expect("record_outcome");
 
-    let calls = jobs.rescheduled_calls();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].0, job.id);
-    assert_eq!(calls[0].1, Duration::from_secs(5 * 60));
-    assert_eq!(calls[0].2, "transient");
-    assert!(jobs.failed_calls().is_empty());
+    assert_eq!(
+        disposition,
+        ScanRowDisposition::Retry("transient".into()),
+        "the reason crosses the handoff verbatim — it is the operator-visible last_error"
+    );
+    assert_no_row_write(&jobs);
+    // The wait the dispatcher will apply to this row is the shared
+    // curve's, read under the same `attempts` the scan path saw. Pinned
+    // here because the backoff used to be applied on this side, and the
+    // claim that "the curve is identical" is the half of this change a
+    // reader cannot check from the diff alone.
+    assert_eq!(compute_backoff(job.attempts), Duration::from_secs(5 * 60));
 }
 
-/// Issue #6 refinement of ADR 0007: a `Quarantined` artifact whose scan
+/// ADR 0007 refinement: a `Quarantined` artifact whose scan
 /// retries exhaust (scanner-execution failure — every backend errored)
-/// stays exactly where it is. `mark_failed` (job-level terminal) still
-/// fires — that IS the persisted "last scan errored" signal
+/// stays exactly where it is. The row still goes terminal — that IS the
+/// persisted "last scan errored" signal
 /// `RescanCandidatesRepository::select_stranded` reads — but there is no
 /// artifact-level transition at all: no `ScanIndeterminate` event, no
 /// `quarantine_status` UPDATE. See
 /// `record_outcome_failed_at_max_attempts_none_status_still_hard_blocks_to_scan_indeterminate`
 /// below for the *other* prior-status branch, which is unchanged.
+///
+/// The terminal row is now the dispatcher's write, from the
+/// `ScanRowDisposition::Failed` this returns, so what is asserted here
+/// is the disposition plus the absence of a row write. The row state
+/// that disposition produces is asserted against a real row in
+/// `hort-adapters-postgres/tests/scan_row_single_owner.rs`.
 #[tokio::test]
-async fn record_outcome_failed_at_max_attempts_marks_job_failed_but_quarantined_artifact_stays_quarantined(
+async fn record_outcome_failed_at_max_attempts_fails_the_row_but_quarantined_artifact_stays_quarantined(
 ) {
     let (uc, jobs, _events, _storage, artifacts, repositories, _policy) =
         make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 5); // == default max_attempts.
 
-    uc.record_outcome(&job, ScanRunOutcome::Failed("dead".into()))
+    let disposition = uc
+        .record_outcome(&job, ScanRunOutcome::Failed("dead".into()))
         .await
         .expect("record_outcome");
 
-    let calls = jobs.failed_calls();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].0, job.id);
-    assert_eq!(calls[0].1, "dead");
-    assert!(jobs.rescheduled_calls().is_empty());
+    assert_eq!(
+        disposition,
+        ScanRowDisposition::Failed("dead".into()),
+        "an exhausted budget is terminal and must not ask for another retry"
+    );
+    assert_no_row_write(&jobs);
 
     // The artifact stays exactly where it was — still Quarantined, not
     // ScanIndeterminate. Downloads stay blocked either way (the status
@@ -2107,14 +2157,20 @@ async fn record_outcome_failed_at_max_attempts_quarantined_artifact_commits_no_t
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 5);
 
-    uc.record_outcome(&job, ScanRunOutcome::Failed("all backends down".into()))
+    let disposition = uc
+        .record_outcome(&job, ScanRunOutcome::Failed("all backends down".into()))
         .await
         .expect("record_outcome");
 
     let saved = artifacts.get(artifact_id).unwrap();
     assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
-    // Job still marked failed (the per-attempt job state is unchanged).
-    assert_eq!(jobs.failed_calls().len(), 1);
+    // The row still goes terminal — the scan path reports it, the
+    // dispatcher writes it.
+    assert_eq!(
+        disposition,
+        ScanRowDisposition::Failed("all backends down".into())
+    );
+    assert_no_row_write(&jobs);
     assert!(
         lifecycle.committed_transitions().is_empty(),
         "no ScanIndeterminate (or any) transition must be committed \
@@ -2229,11 +2285,13 @@ async fn record_outcome_failed_below_max_does_not_transition_artifact() {
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 2); // < max → reschedule.
 
-    uc.record_outcome(&job, ScanRunOutcome::Failed("transient".into()))
+    let disposition = uc
+        .record_outcome(&job, ScanRunOutcome::Failed("transient".into()))
         .await
         .expect("record_outcome");
 
-    assert_eq!(jobs.rescheduled_calls().len(), 1);
+    assert_eq!(disposition, ScanRowDisposition::Retry("transient".into()));
+    assert_no_row_write(&jobs);
     let saved = artifacts.get(artifact_id).unwrap();
     // Still quarantined — no fail-closed transition before exhaustion.
     assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
@@ -2254,13 +2312,19 @@ async fn record_outcome_failed_idempotent_when_already_scan_indeterminate() {
     repositories.insert(repo);
     let job = sample_scan_job(artifact_id, 5);
 
-    uc.record_outcome(&job, ScanRunOutcome::Failed("still down".into()))
+    let disposition = uc
+        .record_outcome(&job, ScanRunOutcome::Failed("still down".into()))
         .await
         .expect("record_outcome: idempotent skip must not error");
 
     let saved = artifacts.get(artifact_id).unwrap();
     assert_eq!(saved.quarantine_status, QuarantineStatus::ScanIndeterminate);
-    assert_eq!(jobs.failed_calls().len(), 1);
+    assert_eq!(
+        disposition,
+        ScanRowDisposition::Failed("still down".into()),
+        "an idempotent artifact-level skip still ends the row"
+    );
+    assert_no_row_write(&jobs);
 }
 
 // ===========================================================================
@@ -5408,17 +5472,18 @@ async fn record_outcome_nothing_analysable_holds_the_artifact_and_does_not_retry
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 1);
 
-    uc.record_outcome(
-        &job,
-        ScanRunOutcome::NothingAnalysable {
-            scanner: "trivy".into(),
-            reason: "no scan backend could analyse artifact (kind npm_tarball): \
-                     trivy=no_analyzer_matched"
-                .into(),
-        },
-    )
-    .await
-    .expect("record_outcome");
+    let disposition = uc
+        .record_outcome(
+            &job,
+            ScanRunOutcome::NothingAnalysable {
+                scanner: "trivy".into(),
+                reason: "no scan backend could analyse artifact (kind npm_tarball): \
+                         trivy=no_analyzer_matched"
+                    .into(),
+            },
+        )
+        .await
+        .expect("record_outcome");
 
     assert_eq!(
         artifacts
@@ -5429,18 +5494,16 @@ async fn record_outcome_nothing_analysable_holds_the_artifact_and_does_not_retry
         "an artifact nothing examined must be held, never released"
     );
     assert_eq!(
-        jobs.failed_calls().len(),
-        1,
-        "the job must go terminal, not be rescheduled"
+        disposition,
+        ScanRowDisposition::Failed(
+            "no scan backend could analyse artifact (kind npm_tarball): \
+             trivy=no_analyzer_matched"
+                .into()
+        ),
+        "the job must go terminal, not be rescheduled, and must not read as completed — \
+         a deterministic abstention does not spend the retry budget"
     );
-    assert!(
-        jobs.rescheduled_calls().is_empty(),
-        "a deterministic abstention must not spend the retry budget"
-    );
-    assert!(
-        jobs.completed_calls().is_empty(),
-        "marking the job completed would read as a successful scan"
-    );
+    assert_no_row_write(&jobs);
 
     // The terminal state itself is the proof that no `ScanCompleted`
     // was recorded: `record_scan_result` would have driven the artifact
@@ -5473,15 +5536,16 @@ async fn record_outcome_nothing_analysable_is_idempotent_on_a_terminal_artifact(
     repositories.insert(repo);
     let job = sample_scan_job(artifact_id, 1);
 
-    uc.record_outcome(
-        &job,
-        ScanRunOutcome::NothingAnalysable {
-            scanner: "trivy".into(),
-            reason: "trivy=not_applicable".into(),
-        },
-    )
-    .await
-    .expect("record_outcome must treat an already-terminal artifact as a skip");
+    let disposition = uc
+        .record_outcome(
+            &job,
+            ScanRunOutcome::NothingAnalysable {
+                scanner: "trivy".into(),
+                reason: "trivy=not_applicable".into(),
+            },
+        )
+        .await
+        .expect("record_outcome must treat an already-terminal artifact as a skip");
 
     let appended: Vec<DomainEvent> = events
         .appended_batches()
@@ -5494,7 +5558,11 @@ async fn record_outcome_nothing_analysable_is_idempotent_on_a_terminal_artifact(
             .any(|e| matches!(e, DomainEvent::ScanIndeterminate(_))),
         "no duplicate ScanIndeterminate on an already-terminal artifact"
     );
-    assert_eq!(jobs.failed_calls().len(), 1);
+    assert_eq!(
+        disposition,
+        ScanRowDisposition::Failed("trivy=not_applicable".into())
+    );
+    assert_no_row_write(&jobs);
 }
 
 // ---------------------------------------------------------------------------
@@ -5801,28 +5869,27 @@ async fn record_outcome_not_applicable_records_scan_authority_and_does_not_hold(
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 1);
 
-    uc.record_outcome(
-        &job,
-        ScanRunOutcome::Completed {
-            scanner: "trivy".into(),
-            kind: TEST_SCAN_KIND,
-            findings: Vec::new(),
-            assessment: ScanAssessment::NotApplicable,
-            sbom: None,
-        },
-    )
-    .await
-    .expect("record_outcome");
+    let disposition = uc
+        .record_outcome(
+            &job,
+            ScanRunOutcome::Completed {
+                scanner: "trivy".into(),
+                kind: TEST_SCAN_KIND,
+                findings: Vec::new(),
+                assessment: ScanAssessment::NotApplicable,
+                sbom: None,
+            },
+        )
+        .await
+        .expect("record_outcome");
 
     assert_eq!(
-        jobs.completed_calls(),
-        vec![job.id],
-        "a completed assessment completes the job"
+        disposition,
+        ScanRowDisposition::Completed,
+        "a completed assessment completes the job — nothing failed, there was simply \
+         nothing to assess"
     );
-    assert!(
-        jobs.failed_calls().is_empty(),
-        "nothing failed — there was simply nothing to assess"
-    );
+    assert_no_row_write(&jobs);
     assert_ne!(
         artifacts
             .get(artifact_id)
@@ -5872,16 +5939,18 @@ async fn record_outcome_skipped_no_backends_still_records_an_analysed_assessment
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let job = sample_scan_job(artifact_id, 1);
 
-    uc.record_outcome(
-        &job,
-        ScanRunOutcome::SkippedNoBackends {
-            kind: TEST_SCAN_KIND,
-        },
-    )
-    .await
-    .expect("record_outcome");
+    let disposition = uc
+        .record_outcome(
+            &job,
+            ScanRunOutcome::SkippedNoBackends {
+                kind: TEST_SCAN_KIND,
+            },
+        )
+        .await
+        .expect("record_outcome");
 
-    assert_eq!(jobs.completed_calls(), vec![job.id]);
+    assert_eq!(disposition, ScanRowDisposition::Completed);
+    assert_no_row_write(&jobs);
     let scan_completed = events
         .appended_batches()
         .into_iter()
@@ -7442,10 +7511,12 @@ async fn a_failing_observation_write_leaves_the_outcome_the_events_and_the_job_r
         "the manifest row's own outcome is unchanged: {outcome:?}"
     );
 
-    uc.record_outcome(&job, outcome)
+    let disposition = uc
+        .record_outcome(&job, outcome)
         .await
         .expect("record_outcome");
-    assert_eq!(jobs.completed_calls(), vec![job.id]);
+    assert_eq!(disposition, ScanRowDisposition::Completed);
+    assert_no_row_write(&jobs);
     let batches = events.appended_batches();
     assert_eq!(batches.len(), 1, "exactly the scan's own batch");
     assert!(
@@ -7669,7 +7740,7 @@ async fn a_transient_acquisition_failure_asks_for_another_attempt() {
         panic!("a transient acquisition failure earns a retry, got {outcome:?}");
     };
     assert!(
-        err.contains("could not be produced on attempt 1 of 5"),
+        err.contains("could not be produced on scan attempt 1 of 5"),
         "{err}"
     );
     assert!(err.contains("upstream_5xx"), "{err}");

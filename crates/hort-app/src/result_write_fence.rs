@@ -1,16 +1,22 @@
 //! The one place a refused result write is surfaced.
 //!
-//! Two consumers close a `jobs` row out — [`crate::task_dispatcher`],
-//! for every registered kind, and
-//! [`crate::use_cases::scan_orchestration`]'s `record_outcome`, for
-//! `kind='scan'` — and both reach the same three fenced writes
-//! (`JobsRepository::{mark_completed, reschedule, mark_failed}`). Each
-//! returns a [`ResultWriteOutcome`] rather than `()`, because a row can
-//! be executed twice: the abandoned-lease sweep hands a stalled row on,
-//! a sibling claims it, and the original worker may still come back
-//! with a result. The fence refuses that result; this module is what
-//! keeps the refusal from being silent, in one shape across the ten
-//! call sites instead of ten hand-written log lines that drift.
+//! [`crate::task_dispatcher`] closes a `jobs` row out — for every
+//! registered kind, and for `kind='scan'` too — through the three
+//! fenced writes (`JobsRepository::{mark_completed, reschedule,
+//! mark_failed}`). Each returns a [`ResultWriteOutcome`] rather than
+//! `()`, because a row can be executed twice: the abandoned-lease sweep
+//! hands a stalled row on, a sibling claims it, and the original worker
+//! may still come back with a result. The fence refuses that result;
+//! this module is what keeps the refusal from being silent, in one
+//! shape across the dispatcher's four call sites instead of four
+//! hand-written log lines that drift.
+//!
+//! The scan orchestrator used to be a second consumer, closing its own
+//! row out from `record_outcome`. It no longer writes the row at all —
+//! it reports a `ScanRowDisposition` and the dispatcher writes it —
+//! which is why [`surface_result_write`] now has one caller outside
+//! this module's own tests: [`surface_attempted_result_write`], the
+//! shape a caller that logs rather than propagates needs.
 //!
 //! **No metric here.** A refusal is the tail of an event that is
 //! already counted: the sweep's `hort_admin_tasks_lease_requeued_total`

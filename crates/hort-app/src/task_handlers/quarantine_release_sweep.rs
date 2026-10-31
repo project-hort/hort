@@ -20,8 +20,9 @@
 //!    deadline (`quarantine_window_start + effective_duration`) is at
 //!    or before `now` — the adapter resolves `repo → effective
 //!    duration` from `policy_projections` (repo-scoped → global →
-//!    default) and issues one indexed scan per
-//!    distinct duration `D`, using the partial index
+//!    default), turns each into a cutoff instant and issues one
+//!    ordered scan over all of them, so the batch's single `LIMIT`
+//!    cannot be spent by one duration group. It uses the partial index
 //!    `idx_artifacts_quarantine_release_cursor ON (release_attempt_at
 //!    NULLS FIRST, quarantine_window_start)
 //!    WHERE quarantine_status='quarantined'`.
@@ -58,7 +59,10 @@
 //! by that cursor `NULLS FIRST`. Never-attempted artifacts are served
 //! first, so a freshly-expired artifact is picked up on the very next
 //! tick regardless of backlog size, and a backlog of N is fully
-//! re-attempted every `ceil(N / BATCH_SIZE)` ticks.
+//! re-attempted every `ceil(N / BATCH_SIZE)` ticks. That rotation is
+//! deployment-wide rather than per-policy: the adapter applies one
+//! `LIMIT` over every expired candidate, so a duration group whose rows
+//! never release cannot keep another group out of the batch.
 //!
 //! A `mark_attempted` failure is warn-and-continue: the tick's release
 //! work already stands, and an unstamped batch merely re-serves next tick

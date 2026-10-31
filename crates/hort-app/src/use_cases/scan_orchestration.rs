@@ -66,13 +66,14 @@ use crate::metrics::{
     emit_scan_terminal, observe_scan_duration, SbomExtractionResult, SbomResolutionResult,
     ScanFailureResult, ScanJobsResult, ScanTerminalResult,
 };
-use crate::result_write_fence::surface_result_write;
 // `record_outcome`'s `Failed` branch waits out the workspace's one
 // retry curve. The four-step shape used to be defined here and the task
 // dispatcher carried its own, differently-shaped copy behind the same
 // agreed attempt cap; the definition moved to `crate::retry_backoff` so
-// the number and the window it spans cannot diverge again.
-use crate::retry_backoff::compute_backoff;
+// the number and the window it spans cannot diverge again. The budget
+// those waits are spent against has its default in the same module, for
+// the same reason.
+use crate::retry_backoff::{compute_backoff, DEFAULT_MAX_ATTEMPTS};
 use crate::scanning::any_scan_backend_applies_to;
 use crate::use_cases::composite_scan::{
     CompositeDisposition, CompositeScan, CompositeVerdict, ShadowObservationSink,
@@ -93,16 +94,6 @@ use crate::use_cases::scan_kind_resolution::scan_kind_of;
 fn is_report_too_large_error(err: &DomainError) -> bool {
     matches!(err, DomainError::Invariant(msg) if msg.contains(SCAN_REPORT_TOO_LARGE_MARKER))
 }
-
-/// The `jobs.kind` of every row this orchestrator closes out. Only
-/// used as the label on a refused-write log line — the orchestrator is
-/// reached through `ScanTaskHandler`, which the dispatcher registers
-/// under this same literal.
-const KIND: &str = "scan";
-
-/// Default cap on the number of attempts before a job is moved to the
-/// terminal `failed` status. Mirrors `HORT_SCANNER_MAX_ATTEMPTS`.
-const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
 /// Default for [`ScanOrchestrationConfig::allow_informed_downgrade`].
 /// Mirrors `HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE`'s default: the
@@ -127,7 +118,20 @@ const DEFAULT_ALLOW_INFORMED_DOWNGRADE: bool = true;
 pub struct ScanOrchestrationConfig {
     /// Identifier this worker reports on `jobs.locked_by` claims.
     pub worker_id: String,
-    /// Cap on retry attempts before a job is `mark_failed` permanently.
+    /// Cap on retry attempts before the scan stops asking to be
+    /// retried and records the artifact's terminal verdict.
+    ///
+    /// **The same number the dispatcher closes the row out against.**
+    /// `record_outcome` spends this budget to decide the *artifact's*
+    /// state (`ScanIndeterminate` at the cap, nothing below it) and
+    /// reports a [`ScanRowDisposition`]; the dispatcher spends its own
+    /// `attempt_cap` to decide the *row's* state. Those two decisions
+    /// are halves of one boundary, so the worker's composition root
+    /// assigns both from the one `HORT_SCANNER_MAX_ATTEMPTS`-derived
+    /// `WorkerConfig::max_attempts` field. A smaller cap on the
+    /// dispatcher side fails the row while this side still wanted a
+    /// retry — a terminal row with no artifact verdict behind it; a
+    /// larger one re-drives a scan whose verdict is already recorded.
     pub max_attempts: u32,
     /// **Deprecated, transitional.** Kept on the
     /// struct so the existing `hort-worker` composition root
@@ -276,9 +280,63 @@ pub enum ScanRunOutcome {
         /// `"trivy=no_analyzer_matched"`. Lands on the event's reason.
         reason: String,
     },
-    /// Every configured backend errored. `record_outcome` reschedules
-    /// or marks failed based on the job's attempt count.
+    /// Every configured backend errored. `record_outcome` asks for a
+    /// retry or reports a terminal failure based on the job's attempt
+    /// count.
     Failed(String),
+}
+
+// ---------------------------------------------------------------------------
+// ScanRowDisposition
+// ---------------------------------------------------------------------------
+
+/// What the `jobs` row should become, as the scan path sees it — and
+/// nothing more, because the scan path does not write it.
+///
+/// # Why this is a return value and not an UPDATE
+///
+/// `record_outcome` used to close the row out itself, with
+/// `mark_completed` / `mark_failed` / `reschedule` chosen per outcome.
+/// The dispatcher then wrote the row *again* from
+/// [`ScanTaskHandler`](crate::task_handlers::scan::ScanTaskHandler)'s
+/// return value, and that second write won: the result-write fence is
+/// `AND attempts = $2` and nothing else, and `reschedule` leaves
+/// `attempts` alone, so a scheduled retry was turned into
+/// `status='completed'` by a `mark_completed` carrying the same
+/// attempt. A scan that had just asked to be retried read back as
+/// finished, with no `ScanCompleted`, no verdict and nothing owing the
+/// artifact one — and the terminal arm read back `completed` too, so
+/// "answered", "still owes an answer" and "gave up" were one word at
+/// the one place an operator looks.
+///
+/// The row therefore has exactly one owner, the dispatcher, and the
+/// scan path owns events and artifact state. This type is the whole of
+/// what crosses between them.
+///
+/// # The budget is spent on this side
+///
+/// The retryable/terminal split is decided here rather than by the
+/// dispatcher's cap alone, because the *artifact's* terminal state is
+/// decided at the same boundary — an exhausted scan records
+/// `ScanIndeterminate` (or deliberately leaves an already-quarantined
+/// artifact where it is) before this value is returned. Both sides
+/// read the operator's one configured cap
+/// (`ScanOrchestrationConfig::max_attempts`,
+/// `TaskDispatcher::attempt_cap`), so [`Self::Retry`] below the cap is
+/// honoured and [`Self::Failed`] at it is written, and neither side
+/// can retire a row the other still considers owed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanRowDisposition {
+    /// The scan recorded a result. Terminal success; the row carries
+    /// the handler's `result_summary`.
+    Completed,
+    /// Terminal failure. `String` is the operator-visible `last_error`
+    /// text, verbatim — the same string the removed `mark_failed` calls
+    /// passed.
+    Failed(String),
+    /// Retryable failure, with attempt budget left. `String` is the
+    /// operator-visible `last_error` text, verbatim.
+    Retry(String),
 }
 
 /// The artifact's repository row, reduced to the fact the SBOM step
@@ -949,9 +1007,13 @@ impl ScanOrchestrationUseCase {
                 && total_failed == 0
                 && job.attempts < self.config.max_attempts
             {
+                // "scan attempt" rather than "attempt": the acquisition
+                // path reports a second, inner budget of its own, and a
+                // frame that does not say which of the two it is counting
+                // reads as a contradiction of the number inside it.
                 return Ok(ScanRunOutcome::Failed(format!(
-                    "the composed image of artifact {} could not be produced on attempt {} \
-                     of {}: {why}",
+                    "the composed image of artifact {} could not be produced on scan attempt \
+                     {} of {}: {why}",
                     artifact.id, job.attempts, self.config.max_attempts
                 )));
             }
@@ -1189,9 +1251,11 @@ impl ScanOrchestrationUseCase {
         }
     }
 
-    /// Persist a [`ScanRunOutcome`]. The success branches forward the
-    /// full per-finding `Vec<Finding>` to
-    /// [`QuarantineUseCase::record_scan_result`], which atomically:
+    /// Persist a [`ScanRunOutcome`]'s **events and artifact state**, and
+    /// report what the `jobs` row should become.
+    ///
+    /// The success branches forward the full per-finding `Vec<Finding>`
+    /// to [`QuarantineUseCase::record_scan_result`], which atomically:
     ///
     /// - Writes the JSON-serialised findings to CAS.
     /// - Inserts the `scan_findings` projection rows.
@@ -1202,8 +1266,40 @@ impl ScanOrchestrationUseCase {
     /// The orchestrator never issues a
     /// second `EventStore::append` for `ArtifactBecameVulnerable`; the
     /// consumer owns the delta computation and the atomic batch.
+    ///
+    /// # It does not write the `jobs` row
+    ///
+    /// The returned [`ScanRowDisposition`] is the row's whole story and
+    /// [`TaskDispatcher`](crate::task_dispatcher::TaskDispatcher) is the
+    /// only writer of it — see that type for the two-owner defect this
+    /// shape removes. Two consequences are worth stating because they
+    /// were previously held by comments:
+    ///
+    /// - **Fail-closed ordering holds by construction.** The artifact's
+    ///   transition to `ScanIndeterminate` precedes the row's terminal
+    ///   write because the row write happens after this function has
+    ///   returned. A failure here propagates as `Err` and no terminal
+    ///   row is written on the strength of it.
+    /// - **A persistence failure is an undischarged obligation.** When
+    ///   this returns `Err`, no verdict was recorded, so the handler
+    ///   reports a retryable failure. Below the cap the row goes back
+    ///   to `pending` and the obligation is retried. At the cap the
+    ///   dispatcher writes `failed` — and the artifact is left in the
+    ///   state it already had, which is what keeps the obligation
+    ///   recoverable rather than silent: `quarantined` is re-picked by
+    ///   `RescanCandidatesRepository::select_stranded` (whose predicate
+    ///   is exactly "quarantined, last scan job failed or absent"), and
+    ///   `NULL` / `released` by `select_eligible`, whose
+    ///   `last_scan_at IS NULL` arm admits an artifact no scan ever
+    ///   completed. An artifact already in a terminal
+    ///   `scan_indeterminate` / `rejected` state carries a verdict
+    ///   already, so there is no obligation to lose.
     #[tracing::instrument(skip(self, outcome))]
-    pub async fn record_outcome(&self, job: &ScanJob, outcome: ScanRunOutcome) -> AppResult<()> {
+    pub async fn record_outcome(
+        &self,
+        job: &ScanJob,
+        outcome: ScanRunOutcome,
+    ) -> AppResult<ScanRowDisposition> {
         match outcome {
             ScanRunOutcome::SkippedNoBackends { kind } => {
                 // Emit a clean ScanCompleted via the consumer. The
@@ -1229,20 +1325,10 @@ impl ScanOrchestrationUseCase {
                         None,
                     )
                     .await?;
-                // H17 — scan's forensics are the ScanCompleted event + the
-                // findings projection; the JSON `result_summary`
-                // (`{scanner, finding_count}`) is built by ScanTaskHandler and
-                // persisted by the dispatcher's own (second, authoritative,
-                // idempotent) mark_completed call, so pass Null here.
-                let outcome = self
-                    .jobs
-                    .mark_completed(job.id, job.attempts, serde_json::Value::Null)
-                    .await?;
-                surface_result_write(outcome, "mark_completed", job.id, KIND, job.attempts);
                 emit_scan_jobs(ScanJobsResult::Completed);
                 // Operator-waiver clean outcome.
                 emit_scan_terminal(ScanTerminalResult::Completed);
-                Ok(())
+                Ok(ScanRowDisposition::Completed)
             }
             ScanRunOutcome::Completed {
                 scanner,
@@ -1289,19 +1375,9 @@ impl ScanOrchestrationUseCase {
                         sbom.as_ref(),
                     )
                     .await?;
-                // H17 — scan's forensics are the ScanCompleted event + the
-                // findings projection; the JSON `result_summary`
-                // (`{scanner, finding_count}`) is built by ScanTaskHandler and
-                // persisted by the dispatcher's own (second, authoritative,
-                // idempotent) mark_completed call, so pass Null here.
-                let outcome = self
-                    .jobs
-                    .mark_completed(job.id, job.attempts, serde_json::Value::Null)
-                    .await?;
-                surface_result_write(outcome, "mark_completed", job.id, KIND, job.attempts);
                 emit_scan_jobs(ScanJobsResult::Completed);
                 emit_scan_terminal(terminal);
-                Ok(())
+                Ok(ScanRowDisposition::Completed)
             }
             ScanRunOutcome::NothingAnalysable { scanner, reason } => {
                 // FAIL-CLOSED (ADR 0007). Every backend ran and none
@@ -1338,11 +1414,9 @@ impl ScanOrchestrationUseCase {
                         job.attempts,
                     )
                     .await?;
-                let outcome = self.jobs.mark_failed(job.id, job.attempts, &reason).await?;
-                surface_result_write(outcome, "mark_failed", job.id, KIND, job.attempts);
                 emit_scan_jobs(ScanJobsResult::Failed);
                 emit_scan_terminal(ScanTerminalResult::Indeterminate);
-                Ok(())
+                Ok(ScanRowDisposition::Failed(reason))
             }
             ScanRunOutcome::Failed(err) => {
                 if job.attempts >= self.config.max_attempts {
@@ -1358,16 +1432,17 @@ impl ScanOrchestrationUseCase {
                     // This `Failed` outcome is a scanner-EXECUTION failure
                     // (every configured backend errored — the scan could
                     // not run at all), not a genuinely-ambiguous scan
-                    // RESULT. Issue #6 / ADR 0007 refinement: when the
+                    // RESULT. ADR 0007 refinement: when the
                     // artifact is already `Quarantined` (mid-observation-
                     // window), a scanner outage must not escalate it to
                     // the stricter terminal `scan_indeterminate` — it
                     // fails closed by staying exactly where it already is
                     // (downloads still blocked; `quarantine_status`
                     // untouched, no event, no state UPDATE at all).
-                    // `mark_failed` alone (`jobs.status='failed'`,
-                    // `last_error`) IS the persisted "last scan errored"
-                    // fact `RescanCandidatesRepository::select_stranded`
+                    // The terminal `jobs.status='failed'` the dispatcher
+                    // writes from the returned disposition IS the
+                    // persisted "last scan errored" fact
+                    // `RescanCandidatesRepository::select_stranded`
                     // reads to re-pick the artifact once the scanner
                     // recovers (`CronRescanTickHandler`).
                     //
@@ -1400,23 +1475,22 @@ impl ScanOrchestrationUseCase {
                              (not scan_indeterminate); will be re-picked by the rescan sweep \
                              once the scanner recovers",
                         );
-                        let outcome = self.jobs.mark_failed(job.id, job.attempts, &err).await?;
-                        surface_result_write(outcome, "mark_failed", job.id, KIND, job.attempts);
                         emit_scan_jobs(ScanJobsResult::Failed);
                     } else {
-                        // FAIL-CLOSED (ADR 0007): transition the
-                        // artifact to ScanIndeterminate BEFORE mark_failed
-                        // so a crash between them leaves the job
-                        // retryable rather than the artifact silently
-                        // un-failed. The use case loads the artifact,
+                        // FAIL-CLOSED (ADR 0007): the artifact's
+                        // transition to ScanIndeterminate happens here,
+                        // and the row's terminal write happens after
+                        // this function returns — so the ordering is a
+                        // property of the call graph rather than of a
+                        // comment. The use case loads the artifact,
                         // calls `fail_scan_indeterminate`, and commits the
                         // event + status transition atomically via the
                         // EXISTING `commit_transition_with_score`. An
                         // already-terminal artifact is a recoverable skip
                         // (returns Ok); a genuine load/commit error
-                        // propagates and we do NOT mark the job failed
-                        // (fail-closed: keep the job retryable so the
-                        // transition is retried).
+                        // propagates, so the handler reports a retryable
+                        // failure and the terminal row is not written on
+                        // the strength of a verdict that did not land.
                         let scanner_label = self.scanner_label_for_failed(job).await;
                         self.quarantine
                             .record_scan_indeterminate(
@@ -1426,29 +1500,23 @@ impl ScanOrchestrationUseCase {
                                 job.attempts,
                             )
                             .await?;
-                        let outcome = self.jobs.mark_failed(job.id, job.attempts, &err).await?;
-                        surface_result_write(outcome, "mark_failed", job.id, KIND, job.attempts);
                         emit_scan_jobs(ScanJobsResult::Failed);
                         // Artifact-terminal: indeterminate.
                         emit_scan_terminal(ScanTerminalResult::Indeterminate);
                     }
+                    Ok(ScanRowDisposition::Failed(err))
                 } else {
-                    let backoff = compute_backoff(job.attempts);
                     tracing::info!(
                         artifact_id = %job.artifact_id,
                         attempts = job.attempts,
                         max_attempts = self.config.max_attempts,
-                        backoff_secs = backoff.as_secs(),
-                        "scan failure classified as transient (scanner-execution) — rescheduling",
+                        backoff_secs = compute_backoff(job.attempts).as_secs(),
+                        "scan failure classified as transient (scanner-execution) — asking the \
+                         dispatcher to reschedule",
                     );
-                    let outcome = self
-                        .jobs
-                        .reschedule(job.id, job.attempts, backoff, &err)
-                        .await?;
-                    surface_result_write(outcome, "reschedule", job.id, KIND, job.attempts);
                     emit_scan_jobs(ScanJobsResult::Retried);
+                    Ok(ScanRowDisposition::Retry(err))
                 }
-                Ok(())
             }
         }
     }

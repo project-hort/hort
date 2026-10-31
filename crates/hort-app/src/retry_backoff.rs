@@ -1,10 +1,20 @@
-//! The one retry-backoff curve a failing `jobs` row waits out.
+//! The one retry-backoff curve a failing `jobs` row waits out, and the
+//! one default for the budget that curve is spent against.
 //!
 //! Two consumers spend a row's attempt budget — the generalised
 //! [`crate::task_dispatcher`] poll loop, for every registered kind, and
 //! [`crate::use_cases::scan_orchestration`]'s `record_outcome`, for
 //! `kind='scan'` — and both call [`compute_backoff`] here rather than
 //! carrying a copy of it.
+//!
+//! A budget is two numbers, and both live here for the same reason:
+//! [`DEFAULT_MAX_ATTEMPTS`] is how many executions a row gets and
+//! [`compute_backoff`] is the window they span. Neither consumer
+//! defines either one. The dispatcher is handed the *configured* cap at
+//! construction and the scan orchestrator is handed it on
+//! `ScanOrchestrationConfig`; this constant is only the value an
+//! unconfigured deployment lands on, so there is no second cap for an
+//! operator's setting to fail to reach.
 //!
 //! They used to carry two differently-shaped curves behind one agreed
 //! number. Both stop re-driving a row after five executions, but the
@@ -16,6 +26,25 @@
 //! consumers or on neither.
 
 use std::time::Duration;
+
+/// Default number of executions a `jobs` row gets before it becomes
+/// terminal — the default of `HORT_SCANNER_MAX_ATTEMPTS`
+/// (`hort-worker`'s `WorkerConfig::max_attempts`).
+///
+/// **This is a default, never a cap in its own right.** Both consumers
+/// of the budget take the configured number: the dispatcher as a
+/// `TaskDispatcher::new` argument, the scan orchestrator as
+/// `ScanOrchestrationConfig::max_attempts`, and the worker's
+/// composition root assigns both from the one `WorkerConfig` field. A
+/// `const` used *as* a cap on either side is how an operator who sets
+/// `HORT_SCANNER_MAX_ATTEMPTS=12` gets a row failed at five with no
+/// artifact verdict behind it, so the only thing this value is allowed
+/// to do is stand in when nothing was configured.
+///
+/// Five is the number [`compute_backoff`]'s window is rated for: it
+/// spends the curve's first four waits, which is the 96 minutes that
+/// doc describes. The two halves move together or not at all.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
 /// How long a `jobs` row waits before its next execution, after an
 /// attempt failed retryably.
@@ -131,6 +160,26 @@ mod tests {
                 "attempts = {attempts}"
             );
         }
+    }
+
+    /// The budget's own half of the pairing, pinned by value.
+    ///
+    /// The window asserted above is rated for exactly five executions;
+    /// a reader who changes this constant and not the curve has
+    /// changed what "an exhausted budget" means without changing what
+    /// it costs. The product of the two halves is pinned next to the
+    /// dispatcher's cap, in
+    /// `task_dispatcher::tests::five_executions_span_the_ninety_six_minute_window`.
+    #[test]
+    fn the_default_budget_is_the_one_the_window_is_rated_for() {
+        assert_eq!(
+            DEFAULT_MAX_ATTEMPTS, 5,
+            "the window above spends this many executions' waits"
+        );
+        let spent: Vec<u64> = (1..DEFAULT_MAX_ATTEMPTS)
+            .map(|a| compute_backoff(a).as_secs())
+            .collect();
+        assert_eq!(spent.iter().sum::<u64>(), 96 * 60);
     }
 
     /// `attempts == 0` gets the first wait, not a zero wait.

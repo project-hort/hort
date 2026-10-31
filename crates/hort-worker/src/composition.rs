@@ -672,6 +672,16 @@ pub async fn build_app_context(
         cfg.lock_duration,
         cfg.poll_interval.as_secs(),
         u16::try_from(cfg.batch_size).unwrap_or(u16::MAX),
+        // The same `HORT_SCANNER_MAX_ATTEMPTS`-derived number the
+        // orchestration config above was given, and that is the whole
+        // point of passing it here. The two caps meet at one boundary:
+        // the scan path spends its cap to decide the ARTIFACT's
+        // terminal state and the dispatcher spends this one to decide
+        // the ROW's. While the dispatcher carried a compile-time `5`
+        // they agreed only at the default, so an operator who moved the
+        // scan budget got a row failed on one number and an artifact
+        // held on another.
+        cfg.max_attempts,
     );
     dispatcher.register(
         Arc::new(ScanTaskHandler::new(orchestration.clone())),

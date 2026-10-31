@@ -221,8 +221,13 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
             // resolved policy row (`p.scan_backends IS NULL`) falls back
             // to `DefaultPolicy::block_on_critical_default_backends()`
             // (`["trivy"]`, non-empty) via `COALESCE(cardinality(..), $2)`
-            // — out-of-the-box deployments with zero `ScanPolicy` rows
-            // still get stranded artifacts recovered.
+            // — so a deployment with zero `ScanPolicy` rows has its
+            // stranded artifacts *in* this result set rather than
+            // excluded from it. Whether they are then recovered depends
+            // on this query being run at all: `CronRescanTickHandler`
+            // is its only production caller and the chart ships that
+            // tick off (`scheduledTasks.cronRescanTick.enabled:
+            // false`).
             //
             // `quarantine_status = 'quarantined'` (NOT `'released'`/`NULL`
             // — that's `select_eligible`'s predicate, and NOT

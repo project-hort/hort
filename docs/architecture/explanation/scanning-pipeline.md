@@ -185,6 +185,19 @@ The worker's `TaskDispatcher`
 (`crates/hort-app/src/task_handlers/scan.rs`), a thin adapter over the
 real orchestration in
 `ScanOrchestrationUseCase` (`crates/hort-app/src/use_cases/scan_orchestration.rs`).
+
+**The dispatcher is the `jobs` row's only writer**, for `kind='scan'` as
+for every other kind. The scan path owns the events and the artifact's
+state; `record_outcome` reports what the row should become as a
+`ScanRowDisposition` (completed / terminal-failed / retryable) and the
+handler translates that into the `TaskOutcome` the dispatcher writes.
+Both sides were writers once, and because the result-write fence is
+`AND attempts = $2` and deliberately not the status, the dispatcher's
+later write silently overwrote the first — a scan that had just been
+scheduled for retry read back `status='completed'` with no verdict, and
+the job row is the system's only record that an artifact is still owed
+one. `crates/hort-app/tests/jobs_row_has_one_owner.rs` keeps a second
+writer from reappearing in the application layer.
 `run_scan` is pure work — it loads the artifact, resolves the policy
 chain, extracts the SBOM, runs the advisory enrichment (best-effort:
 a failed query logs and proceeds empty), and invokes each configured
@@ -296,6 +309,12 @@ That curve is not the scan pipeline's own any more — it lives in
 `hort_app::retry_backoff` and the task dispatcher spends the same four waits
 for every other job kind, so five attempts mean the same ~96-minute window
 wherever the number appears. Change it in one place or not at all.
+`HORT_SCANNER_MAX_ATTEMPTS` is likewise one number with two consumers:
+the composition root gives it to both `ScanOrchestrationConfig` — which
+spends it on the *artifact's* terminal state — and the `TaskDispatcher`,
+which spends it on the *row's*. The dispatcher used to carry a
+compile-time `5` instead, so the two agreed at the default and nowhere
+else.
 Exhausting the budget does not abandon the artifact — it transitions
 it, before the job row is marked failed, to the terminal
 `scan_indeterminate` status via
@@ -306,9 +325,16 @@ A `scan_indeterminate` artifact is non-downloadable, non-promotable,
 and **not releasable by the quarantine timer** — only an admin
 override or a post-exclusion re-evaluation can move it
 ([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)).
-The ordering is itself fail-closed: a crash between the artifact
-transition and the job update leaves the job retryable, never the
-artifact silently un-failed.
+The ordering is itself fail-closed, and now by construction rather than
+by convention: the artifact transition happens inside `record_outcome`
+and the row's terminal write happens after it has returned, so a crash
+or a failed append between them leaves the job retryable and never the
+artifact silently un-failed. At the attempt cap that retry request
+becomes a terminal row — and the obligation survives it, because the
+artifact's status was never moved: a `quarantined` one is re-picked by
+`select_stranded` and a permissive (`NULL`) or `released` one by
+`select_eligible`, whose `last_scan_at IS NULL` arm admits exactly an
+artifact no scan ever completed.
 
 The same fail-closed path absorbs a hostile scanner output. Both
 scanner adapters drain the child process's report pipes through a
@@ -932,8 +958,20 @@ never needs leader election to avoid double-firing.
 elapsed (`ScanPolicy.rescanIntervalHours`, default 24, `0` disables)
 and that have no in-flight scan, and enqueues each at priority 10 with
 `trigger_source="cron"`. It is interval-driven and
-advisory-independent: even if every feed went silent, every released
-artifact still gets re-adjudicated on its policy's cadence.
+advisory-independent: once the tick is scheduled, a released artifact
+gets re-adjudicated on its policy's cadence even if every feed went
+silent.
+
+That safety net is **opt-in**, and the interval alone does not buy it.
+`CronRescanTickHandler` is the only production caller of the
+eligibility query — and of the stranded-artifact query beside it — and
+the chart ships the tick off
+(`scheduledTasks.cronRescanTick.enabled: false`). So a deployment that
+has not scheduled it re-adjudicates nothing on any cadence, however
+short the `rescanIntervalHours` its policies declare. `hort-server`
+states that once per boot when a policy declares a cadence nothing
+drives, naming the chart value to set; the gauge is
+`hort_rescan_drive_undriven` (`docs/metrics-catalog.md`).
 
 **The advisory watch**
 (`crates/hort-app/src/task_handlers/advisory_watch_tick.rs`,

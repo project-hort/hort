@@ -55,6 +55,13 @@ use hort_domain::ports::BoxFuture;
 
 /// `deploy/compose/docker-compose.yml` — `HORT_SCANNER_BATCH_SIZE`.
 const REAL_BATCH_SIZE: u16 = 4;
+/// `HORT_SCANNER_MAX_ATTEMPTS`'s default — the attempt budget the
+/// dispatcher closes rows out against. Irrelevant to the claim
+/// starvation these tests reproduce (no row here reaches an outcome
+/// write), but the constructor takes the operator's number rather than
+/// supplying one, so the test states which number it is standing in
+/// for.
+const REAL_MAX_ATTEMPTS: u32 = 5;
 /// `CLEARANCE_VERIFY_PRIORITY` (`hort-app::ingest_use_case`) — the S4
 /// expiry-backstop re-enqueue priority, and `CRON_PRIORITY`
 /// (`hort-server::cli::enqueue_quarantine_release_sweep`). Identical by
@@ -171,6 +178,7 @@ async fn unregistered_kind_reproduces_the_live_row_signature() {
         Duration::from_secs(900),
         0, // poll as fast as the test can drive it
         REAL_BATCH_SIZE,
+        REAL_MAX_ATTEMPTS,
     );
     // The defect: NO `provenance-verify` handler is registered, so the
     // kind never enters `claim_pending_by_kinds`'s `$1` array.

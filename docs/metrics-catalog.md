@@ -1900,6 +1900,60 @@ emitted on the healthy path too (`0.0`) so a fresh scrape always sees
 the series (absence vs `0.0` is ambiguous to dashboards), matching the
 `hort_unsafe_config_active` convention.
 
+### Rescan-drive liveness
+
+| Metric | Type | Labels | Unit | Values |
+|--------|------|--------|------|--------|
+| `hort_rescan_drive_undriven` | gauge | — (no labels) | Boolean (0/1) | `0` = a declared rescan cadence is being driven, OR no active `ScanPolicy` declares one; `1` = a cadence is declared and no `cron-rescan-tick` has completed within the window (including never) |
+
+Emitted **once at boot** by `hort-server::composition` (the
+`emit_rescan_drive_liveness_signal` fn), mirroring
+`hort_staging_sweep_overdue` above. The composition root reads the
+active policy projections (`PolicyProjectionRepository::list_active`)
+plus the newest `completed_at` for a `kind='cron-rescan-tick' AND
+status='completed'` row (`JobsRepository::last_completed_at_by_kind`),
+feeds both through the pure
+`hort_domain::policy::evaluate_rescan_drive_liveness` predicate, and
+sets the gauge: `1.0` when some active policy declares a non-zero
+`rescanIntervalHours` and the newest completed tick is older than
+`HORT_RESCAN_DRIVE_STALENESS_MULTIPLIER × the shortest declared
+interval` (default multiplier `3`, so `72 h` at the default 24-hour
+cadence), `0.0` otherwise. A `warn!` on the `1.0` paths names the
+shortest declared interval, the policy carrying it, the age of the last
+completed tick (or that there is none), and the chart value to set —
+`scheduledTasks.cronRescanTick.enabled` — plus the one-shot
+`POST /api/v1/admin/tasks/cron-rescan-tick` for draining once without
+scheduling anything.
+
+**What it is for.** `ScanPolicy.rescanIntervalHours` is enforced
+correctly by its consumer, but `cron-rescan-tick` is that consumer's
+only driver and `scheduledTasks.cronRescanTick.enabled` defaults to
+`false`. So an operator can declare a cadence, have it stored verbatim,
+read it back from their own policy document and make a threat-model
+decision on it while nothing re-scans anything. The same tick is the
+only production caller of the stranded-artifact selector, so a scan
+left stranded by a failed job has no automatic recovery either — one
+deployment choice, two silent gaps. The signal is a statement about
+reachability, **not** a verdict on the configuration: running without
+the tick is supported and deliberate, and the line says what the choice
+costs.
+
+`0` is also the "nothing declared" value, not just the healthy one.
+A deployment with no policy rows, only archived rows, or only
+`rescanIntervalHours: 0` rows has promised nothing, so there is nothing
+to be undriven — `0` is the honest reading and distinguishing the two
+would need a second series for no actionable gain.
+
+**Why a boolean, why no labels, why boot-only** — identical reasoning
+to `hort_staging_sweep_overdue`: `hort-server` is deliberately
+scheduler-free, so the gauge is set once at boot and scraped
+continuously, with operators alarming on
+`max_over_time(hort_rescan_drive_undriven[6h]) > 0`. One rescan-drive
+posture per deployment, so a label would be unbounded-by-construction
+with no analytical value, and the shortest declared interval is a
+`warn!` field rather than a label for the same reason. Emitted on the
+healthy path too (`0.0`) so a fresh scrape always sees the series.
+
 ### Refcount-reconcile purge start-gate
 
 | Metric | Type | Labels | Unit | Values |
@@ -2862,18 +2916,24 @@ transition; closed taxonomy of 4):
   once per job returned from the `JobsRepository::claim_scan_jobs`
   call. A batch of N claimed jobs ticks the counter N times so the
   `pending → running` rate is observable on a single label.
+  These three labels report what `record_outcome` decided the row
+  should become — the `ScanRowDisposition` it returns. The row itself
+  is written by the dispatcher, from that disposition, so the
+  scan-specific counter and the `hort_admin_tasks_completed_total`
+  result label describe the same transition from the two layers.
 - `completed` — emitted by
-  `ScanOrchestrationUseCase::record_outcome` whenever the job is
-  marked completed. Both `Completed { … }` and `SkippedNoBackends`
-  reach `mark_completed` and tick this label; the wire reports the
-  terminal happy-path outcome regardless of whether scanning ran.
-- `failed` — emitted when `record_outcome` lands on the terminal
-  `mark_failed` arm (the job exhausted `max_attempts` retries). One
-  tick per terminal failure; never co-emitted with `retried` for the
-  same observation.
-- `retried` — emitted when `record_outcome` reschedules the job for
-  a future attempt via `JobsRepository::reschedule`. One tick per
-  reschedule call.
+  `ScanOrchestrationUseCase::record_outcome` whenever the scan
+  recorded a result. Both `Completed { … }` and `SkippedNoBackends`
+  reach `ScanRowDisposition::Completed` and tick this label; the wire
+  reports the terminal happy-path outcome regardless of whether
+  scanning ran.
+- `failed` — emitted when `record_outcome` lands on a terminal
+  disposition (the job exhausted `max_attempts` retries, or had
+  nothing analysable). One tick per terminal failure; never
+  co-emitted with `retried` for the same observation.
+- `retried` — emitted when `record_outcome` returns
+  `ScanRowDisposition::Retry`, asking the dispatcher to reschedule the
+  job for a future attempt. One tick per retried observation.
 
 **`hort_finding_component_relation_total` semantics** — emitted by
 `ScanOrchestrationUseCase::run_scan` once per finding as it is tagged
@@ -3122,8 +3182,9 @@ once per Failed-branch `record_outcome` invocation that itself
 returns `Err`. The Failed branch is the one the worker takes when
 `run_scan` returned `Err(_)` (an infrastructure failure — artifact
 load, SBOM extraction, etc.) and the orchestrator's
-`record_outcome(&job, ScanRunOutcome::Failed(_))` then also failed
-to persist the backoff or `mark_failed` transition. Distinct from
+`record_outcome(&job, ScanRunOutcome::Failed(_))` then also failed —
+it could not persist the artifact's `ScanIndeterminate` transition, or
+could not read the state that decides whether one is owed. Distinct from
 `hort_scan_jobs_total{result=failed}`, which counts jobs the
 orchestrator successfully transitioned into the terminal `failed`
 state — this counter only fires when that very transition could not
@@ -4261,8 +4322,10 @@ with the per-kind reason.
   a terminal `failed` row carrying its last error. Three triggers reach
   it: the handler returned `TaskOutcome::Failed { retry: false }`; it
   asked to be retried on a row whose `attempts` had reached the
-  dispatcher's attempt cap (`JOB_ATTEMPT_CAP`, 5 — the same number the
-  abandoned-lease sweep spends); or the row is a **destructive**
+  dispatcher's attempt cap (`HORT_SCANNER_MAX_ATTEMPTS`, default 5 —
+  the same number the abandoned-lease sweep spends and the same one
+  `ScanOrchestrationConfig::max_attempts` carries); or the row is a
+  **destructive**
   invocation whose requester's authority no longer holds, which the
   dispatcher refuses before calling the handler (below). The label
   reports what the dispatcher did to the row, not what the handler asked
