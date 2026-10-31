@@ -506,6 +506,104 @@ jobs:
         run: cargo test --workspace --test '*' --verbose
 
   # ════════════════════════════════════════════════════════════════════════════
+  # QUALITY — SonarQube Cloud (trunk pushes only)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Drives the analysis of the SonarQube Cloud project from this pipeline.
+  # Without a CI-side scan the platform falls back to its own Automatic
+  # Analysis, which reads neither `sonar-project.properties` nor any coverage
+  # report. Both halves of that matter: the test/production split never
+  # applies, so test code is scored as production code and its findings are
+  # counted against the project; and no coverage metric exists at all, so a
+  # coverage-on-new-code gate condition has nothing to score and is not the
+  # gate it reads as.
+  #
+  # Coverage: this job does NOT recompute it. The `coverage` job already
+  # builds lcov.info and uploads it as the `lcov-coverage` artifact; this job
+  # downloads that. A separate workflow would have to pay for the coverage
+  # build a second time.
+  sonarqube-cloud:
+    name: 🔎 SonarQube Cloud
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [coverage]
+    permissions:
+      contents: read
+    # Pushes to the two integration refs only — no pull-request mode. This
+    # matches the GitLab twin (`quality:sonar` skips merge-request pipelines)
+    # and for the same reason: the gate scores coverage and duplication on NEW
+    # CODE, which is meaningless for the many changes that touch no Rust —
+    # those score 0% and would block. It is also the posture with no gap,
+    # because the `coverage` job only builds lcov.info when Rust actually
+    # changed, and that detection is unconditionally true for a push. Adding
+    # pull-request decoration later means consuming the SAME `rust_changed`
+    # signal the `coverage` job already computes — a second derivation of
+    # "did Rust change" would drift from the first.
+    #
+    # The ref test also excludes `v*` tags, which reach this file as a
+    # `workflow_call` gate for the publish workflows: in a called workflow the
+    # context is the caller's, so `event_name` is `push` there too, and only
+    # the ref distinguishes them. A release must not wait on a third-party
+    # gate verdict.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    env:
+      # Gates the scan step below. A job-level `if:` cannot read `secrets`, so
+      # the "is Sonar configured here at all" check has to sit on the step —
+      # same intent as the GitLab twin's token-gated `rules:`, which keeps an
+      # installation without a Sonar instance from hard-failing.
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      # No SONAR_HOST_URL: the scan action defaults to SonarQube Cloud, which
+      # is this job's target. Setting it would point the scan at a server.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Sonar attributes each line to an author and a date out of git
+          # history, and "new code" is defined against that attribution.
+          # actions/checkout clones at depth 1 by default, which leaves the
+          # scanner with no blame data to work from. The GitLab twin sets
+          # GIT_DEPTH: "0" for exactly this.
+          fetch-depth: 0
+
+      - name: Download the coverage report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          # Uploaded by the `coverage` job of this same run. Its upload step is
+          # conditional on Rust having changed, which is unconditionally true
+          # for a push — and a push is the only event this job runs on.
+          name: lcov-coverage
+
+      - name: SonarQube Cloud scan
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@4d1dc0c91ee400dcf8a6dddf2f705ac36542e304 # v8.4.0
+        with:
+          # The analysis semantics come from sonar-project.properties, shared
+          # with the GitLab scan. Passed here: this target's identity, and the
+          # one report path this pipeline produces. Deliberately no
+          # sonar.rust.clippyReport.reportPaths and no
+          # sonar.coverageReportPaths — nothing on the GitHub side writes
+          # clippy-report.json or coverage-sonar.xml, and naming a file that
+          # does not exist relies on a scanner tolerance nobody here measured.
+          #
+          # No sonar.branch.name either: the scanner derives the branch from
+          # the GitHub Actions environment, which is how the action's own
+          # documented push-to-several-branches example works.
+          args: >-
+            -Dsonar.projectKey=project-hort_hort
+            -Dsonar.organization=project-hort
+            -Dsonar.rust.lcov.reportPaths=lcov.info
+
+      - name: Report an unconfigured Sonar target
+        if: env.SONAR_TOKEN == ''
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ### SonarQube Cloud: skipped — no SONAR_TOKEN secret on this repository
+
+          Add the repository secret to enable the scan. Until then the project is
+          left to SonarQube Cloud's Automatic Analysis, which imports no coverage
+          and applies no test/production split.
+          SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════
   # SECURITY — blocking gates
   # ════════════════════════════════════════════════════════════════════════════
   #

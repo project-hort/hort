@@ -121,7 +121,7 @@ Rust 1.97+ with the following project configuration:
 - **MSRV:** 1.97.0 (see `.clippy.toml`)
 - **`unsafe` is forbidden workspace-wide** via `[workspace.lints.rust] unsafe_code = "forbid"` in the root `Cargo.toml`. This cannot be overridden with `#[allow]` — it is a compile error. All dependencies that need `unsafe` handle it within their own crates; no application code in this workspace has a legitimate need for it. If a future edge case requires revisiting this, the change must be made in `Cargo.toml` and reviewed as a policy change.
 - **Clippy lints** are configured in `[workspace.lints.clippy]` in the root `Cargo.toml`. Every crate inherits these via `[lints] workspace = true`. Do not override workspace lints in individual crates without justification.
-- **SonarCloud quality gate** runs on every PR and enforces >= 85% coverage on new code and <= 1% duplication on new code. PRs that fail the gate will be blocked.
+- **Sonar quality gate** runs on pushes to `develop` and `main` — never on an MR or PR: GitLab's `quality:sonar` scans the in-cluster SonarQube, GitHub's `ci.yml` `sonarqube-cloud` job scans SonarQube Cloud, and each instance's own server-side gate (coverage and duplication on new code) decides the verdict. Per-change coverage and duplication are gated instead by the `coverage` job's own thresholds.
 
 ### Test Coverage Tiers
 
