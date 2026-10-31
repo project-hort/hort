@@ -629,6 +629,36 @@ a name, matches nothing and is rejected.
 **Idempotency:** reapply with no YAML change emits zero events and
 no projection writes. The `unchanged` counter ticks instead.
 
+#### `quarantineDuration` — bounded by what the deadline arithmetic can represent
+
+A quarantine deadline is an *instant*: the window start offset by the
+duration. Apply therefore refuses a `quarantineDuration` that is
+well-formed humantime but longer than the largest offset the system can
+build (`i64::MAX` milliseconds ≈ 9 223 372 036 854 775 s, read off
+`chrono::TimeDelta`'s own limit rather than written down). The refusal
+names the field, the value and the bound:
+
+```text
+ScanPolicy `prod-default` is invalid: spec.quarantineDuration `300000000years` is
+9467280000000000 seconds, above the maximum of 9223372036854775 seconds a quarantine
+window can be: the deadline is computed as an instant offset by this duration and a
+longer one has no representable deadline
+```
+
+Nothing is clamped or defaulted — a quarantine window is a security
+decision, so an unusable value is refused where it was set rather than
+quietly replaced. `hort-server validate-config` catches it offline.
+
+Separately, the quarantine-release sweep **skips** any repository whose
+*stored* duration has no representable deadline, logging the repository
+id and the value at `ERROR`, and sweeps the rest of the deployment
+normally. Apply-time validation cannot heal a row that was written
+before the bound existed or by something other than apply, and the sweep
+is single and deployment-wide — so a row it cannot compute costs that
+repository's releases rather than every release in the installation. The
+held artifacts stay quarantined until the duration is corrected and
+re-applied.
+
 #### `licensePolicy` — apply rejects any declared licence rule
 
 **Licence enforcement is not implemented, and declaring it is now an

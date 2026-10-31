@@ -49,3 +49,8 @@ serial_test = { workspace = true }
 # with `metrics_util::debugging::DebuggingRecorder` and assert the label
 # tuples that fire. Mirrors `hort-app`'s usage of the same feature flag.
 metrics-util = { workspace = true, features = ["debugging"] }
+# The quarantine-release sweep's uncomputable-duration skip is only safe
+# because it is loud: the test asserts the `error!` names the repository
+# and the value, which needs a capturing subscriber. Same recipe as
+# `hort-app`'s sweep-handler tests.
+tracing-subscriber = { workspace = true }

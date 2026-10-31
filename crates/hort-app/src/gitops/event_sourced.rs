@@ -1175,6 +1175,77 @@ mod tests {
         );
     }
 
+    /// The gitops applier's seconds conversion survives the largest
+    /// duration `hort-config` will accept.
+    ///
+    /// `parse_humantime_secs` asserts `INVARIANT: … validator should
+    /// have rejected` on the `i64::try_from`. This drives the whole
+    /// applier — not the helper — with the exact boundary value, and
+    /// asserts first that `validate_scan_policy` really does admit it,
+    /// so the test fails if either side of that handshake moves: a
+    /// looser validator would reach the panic, a tighter one would make
+    /// the bound unreachable and this assertion false.
+    ///
+    /// The apply pipeline has a second, independent copy of the same
+    /// conversion (`apply_config_use_case::humantime_secs`); covering
+    /// only one of the two would leave the other holed.
+    #[test]
+    fn scan_policy_quarantine_duration_at_the_config_bound_converts_without_panicking() {
+        let at_bound = format!("{}s", hort_config::scan_policy::MAX_POLICY_DURATION_SECS);
+        let expected =
+            i64::try_from(hort_config::scan_policy::MAX_POLICY_DURATION_SECS).expect("fits i64");
+
+        let mut spec = baseline_spec();
+        spec.quarantine_duration = at_bound.clone();
+        let env = policy_envelope(spec);
+        assert!(
+            hort_config::scan_policy::validate_scan_policy(&env).is_empty(),
+            "`{at_bound}` must be the largest duration apply accepts — if the validator \
+             refuses it this test is asserting over an unreachable value"
+        );
+
+        // Update path — the one the apply pipeline actually reaches.
+        let proj = baseline_projection(Uuid::from_u128(0x5ec5));
+        let events = ScanPolicyApplier::default().diff(&env, Some(&proj));
+        assert_single_field_updated(
+            &events,
+            &PolicyField::QuarantineDuration,
+            &serde_json::Value::from(24 * 3600),
+            &serde_json::Value::from(expected),
+        );
+
+        // Create path — the trait contract's other branch.
+        let created = ScanPolicyApplier::default().diff(&env, None);
+        let DomainEvent::PolicyCreated(payload) = &created[0] else {
+            panic!("expected PolicyCreated, got {:?}", created[0].event_type());
+        };
+        assert_eq!(
+            payload.config_snapshot["quarantine_duration_secs"],
+            serde_json::Value::from(expected)
+        );
+    }
+
+    /// One second past the bound is what the validator refuses, so it
+    /// must never reach the applier. Pinned here because the panic is
+    /// the only thing standing between a bypassed validator and a
+    /// `quarantine_duration_secs` the release sweep cannot compute a
+    /// deadline from.
+    #[test]
+    #[should_panic(expected = "overflows i64 seconds")]
+    fn scan_policy_quarantine_duration_past_i64_seconds_panics_with_invariant_prefix() {
+        // Well-formed humantime, fits `u64` seconds, past `i64` — the
+        // input the conversion's `INVARIANT:` is written for. The
+        // config bound is three orders of magnitude below this, so the
+        // branch is unreachable from operator YAML; it is pinned here
+        // so a future loosening of that bound cannot quietly change
+        // what the unconvertible case does.
+        let past_i64 = u64::try_from(i64::MAX).expect("i64::MAX is non-negative") + 1;
+        let mut spec = baseline_spec();
+        spec.quarantine_duration = format!("{past_i64}s");
+        let env = policy_envelope(spec);
+        let _ = ScanPolicyApplier::default().diff(&env, None);
+    }
+
     #[test]
     fn scan_policy_require_approval_toggle_emits_one_event() {
         let applier = ScanPolicyApplier::default();
