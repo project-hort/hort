@@ -85,6 +85,15 @@
 //! once it is stamped — so excluding their repo from candidacy strands
 //! them `quarantined` permanently.
 //!
+//! **One uncomputable row costs one repository, not the sweep.** The
+//! cutoff is `now` offset by the resolved duration, and a stored
+//! `quarantine_duration_secs` large enough that no such instant exists
+//! used to panic — on a deployment-wide, every-tick sweep, which made
+//! one policy row stop every release in the installation in a crash
+//! loop. That repository is now skipped, named at `error!` level with
+//! the value that cannot be computed with, and every other
+//! repository's candidates come back normally. See `repo_cutoff`.
+//!
 //! Whether a selected artifact may actually be released is decided per
 //! artifact in `release_expired`: the scan-axis authority (ADR 0007) and
 //! the provenance clearance (ADR 0027). Nothing in this module authorizes
@@ -250,10 +259,12 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             // is the tier chain's only copy that can read the domain's own
             // default.
             //
-            // Every resolved duration produces a pair, none is discarded:
-            // this step selects by DEADLINE only. A permissive window is a
-            // zero-length window, not an absent one — its cutoff is `now`,
-            // which is the same arithmetic
+            // Every resolved duration whose cutoff can be computed at all
+            // produces a pair (`repo_cutoff` carries the one exception,
+            // which is a defective stored row rather than a policy
+            // decision): this step selects by DEADLINE only. A permissive
+            // window is a zero-length window, not an absent one — its
+            // cutoff is `now`, which is the same arithmetic
             // `effective_quarantine_deadline(anchor, 0)` gives the scan
             // fast path — so every artifact the repo still holds is past
             // its deadline and belongs in the candidate set. Deciding here
@@ -286,14 +297,20 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
                     .or(global_duration)
                     .unwrap_or_else(DefaultPolicy::quarantine_duration_secs)
                     .max(0);
-                let cutoff = now - chrono::Duration::seconds(secs);
+                let Some(cutoff) = repo_cutoff(repo, secs, now) else {
+                    continue;
+                };
                 broadest_cutoff = Some(broadest_cutoff.map_or(cutoff, |widest| widest.max(cutoff)));
                 cutoff_repos.push(repo);
                 cutoffs.push(cutoff);
             }
 
-            // Reachable only when no repository holds a quarantined
-            // artifact at all — the honest meaning of "no candidates".
+            // No pair survived the loop. Either no repository holds a
+            // quarantined artifact at all — the honest meaning of "no
+            // candidates" — or every quarantined repository's duration
+            // was uncomputable, in which case `repo_cutoff` has already
+            // named each one at `error!` level. There is nothing to
+            // query either way.
             let Some(broadest_cutoff) = broadest_cutoff else {
                 return Ok(Vec::new());
             };
@@ -412,6 +429,61 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             Ok(())
         })
     }
+}
+
+/// The instant a repository's quarantine windows must have started at
+/// or before, or `None` when that instant does not exist.
+///
+/// `now - duration` is fallible twice over, and both failures are
+/// reachable from a stored `quarantine_duration_secs`: a
+/// [`chrono::TimeDelta`] holds at most `i64::MAX` milliseconds, and
+/// subtracting one from `now` leaves the representable `DateTime` range
+/// well before that. `TimeDelta::seconds` and `DateTime - TimeDelta`
+/// both panic on their own bound, so the arithmetic is done through
+/// their checked forms and the two failures share one verdict — there
+/// is no useful distinction between "no `TimeDelta`" and "no instant":
+/// either way this repository has no deadline to select against.
+///
+/// **Skipped, never guessed.** The caller drops the repository from the
+/// candidacy query and keeps sweeping the others, so one defective row
+/// costs that repository's releases instead of every release in the
+/// deployment — this loop runs on a single deployment-wide sweep that
+/// re-enters every tick, so a panic here is a crash loop with no
+/// release path out of it. Substituting a default or a clamped window
+/// is not available: the quarantine window is a security decision, and
+/// inventing one here would release artifacts under a duration no
+/// operator set.
+///
+/// Fail-closed, and **loud**: the artifacts stay quarantined, which is
+/// the safe direction, but "this repository had nothing to release" and
+/// "this repository cannot be computed" are the same observation from
+/// outside — so the `error!` carries the repository id and the value
+/// that cannot be computed with.
+///
+/// `hort_config::scan_policy::MAX_POLICY_DURATION_SECS` refuses an
+/// uncomputable `quarantineDuration` at apply time, so a row reaching
+/// the `None` branch did not come through apply: a hand-edited row, a
+/// migration, a future writer, or a value stored before that bound
+/// existed. Apply-time validation cannot heal a row already written,
+/// which is why this is not redundant with it.
+fn repo_cutoff(repo: Uuid, secs: i64, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let cutoff = chrono::TimeDelta::try_seconds(secs).and_then(|window| {
+        // Checked: `now - window` is out of range long before
+        // `TimeDelta` itself is.
+        now.checked_sub_signed(window)
+    });
+    if cutoff.is_none() {
+        tracing::error!(
+            repository_id = %repo,
+            quarantine_duration_secs = secs,
+            "quarantine release sweep: this repository's effective quarantine duration has no \
+             representable deadline, so its release candidates cannot be selected — skipping \
+             it and sweeping the remaining repositories. Its quarantined artifacts stay held \
+             until the duration is corrected; correct the ScanPolicy quarantineDuration for \
+             this repository (or the global policy it inherits from) and re-apply."
+        );
+    }
+    cutoff
 }
 
 fn decode_err(e: &sqlx::Error) -> DomainError {
@@ -1301,5 +1373,294 @@ mod tests {
             "the never-attempted row leads, the stamped ones rotate behind it in \
              stamp order — unchanged by the single-query form",
         );
+    }
+
+    /// A hand-set `quarantine_duration_secs` the sweep cannot compute a
+    /// deadline from costs that repository's candidates and nothing
+    /// else: `select_expired` returns `Ok`, the defective repository's
+    /// artifact is absent, and the healthy repository's artifact comes
+    /// back exactly as it would have on its own.
+    ///
+    /// The value is written straight to `policy_projections` because
+    /// that is the only way it can exist — apply refuses it
+    /// (`hort_config::scan_policy::MAX_POLICY_DURATION_SECS`), and the
+    /// rows this guard is for are the ones that did not come through
+    /// apply. Before the guard this call panicked, and because the
+    /// sweep is single and deployment-wide, that stopped every release
+    /// in the installation rather than this one repository's.
+    ///
+    /// `#[serial(hort_pg_db)]` per CLAUDE.md's parallel-safety
+    /// contract.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_skips_repo_whose_stored_duration_has_no_deadline() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let now = Utc::now();
+        let elapsed = now
+            - chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs())
+            - chrono::Duration::seconds(1);
+
+        // The defective repository: a window that elapsed long ago, and
+        // a stored duration with no representable deadline.
+        let broken_repo = seed_repo(&pool).await;
+        seed_repo_scoped_policy(&pool, broken_repo, i64::MAX).await;
+        let broken_artifact = seed_quarantined_artifact(&pool, broken_repo, elapsed).await;
+
+        // The healthy repository beside it, on the default duration.
+        let healthy_repo = seed_repo(&pool).await;
+        let healthy_artifact = seed_quarantined_artifact(&pool, healthy_repo, elapsed).await;
+
+        let out = PgQuarantineReleaseCandidatesRepository::new(pool)
+            .select_expired(1000, now)
+            .await
+            .expect("an uncomputable stored duration must not fail the whole sweep");
+
+        let ids: Vec<Uuid> = out.iter().map(|c| c.artifact_id).collect();
+        assert_eq!(
+            ids,
+            vec![healthy_artifact],
+            "the healthy repository's candidate must come back and the defective \
+             repository's must not; got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&broken_artifact),
+            "an artifact whose repository has no computable deadline cannot be a candidate — \
+             the deadline test it would have to pass does not exist"
+        );
+    }
+
+    // ===================================================================
+    // `repo_cutoff` — the uncomputable-duration skip
+    //
+    // DB-free: the decision is pure arithmetic over `(secs, now)`, so
+    // these run in every gate including one with no `DATABASE_URL`.
+    // The end-to-end half — that a defective row costs its own
+    // repository and nothing else — is
+    // `select_expired_skips_repo_whose_stored_duration_has_no_deadline`
+    // below.
+    // ===================================================================
+
+    /// Minimal capturing subscriber layer: records `(level, rendered
+    /// fields)` per event. The skip's whole contract is that it is not
+    /// silent, so the message and both fields are what the tests
+    /// assert.
+    #[derive(Clone, Default)]
+    struct CapturedEvents {
+        records: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+        fn register_callsite(
+            &self,
+            _meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(
+            &self,
+            _meta: &tracing::Metadata<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct V(String);
+            impl tracing::field::Visit for V {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push_str(&format!("{}={v:?} ", f.name()));
+                }
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.0.push_str(&format!("{}={v} ", f.name()));
+                }
+                fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
+                    self.0.push_str(&format!("{}={v} ", f.name()));
+                }
+            }
+            let mut v = V(String::new());
+            event.record(&mut v);
+            self.records
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), v.0));
+        }
+    }
+
+    /// Run `repo_cutoff` under a thread-local capturing subscriber and
+    /// return its verdict together with the records it emitted.
+    ///
+    /// A global no-op passthrough is installed once first: `tracing`
+    /// caches per-callsite interest, and a callsite first reached with
+    /// no subscriber at all caches as "never" for the rest of the test
+    /// binary — which would make every assertion below vacuously pass
+    /// depending on test order. `rebuild_interest_cache` then
+    /// re-evaluates against the thread-local subscriber. Mirrors the
+    /// capture block in `hort-app`'s
+    /// `task_handlers/quarantine_release_sweep.rs`.
+    fn capture_repo_cutoff(
+        repo: Uuid,
+        secs: i64,
+        now: DateTime<Utc>,
+    ) -> (Option<DateTime<Utc>>, Vec<(tracing::Level, String)>) {
+        use std::sync::OnceLock;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        /// Discards every event; its only job is to keep callsite
+        /// interest out of the permanently-cached "never" state.
+        struct Passthrough;
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Passthrough {
+            fn register_callsite(
+                &self,
+                _meta: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+        }
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::Registry::default().with(Passthrough),
+            );
+        });
+
+        let layer = CapturedEvents::default();
+        let records = layer.records.clone();
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+        let verdict = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+            repo_cutoff(repo, secs, now)
+        };
+        let out = records.lock().unwrap().clone();
+        (verdict, out)
+    }
+
+    /// An ordinary duration resolves to `now - duration` and says
+    /// nothing. The counter-assertion to every skip test below: if this
+    /// one logged, the capture harness would be reporting noise rather
+    /// than the skip.
+    #[test]
+    fn repo_cutoff_computes_an_ordinary_duration_silently() {
+        let repo = Uuid::from_u128(0x0a);
+        let now = Utc::now();
+        let secs = DefaultPolicy::quarantine_duration_secs();
+
+        let (verdict, records) = capture_repo_cutoff(repo, secs, now);
+
+        assert_eq!(
+            verdict,
+            Some(now - chrono::Duration::seconds(secs)),
+            "a computable duration must still produce exactly `now - duration`"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|(level, _)| *level == tracing::Level::ERROR),
+            "a computable duration must not log at error level; got {records:?}"
+        );
+    }
+
+    /// A zero-length window — the permissive-mode policy — resolves to
+    /// `now` and is not a skip. Pinned here because the skip branch
+    /// sits on the same arithmetic, and collapsing the two would strand
+    /// every artifact in a permissive repository.
+    #[test]
+    fn repo_cutoff_treats_a_zero_window_as_now() {
+        let (verdict, records) = capture_repo_cutoff(Uuid::from_u128(0x0b), 0, Utc::now());
+        assert!(verdict.is_some(), "a zero window is a window, not a skip");
+        assert!(!records
+            .iter()
+            .any(|(level, _)| *level == tracing::Level::ERROR));
+    }
+
+    /// A stored duration past `TimeDelta`'s own limit is skipped, not
+    /// panicked on, and the log names the repository and the value.
+    #[test]
+    fn repo_cutoff_skips_and_names_a_duration_past_the_timedelta_limit() {
+        let repo = Uuid::from_u128(0x0c);
+        let secs = i64::MAX;
+        assert!(
+            chrono::TimeDelta::try_seconds(secs).is_none(),
+            "fixture precondition: this value must be the TimeDelta-limit case"
+        );
+
+        let (verdict, records) = capture_repo_cutoff(repo, secs, Utc::now());
+
+        assert_eq!(verdict, None, "an unrepresentable duration must be skipped");
+        let errors: Vec<_> = records
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::ERROR)
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly one error record; got {records:?}");
+        let rendered = &errors[0].1;
+        assert!(
+            rendered.contains(&repo.to_string()),
+            "the log must name the repository id so the skip is attributable; got {rendered}"
+        );
+        assert!(
+            rendered.contains(&secs.to_string()),
+            "the log must name the value that cannot be computed with; got {rendered}"
+        );
+        assert!(
+            rendered.contains("skipping"),
+            "the log must say the repository was skipped — 'no releases here' must not read \
+             as calm; got {rendered}"
+        );
+    }
+
+    /// The second half of the guard, and the reason the verdict is
+    /// `checked_sub_signed` rather than `try_seconds` alone: a duration
+    /// `TimeDelta` holds perfectly well can still have no `DateTime`
+    /// behind it, because the representable calendar range runs out
+    /// roughly three orders of magnitude earlier. This value is inside
+    /// the apply-time bound, so it is a duration an operator could set
+    /// today and have accepted.
+    #[test]
+    fn repo_cutoff_skips_a_duration_with_no_representable_instant() {
+        let repo = Uuid::from_u128(0x0d);
+        // ~31.7 million years: a valid `TimeDelta`, and far outside the
+        // `DateTime<Utc>` calendar range.
+        let secs: i64 = 1_000_000_000_000_000;
+        assert!(
+            chrono::TimeDelta::try_seconds(secs).is_some(),
+            "fixture precondition: this value must be a valid TimeDelta, so the test is \
+             exercising the instant-range failure and not the TimeDelta one"
+        );
+        assert!(
+            u64::try_from(secs).expect("non-negative")
+                <= hort_config_max_policy_duration_secs_for_test(),
+            "fixture precondition: this value is accepted by the apply-time bound, so the \
+             skip is not redundant with it"
+        );
+
+        let (verdict, records) = capture_repo_cutoff(repo, secs, Utc::now());
+
+        assert_eq!(verdict, None, "no instant ⇒ no cutoff ⇒ skip");
+        let errors: Vec<_> = records
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::ERROR)
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly one error record; got {records:?}");
+        assert!(errors[0].1.contains(&repo.to_string()));
+        assert!(errors[0].1.contains(&secs.to_string()));
+    }
+
+    /// `hort-config` is not a dependency of this crate (the adapter
+    /// layer does not parse gitops YAML), so the apply-time bound is
+    /// restated here for the one fixture precondition that needs it.
+    /// `chrono::TimeDelta::MAX.num_seconds()` is the same derivation
+    /// `hort_config::scan_policy::MAX_POLICY_DURATION_SECS` uses, so
+    /// the two cannot disagree.
+    fn hort_config_max_policy_duration_secs_for_test() -> u64 {
+        chrono::TimeDelta::MAX.num_seconds() as u64
     }
 }

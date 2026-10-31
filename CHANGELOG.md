@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `ScanPolicy.quarantineDuration` the deadline arithmetic cannot represent is
+  refused at apply, naming the value and the bound, instead of crashing the
+  apply or the release sweep once stored (#389).
+- The release sweep now skips such a repository, naming it and the value at
+  `ERROR`, rather than stopping every release in the deployment (#389).
 - A scan job that failed transiently no longer reads back as `completed`, so an
   artifact whose scan could not run is no longer held forever without a
   verdict (#388).
