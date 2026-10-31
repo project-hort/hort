@@ -8,9 +8,9 @@ type: application
 # `GRANT … ON ALL TABLES … TO hort_app_role` cannot leave `events` in a
 # state the runtime probe refuses to boot against, nor leave the runtime
 # role able to rewrite `_sqlx_migrations` or `schema_compat_register`.
-version: 0.17.0-alpha.3
+version: 0.17.0-beta.1
 # Application (binary) version. Chart and binary are versioned together.
-appVersion: "0.17.0-alpha.3"
+appVersion: "0.17.0-beta.1"
 # Kubernetes 1.27 introduces the security primitives the chart relies on
 # (RuntimeDefault seccomp, restricted PSS as a hard baseline, native
 # `topologySpreadConstraints` v1).
