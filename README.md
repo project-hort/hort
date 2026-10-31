@@ -55,6 +55,11 @@ for what's tagged today.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/project-hort/hort/ci.yml?branch=develop&label=CI)](https://github.com/project-hort/hort/actions/workflows/ci.yml)
 [![E2E](https://img.shields.io/github/actions/workflow/status/project-hort/hort/e2e.yml?branch=develop&label=E2E)](https://github.com/project-hort/hort/actions/workflows/e2e.yml)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=project-hort_hort&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=project-hort_hort)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=project-hort_hort&metric=coverage)](https://sonarcloud.io/summary/new_code?id=project-hort_hort)
+[![Security](https://sonarcloud.io/api/project_badges/measure?project=project-hort_hort&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=project-hort_hort)
+[![Reliability](https://sonarcloud.io/api/project_badges/measure?project=project-hort_hort&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=project-hort_hort)
+[![Maintainability](https://sonarcloud.io/api/project_badges/measure?project=project-hort_hort&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=project-hort_hort)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Latest release](https://img.shields.io/github/v/release/project-hort/hort?include_prereleases&sort=semver)](https://github.com/project-hort/hort/releases)
 
