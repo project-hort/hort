@@ -1827,9 +1827,11 @@ scheduledTasks:
   #
   # Retains, per kind, the newest `completed` row AND the newest terminal
   # row: the boot-time liveness gauges (`hort_staging_sweep_overdue`,
-  # `hort_event_chain_verify_overdue`) read the newest `completed` row of
-  # their kind, so a horizon that collected it would report "never ran"
-  # for a task that demonstrably ran.
+  # `hort_event_chain_verify_overdue`, `hort_rescan_drive_undriven`) read
+  # the newest `completed` row of their kind, so a horizon that collected
+  # it would report "never ran" for a task that demonstrably ran. The
+  # keep-newest clause groups by kind, so a future gauge over a new kind
+  # is covered without an entry here.
   #
   # The two kind-specific sweeps' kinds are excluded so exactly one sweep
   # owns each kind — a kind covered twice would age out on whichever of
@@ -1934,6 +1936,39 @@ scheduledTasks:
   # Cron-driven rescan: insert kind='scan' jobs for artifacts past their
   # ScanPolicy.rescanIntervalHours. Default 5-minute cadence. Each tick
   # is single-active (concurrencyPolicy: Forbid + worker semaphore).
+  #
+  # THIS TICK IS THE DRIVER FOR TWO SEPARATE THINGS, AND BOTH ARE INERT
+  # WHILE IT IS OFF. `enabled: false` is the deliberate default — the
+  # tick is opt-in, not an oversight — but choosing it costs both of
+  # these, so it is worth knowing which:
+  #
+  #   1. `ScanPolicy.rescanIntervalHours` (default 24). The field is
+  #      stored and enforced correctly, but the only query that reads it
+  #      runs inside this tick. Without the tick an operator's declared
+  #      cadence decides nothing: an advisory published after an
+  #      artifact's one-and-only ingest scan is never matched against
+  #      it. What the interval buys when the tick IS scheduled is
+  #      narrower than "everything gets rescanned" — the selector takes
+  #      artifacts whose quarantine status is `released` or NULL, so a
+  #      `rejected` or `scan_indeterminate` artifact is terminal and
+  #      never re-scanned on any interval (ADR 0007).
+  #   2. Stranded-artifact recovery. An artifact whose scan job failed
+  #      outright stays `quarantined` with no release authority, and
+  #      this same tick is the only production caller of the query that
+  #      re-picks it. Without the tick a scanner outage strands every
+  #      artifact ingested during it until someone intervenes — see
+  #      docs/architecture/how-to/recover-stranded-artifacts.md.
+  #
+  # Running without the tick is supported. `hort-server` says so once
+  # per boot — a `warn!` plus the `hort_rescan_drive_undriven` gauge —
+  # whenever an active ScanPolicy declares a non-zero
+  # rescanIntervalHours and no tick has completed in the window, so the
+  # gap is discoverable rather than silent.
+  #
+  # To drain once without scheduling anything (e.g. after a scanner
+  # outage), invoke the task by hand instead of flipping this value:
+  #   POST /api/v1/admin/tasks/cron-rescan-tick
+  #   hort-cli admin task invoke cron-rescan-tick
   cronRescanTick:
     executionPath: admin-task
     enabled: false

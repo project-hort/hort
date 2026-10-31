@@ -926,8 +926,9 @@ mod tests {
 
     #[test]
     fn parse_omitted_rescan_interval_hours_defaults_to_24() {
-        // Out-of-the-box deployments rescan every 24 hours. The
-        // default matches `DefaultPolicy::rescan_interval_hours`.
+        // An omitted field means the 24 h cadence a scheduled
+        // `cron-rescan-tick` rescans at. The default matches
+        // `DefaultPolicy::rescan_interval_hours`.
         let body = "
   scope: global
   severityThreshold: high

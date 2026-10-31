@@ -72,17 +72,21 @@
 //! rows, so the row buys this path nothing.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use hort_domain::entities::artifact::Artifact;
 use hort_domain::error::DomainError;
 use hort_domain::oci::{ImageBudget, ImageDescriptorSlot, ManifestNomination};
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping;
 use hort_domain::ports::scanner::ComposedImage;
 use hort_domain::ports::storage::StoragePort;
-use hort_domain::ports::upstream_proxy::UpstreamProxy;
+use hort_domain::ports::upstream_proxy::{BlobStream, UpstreamProxy};
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::types::ContentHash;
 use tokio::io::AsyncReadExt;
@@ -164,6 +168,117 @@ enum FetchFault {
     Deterministic(String),
     /// Re-asking may get a different one.
     Transient(String),
+}
+
+/// What one body transfer did before it stopped.
+///
+/// These four numbers together are what separate the candidate causes of
+/// a broken transfer, and no one of them does it alone: a read that stops
+/// short of a declared length is a **short body**; one that stops at no
+/// particular offset after a near-constant interval is a **transfer
+/// timeout**; one that never starts is neither. The status is here
+/// because an intermediary can substitute a success other than `200` and
+/// the body that follows is then a different document.
+///
+/// Rendered once, by [`fmt::Display`], so the error text and the `warn!`
+/// cannot drift into describing the same failure two ways.
+struct TransferFacts {
+    /// The success status the body arrived under.
+    status: u16,
+    /// The upstream's own `Content-Length`, when it declared one. `None`
+    /// is a fact rather than a gap: a chunked response declared no length
+    /// to fall short of.
+    declared_length: Option<u64>,
+    /// Bytes the upstream actually delivered before the read stopped,
+    /// counted by [`BodyProbe`] at the source rather than re-derived from
+    /// anything downstream.
+    bytes_read: u64,
+    /// Wall-clock since this attempt asked for the blob — so it covers
+    /// the request round-trip as well as the body, which is the interval
+    /// an upstream or CDN response timeout is set against.
+    elapsed: Duration,
+}
+
+impl fmt::Display for TransferFacts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HTTP {}, ", self.status)?;
+        match self.declared_length {
+            Some(declared) => write!(f, "{} of a declared {declared} bytes read", self.bytes_read)?,
+            None => write!(
+                f,
+                "{} bytes read, no Content-Length declared",
+                self.bytes_read
+            )?,
+        }
+        write!(f, ", {:.3}s elapsed", self.elapsed.as_secs_f64())
+    }
+}
+
+/// Counts the upstream body as it streams, and keeps the stream's **own**
+/// error if it has one.
+///
+/// It exists because `StoragePort::put` returns one error type for two
+/// different faults and cannot tell them apart: the port is handed a
+/// reader, so a failure to *read* that reader — the upstream body ending
+/// early — reaches the adapter as an input-read error and is reported in
+/// the store's own words. Reading the fault off the rendered message
+/// would make the distinction a property of two adapters' strings; this
+/// reads it off the stream itself, which is where the fact is.
+///
+/// The count is taken at the source for the same reason: only the reader
+/// knows how far the transfer got, and nothing downstream of it — not
+/// `PutResult`, which does not exist on the failure path, and not the
+/// declared length, which is exactly the number in question — can
+/// reconstruct it.
+///
+/// Shared through `Arc` because the wrapped stream is moved into `put`
+/// and dropped there; by the time `put` returns, both cells are final.
+struct BodyProbe {
+    /// Bytes the upstream stream yielded.
+    counted: Arc<AtomicU64>,
+    /// The first error the upstream stream yielded, rendered. Set once:
+    /// a stream that errors again after erroring has nothing to add to a
+    /// transfer that already stopped.
+    upstream_error: Arc<OnceLock<String>>,
+}
+
+impl BodyProbe {
+    fn new() -> Self {
+        Self {
+            counted: Arc::new(AtomicU64::new(0)),
+            upstream_error: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Wrap the upstream body so every chunk is counted and a stream
+    /// error is kept. The bytes themselves are passed through untouched —
+    /// CAS hashes what streams, so a probe that altered the stream would
+    /// change the digest it is diagnosing.
+    fn wrap(&self, stream: BlobStream) -> impl Stream<Item = std::io::Result<Bytes>> + Send {
+        let counted = Arc::clone(&self.counted);
+        let upstream_error = Arc::clone(&self.upstream_error);
+        stream.map(move |item| match item {
+            Ok(chunk) => {
+                counted.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                Ok(chunk)
+            }
+            Err(e) => {
+                let _ = upstream_error.set(e.to_string());
+                Err(e)
+            }
+        })
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.counted.load(Ordering::Relaxed)
+    }
+
+    /// The upstream's own read error, when the body is what failed.
+    /// `None` means the stream never errored, so a `put` that failed
+    /// failed on the store's side.
+    fn upstream_read_error(&self) -> Option<&str> {
+        self.upstream_error.get().map(String::as_str)
+    }
 }
 
 /// The composition phase's **one clock**.
@@ -327,10 +442,18 @@ impl<'a> ConstituentAcquisition<'a> {
                 // Not retried, at either level: re-asking gets the same
                 // answer, and a retry here would only delay saying so.
                 Err(FetchFault::Deterministic(why)) => return Err(FetchFault::Deterministic(why)),
+                // The budget names itself. There are two of them and they
+                // are nested — this one, and the scan job's own, which
+                // the caller's frame reports as "scan attempt N of M" —
+                // so a count stated bare reads as a contradiction of that
+                // frame rather than as the inner half of it. The subject
+                // is not repeated here: every `why` a transient arm
+                // produces already opens with the slot and the digest.
                 Err(FetchFault::Transient(why)) if attempt >= MAX_ATTEMPTS_PER_CONSTITUENT => {
                     return Err(FetchFault::Transient(format!(
-                        "{slot} (sha256:{hash}) could not be acquired in \
-                         {MAX_ATTEMPTS_PER_CONSTITUENT} attempts: {why}"
+                        "{MAX_ATTEMPTS_PER_CONSTITUENT} attempts at this constituent — the \
+                         inner budget, nested inside the scan job's own attempt budget — did \
+                         not acquire it: {why}"
                     )))
                 }
                 Err(FetchFault::Transient(why)) => tracing::debug!(
@@ -338,7 +461,7 @@ impl<'a> ConstituentAcquisition<'a> {
                     upstream_name,
                     constituent = %slot,
                     attempt,
-                    max_attempts = MAX_ATTEMPTS_PER_CONSTITUENT,
+                    max_attempts_per_constituent = MAX_ATTEMPTS_PER_CONSTITUENT,
                     reason = %why,
                     "constituent acquisition: transient upstream failure; retrying",
                 ),
@@ -348,6 +471,17 @@ impl<'a> ConstituentAcquisition<'a> {
 
     /// One upstream fetch, streamed into CAS and verified against the
     /// digest the manifest declared.
+    ///
+    /// **One `put` call, two faults.** The port takes a reader, so the
+    /// upstream body's own failure arrives as an input-read error inside
+    /// `put` and comes back worded by the store — which is how a layer
+    /// whose body ended early came to be reported as a storage write
+    /// failure, sending an operator to disk and node pressure for a fault
+    /// on the other side of the transfer. The two are told apart by
+    /// [`BodyProbe`], off the stream rather than off the message, because
+    /// the same arm genuinely does receive filesystem create/write/sync
+    /// and object-store multipart failures and those must keep reading as
+    /// storage faults.
     async fn fetch_attempt(
         &self,
         mapping: &RepositoryUpstreamMapping,
@@ -356,6 +490,11 @@ impl<'a> ConstituentAcquisition<'a> {
         hash: &ContentHash,
         remaining: u64,
     ) -> Result<u64, FetchFault> {
+        // From the request, not from the first byte of the body: the
+        // interval an upstream or CDN response timeout is set against
+        // starts here, and a transfer that broke at a near-constant
+        // elapsed is the signature that identifies one.
+        let started = Instant::now();
         let fetch = self
             .upstream_proxy
             .fetch_blob(
@@ -365,6 +504,7 @@ impl<'a> ConstituentAcquisition<'a> {
             )
             .await
             .map_err(|e| classify_upstream_failure(&e, slot, hash))?;
+        let (status, declared_length) = (fetch.status, fetch.content_length);
 
         // One byte past the remaining budget, so "exactly at the ceiling"
         // and "over it" are distinguishable: a blob that fits lands whole,
@@ -372,18 +512,49 @@ impl<'a> ConstituentAcquisition<'a> {
         // than arriving as a silently truncated body whose digest happens
         // not to match. (The same `+ 1` idiom the bounded event-stream
         // read uses, for the same reason.)
-        let reader = StreamReader::new(fetch.stream).take(remaining.saturating_add(1));
-        let put = self
-            .storage
-            .put(Box::new(reader))
-            .await
-            // CAS could not take the bytes: the object store or the disk,
-            // not the image. Re-running may well succeed.
-            .map_err(|e| {
-                FetchFault::Transient(format!(
-                    "{slot} (sha256:{hash}) was fetched but could not be written to storage: {e}"
-                ))
-            })?;
+        let probe = BodyProbe::new();
+        let reader = StreamReader::new(probe.wrap(fetch.stream)).take(remaining.saturating_add(1));
+        let put = match self.storage.put(Box::new(reader)).await {
+            Ok(put) => put,
+            Err(e) => {
+                let facts = TransferFacts {
+                    status,
+                    declared_length,
+                    bytes_read: probe.bytes_read(),
+                    elapsed: started.elapsed(),
+                };
+                return Err(match probe.upstream_read_error() {
+                    // The body is what failed. Transient for the same
+                    // reason every availability condition is: nothing
+                    // about the image changed.
+                    Some(upstream) => {
+                        tracing::warn!(
+                            artifact_id = %self.artifact.id,
+                            upstream_name,
+                            constituent = %slot,
+                            digest = %hash,
+                            http_status = status,
+                            declared_content_length = ?declared_length,
+                            bytes_read = facts.bytes_read,
+                            elapsed_ms = facts.elapsed.as_millis() as u64,
+                            error = %upstream,
+                            "constituent acquisition: the upstream body read failed before the \
+                             blob was complete; nothing failed on the storage side",
+                        );
+                        FetchFault::Transient(format!(
+                            "{slot} (sha256:{hash}) could not be fetched: the upstream body \
+                             read failed ({facts}): {upstream}"
+                        ))
+                    }
+                    // CAS could not take the bytes: the object store or
+                    // the disk, not the image and not the upstream.
+                    // Re-running may well succeed.
+                    None => FetchFault::Transient(format!(
+                        "{slot} (sha256:{hash}) could not be written to storage ({facts}): {e}"
+                    )),
+                });
+            }
+        };
 
         if put.size_bytes > remaining {
             return Err(FetchFault::Deterministic(format!(
@@ -681,6 +852,7 @@ fn classify_upstream_failure(
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use chrono::Utc;
@@ -816,20 +988,54 @@ mod tests {
         );
     }
 
-    /// An upstream whose every blob fetch takes `delay` and then answers
-    /// from `inner`.
+    /// An upstream that answers from `inner` after `delay`, optionally
+    /// cutting the body it answers with short.
     ///
-    /// A wrapper rather than a fourth hand-rolled `UpstreamProxy` so that
-    /// what the slow upstream *serves* is the same seeded fixture every
-    /// other test uses — which is what lets one double drive both "a
-    /// stalled upstream trips the clock" and "two phases that each fit the
-    /// clock do not fit it together".
-    struct SlowProxy {
+    /// A wrapper rather than a hand-rolled `UpstreamProxy` so that what
+    /// it *serves* is the same seeded fixture every other test uses —
+    /// which is what lets one double drive "a stalled upstream trips the
+    /// clock", "two phases that each fit the clock do not fit it
+    /// together" and "a body that ended early". The two perturbations sit
+    /// on one double because they **compose**: a transfer that was slow
+    /// and then broke is the shape the reported production failure had,
+    /// and asserting the elapsed figure needs the delay while asserting
+    /// the byte figure needs the truncation.
+    struct PerturbingProxy {
         inner: Arc<MockUpstreamProxy>,
         delay: Duration,
+        /// Digest → the body prefix delivered before the stream errors,
+        /// and the `Content-Length` the response declares. The pair is
+        /// stated rather than derived so one fixture says both how far
+        /// the transfer got and what it had promised — which is the
+        /// disagreement the diagnostic exists to surface.
+        truncate: HashMap<String, (Vec<u8>, Option<u64>)>,
     }
 
-    impl UpstreamProxy for SlowProxy {
+    impl PerturbingProxy {
+        fn slow(inner: Arc<MockUpstreamProxy>, delay: Duration) -> Self {
+            Self {
+                inner,
+                delay,
+                truncate: HashMap::new(),
+            }
+        }
+
+        fn truncating(
+            inner: Arc<MockUpstreamProxy>,
+            digest: &str,
+            prefix: Vec<u8>,
+            declared: Option<u64>,
+            delay: Duration,
+        ) -> Self {
+            Self {
+                inner,
+                delay,
+                truncate: HashMap::from([(digest.to_string(), (prefix, declared))]),
+            }
+        }
+    }
+
+    impl UpstreamProxy for PerturbingProxy {
         fn fetch_blob(
             &self,
             mapping: RepositoryUpstreamMapping,
@@ -840,11 +1046,32 @@ mod tests {
             // records a fetch when it is *asked for* rather than when it
             // answers — which is what lets a test see a fetch the wall
             // clock then cut off mid-flight.
-            let fetch = self.inner.fetch_blob(mapping, upstream_name, digest);
+            let fetch = self
+                .inner
+                .fetch_blob(mapping, upstream_name, digest.clone());
             let delay = self.delay;
+            let truncate = self.truncate.get(&digest).cloned();
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
-                fetch.await
+                let answered = fetch.await?;
+                let Some((prefix, declared)) = truncate else {
+                    return Ok(answered);
+                };
+                // The error text is the production one verbatim: the
+                // adapter wraps `reqwest`'s body-decode failure as
+                // `upstream stream error`, and a fixture that invented its
+                // own wording would stop proving what an operator reads.
+                let chunks: Vec<std::io::Result<Bytes>> = vec![
+                    Ok(Bytes::from(prefix)),
+                    Err(std::io::Error::other(
+                        "upstream stream error: error decoding response body",
+                    )),
+                ];
+                Ok(BlobFetch {
+                    stream: Box::pin(futures::stream::iter(chunks)),
+                    content_length: declared,
+                    ..answered
+                })
             })
         }
         fn fetch_manifest(
@@ -1582,6 +1809,223 @@ mod tests {
             panic!("a CAS write failure is retryable; got {outcome:?}");
         };
         assert!(why.contains("could not be written to storage"), "{why}");
+        assert!(
+            !why.contains("could not be fetched"),
+            "a store that is down is not the upstream's fault: {why}"
+        );
+    }
+
+    /// **The fault the arm used to misname.** One `put` call receives two
+    /// different failures — the upstream body ending early, and the store
+    /// refusing the bytes — and the first of them reached an operator in
+    /// the store's words, which cost a measured elimination pass over
+    /// memory, disk and node pressure for a fault on the other side of
+    /// the transfer.
+    ///
+    /// What the message has to carry is the three numbers that separate
+    /// the candidate causes — status, the length the upstream declared,
+    /// and how far the transfer actually got — plus the elapsed, and the
+    /// byte figure is asserted at **two** offsets so it is the count the
+    /// transfer reached rather than a constant the format produced.
+    ///
+    /// Virtual time, so the elapsed figure is exact: 7 s of delay before
+    /// a body that then breaks also pins where the clock starts — at the
+    /// request, not at the first byte, which is the interval an upstream
+    /// or CDN response timeout is set against.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_ends_early_names_the_fetch_and_carries_the_transfer_facts() {
+        let config_bytes = b"{config}".as_slice();
+        let config = sha256_of(config_bytes);
+        let layer_bytes = vec![b'L'; 1024];
+        let layer = sha256_of(&layer_bytes);
+
+        for (stopped_at, declared, expected) in [
+            (
+                0usize,
+                Some(1024u64),
+                "HTTP 200, 0 of a declared 1024 bytes read, 7.000s elapsed",
+            ),
+            (
+                240,
+                Some(1024),
+                "HTTP 200, 240 of a declared 1024 bytes read, 7.000s elapsed",
+            ),
+            // A chunked response declared no length to fall short of,
+            // which is itself what the reader needs to know — so it is
+            // stated rather than rendered as a zero an operator would
+            // read as "the upstream promised nothing".
+            (
+                240,
+                None,
+                "HTTP 200, 240 bytes read, no Content-Length declared, 7.000s elapsed",
+            ),
+        ] {
+            let storage = MockStoragePort::new();
+            storage.insert_content(config.clone(), config_bytes.to_vec());
+            let storage: Arc<dyn StoragePort> = Arc::new(storage);
+            let inner = Arc::new(MockUpstreamProxy::new());
+            seed_blob(&inner, &layer, &layer_bytes);
+            let proxy: Arc<dyn UpstreamProxy> = Arc::new(PerturbingProxy::truncating(
+                inner.clone(),
+                &format!("sha256:{layer}"),
+                layer_bytes[..stopped_at].to_vec(),
+                declared,
+                Duration::from_secs(7),
+            ));
+            let artifact = manifest_artifact(Uuid::new_v4());
+
+            let (outcome, stats) = run(
+                &storage,
+                &proxy,
+                &proxy_resolver(artifact.repository_id),
+                &artifact,
+                ImageBudget::default_for_composite_scan(),
+                &composition(&config, &[&layer]),
+            )
+            .await;
+
+            let Acquisition::Transient(why) = outcome else {
+                panic!("a body that ended early is retryable; got {outcome:?}");
+            };
+            assert!(
+                why.contains(&format!("layers[0] (sha256:{layer}) could not be fetched")),
+                "the subject is the fetch: {why}"
+            );
+            assert!(
+                why.contains("the upstream body read failed"),
+                "and names the body read: {why}"
+            );
+            assert!(
+                !why.contains("could not be written to storage"),
+                "nothing failed on the storage side: {why}"
+            );
+            assert!(
+                why.contains(expected),
+                "the three numbers plus the elapsed, at offset {stopped_at} \
+                 with declared {declared:?}: {why}"
+            );
+            assert!(
+                why.contains("upstream stream error: error decoding response body"),
+                "the upstream's own error survives, un-prefixed by the store: {why}"
+            );
+            assert_eq!(
+                inner.blob_fetches().len(),
+                2,
+                "a broken body is transient, so the per-constituent budget is spent: {why}"
+            );
+            assert_eq!(stats.fetched, 0, "nothing landed");
+        }
+    }
+
+    /// **Three faults, three sentences.** A storage write that failed, an
+    /// upstream body that ended early and a span that ran out are the
+    /// three conditions an operator reads out of this path, and they call
+    /// for opposite responses: look at the store, look at the upstream,
+    /// raise throughput. The first two arrive through the *same* `put`
+    /// call and the third through the phase's deadline, so the only thing
+    /// separating them for a reader is the text.
+    ///
+    /// Asserted as mutual exclusion rather than three independent
+    /// `contains` — a subject that leaked into a second fault's message
+    /// would pass three positive assertions and still leave the pair
+    /// indistinguishable, which is the defect this unit is closing.
+    #[tokio::test]
+    async fn the_three_faults_this_path_reports_are_mutually_distinguishable() {
+        /// One marker per fault, in the order the faults are driven below.
+        const SUBJECTS: [&str; 3] = [
+            "could not be fetched: the upstream body read failed",
+            "could not be written to storage",
+            "wall-clock budget",
+        ];
+
+        let config_bytes = b"{config}".as_slice();
+        let config = sha256_of(config_bytes);
+        let layer_bytes = b"lower layer".as_slice();
+        let layer = sha256_of(layer_bytes);
+        let artifact = manifest_artifact(Uuid::new_v4());
+        let resolver = proxy_resolver(artifact.repository_id);
+        let composition = composition(&config, &[&layer]);
+
+        let seeded_storage = || {
+            let storage = MockStoragePort::new();
+            storage.insert_content(config.clone(), config_bytes.to_vec());
+            storage
+        };
+        let seeded_proxy = || {
+            let inner = Arc::new(MockUpstreamProxy::new());
+            seed_blob(&inner, &layer, layer_bytes);
+            inner
+        };
+
+        // 1. The upstream body ends early.
+        let inner = seeded_proxy();
+        let broken: Arc<dyn UpstreamProxy> = Arc::new(PerturbingProxy::truncating(
+            inner,
+            &format!("sha256:{layer}"),
+            layer_bytes[..4].to_vec(),
+            Some(layer_bytes.len() as u64),
+            Duration::ZERO,
+        ));
+        // 2. The store refuses the bytes. Persistent, so the inner budget
+        //    does not absorb it.
+        let refusing = seeded_storage();
+        refusing.fail_put_persistent(DomainError::Invariant(
+            "object store unavailable".to_string(),
+        ));
+        // 3. The span runs out, with nothing wrong on either side.
+        let stalled: Arc<dyn UpstreamProxy> = Arc::new(PerturbingProxy::slow(
+            seeded_proxy(),
+            Duration::from_secs(30),
+        ));
+
+        let healthy_storage: Arc<dyn StoragePort> = Arc::new(seeded_storage());
+        let refusing_storage: Arc<dyn StoragePort> = Arc::new(refusing);
+        let healthy_proxy: Arc<dyn UpstreamProxy> = seeded_proxy();
+        let mut whys: Vec<String> = Vec::new();
+        for (storage, proxy, budget) in [
+            (
+                &healthy_storage,
+                &broken,
+                ImageBudget::default_for_composite_scan(),
+            ),
+            (
+                &refusing_storage,
+                &healthy_proxy,
+                ImageBudget::default_for_composite_scan(),
+            ),
+            (
+                &healthy_storage,
+                &stalled,
+                ImageBudget {
+                    max_duration: Duration::from_millis(20),
+                    ..ImageBudget::default_for_composite_scan()
+                },
+            ),
+        ] {
+            let (outcome, _) =
+                run(storage, proxy, &resolver, &artifact, budget, &composition).await;
+            let Acquisition::Transient(why) = outcome else {
+                panic!("all three are availability conditions; got {outcome:?}");
+            };
+            whys.push(why);
+        }
+
+        for (fault, why) in whys.iter().enumerate() {
+            for (candidate, subject) in SUBJECTS.iter().enumerate() {
+                assert_eq!(
+                    why.contains(subject),
+                    fault == candidate,
+                    "fault {fault} must carry only its own subject, not {subject:?}: {why}"
+                );
+            }
+        }
+        assert!(
+            whys[1].contains("11 of a declared 11 bytes read"),
+            "a store that refused the bytes still says how far the transfer got — the mock \
+             drains the body before failing, exactly as the production adapters stream then \
+             fail: {}",
+            whys[1]
+        );
     }
 
     // -- the bounds -------------------------------------------------------
@@ -1807,10 +2251,10 @@ mod tests {
         let storage: Arc<dyn StoragePort> = Arc::new(storage);
         // Nothing seeded on the inner proxy: the sleep outlives the budget,
         // so what it would have answered never matters.
-        let proxy: Arc<dyn UpstreamProxy> = Arc::new(SlowProxy {
-            inner: Arc::new(MockUpstreamProxy::new()),
-            delay: Duration::from_secs(30),
-        });
+        let proxy: Arc<dyn UpstreamProxy> = Arc::new(PerturbingProxy::slow(
+            Arc::new(MockUpstreamProxy::new()),
+            Duration::from_secs(30),
+        ));
         let artifact = manifest_artifact(Uuid::new_v4());
 
         let (outcome, _) = run(
@@ -1850,10 +2294,10 @@ mod tests {
         let inner = Arc::new(MockUpstreamProxy::new());
         seed_blob(&inner, &config, &config_bytes);
         seed_blob(&inner, &layer, layer_bytes);
-        let proxy: Arc<dyn UpstreamProxy> = Arc::new(SlowProxy {
-            inner: inner.clone(),
-            delay: Duration::from_millis(60),
-        });
+        let proxy: Arc<dyn UpstreamProxy> = Arc::new(PerturbingProxy::slow(
+            inner.clone(),
+            Duration::from_millis(60),
+        ));
         let artifact = manifest_artifact(Uuid::new_v4());
         let resolver = proxy_resolver(artifact.repository_id);
         let composition = composition(&config, &[&layer]);
@@ -1942,7 +2386,14 @@ mod tests {
         let Acquisition::Transient(why) = outcome else {
             panic!("expected a transient refusal, got {outcome:?}");
         };
-        assert!(why.contains("in 2 attempts"), "{why}");
+        assert!(
+            why.contains("2 attempts at this constituent"),
+            "the inner budget says it is the per-constituent one: {why}"
+        );
+        assert!(
+            why.contains("the scan job's own attempt budget"),
+            "and names the outer budget it is nested inside: {why}"
+        );
         assert_eq!(
             mock_proxy.blob_fetches(),
             vec![format!("sha256:{first}"), format!("sha256:{first}")],
@@ -2004,7 +2455,10 @@ mod tests {
             let Acquisition::Transient(why) = outcome else {
                 panic!("{failing_slot}: a reset connection is retryable; got {outcome:?}");
             };
-            assert!(why.contains("in 2 attempts"), "{failing_slot}: {why}");
+            assert!(
+                why.contains("2 attempts at this constituent"),
+                "{failing_slot}: {why}"
+            );
             assert!(why.contains(failing_slot), "{failing_slot}: {why}");
             assert_eq!(
                 mock_proxy.blob_fetches(),

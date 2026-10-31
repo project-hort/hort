@@ -51,11 +51,11 @@ artifact via the existing `ScanSucceeded` authority (or rejects it on
 findings) — this mechanism only gives the scan another chance to
 actually run. It does not release anything on a timer.
 
-## 2. The sweep self-heals — usually no action needed
+## 2. The sweep self-heals — once the tick is scheduled
 
 The `cron-rescan-tick` task (the same k8s CronJob / admin-task that
-drives the routine interval-based rescan, default schedule `*/5 * * *
-*`) also re-picks stranded artifacts every tick, via
+drives the routine interval-based rescan when it is scheduled, default
+schedule `*/5 * * * *`) also re-picks stranded artifacts every tick, via
 `RescanCandidatesRepository::select_stranded`: `quarantine_status='quarantined'`
 artifacts whose last scan errored and have no in-flight `kind='scan'`
 job. Once the scanner is back, the very next tick re-enqueues a fresh
@@ -63,6 +63,26 @@ scan for every stranded artifact — no operator action required. The
 recovered scan releases the artifact normally (`ScanSucceeded`) or
 rejects it on findings; nothing about the release predicate is
 special-cased for a recovered stranded artifact.
+
+**The tick is opt-in, so "no action required" presumes you scheduled
+it.** `scheduledTasks.cronRescanTick.enabled` defaults to `false`, and
+that one task is the only production caller of *both*
+`select_stranded` and the interval-based `select_eligible` — so on a
+deployment without it, nothing in this section happens on its own and
+no metric moves to say so. Two ways out, and they are different
+choices rather than alternatives to the same thing:
+
+- **Schedule it** — `scheduledTasks.cronRescanTick.enabled=true` — and
+  the self-healing above is what you get from then on.
+- **Drain once without scheduling anything** —
+  `POST /api/v1/admin/tasks/cron-rescan-tick` (or
+  `hort-cli admin task invoke cron-rescan-tick`). One tick, one pass
+  over the stranded set; nothing recurs.
+
+`hort-server` logs the gap once per boot and sets
+`hort_rescan_drive_undriven` when an active policy declares a non-zero
+`rescanIntervalHours` and no tick has completed in the window, so an
+undriven deployment is discoverable without reading this guide first.
 
 ### Confirming whether you currently have stranded artifacts
 

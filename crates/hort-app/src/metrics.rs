@@ -2603,16 +2603,23 @@ pub enum ScanJobsResult {
     /// Emitted by `ScanOrchestrationUseCase::claim_pending` per claimed
     /// job — one tick per row returned from `JobsRepository::claim_scan_jobs`.
     PendingClaimed,
-    /// Emitted by `record_outcome` when the job reaches the
-    /// `mark_completed` arm (both `Completed { … }` and
+    /// Emitted by `record_outcome` when the scan recorded a result
+    /// (`ScanRowDisposition::Completed` — both `Completed { … }` and
     /// `SkippedNoBackends` route through this label).
+    ///
+    /// These three labels report what `record_outcome` decided the row
+    /// should become, not a write it performed: the row is written by
+    /// the `TaskDispatcher` from the returned disposition, so the
+    /// scan-specific counter and `hort_admin_tasks_completed_total`
+    /// describe one transition from two layers.
     Completed,
-    /// Emitted by `record_outcome` on the terminal `mark_failed` arm
-    /// (job exhausted `max_attempts`).
+    /// Emitted by `record_outcome` on a terminal disposition
+    /// (`ScanRowDisposition::Failed` — the job exhausted
+    /// `max_attempts`, or had nothing analysable).
     Failed,
-    /// Emitted by `record_outcome` when the job is rescheduled via
-    /// `JobsRepository::reschedule` for a future attempt. Mutually
-    /// exclusive with `Failed` for the same observation.
+    /// Emitted by `record_outcome` when it asks for another attempt
+    /// (`ScanRowDisposition::Retry`). Mutually exclusive with `Failed`
+    /// for the same observation.
     Retried,
 }
 

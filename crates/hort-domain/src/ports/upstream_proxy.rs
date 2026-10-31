@@ -103,10 +103,28 @@ pub struct ArtifactFetch {
 /// → `None`. The publish-anchored quarantine window (OCI config +
 /// layer blobs) consumes this for
 /// `VerifiedIngestRequest.upstream_published_at`.
+///
+/// `status` and `content_length` are the two response facts a consumer
+/// cannot recover once the body starts streaming, and they are what makes
+/// a broken transfer diagnosable: a read that stops short of a declared
+/// length is a short body, and one that stops at no particular offset
+/// after a constant interval is a transfer timeout. Only the adapter sees
+/// them and only the reader knows how far it got, so the adapter carries
+/// them forward rather than logging them where the failure is not yet
+/// known. `content_length` is the literal `Content-Length` header — absent
+/// for a chunked response, which is itself the useful fact that there was
+/// no declared length to fall short of.
 pub struct BlobFetch {
     pub stream: BlobStream,
     pub declared_digest: Option<String>,
     pub last_modified: Option<DateTime<Utc>>,
+    /// The HTTP status the upstream answered the body with. Always a
+    /// success status — a non-2xx is an `Err` and never reaches here — so
+    /// this distinguishes a plain `200` from a `206` or any other 2xx an
+    /// intermediary substituted.
+    pub status: u16,
+    /// The declared `Content-Length`, when the upstream sent one.
+    pub content_length: Option<u64>,
 }
 
 /// A single OCI referrer descriptor (ADR 0027).

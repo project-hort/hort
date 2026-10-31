@@ -19,20 +19,31 @@
 //!    window elapses.
 //!
 //! Cost is bounded by **number of policies**, not number of artifacts:
-//! there are typically a handful of distinct durations,
-//! so the adapter groups repos by their effective duration and issues
-//! one indexed range scan per distinct duration `D`:
+//! there are typically a handful of distinct durations, and the adapter
+//! resolves each quarantined repo's effective duration into a cutoff
+//! instant, then carries the resulting `(repo, cutoff)` pairs into **one**
+//! ordered scan:
 //!
 //! ```text
 //! WHERE quarantine_status = 'quarantined'
-//!   AND repository_id = ANY($repos_for_D)
-//!   AND quarantine_window_start <= $now - D
+//!   AND quarantine_window_start <= cutoff_for(repository_id)
+//! ORDER BY release_attempt_at ASC NULLS FIRST, quarantine_window_start ASC
+//! LIMIT $batch_size
 //! ```
+//!
+//! **One query, one `LIMIT`** — because the batch budget must not be
+//! consumable by one duration group. The earlier shape issued a query per
+//! distinct duration and spent a shared budget across them, so the
+//! (`HashMap`) visit order decided which groups were queried at all; see
+//! Step 2 for the starvation that follows from that and why ordering
+//! *within* a batch is a different question.
 //!
 //! The partial index `idx_artifacts_quarantine_release_cursor ON
 //! (release_attempt_at NULLS FIRST, quarantine_window_start) WHERE
-//! quarantine_status = 'quarantined'` makes the `<= constant` predicate
-//! an indexed scan and satisfies the ordering below without a sort.
+//! quarantine_status = 'quarantined'` satisfies the ordering without a
+//! sort; the exact per-repo deadline test is a join predicate, and the
+//! broadest of the cutoffs rides along as an index-condition pre-filter
+//! (Step 2).
 //!
 //! **Fair candidacy — the attempt cursor.** Rows are ordered
 //! `release_attempt_at ASC NULLS FIRST, quarantine_window_start ASC`, and
@@ -226,16 +237,21 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-            // Group repos by their resolved effective duration. Precedence
-            // is repo-scoped non-archived policy > global non-archived
-            // policy > `DefaultPolicy::quarantine_duration_secs()` — the
-            // same three-tier resolution every other consumer of the
-            // quarantine window uses (`QuarantineUseCase::record_scan_result`,
-            // the scan fast path, `is_window_elapsed`, the read-path
-            // deadline).
+            // Turn each quarantined repo's resolved effective duration into
+            // the cutoff instant its artifacts' windows must have started
+            // at or before, and keep the `(repo, cutoff)` pairs for the
+            // single query below. Precedence is repo-scoped non-archived
+            // policy > global non-archived policy >
+            // `DefaultPolicy::quarantine_duration_secs()` — the same
+            // three-tier resolution every other consumer of the quarantine
+            // window uses (`QuarantineUseCase::record_scan_result`, the
+            // scan fast path, `is_window_elapsed`, the read-path deadline).
+            // It stays here in Rust rather than being re-typed in SQL: this
+            // is the tier chain's only copy that can read the domain's own
+            // default.
             //
-            // Every resolved duration is grouped, none is discarded: this
-            // step selects by DEADLINE only. A permissive window is a
+            // Every resolved duration produces a pair, none is discarded:
+            // this step selects by DEADLINE only. A permissive window is a
             // zero-length window, not an absent one — its cutoff is `now`,
             // which is the same arithmetic
             // `effective_quarantine_deadline(anchor, 0)` gives the scan
@@ -250,7 +266,19 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             // cutoff off the future side of `now`, where a negative
             // duration would otherwise select rows whose window has NOT
             // elapsed.
-            let mut by_duration: HashMap<i64, Vec<Uuid>> = HashMap::new();
+            //
+            // The two arrays are filled in this one loop, so they stay the
+            // same length and every repo keeps its own cutoff. The repo
+            // list arrived `DISTINCT`, which the join below relies on: a
+            // repeated repo would match its artifacts once per copy and
+            // return the same id several times inside one batch, spending
+            // the budget on duplicates.
+            let mut cutoff_repos: Vec<Uuid> = Vec::with_capacity(quarantined_repos.len());
+            let mut cutoffs: Vec<DateTime<Utc>> = Vec::with_capacity(quarantined_repos.len());
+            // The latest of all the cutoffs, tracked here because this loop
+            // already visits every one of them. Step 2 explains what it is
+            // for.
+            let mut broadest_cutoff: Option<DateTime<Utc>> = None;
             for repo in quarantined_repos {
                 let secs = repo_scoped
                     .get(&repo)
@@ -258,26 +286,54 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
                     .or(global_duration)
                     .unwrap_or_else(DefaultPolicy::quarantine_duration_secs)
                     .max(0);
-                by_duration.entry(secs).or_default().push(repo);
+                let cutoff = now - chrono::Duration::seconds(secs);
+                broadest_cutoff = Some(broadest_cutoff.map_or(cutoff, |widest| widest.max(cutoff)));
+                cutoff_repos.push(repo);
+                cutoffs.push(cutoff);
             }
 
             // Reachable only when no repository holds a quarantined
             // artifact at all — the honest meaning of "no candidates".
-            if by_duration.is_empty() {
+            let Some(broadest_cutoff) = broadest_cutoff else {
                 return Ok(Vec::new());
-            }
+            };
 
             // -----------------------------------------------------------------
-            // Step 2 — one indexed scan per distinct duration.
+            // Step 2 — one ordered scan over every expired candidate.
+            //
+            // **The budget must not be consumable by one duration group.**
+            // The per-repo cutoffs ride in as a `(repo, cutoff)` relation
+            // and the `LIMIT` is applied once, over the whole candidate set
+            // in cursor order, so `release_attempt_at` is a single global
+            // rotation.
+            //
+            // The shape this replaced issued one query per distinct
+            // duration and spent a shared budget across them, breaking out
+            // when it ran dry — which made the iteration order decide
+            // which duration groups were queried **at all**. A group
+            // holding a batch-worth of rows the authority or provenance
+            // gate never releases could therefore fill the budget on every
+            // tick while a releasable artifact in another group was never
+            // selected, and the wait had no bound: that order came from a
+            // `HashMap` and so was re-drawn per process rather than
+            // advancing. Ordering *within* a returned batch genuinely is
+            // irrelevant — the handler is loop-driven and per-artifact —
+            // but that is a different question from which rows reach the
+            // batch, and only the first one is the handler's.
             //
             // The partial index
             // `idx_artifacts_quarantine_release_cursor ON
             // (release_attempt_at NULLS FIRST, quarantine_window_start)
-            // WHERE quarantine_status = 'quarantined'` supports this: it
-            // serves the ORDER BY directly (same column order, same
-            // NULLS FIRST) while `quarantine_window_start <= <constant>`
-            // filters inside the index, and `repository_id = ANY(...)`
-            // is applied before the heap fetch.
+            // WHERE quarantine_status = 'quarantined'` serves the ORDER BY
+            // directly (same column order, same NULLS FIRST). The exact
+            // deadline test is per row, against that row's own repo cutoff,
+            // so it cannot be an index condition — `$3`, the latest of all
+            // the cutoffs, restores one that can be. It is a widening of
+            // the exact test and never narrower: a row that qualifies under
+            // its own `now - D_repo` necessarily satisfies
+            // `now - min(D)`, so the pre-filter rejects only rows the join
+            // predicate would reject anyway, inside the index and without a
+            // heap fetch.
             //
             // The ORDER BY is the anti-starvation contract, not a
             // cosmetic: never-attempted rows (NULL cursor) lead, so a
@@ -285,46 +341,34 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             // matter how large the unreleasable backlog ahead of it is;
             // stamped rows rotate behind them in stamp order.
             // -----------------------------------------------------------------
-            let mut candidates: Vec<QuarantineReleaseCandidate> = Vec::new();
-            // Iteration order over a HashMap is non-deterministic, which
-            // is fine — the handler does not rely on candidate ordering
-            // (release_expired is loop-driven and per-artifact).
-            for (duration_secs, repos) in by_duration {
-                let cutoff = now - chrono::Duration::seconds(duration_secs);
-                let remaining = (batch_size as i64).saturating_sub(candidates.len() as i64);
-                if remaining <= 0 {
-                    break;
-                }
-                let rows = sqlx::query(
-                    r#"
-                    SELECT id AS artifact_id
-                    FROM artifacts
-                    WHERE quarantine_status = 'quarantined'
-                      AND repository_id = ANY($1)
-                      AND quarantine_window_start <= $2
-                      AND deleted_at IS NULL
-                    ORDER BY release_attempt_at ASC NULLS FIRST, quarantine_window_start ASC
-                    LIMIT $3
-                    "#,
+            let rows = sqlx::query(
+                r#"
+                WITH deadline(repository_id, cutoff) AS (
+                    SELECT * FROM unnest($1::uuid[], $2::timestamptz[])
                 )
-                .bind(&repos)
-                .bind(cutoff)
-                .bind(remaining)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| {
-                    map_sqlx_error(
-                        &e,
-                        "QuarantineReleaseCandidate",
-                        "select_expired_per_duration",
-                    )
-                })?;
+                SELECT a.id AS artifact_id
+                FROM artifacts a
+                JOIN deadline d ON d.repository_id = a.repository_id
+                WHERE a.quarantine_status = 'quarantined'
+                  AND a.quarantine_window_start <= $3
+                  AND a.quarantine_window_start <= d.cutoff
+                  AND a.deleted_at IS NULL
+                ORDER BY a.release_attempt_at ASC NULLS FIRST, a.quarantine_window_start ASC
+                LIMIT $4
+                "#,
+            )
+            .bind(&cutoff_repos)
+            .bind(&cutoffs)
+            .bind(broadest_cutoff)
+            .bind(i64::from(batch_size))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "QuarantineReleaseCandidate", "select_expired"))?;
 
-                for row in rows {
-                    let artifact_id: Uuid =
-                        row.try_get("artifact_id").map_err(|e| decode_err(&e))?;
-                    candidates.push(QuarantineReleaseCandidate { artifact_id });
-                }
+            let mut candidates: Vec<QuarantineReleaseCandidate> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let artifact_id: Uuid = row.try_get("artifact_id").map_err(|e| decode_err(&e))?;
+                candidates.push(QuarantineReleaseCandidate { artifact_id });
             }
 
             Ok(candidates)
@@ -1038,6 +1082,224 @@ mod tests {
             stuck.iter().all(|id| seen.contains(id)),
             "and the rotation must still re-attempt the whole backlog — fairness is a \
              rotation, not a de-prioritisation",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Fair candidacy — across duration groups
+    // -----------------------------------------------------------------
+
+    /// **Cross-group starvation regression.** Two duration groups: the
+    /// first holds a full batch of rows that never release, the second
+    /// holds one that can. The releasable row is selected on the **first**
+    /// tick, because the batch's single `LIMIT` is applied over both
+    /// groups at once in cursor order.
+    ///
+    /// The assertion is the exact ordering rather than mere membership,
+    /// and that is what makes it a regression test. The shape this
+    /// replaced queried one duration group at a time against a shared
+    /// budget, so it returned either the long group's three rows (budget
+    /// spent, the other group never queried at all) or the short group's
+    /// single row followed by two of the long group's — never the
+    /// window-start-ordered interleaving below, under either visit order.
+    /// And the visit order came from a `HashMap`, so which of those two a
+    /// deployment got was re-drawn per process rather than progressing.
+    ///
+    /// "Never releases" is modelled by what the adapter can see, as in
+    /// `select_expired_does_not_starve_a_newer_candidate_behind_a_full_unreleasable_batch`:
+    /// the rows stay `quarantined` across ticks because no release ever
+    /// happens, which is the signature of a candidate the authority
+    /// (ADR 0007) or provenance (ADR 0027) gate permanently holds. Why
+    /// such a row is held is `release_expired`'s business; this test is
+    /// about the batch slot it occupies.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_reaches_a_second_duration_group_behind_a_full_batch() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        const BATCH: u32 = 3;
+
+        // Group one: a 1 h window.
+        let held_repo = seed_repo(&pool).await;
+        seed_repo_scoped_policy(&pool, held_repo, 3600).await;
+        // Group two: a 60 s window. A distinct duration, so the old shape
+        // put it in a separate `HashMap` bucket.
+        let releasable_repo = seed_repo(&pool).await;
+        seed_repo_scoped_policy(&pool, releasable_repo, 60).await;
+
+        let now = Utc::now();
+        // A full batch in the long-window group, every row well past its
+        // own 1 h deadline, none of which will ever release.
+        let held_oldest =
+            seed_quarantined_artifact(&pool, held_repo, now - chrono::Duration::hours(5)).await;
+        let held_middle =
+            seed_quarantined_artifact(&pool, held_repo, now - chrono::Duration::hours(4)).await;
+        let held_newest =
+            seed_quarantined_artifact(&pool, held_repo, now - chrono::Duration::hours(3)).await;
+        // One row in the short-window group, waiting *between* the first
+        // two: no ordering the per-group budget could produce matches the
+        // global one, in either visit order.
+        let releasable =
+            seed_quarantined_artifact(&pool, releasable_repo, now - chrono::Duration::minutes(270))
+                .await;
+
+        let adapter = PgQuarantineReleaseCandidatesRepository::new(pool.clone());
+
+        // Repeated calls agree: candidacy is a function of the rows, no
+        // longer of a map order a process draws once at startup.
+        for call in 0..4 {
+            let out = adapter
+                .select_expired(BATCH, now)
+                .await
+                .expect("select_expired Ok");
+            assert_eq!(
+                out.iter().map(|c| c.artifact_id).collect::<Vec<_>>(),
+                vec![held_oldest, releasable, held_middle],
+                "call {call}: one LIMIT over both duration groups in cursor order — a \
+                 releasable artifact must not wait on a group whose rows never release",
+            );
+        }
+
+        // Acceptance: the within-group rotation is unchanged. Stamp what
+        // tick one considered and the long group's remaining row, still
+        // never-attempted, leads tick two.
+        adapter
+            .mark_attempted(&[held_oldest, releasable, held_middle], now)
+            .await
+            .expect("mark_attempted Ok");
+        let tick_two = adapter
+            .select_expired(BATCH, now + chrono::Duration::seconds(1))
+            .await
+            .expect("select_expired Ok");
+        assert_eq!(
+            tick_two.first().map(|c| c.artifact_id),
+            Some(held_newest),
+            "the never-attempted remainder leads the next tick — the cursor still \
+             rotates, now across the whole candidate set rather than inside a group",
+        );
+    }
+
+    /// Every row is tested against **its own** repository's cutoff, not
+    /// against some other group's.
+    ///
+    /// Three rows across two durations, chosen so a pairing that drifted —
+    /// the repo array and the cutoff array falling out of step — flips the
+    /// answer in both directions: the 2-minute-old row in the 60 s repo is
+    /// a candidate and would not be under the 1 h cutoff, and the
+    /// 30-minute-old row in the 1 h repo is not and would be under the
+    /// 60 s one.
+    ///
+    /// This also pins the broadest-cutoff pre-filter as a widening and
+    /// nothing more. That predicate admits everything at or before
+    /// `now - 60s`, which includes the 30-minute-old row; the per-row join
+    /// predicate is what rejects it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_tests_each_row_against_its_own_repository_cutoff() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let short_repo = seed_repo(&pool).await;
+        seed_repo_scoped_policy(&pool, short_repo, 60).await;
+        let long_repo = seed_repo(&pool).await;
+        seed_repo_scoped_policy(&pool, long_repo, 3600).await;
+
+        let now = Utc::now();
+        let short_expired =
+            seed_quarantined_artifact(&pool, short_repo, now - chrono::Duration::minutes(2)).await;
+        let long_expired =
+            seed_quarantined_artifact(&pool, long_repo, now - chrono::Duration::hours(2)).await;
+        let long_not_yet =
+            seed_quarantined_artifact(&pool, long_repo, now - chrono::Duration::minutes(30)).await;
+
+        let out = PgQuarantineReleaseCandidatesRepository::new(pool)
+            .select_expired(1000, now)
+            .await
+            .expect("select_expired Ok");
+
+        let ids: Vec<Uuid> = out.iter().map(|c| c.artifact_id).collect();
+        assert_eq!(
+            ids,
+            vec![long_expired, short_expired],
+            "each row's deadline is its own repository's; a cutoff borrowed from \
+             another group either strands a candidate or selects an unelapsed window",
+        );
+        assert!(
+            !ids.contains(&long_not_yet),
+            "a row inside its own window must stay out, however broad another \
+             group's cutoff is",
+        );
+    }
+
+    /// **Counter-assertion — the single-group case is untouched.** With
+    /// one duration there is nothing to be fair across, so the one-query
+    /// form must return exactly what the per-duration form returned: the
+    /// `batch_size` stalest rows in cursor order, with the remainder
+    /// rotating in behind them on the next tick.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_single_duration_group_keeps_its_cursor_order_and_limit() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        const BATCH: u32 = 3;
+
+        // No policy row at all: the default-duration tier, which is the
+        // common deployment shape — every repo on one window.
+        let repo = seed_repo(&pool).await;
+        let now = Utc::now();
+        let window = chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs());
+
+        let mut seeded = Vec::new();
+        for days_past_deadline in [4_i64, 3, 2, 1] {
+            seeded.push(
+                seed_quarantined_artifact(
+                    &pool,
+                    repo,
+                    now - window - chrono::Duration::days(days_past_deadline),
+                )
+                .await,
+            );
+        }
+
+        let adapter = PgQuarantineReleaseCandidatesRepository::new(pool.clone());
+        let tick_one = adapter
+            .select_expired(BATCH, now)
+            .await
+            .expect("select_expired Ok");
+        assert_eq!(
+            tick_one.iter().map(|c| c.artifact_id).collect::<Vec<_>>(),
+            seeded[..3].to_vec(),
+            "one group, one LIMIT: the three stalest rows, oldest window first",
+        );
+
+        adapter
+            .mark_attempted(
+                &tick_one
+                    .iter()
+                    .map(|c| c.artifact_id)
+                    .collect::<Vec<Uuid>>(),
+                now,
+            )
+            .await
+            .expect("mark_attempted Ok");
+
+        let tick_two = adapter
+            .select_expired(BATCH, now + chrono::Duration::seconds(1))
+            .await
+            .expect("select_expired Ok");
+        assert_eq!(
+            tick_two.iter().map(|c| c.artifact_id).collect::<Vec<_>>(),
+            vec![seeded[3], seeded[0], seeded[1]],
+            "the never-attempted row leads, the stamped ones rotate behind it in \
+             stamp order — unchanged by the single-query form",
         );
     }
 }

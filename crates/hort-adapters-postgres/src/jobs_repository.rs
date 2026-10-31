@@ -1921,9 +1921,11 @@ mod tests {
     ///
     /// The sweep is the only code that runs for a row whose handler
     /// never returned, so a cap applied anywhere else (the scan
-    /// orchestrator's `attempts >= max_attempts`, the dispatcher's
-    /// `TaskOutcome::Failed` arms) is unreachable for exactly the rows
-    /// that need it. A repeatedly-crashing task must terminate.
+    /// orchestrator's `attempts >= max_attempts`, which decides the
+    /// artifact's terminal state, or the dispatcher's
+    /// `TaskOutcome::Failed` arms, which decide the row's) is
+    /// unreachable for exactly the rows that need it. A
+    /// repeatedly-crashing task must terminate.
     #[test]
     fn requeue_abandoned_sql_caps_retries_and_leaves_attempts_alone() {
         let sql = REQUEUE_ABANDONED_SQL;

@@ -2739,6 +2739,18 @@ impl HttpUpstreamProxy {
                 .get(reqwest::header::LAST_MODIFIED)
                 .and_then(|v| v.to_str().ok()),
         );
+        // The two facts that stop being observable the moment the body
+        // starts streaming. Read from the header rather than from
+        // `Response::content_length()` so what travels is literally what
+        // the upstream declared: a consumer comparing bytes-read against
+        // it is asking "did the body end short of its own declaration?",
+        // which a length reqwest derived would not answer.
+        let status = resp.status().as_u16();
+        let content_length = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
         let stream = resp
             .bytes_stream()
             .map_err(|e| std::io::Error::other(format!("upstream stream error: {e}")));
@@ -2747,6 +2759,8 @@ impl HttpUpstreamProxy {
             stream: boxed,
             declared_digest,
             last_modified,
+            status,
+            content_length,
         })
     }
 
@@ -3651,6 +3665,12 @@ mod tests {
 
     /// Happy path: anonymous fetch_blob → 200 → stream yields the
     /// configured bytes, declared digest header round-trips.
+    ///
+    /// The status and the declared `Content-Length` round-trip here too,
+    /// and they are asserted rather than assumed: they stop being
+    /// observable the moment the body starts streaming, so a consumer
+    /// comparing bytes-read against the length the upstream promised can
+    /// only do it with what this envelope carried out.
     #[tokio::test]
     async fn fetch_blob_anonymous_streams_body_and_returns_declared_digest() {
         let server = MockServer::start().await;
@@ -3669,6 +3689,8 @@ mod tests {
         let BlobFetch {
             mut stream,
             declared_digest: declared,
+            status,
+            content_length,
             ..
         } = proxy
             .fetch_blob(m, "library/nginx".into(), "sha256:abc".into())
@@ -3676,6 +3698,8 @@ mod tests {
             .expect("fetch_blob");
 
         assert_eq!(declared.as_deref(), Some("sha256:abc"));
+        assert_eq!(status, 200);
+        assert_eq!(content_length, Some(b"hello-blob".len() as u64));
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
             bytes.extend_from_slice(&chunk.unwrap());

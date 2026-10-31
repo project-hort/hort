@@ -6931,6 +6931,13 @@ impl UpstreamProxy for MockUpstreamProxy {
                 Some((body, declared, last_modified)) => {
                     use bytes::Bytes;
                     use futures::stream;
+                    // A complete body served under its own declared
+                    // length, which is what a healthy upstream does — so
+                    // a consumer comparing bytes-read against
+                    // `content_length` sees them agree here, and a
+                    // fixture that truncates is the thing that makes them
+                    // disagree.
+                    let content_length = Some(body.len() as u64);
                     let stream =
                         stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(body)) });
                     let boxed: BlobStream = Box::pin(stream);
@@ -6938,6 +6945,8 @@ impl UpstreamProxy for MockUpstreamProxy {
                         stream: boxed,
                         declared_digest: declared,
                         last_modified,
+                        status: 200,
+                        content_length,
                     })
                 }
                 None => Err(DomainError::Invariant(format!(

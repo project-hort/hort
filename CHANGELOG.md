@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `hort-server` now warns once per boot, and sets
+  `hort_rescan_drive_undriven`, when a ScanPolicy declares a
+  `rescanIntervalHours` that nothing drives — the `cron-rescan-tick` CronJob
+  is off by default and is the only driver of both interval rescans and
+  stranded-artifact recovery. No default changes; enable
+  `scheduledTasks.cronRescanTick.enabled` if you want the cadence you
+  declared (#388).
+
+### Fixed
+
+- A scan job that failed transiently no longer reads back as `completed`, so an
+  artifact whose scan could not run is no longer held forever without a
+  verdict (#388).
+- `HORT_SCANNER_MAX_ATTEMPTS` now also bounds the task dispatcher, which
+  previously used a fixed 5 regardless of the configured value (#388).
+- A constituent fetch that breaks while a composite scan assembles an image now
+  names the side that failed — an upstream body that ended early was reported
+  as a storage write failure — and carries the HTTP status, declared
+  `Content-Length`, bytes read and elapsed time (#388).
+- An artifact whose quarantine window has elapsed is no longer left unreleased
+  because artifacts under a different quarantine duration filled every release
+  sweep batch (#388).
+- `hort-cli admin task invoke --help` no longer advertises `scan`, which the
+  server does not route and which answered `405`; the per-artifact instrument
+  is `hort-cli admin rescan <ARTIFACT_ID>` (#388).
+
 ## [0.17.0] - 2026-10-31
 
 ### Added

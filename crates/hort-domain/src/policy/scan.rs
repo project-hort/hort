@@ -177,8 +177,13 @@ impl DefaultPolicy {
     /// operator policy is configured (or when a policy YAML omits the
     /// field).
     ///
-    /// Returns `24` — out-of-the-box deployments rescan artifacts
-    /// every 24 hours. Operators who want a different cadence declare
+    /// Returns `24` — the **cadence a rescan runs at once the
+    /// `cron-rescan-tick` task is scheduled**, which is not the same
+    /// claim as "a default deployment rescans every 24 hours". That
+    /// tick is the interval's only driver and the chart ships it off
+    /// (`scheduledTasks.cronRescanTick.enabled: false`), so a
+    /// deployment that has not scheduled it re-scans nothing on any
+    /// interval. Operators who want a different cadence declare
     /// a `ScanPolicy` with an explicit `rescanIntervalHours:` value;
     /// operators who want to disable rescanning entirely declare
     /// `rescanIntervalHours: 0`.
@@ -787,9 +792,10 @@ mod tests {
     // Out-of-the-box default rescan interval.
     #[test]
     fn default_policy_rescan_interval_hours_is_24() {
-        // Out-of-the-box deployments rescan every 24 hours. The
-        // constant is load-bearing — the YAML deserializer's default
-        // and the SQL column DEFAULT both refer back to this value.
+        // 24 h is the cadence a scheduled `cron-rescan-tick` rescans
+        // at, not what an unscheduled deployment does. The constant is
+        // load-bearing — the YAML deserializer's default and the SQL
+        // column DEFAULT both refer back to this value.
         assert_eq!(DefaultPolicy::rescan_interval_hours(), 24);
     }
 

@@ -4,11 +4,11 @@
 //! `QuarantineReleaseSweepHandler` (in
 //! `hort-app::task_handlers::quarantine_release_sweep`) delegates the
 //! SQL-side candidacy predicate — computing the effective per-repo
-//! `ScanPolicy.quarantineDuration` (repo-scoped → global → default),
-//! grouping repos by their handful of distinct durations, and issuing
-//! one indexed range scan per distinct duration `D`
-//! (`quarantine_status='quarantined' AND repository_id = ANY($repos_for_D)
-//! AND quarantine_window_start <= now() - D`)
+//! `ScanPolicy.quarantineDuration` (repo-scoped → global → default) and
+//! issuing one ordered scan over every expired candidate, with the
+//! per-repo deadline as a join predicate
+//! (`quarantine_status='quarantined' AND quarantine_window_start <=
+//! now() - D_for(repository_id)`)
 //! — to this port. Keeping the SQL inside the Postgres adapter and
 //! exposing the result as a flat `Vec<QuarantineReleaseCandidate>`
 //! lets the handler stay a pure orchestration step (port boundary +
@@ -27,6 +27,13 @@
 //! forever. With the cursor, a never-attempted artifact is served on the
 //! very next tick regardless of backlog size, and a backlog of N is
 //! fully re-attempted every `ceil(N / batch_size)` ticks.
+//!
+//! The cursor is **global**, which is the other half of the same
+//! contract: the batch has one `LIMIT`, applied over all expired
+//! candidates at once. A per-duration-group query spending a shared
+//! budget let one group's unreleasable rows consume the whole batch
+//! before another group was queried at all, so the cursor rotated within
+//! groups while nothing rotated across them.
 //!
 //! **Authority discipline.** The candidacy query filters by the *computed*
 //! window deadline only. It is **never** evidence of release authority —
@@ -66,17 +73,20 @@ pub struct QuarantineReleaseCandidate {
 ///    `repo → effective duration` map (repo-scoped policies shadow the
 ///    global default, mirroring `QuarantineUseCase::record_scan_result`'s
 ///    precedence; the third tier is
-///    `DefaultPolicy::quarantine_duration_secs` — a repo with no
-///    matched policy contributes no candidates).
-/// 2. Grouping repos by their distinct duration values (there are at
-///    most a handful — number of policies, not number of artifacts).
-/// 3. Issuing one indexed range scan per distinct duration `D`
-///    (`quarantine_window_start <= $now - D` AND
-///    `repository_id = ANY($repos_for_D)` AND
-///    `quarantine_status = 'quarantined'`), ordered by
+///    `DefaultPolicy::quarantine_duration_secs`, so a repo with no
+///    matched policy still resolves — to the same 24 h window ingest
+///    applied when it quarantined the artifact).
+/// 2. Turning each such duration into the cutoff instant
+///    `$now - D` (there are at most a handful of distinct values —
+///    number of policies, not number of artifacts).
+/// 3. Issuing **one** scan over `quarantine_status = 'quarantined'` with
+///    those `(repo, cutoff)` pairs as a join relation, so each row is
+///    tested against its own repo's cutoff
+///    (`quarantine_window_start <= cutoff`), ordered by
 ///    `release_attempt_at NULLS FIRST, quarantine_window_start`.
-/// 4. Union-ing the per-duration result sets and applying the
-///    global `LIMIT $batch_size` to bound per-tick load.
+/// 4. Applying the single `LIMIT $batch_size` to that one ordered set,
+///    which bounds per-tick load **and** keeps the budget from being
+///    consumable by one duration group.
 pub trait QuarantineReleaseCandidatesRepository: Send + Sync {
     /// Return up to `batch_size` quarantined artifacts whose computed
     /// per-repo deadline `quarantine_window_start + effective_duration`

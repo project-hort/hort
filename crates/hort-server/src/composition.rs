@@ -556,6 +556,147 @@ pub(crate) fn emit_event_chain_verify_liveness_signal(
     }
 }
 
+/// Metric name for the rescan-drive liveness gauge.
+/// Boolean (0/1), **no labels** — a single global series. `1.0` means
+/// "an active `ScanPolicy` declares a non-zero `rescanIntervalHours`
+/// and no `cron-rescan-tick` has completed within
+/// `HORT_RESCAN_DRIVE_STALENESS_MULTIPLIER × the shortest declared
+/// interval`"; `0.0` means the declared cadence is being driven, or
+/// that no cadence is declared at all. The catalog entry in
+/// `docs/metrics-catalog.md` pins the no-label contract.
+const RESCAN_DRIVE_UNDRIVEN_METRIC: &str = "hort_rescan_drive_undriven";
+
+/// Boot-time liveness signal for the `cron-rescan-tick` **driver**.
+///
+/// `ScanPolicy.rescanIntervalHours` is enforced correctly by its
+/// consumer — the eligibility query in
+/// `hort-adapters-postgres::rescan_candidates` — but that query runs
+/// only when the `cron-rescan-tick` task runs, and
+/// `scheduledTasks.cronRescanTick.enabled` defaults to `false`. So an
+/// operator can declare a cadence, have it stored verbatim, read it
+/// back from their own policy document, and make a threat-model
+/// decision on it while nothing re-scans anything. The same tick is
+/// the only production caller of
+/// `RescanCandidatesRepository::select_stranded`, so a scan left
+/// stranded by a failed job has no automatic recovery either — one
+/// deployment choice, two silent gaps.
+///
+/// **The chart default staying `false` is deliberate**, so this is a
+/// statement about reachability and not a verdict on the
+/// configuration: an operator running without the tick has made a
+/// supported choice, and the line says what the choice costs. It names
+/// the chart value to set so an operator reading it does not have to go
+/// looking for the switch, plus the one-shot admin task for draining
+/// once without scheduling anything.
+///
+/// The pure decision lives in
+/// [`hort_domain::policy::evaluate_rescan_drive_liveness`] (zero-I/O,
+/// 100%-tested); this function is the thin composition-root shell that
+/// supplies the wall-clock plus the two port reads, then emits the
+/// gauge and a `warn!` on the undriven paths — mirroring
+/// [`emit_staging_sweep_liveness_signal`] and
+/// [`emit_event_chain_verify_liveness_signal`].
+///
+/// **Placement rationale (boot-time emit, not a periodic loop).** A
+/// periodic in-process re-check would itself be a `tokio::time`
+/// scheduler, and the scheduler-free `hort-server` is load-bearing
+/// (ADR 0028). The gauge is set once at boot and scraped continuously;
+/// Prometheus alerts on
+/// `max_over_time(hort_rescan_drive_undriven[…]) > 0`, the same alarm
+/// shape the sibling boot signals use. The gauge is emitted on every
+/// path (`0.0` when driven or when nothing is declared) so a fresh
+/// scrape always sees the series — absence and `0.0` are ambiguous to
+/// dashboards.
+///
+/// Never returns an error / never blocks boot: an undriven cadence is
+/// an operational fact to surface, not a reason to refuse to start —
+/// and refusing would break deployments whose configuration is right.
+pub(crate) fn emit_rescan_drive_liveness_signal(
+    policies: &[hort_domain::entities::scan_policy::ScanPolicyProjection],
+    last_completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    staleness_multiplier: u32,
+) {
+    use hort_domain::policy::{evaluate_rescan_drive_liveness, RescanDriveLiveness};
+
+    let liveness =
+        evaluate_rescan_drive_liveness(policies, last_completed_at, now, staleness_multiplier);
+
+    match liveness {
+        RescanDriveLiveness::NoCadenceDeclared => {
+            tracing::debug!(
+                "rescan drive: no active ScanPolicy declares a non-zero \
+                 rescanIntervalHours, so no rescan cadence is owed"
+            );
+            metrics::gauge!(RESCAN_DRIVE_UNDRIVEN_METRIC).set(0.0);
+        }
+        RescanDriveLiveness::Driven {
+            cadence,
+            age_secs,
+            threshold_secs,
+        } => {
+            tracing::debug!(
+                shortest_interval_hours = cadence.interval_hours,
+                policy_name = %cadence.policy_name,
+                age_secs,
+                threshold_secs,
+                "rescan drive OK — a cron-rescan-tick completed within the window \
+                 for the shortest declared rescan cadence"
+            );
+            metrics::gauge!(RESCAN_DRIVE_UNDRIVEN_METRIC).set(0.0);
+        }
+        RescanDriveLiveness::Stale {
+            cadence,
+            age_secs,
+            threshold_secs,
+        } => {
+            tracing::warn!(
+                shortest_interval_hours = cadence.interval_hours,
+                policy_name = %cadence.policy_name,
+                age_secs,
+                threshold_secs,
+                staleness_multiplier,
+                "rescan cadence declared but not currently driven: ScanPolicy \
+                 policy_name declares the shortest rescanIntervalHours on this \
+                 deployment (shortest_interval_hours h), and the newest completed \
+                 cron-rescan-tick is age_secs seconds old — past the \
+                 threshold_secs-second window. Until a tick runs again, released \
+                 artifacts are not re-scanned on that cadence and artifacts \
+                 stranded by a failed scan are not re-picked (the same tick drives \
+                 both). Schedule it with \
+                 `scheduledTasks.cronRescanTick.enabled=true`, or drain once \
+                 without scheduling via `POST /api/v1/admin/tasks/cron-rescan-tick`."
+            );
+            metrics::gauge!(RESCAN_DRIVE_UNDRIVEN_METRIC).set(1.0);
+        }
+        RescanDriveLiveness::NeverDriven {
+            cadence,
+            threshold_secs,
+        } => {
+            tracing::warn!(
+                shortest_interval_hours = cadence.interval_hours,
+                policy_name = %cadence.policy_name,
+                threshold_secs,
+                staleness_multiplier,
+                "rescan cadence declared but never driven: ScanPolicy policy_name \
+                 declares the shortest rescanIntervalHours on this deployment \
+                 (shortest_interval_hours h), and no cron-rescan-tick has ever \
+                 completed here — the `scheduledTasks.cronRescanTick` CronJob is \
+                 off by default and nothing else drives the rescan. So released \
+                 artifacts are never re-scanned on that cadence and artifacts \
+                 stranded by a failed scan are never re-picked (the same tick \
+                 drives both); an advisory published after an artifact's only scan \
+                 is not matched against it. This is a supported configuration — if \
+                 you want the cadence you declared, set \
+                 `scheduledTasks.cronRescanTick.enabled=true`; to drain once \
+                 without scheduling anything, \
+                 `POST /api/v1/admin/tasks/cron-rescan-tick`."
+            );
+            metrics::gauge!(RESCAN_DRIVE_UNDRIVEN_METRIC).set(1.0);
+        }
+    }
+}
+
 /// Structured boot-time **quarantine posture** verdict,
 /// the value returned by [`evaluate_quarantine_posture`].
 ///
@@ -1258,6 +1399,68 @@ async fn run_event_chain_verify_liveness_check(jobs_repo: &PgJobsRepository) {
                 error = %e,
                 "event-chain verify liveness check skipped — last-completed query failed; \
                  hort_event_chain_verify_overdue not emitted this boot"
+            );
+        }
+    }
+}
+
+/// Boot-time liveness check for the `cron-rescan-tick` **driver**.
+/// Mirrors [`run_staging_sweep_liveness_check`]: parses its own env-var
+/// knob, fetches the two inputs the predicate needs, and emits
+/// [`emit_rescan_drive_liveness_signal`]. A query failure is logged and
+/// treated as "unknown"; it must not block an otherwise-serviceable
+/// boot.
+///
+/// Only **one** knob, unlike the sibling checks' two: the expected
+/// interval is not an operator guess about a CronJob schedule, it is
+/// the cadence the policies themselves declare, so the predicate reads
+/// it from the projection rows rather than from the environment.
+///
+/// The policy list is read separately from
+/// [`run_quarantine_posture_log`]'s even though both call
+/// `list_active()`. Two boot-time reads cost nothing measurable, and
+/// fusing two independent signals into one fetch would make either
+/// one's failure silence the other.
+async fn run_rescan_drive_liveness_check(
+    jobs_repo: &PgJobsRepository,
+    policy_projections: &Arc<dyn PolicyProjectionRepository>,
+) {
+    use hort_domain::ports::jobs_repository::JobsRepository as _;
+    let staleness_multiplier = std::env::var("HORT_RESCAN_DRIVE_STALENESS_MULTIPLIER")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3);
+
+    let policies = match policy_projections.list_active().await {
+        Ok(policies) => policies,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "rescan drive liveness check skipped — list_active() on \
+                 policy_projections failed; hort_rescan_drive_undriven not emitted \
+                 this boot"
+            );
+            return;
+        }
+    };
+
+    match jobs_repo
+        .last_completed_at_by_kind("cron-rescan-tick")
+        .await
+    {
+        Ok(last_completed_at) => {
+            emit_rescan_drive_liveness_signal(
+                &policies,
+                last_completed_at,
+                chrono::Utc::now(),
+                staleness_multiplier,
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "rescan drive liveness check skipped — last-completed query failed; \
+                 hort_rescan_drive_undriven not emitted this boot"
             );
         }
     }
@@ -2385,11 +2588,13 @@ pub async fn build_app_context(
 
     // Boot-time liveness + posture signals — see
     // `run_staging_sweep_liveness_check`, `run_event_chain_verify_liveness_check`,
-    // and `run_quarantine_posture_log` for the rationale behind each.
+    // `run_rescan_drive_liveness_check`, and `run_quarantine_posture_log` for the
+    // rationale behind each.
     // None of these block boot: a query failure degrades to a debug
     // log, not a startup error.
     run_staging_sweep_liveness_check(&jobs_repo).await;
     run_event_chain_verify_liveness_check(&jobs_repo).await;
+    run_rescan_drive_liveness_check(&jobs_repo, &policy_projections).await;
     run_quarantine_posture_log(&policy_projections, &repository_upstream_mappings).await;
 
     // Load the OCI Distribution-Spec `/v2/auth`
@@ -4119,6 +4324,127 @@ mod tests {
             }
             other => panic!("expected gauge, got {other:?}"),
         }
+    }
+
+    // -- emit_rescan_drive_liveness_signal ---------------------------------
+    //
+    // Boot-time rescan-drive liveness signal. The pure decision is
+    // unit-tested exhaustively in
+    // `hort_domain::policy::rescan_drive_liveness`; these tests pin only
+    // the composition-shell behaviour: the `hort_rescan_drive_undriven`
+    // gauge fires `0.0` when the declared cadence is driven AND when
+    // nothing is declared (so a fresh scrape always sees the series),
+    // and `1.0` on the stale / never-driven paths, with NO labels.
+
+    /// Build a policy whose rescan cadence and archived flag are the
+    /// controllable facts. Reuses [`make_scan_policy`] rather than
+    /// re-typing the 20-field literal.
+    fn make_rescan_policy(
+        name: &str,
+        rescan_interval_hours: i32,
+        archived: bool,
+    ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
+        let mut policy = make_scan_policy(0, archived);
+        policy.name = name.to_string();
+        policy.rescan_interval_hours = rescan_interval_hours;
+        policy
+    }
+
+    /// Read the no-label `hort_rescan_drive_undriven` gauge out of a
+    /// captured recorder snapshot and assert its value.
+    fn assert_rescan_drive_gauge(entries: &[MetricEntry], expected: f64, ctx: &str) {
+        let gauge = find_metric(
+            entries,
+            MetricKind::Gauge,
+            RESCAN_DRIVE_UNDRIVEN_METRIC,
+            &[],
+        )
+        .unwrap_or_else(|| panic!("hort_rescan_drive_undriven must fire on the {ctx} path"));
+        match gauge {
+            DebugValue::Gauge(v) => {
+                let f: f64 = (*v).into();
+                assert!(
+                    (f - expected).abs() < f64::EPSILON,
+                    "{ctx}: expected {expected}, got {f}"
+                );
+            }
+            other => panic!("expected gauge, got {other:?}"),
+        }
+    }
+
+    /// No cadence declared (zero policy rows) → gauge `0.0`. Nothing was
+    /// promised, so nothing is undriven — but the series still has to
+    /// exist, or a dashboard cannot tell "healthy" from "not scraped".
+    #[test]
+    fn emit_rescan_drive_liveness_signal_gauge_zero_when_no_cadence_declared() {
+        let now = chrono::Utc::now();
+        let entries = capture(|| {
+            emit_rescan_drive_liveness_signal(&[], None, now, 3);
+        });
+        assert_rescan_drive_gauge(&entries, 0.0, "no-cadence-declared");
+    }
+
+    /// Declared cadence, tick inside the window → gauge `0.0`.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_gauge_zero_when_driven() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("daily", 24, false)];
+        let entries = capture(|| {
+            emit_rescan_drive_liveness_signal(
+                &policies,
+                Some(now - chrono::Duration::seconds(300)),
+                now,
+                3,
+            );
+        });
+        assert_rescan_drive_gauge(&entries, 0.0, "driven");
+    }
+
+    /// Declared cadence, newest tick older than `multiplier × shortest
+    /// interval` → gauge `1.0`.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_gauge_one_when_stale() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("daily", 24, false)];
+        // 10 days old; window = 24 h × 3 = 72 h → stale.
+        let entries = capture(|| {
+            emit_rescan_drive_liveness_signal(
+                &policies,
+                Some(now - chrono::Duration::days(10)),
+                now,
+                3,
+            );
+        });
+        assert_rescan_drive_gauge(&entries, 1.0, "stale");
+    }
+
+    /// Declared cadence, no tick ever → gauge `1.0`. This is the
+    /// deployment the unit exists for: `cronRescanTick.enabled` is
+    /// `false` by default and nobody turned it on.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_gauge_one_when_never_driven() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("daily", 24, false)];
+        let entries = capture(|| {
+            emit_rescan_drive_liveness_signal(&policies, None, now, 3);
+        });
+        assert_rescan_drive_gauge(&entries, 1.0, "never-driven");
+    }
+
+    /// An archived row and a `rescanIntervalHours: 0` row declare no
+    /// cadence between them, so the shell reports healthy rather than
+    /// warning about a policy nobody is relying on.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_ignores_archived_and_zero_interval_rows() {
+        let now = chrono::Utc::now();
+        let policies = [
+            make_rescan_policy("retired", 1, true),
+            make_rescan_policy("opted-out", 0, false),
+        ];
+        let entries = capture(|| {
+            emit_rescan_drive_liveness_signal(&policies, None, now, 3);
+        });
+        assert_rescan_drive_gauge(&entries, 0.0, "archived-and-zero-only");
     }
 
     // -- derive_oci_token_endpoint_strings ---------------------------------
