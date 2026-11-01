@@ -2245,6 +2245,86 @@ mod proxy_pull_through {
         assert_eq!(st, StatusCode::NOT_FOUND);
     }
 
+    /// Proxy cache miss where the upstream has NEITHER a sidecar NOR the
+    /// artifact → 404, the same answer the metadata path gives for a
+    /// coordinate this upstream does not carry. The sidecar leg runs first,
+    /// so before the exhaustion was classified this miss reached the client
+    /// as the `upstream publishes no usable checksum` 502.
+    #[tokio::test]
+    async fn proxy_cache_miss_no_sidecar_and_no_artifact_returns_404() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_repo(&mocks, "mvn-mirror");
+        seed_mapping(&mocks, repo.id);
+
+        // Nothing seeded upstream at all.
+        let router = router(ctx);
+        let (st, _) = get(&router, &format!("/maven/mvn-mirror/{REL}")).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// Insert a `type: virtual` Maven repo over `members` in priority order
+    /// (index 0 = highest). Local to this module because the virtual walk is
+    /// what consumes the pull-through classification.
+    fn insert_virtual_over(mocks: &MockPorts, key: &str, members: &[&Repository]) -> Repository {
+        let mut repo = sample_repository();
+        repo.key = key.to_string();
+        repo.format = RepositoryFormat::Maven;
+        repo.repo_type = RepositoryType::Virtual;
+        mocks.repositories.insert(repo.clone());
+        for m in members {
+            mocks.repositories.seed_virtual_member(repo.id, m.id);
+        }
+        repo
+    }
+
+    /// The reported defect, end to end: a virtual whose first proxy member's
+    /// upstream does not carry the coordinate must serve it from a later
+    /// member. The walk continues on a 404 from a member and aborts on
+    /// anything else, so the first member's pull answering 502 for a plain
+    /// miss made the coordinate unreachable under every member ordering.
+    ///
+    /// Both members are proxies so that name-level pinning does not apply (a
+    /// non-proxy owner of the name would exclude every proxy from the walk
+    /// before any pull ran). The later member holds the artifact as an
+    /// already-cached row rather than pulling it, because `MockUpstreamProxy`
+    /// keys its upstream fixtures by `(path_prefix, path)` and Maven resolves
+    /// every mapping at the empty prefix — so two proxy members cannot be
+    /// given different upstream content for one coordinate in this harness.
+    #[tokio::test]
+    async fn virtual_first_member_upstream_miss_falls_through_to_a_later_member() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+
+        // Member 1: a proxy whose upstream has neither a sidecar nor the file.
+        let first = proxy_repo(&mocks, "mvn-releases-only");
+        seed_mapping(&mocks, first.id);
+
+        // Member 2: a proxy that already holds the coordinate.
+        let second = proxy_repo(&mocks, "mvn-snapshots");
+        insert_file(
+            &mocks,
+            second.id,
+            "com.example:foo",
+            "1.0",
+            REL,
+            b"SNAPSHOTBYTES",
+            QuarantineStatus::Released,
+        );
+
+        let _virt = insert_virtual_over(&mocks, "mvn-virt", &[&first, &second]);
+
+        let router = router(ctx);
+        let (st, body) = get(&router, &format!("/maven/mvn-virt/{REL}")).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a member whose upstream lacks the coordinate must not abort the walk"
+        );
+        assert_eq!(
+            body, b"SNAPSHOTBYTES",
+            "the later member's bytes are served"
+        );
+    }
+
     /// A HOSTED-repo cache miss stays 404 — it must NOT enter the Proxy
     /// pull-through branch even with upstream fixtures + a mapping seeded.
     #[tokio::test]
