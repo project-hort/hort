@@ -235,7 +235,7 @@ async fn build_app_context_registers_seed_import_handler() {
         stateful_upload_staging_dir: PathBuf::from("/tmp/hort-worker-smoke-staging"),
         poll_interval: std::time::Duration::from_secs(5),
         batch_size: 4,
-        // Deliberately NOT `HORT_SCANNER_MAX_ATTEMPTS`'s default of 5:
+        // Deliberately NOT `HORT_SCANNER_MAX_ATTEMPTS`'s default of 6:
         // the assertion below is that the dispatcher closes rows out
         // against the operator's number, and at the default it would
         // pass against a hard-coded one too.

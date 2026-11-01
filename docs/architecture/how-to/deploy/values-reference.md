@@ -1182,7 +1182,7 @@ advisory-watch-tick, staging-sweep, etc.).
 | `worker.resources` | object | `{cpu, memory}` | no |
 | `worker.scanner.pollIntervalSecs` | integer | `5` | no |
 | `worker.scanner.batchSize` | integer | `4` | no |
-| `worker.scanner.maxAttempts` | integer | `5` | no |
+| `worker.scanner.maxAttempts` | integer | `6` | no |
 | `worker.scanner.lockDurationSecs` | integer | `900` | no |
 | `worker.scanner.trivy.enabled` | boolean | `true` | no |
 | `worker.scanner.trivy.binary` | string | `/usr/local/bin/trivy` | no |

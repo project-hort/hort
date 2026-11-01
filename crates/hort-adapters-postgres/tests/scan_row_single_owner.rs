@@ -76,12 +76,12 @@ use hort_domain::types::ContentHash;
 /// The attempt budget these tests build the dispatcher with —
 /// `HORT_SCANNER_MAX_ATTEMPTS`'s default, and the same number a real
 /// worker also gives `ScanOrchestrationConfig::max_attempts`.
-const ATTEMPT_CAP: u32 = 5;
+const ATTEMPT_CAP: u32 = 6;
 
 /// `attempts` to seed so the *next* claim lands exactly on
 /// [`ATTEMPT_CAP`]. The claim statement increments the column, so a row
 /// seeded one below the cap is the execution at the budget's edge.
-const AT_CAP_SEED: i32 = 4;
+const AT_CAP_SEED: i32 = 5;
 const _: () = assert!(AT_CAP_SEED >= 0 && AT_CAP_SEED as u32 + 1 == ATTEMPT_CAP);
 
 /// Lease long enough that nothing lapses on its own.
@@ -372,7 +372,10 @@ async fn a_transient_scan_failure_with_budget_left_stays_a_scheduled_retry() {
         "`attempts` advances per claim — a fix that re-fenced on status instead of removing \
          the second writer would leave this at 1 while the row still read pending; got {state:?}"
     );
-    assert_eq!(state.status, "pending", "budget is still left at 2 of 5");
+    assert_eq!(
+        state.status, "pending",
+        "budget is still left below the cap"
+    );
 }
 
 // ---------------------------------------------------------------------------

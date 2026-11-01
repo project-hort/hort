@@ -61,7 +61,7 @@ const REAL_BATCH_SIZE: u16 = 4;
 /// write), but the constructor takes the operator's number rather than
 /// supplying one, so the test states which number it is standing in
 /// for.
-const REAL_MAX_ATTEMPTS: u32 = 5;
+const REAL_MAX_ATTEMPTS: u32 = 6;
 /// `CLEARANCE_VERIFY_PRIORITY` (`hort-app::ingest_use_case`) — the S4
 /// expiry-backstop re-enqueue priority, and `CRON_PRIORITY`
 /// (`hort-server::cli::enqueue_quarantine_release_sweep`). Identical by

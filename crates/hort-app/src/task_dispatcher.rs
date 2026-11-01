@@ -298,8 +298,8 @@ pub struct TaskDispatcher {
     ///
     /// **A number of attempts is only half of a budget**; the other
     /// half is the window they span, which is [`compute_backoff`]'s to
-    /// set. At the default five, those executions spend the curve's
-    /// first four waits — 96 minutes from the first failure to the cap
+    /// set. At the default six, those executions spend the curve's
+    /// first five waits — 156 minutes from the first failure to the cap
     /// — and both halves had to agree before the cap could mean
     /// "persistently broken": while the dispatcher kept its own
     /// 30-s-doubling curve, the same five attempts were spent inside
@@ -1779,10 +1779,10 @@ mod tests {
     /// Production threads `HORT_SCANNER_MAX_ATTEMPTS` into
     /// `TaskDispatcher::new`; the tests use that variable's own default
     /// so the window assertion in
-    /// [`five_executions_span_the_ninety_six_minute_window`] is the one
-    /// an out-of-the-box deployment experiences. Tests that are about
-    /// the cap being *configured* build their own dispatcher with a
-    /// different value — see
+    /// [`six_executions_span_the_hundred_and_fifty_six_minute_window`]
+    /// is the one an out-of-the-box deployment experiences. Tests that
+    /// are about the cap being *configured* build their own dispatcher
+    /// with a different value — see
     /// [`the_cap_is_the_configured_one_not_the_default`].
     const TEST_ATTEMPT_CAP: u32 = DEFAULT_MAX_ATTEMPTS;
 
@@ -2968,9 +2968,9 @@ mod tests {
     /// `crate::retry_backoff`'s own tests. Neither file can state the
     /// product, and the product is the only part an operator
     /// experiences — a row that sits in the jobs table with a growing
-    /// retry delay for an hour and a half before it goes `failed`.
+    /// retry delay for two and a half hours before it goes `failed`.
     ///
-    /// This is also what pins the neighbouring cap tests to the *fifth*
+    /// This is also what pins the neighbouring cap tests to the *sixth*
     /// execution: they are written against `TEST_ATTEMPT_CAP` and would
     /// pass at any value of it, so the number itself is asserted here.
     /// Reshape the curve and this fails, which is the point — an
@@ -2984,10 +2984,10 @@ mod tests {
     /// [`the_cap_is_the_configured_one_not_the_default`] is what proves
     /// the configured number is the one that fires.
     #[test]
-    fn five_executions_span_the_ninety_six_minute_window() {
+    fn six_executions_span_the_hundred_and_fifty_six_minute_window() {
         assert_eq!(
-            TEST_ATTEMPT_CAP, 5,
-            "the window asserted below is the one five executions span"
+            TEST_ATTEMPT_CAP, 6,
+            "the window asserted below is the one six executions span"
         );
 
         let spent: Vec<u64> = (1..TEST_ATTEMPT_CAP)
@@ -2995,12 +2995,12 @@ mod tests {
             .collect();
         assert_eq!(
             spent,
-            vec![60, 5 * 60, 30 * 60, 60 * 60],
-            "the four waits a five-execution budget actually spends"
+            vec![60, 5 * 60, 30 * 60, 60 * 60, 60 * 60],
+            "the five waits a six-execution budget actually spends"
         );
         assert_eq!(
             spent.iter().sum::<u64>(),
-            96 * 60,
+            156 * 60,
             "first failure to terminal row — the scan pipeline's own window, to the second"
         );
     }

@@ -1097,8 +1097,8 @@ worker:
     pollIntervalSecs: 5
     # HORT_SCANNER_BATCH_SIZE — default 4 (FOR UPDATE SKIP LOCKED batch).
     batchSize: 4
-    # HORT_SCANNER_MAX_ATTEMPTS — default 5.
-    maxAttempts: 5
+    # HORT_SCANNER_MAX_ATTEMPTS — default 6.
+    maxAttempts: 6
     # HORT_SCANNER_LOCK_DURATION_SECS — default 900 (15 min). Workers
     # whose pods die mid-scan have their claim expire after this window;
     # another worker re-claims the row.
