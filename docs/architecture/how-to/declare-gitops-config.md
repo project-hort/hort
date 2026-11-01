@@ -96,8 +96,6 @@ spec:
   description: "Pull-through cache for the public npmjs.org registry"
   format: npm
   type: proxy
-  storage:
-    backend: filesystem
   proxy:
     upstreamUrl: "https://registry.npmjs.org"
   isPublic: true
@@ -2003,8 +2001,6 @@ spec:
   name: "PyPI Curated"
   format: pypi
   type: hosted
-  storage:
-    backend: filesystem
   isPublic: true
   replicationPriority: local_only
   curationRules:

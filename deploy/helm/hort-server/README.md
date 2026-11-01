@@ -13,8 +13,10 @@ external LB).
 ## Quick start
 
 ```sh
+# Select a chart version that is actually published and matches the
+# desired hort-server release (Chart.yaml in this checkout: 0.17.0).
 helm install hort-server oci://${REGISTRY}/${IMAGE_PREFIX}/charts/hort-server \
-  --version 1.0.0-rc.14 \
+  --version 0.17.0 \
   --set publicBaseUrl=https://hort.example.com \
   --set auth.oidc.issuerUrl=https://idp.example.com/realms/hort \
   --set auth.oidc.audience=hort-server \
@@ -34,6 +36,13 @@ helm install hort-server oci://${REGISTRY}/${IMAGE_PREFIX}/charts/hort-server \
 | `ephemeralStore.redis.{url|existingSecret}` | Required when `ephemeralStore.backend=redis` |
 
 `values.schema.json` enforces these at `helm install` time.
+
+**NetworkPolicy caveat:** this short command is not a complete installation
+recipe. With the default `networkPolicy.enabled: true`, empty application
+`ingress` and `egress` lists deny traffic to and from application pods. Supply
+cluster-appropriate NetworkPolicy rules for your edge, PostgreSQL, OIDC,
+DNS and upstreams before expecting readiness and client requests to work.
+See `docs/operator/installation/kubernetes-helm.md` for the operator workflow.
 
 ## Topology
 

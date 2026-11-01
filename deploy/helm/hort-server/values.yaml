@@ -145,13 +145,19 @@ auth:
   #
   #   1. helm install / upgrade with provider=disabled +
   #      nativeTokens.enabled=true (plus the signingKey secret).
-  #   2. Issue a service-account token from inside the pod:
-  #          kubectl exec -it <pod> -- hort-server admin issue-svc-token \
-  #              --username admin --role developer
-  #      Copy the printed `hort_svc_*` token; it is shown once.
-  #   3. Configure hort-cli on the operator's workstation:
-  #          hort-cli auth login --paste
-  #      (paste the `hort_svc_*` token at the prompt).
+  #   2. Declare a ServiceAccount and matching PermissionGrant resources
+  #      in the applied GitOps config. A ServiceAccount is NOT an admin
+  #      and is not automatically authorized just because it exists.
+  #   3. With the appropriate migration/runtime DSN on a trusted host,
+  #      mint a token for the PRE-DECLARED account:
+  #          hort-server admin issue-svc-token --name=<sa-name> \
+  #              --permission=read --repository=<repo-key> \
+  #              --require-authority=<repo-key>
+  #      Use permission and repository values matching your actual grant.
+  #      The token is shown only once; treat stdout as sensitive.
+  #   4. On the operator's workstation, use `hort-cli auth login --paste`.
+  #      This is a limited service-account workflow, NOT a way to mint a
+  #      human administrator or replace proper OIDC operator access.
   #
   # The prior `basic` provider and the `admin bootstrap` CLI are retired —
   # the HTTP-Basic-against-local-admin-row identity path is gone
