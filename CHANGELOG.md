@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- `ArtifactRepository.spec.storage.path` is deprecated and routes nothing; blob
+  placement is the one global CAS selected by `HORT_STORAGE_BACKEND`. Declaring
+  it warns once per repository at apply — and fails `validate-config --strict`,
+  so drop the `path:` line; a `storage:` block with `backend:` alone is valid.
+  A later release removes the field (#331).
+
 ### Changed
 
 - `hort-server` now warns once per boot, and sets

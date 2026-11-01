@@ -9,7 +9,6 @@ spec:
   type: proxy
   storage:
     backend: filesystem
-    path: oci-proxy
   proxy:
     upstreamUrl: "https://index.docker.io"
   isPublic: true

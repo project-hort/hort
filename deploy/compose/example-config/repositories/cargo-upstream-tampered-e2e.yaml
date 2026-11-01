@@ -14,7 +14,6 @@ spec:
   type: proxy
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/cargo-upstream-tampered-e2e
   proxy:
     # Required by the gitops validator for type=proxy. The standalone
     # UpstreamMapping at deploy/compose/example-config/upstreams/

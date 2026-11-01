@@ -9,6 +9,5 @@ spec:
   type: hosted
   storage:
     backend: filesystem
-    path: oci-hosted
   isPublic: true
   replicationPriority: local_only

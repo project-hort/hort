@@ -55,7 +55,6 @@ spec:
   type: proxy
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/pypi-public
   proxy:
     upstreamUrl: https://pypi.org/
   isPublic: true

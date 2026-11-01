@@ -19,7 +19,6 @@ spec:
   indexMode: include_pending
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/maven-central-e2e
   proxy:
     # Required by the gitops validator (crates/hort-config/src/repository.rs)
     # for type=proxy. The standalone UpstreamMapping resource at

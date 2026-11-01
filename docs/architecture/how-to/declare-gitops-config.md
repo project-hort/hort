@@ -98,7 +98,6 @@ spec:
   type: proxy
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/npm-public
   proxy:
     upstreamUrl: "https://registry.npmjs.org"
   isPublic: true
@@ -118,6 +117,13 @@ Fields map 1:1 to the persisted `Repository` shape. Notable rules:
   authoritative); a per-repo `backend` differing from the deployment's
   global backend is rejected at apply. `backend` (when present) must
   be `filesystem` or `s3`.
+- `storage.path` is **deprecated** and routes nothing: placement is the
+  one global CAS selected by `HORT_STORAGE_BACKEND`, and the declared
+  value is persisted without ever being read. Declaring it emits one
+  non-aborting warning per repository at apply
+  (`hort_apply_config_linter_total{rule="repository_storage_path_deprecated",result="warn"}`);
+  the apply still succeeds. Drop the `path:` line — `storage:` with
+  `backend:` alone is valid. A later release removes the field.
 - `proxy.credentials` is **forbidden forever** as a plaintext
   anti-pattern (`ParseError::CredentialsFieldForbidden`). Use
   `proxy.secretRef:` — references a secret resolved
@@ -131,9 +137,9 @@ Fields map 1:1 to the persisted `Repository` shape. Notable rules:
   upstream credentials via the standalone `kind: UpstreamMapping`
   envelope. See §6 for the gitops writer status; the YAML schema
   lives in `crates/hort-config/src/upstream_mapping.rs`.
-- `${ENV_VAR}` interpolation works in `description`, `storage.path`,
-  and `proxy.upstreamUrl`. Use `$$` for a literal `$`. Missing vars
-  fail loudly.
+- `${ENV_VAR}` interpolation works in `description`,
+  `proxy.upstreamUrl`, and the deprecated `storage.path`. Use `$$` for
+  a literal `$`. Missing vars fail loudly.
 
 ### Virtual repositories
 
@@ -1999,7 +2005,6 @@ spec:
   type: hosted
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/pypi-curated
   isPublic: true
   replicationPriority: local_only
   curationRules:

@@ -14,7 +14,6 @@ spec:
   indexMode: include_pending
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/npm-public
   proxy:
     upstreamUrl: "https://registry.npmjs.org"
     # NOTE: credentials and secretRef are not yet implemented. Anonymous

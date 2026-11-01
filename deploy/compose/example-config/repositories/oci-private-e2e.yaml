@@ -16,6 +16,5 @@ spec:
   type: hosted
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/oci-private-e2e
   isPublic: false
   replicationPriority: local_only

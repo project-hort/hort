@@ -106,23 +106,29 @@ fn build_repository_from_spec(
         );
     }
 
-    // `spec.storage` is optional. Omitting
-    // it is the documented honest path — inherit the deployment's
+    // `spec.storage` is optional, and so is its `path`. Omitting
+    // either is the documented honest path — inherit the deployment's
     // effective global backend (per-repo storage is not
     // routing-effective in v2; see the `StorageSpec` honesty note). The
     // `storage_*` columns are NOT NULL with no usable default, so the
-    // omitted case is resolved to concrete, internally-consistent
+    // omitted cases are resolved to concrete, internally-consistent
     // values here (never NULL, never a magic free-string sentinel —
     // that was the original footgun): the effective global backend if the
     // composition wired one, else `"filesystem"` (the DB column default
     // and the domain default — the least-surprising fallback when the
     // cross-check is unwired); the placement-inert `storage_path`
     // becomes the repo key (stable across re-apply, NOT NULL, honest —
-    // no fabricated filesystem prefix). When the operator *did* supply
-    // a block, it is used verbatim (the apply-time mismatch reject runs
-    // separately in `reject_repo_storage_backend_mismatch`).
+    // no fabricated filesystem prefix). A declared `backend` is used
+    // verbatim (the apply-time mismatch reject runs separately in
+    // `reject_repo_storage_backend_mismatch`); a declared `path` is
+    // persisted verbatim too, so dropping it on an existing repository
+    // is a visible column change rather than a silent one — and the
+    // apply warns that it routes nothing.
     let (storage_backend, storage_path) = match spec.storage.as_ref() {
-        Some(s) => (s.backend.clone(), s.path.clone()),
+        Some(s) => (
+            s.backend.clone(),
+            s.path.clone().unwrap_or_else(|| env.metadata.name.clone()),
+        ),
         None => {
             let backend = effective_backend
                 .map(|e| e.as_spec_str().to_string())
@@ -571,6 +577,70 @@ mod tests {
         uc.apply(desired, env_oidc()).await.expect(
             "omitted storage is the validator's own remedy — it must inherit, \
              never trip reject_repo_storage_backend_mismatch",
+        );
+    }
+
+    // ---- storage.path: declared, dropped, and the NOT NULL column -----
+    //
+    // `repository.storage_path` is NOT NULL with no usable default, so
+    // every shape of the operator's `storage:` block has to resolve to a
+    // concrete value here. The deprecation made `path` optional, which
+    // added a third shape — a declared block with the line dropped — and
+    // the column still has to be filled.
+
+    /// A declared block with the deprecated line **dropped** resolves
+    /// `storage_path` to the repository key, exactly as an omitted block
+    /// does: the two remedies the deprecation warning offers must not
+    /// persist different rows. (The backend still comes from the
+    /// operator's declaration, which is the half that is not deprecated.)
+    #[tokio::test]
+    async fn declared_storage_without_path_resolves_the_column_to_the_repo_key() {
+        use hort_domain::ports::repository_repository::RepositoryRepository;
+
+        let h = build_harness();
+        // `repo_env` declares `storage: { backend: filesystem }` with no
+        // path — the "keep the block, drop the line" remedy.
+        let mut desired = DesiredState::default();
+        desired
+            .repositories
+            .push(repo_env("path-dropped", "hosted"));
+
+        h.uc.apply(desired, env_oidc())
+            .await
+            .expect("a block with no path is the warning's own remedy");
+
+        let stored = h.repos.find_by_key("path-dropped").await.unwrap();
+        assert_eq!(stored.storage_backend, "filesystem");
+        assert_eq!(
+            stored.storage_path, "path-dropped",
+            "a dropped path resolves to the repo key (NOT NULL, stable, inert) — \
+             the same value an omitted block resolves to"
+        );
+    }
+
+    /// A declared `path` is persisted **verbatim**, deprecated or not.
+    /// Nothing reads it, but the column is the operator's declaration
+    /// until they drop the line — so an upgrade does not silently
+    /// rewrite rows out from under a tree that still carries the field.
+    #[tokio::test]
+    async fn declared_storage_path_is_persisted_verbatim() {
+        use hort_domain::ports::repository_repository::RepositoryRepository;
+
+        let h = build_harness();
+        let mut env = repo_env("path-declared", "hosted");
+        env.spec.storage.as_mut().unwrap().path = Some("/var/lib/hort/custom".into());
+
+        let mut desired = DesiredState::default();
+        desired.repositories.push(env);
+
+        h.uc.apply(desired, env_oidc())
+            .await
+            .expect("a declared path warns, it does not reject");
+
+        let stored = h.repos.find_by_key("path-declared").await.unwrap();
+        assert_eq!(
+            stored.storage_path, "/var/lib/hort/custom",
+            "a declared path is persisted as written, not normalised away"
         );
     }
 

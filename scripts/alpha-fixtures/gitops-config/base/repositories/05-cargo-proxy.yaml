@@ -9,7 +9,6 @@ spec:
   type: proxy
   storage:
     backend: filesystem
-    path: cargo-proxy
   proxy:
     upstreamUrl: "https://crates.io"
   isPublic: true

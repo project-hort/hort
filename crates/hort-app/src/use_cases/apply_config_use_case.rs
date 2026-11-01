@@ -1374,6 +1374,58 @@ impl ApplyConfigUseCase {
                     _ => tracing::warn!("{}", w.message),
                 }
             }
+
+            // Row 16 — the deprecated `storage.path` advisory, one per
+            // declaring repository. Emitted here rather than before the
+            // reject walk for the same reason as the row-7 warns above:
+            // on a bundle the apply refuses, nothing was deprecated
+            // *away* and the operator's next clean apply re-reports it,
+            // so the line would be noise beside the rejection they have
+            // to act on first.
+            //
+            // The key rides as a STRUCTURED field (`repository`) and not
+            // only in the prose, so an operator with hundreds of
+            // repositories can filter the deprecation to the envelopes
+            // they still have to edit. `tracing` does not substitute
+            // field names into a message literal, so the message states
+            // the subject by its role and lets the field carry the
+            // value.
+            for w in report
+                .warnings
+                .iter()
+                .filter(|f| f.rule == LinterRule::RepositoryStoragePathDeprecated)
+            {
+                match &w.warn_context {
+                    Some(crate::lint::WarnContext::RepositoryStoragePathDeprecated {
+                        repository,
+                        detail,
+                    }) => {
+                        tracing::warn!(
+                            repository = %repository,
+                            "gitops apply: deprecated storage.path — {detail}"
+                        );
+                    }
+                    // No structured context (shouldn't happen for this rule) —
+                    // fall back to the flat rendered message.
+                    _ => tracing::warn!("{}", w.message),
+                }
+                // Unlike every other metric-carrying row walked from
+                // `PRE_WRITE_REJECT_ROWS` this one ticks `warn`, not
+                // `reject`: the apply commits. Gated by
+                // `emit_advisories` for the same reason the log line is
+                // — this pass runs twice per boot (preflight, then
+                // apply) and an un-gated emission would double-count
+                // every deprecation.
+                // Read off the finding's own rule, exactly as the
+                // reject walk does, so the label cannot drift from the
+                // row the finding came from.
+                if let Some(metric_rule) = w.rule.metric_rule() {
+                    crate::metrics::emit_apply_config_linter(
+                        metric_rule,
+                        crate::metrics::LinterResult::Warn,
+                    );
+                }
+            }
         }
 
         // ----- upstream-host allowlist (pre-write park gate) -----
@@ -2849,9 +2901,14 @@ mod tests {
             description: None,
             format: "npm".into(),
             repo_type: repo_type.into(),
+            // No `path`: it is deprecated, and row 16 warns on every
+            // declaration — so the shared builder carries the shape this
+            // repository's own trees carry, and a test that wants the
+            // row-16 warning (and its metric) opts in explicitly rather
+            // than every apply test in the module inheriting it.
             storage: Some(StorageSpec {
                 backend: "filesystem".into(),
-                path: format!("/data/{name}"),
+                path: None,
             }),
             proxy: if repo_type == "proxy" {
                 Some(hort_config::repository::ProxySpec {
@@ -3761,18 +3818,20 @@ mod tests {
         let records = captured.lock().unwrap();
         let warn = records
             .iter()
-            .find(|(lvl, _)| *lvl == tracing::Level::WARN)
+            .find(|e| e.level == tracing::Level::WARN)
             .expect("a >1-envelope resolution must warn");
         assert!(
-            warn.1.contains("lint_config_source_count")
-                && warn.1.contains("more than one PermissionGrantLintConfig"),
+            warn.combined.contains("lint_config_source_count")
+                && warn
+                    .combined
+                    .contains("more than one PermissionGrantLintConfig"),
             "warn must carry the count + the singleton message, got: {}",
-            warn.1
+            warn.combined
         );
         assert!(
-            !warn.1.contains("team-alpha"),
+            !warn.combined.contains("team-alpha"),
             "warn must NOT log claim names (operator topology — counts only): {}",
-            warn.1
+            warn.combined
         );
     }
 
@@ -3808,22 +3867,22 @@ mod tests {
         let records = captured.lock().unwrap();
         let info = records
             .iter()
-            .find(|(lvl, _)| *lvl == tracing::Level::INFO)
+            .find(|e| e.level == tracing::Level::INFO)
             .expect("a resolved non-default lint config must log info");
         assert!(
-            info.1.contains("single_claim_allowlist_len=2"),
+            info.combined.contains("single_claim_allowlist_len=2"),
             "info must carry the allowlist length, got: {}",
-            info.1
+            info.combined
         );
         assert!(
-            info.1.contains("rule_overrides_count=1"),
+            info.combined.contains("rule_overrides_count=1"),
             "info must carry the override count, got: {}",
-            info.1
+            info.combined
         );
         assert!(
-            !info.1.contains("team-alpha") && !info.1.contains("platform-readers"),
+            !info.combined.contains("team-alpha") && !info.combined.contains("platform-readers"),
             "info must NOT log claim names (counts only): {}",
-            info.1
+            info.combined
         );
     }
 
@@ -3857,9 +3916,275 @@ mod tests {
 
         let records = captured.lock().unwrap();
         assert!(
-            !records.iter().any(|(lvl, _)| *lvl == tracing::Level::INFO),
+            !records.iter().any(|e| e.level == tracing::Level::INFO),
             "a default-equivalent bundle is not a security-relevant change — no info"
         );
+    }
+
+    // -- row 16: the deprecated `storage.path` advisory ------------------
+    //
+    // Three claims, and the second is the one nothing else in the
+    // workspace holds. (1) The apply SUCCEEDS — the field is set in
+    // every repository envelope written against the pre-`Option` schema,
+    // so a rejection here would turn the first apply after an upgrade
+    // into a boot-parking validation failure over a value that routes
+    // nothing. (2) The rendered sentence does not name its own tracing
+    // field: `tracing` substitutes nothing into a message literal, so a
+    // literal containing the word `repository` renders that word where
+    // the operator expects a repository key, with the real value
+    // arriving separately in the structured block — no information is
+    // lost to an aggregator, but the line's only job is to be read by a
+    // human deciding which envelopes to edit. (3) The key still reaches
+    // the structured block, so that human can filter on it.
+    //
+    // The same split-capture shape as `hort-server`'s `composition.rs`
+    // prose tests, which carry the full reasoning: the `combined`
+    // rendering legitimately contains `repository` as a *key*, so only
+    // `CapturedEvent::message` can answer the question.
+
+    /// `repo_env` with the deprecated `storage.path` declared, which the
+    /// shared builder deliberately omits.
+    fn repo_env_with_storage_path(name: &str, path: &str) -> Envelope<RepositorySpec> {
+        let mut env = repo_env(name, "hosted");
+        env.spec
+            .storage
+            .as_mut()
+            .expect("repo_env declares a storage block")
+            .path = Some(path.into());
+        env
+    }
+
+    /// Run one apply under the split capturing subscriber and hand back
+    /// the events it emitted.
+    ///
+    /// Shares the global-passthrough + interest-rebuild dance with the
+    /// lint-config resolver tests above (see
+    /// [`install_global_passthrough_subscriber`] for why the passthrough
+    /// is needed at all: a callsite first reached with no subscriber
+    /// caches as "never" for the rest of the test binary, which would
+    /// make these assertions vacuously pass depending on test order).
+    ///
+    /// **Synchronous, driving the apply through its own current-thread
+    /// runtime** rather than being an `async fn` the callers `.await`.
+    /// Both of the thread-locals this needs are bound to the thread that
+    /// calls it: `TRACING_TEST_MUTEX` orders the subscriber installs, and
+    /// `set_default` is thread-local — and holding a `std::sync` guard
+    /// across an `.await` is `clippy::await_holding_lock`. A
+    /// current-thread `block_on` runs the future on this thread, so the
+    /// captured events are the apply's own. Mirrors the metric test
+    /// below, which builds its runtime the same way for the same reason.
+    fn capture_apply_events(desired: DesiredState) -> (AppResult<ApplyReport>, Vec<CapturedEvent>) {
+        install_global_passthrough_subscriber();
+        let _serial = TRACING_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let layer = CapturingLayer::default();
+        let captured = layer.records.clone();
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+            runtime.block_on(async {
+                let h = build_harness();
+                h.uc.apply(desired, env_oidc()).await
+            })
+        };
+        let events = captured.lock().unwrap().clone();
+        (result, events)
+    }
+
+    /// Every tracing field the row-16 warn attaches, so the prose check
+    /// below is a census rather than a spot check.
+    const STORAGE_PATH_WARN_FIELD_NAMES: &[&str] = &["repository"];
+
+    /// An apply carrying `storage.path` **succeeds** and emits exactly
+    /// one warning per declaring repository: the key rides as a
+    /// structured field, and the rendered sentence names no field of its
+    /// own.
+    #[test]
+    fn declared_storage_path_warns_without_aborting_the_apply() {
+        let mut desired = DesiredState::default();
+        desired.repositories.push(repo_env_with_storage_path(
+            "npm-legacy",
+            "/var/lib/hort/npm-legacy",
+        ));
+
+        let (result, events) = capture_apply_events(desired);
+
+        let report = result.expect(
+            "a deprecation must not abort the apply — the field is set in every \
+             envelope written against the pre-Option schema",
+        );
+        assert_eq!(
+            report.created, 1,
+            "and the repository is actually committed, not merely not-rejected"
+        );
+
+        let warns: Vec<&CapturedEvent> = events
+            .iter()
+            .filter(|e| {
+                e.level == tracing::Level::WARN && e.message.contains("deprecated storage.path")
+            })
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "exactly one deprecation warning per declaring repository; got {events:?}"
+        );
+        let warn = warns[0];
+
+        // Non-vacuity: an event the harness never saw, or one with an
+        // empty message, would satisfy every `contains` below trivially.
+        assert!(
+            !warn.message.is_empty(),
+            "captured no message — the checks below would be vacuous: {warn:?}"
+        );
+        assert!(
+            !warn.fields.is_empty(),
+            "captured no fields — the harness is not seeing this event: {warn:?}"
+        );
+
+        // (2) The prose names no tracing field of its own. The gitops
+        // *kind* `ArtifactRepository` is an operator surface and has to
+        // stay spelled out — same carve-out `composition.rs` makes for a
+        // chart value or an env var — and does not collide with the
+        // lowercase field name.
+        for name in STORAGE_PATH_WARN_FIELD_NAMES {
+            assert!(
+                !warn.message.contains(name),
+                "the rendered message names its own tracing field `{name}`, so an \
+                 operator reads the field name where its value belongs. Message was: {}",
+                warn.message
+            );
+        }
+
+        // (3) …and the value is attached, so an operator with hundreds
+        // of repositories can filter the deprecation to the envelopes
+        // they still have to edit.
+        assert_eq!(
+            warn.field("repository"),
+            Some("npm-legacy"),
+            "the repository key must stay attached, carrying the value: {warn:?}"
+        );
+
+        // The operator-actionable content: what does route placement,
+        // and which line to delete.
+        assert!(
+            warn.message.contains("HORT_STORAGE_BACKEND"),
+            "the deployment knob that DOES select placement must be named — it is an \
+             operator surface, not a tracing field: {}",
+            warn.message
+        );
+        assert!(
+            warn.message.contains("`path:`"),
+            "the line to drop must be named: {}",
+            warn.message
+        );
+    }
+
+    /// A repository that already dropped the line applies **silently** —
+    /// the counter-assertion that the warning above is caused by the
+    /// field and not by applying a repository at all.
+    #[test]
+    fn absent_storage_path_applies_without_a_deprecation_warning() {
+        let mut desired = DesiredState::default();
+        // The shared builder declares `storage: { backend: filesystem }`
+        // with no path — the remedy's "keep the block" shape.
+        desired.repositories.push(repo_env("npm-current", "hosted"));
+        // …and the "no block at all" shape, which cannot carry a path.
+        let mut no_block = repo_env("npm-inherits", "hosted");
+        no_block.spec.storage = None;
+        desired.repositories.push(no_block);
+
+        let (result, events) = capture_apply_events(desired);
+
+        assert_eq!(
+            result.expect("a clean bundle applies").created,
+            2,
+            "both repositories commit"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.message.contains("deprecated storage.path")),
+            "neither remedy shape may warn: {events:?}"
+        );
+    }
+
+    /// The row's `hort_apply_config_linter_total` series carries the
+    /// catalogued `rule` label and `result="warn"` — the one
+    /// metric-carrying *lint row* whose result is not `reject`, because
+    /// the apply commits. (The four grant rules already span all three
+    /// results; they are emitted from the grant stage, not from here.)
+    #[test]
+    fn declared_storage_path_emits_its_catalogued_linter_metric_as_warn() {
+        use crate::metrics::capture_metrics;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let mut desired = DesiredState::default();
+                desired
+                    .repositories
+                    .push(repo_env_with_storage_path("npm-legacy", "/var/lib/hort/x"));
+                h.uc.apply(desired, env_oidc())
+                    .await
+                    .expect("the warning does not abort the apply");
+            });
+        });
+
+        let entries = snap.into_vec();
+        let hits: Vec<_> = entries
+            .iter()
+            .filter(|(k, _, _, _)| k.key().name() == "hort_apply_config_linter_total")
+            .filter(|(k, _, _, _)| {
+                k.key()
+                    .labels()
+                    .any(|l| l.key() == "rule" && l.value() == "repository_storage_path_deprecated")
+            })
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "one series for the row; got {:?}",
+            entries
+                .iter()
+                .map(|(k, _, _, _)| k.key().name().to_string())
+                .collect::<Vec<_>>()
+        );
+        let labels: HashMap<&str, &str> = hits[0]
+            .0
+            .key()
+            .labels()
+            .map(|l| (l.key(), l.value()))
+            .collect();
+        assert_eq!(
+            labels.get("result"),
+            Some(&"warn"),
+            "the apply commits, so the result is `warn` and never `reject`: {labels:?}"
+        );
+        // The operator's filesystem path is operator-authored free text
+        // and must never become a label.
+        assert!(
+            !labels.contains_key("path") && !labels.contains_key("repository"),
+            "no unbounded label may ride this series: {labels:?}"
+        );
+        match hits[0].3 {
+            metrics_util::debugging::DebugValue::Counter(v) => assert_eq!(
+                v, 1,
+                "one increment per offending repository, not one per apply pass \
+                 (the pass runs twice per boot: preflight, then apply)"
+            ),
+            ref other => panic!("expected Counter, got {other:?}"),
+        }
     }
 
     // -- tracing capture machinery (mirrors `repository_access.rs`'s
@@ -3868,9 +4193,38 @@ mod tests {
 
     use tracing_subscriber::layer::SubscriberExt;
 
+    /// One captured `tracing` event.
+    ///
+    /// `combined` is the flat `key=value …` rendering the existing
+    /// assertions in this module read. `message` and `fields` are the
+    /// same event with the message literal held **apart** from the
+    /// structured block, which the flat form cannot express: the
+    /// structured block legitimately contains a field's *name* as a key,
+    /// so a substring match over `combined` cannot tell a correct event
+    /// from one whose message literal names its own field — the defect
+    /// where an operator reads `repository` where a repository key
+    /// belongs. Mirrors `CapturedEvent` in `hort-server`'s
+    /// `composition.rs`, which carries that reasoning in full.
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        combined: String,
+        message: String,
+        fields: Vec<(String, String)>,
+    }
+
+    impl CapturedEvent {
+        fn field(&self, name: &str) -> Option<&str> {
+            self.fields
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
     #[derive(Clone, Default)]
     struct CapturingLayer {
-        records: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+        records: Arc<Mutex<Vec<CapturedEvent>>>,
     }
 
     impl<S> tracing_subscriber::Layer<S> for CapturingLayer
@@ -3897,29 +4251,45 @@ mod tests {
         ) {
             let mut visitor = TracingMessageVisitor::default();
             event.record(&mut visitor);
-            self.records
-                .lock()
-                .unwrap()
-                .push((*event.metadata().level(), visitor.combined));
+            self.records.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                combined: visitor.combined,
+                message: visitor.message,
+                fields: visitor.fields,
+            });
         }
     }
 
+    /// Records every field three ways: into the flat `combined` string,
+    /// and — because `tracing` records a message literal as a field
+    /// named `message` — with that one field routed to its own slot and
+    /// the rest kept as `(key, value)` pairs.
     #[derive(Default)]
     struct TracingMessageVisitor {
         combined: String,
+        message: String,
+        fields: Vec<(String, String)>,
+    }
+    impl TracingMessageVisitor {
+        fn put(&mut self, field: &tracing::field::Field, rendered: String) {
+            self.combined
+                .push_str(&format!("{}={rendered} ", field.name()));
+            if field.name() == "message" {
+                self.message = rendered;
+            } else {
+                self.fields.push((field.name().to_string(), rendered));
+            }
+        }
     }
     impl tracing::field::Visit for TracingMessageVisitor {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.combined
-                .push_str(&format!("{}={:?} ", field.name(), value));
+            self.put(field, format!("{value:?}"));
         }
         fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-            self.combined
-                .push_str(&format!("{}={} ", field.name(), value));
+            self.put(field, value.to_string());
         }
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.combined
-                .push_str(&format!("{}={} ", field.name(), value));
+            self.put(field, value.to_string());
         }
     }
 
@@ -7999,8 +8369,13 @@ mod tests {
                 // cross-kind FK keeps its distinct log line and its
                 // `"; "`-joined envelope.
                 LinterRule::SaIssuerFk => Consumption::Dedicated,
-                // Row 3 — advisory warning only.
-                LinterRule::UnderConstrainedFederatedIdentities => Consumption::AdvisoryOnly,
+                // Rows 3 and 16 — advisory warnings only. Row 16 is the
+                // one inert-field row that does not reject, so unlike
+                // its twelve siblings it has no rejection to bring
+                // forward; its justification is on
+                // `RULE_REPOSITORY_STORAGE_PATH_DEPRECATED`.
+                LinterRule::UnderConstrainedFederatedIdentities
+                | LinterRule::RepositoryStoragePathDeprecated => Consumption::AdvisoryOnly,
             }
         }
 
@@ -8024,6 +8399,7 @@ mod tests {
             LinterRule::ScanPolicyMaxArtifactAgeNotImplemented,
             LinterRule::SaRotationTargetConflict,
             LinterRule::CompositeVerdictPromotedRequiresScanBackends,
+            LinterRule::RepositoryStoragePathDeprecated,
         ];
 
         let in_table: HashSet<LinterRule> =
@@ -8067,7 +8443,7 @@ mod tests {
             .count();
         assert_eq!(
             (table, dedicated, advisory),
-            (14, 1, 1),
+            (14, 1, 2),
             "the LinterRule bucket counts changed — a silent reclassification \
              (or a variant missing from ALL_RULES) is exactly what this guard \
              exists to catch"

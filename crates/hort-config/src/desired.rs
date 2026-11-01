@@ -1513,6 +1513,98 @@ pub fn validate_scan_policy_promoted_composite_requires_scan_backends(
     errors
 }
 
+/// One repository declaring the deprecated `storage.path`.
+///
+/// A finding struct rather than a [`ValidationError`] because this rule
+/// warns instead of rejecting (see
+/// [`validate_repository_storage_path_deprecated`]): the error channel's
+/// `Display` renders "is invalid", which would be a false statement about
+/// a config the apply goes on to commit. The shape mirrors
+/// [`crate::detect_under_constrained_federated_identities`], the crate's
+/// other warning producer — a typed key beside the rendered sentence, so
+/// the apply path can attach the key as a structured `tracing` field
+/// instead of leaving it only in prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeprecatedStoragePath {
+    /// The offending `ArtifactRepository.metadata.name`.
+    pub repository: String,
+    /// The fully-rendered operator-facing sentence.
+    pub message: String,
+}
+
+/// Apply-time linter **warning** on a declared, deprecated
+/// `ArtifactRepository.spec.storage.path`.
+///
+/// The field is accepted-but-inert: it is parsed, interpolated,
+/// persisted to `repository.storage_path` and selected back by the
+/// adapter queries — and read by nothing that places a blob. Placement
+/// is the one global CAS adapter wired at serve start from the
+/// deployment-level `HORT_STORAGE_BACKEND`, so no value here routes
+/// anything. That is ADR 0015's "accepted at apply, inert at runtime"
+/// block, whose canonical exemplar
+/// [`validate_prefetch_max_age_days_not_implemented`] **rejects**.
+///
+/// **This one warns, and the difference is the field's install base, not
+/// a softer view of the anti-pattern.** `maxAgeDays` had no writers, so
+/// rejecting it failed no existing apply. `storage.path` was effectively
+/// mandatory before it became `Option` — every repository envelope
+/// written against the older schema carries it — so a reject would turn
+/// the first apply after an upgrade into a boot-parking validation
+/// failure for every operator at once, over a field that changes
+/// nothing. Deprecate-then-remove is the path for a field already in
+/// use: this release warns, and the removal (field + `storage_path`
+/// column, the latter under ADR 0030's expand/contract) follows at least
+/// one release later.
+///
+/// **Non-aborting.** The apply commits; the warning is the whole signal.
+/// The sibling `storage.backend` keeps its fail-closed mismatch reject
+/// because a matching `backend` is a *true* statement about placement
+/// and a differing one is a false one the operator must not keep —
+/// whereas every `path` is equally inert, so there is nothing to
+/// cross-check it against and no fail-closed verdict to reach.
+///
+/// **Retirement trigger.** Delete this function, its `LinterRule` row,
+/// its metric constant and its metrics-catalog entry **in the same
+/// commit** that removes `StorageSpec.path` — a warning about a field
+/// that no longer parses is unreachable code a later reader has to
+/// re-derive. (A future release that makes per-repository placement
+/// routing real would retire it the other way, by giving the field a
+/// consumer.)
+///
+/// Pure function of `DesiredState`; one finding per offending
+/// repository.
+pub fn validate_repository_storage_path_deprecated(
+    state: &DesiredState,
+) -> Vec<DeprecatedStoragePath> {
+    let mut findings = Vec::new();
+    for env in &state.repositories {
+        // `storage: { backend: … }` with no `path:` is the remedy, and
+        // an omitted `storage:` block cannot carry one at all — only a
+        // declared value is the finding.
+        if env
+            .spec
+            .storage
+            .as_ref()
+            .and_then(|s| s.path.as_ref())
+            .is_none()
+        {
+            continue;
+        }
+        findings.push(DeprecatedStoragePath {
+            repository: env.metadata.name.clone(),
+            message: format!(
+                "ArtifactRepository `{name}`: `storage.path` is deprecated and routes \
+                 nothing. Blob placement is the deployment's single global CAS, selected \
+                 by HORT_STORAGE_BACKEND; the declared value is persisted and never read, \
+                 so no path here moves a byte. Drop the `path:` line — a `storage:` block \
+                 with `backend:` alone is valid. A later release removes the field.",
+                name = env.metadata.name,
+            ),
+        });
+    }
+    findings
+}
+
 /// Every `UpstreamMapping.spec.repository` must resolve to a declared
 /// `ArtifactRepository.metadata.name`. The apply pipeline needs the
 /// repository_id for the row insert; a dangling reference at
@@ -4655,5 +4747,114 @@ spec:
             row_0.to_string().contains("compositeVerdictMode"),
             "and that is the message the operator gets: {row_0}"
         );
+    }
+    // ---- row 16: the deprecated `storage.path` -----------------------
+    //
+    // The detector's whole job is to tell a declared `path` apart from
+    // the two shapes that are the remedy, so all three are pinned.
+
+    /// A repository envelope with the given `storage:` body.
+    fn repo_yaml_with_storage(name: &str, storage_line: &str) -> Vec<u8> {
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: {name}
+spec:
+  name: {name}
+  format: npm
+  type: hosted
+{storage_line}  isPublic: true
+  replicationPriority: immediate
+"
+        )
+        .into_bytes()
+    }
+
+    /// One finding per declaring repository, carrying that
+    /// repository's key — and the message says what does route
+    /// placement and what to do about it, because a deprecation an
+    /// operator cannot act on is just noise in their log.
+    #[test]
+    fn declared_storage_path_warns_once_per_repository() {
+        let state = DesiredState::parse_files(vec![
+            (
+                p("a.yaml"),
+                repo_yaml_with_storage("alpha", "  storage: { backend: filesystem, path: /a }\n"),
+            ),
+            (
+                p("b.yaml"),
+                repo_yaml_with_storage("beta", "  storage: { backend: filesystem, path: /b }\n"),
+            ),
+            (
+                p("c.yaml"),
+                repo_yaml_with_storage("gamma", "  storage: { backend: filesystem }\n"),
+            ),
+        ])
+        .unwrap();
+
+        let findings = validate_repository_storage_path_deprecated(&state);
+        let keys: Vec<&str> = findings.iter().map(|f| f.repository.as_str()).collect();
+        assert_eq!(keys, vec!["alpha", "beta"], "one per declaring repo");
+        assert!(
+            !findings.iter().any(|f| f.repository == "gamma"),
+            "the repository that already dropped the line is untouched: {findings:?}"
+        );
+
+        let first = &findings[0];
+        assert!(
+            first.message.contains("alpha"),
+            "the message names the offender: {}",
+            first.message
+        );
+        assert!(
+            first.message.contains("deprecated"),
+            "the message says the field is deprecated: {}",
+            first.message
+        );
+        assert!(
+            first.message.contains("HORT_STORAGE_BACKEND"),
+            "the message names what DOES select placement: {}",
+            first.message
+        );
+        assert!(
+            first.message.contains("`path:`"),
+            "the message names the line to drop: {}",
+            first.message
+        );
+    }
+
+    /// `storage: { backend: filesystem }` — the remedy — is silent.
+    #[test]
+    fn storage_block_without_path_is_silent() {
+        let state = DesiredState::parse_files(vec![(
+            p("a.yaml"),
+            repo_yaml_with_storage("alpha", "  storage: { backend: filesystem }\n"),
+        )])
+        .unwrap();
+        assert!(
+            validate_repository_storage_path_deprecated(&state).is_empty(),
+            "a block with no path is the remedy, not a finding"
+        );
+    }
+
+    /// An omitted `storage:` block cannot carry a path at all, and must
+    /// not be read as one by the `and_then` chain.
+    #[test]
+    fn omitted_storage_block_is_silent() {
+        let state =
+            DesiredState::parse_files(vec![(p("a.yaml"), repo_yaml_with_storage("alpha", ""))])
+                .unwrap();
+        assert!(
+            validate_repository_storage_path_deprecated(&state).is_empty(),
+            "an omitted block is the other remedy"
+        );
+    }
+
+    /// An empty desired state produces nothing — the counter-assertion
+    /// that the three tests above are not passing on an empty corpus.
+    #[test]
+    fn no_repositories_is_silent() {
+        assert!(validate_repository_storage_path_deprecated(&DesiredState::default()).is_empty());
     }
 }

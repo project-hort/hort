@@ -25,6 +25,5 @@ spec:
   type: hosted
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/oci-trivy-e2e
   isPublic: true
   replicationPriority: local_only

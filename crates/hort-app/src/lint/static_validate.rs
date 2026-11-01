@@ -213,6 +213,33 @@ pub(crate) const RULE_SCAN_POLICY_MAX_ARTIFACT_AGE_NOT_IMPLEMENTED: &str =
 pub(crate) const RULE_COMPOSITE_VERDICT_PROMOTED_REQUIRES_SCAN_BACKENDS: &str =
     "composite_verdict_promoted_requires_scan_backends";
 
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when an `ArtifactRepository`
+/// envelope declares the deprecated `storage.path`. The field is parsed,
+/// persisted and read by nothing that places a blob — placement is the
+/// one global CAS adapter selected by `HORT_STORAGE_BACKEND` — so it is
+/// the same ADR 0015 accepted-but-inert surface
+/// [`RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED`] closes for
+/// `maxAgeDays`, on the storage axis.
+///
+/// **The only rule label defined in this module whose metric result is
+/// `warn` rather than `reject`** — the four grant-rule labels in
+/// [`crate::lint::permission_grants`] already span all three results,
+/// but every inert-field row here rejects. `maxAgeDays` had no writers,
+/// so rejecting it failed no existing apply; `storage.path` was
+/// effectively mandatory before it became `Option`, so a reject would
+/// fail the first apply after an upgrade for every operator at once over
+/// a field that changes nothing. The reasoning is on
+/// [`hort_config::desired::validate_repository_storage_path_deprecated`],
+/// which also carries the retirement trigger. One increment per
+/// offending repository. Catalog entry update ships in the same PR
+/// (`docs/metrics-catalog.md`).
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_REPOSITORY_STORAGE_PATH_DEPRECATED: &str =
+    "repository_storage_path_deprecated";
+
 /// The snapshot-free apply-config lint rules.
 ///
 /// The discriminant is carried on every [`LintFinding`] so the apply
@@ -306,6 +333,16 @@ pub enum LinterRule {
     /// findings, so appending is the only placement that leaves every
     /// existing config's reject message exactly as it was.
     CompositeVerdictPromotedRequiresScanBackends,
+    /// Row 16 — an `ArtifactRepository` declaring the deprecated,
+    /// placement-inert `storage.path`. **Warn + metric** — the only
+    /// inert-field row that does not reject (see
+    /// [`RULE_REPOSITORY_STORAGE_PATH_DEPRECATED`] for why the field's
+    /// install base, not a softer reading of ADR 0015, is the
+    /// difference). Appended after row 15: it produces no error
+    /// findings, so its placement cannot change which message an
+    /// already-failing config rejects with either way, and appending
+    /// keeps the row order one monotonic list.
+    RepositoryStoragePathDeprecated,
 }
 
 impl LinterRule {
@@ -347,6 +384,9 @@ impl LinterRule {
             }
             Self::CompositeVerdictPromotedRequiresScanBackends => {
                 Some(RULE_COMPOSITE_VERDICT_PROMOTED_REQUIRES_SCAN_BACKENDS)
+            }
+            Self::RepositoryStoragePathDeprecated => {
+                Some(RULE_REPOSITORY_STORAGE_PATH_DEPRECATED)
             }
             Self::SaIssuerFk
             | Self::UnderConstrainedFederatedIdentities
@@ -394,6 +434,15 @@ pub enum WarnContext {
     ProvenanceVerifyIfPresent {
         /// The offending `ScanPolicy.metadata.name`.
         policy: String,
+    },
+    /// Row 16 — an `ArtifactRepository` declaring the deprecated
+    /// `storage.path`.
+    RepositoryStoragePathDeprecated {
+        /// The offending `ArtifactRepository.metadata.name`.
+        repository: String,
+        /// The detector's core sentence (the `{}` the apply log template
+        /// fills).
+        detail: String,
     },
 }
 
@@ -715,6 +764,30 @@ impl StaticConfigValidator {
             report.errors.push(LintFinding::error(
                 LinterRule::CompositeVerdictPromotedRequiresScanBackends,
                 err.to_string(),
+            ));
+        }
+
+        // Row 16 — an `ArtifactRepository` declaring the deprecated
+        // `storage.path`. The one inert-field row that WARNS: the field
+        // was effectively mandatory before it became `Option`, so a
+        // reject would fail the first apply after an upgrade for every
+        // operator at once over a value that routes nothing (the
+        // reasoning and the retirement trigger live on the detector).
+        // Shaped like row 3: the `message` is the FULLY-RENDERED line
+        // the CLI prints, and the `warn_context` carries the typed
+        // repository key the apply path re-emits as a structured `warn!`
+        // field.
+        for finding in hort_config::desired::validate_repository_storage_path_deprecated(desired) {
+            report.warnings.push(LintFinding::warning(
+                LinterRule::RepositoryStoragePathDeprecated,
+                format!(
+                    "gitops apply: deprecated storage.path — {}",
+                    finding.message
+                ),
+                Some(WarnContext::RepositoryStoragePathDeprecated {
+                    repository: finding.repository,
+                    detail: finding.message,
+                }),
             ));
         }
 
@@ -1450,9 +1523,14 @@ mod tests {
                 description: None,
                 format: format.into(),
                 repo_type: "proxy".into(),
+                // No `path`: it is deprecated, and row 16 warns on every
+                // declaration — so the shared builder carries the shape
+                // this repository's own trees carry, and a test that
+                // wants the row-16 finding opts in explicitly rather
+                // than every other test in the module inheriting it.
                 storage: Some(StorageSpec {
                     backend: "filesystem".into(),
-                    path: format!("/data/{name}"),
+                    path: None,
                 }),
                 proxy: Some(hort_config::repository::ProxySpec {
                     upstream_url: "https://example.com".into(),
@@ -2147,6 +2225,96 @@ mod tests {
             report.errors.is_empty(),
             "omitted storage inherits — no mismatch: {:?}",
             report.errors
+        );
+    }
+
+    // ---- row 16: deprecated storage.path ------------------------------
+
+    /// The row produces a **warning**, never an error, and the warning
+    /// carries the typed repository key in its `WarnContext` so the
+    /// apply path can attach it as a structured `tracing` field rather
+    /// than leaving it only in prose.
+    #[test]
+    fn declared_storage_path_warns_and_never_errors() {
+        let mut repo = repo_env("legacy-path", "oci");
+        repo.spec.storage.as_mut().unwrap().path = Some("/var/lib/hort/legacy-path".into());
+        let desired = DesiredState {
+            repositories: vec![repo],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+
+        assert!(
+            report
+                .errors
+                .iter()
+                .all(|f| f.rule != LinterRule::RepositoryStoragePathDeprecated),
+            "the deprecation must never reach the error channel — a reject \
+             would fail every apply that still carries the field: {:?}",
+            report.errors
+        );
+        let hits: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|f| f.rule == LinterRule::RepositoryStoragePathDeprecated)
+            .collect();
+        assert_eq!(hits.len(), 1, "one per declaring repository: {hits:?}");
+        assert!(
+            hits[0].message.contains("legacy-path")
+                && hits[0].message.contains("HORT_STORAGE_BACKEND"),
+            "the CLI-printed message names the offender and what does route \
+             placement: {}",
+            hits[0].message
+        );
+        assert_eq!(
+            hits[0].warn_context,
+            Some(WarnContext::RepositoryStoragePathDeprecated {
+                repository: "legacy-path".into(),
+                detail: hort_config::desired::validate_repository_storage_path_deprecated(&desired)
+                    [0]
+                .message
+                .clone(),
+            }),
+            "the typed key must reach the apply path, single-sourced from \
+             the detector: {:?}",
+            hits[0].warn_context
+        );
+    }
+
+    /// The remedy is silent, on both of its shapes — a declared block
+    /// with no `path`, and no block at all.
+    #[test]
+    fn storage_path_absent_produces_no_warning() {
+        for (name, drop_block) in [("keeps-block", false), ("drops-block", true)] {
+            let mut repo = repo_env(name, "oci"); // builder carries path: None
+            if drop_block {
+                repo.spec.storage = None;
+            }
+            let desired = DesiredState {
+                repositories: vec![repo],
+                ..Default::default()
+            };
+            let report = oci_validator().validate(&desired);
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .all(|f| f.rule != LinterRule::RepositoryStoragePathDeprecated),
+                "`{name}` declares no path and must be silent: {:?}",
+                report.warnings
+            );
+        }
+    }
+
+    /// The row carries a metric, and it is the one rule here whose
+    /// result is `warn`. Pinned on the label value rather than on
+    /// `is_some()`, because a label that drifts from the catalog is a
+    /// silently-renamed series.
+    #[test]
+    fn row_16_metric_label_matches_the_catalog() {
+        assert_eq!(
+            LinterRule::RepositoryStoragePathDeprecated.metric_rule(),
+            Some("repository_storage_path_deprecated")
         );
     }
 
