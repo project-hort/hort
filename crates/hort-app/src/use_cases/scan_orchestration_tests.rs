@@ -8449,15 +8449,95 @@ async fn a_promoted_constituent_stops_holding_on_a_missing_decoder_but_not_on_a_
     );
 }
 
+/// **The second refusal pair, end to end** — the one the live defect was.
+///
+/// A layer whose tree no analyzer claimed stops holding on a promoted
+/// policy: nothing in "no analyzer matched" is a statement that these
+/// bytes are dangerous, and ADR 0064 D2 governs the absence of an
+/// assessment exactly as it governs a finding. The layer lands on a
+/// completed not-applicable assessment, so it releases on its own time
+/// gate instead of sitting `scan_indeterminate` with `last_scan_at` NULL
+/// while the manifest that composes it serves — which is the state a
+/// client resolving a manifest and fetching its layers hits as a 503.
+///
+/// Paired with the refusal that must keep holding the same row for the
+/// opposite reason: `IncompleteComposition` is the *composition's* own
+/// absent assessment, so there is nothing above it to hand the
+/// obligation to, and moving it would release a layer on the strength of
+/// an image nobody assembled.
+#[tokio::test]
+async fn a_promoted_constituent_stops_holding_when_no_analyzer_matched_its_tree() {
+    let (outcome, _events, artifacts, artifact_id, uc, job) = constituent_scan(
+        seed_promoted_policy(vec!["trivy".into()]),
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NoAnalyzerMatched,
+        )),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "no analyzer claiming the layer's tree is an absence of analysis the \
+         composition carries, not a hold on the layer: {outcome:?}"
+    );
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    assert_ne!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "the layer must not be left terminal for an assessment it does not owe"
+    );
+
+    let (outcome, _events, artifacts, artifact_id, uc, job) = constituent_scan(
+        seed_promoted_policy(vec!["trivy".into()]),
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::IncompleteComposition,
+        )),
+    )
+    .await;
+    assert!(
+        matches!(outcome, ScanRunOutcome::NothingAnalysable { .. }),
+        "an image that was never assembled is the composition's own absent \
+         assessment: {outcome:?}"
+    );
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "there is nothing above an unassembled composition for the obligation to move to"
+    );
+}
+
 /// And the other refusals keep holding a promoted constituent too — only
-/// the missing decoder moved. Stated separately from the pair above
-/// because this is about the rest of the enum: a refusal that drifted
-/// onto the non-gating side would release a layer nothing assessed.
+/// the two that state an *absence of analysis* moved. Stated separately
+/// from the pairs above because this is about the rest of the enum: a
+/// refusal that drifted onto the non-gating side would release a layer
+/// nothing assessed.
+///
+/// `UnusableArchive` is here even though ADR 0064 D2 names it in the same
+/// sentence as the decoder case: the trivy adapter reaches it both for
+/// "no decoder for this compression" (which D2 places with the
+/// composition) and for "an extraction bound tripped / an entry tried to
+/// escape the workspace" (which keeps gating), and until those are two
+/// reasons the fail-closed reading is the only safe one.
 #[tokio::test]
 async fn a_promoted_constituent_still_holds_on_every_other_refusal() {
     for refusal in [
         NotAnalysable::UnusableArchive,
-        NotAnalysable::NoAnalyzerMatched,
         NotAnalysable::IncompleteComposition,
     ] {
         let (outcome, _events, artifacts, artifact_id, uc, job) = constituent_scan(

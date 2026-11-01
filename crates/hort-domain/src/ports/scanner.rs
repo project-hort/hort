@@ -248,6 +248,16 @@ impl ScanTarget<'_> {
 /// what lets the second one stop gating a constituent whose filesystem
 /// verdict belongs to its composition, while the first keeps gating
 /// everywhere — the pair that [`Self::gates_release`] decides.
+///
+/// [`Self::NoAnalyzerMatched`] sits on the same side of that line as
+/// the missing decoder, and [`Self::IncompleteComposition`] on the same
+/// side as the hostile archive. D2's criterion is about *the bytes
+/// versus the resulting filesystem*, not about which of the four
+/// reasons a reader finds more alarming: "no analyzer claimed anything
+/// in this tree" is an absence of analysis of the filesystem, while "I
+/// could not build the image" is the composition's own absent
+/// assessment and has nothing above it to hand the obligation to. Four
+/// values and two answers, every one of them stated at its own arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotAnalysable {
     /// The artifact carries no package surface for this backend to look
@@ -341,7 +351,21 @@ pub enum NotAnalysable {
     /// assessed and its whole reason for existing is that the package
     /// surface belongs to it rather than to its layers (ADR 0064 D1).
     ///
-    /// Gates (fail-closed): the surface stays unassessed either way.
+    /// **Gates, except on a constituent whose composition carries the
+    /// filesystem verdict** (ADR 0064 D2) — the same conditional answer
+    /// [`Self::UnsupportedContainer`] gets, and for the same reason. D2
+    /// governs the *absence* of an assessment exactly as it governs a
+    /// finding, and "no analyzer claimed anything here" is an absence of
+    /// analysis rather than a claim that the layer's bytes are
+    /// dangerous. On a layer whose composition is the unit of filesystem
+    /// assessment, that absence belongs to the composition; the
+    /// obligation moves rather than being dropped, which is why it moves
+    /// only where an operator has promoted the composite verdict.
+    ///
+    /// The composed-image reading above is unaffected: a manifest is not
+    /// a constituent ([`ArtifactKind::is_composition_constituent`]), so
+    /// an assembled image nothing claimed still fails closed — there is
+    /// nothing above it for the obligation to move to.
     NoAnalyzerMatched,
     /// No report about a composed image exists. In every case this value
     /// reaches today, that is because the composition itself was not
@@ -379,23 +403,34 @@ pub enum NotAnalysable {
 impl NotAnalysable {
     /// Whether this abstention holds the artifact it is about.
     ///
-    /// Two arms answer without consulting anything: [`Self::NotApplicable`]
+    /// Three arms answer without consulting anything: [`Self::NotApplicable`]
     /// is not an unassessed surface but the absence of a surface, so there
-    /// is nothing for a hold to wait on; [`Self::UnusableArchive`],
-    /// [`Self::NoAnalyzerMatched`] and [`Self::IncompleteComposition`] are
-    /// an expected surface that went unassessed, and the fail-closed
-    /// reading of that is a hold (ADR 0007).
+    /// is nothing for a hold to wait on; [`Self::UnusableArchive`] and
+    /// [`Self::IncompleteComposition`] are an expected surface that went
+    /// unassessed, and the fail-closed reading of that is a hold
+    /// (ADR 0007).
     ///
-    /// [`Self::UnsupportedContainer`] is the one arm whose answer depends
-    /// on the artifact rather than only on the refusal, and `kind` and
-    /// `composite_verdict` are what that depends on (ADR 0064 D2). "I have
-    /// no decoder for this container" is a statement about hort's decoder
-    /// inventory, not about the bytes — so on a row that is a *constituent*
-    /// of a composition hort assesses as one unit, and only where an
-    /// operator has promoted that composite verdict, the statement belongs
-    /// to the composition and must not hold the constituent. On every other
-    /// row, and under every other posture, it holds exactly as it did
-    /// before.
+    /// [`Self::UnsupportedContainer`] and [`Self::NoAnalyzerMatched`] are
+    /// the arms whose answer depends on the artifact rather than only on
+    /// the refusal, and `kind` and `composite_verdict` are what that
+    /// depends on (ADR 0064 D2). What puts them together is the criterion
+    /// D2 states: whether what the scan says is about *the bytes* or
+    /// about *the resulting filesystem*, which governs the **absence** of
+    /// an assessment exactly as it governs a finding. "I have no decoder
+    /// for this container" is a statement about hort's decoder inventory;
+    /// "no analyzer claimed anything here" is an absence of analysis.
+    /// Neither says the bytes are dangerous — so on a row that is a
+    /// *constituent* of a composition hort assesses as one unit, and only
+    /// where an operator has promoted that composite verdict, the
+    /// statement belongs to the composition and must not hold the
+    /// constituent. On every other row, and under every other posture,
+    /// both hold exactly as they did before.
+    ///
+    /// The two that stay unconditional are on the other side of the same
+    /// line. `UnusableArchive` is about the bytes — an extraction bound
+    /// tripped, an entry tried to escape the workspace — and
+    /// `IncompleteComposition` is the composition's *own* absent
+    /// assessment, so it has nothing above it to hand the obligation to.
     ///
     /// Both inputs are required, and together: promotion alone would move
     /// the obligation for every format ADR 0064 explicitly leaves undecided,
@@ -419,11 +454,11 @@ impl NotAnalysable {
     ) -> bool {
         match self {
             Self::NotApplicable => false,
-            Self::UnsupportedContainer => {
+            Self::UnsupportedContainer | Self::NoAnalyzerMatched => {
                 !(kind.is_composition_constituent()
                     && composite_verdict.carries_release_authority())
             }
-            Self::UnusableArchive | Self::NoAnalyzerMatched | Self::IncompleteComposition => true,
+            Self::UnusableArchive | Self::IncompleteComposition => true,
         }
     }
 }
@@ -463,12 +498,15 @@ impl std::fmt::Display for NotAnalysable {
 /// backend could analyse to the existing fail-closed
 /// [`QuarantineStatus::ScanIndeterminate`](crate::entities::artifact::QuarantineStatus::ScanIndeterminate)
 /// (ADR 0007) — the same hold an absent verdict already receives — never
-/// to a clean `ScanCompleted`. The one exception is an artifact whose
-/// abstentions are all [`NotAnalysable::NotApplicable`]: there is no
-/// surface to assess, so it records a completed
+/// to a clean `ScanCompleted`. The exception is an artifact none of whose
+/// abstentions gate: always [`NotAnalysable::NotApplicable`], since there
+/// is no surface to assess, and on a constituent under a promoted
+/// composite verdict also the two abstentions whose absent assessment
+/// belongs to the composition (ADR 0064 D2). Those record a completed
 /// [`ScanAssessment::NotApplicable`](crate::events::ScanAssessment::NotApplicable)
-/// instead of a hold — still never a clean verdict. See
-/// [`NotAnalysable::gates_release`].
+/// instead of a hold — still never a clean verdict. Which abstentions
+/// those are is [`NotAnalysable::gates_release`]'s answer and not a list
+/// here.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScanAnalysis {
     /// The backend analysed the target. An empty vector here **is** a
@@ -865,16 +903,56 @@ mod tests {
         );
     }
 
-    /// And the one cell that moved is the only one: every variant, over
+    /// **The second pair ADR 0064 D2 splits, asserted the same way.**
+    /// "No analyzer claimed anything in this layer" is an *absence* of
+    /// analysis, and D2 governs the absence of an assessment exactly as
+    /// it governs a finding: nothing here says the layer's bytes are
+    /// dangerous, so on a constituent whose composition carries the
+    /// filesystem verdict the statement belongs to the composition.
+    ///
+    /// Paired with the two refusals that must keep holding the same row,
+    /// for the same reason the decoder test is a pair: the loosening is
+    /// only correct if it is this narrow. `IncompleteComposition` is a
+    /// statement about the composition itself — the thing that would
+    /// have to inherit the obligation — so moving it would hand the
+    /// obligation to the very assessment that did not happen, and
+    /// `UnusableArchive` is about the bytes.
+    #[test]
+    fn a_promoted_constituent_stops_gating_on_an_unmatched_analyzer_but_not_on_the_composition() {
+        let (kind, mode) = (ArtifactKind::OciBlob, CompositeVerdictMode::Promoted);
+        assert!(
+            !NotAnalysable::NoAnalyzerMatched.gates_release(kind, mode),
+            "no analyzer claiming this layer is an absence of analysis, not a claim \
+             about the bytes; the composition that is assessed carries it"
+        );
+        assert!(
+            NotAnalysable::IncompleteComposition.gates_release(kind, mode),
+            "an image that was never assembled is the composition's own absent \
+             assessment — there is nothing above it for the obligation to move to"
+        );
+        assert!(
+            NotAnalysable::UnusableArchive.gates_release(kind, mode),
+            "an extraction bound tripped is about these bytes and keeps holding them"
+        );
+    }
+
+    /// And the cells that moved are the only ones: every variant, over
     /// every kind, under both postures.
+    ///
+    /// Two cells, one per abstention that states an absence of analysis
+    /// rather than a fact about the bytes — a container with no decoder
+    /// and a tree no analyzer claimed. Both only on an OCI blob, and
+    /// both only under a promoted composite verdict.
     ///
     /// The exhaustive form is what scopes the loosening. ADR 0064 decides
     /// the OCI image and says of every other format "not decided here";
     /// a kind drifting onto the moved side would hand an npm tarball a
     /// decision nobody took, and it would do so silently — the refusal
-    /// would simply stop holding.
+    /// would simply stop holding. The same is true one axis over: a third
+    /// abstention joining `MOVED_REFUSALS` would release a layer on a
+    /// statement that is about its bytes.
     #[test]
-    fn exactly_one_cell_of_the_kind_posture_matrix_moved() {
+    fn exactly_two_cells_of_the_kind_posture_matrix_moved() {
         const EVERY_KIND: [ArtifactKind; 9] = [
             ArtifactKind::MavenJar,
             ArtifactKind::MavenPom,
@@ -886,6 +964,13 @@ mod tests {
             ArtifactKind::OciManifest,
             ArtifactKind::Other,
         ];
+        /// The abstentions ADR 0064 D2 places with the composition: each
+        /// says an assessment is *absent*, neither says anything about the
+        /// layer's bytes.
+        const MOVED_REFUSALS: [NotAnalysable; 2] = [
+            NotAnalysable::UnsupportedContainer,
+            NotAnalysable::NoAnalyzerMatched,
+        ];
         let mut moved = 0usize;
         for refusal in EVERY_ABSTENTION {
             for kind in EVERY_KIND {
@@ -894,12 +979,12 @@ mod tests {
                     CompositeVerdictMode::Promoted,
                 ] {
                     let gates = refusal.gates_release(kind, mode);
-                    let is_moved_cell = refusal == NotAnalysable::UnsupportedContainer
+                    let is_moved_cell = MOVED_REFUSALS.contains(&refusal)
                         && kind == ArtifactKind::OciBlob
                         && mode == CompositeVerdictMode::Promoted;
                     if is_moved_cell {
                         moved += 1;
-                        assert!(!gates, "the moved cell must not gate");
+                        assert!(!gates, "{refusal}: a moved cell must not gate");
                     } else if refusal == NotAnalysable::NotApplicable {
                         assert!(!gates, "{refusal} is the absence of a surface everywhere");
                     } else {
@@ -912,7 +997,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(moved, 1, "one cell moved, and it is the one above");
+        assert_eq!(
+            moved,
+            MOVED_REFUSALS.len(),
+            "one cell moved per refusal that states an absence of analysis, and no other"
+        );
     }
 
     /// The two are **distinguishable by value**, which is what makes
