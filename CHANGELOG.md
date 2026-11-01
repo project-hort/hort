@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The boot-time quarantine-posture log line no longer prints tracing field
+  names where its three counts belong (#331).
 - A `ScanPolicy.quarantineDuration` the deadline arithmetic cannot represent is
   refused at apply, naming the value and the bound, instead of crashing the
   apply or the release sweep once stored (#389).

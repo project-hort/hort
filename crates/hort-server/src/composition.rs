@@ -656,14 +656,12 @@ pub(crate) fn emit_rescan_drive_liveness_signal(
                 age_secs,
                 threshold_secs,
                 staleness_multiplier,
-                "rescan cadence declared but not currently driven: ScanPolicy \
-                 policy_name declares the shortest rescanIntervalHours on this \
-                 deployment (shortest_interval_hours h), and the newest completed \
-                 cron-rescan-tick is age_secs seconds old — past the \
-                 threshold_secs-second window. Until a tick runs again, released \
-                 artifacts are not re-scanned on that cadence and artifacts \
-                 stranded by a failed scan are not re-picked (the same tick drives \
-                 both). Schedule it with \
+                "rescan cadence declared but not currently driven: the newest \
+                 completed cron-rescan-tick is older than the staleness window for \
+                 the ScanPolicy declaring the shortest rescanIntervalHours on this \
+                 deployment. Until a tick runs again, released artifacts are not \
+                 re-scanned on that cadence and artifacts stranded by a failed scan \
+                 are not re-picked (the same tick drives both). Schedule it with \
                  `scheduledTasks.cronRescanTick.enabled=true`, or drain once \
                  without scheduling via `POST /api/v1/admin/tasks/cron-rescan-tick`."
             );
@@ -678,16 +676,16 @@ pub(crate) fn emit_rescan_drive_liveness_signal(
                 policy_name = %cadence.policy_name,
                 threshold_secs,
                 staleness_multiplier,
-                "rescan cadence declared but never driven: ScanPolicy policy_name \
-                 declares the shortest rescanIntervalHours on this deployment \
-                 (shortest_interval_hours h), and no cron-rescan-tick has ever \
-                 completed here — the `scheduledTasks.cronRescanTick` CronJob is \
-                 off by default and nothing else drives the rescan. So released \
-                 artifacts are never re-scanned on that cadence and artifacts \
-                 stranded by a failed scan are never re-picked (the same tick \
-                 drives both); an advisory published after an artifact's only scan \
-                 is not matched against it. This is a supported configuration — if \
-                 you want the cadence you declared, set \
+                "rescan cadence declared but never driven: no cron-rescan-tick has \
+                 ever completed here — the `scheduledTasks.cronRescanTick` CronJob \
+                 is off by default and nothing else drives the rescan — so the \
+                 ScanPolicy declaring the shortest rescanIntervalHours on this \
+                 deployment is not being driven at all. Released artifacts are \
+                 never re-scanned on that cadence and artifacts stranded by a \
+                 failed scan are never re-picked (the same tick drives both); an \
+                 advisory published after an artifact's only scan is not matched \
+                 against it. This is a supported configuration — if you want the \
+                 cadence you declared, set \
                  `scheduledTasks.cronRescanTick.enabled=true`; to drain once \
                  without scheduling anything, \
                  `POST /api/v1/admin/tasks/cron-rescan-tick`."
@@ -819,24 +817,19 @@ pub(crate) fn evaluate_quarantine_posture(
             default_quarantine_duration_secs = posture.default_quarantine_duration_secs,
             permissive_operator_policy_count = posture.permissive_operator_policy_count,
             trust_upstream_publish_time_count = posture.trust_upstream_publish_time_count,
-            "quarantine posture: out-of-the-box ingest is quarantined by default for \
-             default_quarantine_duration_secs seconds. \
-             permissive_operator_policy_count operator ScanPolicy rows set \
-             quarantineDuration=0 (explicit permissive override — legitimate for \
-             internal-only repos but worth flagging in dashboards). \
-             trust_upstream_publish_time_count upstream mappings have opted in to \
-             publish-time anchoring."
+            "quarantine posture: out-of-the-box ingest is quarantined by default for the \
+             resolved default hold, and at least one operator ScanPolicy row overrides that \
+             to permissive with quarantineDuration=0 — an explicit override, legitimate for \
+             internal-only repos but worth flagging in dashboards."
         );
     } else {
         tracing::info!(
             default_quarantine_duration_secs = posture.default_quarantine_duration_secs,
             permissive_operator_policy_count = posture.permissive_operator_policy_count,
             trust_upstream_publish_time_count = posture.trust_upstream_publish_time_count,
-            "quarantine posture: out-of-the-box ingest is quarantined by default for \
-             default_quarantine_duration_secs seconds. No operator \
-             ScanPolicy currently overrides to permissive (quarantineDuration=0). \
-             trust_upstream_publish_time_count upstream mappings have opted in to \
-             publish-time anchoring."
+            "quarantine posture: out-of-the-box ingest is quarantined by default for the \
+             resolved default hold, and no operator ScanPolicy currently overrides to \
+             permissive (quarantineDuration=0)."
         );
     }
 
@@ -4447,6 +4440,329 @@ mod tests {
         assert_rescan_drive_gauge(&entries, 0.0, "archived-and-zero-only");
     }
 
+    // -- emit_rescan_drive_liveness_signal: the rendered sentence ----------
+    //
+    // The gauge tests above pin the verdict; these pin the *prose*, which
+    // nothing else in the workspace holds. `tracing` does not substitute
+    // field names into a message literal, so a literal containing the
+    // word `policy_name` renders the word `policy_name` where the
+    // operator expects a policy name, with the real value arriving
+    // separately in the structured block. No information is lost — an
+    // aggregator reads the fields — but the sentence is, and this line's
+    // only job is to be read by a human deciding whether their
+    // configuration is what they intended.
+    //
+    // The shape asserted here is the one
+    // `hort_adapters_postgres::quarantine_release_candidates::repo_cutoff`
+    // uses: name the thing by its role ("the ScanPolicy declaring the
+    // shortest rescanIntervalHours on this deployment"), never by its
+    // field name, and let the fields supply the specifics. Deliberately
+    // not `{}` interpolation, which would duplicate every value between
+    // the message and its own field.
+    //
+    // An env var, a chart value, a metric name or a task kind in the
+    // prose is NOT this defect: those are operator surfaces and have to
+    // stay spelled out, which is why the chart value and the one-shot
+    // admin task are asserted *present* below.
+
+    /// One captured `tracing` event, with the `message` field kept apart
+    /// from the structured fields.
+    ///
+    /// The split is the whole point: the structured block legitimately
+    /// contains the string `policy_name` — as a *key* — so a substring
+    /// match over a whole rendered line could not tell a correct event
+    /// from the defect. Only the message may not name a field.
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        message: String,
+        fields: Vec<(String, String)>,
+    }
+
+    impl CapturedEvent {
+        fn field(&self, name: &str) -> Option<&str> {
+            self.fields
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// Minimal capturing subscriber layer: records one
+    /// [`CapturedEvent`] per event. Mirrors the `CapturedEvents` idiom
+    /// in `hort_adapters_postgres::quarantine_release_candidates`'s
+    /// tests, with the message routed to its own slot rather than
+    /// stringified in among the fields.
+    #[derive(Clone, Default)]
+    struct CapturedEvents {
+        records: Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+        fn register_callsite(
+            &self,
+            _meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(
+            &self,
+            _meta: &tracing::Metadata<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            /// `tracing` records a message literal as a field named
+            /// `message`, which is how the rendered sentence becomes
+            /// observable at all.
+            #[derive(Default)]
+            struct V {
+                message: String,
+                fields: Vec<(String, String)>,
+            }
+            impl V {
+                fn put(&mut self, f: &tracing::field::Field, v: String) {
+                    if f.name() == "message" {
+                        self.message = v;
+                    } else {
+                        self.fields.push((f.name().to_string(), v));
+                    }
+                }
+            }
+            impl tracing::field::Visit for V {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.put(f, format!("{v:?}"));
+                }
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.put(f, v.to_string());
+                }
+                fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
+                    self.put(f, v.to_string());
+                }
+                fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                    self.put(f, v.to_string());
+                }
+            }
+            let mut v = V::default();
+            event.record(&mut v);
+            self.records.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                message: v.message,
+                fields: v.fields,
+            });
+        }
+    }
+
+    /// Run `emit` under a thread-local capturing subscriber and return
+    /// the events it emitted.
+    ///
+    /// A global no-op passthrough is installed once first: `tracing`
+    /// caches per-callsite interest, and a callsite first reached with
+    /// no subscriber at all caches as "never" for the rest of the test
+    /// binary — which would make the assertions below vacuously pass
+    /// depending on test order. `rebuild_interest_cache` then
+    /// re-evaluates against the thread-local subscriber. Mirrors
+    /// `capture_repo_cutoff` in
+    /// `hort_adapters_postgres::quarantine_release_candidates`.
+    ///
+    /// Takes the emitting closure rather than being written once per
+    /// signal, because the passthrough install is a once-per-process
+    /// act: `set_global_default` succeeds exactly once, so a second
+    /// per-signal copy of this dance would be a block of duplicated
+    /// lines whose `set_global_default` call can only ever fail.
+    fn capture_events(emit: impl FnOnce()) -> Vec<CapturedEvent> {
+        use std::sync::OnceLock;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        /// Discards every event; its only job is to keep callsite
+        /// interest out of the permanently-cached "never" state.
+        struct Passthrough;
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Passthrough {
+            fn register_callsite(
+                &self,
+                _meta: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+        }
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::Registry::default().with(Passthrough),
+            );
+        });
+
+        let layer = CapturedEvents::default();
+        let records = layer.records.clone();
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+            emit();
+        }
+        // Bound rather than returned directly: a tail expression's
+        // temporaries outlive the function's locals, so a `MutexGuard`
+        // borrowing `records` in tail position does not compile.
+        let out = records.lock().unwrap().clone();
+        out
+    }
+
+    /// [`capture_events`] bound to [`emit_rescan_drive_liveness_signal`].
+    fn capture_rescan_drive_events(
+        policies: &[hort_domain::entities::scan_policy::ScanPolicyProjection],
+        last_completed_at: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<CapturedEvent> {
+        capture_events(|| emit_rescan_drive_liveness_signal(policies, last_completed_at, now, 3))
+    }
+
+    /// Every field the rescan-drive signal attaches, so the check below
+    /// is a census rather than a spot check — the defect is the same
+    /// defect whichever of the five names it is.
+    const RESCAN_DRIVE_FIELD_NAMES: &[&str] = &[
+        "policy_name",
+        "shortest_interval_hours",
+        "age_secs",
+        "threshold_secs",
+        "staleness_multiplier",
+    ];
+
+    /// Assert the rendered message names none of the tracing fields in
+    /// `field_names`, with counter-assertions that make the check
+    /// non-vacuous: an event the harness never saw, or one with an
+    /// empty message, would otherwise satisfy every `contains`
+    /// trivially.
+    fn assert_message_names_no_field(event: &CapturedEvent, ctx: &str, field_names: &[&str]) {
+        assert!(
+            !event.message.is_empty(),
+            "{ctx}: captured no message — the `contains` checks would be vacuous"
+        );
+        assert!(
+            !event.fields.is_empty(),
+            "{ctx}: captured no fields — the harness is not seeing this event"
+        );
+        for name in field_names {
+            assert!(
+                !event.message.contains(name),
+                "{ctx}: the rendered message names its own tracing field `{name}`, so an \
+                 operator reads the field name where its value belongs. Message was: {}",
+                event.message
+            );
+        }
+    }
+
+    /// [`assert_message_names_no_field`] bound to the rescan-drive
+    /// census, so a call site cannot reach for another signal's list and
+    /// pass while naming its own fields.
+    fn assert_no_field_name_in_prose(event: &CapturedEvent, ctx: &str) {
+        assert_message_names_no_field(event, ctx, RESCAN_DRIVE_FIELD_NAMES);
+    }
+
+    /// The never-driven WARN — the line this signal exists to emit —
+    /// reads as a sentence, and `policy_name` /
+    /// `shortest_interval_hours` still carry their values as fields.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_never_driven_message_names_no_field() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("crates-scan", 24, false)];
+
+        let events = capture_rescan_drive_events(&policies, None, now);
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == tracing::Level::WARN)
+            .unwrap_or_else(|| panic!("the never-driven path must warn; got {events:?}"));
+        assert_no_field_name_in_prose(warn, "never-driven");
+        assert_eq!(
+            warn.field("policy_name"),
+            Some("crates-scan"),
+            "policy_name must stay attached, carrying the value: {warn:?}"
+        );
+        assert_eq!(
+            warn.field("shortest_interval_hours"),
+            Some("24"),
+            "shortest_interval_hours must stay attached, carrying the value: {warn:?}"
+        );
+        // The chart value and the one-shot admin task are operator
+        // surfaces, not tracing fields: an operator cannot act on this
+        // warning without them, so they stay spelled out in the prose.
+        assert!(
+            warn.message
+                .contains("scheduledTasks.cronRescanTick.enabled=true"),
+            "the chart value to set must stay named: {}",
+            warn.message
+        );
+        assert!(
+            warn.message
+                .contains("POST /api/v1/admin/tasks/cron-rescan-tick"),
+            "the one-shot admin task must stay named: {}",
+            warn.message
+        );
+    }
+
+    /// The stale WARN is the same literal-with-field-names defect in the
+    /// neighbouring match arm, and it named four of its own fields
+    /// (`policy_name`, `shortest_interval_hours`, `age_secs`,
+    /// `threshold_secs`) rather than two.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_stale_message_names_no_field() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("crates-scan", 24, false)];
+
+        // 10 days old; window = 24 h × 3 = 72 h → stale.
+        let events =
+            capture_rescan_drive_events(&policies, Some(now - chrono::Duration::days(10)), now);
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == tracing::Level::WARN)
+            .unwrap_or_else(|| panic!("the stale path must warn; got {events:?}"));
+        assert_no_field_name_in_prose(warn, "stale");
+        assert_eq!(
+            warn.field("policy_name"),
+            Some("crates-scan"),
+            "policy_name must stay attached, carrying the value: {warn:?}"
+        );
+        assert_eq!(
+            warn.field("shortest_interval_hours"),
+            Some("24"),
+            "shortest_interval_hours must stay attached, carrying the value: {warn:?}"
+        );
+        assert!(
+            warn.message
+                .contains("scheduledTasks.cronRescanTick.enabled=true"),
+            "the chart value to set must stay named: {}",
+            warn.message
+        );
+    }
+
+    /// Counter-assertion for the two tests above: the healthy
+    /// (`Driven`) arm logs at DEBUG and already had the right shape, so
+    /// if it ever starts naming a field the same check catches it — and
+    /// if the capture harness were reporting nothing at all, this test's
+    /// own `expect` would fail first.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_driven_debug_message_names_no_field() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("crates-scan", 24, false)];
+
+        let events =
+            capture_rescan_drive_events(&policies, Some(now - chrono::Duration::seconds(300)), now);
+
+        let debug = events
+            .iter()
+            .find(|e| e.level == tracing::Level::DEBUG)
+            .unwrap_or_else(|| panic!("the driven path must log at DEBUG; got {events:?}"));
+        assert_no_field_name_in_prose(debug, "driven");
+    }
+
     // -- derive_oci_token_endpoint_strings ---------------------------------
     //
     // The boot-fail surface for the OCI `/v2/auth` endpoint binding;
@@ -4738,5 +5054,141 @@ mod tests {
         assert_eq!(posture.default_quarantine_duration_secs, 86_400);
         assert_eq!(posture.permissive_operator_policy_count, 2);
         assert_eq!(posture.trust_upstream_publish_time_count, 3);
+    }
+
+    // -- evaluate_quarantine_posture: the rendered sentence -----------------
+    //
+    // The verdict tests above pin the two counts; these pin the *prose*
+    // of the boot line an operator reads to confirm their
+    // quarantine-by-default posture. Both literals named all three of
+    // their own tracing fields, each opening a sentence, so the line
+    // rendered the words `default_quarantine_duration_secs seconds`
+    // where the number belongs. Same defect and same shape as the
+    // rescan-drive prose tests above; the reasoning is there.
+    //
+    // The publish-time-anchoring clause was dropped from the prose
+    // rather than reworded into a role-based equivalent, which is the
+    // one way this signal differs from the rescan one. A role-based
+    // rewrite of a *count* readout cannot stay true in the degenerate
+    // case: the `warn!` arm fires on
+    // `permissive_operator_policy_count > 0`, while
+    // `trust_upstream_publish_time_count` is counted independently off
+    // the upstream mappings and can be `0` in that same arm — so "some
+    // upstream mappings have opted in to publish-time anchoring" is a
+    // sentence that arm can contradict. The count stays attached as
+    // a field, which is all an aggregator reads, and a sentence that can
+    // be false is worse than a sentence that says less.
+    //
+    // `quarantineDuration=0` is the policy-document field an operator
+    // writes, not a tracing field, so it stays spelled out and is
+    // asserted present: without it the warning reports an override and
+    // names nowhere to look for it.
+
+    /// [`capture_events`] bound to [`evaluate_quarantine_posture`].
+    fn capture_quarantine_posture_events(
+        scan_policies: &[hort_domain::entities::scan_policy::ScanPolicyProjection],
+        upstream_mappings: &[hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping],
+    ) -> Vec<CapturedEvent> {
+        capture_events(|| {
+            evaluate_quarantine_posture(scan_policies, upstream_mappings);
+        })
+    }
+
+    /// Every field the quarantine-posture line attaches, so the check
+    /// below is a census rather than a spot check — the defect is the
+    /// same defect whichever of the three names it is.
+    const QUARANTINE_POSTURE_FIELD_NAMES: &[&str] = &[
+        "default_quarantine_duration_secs",
+        "permissive_operator_policy_count",
+        "trust_upstream_publish_time_count",
+    ];
+
+    /// [`assert_message_names_no_field`] bound to the quarantine-posture
+    /// census, so a call site cannot reach for another signal's list and
+    /// pass while naming its own fields.
+    fn assert_no_posture_field_name_in_prose(event: &CapturedEvent, ctx: &str) {
+        assert_message_names_no_field(event, ctx, QUARANTINE_POSTURE_FIELD_NAMES);
+    }
+
+    /// The permissive-override `warn!` arm — the posture line an
+    /// operator most needs to read — names none of its three fields, and
+    /// all three still carry their values.
+    ///
+    /// `trust_upstream_publish_time_count` is deliberately `0` in this
+    /// fixture: this is the boot on which the removed third sentence
+    /// ("… upstream mappings have opted in to publish-time anchoring")
+    /// was not merely unreadable but false.
+    #[test]
+    fn evaluate_quarantine_posture_permissive_warn_message_names_no_field() {
+        let policies = [make_scan_policy(0, false)];
+
+        let events = capture_quarantine_posture_events(&policies, &[]);
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == tracing::Level::WARN)
+            .unwrap_or_else(|| panic!("a permissive override must warn; got {events:?}"));
+        assert_no_posture_field_name_in_prose(warn, "permissive-override");
+        assert_eq!(
+            warn.field("default_quarantine_duration_secs"),
+            Some("86400"),
+            "the resolved default hold must stay attached, carrying its value: {warn:?}"
+        );
+        assert_eq!(
+            warn.field("permissive_operator_policy_count"),
+            Some("1"),
+            "the override count must stay attached, carrying its value: {warn:?}"
+        );
+        assert_eq!(
+            warn.field("trust_upstream_publish_time_count"),
+            Some("0"),
+            "the publish-time opt-in count must stay attached even though the prose no \
+             longer narrates it: {warn:?}"
+        );
+        assert!(
+            warn.message.contains("quarantineDuration=0"),
+            "the operator surface the override is written on must stay named: {}",
+            warn.message
+        );
+    }
+
+    /// The clean `info!` arm: no permissive override, one publish-time
+    /// opt-in. Same census — and the counter-assertion for the test
+    /// above, because the defect stood in both literals and a fix
+    /// applied to only one would pass there and fail here.
+    #[test]
+    fn evaluate_quarantine_posture_clean_info_message_names_no_field() {
+        let policies = [make_scan_policy(3_600, false)];
+        let mappings = [make_upstream_mapping(true)];
+
+        let events = capture_quarantine_posture_events(&policies, &mappings);
+
+        let info = events
+            .iter()
+            .find(|e| e.level == tracing::Level::INFO)
+            .unwrap_or_else(|| panic!("the clean posture must log at INFO; got {events:?}"));
+        assert_no_posture_field_name_in_prose(info, "no-override");
+        assert_eq!(
+            info.field("default_quarantine_duration_secs"),
+            Some("86400"),
+            "the resolved default hold must stay attached, carrying its value: {info:?}"
+        );
+        assert_eq!(
+            info.field("permissive_operator_policy_count"),
+            Some("0"),
+            "the override count must stay attached, carrying its value: {info:?}"
+        );
+        assert_eq!(
+            info.field("trust_upstream_publish_time_count"),
+            Some("1"),
+            "the publish-time opt-in count must stay attached even though the prose no \
+             longer narrates it: {info:?}"
+        );
+        assert!(
+            info.message.contains("quarantineDuration=0"),
+            "the operator surface the absent override would be written on must stay \
+             named: {}",
+            info.message
+        );
     }
 }
