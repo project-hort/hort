@@ -2382,6 +2382,13 @@ pub async fn build_app_context(
     // where an operator triaging "which upstream is plaintext?" needs
     // the emitting format to be the real one.
     let upstream_user_agent = hort_adapters_upstream_http::user_agent_from_env();
+    // Outbound fetch deadline: HORT_UPSTREAM_TIMEOUT_SECS or the built-in
+    // default, resolved by the same adapter helper hort-worker calls so both
+    // binaries agree. Resolved HERE rather than inside the closure because it
+    // is fallible — an unparseable or zero value aborts boot instead of
+    // leaving the operator who raised it on the default — and the closure
+    // runs once per served format.
+    let upstream_timeout = hort_adapters_upstream_http::timeout_from_env()?;
     let upstream_proxy_config = |format_label: &str| {
         hort_adapters_upstream_http::HttpUpstreamProxyConfig {
             extra_trust_anchors: extra_trust_anchors.clone(),
@@ -2393,6 +2400,8 @@ pub async fn build_app_context(
             // default once a chart knob exists.
             metadata_cache_max_bytes: upstream_metadata_cache_max_bytes,
             manifest_cache_max_bytes: upstream_manifest_cache_max_bytes,
+            // Total per-request upstream deadline, resolved above.
+            timeout: upstream_timeout,
             // Outbound User-Agent: HORT_UPSTREAM_USER_AGENT or the built-in
             // default (crates.io rejects requests with no UA). Resolved by the
             // shared adapter helper so hort-server + hort-worker match.

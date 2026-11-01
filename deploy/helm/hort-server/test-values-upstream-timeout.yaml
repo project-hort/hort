@@ -1,0 +1,33 @@
+# Upstream fetch-timeout fixture: a raised `upstream.timeoutSeconds` must
+# reach the env on BOTH Deployments.
+#
+# The worker fetches upstream on four legs of its own (composite scan,
+# prefetch, provenance referrers, OCI index children), so a deadline that
+# only reached hort-server would leave every scheduled upstream fetch on the
+# built-in default — and an operator reading `kubectl describe` on the
+# server pod would have no way to tell.
+#
+# 1234 is deliberately not any other default in the chart, so the rendered
+# value cannot be matched by accident.
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+worker:
+  enabled: true
+
+upstream:
+  timeoutSeconds: 1234

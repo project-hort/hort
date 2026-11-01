@@ -1,0 +1,31 @@
+# Regression fixture: `upstream.timeoutSeconds: 0` MUST be rejected at
+# `helm template`.
+#
+# Zero is not "no timeout" — the value becomes reqwest's total per-request
+# deadline, and the absence of a deadline is spelled by not setting one at
+# all, so a zero deadline fails every upstream fetch immediately. The schema
+# floors the value at 1; the binary refuses the same value at boot, and this
+# fixture is what keeps the earlier of the two refusals in place.
+#
+# `timeoutSeconds` is the only key this fixture sets under `upstream`, so
+# the error can only be about this knob. The pattern is the key name because
+# the rest of the message differs by helm version.
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+upstream:
+  timeoutSeconds: 0
