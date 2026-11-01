@@ -131,29 +131,61 @@ pub struct RepositorySpec {
 /// mapper-round-tripped) but they do **not** route blob placement in
 /// v2: the actual CAS is the single global storage adapter wired once
 /// at serve start from the deployment-level `HORT_STORAGE_BACKEND`.
-/// `backend` is enum-validated at parse to `{filesystem, s3}` (the
-/// global value-domain) so it can no longer be a silent free-string
-/// no-op, and an apply against a deployment whose effective global
-/// backend differs is intended to be rejected loud + fail-closed rather
-/// than silently ignored. Full per-repository multi-backend storage
-/// routing is a planned future feature. Until that lands, the per-repo
-/// `storage.backend` is parsed + persisted but does NOT route
-/// placement; the apply-time mismatch reject keeps this honest.
+/// Full per-repository multi-backend storage routing is a planned
+/// future feature. The two fields are held honest by **different**
+/// controls, and the difference is deliberate:
 ///
-/// `RepositorySpec.storage` is `Option<StorageSpec>`: omitting the
-/// whole block is the documented honest path (inherit the deployment's
-/// effective global backend). The apply-time mismatch reject and the
-/// suggested remedy "omit the per-repo `storage:` block" are therefore
-/// actually reachable.
+/// - `backend` is enum-validated at parse to `{filesystem, s3}` (the
+///   global value-domain) so it can no longer be a silent free-string
+///   no-op, and an apply against a deployment whose effective global
+///   backend differs is **rejected** loud + fail-closed rather than
+///   silently ignored. A declared `backend` that matches the
+///   deployment's is a true statement about where blobs land, which is
+///   why it survives the reject and stays in the schema.
+/// - `path` is **deprecated**: there is no global counterpart to
+///   cross-check it against, nothing in the serve path reads it, and no
+///   value of it is a true statement about placement. An apply that
+///   declares it **warns** (non-aborting) via
+///   [`validate_repository_storage_path_deprecated`](crate::desired::validate_repository_storage_path_deprecated);
+///   the remedy is to drop the `path:` line. A later release removes
+///   the field outright.
+///
+/// Why `path` warns where its own anti-pattern class (ADR 0015,
+/// "accepted at apply, inert at runtime") otherwise **rejects**: a
+/// reject is only free when nothing has written the field yet. The
+/// canonical exemplar `PrefetchPolicy.maxAgeDays` was never in use, so
+/// rejecting it broke no existing tree; `storage.path` is set in every
+/// repository envelope written before this deprecation, so a reject
+/// would fail every existing apply on upgrade. Deprecate-then-remove is
+/// the path for a field already in use.
+///
+/// `RepositorySpec.storage` is `Option<StorageSpec>` and `path` is
+/// `Option<String>`: omitting the whole block is the documented honest
+/// path (inherit the deployment's effective global backend), and
+/// `storage: { backend: filesystem }` is valid — which is what makes
+/// both the mismatch reject's "omit the per-repo `storage:` block"
+/// remedy and the deprecation warning's "drop the `path:` line" remedy
+/// reachable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StorageSpec {
     /// `filesystem | s3` — enum-validated at parse, case-sensitive,
     /// matching the global `HORT_STORAGE_BACKEND` value-domain.
-    /// Persisted but placement-inert in v2 (see the `StorageSpec`
-    /// honesty note above).
+    /// Persisted but placement-inert in v2; the apply-time mismatch
+    /// reject is what keeps it honest (see the `StorageSpec` honesty
+    /// note above).
     pub backend: String,
-    pub path: String,
+    /// **Deprecated** — persisted to `repository.storage_path` and read
+    /// by nothing. Placement is the one global CAS adapter selected by
+    /// `HORT_STORAGE_BACKEND`, so no value here routes anything.
+    /// Declaring it warns at apply (non-aborting); a later release
+    /// removes the field. `Option` so `storage: { backend: filesystem }`
+    /// parses — the warning's remedy has to be writable, and before this
+    /// an operator who wanted to state `backend` was forced to invent a
+    /// path that did nothing. `skip_serializing_if` keeps a round-tripped
+    /// spec from re-emitting the deprecated key it did not carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// The closed value-domain for [`StorageSpec::backend`]. Mirrors the
@@ -314,8 +346,8 @@ pub fn parse_repository(path: &Path, bytes: &[u8]) -> Result<Envelope<Repository
     if let Some(desc) = env.spec.description.as_mut() {
         *desc = interpolate(desc)?;
     }
-    if let Some(storage) = env.spec.storage.as_mut() {
-        storage.path = interpolate(&storage.path)?;
+    if let Some(path) = env.spec.storage.as_mut().and_then(|s| s.path.as_mut()) {
+        *path = interpolate(path)?;
     }
     if let Some(p) = env.spec.proxy.as_mut() {
         p.upstream_url = interpolate(&p.upstream_url)?;
@@ -1859,7 +1891,7 @@ spec:
                 repo_type: "hosted".into(),
                 storage: Some(StorageSpec {
                     backend: "filesystem".into(),
-                    path: "/x".into(),
+                    path: Some("/x".into()),
                 }),
                 proxy: Some(ProxySpec {
                     upstream_url: "https://crates.io".into(),
@@ -1966,6 +1998,76 @@ spec:
         assert!(
             env.spec.storage.is_none(),
             "omitted storage must deserialise to None, not a default"
+        );
+    }
+
+    /// A declared `storage:` block with **no** `path:` parses to
+    /// `path: None`. This is what makes the deprecation warning's
+    /// remedy writable: `path` used to be a required `String` under
+    /// `deny_unknown_fields`, so an operator who wanted to state
+    /// `backend` was forced to invent a path that routed nothing.
+    #[test]
+    fn storage_path_omitted_parses_to_none() {
+        let body = "
+  name: x
+  format: npm
+  type: hosted
+  storage: { backend: filesystem }
+  isPublic: true
+  replicationPriority: immediate
+";
+        let env = parse_repository(&p(), yaml(body).as_bytes())
+            .expect("`storage: { backend: filesystem }` must parse");
+        let storage = env.spec.storage.as_ref().expect("the block is declared");
+        assert_eq!(storage.backend, "filesystem");
+        assert!(
+            storage.path.is_none(),
+            "an undeclared path must deserialise to None, not an empty string"
+        );
+    }
+
+    /// A declared `path:` still parses — the field is deprecated, not
+    /// removed, and existing YAML keeps working (the whole reason this
+    /// warns instead of rejecting). Pinned so the `Option` migration
+    /// cannot quietly become a parse rejection.
+    #[test]
+    fn storage_path_declared_still_parses() {
+        let body = "
+  name: x
+  format: npm
+  type: hosted
+  storage: { backend: filesystem, path: /var/lib/hort/x }
+  isPublic: true
+  replicationPriority: immediate
+";
+        let env = parse_repository(&p(), yaml(body).as_bytes())
+            .expect("a declared path must keep parsing — deprecated, not removed");
+        assert_eq!(
+            env.spec.storage.as_ref().and_then(|s| s.path.as_deref()),
+            Some("/var/lib/hort/x")
+        );
+    }
+
+    /// A spec that carried no `path` does not re-emit the deprecated key
+    /// when serialised back out (`skip_serializing_if`). Without this a
+    /// round-trip through the spec would hand the next reader a `path:`
+    /// the operator never wrote — and the warning would name a line
+    /// that is not in their tree.
+    #[test]
+    fn omitted_storage_path_is_not_reserialised() {
+        let body = "
+  name: x
+  format: npm
+  type: hosted
+  storage: { backend: filesystem }
+  isPublic: true
+  replicationPriority: immediate
+";
+        let env = parse_repository(&p(), yaml(body).as_bytes()).unwrap();
+        let rendered = serde_json::to_string(&env.spec.storage).unwrap();
+        assert!(
+            !rendered.contains("path"),
+            "an absent path must not be re-emitted: {rendered}"
         );
     }
 

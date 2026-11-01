@@ -11,7 +11,6 @@ spec:
   # cold-start concern does not apply (the default released_only is correct).
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/dockerhub-proxy
   proxy:
     upstreamUrl: "https://registry-1.docker.io"
   isPublic: false

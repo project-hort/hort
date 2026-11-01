@@ -9,6 +9,5 @@ spec:
   type: hosted
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/hort-charts
   isPublic: true
   replicationPriority: local_only

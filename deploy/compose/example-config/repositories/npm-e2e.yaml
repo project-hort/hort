@@ -9,6 +9,5 @@ spec:
   type: hosted
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/npm-e2e
   isPublic: true
   replicationPriority: local_only

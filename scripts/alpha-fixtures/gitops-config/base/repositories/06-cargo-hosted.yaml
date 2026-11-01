@@ -9,6 +9,5 @@ spec:
   type: hosted
   storage:
     backend: filesystem
-    path: cargo-hosted
   isPublic: true
   replicationPriority: local_only

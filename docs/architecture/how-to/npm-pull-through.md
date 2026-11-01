@@ -124,7 +124,6 @@ spec:
   type: proxy
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/npm-public
   proxy:
     upstreamUrl: https://registry.npmjs.org
   isPublic: true

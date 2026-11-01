@@ -9,7 +9,6 @@ spec:
   type: proxy
   storage:
     backend: filesystem
-    path: npm-proxy
   proxy:
     upstreamUrl: "https://registry.npmjs.org"
   isPublic: true

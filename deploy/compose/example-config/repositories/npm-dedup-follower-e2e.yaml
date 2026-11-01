@@ -13,7 +13,6 @@ spec:
   indexMode: include_pending
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/npm-dedup-follower-e2e
   proxy:
     # Same upstream as npm-dedup-leader-e2e: identical bytes, hence an
     # identical `dist.integrity` SRI, hence the SAME cross-repository

@@ -25,7 +25,6 @@ spec:
   indexMode: include_pending
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/crates-proxy
   proxy:
     upstreamUrl: "https://index.crates.io"
   isPublic: false

@@ -536,7 +536,6 @@ spec:
   replicationPriority: local_only
   storage:
     backend: filesystem
-    path: py-lib
 ";
 
     const REPO_OCI_HOSTED: &str = "\
@@ -552,7 +551,6 @@ spec:
   replicationPriority: local_only
   storage:
     backend: filesystem
-    path: oci-hosted
 ";
 
     // ---- clap parsing -----------------------------------------------------
@@ -778,7 +776,6 @@ spec:
   replicationPriority: local_only
   storage:
     backend: s3
-    path: s3-on-fs
 ";
         let dir = TempDir::new().unwrap();
         write(dir.path(), "repositories/r.yaml", repo);
@@ -806,7 +803,6 @@ spec:
   replicationPriority: local_only
   storage:
     backend: filesystem
-    path: oci-proxy
   proxy:
     upstreamUrl: https://index.docker.io
 ";
@@ -1161,7 +1157,6 @@ spec:
   replicationPriority: local_only
   storage:
     backend: filesystem
-    path: npm-proxy
   proxy:
     upstreamUrl: https://registry.npmjs.org
   prefetchPolicy:
@@ -1191,7 +1186,6 @@ spec:
   replicationPriority: local_only
   storage:
     backend: filesystem
-    path: npm-proxy
   proxy:
     upstreamUrl: https://registry.npmjs.org
 ";
@@ -1242,7 +1236,6 @@ spec:
   replicationPriority: local_only
   storage:
     backend: filesystem
-    path: npm-proxy
 ";
         // A single-claim ([developer]) grant — the linter rejects it
         // (single-claim-grant rule, `reject` by secure default).
@@ -1293,7 +1286,6 @@ spec:
     upstreamUrl: https://registry-1.docker.io
   storage:
     backend: filesystem
-    path: oci-mirror
 ";
         let mapping = "\
 apiVersion: project-hort.de/v1
@@ -1336,7 +1328,6 @@ spec:
     upstreamUrl: https://registry-1.docker.io
   storage:
     backend: filesystem
-    path: oci-mirror
 ";
         let mapping = "\
 apiVersion: project-hort.de/v1
@@ -1406,6 +1397,47 @@ spec:
         // With --strict → the warning is promoted to exit 1.
         let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, true);
         assert_eq!(code_str(code), exit(1), "warnings under --strict → 1");
+    }
+
+    /// The deprecated `storage.path` is a warning on the offline gate
+    /// too: exit 0 by default, exit 1 under `--strict`. That split is
+    /// the whole point of deprecating rather than rejecting — an
+    /// operator's existing tree still validates and still applies, while
+    /// a CI job that opts into `--strict` learns there is a line to drop
+    /// before the removal lands.
+    #[test]
+    fn validate_tree_deprecated_storage_path_warns_and_promotes_under_strict() {
+        let repo = "\
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: oci-legacy
+spec:
+  name: oci-legacy
+  format: oci
+  type: hosted
+  isPublic: true
+  replicationPriority: local_only
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/oci-legacy
+";
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", repo);
+
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(
+            code_str(code),
+            success(),
+            "a deprecated field must not fail the default gate"
+        );
+
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, true);
+        assert_eq!(
+            code_str(code),
+            exit(1),
+            "--strict promotes the deprecation, so CI can see it"
+        );
     }
 
     // ---- HORT_UPSTREAM_USER_AGENT offline lint --------------------------
@@ -1604,7 +1636,6 @@ spec:
   replicationPriority: local_only
   storage:
     backend: filesystem
-    path: blank
 ";
 
     /// A second envelope re-declaring `oci-hosted` — same `(kind, name)`
@@ -1623,7 +1654,6 @@ spec:
   replicationPriority: local_only
   storage:
     backend: filesystem
-    path: oci-hosted-copy
 ";
 
     const ROW0_CORPUS: &[Row0Case] = &[

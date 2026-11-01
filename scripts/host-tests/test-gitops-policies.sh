@@ -868,7 +868,6 @@ spec:
   type: hosted
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/pypi-curated
   isPublic: true
   replicationPriority: local_only
   curationRules:

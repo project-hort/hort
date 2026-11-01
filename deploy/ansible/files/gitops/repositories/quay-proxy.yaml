@@ -10,7 +10,6 @@ spec:
   # No indexMode (OCI — exact tag/digest requests). See dockerhub-proxy.yaml.
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/quay-proxy
   proxy:
     upstreamUrl: "https://quay.io"
   isPublic: false
