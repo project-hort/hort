@@ -810,8 +810,9 @@ pub trait JobsRepository: Send + Sync {
     /// never reaches any of them, so a requeue that did not carry its
     /// own cap would re-drive a crash loop forever while `attempts`
     /// climbed with nothing reading it. The number is the same on every
-    /// path on purpose; the dispatcher's `JOB_ATTEMPT_CAP` is what it
-    /// passes in here.
+    /// path on purpose, and it is the operator's configured one
+    /// (`HORT_SCANNER_MAX_ATTEMPTS`): the dispatcher is handed it at
+    /// construction and passes that same value in here.
     ///
     /// The row is never deleted. It may be genuinely running, and its
     /// completion has to land somewhere — and it does, because the

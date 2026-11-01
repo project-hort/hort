@@ -98,7 +98,6 @@ spec:
   type: proxy
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/npm-public
   proxy:
     upstreamUrl: "https://registry.npmjs.org"
   isPublic: true
@@ -118,6 +117,13 @@ Fields map 1:1 to the persisted `Repository` shape. Notable rules:
   authoritative); a per-repo `backend` differing from the deployment's
   global backend is rejected at apply. `backend` (when present) must
   be `filesystem` or `s3`.
+- `storage.path` is **deprecated** and routes nothing: placement is the
+  one global CAS selected by `HORT_STORAGE_BACKEND`, and the declared
+  value is persisted without ever being read. Declaring it emits one
+  non-aborting warning per repository at apply
+  (`hort_apply_config_linter_total{rule="repository_storage_path_deprecated",result="warn"}`);
+  the apply still succeeds. Drop the `path:` line — `storage:` with
+  `backend:` alone is valid. A later release removes the field.
 - `proxy.credentials` is **forbidden forever** as a plaintext
   anti-pattern (`ParseError::CredentialsFieldForbidden`). Use
   `proxy.secretRef:` — references a secret resolved
@@ -131,9 +137,9 @@ Fields map 1:1 to the persisted `Repository` shape. Notable rules:
   upstream credentials via the standalone `kind: UpstreamMapping`
   envelope. See §6 for the gitops writer status; the YAML schema
   lives in `crates/hort-config/src/upstream_mapping.rs`.
-- `${ENV_VAR}` interpolation works in `description`, `storage.path`,
-  and `proxy.upstreamUrl`. Use `$$` for a literal `$`. Missing vars
-  fail loudly.
+- `${ENV_VAR}` interpolation works in `description`,
+  `proxy.upstreamUrl`, and the deprecated `storage.path`. Use `$$` for
+  a literal `$`. Missing vars fail loudly.
 
 ### Virtual repositories
 
@@ -628,6 +634,36 @@ a name, matches nothing and is rejected.
 
 **Idempotency:** reapply with no YAML change emits zero events and
 no projection writes. The `unchanged` counter ticks instead.
+
+#### `quarantineDuration` — bounded by what the deadline arithmetic can represent
+
+A quarantine deadline is an *instant*: the window start offset by the
+duration. Apply therefore refuses a `quarantineDuration` that is
+well-formed humantime but longer than the largest offset the system can
+build (`i64::MAX` milliseconds ≈ 9 223 372 036 854 775 s, read off
+`chrono::TimeDelta`'s own limit rather than written down). The refusal
+names the field, the value and the bound:
+
+```text
+ScanPolicy `prod-default` is invalid: spec.quarantineDuration `300000000years` is
+9467280000000000 seconds, above the maximum of 9223372036854775 seconds a quarantine
+window can be: the deadline is computed as an instant offset by this duration and a
+longer one has no representable deadline
+```
+
+Nothing is clamped or defaulted — a quarantine window is a security
+decision, so an unusable value is refused where it was set rather than
+quietly replaced. `hort-server validate-config` catches it offline.
+
+Separately, the quarantine-release sweep **skips** any repository whose
+*stored* duration has no representable deadline, logging the repository
+id and the value at `ERROR`, and sweeps the rest of the deployment
+normally. Apply-time validation cannot heal a row that was written
+before the bound existed or by something other than apply, and the sweep
+is single and deployment-wide — so a row it cannot compute costs that
+repository's releases rather than every release in the installation. The
+held artifacts stay quarantined until the duration is corrected and
+re-applied.
 
 #### `licensePolicy` — apply rejects any declared licence rule
 
@@ -1969,7 +2005,6 @@ spec:
   type: hosted
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/pypi-curated
   isPublic: true
   replicationPriority: local_only
   curationRules:

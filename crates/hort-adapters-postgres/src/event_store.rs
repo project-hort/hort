@@ -135,7 +135,7 @@ pub fn inspect_audit_block(error: &sqlx::Error) -> Option<AuditBlockedOp> {
     emit_audit_events_blocked(op, AuditBlockedDecisionPoint::TriggerCaught);
     tracing::error!(
         attempted_op = op.as_str(),
-        message = msg,
+        db_message = msg,
         "events_immutable trigger caught a forbidden mutation"
     );
     Some(op)

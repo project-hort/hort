@@ -968,7 +968,7 @@ mod tests {
             repo_type: "hosted".into(),
             storage: Some(StorageSpec {
                 backend: "filesystem".into(),
-                path: format!("/data/{name}"),
+                path: Some(format!("/data/{name}")),
             }),
             proxy: None,
             virtual_members: None,

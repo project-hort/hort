@@ -425,7 +425,53 @@ asserts the code-held eventstore-retention rule set
 `{Artifact, AuthAttempts, DownloadAudit, TokenUse}`, with a no-wildcard
 exhaustiveness match over every `StreamCategory` so a future variant — or an
 accidentally-seeded privileged category — cannot silently become eligible for
-automated stream deletion), `db_tests_are_serialized` (the parallel-safety
+automated stream deletion), `jobs_row_has_one_owner` (a `jobs` row's result
+state has exactly one writer — asserts no `crates/hort-app/**` production file
+other than `task_dispatcher.rs` calls
+`JobsRepository::{mark_completed, reschedule, mark_failed}`. **Layer-scoped
+with no allow-list**, and the scoping is derived rather than enumerated: the
+row-write census is three production files, because the Postgres adapter
+resolves an unmappable *claimed* row terminally on purpose — the claim UPDATE
+has already moved it to `running`, the claim predicate only selects `pending`,
+and an unmappable row is unmappable on every later claim, so re-queueing it
+trades silent loss for a hot loop — and the guard *pins* that call instead of
+forbidding it, which the naive "exactly one file in the workspace" form could
+not. Convention already assumed the dispatcher owned the row and did not hold
+it: `ScanOrchestrationUseCase::record_outcome` closed its own row out at six
+sites while `ScanTaskHandler::run` returned a blanket
+`TaskOutcome::Completed`, and the dispatcher's second write won — the
+result-write fence is `AND attempts = $2` and deliberately not the status, and
+`reschedule` leaves `attempts` alone, so a scheduled scan retry read back
+`status='completed'` with a transient error still in `last_error`, no
+`ScanCompleted` and no verdict, while the job row is the system's only record
+that an artifact is still owed one. Also pins the other half of that handoff:
+the attempt budget is one *configured* number (`HORT_SCANNER_MAX_ATTEMPTS`
+reaching both `ScanOrchestrationConfig::max_attempts` and the dispatcher's
+`attempt_cap`) rather than a config value on one side and a `const` on the
+other, which agreed only at the default. Counter-assertions on the
+dispatcher's own four writes, the port's three method names, the scan path's
+disposition and its mapping; blind spot is a call reached through a macro or a
+differently-named local helper), `cli_advertises_only_routed_task_kinds`
+(every task kind `hort-cli admin task invoke --help` advertises has a
+`post(invoke::<…>)` route in `hort-http-admin-tasks`, and every routed kind is
+either advertised or declared unadvertised **with its reason in the guard
+itself**. A kind in the help text with no route does not 404 — it falls
+through to the `GET /{id}` pattern and answers `405`, so a documented recovery
+instrument reads as broken while naming no alternative, which is how `scan`
+stayed advertised. **No exemption file on purpose**: the four scheduler-only
+kinds are declared where the assertion stands, so a reviewer reading the guard
+reads the reasons and a reason that has stopped being true sits in front of
+whoever next edits the list. The comparison is against the router's routes and
+deliberately **not** against `ADMIN_INVOKABLE_TASK_KINDS`, which is broader by
+design — it gates the DSN-direct `hort-server enqueue-*` subcommands and event
+validation too, so comparing against it would bless exactly the `405` the guard
+exists to prevent. Reads both files through the shared token-aware lexer in
+`crates/hort-app/tests/rust_scan/`, because the router's module header
+documents the whole table in prose and the `/{id}` path literal carries braces
+a raw matcher trips on. Counter-assertions on both parsed lists plus a mutation
+check that the scan can still fail; blind spot is a route registered through a
+macro or a help text that stops using the `v1 allowlist:` heading, which the
+heading counter-assertion is there to catch), `db_tests_are_serialized` (the parallel-safety
 contract above — reports every test function reaching a real Postgres
 connection without `#[serial(hort_pg_db)]`, with no allow-list),
 `db_gate_not_silent` (rejects any

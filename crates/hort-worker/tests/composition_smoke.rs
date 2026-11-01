@@ -235,7 +235,11 @@ async fn build_app_context_registers_seed_import_handler() {
         stateful_upload_staging_dir: PathBuf::from("/tmp/hort-worker-smoke-staging"),
         poll_interval: std::time::Duration::from_secs(5),
         batch_size: 4,
-        max_attempts: 5,
+        // Deliberately NOT `HORT_SCANNER_MAX_ATTEMPTS`'s default of 5:
+        // the assertion below is that the dispatcher closes rows out
+        // against the operator's number, and at the default it would
+        // pass against a hard-coded one too.
+        max_attempts: 7,
         lock_duration: std::time::Duration::from_secs(900),
         worker_id: "hort-worker-smoke".to_string(),
         finding_merge_allow_informed_downgrade: true,
@@ -275,6 +279,22 @@ async fn build_app_context_registers_seed_import_handler() {
              environment gap: {e:#}"
         ),
     };
+
+    // One attempt budget, two holders. The scan orchestrator spends its
+    // cap to decide the ARTIFACT's terminal state (an exhausted scan
+    // records `ScanIndeterminate`, or leaves an already-quarantined
+    // artifact alone) and the dispatcher spends this one to decide the
+    // ROW's. They are halves of one boundary: a dispatcher that failed
+    // the row on a smaller number would leave a terminal row with no
+    // verdict behind it, and a larger one would re-drive a scan whose
+    // verdict was already recorded. The composition root is the single
+    // place that number is read, so this is where the two can be seen
+    // to agree.
+    assert_eq!(
+        output.dispatcher.attempt_cap(),
+        cfg.max_attempts,
+        "the dispatcher must close rows out against WorkerConfig::max_attempts          (HORT_SCANNER_MAX_ATTEMPTS), the same field ScanOrchestrationConfig::max_attempts          is assigned from"
+    );
 
     let kinds: std::collections::HashSet<&str> =
         output.dispatcher.registered_kinds().into_iter().collect();

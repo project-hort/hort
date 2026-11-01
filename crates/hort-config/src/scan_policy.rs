@@ -24,6 +24,42 @@ use crate::envelope::{Envelope, Kind};
 use crate::error::{ParseError, ValidationError};
 use crate::scope::ScopeSpec;
 
+/// The longest `quarantineDuration` the system can compute a deadline
+/// from, in whole seconds.
+///
+/// Every consumer of a policy's quarantine window — the release sweep's
+/// per-repository cutoff, `effective_quarantine_deadline`, the
+/// read-path deadline, the scan fast path — converts the stored seconds
+/// into a [`chrono::TimeDelta`] and offsets an instant by it.
+/// `TimeDelta` holds at most `i64::MAX` *milliseconds*, so a duration
+/// past this bound cannot be built at all and the conversion panics
+/// instead of yielding a deadline. A value above it is therefore not a
+/// very long quarantine window; it is a window the arithmetic has no
+/// answer for.
+///
+/// The bound is **read off `chrono`'s own limit** rather than written
+/// down, so a chrono release that moves `TimeDelta::MAX` moves this
+/// with it and the refusal message reports the new number.
+/// `secs_i64_roundtrip` and `bound_is_chronos_own_limit` pin both
+/// halves of that derivation. It is also, and not coincidentally,
+/// inside `i64` — which is what the two seconds-conversions in
+/// `hort-app` assert when they `i64::try_from(dur.as_secs())`, so one
+/// check closes both.
+///
+/// **What this bound does not promise.** It is `TimeDelta`'s limit, not
+/// the `DateTime<Utc>` calendar's: subtracting a duration of a few
+/// hundred thousand years from `now` already leaves the representable
+/// instant range, three orders of magnitude below this value. So a
+/// duration accepted here can still have no computable deadline, and
+/// every consumer that offsets an instant by it must do that
+/// arithmetic in checked form. The quarantine-release sweep does
+/// (`hort_adapters_postgres::quarantine_release_candidates::repo_cutoff`
+/// skips and logs such a repository); tightening this bound to the
+/// calendar range instead would make the system's accepted maximum
+/// depend on `now`, which is not a property a config validator can
+/// have.
+pub const MAX_POLICY_DURATION_SECS: u64 = chrono::TimeDelta::MAX.num_seconds() as u64;
+
 /// Shape of a `kind: ScanPolicy` YAML body.
 ///
 /// `severityThreshold` and the duration fields are validated through
@@ -43,8 +79,11 @@ pub struct ScanPolicySpec {
     /// `critical | high | medium | low`. Validated via
     /// `SeverityThreshold::FromStr`.
     pub severity_threshold: String,
-    /// Humantime duration string (e.g. `"24h"`, `"7d"`). Validated
-    /// via `humantime::parse_duration`.
+    /// Humantime duration string (e.g. `"24h"`, `"7d"`). Validated in
+    /// [`validate_scan_policy`] for both well-formedness (via
+    /// `humantime::parse_duration`) and computability: a duration above
+    /// [`MAX_POLICY_DURATION_SECS`] is refused, because the quarantine
+    /// deadline is an instant offset by it and no such instant exists.
     pub quarantine_duration: String,
     pub require_approval: bool,
     /// Per-policy supply-chain provenance enforcement mode
@@ -250,6 +289,12 @@ pub fn parse_scan_policy(
 /// - `severityThreshold` parses via `SeverityThreshold::FromStr`
 /// - `quarantineDuration` and `maxArtifactAge` (when present) parse
 ///   via `humantime::parse_duration`
+/// - `quarantineDuration` is additionally bounded by
+///   [`MAX_POLICY_DURATION_SECS`] — a duration the quarantine-deadline
+///   arithmetic cannot represent is refused here, which is the check
+///   the `INVARIANT:` assertions on the two seconds-conversion sites in
+///   `hort-app` (`apply_config_use_case::humantime_secs` and
+///   `gitops::event_sourced::parse_humantime_secs`) assert has run
 ///
 /// Cross-spec rules (scope.repository resolves to a declared repo,
 /// duplicate names) live in `crate::desired`.
@@ -272,15 +317,38 @@ pub fn validate_scan_policy(env: &Envelope<ScanPolicySpec>) -> Vec<ValidationErr
         });
     }
 
-    if let Err(err) = parse_humantime(&env.spec.quarantine_duration) {
-        errors.push(ValidationError::Invalid {
+    match parse_humantime(&env.spec.quarantine_duration) {
+        Err(err) => errors.push(ValidationError::Invalid {
             kind: Kind::ScanPolicy,
             name: env.metadata.name.clone(),
             detail: format!(
                 "spec.quarantineDuration `{}` is not a valid humantime duration: {err}",
                 env.spec.quarantine_duration
             ),
-        });
+        }),
+        // Well-formed, but is it a duration the system can *compute*
+        // with? Every consumer of the quarantine window turns these
+        // seconds into a `chrono::TimeDelta` and offsets an instant by
+        // it, so a value past `MAX_POLICY_DURATION_SECS` is not a long
+        // window — no `TimeDelta` holds it, and the conversion panics
+        // rather than producing a deadline. Refusing it here is what
+        // makes the `INVARIANT:` assertions on those conversions true.
+        Ok(dur) if dur.as_secs() > MAX_POLICY_DURATION_SECS => {
+            errors.push(ValidationError::Invalid {
+                kind: Kind::ScanPolicy,
+                name: env.metadata.name.clone(),
+                detail: format!(
+                    "spec.quarantineDuration `{}` is {} seconds, above the maximum of {} \
+                     seconds a quarantine window can be: the deadline is computed as an \
+                     instant offset by this duration and a longer one has no representable \
+                     deadline",
+                    env.spec.quarantine_duration,
+                    dur.as_secs(),
+                    MAX_POLICY_DURATION_SECS
+                ),
+            });
+        }
+        Ok(_) => {}
     }
 
     if let Some(age) = env.spec.max_artifact_age.as_ref() {
@@ -507,6 +575,150 @@ mod tests {
         assert!(errors.iter().any(|e| {
             e.to_string().contains("quarantineDuration") && e.to_string().contains("24garbage")
         }));
+    }
+
+    /// Helper: a minimal global policy whose `quarantineDuration` is
+    /// the supplied string, and the errors `validate_scan_policy`
+    /// returns for it.
+    fn errors_for_quarantine_duration(s: &str) -> Vec<ValidationError> {
+        let body = format!(
+            "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: \"{s}\"
+  requireApproval: false
+  licensePolicy: {{}}
+"
+        );
+        let env = parse_scan_policy(&p(), yaml("p", &body).as_bytes()).unwrap();
+        validate_scan_policy(&env)
+    }
+
+    /// `MAX_POLICY_DURATION_SECS` is chrono's own limit, not a number
+    /// typed in here. Pinning both sides of the boundary against
+    /// `TimeDelta::try_seconds` is what makes the constant a derivation
+    /// rather than a guess: a chrono release that moves the limit fails
+    /// this, instead of silently leaving the validator one second off
+    /// the panic it is there to prevent.
+    #[test]
+    fn bound_is_chronos_own_limit() {
+        let at_bound = i64::try_from(MAX_POLICY_DURATION_SECS).expect("bound fits in i64");
+        assert!(
+            chrono::TimeDelta::try_seconds(at_bound).is_some(),
+            "a duration at MAX_POLICY_DURATION_SECS must be representable as a TimeDelta"
+        );
+        assert!(
+            chrono::TimeDelta::try_seconds(at_bound + 1).is_none(),
+            "one second over MAX_POLICY_DURATION_SECS must NOT be representable — if it is, \
+             the bound is below chrono's real limit and refuses durations the system can use"
+        );
+    }
+
+    /// The other half of the derivation: the bound is also inside
+    /// `i64`, which is what the two `hort-app` conversions
+    /// (`apply_config_use_case::humantime_secs`,
+    /// `gitops::event_sourced::parse_humantime_secs`) assert when they
+    /// `i64::try_from(dur.as_secs())`. One check closes both panics
+    /// precisely because this holds.
+    #[test]
+    fn secs_i64_roundtrip() {
+        assert!(
+            i64::try_from(MAX_POLICY_DURATION_SECS).is_ok(),
+            "the accepted maximum must survive the i64 conversion both appliers perform"
+        );
+    }
+
+    /// A duration exactly at the bound is accepted; one second over is
+    /// refused. Both strings are built from the constant, so there is
+    /// no second copy of the number to drift.
+    #[test]
+    fn validate_accepts_the_bound_and_refuses_one_second_over() {
+        assert!(
+            errors_for_quarantine_duration(&format!("{MAX_POLICY_DURATION_SECS}s")).is_empty(),
+            "the largest computable duration must be accepted"
+        );
+
+        let over = format!("{}s", MAX_POLICY_DURATION_SECS + 1);
+        let errors = errors_for_quarantine_duration(&over);
+        assert!(
+            errors.iter().any(|e| {
+                let msg = e.to_string();
+                msg.contains("quarantineDuration")
+                    && msg.contains(&over)
+                    && msg.contains(&MAX_POLICY_DURATION_SECS.to_string())
+            }),
+            "one second over the bound must be refused naming the field, the value and the \
+             bound; got {errors:?}"
+        );
+    }
+
+    /// An absurd-but-well-formed operator value is refused rather than
+    /// stored and left to kill the deployment-wide release sweep. This
+    /// is the value from the field census: it parses, it fits in `u64`
+    /// seconds, and it is past what a `TimeDelta` can hold.
+    #[test]
+    fn validate_refuses_duration_the_deadline_arithmetic_cannot_represent() {
+        let errors = errors_for_quarantine_duration("300000000years");
+        assert!(
+            errors.iter().any(|e| {
+                let msg = e.to_string();
+                msg.contains("spec.quarantineDuration")
+                    && msg.contains("300000000years")
+                    && msg.contains(&MAX_POLICY_DURATION_SECS.to_string())
+            }),
+            "`300000000years` must be refused naming the field, the value and the bound; \
+             got {errors:?}"
+        );
+    }
+
+    /// The same check — not a second one — refuses a value so large it
+    /// is nowhere near the boundary. Asserting on the message proves it
+    /// came from the bound branch rather than from the humantime parse.
+    #[test]
+    fn validate_refuses_far_over_bound_through_the_same_check() {
+        let errors = errors_for_quarantine_duration("100000000000years");
+        let bound_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| {
+                let msg = e.to_string();
+                msg.contains("spec.quarantineDuration")
+                    && msg.contains(&MAX_POLICY_DURATION_SECS.to_string())
+            })
+            .collect();
+        assert_eq!(
+            bound_errors.len(),
+            1,
+            "exactly one bound refusal, from the one check; got {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.to_string().contains("is not a valid humantime duration")),
+            "the value is well-formed — it must be refused as uncomputable, not as malformed; \
+             got {errors:?}"
+        );
+    }
+
+    /// Counter-assertion: the bound refuses nothing an operator would
+    /// plausibly write, and a malformed or negative duration is still
+    /// refused by the pre-existing well-formedness check — the new
+    /// branch did not displace it.
+    #[test]
+    fn validate_leaves_ordinary_and_malformed_durations_as_they_were() {
+        for s in ["0s", "24h", "7d"] {
+            assert!(
+                errors_for_quarantine_duration(s).is_empty(),
+                "`{s}` must stay accepted"
+            );
+        }
+        for s in ["-1h", "24garbage"] {
+            assert!(
+                errors_for_quarantine_duration(s)
+                    .iter()
+                    .any(|e| e.to_string().contains("is not a valid humantime duration")),
+                "`{s}` must still be refused as malformed"
+            );
+        }
     }
 
     #[test]
@@ -926,8 +1138,9 @@ mod tests {
 
     #[test]
     fn parse_omitted_rescan_interval_hours_defaults_to_24() {
-        // Out-of-the-box deployments rescan every 24 hours. The
-        // default matches `DefaultPolicy::rescan_interval_hours`.
+        // An omitted field means the 24 h cadence a scheduled
+        // `cron-rescan-tick` rescans at. The default matches
+        // `DefaultPolicy::rescan_interval_hours`.
         let body = "
   scope: global
   severityThreshold: high

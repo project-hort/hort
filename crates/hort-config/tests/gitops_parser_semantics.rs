@@ -668,7 +668,7 @@ fn an_anchor_and_alias_without_a_merge_key_resolves() {
 
     let parsed = through_entry_point(parse_repository, &doc).expect("the alias resolves");
     assert_eq!(
-        parsed.spec.storage.as_ref().map(|s| s.path.as_str()),
+        parsed.spec.storage.as_ref().and_then(|s| s.path.as_deref()),
         Some("pinned text")
     );
     assert_eq!(parsed.spec.description.as_deref(), Some("pinned text"));

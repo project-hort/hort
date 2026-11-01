@@ -9,7 +9,6 @@ spec:
   type: virtual
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/all-npm
   virtualMembers:
     - npm-public
   isPublic: true

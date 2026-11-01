@@ -144,10 +144,10 @@ use tls_config::{
 /// Per-instance configuration.
 ///
 /// [`HttpUpstreamProxyConfig::new`] carries production-sane defaults for
-/// every knob except `format_label`: 30s timeout, redirect cap of 5, no
-/// extra CA. Realm endpoints for the bearer-challenge flow are learned at
-/// runtime from upstream `WWW-Authenticate` responses — there is no
-/// configuration knob for them.
+/// every knob except `format_label`: a [`DEFAULT_UPSTREAM_TIMEOUT_SECS`]
+/// timeout, redirect cap of 5, no extra CA. Realm endpoints for the
+/// bearer-challenge flow are learned at runtime from upstream
+/// `WWW-Authenticate` responses — there is no configuration knob for them.
 ///
 /// There is deliberately no `Default` impl: `format_label` names the
 /// emitting format/subsystem and has no defensible default, so it is a
@@ -156,6 +156,18 @@ use tls_config::{
 /// security signal — to whichever value the default happened to carry.
 #[derive(Clone)]
 pub struct HttpUpstreamProxyConfig {
+    /// Total request timeout applied to every upstream fetch (blob /
+    /// manifest / metadata / referrers), on the base client and on every
+    /// per-mapping TLS client alike. Default
+    /// [`DEFAULT_UPSTREAM_TIMEOUT_SECS`]; composition sets this from
+    /// `HORT_UPSTREAM_TIMEOUT_SECS` via [`timeout_from_env`].
+    ///
+    /// This is reqwest's `.timeout()`, which is a **total** deadline
+    /// covering the response body — not an idle deadline. A transfer
+    /// making uninterrupted progress is still cut at the limit, so the
+    /// value bounds transfer *size at the achieved bandwidth*, not
+    /// transfer health. An upstream blob that cannot finish inside it can
+    /// never be ingested, and each retry restarts at byte 0.
     pub timeout: Duration,
     /// `format` label fired on every metric emission. The server read
     /// path builds one instance per served format, each passing its own
@@ -235,7 +247,7 @@ impl HttpUpstreamProxyConfig {
     /// `HttpUpstreamProxyConfig { timeout: …, ..HttpUpstreamProxyConfig::new("npm") }`.
     pub fn new(format_label: impl Into<String>) -> Self {
         Self {
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(DEFAULT_UPSTREAM_TIMEOUT_SECS),
             format_label: format_label.into(),
             max_redirect_hops: 5,
             // Settled default (ADR 0026).
@@ -357,6 +369,75 @@ pub fn validate_user_agent_override(raw: &str) -> Result<(), String> {
              fall back to the built-in default User-Agent"
         ))
     }
+}
+
+/// Default total request timeout for every upstream pull-through fetch,
+/// in seconds.
+///
+/// Carried by [`HttpUpstreamProxyConfig::new`] and returned by
+/// [`resolve_timeout`] when `HORT_UPSTREAM_TIMEOUT_SECS` is unset or
+/// empty, so the constructor default and the resolver default are one
+/// number rather than two that agree today.
+pub const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 30;
+
+/// Env var that overrides the upstream fetch timeout, in whole seconds.
+pub const HORT_UPSTREAM_TIMEOUT_SECS_ENV: &str = "HORT_UPSTREAM_TIMEOUT_SECS";
+
+/// Resolve the upstream fetch timeout from an optional raw override:
+/// unset, empty or whitespace means [`DEFAULT_UPSTREAM_TIMEOUT_SECS`]
+/// (matching how an empty `HORT_UPSTREAM_USER_AGENT` means "use the
+/// default"); a whole number of seconds `>= 1` wins. Pure (no env read,
+/// no logging) so the trim/empty/default/refusal logic is unit-testable.
+///
+/// **Refuses rather than falling back**, which is the one deliberate
+/// difference from [`resolve_user_agent`]. An operator raises this knob
+/// precisely because fetches are failing at the current limit; a value
+/// silently discarded back to the default leaves them watching the
+/// identical failures while believing they raised it. A `User-Agent`
+/// that falls back still produces working fetches, so it warns instead.
+///
+/// `0` is refused rather than read as "no timeout": reqwest spells "no
+/// timeout" as the absence of `.timeout()`, so a zero `Duration` is a
+/// zero deadline and would fail every upstream fetch immediately.
+pub fn resolve_timeout(raw: Option<&str>) -> DomainResult<Duration> {
+    // Unset / empty / whitespace ⇒ "use the default", folded into `None`
+    // here so the only cases left below are a real value.
+    let Some(t) = raw.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(Duration::from_secs(DEFAULT_UPSTREAM_TIMEOUT_SECS));
+    };
+    let secs: u64 = t.parse().map_err(|e| {
+        DomainError::Invariant(format!(
+            "{HORT_UPSTREAM_TIMEOUT_SECS_ENV}={t:?} is not a whole number of \
+             seconds ({e}); refusing to start rather than applying the \
+             {DEFAULT_UPSTREAM_TIMEOUT_SECS}s default behind the back of an \
+             operator who set this variable to change it"
+        ))
+    })?;
+    if secs == 0 {
+        return Err(DomainError::Invariant(format!(
+            "{HORT_UPSTREAM_TIMEOUT_SECS_ENV}={t:?} is not a usable timeout: \
+             the value is a total per-request deadline, so zero would fail \
+             every upstream fetch immediately. Unset the variable to use the \
+             {DEFAULT_UPSTREAM_TIMEOUT_SECS}s default"
+        )));
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+/// The upstream fetch timeout for this process: `HORT_UPSTREAM_TIMEOUT_SECS`
+/// when set to a whole number of seconds `>= 1`, else
+/// [`DEFAULT_UPSTREAM_TIMEOUT_SECS`]. Lives in the adapter (not
+/// per-composition) so `hort-server` and `hort-worker` resolve it
+/// identically — every upstream fetch from either binary carries the same
+/// deadline.
+///
+/// A non-empty value that is not a whole number of seconds `>= 1` is
+/// **fatal**: both composition roots propagate the error and boot aborts
+/// naming the variable and the value. See [`resolve_timeout`] for why
+/// this refuses where the `User-Agent` warns.
+pub fn timeout_from_env() -> DomainResult<Duration> {
+    let raw = std::env::var(HORT_UPSTREAM_TIMEOUT_SECS_ENV).ok();
+    resolve_timeout(raw.as_deref())
 }
 
 const METRIC_FETCH: &str = "hort_upstream_fetch_total";
@@ -2739,6 +2820,18 @@ impl HttpUpstreamProxy {
                 .get(reqwest::header::LAST_MODIFIED)
                 .and_then(|v| v.to_str().ok()),
         );
+        // The two facts that stop being observable the moment the body
+        // starts streaming. Read from the header rather than from
+        // `Response::content_length()` so what travels is literally what
+        // the upstream declared: a consumer comparing bytes-read against
+        // it is asking "did the body end short of its own declaration?",
+        // which a length reqwest derived would not answer.
+        let status = resp.status().as_u16();
+        let content_length = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
         let stream = resp
             .bytes_stream()
             .map_err(|e| std::io::Error::other(format!("upstream stream error: {e}")));
@@ -2747,6 +2840,8 @@ impl HttpUpstreamProxy {
             stream: boxed,
             declared_digest,
             last_modified,
+            status,
+            content_length,
         })
     }
 
@@ -3651,6 +3746,12 @@ mod tests {
 
     /// Happy path: anonymous fetch_blob → 200 → stream yields the
     /// configured bytes, declared digest header round-trips.
+    ///
+    /// The status and the declared `Content-Length` round-trip here too,
+    /// and they are asserted rather than assumed: they stop being
+    /// observable the moment the body starts streaming, so a consumer
+    /// comparing bytes-read against the length the upstream promised can
+    /// only do it with what this envelope carried out.
     #[tokio::test]
     async fn fetch_blob_anonymous_streams_body_and_returns_declared_digest() {
         let server = MockServer::start().await;
@@ -3669,6 +3770,8 @@ mod tests {
         let BlobFetch {
             mut stream,
             declared_digest: declared,
+            status,
+            content_length,
             ..
         } = proxy
             .fetch_blob(m, "library/nginx".into(), "sha256:abc".into())
@@ -3676,6 +3779,8 @@ mod tests {
             .expect("fetch_blob");
 
         assert_eq!(declared.as_deref(), Some("sha256:abc"));
+        assert_eq!(status, 200);
+        assert_eq!(content_length, Some(b"hello-blob".len() as u64));
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
             bytes.extend_from_slice(&chunk.unwrap());
@@ -3836,6 +3941,130 @@ mod tests {
             .fetch_blob(m, "library/nginx".into(), "sha256:abc".into())
             .await
             .expect("fetch must match the configured User-Agent mock");
+    }
+
+    // ---- Upstream fetch timeout (global; HORT_UPSTREAM_TIMEOUT_SECS) ----
+
+    #[test]
+    fn resolve_timeout_defaults_to_thirty_seconds_when_unset() {
+        // The literal is pinned here on purpose: the default is a
+        // compatibility promise, so a change to
+        // `DEFAULT_UPSTREAM_TIMEOUT_SECS` has to move a test rather than
+        // ride along silently. Unset, empty and whitespace are all "use
+        // the default" — the same treatment an empty
+        // `HORT_UPSTREAM_USER_AGENT` gets, and not an error.
+        assert_eq!(resolve_timeout(None).unwrap(), Duration::from_secs(30));
+        assert_eq!(resolve_timeout(Some("")).unwrap(), Duration::from_secs(30));
+        assert_eq!(
+            resolve_timeout(Some("   ")).unwrap(),
+            Duration::from_secs(30)
+        );
+        // And the constructor every caller starts from carries the same
+        // number, so the two defaults cannot drift apart.
+        assert_eq!(
+            HttpUpstreamProxyConfig::new("oci").timeout,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn resolve_timeout_honours_and_trims_a_valid_override() {
+        assert_eq!(
+            resolve_timeout(Some("300")).unwrap(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            resolve_timeout(Some("  90  ")).unwrap(),
+            Duration::from_secs(90)
+        );
+        // The floor is one second, which is a usable deadline.
+        assert_eq!(resolve_timeout(Some("1")).unwrap(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn resolve_timeout_refuses_zero_naming_the_variable_and_the_value() {
+        // Zero is not "no timeout" — reqwest spells that as the absence of
+        // `.timeout()`, so a zero `Duration` is a zero deadline that fails
+        // every fetch. Refused, and the message has to carry both the
+        // variable and the value an operator typed, because the boot log is
+        // the only place they will see it.
+        let err = resolve_timeout(Some("0")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("HORT_UPSTREAM_TIMEOUT_SECS"), "{msg}");
+        assert!(msg.contains("\"0\""), "{msg}");
+    }
+
+    #[test]
+    fn resolve_timeout_refuses_an_unparseable_override_rather_than_defaulting() {
+        // Each of these would have been silently discarded back to 30s by a
+        // User-Agent-style fallback, leaving an operator who raised the knob
+        // watching the identical failures.
+        for raw in ["abc", "-5", "1.5", "30s", "99999999999999999999"] {
+            let err = resolve_timeout(Some(raw))
+                .expect_err("a non-numeric or out-of-range value must refuse");
+            let msg = err.to_string();
+            assert!(msg.contains("HORT_UPSTREAM_TIMEOUT_SECS"), "{raw}: {msg}");
+            assert!(msg.contains(raw), "{raw}: {msg}");
+        }
+    }
+
+    /// A resolved override reaches the `reqwest::Client`'s deadline: the
+    /// mock delays 2s, the configured timeout is the 1s the resolver
+    /// returned, and the fetch is cut with the `timeout` classification.
+    /// reqwest exposes no getter for a built client's timeout, so this
+    /// behaviour is the only available proof that the field is applied —
+    /// and it runs through the same `build_client_inner` both composition
+    /// roots reach.
+    #[tokio::test]
+    async fn resolved_timeout_override_reaches_the_reqwest_client() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/p/blobs/sha256:slow"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: resolve_timeout(Some("1")).unwrap(),
+            ..HttpUpstreamProxyConfig::new("oci")
+        };
+        let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap();
+        let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+        let err = proxy
+            .fetch_blob(m, "p".into(), "sha256:slow".into())
+            .await
+            .err()
+            .expect("a 2s response must not survive a 1s configured timeout");
+        assert_eq!(classify_error(&err), Some(UpstreamErrorKind::Timeout));
+    }
+
+    /// The other half of the same proof, and the one that pins the
+    /// default's *size*: the identical 2s-delayed response SUCCEEDS when
+    /// the timeout is the one `resolve_timeout(None)` returns. A default
+    /// lowered anywhere near the override above fails here, which an
+    /// equality assertion on the `Duration` alone cannot catch (it would
+    /// keep passing against a client that ignored the field).
+    #[tokio::test]
+    async fn default_resolved_timeout_does_not_cut_a_two_second_fetch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/p/blobs/sha256:slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(2))
+                    .set_body_bytes(b"slow-but-fine".as_slice()),
+            )
+            .mount(&server)
+            .await;
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: resolve_timeout(None).unwrap(),
+            ..HttpUpstreamProxyConfig::new("oci")
+        };
+        let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap();
+        let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+        proxy
+            .fetch_blob(m, "p".into(), "sha256:slow".into())
+            .await
+            .expect("the default timeout must leave a 2s fetch alone");
     }
 
     /// 404 → `not_found` classified error.

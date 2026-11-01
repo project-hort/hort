@@ -412,8 +412,11 @@ wiring the alarm.
 (the claim loop is `FOR UPDATE SKIP LOCKED`, so additional replicas
 drain cooperatively without coordination), and/or raise `priority` on
 the latency-sensitive trigger sources via admin so ingest first-scans
-stay ahead of routine cron rescans. Lengthening the cron-rescan schedule
-(`scheduledTasks.cronRescanTick.schedule`) reduces the batch-injection rate.
+stay ahead of the routine cron rescans that a *scheduled*
+`scheduledTasks.cronRescanTick` injects. Lengthening that schedule
+(`scheduledTasks.cronRescanTick.schedule`) reduces the batch-injection
+rate; the tick is off by default, so a deployment that never enabled it
+contributes no cron rescans to this queue at all.
 The structural fix — a per-(principal, repository) manual-rescan enqueue
 rate cap with an HTTP 429 response — is **deferred** (it requires a
 `KEYSPACE_REGISTRY` durable prefix and an `hort-http-core`
@@ -511,6 +514,7 @@ it is referenced, not scheduled here.
 | `HORT_RBAC_REFRESH_SECS` | u32 | `30` | No | RBAC snapshot poll cadence. |
 | `HORT_UPSTREAM_RESOLVER_REFRESH_SECS` | u32 | `60` | No | Upstream-resolver snapshot refresh cadence. Minimum `5` (lower → error). |
 | `HORT_UPSTREAM_ALLOWLIST_HOSTS` | tri-state CSV | _unset → disabled_ | No | Apply-time upstream-host allowlist. `__deny_all__` → strict deny; `h1,h2` → host list; empty/unset → no enforcement. |
+| `HORT_UPSTREAM_TIMEOUT_SECS` | u64 | `30` | No | **Total** deadline on every upstream pull-through fetch (blob / manifest / metadata / referrers). Read by **both** `hort-server` and `hort-worker` through one adapter helper, so a value applies to the whole deployment. Not an idle deadline: a transfer making uninterrupted progress is still cut at the limit, and the retry restarts at byte 0 — so an upstream blob that cannot finish inside it is unfetchable rather than slow, and this knob is how an operator raises that ceiling. Minimum `1`; unparseable or `0` aborts boot naming the variable and the value (interlock 15 below), never a silent revert to `30`. **Above `600` it stops being the binding limit on the read path**: a coalesced blob pull-through runs inside `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS` (default `600`), which cancels the leader's fetch outright, so the effective ceiling there is the lower of the two. Chart value: `upstream.timeoutSeconds`. |
 | `HORT_STATEFUL_UPLOAD_STAGING_DIR` | path | _derived_ | No | Stateful-upload chunk staging root. Default: `<HORT_STORAGE_FILESYSTEM_PATH>/stateful-upload-staging` (filesystem) or `/var/lib/hort/stateful-upload-staging` (S3, + boot WARN). |
 | `HORT_OCI_LEGACY_CATALOG_ENABLED` | bool | `false` | No | Mount the Docker-legacy global `/v2/_catalog`. |
 | `HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL` | u32 | `32` | No | Per-(repo, principal) OCI upload-session cap. |
@@ -519,6 +523,7 @@ it is referenced, not scheduled here.
 | `HORT_EVENT_CHAIN_CHECKPOINT_CADENCE_SECS` | u64 | `3600` | No | Signed-checkpoint cadence for the tamper-evident event chain (ADR 0002). Read by the always-on `eventstore-checkpoint` `dsn-direct` task. |
 | `HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS` | u64 | `86400` | No | Expected cadence of the `verify-event-chain` CronJob, used only to derive the staleness gauge (matches the chart's default `verifyEventChain` schedule). A query failure is logged and treated as "unknown" — never blocks boot. |
 | `HORT_EVENT_CHAIN_VERIFY_STALENESS_MULTIPLIER` | u32 | `3` | No | Multiplier on the expected interval above before the last-run gauge is considered stale (tolerates missed ticks before alarming). |
+| `HORT_RESCAN_DRIVE_STALENESS_MULTIPLIER` | u32 | `3` | No | Multiplier on the **shortest `rescanIntervalHours` any active `ScanPolicy` declares** before `hort-server`'s boot-time rescan-drive signal reports the cadence undriven (`hort_rescan_drive_undriven` + a `warn!` naming `scheduledTasks.cronRescanTick.enabled`). No paired interval knob: the expected cadence comes from the policies themselves, not from the environment. A query failure is logged and treated as "unknown" — never blocks boot. |
 
 ---
 
@@ -597,6 +602,17 @@ rather than run misconfigured.
 14. **`HORT_EXTRA_CA_BUNDLE` fail-closed.** Set-but-unreadable / invalid
     PEM / zero certs aborts boot — never degrades silently to
     public-CA-only trust.
+15. **`HORT_UPSTREAM_TIMEOUT_SECS` fail-closed.** A non-empty value that
+    is not a whole number of seconds `>= 1` (including `0`, which is a
+    zero deadline rather than "no deadline") aborts boot, naming the
+    variable and the value. Unset or empty means the `30` s default and is
+    not an error. Enforced in composition, so it holds for **`hort-worker`
+    too** — unlike the rules above, which are `hort-server` `Config`
+    rules. Deliberately not a warn-and-default like
+    `HORT_UPSTREAM_USER_AGENT`: an operator raises this knob because
+    fetches are failing at the current limit, and a discarded value would
+    leave them watching the identical failures while believing they raised
+    it.
 
 ---
 

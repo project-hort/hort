@@ -124,11 +124,22 @@ pub struct TaskArgs {
 /// `admin task` sub-subcommands.
 #[derive(Subcommand, Debug)]
 pub enum TaskCommand {
+    // The kind list in the doc comment below is checked against the
+    // server's `POST /api/v1/admin/tasks/<kind>` routes by
+    // `crates/hort-app/tests/cli_advertises_only_routed_task_kinds.rs`.
+    // That guard reads from the allowlist heading to the period closing
+    // it, so keep the kinds one comma-separated run ending in a period —
+    // and note that a kind named anywhere else in this help text is a
+    // kind it cannot check.
     /// Invoke a task by kind.
     ///
-    /// v1 allowlist: noop, staging-sweep, scan, cron-rescan-tick,
+    /// v1 allowlist: noop, staging-sweep, cron-rescan-tick,
     /// advisory-watch-tick, retention-evaluate, retention-purge,
     /// eventstore-archive.
+    ///
+    /// A scan is not one of them: the server enqueues a scan per
+    /// artifact, never as a bare kind, so reach for
+    /// `hort-cli admin rescan <ARTIFACT_ID>` instead.
     ///
     /// Body defaults to `{}`. Use `--params-file <path>` to supply JSON
     /// params. `--param k=v` style is deferred post-v1.

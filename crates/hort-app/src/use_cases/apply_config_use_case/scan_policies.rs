@@ -195,6 +195,49 @@ mod tests {
         assert!(matches!(appends[0].actor, Actor::GitOps(_)));
     }
 
+    /// The apply pipeline's seconds conversion survives the largest
+    /// duration `hort-config` will accept.
+    ///
+    /// `create_command_from_spec` reaches
+    /// `apply_config_use_case::humantime_secs`, whose
+    /// `expect("INVARIANT: duration validated to fit in i64")` is an
+    /// assertion about `hort_config::scan_policy::validate_scan_policy`.
+    /// This drives the boundary value through the whole apply — and
+    /// asserts the validator really does admit it first, so neither
+    /// side of that handshake can move without failing here. The gitops
+    /// applier holds an independent copy of the same conversion, tested
+    /// separately in `gitops::event_sourced`.
+    #[tokio::test]
+    async fn scan_policy_quarantine_duration_at_the_config_bound_applies_without_panicking() {
+        let at_bound = format!("{}s", hort_config::scan_policy::MAX_POLICY_DURATION_SECS);
+        let expected =
+            i64::try_from(hort_config::scan_policy::MAX_POLICY_DURATION_SECS).expect("fits i64");
+
+        let mut env = scan_policy_env("prod-default");
+        env.spec.quarantine_duration = at_bound.clone();
+        assert!(
+            hort_config::scan_policy::validate_scan_policy(&env).is_empty(),
+            "`{at_bound}` must be the largest duration apply accepts — if the validator \
+             refuses it this test is asserting over an unreachable value"
+        );
+
+        let h = build_harness();
+        let mut desired = DesiredState::default();
+        desired.scan_policies.push(env);
+        let report = h.uc.apply(desired, env_oidc()).await.unwrap();
+        assert_eq!(report.created, 1);
+
+        let appends = h.events.appended();
+        let DomainEvent::PolicyCreated(payload) = &appends[0].events[0].event else {
+            panic!("expected PolicyCreated");
+        };
+        assert_eq!(
+            payload.config_snapshot["quarantine_duration_secs"],
+            serde_json::Value::from(expected),
+            "the boundary duration must reach the event as whole seconds, unclamped"
+        );
+    }
+
     #[tokio::test]
     async fn idempotent_scan_policy_reapply_emits_zero_events() {
         let h = build_harness();

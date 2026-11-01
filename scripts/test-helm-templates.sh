@@ -151,6 +151,8 @@ test-values.yaml|helm.sh/hook-weight: "-9"|1|the pre-pull wait/cleanup Job rende
 test-values.yaml|^kind: DaemonSet$|2|both prepull DaemonSets (server + worker) render by default
 test-values-prepull-disabled.yaml|prepull|0|prePull.enabled=false renders NEITHER DaemonSet, NOR the wait Job, NOR its RBAC (all four resource names contain "prepull")
 test-values-prepull-disabled.yaml|^kind: NetworkPolicy$|2|prePull.enabled=false has no effect on the unrelated NetworkPolicy pair (still networkPolicy.enabled default true)
+test-values-upstream-timeout.yaml|HORT_UPSTREAM_TIMEOUT_SECS|2|a raised upstream.timeoutSeconds renders the deadline env on BOTH Deployments — the worker fetches upstream on four legs of its own (composite scan, prefetch, provenance referrers, OCI index children), so a server-only deadline would leave every scheduled fetch on the built-in default
+test-values-upstream-timeout.yaml|^ *value: "1234"$|2|and both carry the operator's value verbatim — 1234 is no other default in the chart, so this count cannot be satisfied by an unrelated env
 EOF
 }
 
@@ -199,6 +201,10 @@ test-values.yaml|templates/prepull-rbac.yaml|helm.sh/hook: pre-install,pre-upgra
 test-values.yaml|templates/prepull-rbac.yaml|helm.sh/hook-weight: "-11"|3|all three pre-pull RBAC resources render at weight -11 — strictly before the pre-pull DaemonSets (-10) and the wait Job (-9), so the ServiceAccount exists before anything that needs it
 test-values.yaml|templates/prepull-rbac.yaml|helm.sh/hook-delete-policy: before-hook-creation$|3|all three pre-pull RBAC resources use before-hook-creation ONLY — pinning the failure mode: adding hook-succeeded here would delete the ServiceAccount before the weight -9 Job ever runs (non-workload kinds "succeed" the instant they're created)
 test-values.yaml|templates/prepull-rbac.yaml|hook-succeeded|0|none of the three pre-pull RBAC resources may carry hook-succeeded in their delete-policy (see row above for why)
+test-values.yaml|templates/deployment.yaml|HORT_UPSTREAM_TIMEOUT_SECS|1|DEFAULT RENDER: the server Deployment carries the upstream-deadline env unconditionally. Unlike upstream.userAgent there is no empty-means-unset sentinel, because the one value that could play that role is 0 — and 0 is a zero deadline the binary refuses, not an absent one
+test-values.yaml|templates/deployment.yaml|^ *value: "30"$|1|DEFAULT RENDER: and the value is the chart default 30, the same number the binary defaults to, so an unchanged chart moves no deployment's behaviour. Scoped because the worker Deployment renders the identical pair
+test-values.yaml|templates/worker-deployment.yaml|HORT_UPSTREAM_TIMEOUT_SECS|1|DEFAULT RENDER: the worker Deployment carries it too — its upstream legs are invisible to an operator reading the server pod
+test-values.yaml|templates/worker-deployment.yaml|^ *value: "30"$|1|DEFAULT RENDER: with the same default, so one deadline applies across the whole deployment rather than two that agree by accident
 EOF
 }
 
@@ -233,6 +239,9 @@ test-values-worker-metrics-no-networkpolicy.yaml|worker.metrics.enabled=true wit
 test-values-dex-broken.yaml|auth.dex.issuerUrl|auth.dex.enabled=true with an empty auth.dex.issuerUrl must fail schema validation — the chart points HORT_OIDC_ISSUER_URL at Dex so an empty issuer is rejected at render time
 test-values-svc-tokens-repository-typo.yaml|[Aa]dditional propert|a mistyped scheduledTasks.svcTokens[].repository key (repositroy) must fail schema validation — additionalProperties:false on the svcTokens item schema, mirroring the top-level strict-schema typo fixture
 test-values-strict-schema-typo.yaml|networkPolicy|and the rejection must name the networkPolicy BLOCK, not just some block: the row above is satisfied by any one of the fixture's six typos, so relaxing additionalProperties on networkPolicy alone leaves it green. That block is where a silently-accepted typo is fail-OPEN — an ignored networkPolicy.jobEgress leaves the Job pods on the unrestricted default while the operator believes they narrowed it. The error text differs by helm version (`networkPolicy: Additional property jobEgres` vs `at '/networkPolicy': additional properties 'jobEgres'`), so the pattern is the block name both formats share, and the fixture sets nothing else under it
+test-values-upstream-timeout-zero.yaml|timeoutSeconds|upstream.timeoutSeconds: 0 must fail schema validation — zero is a zero deadline rather than "no timeout" (reqwest spells that as the absence of one), so every upstream fetch would fail immediately. The fixture sets nothing else under upstream, and the pattern is the key name because the rest of the message differs by helm version ("Must be greater than or equal to 1" vs "minimum: got 0, want 1")
+test-values-upstream-timeout-noninteger.yaml|timeoutSeconds|a non-integer upstream.timeoutSeconds must fail schema validation rather than reaching the pod, where it aborts boot. Quoting it is the realistic mistake: every sibling under upstream IS a quoted size string
+test-values-upstream-timeout-noninteger.yaml|integer|and this fixture's rejection must be about the TYPE, not the minimum — both helm message formats name `integer` ("Expected: integer, given: string" / "got string, want integer"), which is what keeps its verdict distinguishable from the zero fixture's
 EOF
 }
 

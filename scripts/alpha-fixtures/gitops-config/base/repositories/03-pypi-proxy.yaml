@@ -9,7 +9,6 @@ spec:
   type: proxy
   storage:
     backend: filesystem
-    path: pypi-proxy
   proxy:
     upstreamUrl: "https://pypi.org"
   isPublic: true

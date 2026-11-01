@@ -16,13 +16,19 @@ flag behind it.
 
 What it retains, and why that is the point: per kind, the newest
 `completed` row AND the newest terminal row. The boot-time liveness
-gauges `hort_staging_sweep_overdue` and `hort_event_chain_verify_overdue`
-read the newest `completed` row of their kind
-(`JobsRepository::last_completed_at_by_kind`), and the prefetch rotation
-reads the newest `completed` row's `result_summary`. Both filter
+gauges `hort_staging_sweep_overdue`, `hort_event_chain_verify_overdue`
+and `hort_rescan_drive_undriven` read the newest `completed` row of their
+kind (`JobsRepository::last_completed_at_by_kind`), and the prefetch
+rotation reads the newest `completed` row's `result_summary`. Both filter
 `status = 'completed'`, so keeping only the newest *terminal* row would
 let a `failed` newest row shadow the `completed` row underneath it and
 make a task that demonstrably ran report as never having run.
+
+The `GROUP BY kind` in that keep-newest clause is what makes the set of
+dependents open-ended: a new liveness gauge over a new kind is protected
+without touching this sweep, which is why `cron-rescan-tick` needed no
+exclusion here. Shortening the horizon or dropping the keep-newest clause
+breaks all three gauges at once.
 
 Why the two sibling sweeps' kinds are excluded: each carries its own
 horizon constant, and a kind covered by two sweeps ages out on whichever

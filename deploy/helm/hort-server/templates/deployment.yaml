@@ -251,6 +251,12 @@ spec:
             - name: HORT_UPSTREAM_USER_AGENT
               value: {{ .Values.upstream.userAgent | quote }}
             {{- end }}
+            # Total per-request deadline on every upstream fetch, in whole
+            # seconds. Rendered unconditionally (the schema floors it at 1);
+            # the binary refuses a value it cannot use at boot rather than
+            # reverting to its own default.
+            - name: HORT_UPSTREAM_TIMEOUT_SECS
+              value: {{ .Values.upstream.timeoutSeconds | quote }}
             # ----- Metrics -----
             {{- if .Values.metrics.bindAddr }}
             - name: HORT_METRICS_BIND

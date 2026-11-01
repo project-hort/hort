@@ -664,7 +664,7 @@ so they don't all hit the snapshot queries on the same edge
 | Metric | Type | Labels | Unit | Description |
 |---|---|---|---|---|
 | `hort_dispatcher_principal_resolved_total` | counter | `source ∈ {snapshot_present, snapshot_empty_admin, snapshot_empty_no_admin}` | — | One increment per principal synthesis in the subscription-delivery dispatcher — one per **active subscription per reconcile pass**, since the principal is re-synthesised for a running task as well as a new one, so the rate tracks the active-subscription count rather than the spawn rate. 3-series. `snapshot_present` = `subscription.snapshot_claims` was non-empty and was used as the evaluation claim set; `snapshot_empty_admin` = `snapshot_claims` empty but the owner carries the admin bit (evaluates with admin authority); `snapshot_empty_no_admin` = `snapshot_claims` empty and owner is not an admin — the operator diagnostic for "subscription created via PAT by a non-admin user" (such a subscription can never match a claims-scoped grant). |
-| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository and `prefetch_trigger_requires_version_discovery` per offending `prefetchPolicy.triggers` entry (the ADR 0015 inert-field rules); `scan_backend_capability` fires per offending (ScanPolicy, repository, `scanBackends` entry) pairing — the same ADR 0015 rule on the scan axis, rejecting a backend the compiled-in scanner capability map says cannot analyse that repository's format; `retention_unused_for_not_implemented` fires per offending `RetentionPolicy` whose predicate uses `UnusedFor` at the root or nested in a `Composite` (the same ADR 0015 rule on the retention axis, in its mislabelled rather than merely inert form — no last-download signal exists, so the evaluator falls back to the creation time and the predicate silently decides on age; the rule is retired when a real last-download anchor is wired); `scan_policy_license_policy_not_implemented` fires per offending `ScanPolicy` declaring a non-inert `licensePolicy` (the scan path evaluates it against an empty licence list, so every rule in it matches nothing — retired when a port surfaces an artifact's licences); `exclusion_scope_not_implemented` fires per offending `Exclusion` whose `scope` names a repository (the finding filter never reads the scope, so the waiver clears its CVE for every repository the parent policy governs — retired when per-repository scoping is enforced); `virtual_member_format_not_enforced` fires per offending (virtual repository, `virtualMembers` entry) pair whose formats differ (nothing compares them, so the member is resolved for the virtual's format and owns the names it holds there — retired when a format-compatibility model ships); `scan_policy_max_artifact_age_not_implemented` fires per offending `ScanPolicy` declaring a `maxArtifactAge` (the cap is projected, event-sourced and persisted while the age evaluator has no caller on any scan, release or retention path, so no artifact is ever flagged for age — retired when a consumer feeds the projected cap and the artifact's ingest instant through `evaluate_age_gates`); `composite_verdict_promoted_requires_scan_backends` fires per offending `ScanPolicy` pairing `compositeVerdictMode: promoted` with an empty `scanBackends` — the ADR 0016 cross-opt-in rule on the composition axis, and the second rule whose other half is the same empty backend list: the waiver returns before a composed image is resolved, so the promotion grants release authority to a verdict no manifest in scope ever carries (never retired — a waived scan has nothing to promote under any implementation). `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented`, `prefetch_trigger_requires_version_discovery`, `scan_backend_capability`, `retention_unused_for_not_implemented`, `scan_policy_license_policy_not_implemented`, `exclusion_scope_not_implemented`, `virtual_member_format_not_enforced`, `scan_policy_max_artifact_age_not_implemented`, `composite_verdict_promoted_requires_scan_backends` — cardinality is fixed at the rule count (14). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 14 rules × 3 results = 42. |
+| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository and `prefetch_trigger_requires_version_discovery` per offending `prefetchPolicy.triggers` entry (the ADR 0015 inert-field rules); `scan_backend_capability` fires per offending (ScanPolicy, repository, `scanBackends` entry) pairing — the same ADR 0015 rule on the scan axis, rejecting a backend the compiled-in scanner capability map says cannot analyse that repository's format; `retention_unused_for_not_implemented` fires per offending `RetentionPolicy` whose predicate uses `UnusedFor` at the root or nested in a `Composite` (the same ADR 0015 rule on the retention axis, in its mislabelled rather than merely inert form — no last-download signal exists, so the evaluator falls back to the creation time and the predicate silently decides on age; the rule is retired when a real last-download anchor is wired); `scan_policy_license_policy_not_implemented` fires per offending `ScanPolicy` declaring a non-inert `licensePolicy` (the scan path evaluates it against an empty licence list, so every rule in it matches nothing — retired when a port surfaces an artifact's licences); `exclusion_scope_not_implemented` fires per offending `Exclusion` whose `scope` names a repository (the finding filter never reads the scope, so the waiver clears its CVE for every repository the parent policy governs — retired when per-repository scoping is enforced); `virtual_member_format_not_enforced` fires per offending (virtual repository, `virtualMembers` entry) pair whose formats differ (nothing compares them, so the member is resolved for the virtual's format and owns the names it holds there — retired when a format-compatibility model ships); `scan_policy_max_artifact_age_not_implemented` fires per offending `ScanPolicy` declaring a `maxArtifactAge` (the cap is projected, event-sourced and persisted while the age evaluator has no caller on any scan, release or retention path, so no artifact is ever flagged for age — retired when a consumer feeds the projected cap and the artifact's ingest instant through `evaluate_age_gates`); `composite_verdict_promoted_requires_scan_backends` fires per offending `ScanPolicy` pairing `compositeVerdictMode: promoted` with an empty `scanBackends` — the ADR 0016 cross-opt-in rule on the composition axis, and the second rule whose other half is the same empty backend list: the waiver returns before a composed image is resolved, so the promotion grants release authority to a verdict no manifest in scope ever carries (never retired — a waived scan has nothing to promote under any implementation); `repository_storage_path_deprecated` fires per offending `ArtifactRepository` declaring the deprecated `storage.path` — the only *lint-row* rule that emits `result="warn"` rather than `result="reject"` (the four grant rules span all three results), because unlike its inert-field siblings the field was effectively mandatory before it became optional, so rejecting it would fail the first apply after an upgrade for every operator at once over a value that routes nothing (placement is the one global CAS selected by `HORT_STORAGE_BACKEND`); retired in the same commit that removes `StorageSpec.path`. `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented`, `prefetch_trigger_requires_version_discovery`, `scan_backend_capability`, `retention_unused_for_not_implemented`, `scan_policy_license_policy_not_implemented`, `exclusion_scope_not_implemented`, `virtual_member_format_not_enforced`, `scan_policy_max_artifact_age_not_implemented`, `composite_verdict_promoted_requires_scan_backends`, `repository_storage_path_deprecated` — cardinality is fixed at the rule count (15). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 15 rules × 3 results = 45. |
 | `hort_effective_permissions_lookups_total` | counter | `result ∈ {ok, denied, not_found}` | — | One increment per call to the admin effective-permissions endpoint (`GET /api/v1/admin/users/:user_id/effective-permissions`). 3-series. `ok` = admin caller, inspected user resolved, view returned; `denied` = `require_admin()` rejected the caller (emitted before the early return; the inspected user was never resolved); `not_found` = caller was admin but the inspected `user_id` did not resolve to a user row. |
 
 Emitted by
@@ -1900,6 +1900,60 @@ emitted on the healthy path too (`0.0`) so a fresh scrape always sees
 the series (absence vs `0.0` is ambiguous to dashboards), matching the
 `hort_unsafe_config_active` convention.
 
+### Rescan-drive liveness
+
+| Metric | Type | Labels | Unit | Values |
+|--------|------|--------|------|--------|
+| `hort_rescan_drive_undriven` | gauge | — (no labels) | Boolean (0/1) | `0` = a declared rescan cadence is being driven, OR no active `ScanPolicy` declares one; `1` = a cadence is declared and no `cron-rescan-tick` has completed within the window (including never) |
+
+Emitted **once at boot** by `hort-server::composition` (the
+`emit_rescan_drive_liveness_signal` fn), mirroring
+`hort_staging_sweep_overdue` above. The composition root reads the
+active policy projections (`PolicyProjectionRepository::list_active`)
+plus the newest `completed_at` for a `kind='cron-rescan-tick' AND
+status='completed'` row (`JobsRepository::last_completed_at_by_kind`),
+feeds both through the pure
+`hort_domain::policy::evaluate_rescan_drive_liveness` predicate, and
+sets the gauge: `1.0` when some active policy declares a non-zero
+`rescanIntervalHours` and the newest completed tick is older than
+`HORT_RESCAN_DRIVE_STALENESS_MULTIPLIER × the shortest declared
+interval` (default multiplier `3`, so `72 h` at the default 24-hour
+cadence), `0.0` otherwise. A `warn!` on the `1.0` paths names the
+shortest declared interval, the policy carrying it, the age of the last
+completed tick (or that there is none), and the chart value to set —
+`scheduledTasks.cronRescanTick.enabled` — plus the one-shot
+`POST /api/v1/admin/tasks/cron-rescan-tick` for draining once without
+scheduling anything.
+
+**What it is for.** `ScanPolicy.rescanIntervalHours` is enforced
+correctly by its consumer, but `cron-rescan-tick` is that consumer's
+only driver and `scheduledTasks.cronRescanTick.enabled` defaults to
+`false`. So an operator can declare a cadence, have it stored verbatim,
+read it back from their own policy document and make a threat-model
+decision on it while nothing re-scans anything. The same tick is the
+only production caller of the stranded-artifact selector, so a scan
+left stranded by a failed job has no automatic recovery either — one
+deployment choice, two silent gaps. The signal is a statement about
+reachability, **not** a verdict on the configuration: running without
+the tick is supported and deliberate, and the line says what the choice
+costs.
+
+`0` is also the "nothing declared" value, not just the healthy one.
+A deployment with no policy rows, only archived rows, or only
+`rescanIntervalHours: 0` rows has promised nothing, so there is nothing
+to be undriven — `0` is the honest reading and distinguishing the two
+would need a second series for no actionable gain.
+
+**Why a boolean, why no labels, why boot-only** — identical reasoning
+to `hort_staging_sweep_overdue`: `hort-server` is deliberately
+scheduler-free, so the gauge is set once at boot and scraped
+continuously, with operators alarming on
+`max_over_time(hort_rescan_drive_undriven[6h]) > 0`. One rescan-drive
+posture per deployment, so a label would be unbounded-by-construction
+with no analytical value, and the shortest declared interval is a
+`warn!` field rather than a label for the same reason. Emitted on the
+healthy path too (`0.0`) so a fresh scrape always sees the series.
+
 ### Refcount-reconcile purge start-gate
 
 | Metric | Type | Labels | Unit | Values |
@@ -2862,18 +2916,24 @@ transition; closed taxonomy of 4):
   once per job returned from the `JobsRepository::claim_scan_jobs`
   call. A batch of N claimed jobs ticks the counter N times so the
   `pending → running` rate is observable on a single label.
+  These three labels report what `record_outcome` decided the row
+  should become — the `ScanRowDisposition` it returns. The row itself
+  is written by the dispatcher, from that disposition, so the
+  scan-specific counter and the `hort_admin_tasks_completed_total`
+  result label describe the same transition from the two layers.
 - `completed` — emitted by
-  `ScanOrchestrationUseCase::record_outcome` whenever the job is
-  marked completed. Both `Completed { … }` and `SkippedNoBackends`
-  reach `mark_completed` and tick this label; the wire reports the
-  terminal happy-path outcome regardless of whether scanning ran.
-- `failed` — emitted when `record_outcome` lands on the terminal
-  `mark_failed` arm (the job exhausted `max_attempts` retries). One
-  tick per terminal failure; never co-emitted with `retried` for the
-  same observation.
-- `retried` — emitted when `record_outcome` reschedules the job for
-  a future attempt via `JobsRepository::reschedule`. One tick per
-  reschedule call.
+  `ScanOrchestrationUseCase::record_outcome` whenever the scan
+  recorded a result. Both `Completed { … }` and `SkippedNoBackends`
+  reach `ScanRowDisposition::Completed` and tick this label; the wire
+  reports the terminal happy-path outcome regardless of whether
+  scanning ran.
+- `failed` — emitted when `record_outcome` lands on a terminal
+  disposition (the job exhausted `max_attempts` retries, or had
+  nothing analysable). One tick per terminal failure; never
+  co-emitted with `retried` for the same observation.
+- `retried` — emitted when `record_outcome` returns
+  `ScanRowDisposition::Retry`, asking the dispatcher to reschedule the
+  job for a future attempt. One tick per retried observation.
 
 **`hort_finding_component_relation_total` semantics** — emitted by
 `ScanOrchestrationUseCase::run_scan` once per finding as it is tagged
@@ -3122,8 +3182,9 @@ once per Failed-branch `record_outcome` invocation that itself
 returns `Err`. The Failed branch is the one the worker takes when
 `run_scan` returned `Err(_)` (an infrastructure failure — artifact
 load, SBOM extraction, etc.) and the orchestrator's
-`record_outcome(&job, ScanRunOutcome::Failed(_))` then also failed
-to persist the backoff or `mark_failed` transition. Distinct from
+`record_outcome(&job, ScanRunOutcome::Failed(_))` then also failed —
+it could not persist the artifact's `ScanIndeterminate` transition, or
+could not read the state that decides whether one is owed. Distinct from
 `hort_scan_jobs_total{result=failed}`, which counts jobs the
 orchestrator successfully transitioned into the terminal `failed`
 state — this counter only fires when that very transition could not
@@ -4261,8 +4322,10 @@ with the per-kind reason.
   a terminal `failed` row carrying its last error. Three triggers reach
   it: the handler returned `TaskOutcome::Failed { retry: false }`; it
   asked to be retried on a row whose `attempts` had reached the
-  dispatcher's attempt cap (`JOB_ATTEMPT_CAP`, 5 — the same number the
-  abandoned-lease sweep spends); or the row is a **destructive**
+  dispatcher's attempt cap (`HORT_SCANNER_MAX_ATTEMPTS`, default 5 —
+  the same number the abandoned-lease sweep spends and the same one
+  `ScanOrchestrationConfig::max_attempts` carries); or the row is a
+  **destructive**
   invocation whose requester's authority no longer holds, which the
   dispatcher refuses before calling the handler (below). The label
   reports what the dispatcher did to the row, not what the handler asked

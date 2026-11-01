@@ -628,7 +628,6 @@ gitopsConfig:
       type: hosted
       storage:
         backend: filesystem
-        path: /var/lib/hort-server/cas/pypi-internal
       isPublic: false
       replicationPriority: local_only
   "service-account.${SA_NAME}.yaml": |

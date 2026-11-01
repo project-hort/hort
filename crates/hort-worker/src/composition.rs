@@ -572,6 +572,14 @@ pub async fn build_app_context(
             // other outbound legs (HORT_UPSTREAM_USER_AGENT or the
             // built-in default), so a custom value applies uniformly.
             user_agent: hort_adapters_upstream_http::user_agent_from_env(),
+            // Same upstream fetch deadline as hort-server
+            // (HORT_UPSTREAM_TIMEOUT_SECS or the built-in default), resolved by
+            // the shared adapter helper so both binaries agree. Fallible on
+            // purpose — see `timeout_from_env`: a value the binary cannot use
+            // aborts boot rather than leaving the operator who set it on the
+            // default, which is the one place this knob departs from the
+            // User-Agent beside it.
+            timeout: hort_adapters_upstream_http::timeout_from_env()?,
             ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new("composite_scan")
         };
         Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(
@@ -672,6 +680,16 @@ pub async fn build_app_context(
         cfg.lock_duration,
         cfg.poll_interval.as_secs(),
         u16::try_from(cfg.batch_size).unwrap_or(u16::MAX),
+        // The same `HORT_SCANNER_MAX_ATTEMPTS`-derived number the
+        // orchestration config above was given, and that is the whole
+        // point of passing it here. The two caps meet at one boundary:
+        // the scan path spends its cap to decide the ARTIFACT's
+        // terminal state and the dispatcher spends this one to decide
+        // the ROW's. While the dispatcher carried a compile-time `5`
+        // they agreed only at the default, so an operator who moved the
+        // scan budget got a row failed on one number and an artifact
+        // held on another.
+        cfg.max_attempts,
     );
     dispatcher.register(
         Arc::new(ScanTaskHandler::new(orchestration.clone())),
@@ -817,6 +835,9 @@ pub async fn build_app_context(
             // or the built-in default) — worker prefetch + provenance fetches
             // carry the identical UA so a custom value applies uniformly.
             user_agent: hort_adapters_upstream_http::user_agent_from_env(),
+            // Same deadline as every other upstream leg, resolved by the
+            // shared adapter helper (`timeout_from_env`).
+            timeout: hort_adapters_upstream_http::timeout_from_env()?,
             ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new("prefetch_tick")
         };
         Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(
@@ -898,6 +919,9 @@ pub async fn build_app_context(
             // or the built-in default) — worker prefetch + provenance fetches
             // carry the identical UA so a custom value applies uniformly.
             user_agent: hort_adapters_upstream_http::user_agent_from_env(),
+            // Same deadline as every other upstream leg, resolved by the
+            // shared adapter helper (`timeout_from_env`).
+            timeout: hort_adapters_upstream_http::timeout_from_env()?,
             ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new("provenance")
         };
         Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(
@@ -1631,6 +1655,9 @@ pub async fn build_app_context(
             // outbound legs (HORT_UPSTREAM_USER_AGENT or the built-in
             // default), so a custom value applies uniformly.
             user_agent: hort_adapters_upstream_http::user_agent_from_env(),
+            // Same deadline as every other upstream leg, resolved by the
+            // shared adapter helper (`timeout_from_env`).
+            timeout: hort_adapters_upstream_http::timeout_from_env()?,
             ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new("oci_index_child_ingest")
         };
         Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(

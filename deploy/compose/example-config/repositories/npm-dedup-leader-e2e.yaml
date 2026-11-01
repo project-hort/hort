@@ -18,7 +18,6 @@ spec:
   indexMode: include_pending
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/npm-dedup-leader-e2e
   proxy:
     # Validator-only field; the runtime resolves the upstream through the
     # standalone UpstreamMapping envelope in ../upstreams/.

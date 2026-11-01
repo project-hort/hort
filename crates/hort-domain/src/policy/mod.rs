@@ -30,6 +30,7 @@ pub mod primitives;
 pub mod promotion;
 pub mod quarantine_anchor;
 pub mod re_evaluation;
+pub mod rescan_drive_liveness;
 pub mod scan;
 pub mod scan_delta;
 pub mod staging_sweep_liveness;
@@ -56,6 +57,9 @@ pub use quarantine_anchor::{
     derive_quarantine_anchor, AnchorEvidence, AnchorSource, DerivedAnchor,
 };
 pub use re_evaluation::{decide_rejected_transition, ReEvaluationOutcome};
+pub use rescan_drive_liveness::{
+    evaluate_rescan_drive_liveness, DeclaredCadence, RescanDriveLiveness,
+};
 pub use scan::{
     composite_verdict_mode_of, effective_quarantine_deadline, evaluate_scan_result,
     evaluate_scan_summary, has_license_policy, DefaultPolicy, ScanOutcome,

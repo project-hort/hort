@@ -344,16 +344,17 @@ http:
   publishBodyMaxSize: ""
 
 # -------------------- Upstream proxy --------------------
-# Configurable storage backstops on the streaming upstream fetch path.
-# Each cap bounds the per-fetch on-disk write; a trip emits a structured
-# 502 with `bytes_read` + `cap` and the
-# `result=<metadata|manifest|version_object>_too_large` metric label.
+# The pull-through fetch path: the streaming storage backstops, the
+# outbound identity, and the per-request deadline.
 #
-# Values are human-readable size STRINGS — `64Mi`, `1Gi`, `512Ki`,
-# decimal `64M`, or a bare byte integer. Quote them. (Strings, not bare
-# numbers, so a multi-GiB value can never round-trip through Helm's
-# float64 coercion into scientific notation, which the binary's parser
-# rejects at boot.)
+# The three `*MaxSize` caps bound the per-fetch on-disk write; a trip emits
+# a structured 502 with `bytes_read` + `cap` and the
+# `result=<metadata|manifest|version_object>_too_large` metric label. Their
+# values are human-readable size STRINGS — `64Mi`, `1Gi`, `512Ki`, decimal
+# `64M`, or a bare byte integer. Quote them. (Strings, not bare numbers, so
+# a multi-GiB value can never round-trip through Helm's float64 coercion
+# into scientific notation, which the binary's parser rejects at boot.)
+# `timeoutSeconds` is a small whole number and carries no such hazard.
 upstream:
   # HORT_UPSTREAM_METADATA_CACHE_MAX_SIZE — default 64Mi. Caps the
   # streamed write on `fetch_metadata` (npm packument, PyPI JSON, Cargo
@@ -383,6 +384,29 @@ upstream:
   # `hort-server validate-config` lints it offline); an invalid value is
   # ignored by the binary, which falls back to the built-in default.
   userAgent: ""
+  # HORT_UPSTREAM_TIMEOUT_SECS — total deadline, in whole seconds, on every
+  # upstream pull-through fetch (blob / manifest / metadata / referrers),
+  # applied by BOTH hort-server and the worker. Default 30, which is the
+  # binary's own default: this value is rendered unconditionally, so the chart
+  # pins it the way the three caps above pin theirs.
+  #
+  # It is a TOTAL request deadline, not an idle one: a transfer making
+  # uninterrupted progress is still cut at the limit, and the retry restarts at
+  # byte 0. So raise it when a legitimately large upstream blob cannot finish
+  # inside 30 s at your egress bandwidth — the default makes such a blob
+  # unfetchable rather than slow. The floor is 1 (the schema rejects 0 and any
+  # non-integer, and so does the binary at boot: a value it cannot use aborts
+  # startup instead of silently reverting to 30, which would leave you watching
+  # the same failures).
+  #
+  # Above 600 this knob stops being the binding limit on the read path. A
+  # coalesced blob pull-through runs inside the pull-through dedup leader's own
+  # deadline (HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS, default 600 s), which
+  # cancels the leader's fetch outright — so the effective ceiling there is the
+  # lower of the two. Raising this past 600 without raising that one changes
+  # nothing for the blob it was raised for; the dedup deadline has no chart
+  # value of its own today, so set it through `extraEnv`.
+  timeoutSeconds: 30
 
 # -------------------- Metrics --------------------
 # /metrics is served EXCLUSIVELY by the dedicated admin listener, gated by
@@ -1827,9 +1851,11 @@ scheduledTasks:
   #
   # Retains, per kind, the newest `completed` row AND the newest terminal
   # row: the boot-time liveness gauges (`hort_staging_sweep_overdue`,
-  # `hort_event_chain_verify_overdue`) read the newest `completed` row of
-  # their kind, so a horizon that collected it would report "never ran"
-  # for a task that demonstrably ran.
+  # `hort_event_chain_verify_overdue`, `hort_rescan_drive_undriven`) read
+  # the newest `completed` row of their kind, so a horizon that collected
+  # it would report "never ran" for a task that demonstrably ran. The
+  # keep-newest clause groups by kind, so a future gauge over a new kind
+  # is covered without an entry here.
   #
   # The two kind-specific sweeps' kinds are excluded so exactly one sweep
   # owns each kind — a kind covered twice would age out on whichever of
@@ -1934,6 +1960,39 @@ scheduledTasks:
   # Cron-driven rescan: insert kind='scan' jobs for artifacts past their
   # ScanPolicy.rescanIntervalHours. Default 5-minute cadence. Each tick
   # is single-active (concurrencyPolicy: Forbid + worker semaphore).
+  #
+  # THIS TICK IS THE DRIVER FOR TWO SEPARATE THINGS, AND BOTH ARE INERT
+  # WHILE IT IS OFF. `enabled: false` is the deliberate default — the
+  # tick is opt-in, not an oversight — but choosing it costs both of
+  # these, so it is worth knowing which:
+  #
+  #   1. `ScanPolicy.rescanIntervalHours` (default 24). The field is
+  #      stored and enforced correctly, but the only query that reads it
+  #      runs inside this tick. Without the tick an operator's declared
+  #      cadence decides nothing: an advisory published after an
+  #      artifact's one-and-only ingest scan is never matched against
+  #      it. What the interval buys when the tick IS scheduled is
+  #      narrower than "everything gets rescanned" — the selector takes
+  #      artifacts whose quarantine status is `released` or NULL, so a
+  #      `rejected` or `scan_indeterminate` artifact is terminal and
+  #      never re-scanned on any interval (ADR 0007).
+  #   2. Stranded-artifact recovery. An artifact whose scan job failed
+  #      outright stays `quarantined` with no release authority, and
+  #      this same tick is the only production caller of the query that
+  #      re-picks it. Without the tick a scanner outage strands every
+  #      artifact ingested during it until someone intervenes — see
+  #      docs/architecture/how-to/recover-stranded-artifacts.md.
+  #
+  # Running without the tick is supported. `hort-server` says so once
+  # per boot — a `warn!` plus the `hort_rescan_drive_undriven` gauge —
+  # whenever an active ScanPolicy declares a non-zero
+  # rescanIntervalHours and no tick has completed in the window, so the
+  # gap is discoverable rather than silent.
+  #
+  # To drain once without scheduling anything (e.g. after a scanner
+  # outage), invoke the task by hand instead of flipping this value:
+  #   POST /api/v1/admin/tasks/cron-rescan-tick
+  #   hort-cli admin task invoke cron-rescan-tick
   cronRescanTick:
     executionPath: admin-task
     enabled: false

@@ -556,6 +556,145 @@ pub(crate) fn emit_event_chain_verify_liveness_signal(
     }
 }
 
+/// Metric name for the rescan-drive liveness gauge.
+/// Boolean (0/1), **no labels** — a single global series. `1.0` means
+/// "an active `ScanPolicy` declares a non-zero `rescanIntervalHours`
+/// and no `cron-rescan-tick` has completed within
+/// `HORT_RESCAN_DRIVE_STALENESS_MULTIPLIER × the shortest declared
+/// interval`"; `0.0` means the declared cadence is being driven, or
+/// that no cadence is declared at all. The catalog entry in
+/// `docs/metrics-catalog.md` pins the no-label contract.
+const RESCAN_DRIVE_UNDRIVEN_METRIC: &str = "hort_rescan_drive_undriven";
+
+/// Boot-time liveness signal for the `cron-rescan-tick` **driver**.
+///
+/// `ScanPolicy.rescanIntervalHours` is enforced correctly by its
+/// consumer — the eligibility query in
+/// `hort-adapters-postgres::rescan_candidates` — but that query runs
+/// only when the `cron-rescan-tick` task runs, and
+/// `scheduledTasks.cronRescanTick.enabled` defaults to `false`. So an
+/// operator can declare a cadence, have it stored verbatim, read it
+/// back from their own policy document, and make a threat-model
+/// decision on it while nothing re-scans anything. The same tick is
+/// the only production caller of
+/// `RescanCandidatesRepository::select_stranded`, so a scan left
+/// stranded by a failed job has no automatic recovery either — one
+/// deployment choice, two silent gaps.
+///
+/// **The chart default staying `false` is deliberate**, so this is a
+/// statement about reachability and not a verdict on the
+/// configuration: an operator running without the tick has made a
+/// supported choice, and the line says what the choice costs. It names
+/// the chart value to set so an operator reading it does not have to go
+/// looking for the switch, plus the one-shot admin task for draining
+/// once without scheduling anything.
+///
+/// The pure decision lives in
+/// [`hort_domain::policy::evaluate_rescan_drive_liveness`] (zero-I/O,
+/// 100%-tested); this function is the thin composition-root shell that
+/// supplies the wall-clock plus the two port reads, then emits the
+/// gauge and a `warn!` on the undriven paths — mirroring
+/// [`emit_staging_sweep_liveness_signal`] and
+/// [`emit_event_chain_verify_liveness_signal`].
+///
+/// **Placement rationale (boot-time emit, not a periodic loop).** A
+/// periodic in-process re-check would itself be a `tokio::time`
+/// scheduler, and the scheduler-free `hort-server` is load-bearing
+/// (ADR 0028). The gauge is set once at boot and scraped continuously;
+/// Prometheus alerts on
+/// `max_over_time(hort_rescan_drive_undriven[…]) > 0`, the same alarm
+/// shape the sibling boot signals use. The gauge is emitted on every
+/// path (`0.0` when driven or when nothing is declared) so a fresh
+/// scrape always sees the series — absence and `0.0` are ambiguous to
+/// dashboards.
+///
+/// Never returns an error / never blocks boot: an undriven cadence is
+/// an operational fact to surface, not a reason to refuse to start —
+/// and refusing would break deployments whose configuration is right.
+pub(crate) fn emit_rescan_drive_liveness_signal(
+    policies: &[hort_domain::entities::scan_policy::ScanPolicyProjection],
+    last_completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    staleness_multiplier: u32,
+) {
+    use hort_domain::policy::{evaluate_rescan_drive_liveness, RescanDriveLiveness};
+
+    let liveness =
+        evaluate_rescan_drive_liveness(policies, last_completed_at, now, staleness_multiplier);
+
+    match liveness {
+        RescanDriveLiveness::NoCadenceDeclared => {
+            tracing::debug!(
+                "rescan drive: no active ScanPolicy declares a non-zero \
+                 rescanIntervalHours, so no rescan cadence is owed"
+            );
+            metrics::gauge!(RESCAN_DRIVE_UNDRIVEN_METRIC).set(0.0);
+        }
+        RescanDriveLiveness::Driven {
+            cadence,
+            age_secs,
+            threshold_secs,
+        } => {
+            tracing::debug!(
+                shortest_interval_hours = cadence.interval_hours,
+                policy_name = %cadence.policy_name,
+                age_secs,
+                threshold_secs,
+                "rescan drive OK — a cron-rescan-tick completed within the window \
+                 for the shortest declared rescan cadence"
+            );
+            metrics::gauge!(RESCAN_DRIVE_UNDRIVEN_METRIC).set(0.0);
+        }
+        RescanDriveLiveness::Stale {
+            cadence,
+            age_secs,
+            threshold_secs,
+        } => {
+            tracing::warn!(
+                shortest_interval_hours = cadence.interval_hours,
+                policy_name = %cadence.policy_name,
+                age_secs,
+                threshold_secs,
+                staleness_multiplier,
+                "rescan cadence declared but not currently driven: the newest \
+                 completed cron-rescan-tick is older than the staleness window for \
+                 the ScanPolicy declaring the shortest rescanIntervalHours on this \
+                 deployment. Until a tick runs again, released artifacts are not \
+                 re-scanned on that cadence and artifacts stranded by a failed scan \
+                 are not re-picked (the same tick drives both). Schedule it with \
+                 `scheduledTasks.cronRescanTick.enabled=true`, or drain once \
+                 without scheduling via `POST /api/v1/admin/tasks/cron-rescan-tick`."
+            );
+            metrics::gauge!(RESCAN_DRIVE_UNDRIVEN_METRIC).set(1.0);
+        }
+        RescanDriveLiveness::NeverDriven {
+            cadence,
+            threshold_secs,
+        } => {
+            tracing::warn!(
+                shortest_interval_hours = cadence.interval_hours,
+                policy_name = %cadence.policy_name,
+                threshold_secs,
+                staleness_multiplier,
+                "rescan cadence declared but never driven: no cron-rescan-tick has \
+                 ever completed here — the `scheduledTasks.cronRescanTick` CronJob \
+                 is off by default and nothing else drives the rescan — so the \
+                 ScanPolicy declaring the shortest rescanIntervalHours on this \
+                 deployment is not being driven at all. Released artifacts are \
+                 never re-scanned on that cadence and artifacts stranded by a \
+                 failed scan are never re-picked (the same tick drives both); an \
+                 advisory published after an artifact's only scan is not matched \
+                 against it. This is a supported configuration — if you want the \
+                 cadence you declared, set \
+                 `scheduledTasks.cronRescanTick.enabled=true`; to drain once \
+                 without scheduling anything, \
+                 `POST /api/v1/admin/tasks/cron-rescan-tick`."
+            );
+            metrics::gauge!(RESCAN_DRIVE_UNDRIVEN_METRIC).set(1.0);
+        }
+    }
+}
+
 /// Structured boot-time **quarantine posture** verdict,
 /// the value returned by [`evaluate_quarantine_posture`].
 ///
@@ -678,24 +817,19 @@ pub(crate) fn evaluate_quarantine_posture(
             default_quarantine_duration_secs = posture.default_quarantine_duration_secs,
             permissive_operator_policy_count = posture.permissive_operator_policy_count,
             trust_upstream_publish_time_count = posture.trust_upstream_publish_time_count,
-            "quarantine posture: out-of-the-box ingest is quarantined by default for \
-             default_quarantine_duration_secs seconds. \
-             permissive_operator_policy_count operator ScanPolicy rows set \
-             quarantineDuration=0 (explicit permissive override — legitimate for \
-             internal-only repos but worth flagging in dashboards). \
-             trust_upstream_publish_time_count upstream mappings have opted in to \
-             publish-time anchoring."
+            "quarantine posture: out-of-the-box ingest is quarantined by default for the \
+             resolved default hold, and at least one operator ScanPolicy row overrides that \
+             to permissive with quarantineDuration=0 — an explicit override, legitimate for \
+             internal-only repos but worth flagging in dashboards."
         );
     } else {
         tracing::info!(
             default_quarantine_duration_secs = posture.default_quarantine_duration_secs,
             permissive_operator_policy_count = posture.permissive_operator_policy_count,
             trust_upstream_publish_time_count = posture.trust_upstream_publish_time_count,
-            "quarantine posture: out-of-the-box ingest is quarantined by default for \
-             default_quarantine_duration_secs seconds. No operator \
-             ScanPolicy currently overrides to permissive (quarantineDuration=0). \
-             trust_upstream_publish_time_count upstream mappings have opted in to \
-             publish-time anchoring."
+            "quarantine posture: out-of-the-box ingest is quarantined by default for the \
+             resolved default hold, and no operator ScanPolicy currently overrides to \
+             permissive (quarantineDuration=0)."
         );
     }
 
@@ -1258,6 +1392,68 @@ async fn run_event_chain_verify_liveness_check(jobs_repo: &PgJobsRepository) {
                 error = %e,
                 "event-chain verify liveness check skipped — last-completed query failed; \
                  hort_event_chain_verify_overdue not emitted this boot"
+            );
+        }
+    }
+}
+
+/// Boot-time liveness check for the `cron-rescan-tick` **driver**.
+/// Mirrors [`run_staging_sweep_liveness_check`]: parses its own env-var
+/// knob, fetches the two inputs the predicate needs, and emits
+/// [`emit_rescan_drive_liveness_signal`]. A query failure is logged and
+/// treated as "unknown"; it must not block an otherwise-serviceable
+/// boot.
+///
+/// Only **one** knob, unlike the sibling checks' two: the expected
+/// interval is not an operator guess about a CronJob schedule, it is
+/// the cadence the policies themselves declare, so the predicate reads
+/// it from the projection rows rather than from the environment.
+///
+/// The policy list is read separately from
+/// [`run_quarantine_posture_log`]'s even though both call
+/// `list_active()`. Two boot-time reads cost nothing measurable, and
+/// fusing two independent signals into one fetch would make either
+/// one's failure silence the other.
+async fn run_rescan_drive_liveness_check(
+    jobs_repo: &PgJobsRepository,
+    policy_projections: &Arc<dyn PolicyProjectionRepository>,
+) {
+    use hort_domain::ports::jobs_repository::JobsRepository as _;
+    let staleness_multiplier = std::env::var("HORT_RESCAN_DRIVE_STALENESS_MULTIPLIER")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3);
+
+    let policies = match policy_projections.list_active().await {
+        Ok(policies) => policies,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "rescan drive liveness check skipped — list_active() on \
+                 policy_projections failed; hort_rescan_drive_undriven not emitted \
+                 this boot"
+            );
+            return;
+        }
+    };
+
+    match jobs_repo
+        .last_completed_at_by_kind("cron-rescan-tick")
+        .await
+    {
+        Ok(last_completed_at) => {
+            emit_rescan_drive_liveness_signal(
+                &policies,
+                last_completed_at,
+                chrono::Utc::now(),
+                staleness_multiplier,
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "rescan drive liveness check skipped — last-completed query failed; \
+                 hort_rescan_drive_undriven not emitted this boot"
             );
         }
     }
@@ -2186,6 +2382,13 @@ pub async fn build_app_context(
     // where an operator triaging "which upstream is plaintext?" needs
     // the emitting format to be the real one.
     let upstream_user_agent = hort_adapters_upstream_http::user_agent_from_env();
+    // Outbound fetch deadline: HORT_UPSTREAM_TIMEOUT_SECS or the built-in
+    // default, resolved by the same adapter helper hort-worker calls so both
+    // binaries agree. Resolved HERE rather than inside the closure because it
+    // is fallible — an unparseable or zero value aborts boot instead of
+    // leaving the operator who raised it on the default — and the closure
+    // runs once per served format.
+    let upstream_timeout = hort_adapters_upstream_http::timeout_from_env()?;
     let upstream_proxy_config = |format_label: &str| {
         hort_adapters_upstream_http::HttpUpstreamProxyConfig {
             extra_trust_anchors: extra_trust_anchors.clone(),
@@ -2197,6 +2400,8 @@ pub async fn build_app_context(
             // default once a chart knob exists.
             metadata_cache_max_bytes: upstream_metadata_cache_max_bytes,
             manifest_cache_max_bytes: upstream_manifest_cache_max_bytes,
+            // Total per-request upstream deadline, resolved above.
+            timeout: upstream_timeout,
             // Outbound User-Agent: HORT_UPSTREAM_USER_AGENT or the built-in
             // default (crates.io rejects requests with no UA). Resolved by the
             // shared adapter helper so hort-server + hort-worker match.
@@ -2385,11 +2590,13 @@ pub async fn build_app_context(
 
     // Boot-time liveness + posture signals — see
     // `run_staging_sweep_liveness_check`, `run_event_chain_verify_liveness_check`,
-    // and `run_quarantine_posture_log` for the rationale behind each.
+    // `run_rescan_drive_liveness_check`, and `run_quarantine_posture_log` for the
+    // rationale behind each.
     // None of these block boot: a query failure degrades to a debug
     // log, not a startup error.
     run_staging_sweep_liveness_check(&jobs_repo).await;
     run_event_chain_verify_liveness_check(&jobs_repo).await;
+    run_rescan_drive_liveness_check(&jobs_repo, &policy_projections).await;
     run_quarantine_posture_log(&policy_projections, &repository_upstream_mappings).await;
 
     // Load the OCI Distribution-Spec `/v2/auth`
@@ -4121,6 +4328,450 @@ mod tests {
         }
     }
 
+    // -- emit_rescan_drive_liveness_signal ---------------------------------
+    //
+    // Boot-time rescan-drive liveness signal. The pure decision is
+    // unit-tested exhaustively in
+    // `hort_domain::policy::rescan_drive_liveness`; these tests pin only
+    // the composition-shell behaviour: the `hort_rescan_drive_undriven`
+    // gauge fires `0.0` when the declared cadence is driven AND when
+    // nothing is declared (so a fresh scrape always sees the series),
+    // and `1.0` on the stale / never-driven paths, with NO labels.
+
+    /// Build a policy whose rescan cadence and archived flag are the
+    /// controllable facts. Reuses [`make_scan_policy`] rather than
+    /// re-typing the 20-field literal.
+    fn make_rescan_policy(
+        name: &str,
+        rescan_interval_hours: i32,
+        archived: bool,
+    ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
+        let mut policy = make_scan_policy(0, archived);
+        policy.name = name.to_string();
+        policy.rescan_interval_hours = rescan_interval_hours;
+        policy
+    }
+
+    /// Read the no-label `hort_rescan_drive_undriven` gauge out of a
+    /// captured recorder snapshot and assert its value.
+    fn assert_rescan_drive_gauge(entries: &[MetricEntry], expected: f64, ctx: &str) {
+        let gauge = find_metric(
+            entries,
+            MetricKind::Gauge,
+            RESCAN_DRIVE_UNDRIVEN_METRIC,
+            &[],
+        )
+        .unwrap_or_else(|| panic!("hort_rescan_drive_undriven must fire on the {ctx} path"));
+        match gauge {
+            DebugValue::Gauge(v) => {
+                let f: f64 = (*v).into();
+                assert!(
+                    (f - expected).abs() < f64::EPSILON,
+                    "{ctx}: expected {expected}, got {f}"
+                );
+            }
+            other => panic!("expected gauge, got {other:?}"),
+        }
+    }
+
+    /// No cadence declared (zero policy rows) → gauge `0.0`. Nothing was
+    /// promised, so nothing is undriven — but the series still has to
+    /// exist, or a dashboard cannot tell "healthy" from "not scraped".
+    #[test]
+    fn emit_rescan_drive_liveness_signal_gauge_zero_when_no_cadence_declared() {
+        let now = chrono::Utc::now();
+        let entries = capture(|| {
+            emit_rescan_drive_liveness_signal(&[], None, now, 3);
+        });
+        assert_rescan_drive_gauge(&entries, 0.0, "no-cadence-declared");
+    }
+
+    /// Declared cadence, tick inside the window → gauge `0.0`.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_gauge_zero_when_driven() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("daily", 24, false)];
+        let entries = capture(|| {
+            emit_rescan_drive_liveness_signal(
+                &policies,
+                Some(now - chrono::Duration::seconds(300)),
+                now,
+                3,
+            );
+        });
+        assert_rescan_drive_gauge(&entries, 0.0, "driven");
+    }
+
+    /// Declared cadence, newest tick older than `multiplier × shortest
+    /// interval` → gauge `1.0`.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_gauge_one_when_stale() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("daily", 24, false)];
+        // 10 days old; window = 24 h × 3 = 72 h → stale.
+        let entries = capture(|| {
+            emit_rescan_drive_liveness_signal(
+                &policies,
+                Some(now - chrono::Duration::days(10)),
+                now,
+                3,
+            );
+        });
+        assert_rescan_drive_gauge(&entries, 1.0, "stale");
+    }
+
+    /// Declared cadence, no tick ever → gauge `1.0`. This is the
+    /// deployment the unit exists for: `cronRescanTick.enabled` is
+    /// `false` by default and nobody turned it on.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_gauge_one_when_never_driven() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("daily", 24, false)];
+        let entries = capture(|| {
+            emit_rescan_drive_liveness_signal(&policies, None, now, 3);
+        });
+        assert_rescan_drive_gauge(&entries, 1.0, "never-driven");
+    }
+
+    /// An archived row and a `rescanIntervalHours: 0` row declare no
+    /// cadence between them, so the shell reports healthy rather than
+    /// warning about a policy nobody is relying on.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_ignores_archived_and_zero_interval_rows() {
+        let now = chrono::Utc::now();
+        let policies = [
+            make_rescan_policy("retired", 1, true),
+            make_rescan_policy("opted-out", 0, false),
+        ];
+        let entries = capture(|| {
+            emit_rescan_drive_liveness_signal(&policies, None, now, 3);
+        });
+        assert_rescan_drive_gauge(&entries, 0.0, "archived-and-zero-only");
+    }
+
+    // -- emit_rescan_drive_liveness_signal: the rendered sentence ----------
+    //
+    // The gauge tests above pin the verdict; these pin the *prose*, which
+    // nothing else in the workspace holds. `tracing` does not substitute
+    // field names into a message literal, so a literal containing the
+    // word `policy_name` renders the word `policy_name` where the
+    // operator expects a policy name, with the real value arriving
+    // separately in the structured block. No information is lost — an
+    // aggregator reads the fields — but the sentence is, and this line's
+    // only job is to be read by a human deciding whether their
+    // configuration is what they intended.
+    //
+    // The shape asserted here is the one
+    // `hort_adapters_postgres::quarantine_release_candidates::repo_cutoff`
+    // uses: name the thing by its role ("the ScanPolicy declaring the
+    // shortest rescanIntervalHours on this deployment"), never by its
+    // field name, and let the fields supply the specifics. Deliberately
+    // not `{}` interpolation, which would duplicate every value between
+    // the message and its own field.
+    //
+    // An env var, a chart value, a metric name or a task kind in the
+    // prose is NOT this defect: those are operator surfaces and have to
+    // stay spelled out, which is why the chart value and the one-shot
+    // admin task are asserted *present* below.
+
+    /// One captured `tracing` event, with the `message` field kept apart
+    /// from the structured fields.
+    ///
+    /// The split is the whole point: the structured block legitimately
+    /// contains the string `policy_name` — as a *key* — so a substring
+    /// match over a whole rendered line could not tell a correct event
+    /// from the defect. Only the message may not name a field.
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        message: String,
+        fields: Vec<(String, String)>,
+    }
+
+    impl CapturedEvent {
+        fn field(&self, name: &str) -> Option<&str> {
+            self.fields
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// Minimal capturing subscriber layer: records one
+    /// [`CapturedEvent`] per event. Mirrors the `CapturedEvents` idiom
+    /// in `hort_adapters_postgres::quarantine_release_candidates`'s
+    /// tests, with the message routed to its own slot rather than
+    /// stringified in among the fields.
+    #[derive(Clone, Default)]
+    struct CapturedEvents {
+        records: Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+        fn register_callsite(
+            &self,
+            _meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(
+            &self,
+            _meta: &tracing::Metadata<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            /// `tracing` records a message literal as a field named
+            /// `message`, which is how the rendered sentence becomes
+            /// observable at all.
+            #[derive(Default)]
+            struct V {
+                message: String,
+                fields: Vec<(String, String)>,
+            }
+            impl V {
+                fn put(&mut self, f: &tracing::field::Field, v: String) {
+                    if f.name() == "message" {
+                        self.message = v;
+                    } else {
+                        self.fields.push((f.name().to_string(), v));
+                    }
+                }
+            }
+            impl tracing::field::Visit for V {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.put(f, format!("{v:?}"));
+                }
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.put(f, v.to_string());
+                }
+                fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
+                    self.put(f, v.to_string());
+                }
+                fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                    self.put(f, v.to_string());
+                }
+            }
+            let mut v = V::default();
+            event.record(&mut v);
+            self.records.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                message: v.message,
+                fields: v.fields,
+            });
+        }
+    }
+
+    /// Run `emit` under a thread-local capturing subscriber and return
+    /// the events it emitted.
+    ///
+    /// A global no-op passthrough is installed once first: `tracing`
+    /// caches per-callsite interest, and a callsite first reached with
+    /// no subscriber at all caches as "never" for the rest of the test
+    /// binary — which would make the assertions below vacuously pass
+    /// depending on test order. `rebuild_interest_cache` then
+    /// re-evaluates against the thread-local subscriber. Mirrors
+    /// `capture_repo_cutoff` in
+    /// `hort_adapters_postgres::quarantine_release_candidates`.
+    ///
+    /// Takes the emitting closure rather than being written once per
+    /// signal, because the passthrough install is a once-per-process
+    /// act: `set_global_default` succeeds exactly once, so a second
+    /// per-signal copy of this dance would be a block of duplicated
+    /// lines whose `set_global_default` call can only ever fail.
+    fn capture_events(emit: impl FnOnce()) -> Vec<CapturedEvent> {
+        use std::sync::OnceLock;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        /// Discards every event; its only job is to keep callsite
+        /// interest out of the permanently-cached "never" state.
+        struct Passthrough;
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Passthrough {
+            fn register_callsite(
+                &self,
+                _meta: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+        }
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::Registry::default().with(Passthrough),
+            );
+        });
+
+        let layer = CapturedEvents::default();
+        let records = layer.records.clone();
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+            emit();
+        }
+        // Bound rather than returned directly: a tail expression's
+        // temporaries outlive the function's locals, so a `MutexGuard`
+        // borrowing `records` in tail position does not compile.
+        let out = records.lock().unwrap().clone();
+        out
+    }
+
+    /// [`capture_events`] bound to [`emit_rescan_drive_liveness_signal`].
+    fn capture_rescan_drive_events(
+        policies: &[hort_domain::entities::scan_policy::ScanPolicyProjection],
+        last_completed_at: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<CapturedEvent> {
+        capture_events(|| emit_rescan_drive_liveness_signal(policies, last_completed_at, now, 3))
+    }
+
+    /// Every field the rescan-drive signal attaches, so the check below
+    /// is a census rather than a spot check — the defect is the same
+    /// defect whichever of the five names it is.
+    const RESCAN_DRIVE_FIELD_NAMES: &[&str] = &[
+        "policy_name",
+        "shortest_interval_hours",
+        "age_secs",
+        "threshold_secs",
+        "staleness_multiplier",
+    ];
+
+    /// Assert the rendered message names none of the tracing fields in
+    /// `field_names`, with counter-assertions that make the check
+    /// non-vacuous: an event the harness never saw, or one with an
+    /// empty message, would otherwise satisfy every `contains`
+    /// trivially.
+    fn assert_message_names_no_field(event: &CapturedEvent, ctx: &str, field_names: &[&str]) {
+        assert!(
+            !event.message.is_empty(),
+            "{ctx}: captured no message — the `contains` checks would be vacuous"
+        );
+        assert!(
+            !event.fields.is_empty(),
+            "{ctx}: captured no fields — the harness is not seeing this event"
+        );
+        for name in field_names {
+            assert!(
+                !event.message.contains(name),
+                "{ctx}: the rendered message names its own tracing field `{name}`, so an \
+                 operator reads the field name where its value belongs. Message was: {}",
+                event.message
+            );
+        }
+    }
+
+    /// [`assert_message_names_no_field`] bound to the rescan-drive
+    /// census, so a call site cannot reach for another signal's list and
+    /// pass while naming its own fields.
+    fn assert_no_field_name_in_prose(event: &CapturedEvent, ctx: &str) {
+        assert_message_names_no_field(event, ctx, RESCAN_DRIVE_FIELD_NAMES);
+    }
+
+    /// The never-driven WARN — the line this signal exists to emit —
+    /// reads as a sentence, and `policy_name` /
+    /// `shortest_interval_hours` still carry their values as fields.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_never_driven_message_names_no_field() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("crates-scan", 24, false)];
+
+        let events = capture_rescan_drive_events(&policies, None, now);
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == tracing::Level::WARN)
+            .unwrap_or_else(|| panic!("the never-driven path must warn; got {events:?}"));
+        assert_no_field_name_in_prose(warn, "never-driven");
+        assert_eq!(
+            warn.field("policy_name"),
+            Some("crates-scan"),
+            "policy_name must stay attached, carrying the value: {warn:?}"
+        );
+        assert_eq!(
+            warn.field("shortest_interval_hours"),
+            Some("24"),
+            "shortest_interval_hours must stay attached, carrying the value: {warn:?}"
+        );
+        // The chart value and the one-shot admin task are operator
+        // surfaces, not tracing fields: an operator cannot act on this
+        // warning without them, so they stay spelled out in the prose.
+        assert!(
+            warn.message
+                .contains("scheduledTasks.cronRescanTick.enabled=true"),
+            "the chart value to set must stay named: {}",
+            warn.message
+        );
+        assert!(
+            warn.message
+                .contains("POST /api/v1/admin/tasks/cron-rescan-tick"),
+            "the one-shot admin task must stay named: {}",
+            warn.message
+        );
+    }
+
+    /// The stale WARN is the same literal-with-field-names defect in the
+    /// neighbouring match arm, and it named four of its own fields
+    /// (`policy_name`, `shortest_interval_hours`, `age_secs`,
+    /// `threshold_secs`) rather than two.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_stale_message_names_no_field() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("crates-scan", 24, false)];
+
+        // 10 days old; window = 24 h × 3 = 72 h → stale.
+        let events =
+            capture_rescan_drive_events(&policies, Some(now - chrono::Duration::days(10)), now);
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == tracing::Level::WARN)
+            .unwrap_or_else(|| panic!("the stale path must warn; got {events:?}"));
+        assert_no_field_name_in_prose(warn, "stale");
+        assert_eq!(
+            warn.field("policy_name"),
+            Some("crates-scan"),
+            "policy_name must stay attached, carrying the value: {warn:?}"
+        );
+        assert_eq!(
+            warn.field("shortest_interval_hours"),
+            Some("24"),
+            "shortest_interval_hours must stay attached, carrying the value: {warn:?}"
+        );
+        assert!(
+            warn.message
+                .contains("scheduledTasks.cronRescanTick.enabled=true"),
+            "the chart value to set must stay named: {}",
+            warn.message
+        );
+    }
+
+    /// Counter-assertion for the two tests above: the healthy
+    /// (`Driven`) arm logs at DEBUG and already had the right shape, so
+    /// if it ever starts naming a field the same check catches it — and
+    /// if the capture harness were reporting nothing at all, this test's
+    /// own `expect` would fail first.
+    #[test]
+    fn emit_rescan_drive_liveness_signal_driven_debug_message_names_no_field() {
+        let now = chrono::Utc::now();
+        let policies = [make_rescan_policy("crates-scan", 24, false)];
+
+        let events =
+            capture_rescan_drive_events(&policies, Some(now - chrono::Duration::seconds(300)), now);
+
+        let debug = events
+            .iter()
+            .find(|e| e.level == tracing::Level::DEBUG)
+            .unwrap_or_else(|| panic!("the driven path must log at DEBUG; got {events:?}"));
+        assert_no_field_name_in_prose(debug, "driven");
+    }
+
     // -- derive_oci_token_endpoint_strings ---------------------------------
     //
     // The boot-fail surface for the OCI `/v2/auth` endpoint binding;
@@ -4412,5 +5063,141 @@ mod tests {
         assert_eq!(posture.default_quarantine_duration_secs, 86_400);
         assert_eq!(posture.permissive_operator_policy_count, 2);
         assert_eq!(posture.trust_upstream_publish_time_count, 3);
+    }
+
+    // -- evaluate_quarantine_posture: the rendered sentence -----------------
+    //
+    // The verdict tests above pin the two counts; these pin the *prose*
+    // of the boot line an operator reads to confirm their
+    // quarantine-by-default posture. Both literals named all three of
+    // their own tracing fields, each opening a sentence, so the line
+    // rendered the words `default_quarantine_duration_secs seconds`
+    // where the number belongs. Same defect and same shape as the
+    // rescan-drive prose tests above; the reasoning is there.
+    //
+    // The publish-time-anchoring clause was dropped from the prose
+    // rather than reworded into a role-based equivalent, which is the
+    // one way this signal differs from the rescan one. A role-based
+    // rewrite of a *count* readout cannot stay true in the degenerate
+    // case: the `warn!` arm fires on
+    // `permissive_operator_policy_count > 0`, while
+    // `trust_upstream_publish_time_count` is counted independently off
+    // the upstream mappings and can be `0` in that same arm — so "some
+    // upstream mappings have opted in to publish-time anchoring" is a
+    // sentence that arm can contradict. The count stays attached as
+    // a field, which is all an aggregator reads, and a sentence that can
+    // be false is worse than a sentence that says less.
+    //
+    // `quarantineDuration=0` is the policy-document field an operator
+    // writes, not a tracing field, so it stays spelled out and is
+    // asserted present: without it the warning reports an override and
+    // names nowhere to look for it.
+
+    /// [`capture_events`] bound to [`evaluate_quarantine_posture`].
+    fn capture_quarantine_posture_events(
+        scan_policies: &[hort_domain::entities::scan_policy::ScanPolicyProjection],
+        upstream_mappings: &[hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping],
+    ) -> Vec<CapturedEvent> {
+        capture_events(|| {
+            evaluate_quarantine_posture(scan_policies, upstream_mappings);
+        })
+    }
+
+    /// Every field the quarantine-posture line attaches, so the check
+    /// below is a census rather than a spot check — the defect is the
+    /// same defect whichever of the three names it is.
+    const QUARANTINE_POSTURE_FIELD_NAMES: &[&str] = &[
+        "default_quarantine_duration_secs",
+        "permissive_operator_policy_count",
+        "trust_upstream_publish_time_count",
+    ];
+
+    /// [`assert_message_names_no_field`] bound to the quarantine-posture
+    /// census, so a call site cannot reach for another signal's list and
+    /// pass while naming its own fields.
+    fn assert_no_posture_field_name_in_prose(event: &CapturedEvent, ctx: &str) {
+        assert_message_names_no_field(event, ctx, QUARANTINE_POSTURE_FIELD_NAMES);
+    }
+
+    /// The permissive-override `warn!` arm — the posture line an
+    /// operator most needs to read — names none of its three fields, and
+    /// all three still carry their values.
+    ///
+    /// `trust_upstream_publish_time_count` is deliberately `0` in this
+    /// fixture: this is the boot on which the removed third sentence
+    /// ("… upstream mappings have opted in to publish-time anchoring")
+    /// was not merely unreadable but false.
+    #[test]
+    fn evaluate_quarantine_posture_permissive_warn_message_names_no_field() {
+        let policies = [make_scan_policy(0, false)];
+
+        let events = capture_quarantine_posture_events(&policies, &[]);
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == tracing::Level::WARN)
+            .unwrap_or_else(|| panic!("a permissive override must warn; got {events:?}"));
+        assert_no_posture_field_name_in_prose(warn, "permissive-override");
+        assert_eq!(
+            warn.field("default_quarantine_duration_secs"),
+            Some("86400"),
+            "the resolved default hold must stay attached, carrying its value: {warn:?}"
+        );
+        assert_eq!(
+            warn.field("permissive_operator_policy_count"),
+            Some("1"),
+            "the override count must stay attached, carrying its value: {warn:?}"
+        );
+        assert_eq!(
+            warn.field("trust_upstream_publish_time_count"),
+            Some("0"),
+            "the publish-time opt-in count must stay attached even though the prose no \
+             longer narrates it: {warn:?}"
+        );
+        assert!(
+            warn.message.contains("quarantineDuration=0"),
+            "the operator surface the override is written on must stay named: {}",
+            warn.message
+        );
+    }
+
+    /// The clean `info!` arm: no permissive override, one publish-time
+    /// opt-in. Same census — and the counter-assertion for the test
+    /// above, because the defect stood in both literals and a fix
+    /// applied to only one would pass there and fail here.
+    #[test]
+    fn evaluate_quarantine_posture_clean_info_message_names_no_field() {
+        let policies = [make_scan_policy(3_600, false)];
+        let mappings = [make_upstream_mapping(true)];
+
+        let events = capture_quarantine_posture_events(&policies, &mappings);
+
+        let info = events
+            .iter()
+            .find(|e| e.level == tracing::Level::INFO)
+            .unwrap_or_else(|| panic!("the clean posture must log at INFO; got {events:?}"));
+        assert_no_posture_field_name_in_prose(info, "no-override");
+        assert_eq!(
+            info.field("default_quarantine_duration_secs"),
+            Some("86400"),
+            "the resolved default hold must stay attached, carrying its value: {info:?}"
+        );
+        assert_eq!(
+            info.field("permissive_operator_policy_count"),
+            Some("0"),
+            "the override count must stay attached, carrying its value: {info:?}"
+        );
+        assert_eq!(
+            info.field("trust_upstream_publish_time_count"),
+            Some("1"),
+            "the publish-time opt-in count must stay attached even though the prose no \
+             longer narrates it: {info:?}"
+        );
+        assert!(
+            info.message.contains("quarantineDuration=0"),
+            "the operator surface the absent override would be written on must stay \
+             named: {}",
+            info.message
+        );
     }
 }

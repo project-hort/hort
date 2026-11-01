@@ -226,7 +226,6 @@ spec:
   type: hosted
   storage:
     backend: filesystem
-    path: /var/lib/hort-server/cas/${RBAC_REPO}
   isPublic: false
   replicationPriority: local_only
 EOF

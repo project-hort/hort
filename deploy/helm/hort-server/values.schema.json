@@ -663,14 +663,15 @@
       }
     },
     "upstream": {
-      "description": "Storage backstops on the streaming upstream fetch path. Human-readable size strings (e.g. \"64Mi\", \"1Gi\", \"64M\", or a bare byte integer); the binary enforces a 1024-byte floor.",
+      "description": "The pull-through fetch path: streaming storage backstops, the outbound User-Agent, and the per-request deadline. The three *MaxSize caps are human-readable size strings (e.g. \"64Mi\", \"1Gi\", \"64M\", or a bare byte integer); the binary enforces a 1024-byte floor.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "metadataCacheMaxSize": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?([KkMmGgTt]i?)?[Bb]?$"},
         "manifestCacheMaxSize": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?([KkMmGgTt]i?)?[Bb]?$"},
         "projectorVersionObjectMaxSize": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?([KkMmGgTt]i?)?[Bb]?$"},
-        "userAgent": {"type": "string", "pattern": "^[^\\x00-\\x08\\x0a-\\x1f\\x7f]*$", "description": "HORT_UPSTREAM_USER_AGENT — outbound User-Agent for upstream pull-through fetches (hort-server + worker). Empty → the binary built-in hort/<version>; crates.io requires a non-empty UA. Must be a valid HTTP header value: no control characters (the pattern rejects C0 controls except TAB, plus DEL — matching what the binary accepts); the same value is offline-validatable via `hort-server validate-config`."}
+        "userAgent": {"type": "string", "pattern": "^[^\\x00-\\x08\\x0a-\\x1f\\x7f]*$", "description": "HORT_UPSTREAM_USER_AGENT — outbound User-Agent for upstream pull-through fetches (hort-server + worker). Empty → the binary built-in hort/<version>; crates.io requires a non-empty UA. Must be a valid HTTP header value: no control characters (the pattern rejects C0 controls except TAB, plus DEL — matching what the binary accepts); the same value is offline-validatable via `hort-server validate-config`."},
+        "timeoutSeconds": {"type": "integer", "minimum": 1, "description": "HORT_UPSTREAM_TIMEOUT_SECS — total deadline in whole seconds on every upstream pull-through fetch (hort-server + worker). Default 30, rendered unconditionally. A TOTAL request deadline, not an idle one: a transfer making uninterrupted progress is still cut at the limit, so a large upstream blob that cannot finish inside it is unfetchable rather than slow. Minimum 1 — zero is not 'no timeout' but a zero deadline that fails every fetch, and the binary refuses it (and any non-integer) at boot rather than reverting to the default behind the operator's back."}
       }
     },
     "metrics": {

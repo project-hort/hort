@@ -4,21 +4,48 @@
 //! the generic [`TaskHandler`] interface so the [`TaskDispatcher`] can manage
 //! scan jobs alongside other kinds without a separate scan-specific poll loop.
 //!
-//! # Design — "double record_outcome"
+//! # The `jobs` row has exactly one owner
 //!
 //! `ScanTaskHandler::run` calls both
 //! [`ScanOrchestrationUseCase::run_scan`] AND
-//! [`ScanOrchestrationUseCase::record_outcome`] internally. The `record_outcome`
-//! call writes the scan-specific events (`ScanCompleted`,
-//! `ArtifactBecameVulnerable`, etc.) and transitions the jobs row to
-//! `completed` / `pending` / `failed` via the scan backoff logic.
+//! [`ScanOrchestrationUseCase::record_outcome`] internally.
+//! `record_outcome` writes the scan-specific events (`ScanCompleted`,
+//! `ArtifactBecameVulnerable`, the policy reject path,
+//! `ScanIndeterminate`) and the artifact-state transitions — and
+//! **nothing on the `jobs` row**. It reports what the row should become
+//! as a [`ScanRowDisposition`], which this handler translates into the
+//! [`TaskOutcome`] the dispatcher writes.
 //!
-//! The dispatcher then also calls `mark_completed` on the same row. That
-//! second UPDATE is idempotent — setting an already-completed row to
-//! `completed` again is a no-op at the application level and costs one
-//! extra DB round-trip per scan job. This is the pragmatic choice:
-//! simpler than adding a guard, and the scan semantics (scan-specific
-//! event ordering, backoff accounting) are fully preserved.
+//! This used to be two writers. `record_outcome` closed the row out
+//! itself and this handler then returned a blanket
+//! `TaskOutcome::Completed`, so the dispatcher wrote the row a second
+//! time — and won, because the result-write fence is `AND attempts = $2`
+//! and nothing else while `reschedule` leaves `attempts` untouched. A
+//! scan that had just been scheduled for retry read back
+//! `status='completed', attempts=1` with a transient error in
+//! `last_error`, no `ScanCompleted`, no verdict and `last_scan_at` NULL:
+//! the release sweep then correctly declined that artifact forever,
+//! because the job row — the system's only record that the artifact is
+//! still owed a verdict — claimed the work was finished. The terminal
+//! arm was clobbered the same way, so "answered", "still owes an
+//! answer" and "gave up" were one word at the one place an operator
+//! looks.
+//!
+//! The dispositions map one-to-one, and the reason strings cross
+//! unchanged — they are the operator-visible `last_error` text:
+//!
+//! | [`ScanRunOutcome`] | [`ScanRowDisposition`] | [`TaskOutcome`] |
+//! |---|---|---|
+//! | `Completed` | `Completed` | `Completed { result_summary }` |
+//! | `SkippedNoBackends` | `Completed` | `Completed { result_summary }` |
+//! | `NothingAnalysable` | `Failed(reason)` | `Failed { retry: false }` |
+//! | `Failed`, budget spent | `Failed(err)` | `Failed { retry: false }` |
+//! | `Failed`, budget left | `Retry(err)` | `Failed { retry: true }` |
+//!
+//! A `record_outcome` error is the one case with no disposition: no
+//! verdict was recorded, so the obligation is undischarged and the
+//! handler reports a retryable failure. See `record_outcome`'s own doc
+//! for what that means at the cap.
 //!
 //! # How the `ScanJob` is reconstructed
 //!
@@ -39,7 +66,29 @@ use hort_domain::ports::jobs_repository::{JobStatus, KindFields, ScanJob, Trigge
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
 
-use crate::use_cases::scan_orchestration::{ScanOrchestrationUseCase, ScanRunOutcome};
+use crate::use_cases::scan_orchestration::{
+    ScanOrchestrationUseCase, ScanRowDisposition, ScanRunOutcome,
+};
+
+/// Translate the scan path's [`ScanRowDisposition`] into the
+/// [`TaskOutcome`] the dispatcher writes to the row.
+///
+/// Pure, and separate from `run`, so the mapping is testable without
+/// standing up a whole [`ScanOrchestrationUseCase`]: it is the entire
+/// handoff this module exists to get right, and the thing a future
+/// change is most likely to get wrong is returning `Completed` for an
+/// arm that did not complete.
+///
+/// `result_summary` rides only the `Completed` disposition. The failing
+/// dispositions carry their text on `jobs.last_error` instead, which is
+/// where an operator reads it.
+fn outcome_for(disposition: ScanRowDisposition, result_summary: serde_json::Value) -> TaskOutcome {
+    match disposition {
+        ScanRowDisposition::Completed => TaskOutcome::Completed { result_summary },
+        ScanRowDisposition::Failed(reason) => TaskOutcome::fail(reason, false),
+        ScanRowDisposition::Retry(reason) => TaskOutcome::fail(reason, true),
+    }
+}
 
 /// [`TaskHandler`] wrapper around [`ScanOrchestrationUseCase`].
 ///
@@ -47,9 +96,10 @@ use crate::use_cases::scan_orchestration::{ScanOrchestrationUseCase, ScanRunOutc
 ///
 /// 1. Reconstructs a [`ScanJob`] from the scan-specific columns in `ctx.job_row`.
 /// 2. Calls `run_scan` to produce a [`ScanRunOutcome`].
-/// 3. Calls `record_outcome` to emit scan events and update the jobs row.
-/// 4. Returns `TaskOutcome::Completed` so the dispatcher's generic row-update
-///    path is a harmless idempotent no-op (see module doc for reasoning).
+/// 3. Calls `record_outcome` to emit scan events and move artifact state.
+/// 4. Returns the [`TaskOutcome`] that `record_outcome`'s
+///    [`ScanRowDisposition`] names, so the dispatcher's single row write
+///    tells the truth about what happened (see module doc).
 pub struct ScanTaskHandler {
     orchestration: Arc<ScanOrchestrationUseCase>,
 }
@@ -157,6 +207,11 @@ impl TaskHandler for ScanTaskHandler {
                 ScanRunOutcome::SkippedNoBackends { kind: _ } => {
                     serde_json::json!({ "skipped": "no_backends" })
                 }
+                // These two arms never reach a `Completed` disposition,
+                // so `outcome_for` drops the summary and the row keeps
+                // its `last_error` instead. Built anyway: a future arm
+                // that starts completing must not inherit a `Null`
+                // summary by omission.
                 ScanRunOutcome::NothingAnalysable { scanner, reason } => {
                     // Not an `error`: every backend ran. The job still
                     // ends terminal-failed (there is no verdict to
@@ -171,23 +226,24 @@ impl TaskHandler for ScanTaskHandler {
                 }
             };
 
-            // Record outcome (emits events + updates the jobs row).
-            // If this fails, propagate the error as a retryable failure —
-            // the dispatcher will then reschedule via its generic path.
-            if let Err(e) = self
+            // Record the scan's events and artifact state. The jobs row
+            // is written by the dispatcher, from the disposition this
+            // returns — never here.
+            //
+            // On an error nothing was recorded, so the artifact is
+            // still owed a verdict: report a retryable failure rather
+            // than any terminal disposition.
+            match self
                 .orchestration
                 .record_outcome(&scan_job, run_outcome)
                 .await
             {
-                return Ok(TaskOutcome::fail(
+                Ok(disposition) => Ok(outcome_for(disposition, result_summary)),
+                Err(e) => Ok(TaskOutcome::fail(
                     format!("record_outcome failed: {e}"),
                     true,
-                ));
+                )),
             }
-
-            // Return Completed. The dispatcher will call mark_completed again —
-            // that second UPDATE is idempotent (see module doc).
-            Ok(TaskOutcome::Completed { result_summary })
         })
     }
 }
@@ -198,10 +254,14 @@ impl TaskHandler for ScanTaskHandler {
 
 #[cfg(test)]
 mod tests {
-    // We can't construct a `ScanOrchestrationUseCase` without a full wiring.
-    // Scan-specific column extraction and error paths are exercised through
-    // the dispatcher integration tests (`task_dispatcher` module).
-    // This module provides only the compile-time dyn-compatibility check.
+    // A `ScanOrchestrationUseCase` cannot be constructed without a full
+    // wiring, so `run`'s column extraction and orchestration paths are
+    // exercised through the dispatcher and orchestration test modules.
+    // What is tested here is the handoff itself — the mapping from the
+    // scan path's disposition to the outcome the dispatcher writes,
+    // which is this module's whole reason to exist.
+
+    use super::*;
 
     /// Confirm that `ScanTaskHandler` satisfies `TaskHandler` and that
     /// `kind()` returns the expected string literal. The real column-extraction
@@ -209,5 +269,77 @@ mod tests {
     #[test]
     fn kind_constant_is_scan() {
         assert_eq!("scan", "scan");
+    }
+
+    /// A completed scan carries its summary onto the row.
+    #[test]
+    fn completed_disposition_carries_the_result_summary() {
+        let summary = serde_json::json!({
+            "scanner": "trivy",
+            "finding_count": 2,
+            "assessment": "analysed",
+        });
+        assert_eq!(
+            outcome_for(ScanRowDisposition::Completed, summary.clone()),
+            TaskOutcome::Completed {
+                result_summary: summary
+            },
+        );
+    }
+
+    /// A terminal scan failure is terminal on the row too, and keeps
+    /// the orchestrator's reason verbatim — that string is the
+    /// operator-visible `last_error`.
+    #[test]
+    fn failed_disposition_is_a_terminal_row_failure_with_the_reason_verbatim() {
+        let outcome = outcome_for(
+            ScanRowDisposition::Failed("trivy=no_analyzer_matched".into()),
+            serde_json::json!({ "ignored": true }),
+        );
+        assert_eq!(
+            outcome,
+            TaskOutcome::Failed {
+                reason: "trivy=no_analyzer_matched".into(),
+                retry: false,
+            },
+            "a scan with no verdict to record must not ask to be re-driven"
+        );
+    }
+
+    /// A retryable scan failure asks for the retry, and the dispatcher's
+    /// attempt budget decides whether it gets one.
+    #[test]
+    fn retry_disposition_asks_for_the_retry_with_the_reason_verbatim() {
+        let outcome = outcome_for(
+            ScanRowDisposition::Retry("scanner compose failed".into()),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            outcome,
+            TaskOutcome::Failed {
+                reason: "scanner compose failed".into(),
+                retry: true,
+            },
+        );
+    }
+
+    /// No disposition maps to `Completed` except `Completed`.
+    ///
+    /// The defect this module's shape removes was a blanket
+    /// `TaskOutcome::Completed` for every `ScanRunOutcome`, so the
+    /// property worth pinning is not any one arm but the absence of a
+    /// second path to `Completed`.
+    #[test]
+    fn only_the_completed_disposition_completes_the_row() {
+        for disposition in [
+            ScanRowDisposition::Failed("dead".into()),
+            ScanRowDisposition::Retry("transient".into()),
+        ] {
+            let outcome = outcome_for(disposition.clone(), serde_json::json!({ "x": 1 }));
+            assert!(
+                matches!(outcome, TaskOutcome::Failed { .. }),
+                "{disposition:?} must not complete the row; got {outcome:?}"
+            );
+        }
     }
 }

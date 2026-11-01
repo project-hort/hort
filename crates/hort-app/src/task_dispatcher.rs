@@ -31,7 +31,8 @@
 //! - `hort_admin_tasks_completed_total{kind, result}` — one increment per
 //!   `record_outcome_for_row` call. `result ∈ {completed, failed_retry,
 //!   failed_terminal}`. A retryable failure on a row that has spent its
-//!   [`JOB_ATTEMPT_CAP`] budget counts as `failed_terminal`, because
+//!   attempt budget ([`TaskDispatcher::attempt_cap`]) counts as
+//!   `failed_terminal`, because
 //!   that is what the dispatcher did to the row.
 //! - `hort_admin_tasks_duration_seconds{kind}` — elapsed time from claim to
 //!   `record_outcome_for_row`, wrapping `TaskHandler::run`.
@@ -212,53 +213,6 @@ const _: () = assert!(
     "sweep spacing must stay small against the lease-plus-grace recovery bound"
 );
 
-/// `attempts` at which a failing `jobs` row stops being re-driven and
-/// becomes the terminal, operator-visible `failed` row ADR 0028
-/// describes.
-///
-/// A row reaches the cap one of two ways, and the same number bounds
-/// both — one behaviour, two triggers:
-///
-/// - **The handler returned a failure** — `TaskOutcome::Failed { retry:
-///   true }`, or an `Err` recorded as one. `record_outcome_for_row`
-///   reschedules while `attempts` is below the cap and calls
-///   `mark_failed` at it. [`compute_backoff`] bounds how long a row
-///   *waits* and bounds nothing else, so without this cap a job that
-///   fails the same way every time would be re-driven for as long as it
-///   kept failing, and would never become a `failed` row at all.
-/// - **The handler never returned** — its worker died holding the
-///   claim, and `sweep_abandoned_leases` is the only code that runs for
-///   such a row. It passes this cap to `requeue_abandoned`, whose
-///   `CASE` requeues below the cap and fails the row at it.
-///
-/// Both paths spend the same budget because a requeue and a reschedule
-/// both cost exactly one attempt: neither touches the counter, and the
-/// next claim increments it.
-///
-/// **Uniform across kinds, deliberately.**
-/// [`REQUEUE_ON_LEASE_EXPIRY_KINDS`] answers a different question —
-/// which kinds tolerate a *concurrent* second execution after a crash,
-/// where the duplicate is absorbed by nothing. A returned failure has
-/// no in-flight duplicate to fear, precisely because the handler
-/// returned, so carrying that allow-list over would answer the wrong
-/// question and build an exemption table nobody could audit.
-///
-/// Set to the scan pipeline's own default (`HORT_SCANNER_MAX_ATTEMPTS`,
-/// 5) so a scan row hits one budget rather than two disagreeing ones:
-/// the scan orchestrator's `attempts >= max_attempts` branch in
-/// `record_outcome` and this cap are the same number on purpose.
-///
-/// **A number of attempts is only half of a budget**; the other half is
-/// the window they span, which is [`compute_backoff`]'s to set. Five
-/// executions spend that curve's first four waits — 96 minutes from the
-/// first failure to this cap — and both halves had to agree before the
-/// cap could mean "persistently broken": while the dispatcher kept its
-/// own 30-s-doubling curve, the same five attempts were spent inside
-/// 7 m 30 s, so a transient outage slightly longer than a coffee break
-/// produced the same permanent `failed` row as a genuinely broken
-/// dependency.
-const JOB_ATTEMPT_CAP: u32 = 5;
-
 // ---------------------------------------------------------------------------
 // TaskDispatcher
 // ---------------------------------------------------------------------------
@@ -294,6 +248,65 @@ pub struct TaskDispatcher {
     lock_duration: Duration,
     poll_interval_secs: u64,
     batch_size: u16,
+    /// `attempts` at which a failing `jobs` row stops being re-driven
+    /// and becomes the terminal, operator-visible `failed` row
+    /// ADR 0028 describes.
+    ///
+    /// A row reaches the cap one of two ways, and the same number
+    /// bounds both — one behaviour, two triggers:
+    ///
+    /// - **The handler returned a failure** — `TaskOutcome::Failed {
+    ///   retry: true }`, or an `Err` recorded as one.
+    ///   `record_outcome_for_row` reschedules while `attempts` is below
+    ///   the cap and calls `mark_failed` at it. [`compute_backoff`]
+    ///   bounds how long a row *waits* and bounds nothing else, so
+    ///   without this cap a job that fails the same way every time
+    ///   would be re-driven for as long as it kept failing, and would
+    ///   never become a `failed` row at all.
+    /// - **The handler never returned** — its worker died holding the
+    ///   claim, and `sweep_abandoned_leases` is the only code that runs
+    ///   for such a row. It passes this cap to `requeue_abandoned`,
+    ///   whose `CASE` requeues below the cap and fails the row at it.
+    ///
+    /// Both paths spend the same budget because a requeue and a
+    /// reschedule both cost exactly one attempt: neither touches the
+    /// counter, and the next claim increments it.
+    ///
+    /// **Uniform across kinds, deliberately.**
+    /// [`REQUEUE_ON_LEASE_EXPIRY_KINDS`] answers a different question —
+    /// which kinds tolerate a *concurrent* second execution after a
+    /// crash, where the duplicate is absorbed by nothing. A returned
+    /// failure has no in-flight duplicate to fear, precisely because
+    /// the handler returned, so carrying that allow-list over would
+    /// answer the wrong question and build an exemption table nobody
+    /// could audit.
+    ///
+    /// **Configured, not a constant, and this is load-bearing.** The
+    /// value comes from `HORT_SCANNER_MAX_ATTEMPTS` by way of
+    /// `WorkerConfig::max_attempts`, which the worker's composition
+    /// root also assigns to `ScanOrchestrationConfig::max_attempts`.
+    /// Those two caps meet at one boundary: the scan path spends its
+    /// cap to decide the *artifact's* terminal state (an exhausted scan
+    /// records `ScanIndeterminate`, or deliberately leaves an
+    /// already-quarantined artifact alone) and this one decides the
+    /// *row's*. While this was a `const u32 = 5` the two agreed only at
+    /// the default — an operator who raised the scan budget got rows
+    /// failed at five with no artifact verdict behind them, and one who
+    /// lowered it got scans re-driven past their own verdict. There is
+    /// deliberately no default here: a composition root that did not
+    /// decide cannot compile.
+    ///
+    /// **A number of attempts is only half of a budget**; the other
+    /// half is the window they span, which is [`compute_backoff`]'s to
+    /// set. At the default five, those executions spend the curve's
+    /// first four waits — 96 minutes from the first failure to the cap
+    /// — and both halves had to agree before the cap could mean
+    /// "persistently broken": while the dispatcher kept its own
+    /// 30-s-doubling curve, the same five attempts were spent inside
+    /// 7 m 30 s, so a transient outage slightly longer than a coffee
+    /// break produced the same permanent `failed` row as a genuinely
+    /// broken dependency.
+    attempt_cap: u32,
 }
 
 impl TaskDispatcher {
@@ -301,6 +314,14 @@ impl TaskDispatcher {
     ///
     /// Call [`register`](Self::register) for each handler kind before
     /// calling [`run`](Self::run).
+    ///
+    /// `attempt_cap` is the operator's configured attempt budget
+    /// (`HORT_SCANNER_MAX_ATTEMPTS`), not a default this type supplies —
+    /// see [`TaskDispatcher::attempt_cap`] for why it must be the same
+    /// number the scan orchestrator was built with.
+    // One composition-root call site; the alternative is a config struct
+    // whose fields would read exactly as these arguments do.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         job_repo: Arc<dyn JobsRepository>,
         event_store: Arc<EventStorePublisher>,
@@ -309,6 +330,7 @@ impl TaskDispatcher {
         lock_duration: Duration,
         poll_interval_secs: u64,
         batch_size: u16,
+        attempt_cap: u32,
     ) -> Self {
         Self {
             handlers: HashMap::new(),
@@ -320,7 +342,17 @@ impl TaskDispatcher {
             lock_duration,
             poll_interval_secs,
             batch_size,
+            attempt_cap,
         }
+    }
+
+    /// The attempt budget this dispatcher closes rows out against.
+    ///
+    /// Exposed so a composition test can assert the worker threaded one
+    /// configured number into both halves of the scan boundary rather
+    /// than leaving them to agree by coincidence — see the field's doc.
+    pub fn attempt_cap(&self) -> u32 {
+        self.attempt_cap
     }
 
     /// Register a handler for its `kind()` with a per-kind concurrency cap.
@@ -616,7 +648,7 @@ impl TaskDispatcher {
             .requeue_abandoned(
                 REQUEUE_ON_LEASE_EXPIRY_KINDS,
                 grace,
-                JOB_ATTEMPT_CAP,
+                self.attempt_cap,
                 LEASE_SWEEP_BATCH,
             )
             .await
@@ -908,20 +940,22 @@ impl TaskDispatcher {
     ///
     /// `Failed { retry: true }` is a *request* to be re-driven, not a
     /// guarantee of one: it is honoured while the row has attempt
-    /// budget left and refused at [`JOB_ATTEMPT_CAP`], where the row
-    /// becomes terminal instead. See that constant for why the budget
-    /// is one number across both the returned-failure and the
-    /// dead-worker path, and uniform across kinds.
+    /// budget left and refused at [`TaskDispatcher::attempt_cap`], where
+    /// the row becomes terminal instead. See that field for why the
+    /// budget is one number across both the returned-failure and the
+    /// dead-worker path, uniform across kinds, and configured rather
+    /// than compiled in.
     ///
-    /// Decision on the "double record_outcome" problem for `kind="scan"`:
-    ///
-    /// `ScanTaskHandler::run` calls `ScanOrchestrationUseCase::record_outcome`
-    /// internally and then returns `TaskOutcome::Completed`. This dispatcher
-    /// then also calls `mark_completed`. The second `mark_completed` is an
-    /// idempotent SQL UPDATE (sets an already-completed row to completed again)
-    /// — harmless and simpler than adding a guard. The scan path is the only
-    /// case where the handler owns the row-state transition, and the cost is
-    /// one extra DB round-trip per scan job. This is acceptable for v1.
+    /// **This is the only writer of a `jobs` row's result state**, for
+    /// every kind including `scan`. `ScanTaskHandler::run` used to close
+    /// its own row out inside
+    /// `ScanOrchestrationUseCase::record_outcome` and then return a
+    /// blanket `TaskOutcome::Completed`, so this method wrote the row a
+    /// second time and won — turning a scheduled scan retry into
+    /// `status='completed'` with no verdict behind it. The scan path now
+    /// owns events and artifact state and reports what the row should
+    /// become; `crates/hort-app/tests/jobs_row_has_one_owner.rs` is what
+    /// keeps a second writer from reappearing in this layer.
     async fn record_outcome_for_row(&self, job: &JobRow, kind: &str, outcome: TaskOutcome) {
         match outcome {
             TaskOutcome::Completed { result_summary } => {
@@ -955,7 +989,7 @@ impl TaskDispatcher {
             // `CASE` arm), so a row that keeps failing ends up in the
             // same state whichever way it got there.
             TaskOutcome::Failed { reason, retry } => {
-                if retry && job.attempts < JOB_ATTEMPT_CAP {
+                if retry && job.attempts < self.attempt_cap {
                     let backoff = compute_backoff(job.attempts);
                     let written = self
                         .job_repo
@@ -984,7 +1018,7 @@ impl TaskDispatcher {
                             job_id = %job.id,
                             kind,
                             attempts = job.attempts,
-                            attempt_cap = JOB_ATTEMPT_CAP,
+                            attempt_cap = self.attempt_cap,
                             last_error = %reason,
                             "TaskDispatcher: task asked to be retried but has spent its attempt \
                              budget — failing the row terminally instead of re-driving it; the \
@@ -1150,6 +1184,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::destructive_task_reauthorization::{REFUSAL_PREFIX, UNAVAILABLE_PREFIX};
+    use crate::retry_backoff::DEFAULT_MAX_ATTEMPTS;
     use crate::use_cases::test_support::{
         MockPermissionGrantRepository, MockUserRepository, ResultWriteLog,
     };
@@ -1735,8 +1770,21 @@ mod tests {
             Duration::from_secs(60),
             999_999, // very long poll interval — we drive ticks manually via seeded batches
             16,
+            TEST_ATTEMPT_CAP,
         )
     }
+
+    /// The attempt budget `make_dispatcher` builds its dispatchers with.
+    ///
+    /// Production threads `HORT_SCANNER_MAX_ATTEMPTS` into
+    /// `TaskDispatcher::new`; the tests use that variable's own default
+    /// so the window assertion in
+    /// [`five_executions_span_the_ninety_six_minute_window`] is the one
+    /// an out-of-the-box deployment experiences. Tests that are about
+    /// the cap being *configured* build their own dispatcher with a
+    /// different value — see
+    /// [`the_cap_is_the_configured_one_not_the_default`].
+    const TEST_ATTEMPT_CAP: u32 = DEFAULT_MAX_ATTEMPTS;
 
     // -----------------------------------------------------------------------
     // Helper to look up a counter value from a debugging snapshot
@@ -2180,10 +2228,109 @@ mod tests {
         (repo, row_id, counters)
     }
 
+    /// The cap that fires is the one the dispatcher was constructed
+    /// with, not the default.
+    ///
+    /// This is the half of the scan boundary the handoff has to get
+    /// right. `HORT_SCANNER_MAX_ATTEMPTS` sets both
+    /// `ScanOrchestrationConfig::max_attempts` — which decides whether
+    /// an exhausted scan records the artifact's `ScanIndeterminate` —
+    /// and this cap, which decides whether the row goes terminal. While
+    /// this side was a `const u32 = 5` the two agreed only at the
+    /// default: an operator setting `3` got a row failed at 5 after the
+    /// scan path had already recorded the verdict at 3, and one setting
+    /// `12` got the row failed at 5 with no verdict recorded at all.
+    /// A dispatcher built with a cap of 2 must therefore fail at 2.
+    #[test]
+    fn the_cap_is_the_configured_one_not_the_default() {
+        const CONFIGURED: u32 = 2;
+        // A cap the default would NOT have fired at — otherwise this test
+        // passes against a compiled-in constant too.
+        const _: () = assert!(CONFIGURED < DEFAULT_MAX_ATTEMPTS);
+
+        for (attempts, expect_terminal) in [(CONFIGURED - 1, false), (CONFIGURED, true)] {
+            let repo = Arc::new(DispatcherMockRepo::new());
+            let mut row = make_job_row("retry-kind");
+            row.attempts = attempts;
+            let row_id = row.id;
+            let dispatcher = Arc::new(TaskDispatcher::new(
+                repo.clone() as Arc<dyn JobsRepository>,
+                crate::event_store_publisher::wrap_for_test(Arc::new(NoopEventStore)),
+                authorizing_reauthorizer(),
+                "test-worker",
+                Duration::from_secs(60),
+                999_999,
+                16,
+                CONFIGURED,
+            ));
+
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(dispatcher.dispatch_one(row, Arc::new(RetryHandler("retry-kind"))));
+
+            if expect_terminal {
+                assert_eq!(
+                    repo.mark_failed_calls(),
+                    vec![(row_id, "transient error".to_string())],
+                    "attempts={attempts} is at the configured cap and must be terminal",
+                );
+                assert!(repo.reschedule_calls().is_empty());
+            } else {
+                assert_eq!(
+                    repo.reschedule_calls(),
+                    vec![(row_id, "transient error".to_string())],
+                    "attempts={attempts} is below the configured cap and must be rescheduled",
+                );
+                assert!(
+                    repo.mark_failed_calls().is_empty(),
+                    "a row with budget left under the CONFIGURED cap must not be failed"
+                );
+            }
+        }
+    }
+
+    /// The sweep spends the same configured budget the returned-failure
+    /// path does.
+    ///
+    /// `requeue_abandoned`'s over-cap `CASE` is the dead-worker half of
+    /// one budget, so a cap threaded into only one of the two paths
+    /// would let a crashed worker's row outlive — or die ahead of — an
+    /// identical row whose handler returned.
+    #[test]
+    fn the_sweep_passes_the_configured_cap_not_the_default() {
+        const CONFIGURED: u32 = 9;
+        const _: () = assert!(CONFIGURED != DEFAULT_MAX_ATTEMPTS);
+
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let dispatcher = Arc::new(TaskDispatcher::new(
+            repo.clone() as Arc<dyn JobsRepository>,
+            crate::event_store_publisher::wrap_for_test(Arc::new(NoopEventStore)),
+            authorizing_reauthorizer(),
+            "test-worker",
+            Duration::from_secs(60),
+            999_999,
+            16,
+            CONFIGURED,
+        ));
+        assert_eq!(dispatcher.attempt_cap(), CONFIGURED);
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(dispatcher.sweep_abandoned_leases());
+
+        let calls = repo.requeue_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].attempt_cap, CONFIGURED);
+    }
+
     /// Below the cap a retryable failure is still rescheduled, waiting
     /// the shared curve's last and longest interval.
     ///
-    /// The boundary is `attempts < JOB_ATTEMPT_CAP`, so the last
+    /// The boundary is `attempts < TEST_ATTEMPT_CAP`, so the last
     /// attempt below the cap keeps its retry — a cap that fired one
     /// attempt early would turn a transient failure into a dead row,
     /// which is the opposite of the point. (The first failure,
@@ -2191,7 +2338,7 @@ mod tests {
     /// `dispatcher_records_outcome_failed_retry`.)
     #[test]
     fn a_returned_retryable_failure_below_the_attempt_cap_is_rescheduled() {
-        let below_cap = JOB_ATTEMPT_CAP - 1;
+        let below_cap = TEST_ATTEMPT_CAP - 1;
         let (repo, row_id, counters) = dispatch_one_row(
             "retry-kind",
             below_cap,
@@ -2230,7 +2377,7 @@ mod tests {
     fn a_returned_retryable_failure_at_the_attempt_cap_is_terminal() {
         let (repo, row_id, counters) = dispatch_one_row(
             "retry-kind",
-            JOB_ATTEMPT_CAP,
+            TEST_ATTEMPT_CAP,
             Arc::new(RetryHandler("retry-kind")),
         );
 
@@ -2262,7 +2409,7 @@ mod tests {
     fn a_returned_retryable_failure_past_the_attempt_cap_is_terminal() {
         let (repo, row_id, _counters) = dispatch_one_row(
             "retry-kind",
-            JOB_ATTEMPT_CAP + 3,
+            TEST_ATTEMPT_CAP + 3,
             Arc::new(RetryHandler("retry-kind")),
         );
 
@@ -2283,7 +2430,7 @@ mod tests {
     fn a_handler_error_at_the_attempt_cap_is_terminal() {
         let (repo, row_id, counters) = dispatch_one_row(
             "retry-kind",
-            JOB_ATTEMPT_CAP,
+            TEST_ATTEMPT_CAP,
             Arc::new(ErrHandler("retry-kind")),
         );
 
@@ -2322,13 +2469,13 @@ mod tests {
             (
                 "reschedule",
                 "retry-kind",
-                JOB_ATTEMPT_CAP - 1,
+                TEST_ATTEMPT_CAP - 1,
                 Arc::new(RetryHandler("retry-kind")),
             ),
             (
                 "mark_failed",
                 "retry-kind",
-                JOB_ATTEMPT_CAP,
+                TEST_ATTEMPT_CAP,
                 Arc::new(RetryHandler("retry-kind")),
             ),
         ];
@@ -2400,7 +2547,7 @@ mod tests {
         );
 
         let (repo, row_id, counters) =
-            dispatch_one_row(kind, JOB_ATTEMPT_CAP, Arc::new(RetryHandler(kind)));
+            dispatch_one_row(kind, TEST_ATTEMPT_CAP, Arc::new(RetryHandler(kind)));
 
         assert_eq!(
             repo.mark_failed_calls(),
@@ -2824,20 +2971,26 @@ mod tests {
     /// retry delay for an hour and a half before it goes `failed`.
     ///
     /// This is also what pins the neighbouring cap tests to the *fifth*
-    /// execution: they are written against `JOB_ATTEMPT_CAP` and would
+    /// execution: they are written against `TEST_ATTEMPT_CAP` and would
     /// pass at any value of it, so the number itself is asserted here.
-    /// Raise the cap or reshape the curve and this fails, which is the
-    /// point — an exhausted budget means "persistently broken" only
-    /// while the window is long enough for that to be the likelier
-    /// reading.
+    /// Reshape the curve and this fails, which is the point — an
+    /// exhausted budget means "persistently broken" only while the
+    /// window is long enough for that to be the likelier reading.
+    ///
+    /// The cap is now configured rather than compiled in, so what this
+    /// pins is the **default** an unconfigured deployment lands on. An
+    /// operator who raises `HORT_SCANNER_MAX_ATTEMPTS` is buying a
+    /// longer window at 60 minutes an attempt and has said so;
+    /// [`the_cap_is_the_configured_one_not_the_default`] is what proves
+    /// the configured number is the one that fires.
     #[test]
     fn five_executions_span_the_ninety_six_minute_window() {
         assert_eq!(
-            JOB_ATTEMPT_CAP, 5,
+            TEST_ATTEMPT_CAP, 5,
             "the window asserted below is the one five executions span"
         );
 
-        let spent: Vec<u64> = (1..JOB_ATTEMPT_CAP)
+        let spent: Vec<u64> = (1..TEST_ATTEMPT_CAP)
             .map(|attempts| compute_backoff(attempts).as_secs())
             .collect();
         assert_eq!(
@@ -3345,7 +3498,7 @@ mod tests {
             Duration::from_secs(60) * LEASE_EXPIRY_GRACE_MULTIPLE,
             "grace is a multiple of this dispatcher's lease, not a fixed constant"
         );
-        assert_eq!(call.attempt_cap, JOB_ATTEMPT_CAP);
+        assert_eq!(call.attempt_cap, TEST_ATTEMPT_CAP);
         assert_eq!(call.batch_size, LEASE_SWEEP_BATCH);
     }
 
@@ -3375,7 +3528,7 @@ mod tests {
             RequeuedJob {
                 id: Uuid::new_v4(),
                 kind: "prefetch".to_string(),
-                attempts: JOB_ATTEMPT_CAP,
+                attempts: TEST_ATTEMPT_CAP,
                 outcome: RequeueOutcome::RetriesExhausted,
             },
         ]);
@@ -3668,6 +3821,7 @@ mod tests {
             Duration::ZERO,
             999_999,
             16,
+            TEST_ATTEMPT_CAP,
         ));
 
         let guard = dispatcher.spawn_lease_renewal(Uuid::new_v4(), "scan".to_string());
