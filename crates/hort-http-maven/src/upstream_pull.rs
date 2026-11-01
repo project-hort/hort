@@ -14,8 +14,13 @@
 //!    Parse the body to a bare lowercase hex digest (tolerating a trailing
 //!    ` filename` suffix). The `.sha1` floor is the guarantee (design §8) — a
 //!    corrupt `.sha512` must NOT block proxying an artifact that has a valid
-//!    `.sha1`. **Only when all three are absent / unfetchable / unparseable →
-//!    502** (unproxiable per ADR 0006 — NO soft-fail, NO unverified ingest).
+//!    `.sha1`. All three absent / unfetchable / unparseable is **not yet a
+//!    verdict**: `classify_sidecar_exhaustion` then asks whether the upstream
+//!    has the artifact at all. It does → **502**, unproxiable per ADR 0006
+//!    (NO soft-fail, NO unverified ingest). It 404s the artifact too → **404**,
+//!    because a coordinate this upstream does not carry is a miss rather than
+//!    a gateway failure, and only a miss lets a virtual repository move on to
+//!    its next member.
 //! 3. Build `VerifiedIngestRequest::UpstreamPublished{ upstream_checksum }`
 //!    with the [`HashAlgorithm`] matching whichever sidecar won, fetch the
 //!    artifact bytes, and ingest via [`IngestUseCase::ingest_verified`] —
@@ -51,6 +56,7 @@ use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
 use hort_app::error::AppError;
+use hort_app::metrics::UpstreamErrorKind;
 use hort_app::pull_dedup::DedupKey;
 use hort_app::use_cases::ingest_use_case::{RegisterExistingCasBlobRequest, VerifiedIngestRequest};
 use hort_domain::entities::artifact::Artifact;
@@ -91,9 +97,12 @@ pub(crate) enum UpstreamPullError {
     #[error("no upstream mapping configured")]
     NoUpstreamMapping,
 
-    /// Upstream returned 404 for the artifact body itself (the sidecar
-    /// resolved, but the file is gone). Wire to 404 — the upstream simply
-    /// doesn't have this file.
+    /// Upstream returned 404 for the artifact body itself — either after a
+    /// sidecar resolved and the file turned out to be gone, or on
+    /// `classify_sidecar_exhaustion`'s probe, which asks the same question
+    /// for a coordinate that published no usable sidecar. Wire to 404 — the
+    /// upstream simply doesn't have this file, which is also what tells a
+    /// virtual repository to try its next member.
     #[error("upstream does not have this artifact")]
     NotFoundUpstream,
 
@@ -102,8 +111,11 @@ pub(crate) enum UpstreamPullError {
     /// (empty body, non-hex, wrong length). The serve-path falls through the
     /// preference list and only surfaces this once ALL THREE are exhausted with
     /// no valid digest — a corrupt stronger sidecar never blocks a valid floor
-    /// (design §8). The artifact is **unproxiable** per ADR 0006 — there is no
-    /// soft-fail / store-without-verify path. Wire to 502.
+    /// (design §8) — AND the artifact itself is there (or the upstream could
+    /// not say; see `classify_sidecar_exhaustion`). The bytes exist and
+    /// nothing can verify them, so the artifact is **unproxiable** per ADR
+    /// 0006 — there is no soft-fail / store-without-verify path. Wire to 502.
+    /// An upstream that has no sidecar *and* no artifact is a miss, not this.
     #[error("no usable upstream checksum sidecar (sha512/sha256/sha1 all absent or malformed)")]
     NoChecksumSidecar,
 
@@ -168,9 +180,18 @@ pub(crate) async fn try_upstream_maven_pull(
     //    failure, OR a malformed body on a stronger digest falls through to the
     //    next (weaker) digest. Shape validation happens inside the loop so a
     //    corrupt `.sha512` never blocks a valid `.sha1` floor (design §8). All
-    //    three exhausted with no valid digest → NoChecksumSidecar (502).
+    //    three exhausted with no valid digest is not yet a verdict — the
+    //    classifier asks whether the upstream has the artifact at all before
+    //    choosing between "there but unverifiable" (502) and "absent" (404).
     let (algorithm, upstream_checksum) =
-        fetch_strongest_sidecar(ctx, repo, &mapping, artifact_path).await?;
+        match fetch_strongest_sidecar(ctx, repo, &mapping, artifact_path).await {
+            Ok(sidecar) => sidecar,
+            Err(exhausted) => {
+                return Err(
+                    classify_sidecar_exhaustion(ctx, &mapping, artifact_path, exhausted).await,
+                )
+            }
+        };
 
     // 3. Stream the artifact body and ingest_verified. The use case rehashes
     //    while streaming with the matching algorithm and returns Conflict on
@@ -348,17 +369,20 @@ pub(crate) async fn try_upstream_maven_pull(
 /// matching-malicious `.sha512`, so forcing a downgrade is not a new attack.
 ///
 /// Returns `(HashAlgorithm, UpstreamPublishedChecksum)` (already shape-checked)
-/// on the first hit. Returns [`UpstreamPullError::NoChecksumSidecar`] only when
-/// ALL THREE are exhausted with no valid digest — the artifact is unproxiable
-/// per ADR 0006 (no soft-fail). A genuine checksum *mismatch* (artifact bytes ≠
-/// a valid sidecar digest) is detected later, by `ingest_verified`, and stays
-/// its own [`UpstreamPullError::ChecksumMismatch`] (502) path.
+/// on the first hit, and [`SidecarsExhausted`] when ALL THREE are exhausted
+/// with no valid digest. Exhaustion is **not** itself a verdict: this function
+/// is about sidecars, and whether the exhaustion means "there but
+/// unverifiable" or "absent" turns on a fact it never fetches, so
+/// [`classify_sidecar_exhaustion`] owns that decision. A genuine checksum
+/// *mismatch* (artifact bytes ≠ a valid sidecar digest) is detected later, by
+/// `ingest_verified`, and stays its own
+/// [`UpstreamPullError::ChecksumMismatch`] (502) path.
 async fn fetch_strongest_sidecar(
     ctx: &Arc<AppContext>,
     repo: &Repository,
     mapping: &hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping,
     artifact_path: &str,
-) -> Result<(HashAlgorithm, UpstreamPublishedChecksum), UpstreamPullError> {
+) -> Result<(HashAlgorithm, UpstreamPublishedChecksum), SidecarsExhausted> {
     for (algorithm, ext) in SIDECAR_PREFERENCE {
         let sidecar_path = format!("{artifact_path}.{ext}");
         match fetch_sidecar_body(ctx, repo, mapping, &sidecar_path).await {
@@ -385,7 +409,8 @@ async fn fetch_strongest_sidecar(
             },
             // Not-found (or any fetch failure) on this digest → fall through
             // to the next (weaker) digest. The floor `.sha1` exhausting the
-            // loop is the genuine "unproxiable" case.
+            // loop is what `classify_sidecar_exhaustion` then has to tell
+            // apart from the artifact not being there at all.
             Err(SidecarFetchError::Unavailable(msg)) => {
                 tracing::debug!(
                     algorithm = ext,
@@ -395,11 +420,100 @@ async fn fetch_strongest_sidecar(
             }
         }
     }
-    tracing::warn!(
+    tracing::debug!(
         artifact_path,
-        "Maven upstream publishes no usable sha512/sha256/sha1 sidecar — unproxiable (ADR 0006)"
+        "Maven upstream publishes no usable sha512/sha256/sha1 sidecar; classifying the exhaustion"
     );
-    Err(UpstreamPullError::NoChecksumSidecar)
+    Err(SidecarsExhausted)
+}
+
+/// [`fetch_strongest_sidecar`] fell off the end of the preference list with no
+/// usable digest.
+///
+/// Deliberately **not** an [`UpstreamPullError`]: on its own the exhaustion
+/// names no failure, and the one thing that can turn it into one is
+/// [`classify_sidecar_exhaustion`]. There is no `From` impl, so a later `?` at
+/// the call site cannot quietly route it back to a 502.
+struct SidecarsExhausted;
+
+/// Classify a sidecar exhaustion by asking the one question the sidecar leg
+/// never asks: does the upstream have this artifact at all?
+///
+/// - **the artifact fetch 404s → [`UpstreamPullError::NotFoundUpstream`]
+///   (404).** The upstream does not carry this coordinate, and "no usable
+///   sidecar" was a symptom of that rather than a refusal. This is the half
+///   that matters beyond one repository: a virtual repository reads a 404 from
+///   a member as "absent here" and continues its walk, and aborts on anything
+///   else — so answering 502 for a plain miss stops the walk at the first
+///   member whose upstream lacks the coordinate. For a virtual that mixes a
+///   release upstream with a snapshot upstream — the ordinary Maven topology —
+///   that is every snapshot request, under any member ordering.
+/// - **the artifact fetch succeeds → [`UpstreamPullError::NoChecksumSidecar`]
+///   (502).** ADR 0006's genuine unproxiable case: the bytes are there and
+///   nothing published can verify them, so hort refuses rather than storing
+///   unverified content.
+/// - **anything else → [`UpstreamPullError::NoChecksumSidecar`] (502)**, the
+///   answer this path has always given. Only a *proven* miss reclassifies; an
+///   upstream that could not say (5xx, network, timeout, an error carrying no
+///   classification at all) keeps the refusal, which is the stricter of the
+///   two answers.
+///
+/// The not-found question is put to the upstream port's own error vocabulary
+/// (`UpstreamErrorKind::from_domain_error`, the single decoder for the
+/// sentinel the adapter encodes) rather than to the rendered message — the
+/// typed `DomainError` is still in hand here, unlike at the post-coalesce
+/// artifact-leg arm, which only ever sees a stringified `AppError`.
+///
+/// The probe costs one upstream request and stores nothing: `fetch_artifact`
+/// returns at the response headers with the body unread, so the
+/// `ArtifactFetch` dropped here transfers no payload. It deliberately does
+/// **not** go through `PullDedup` — the artifact-body leg's window carries a
+/// verified `ContentHash` that followers adopt without fetching, and a probe
+/// has no verified bytes to contribute to one.
+async fn classify_sidecar_exhaustion(
+    ctx: &Arc<AppContext>,
+    mapping: &hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping,
+    artifact_path: &str,
+    _exhausted: SidecarsExhausted,
+) -> UpstreamPullError {
+    match ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .fetch_artifact(mapping.clone(), artifact_path.to_string())
+        .await
+    {
+        // Dropped unread — the headers answered the question, and the body is
+        // never pulled over the wire.
+        Ok(_unread) => {
+            tracing::warn!(
+                artifact_path,
+                "Maven upstream has the artifact but publishes no usable \
+                 sha512/sha256/sha1 sidecar — unproxiable (ADR 0006)"
+            );
+            UpstreamPullError::NoChecksumSidecar
+        }
+        Err(e)
+            if matches!(
+                UpstreamErrorKind::from_domain_error(&e),
+                Some(UpstreamErrorKind::NotFound)
+            ) =>
+        {
+            tracing::debug!(
+                artifact_path,
+                "Maven upstream has neither a usable sidecar nor the artifact — a miss"
+            );
+            UpstreamPullError::NotFoundUpstream
+        }
+        Err(e) => {
+            tracing::warn!(
+                artifact_path,
+                error = %e,
+                "Maven upstream publishes no usable sidecar and could not say whether the \
+                 artifact exists — treated as unproxiable (ADR 0006)"
+            );
+            UpstreamPullError::NoChecksumSidecar
+        }
+    }
 }
 
 /// Parse a fetched sidecar body into a shape-validated
@@ -421,7 +535,8 @@ fn parse_and_validate(
 /// A single sidecar fetch failed — every failure mode (404, 5xx, network)
 /// collapses to one variant because the negotiation treats them all as "this
 /// digest is unavailable, try the next". The floor exhausting the loop is the
-/// only place a fetch failure becomes terminal (→ `NoChecksumSidecar`).
+/// only place a fetch failure leaves the loop at all, as
+/// [`SidecarsExhausted`].
 enum SidecarFetchError {
     Unavailable(String),
 }
@@ -867,6 +982,111 @@ mod tests {
         assert!(
             matches!(err, UpstreamPullError::NoChecksumSidecar),
             "expected NoChecksumSidecar, got {err:?}"
+        );
+    }
+
+    // ---- Branch: sidecars exhausted AND the artifact absent → 404 ----------
+    //
+    // The exhaustion is classified rather than assumed: with nothing at all
+    // seeded upstream, the probe's 404 says the upstream does not carry this
+    // coordinate, so the pull is a miss. The 502 it used to answer made a
+    // miss indistinguishable from "the bytes are here and cannot be verified"
+    // — and a virtual repository, which continues its walk on a 404 and
+    // aborts on anything else, stopped at the first member whose upstream
+    // lacks the coordinate.
+
+    #[tokio::test]
+    async fn all_sidecars_absent_and_artifact_absent_returns_not_found_upstream() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_maven_repo("maven-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        // Nothing seeded: no sidecar AND no artifact body.
+        let err = try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::NotFoundUpstream),
+            "an upstream with neither a sidecar nor the artifact is a miss, got {err:?}"
+        );
+        assert_eq!(
+            map_upstream_pull_error(&err).status(),
+            StatusCode::NOT_FOUND,
+            "and it must reach the client as the same 404 the metadata path answers"
+        );
+    }
+
+    // ---- …and a malformed body is not a miss either, unless the file is gone -
+    //
+    // The malformed-sidecar fall-through reaches the same exhaustion, so it
+    // takes the same classification: present sidecars that parse to nothing
+    // plus an absent artifact is still an absent artifact.
+
+    #[tokio::test]
+    async fn all_present_sidecars_malformed_and_artifact_absent_returns_not_found_upstream() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_maven_repo("maven-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        // Every sidecar fetches and none parses; the artifact body is NOT
+        // seeded.
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{ARTIFACT_PATH}.sha512"),
+            b"   \n".to_vec(),
+        );
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{ARTIFACT_PATH}.sha256"),
+            b"not-a-valid-digest".to_vec(),
+        );
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{ARTIFACT_PATH}.sha1"),
+            b"deadbeef".to_vec(),
+        );
+
+        let err = try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::NotFoundUpstream),
+            "expected NotFoundUpstream, got {err:?}"
+        );
+    }
+
+    // ---- Branch: the probe cannot answer → the refusal stands --------------
+    //
+    // Only a PROVEN miss reclassifies. An upstream that answered the probe
+    // with a 5xx has not said the coordinate is absent, and treating it as
+    // absent would let a virtual repository walk past a member that may well
+    // hold the artifact — so the exhaustion keeps its 502.
+
+    #[tokio::test]
+    async fn sidecars_absent_and_probe_cannot_answer_returns_no_checksum_sidecar() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_maven_repo("maven-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        // No sidecar and no artifact fixture, but the probe — the only
+        // `fetch_artifact` call this path makes — fails with a classified
+        // 5xx instead of the mock's default not-found.
+        mocks.upstream_proxy.fail_next_artifact_with(
+            UpstreamErrorKind::Upstream5xx.into_domain_error("origin 503"),
+        );
+
+        let err = try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::NoChecksumSidecar),
+            "an upstream that could not say must keep the refusal, got {err:?}"
         );
     }
 

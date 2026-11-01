@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A Maven proxy whose upstream has neither the artifact nor a checksum sidecar
+  now answers 404 rather than 502, so a virtual Maven repository serves a
+  coordinate only a later member holds (#391).
+
 ## [0.17.1] - 2026-11-01
 
 ### Added
