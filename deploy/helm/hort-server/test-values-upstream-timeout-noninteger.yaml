@@ -1,0 +1,27 @@
+# Regression fixture: a non-integer `upstream.timeoutSeconds` MUST be
+# rejected at `helm template`.
+#
+# The env is a whole number of seconds and the binary refuses anything else
+# at boot. A quoted value is the realistic mistake — every sibling under
+# `upstream` is a quoted size string — and an unquoted fractional value is
+# the other. Either one reaching the pod would abort startup, so the schema
+# rejects it at install time instead, where the operator is still looking.
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+upstream:
+  timeoutSeconds: "60"

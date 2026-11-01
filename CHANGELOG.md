@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `HORT_UPSTREAM_TIMEOUT_SECS` (chart: `upstream.timeoutSeconds`) sets the
+  deadline on an upstream pull-through fetch, for a large blob that cannot
+  finish inside the unchanged 30 s default. Default behaviour is unchanged;
+  a value the binary cannot use aborts boot rather than reverting to 30 (#331).
+
 ### Deprecated
 
 - `ArtifactRepository.spec.storage.path` is deprecated and routes nothing; blob

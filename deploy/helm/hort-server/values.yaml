@@ -344,16 +344,17 @@ http:
   publishBodyMaxSize: ""
 
 # -------------------- Upstream proxy --------------------
-# Configurable storage backstops on the streaming upstream fetch path.
-# Each cap bounds the per-fetch on-disk write; a trip emits a structured
-# 502 with `bytes_read` + `cap` and the
-# `result=<metadata|manifest|version_object>_too_large` metric label.
+# The pull-through fetch path: the streaming storage backstops, the
+# outbound identity, and the per-request deadline.
 #
-# Values are human-readable size STRINGS — `64Mi`, `1Gi`, `512Ki`,
-# decimal `64M`, or a bare byte integer. Quote them. (Strings, not bare
-# numbers, so a multi-GiB value can never round-trip through Helm's
-# float64 coercion into scientific notation, which the binary's parser
-# rejects at boot.)
+# The three `*MaxSize` caps bound the per-fetch on-disk write; a trip emits
+# a structured 502 with `bytes_read` + `cap` and the
+# `result=<metadata|manifest|version_object>_too_large` metric label. Their
+# values are human-readable size STRINGS — `64Mi`, `1Gi`, `512Ki`, decimal
+# `64M`, or a bare byte integer. Quote them. (Strings, not bare numbers, so
+# a multi-GiB value can never round-trip through Helm's float64 coercion
+# into scientific notation, which the binary's parser rejects at boot.)
+# `timeoutSeconds` is a small whole number and carries no such hazard.
 upstream:
   # HORT_UPSTREAM_METADATA_CACHE_MAX_SIZE — default 64Mi. Caps the
   # streamed write on `fetch_metadata` (npm packument, PyPI JSON, Cargo
@@ -383,6 +384,29 @@ upstream:
   # `hort-server validate-config` lints it offline); an invalid value is
   # ignored by the binary, which falls back to the built-in default.
   userAgent: ""
+  # HORT_UPSTREAM_TIMEOUT_SECS — total deadline, in whole seconds, on every
+  # upstream pull-through fetch (blob / manifest / metadata / referrers),
+  # applied by BOTH hort-server and the worker. Default 30, which is the
+  # binary's own default: this value is rendered unconditionally, so the chart
+  # pins it the way the three caps above pin theirs.
+  #
+  # It is a TOTAL request deadline, not an idle one: a transfer making
+  # uninterrupted progress is still cut at the limit, and the retry restarts at
+  # byte 0. So raise it when a legitimately large upstream blob cannot finish
+  # inside 30 s at your egress bandwidth — the default makes such a blob
+  # unfetchable rather than slow. The floor is 1 (the schema rejects 0 and any
+  # non-integer, and so does the binary at boot: a value it cannot use aborts
+  # startup instead of silently reverting to 30, which would leave you watching
+  # the same failures).
+  #
+  # Above 600 this knob stops being the binding limit on the read path. A
+  # coalesced blob pull-through runs inside the pull-through dedup leader's own
+  # deadline (HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS, default 600 s), which
+  # cancels the leader's fetch outright — so the effective ceiling there is the
+  # lower of the two. Raising this past 600 without raising that one changes
+  # nothing for the blob it was raised for; the dedup deadline has no chart
+  # value of its own today, so set it through `extraEnv`.
+  timeoutSeconds: 30
 
 # -------------------- Metrics --------------------
 # /metrics is served EXCLUSIVELY by the dedicated admin listener, gated by

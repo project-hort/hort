@@ -514,6 +514,7 @@ it is referenced, not scheduled here.
 | `HORT_RBAC_REFRESH_SECS` | u32 | `30` | No | RBAC snapshot poll cadence. |
 | `HORT_UPSTREAM_RESOLVER_REFRESH_SECS` | u32 | `60` | No | Upstream-resolver snapshot refresh cadence. Minimum `5` (lower → error). |
 | `HORT_UPSTREAM_ALLOWLIST_HOSTS` | tri-state CSV | _unset → disabled_ | No | Apply-time upstream-host allowlist. `__deny_all__` → strict deny; `h1,h2` → host list; empty/unset → no enforcement. |
+| `HORT_UPSTREAM_TIMEOUT_SECS` | u64 | `30` | No | **Total** deadline on every upstream pull-through fetch (blob / manifest / metadata / referrers). Read by **both** `hort-server` and `hort-worker` through one adapter helper, so a value applies to the whole deployment. Not an idle deadline: a transfer making uninterrupted progress is still cut at the limit, and the retry restarts at byte 0 — so an upstream blob that cannot finish inside it is unfetchable rather than slow, and this knob is how an operator raises that ceiling. Minimum `1`; unparseable or `0` aborts boot naming the variable and the value (interlock 15 below), never a silent revert to `30`. **Above `600` it stops being the binding limit on the read path**: a coalesced blob pull-through runs inside `HORT_PULL_DEDUP_LEADER_TIMEOUT_SECS` (default `600`), which cancels the leader's fetch outright, so the effective ceiling there is the lower of the two. Chart value: `upstream.timeoutSeconds`. |
 | `HORT_STATEFUL_UPLOAD_STAGING_DIR` | path | _derived_ | No | Stateful-upload chunk staging root. Default: `<HORT_STORAGE_FILESYSTEM_PATH>/stateful-upload-staging` (filesystem) or `/var/lib/hort/stateful-upload-staging` (S3, + boot WARN). |
 | `HORT_OCI_LEGACY_CATALOG_ENABLED` | bool | `false` | No | Mount the Docker-legacy global `/v2/_catalog`. |
 | `HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL` | u32 | `32` | No | Per-(repo, principal) OCI upload-session cap. |
@@ -601,6 +602,17 @@ rather than run misconfigured.
 14. **`HORT_EXTRA_CA_BUNDLE` fail-closed.** Set-but-unreadable / invalid
     PEM / zero certs aborts boot — never degrades silently to
     public-CA-only trust.
+15. **`HORT_UPSTREAM_TIMEOUT_SECS` fail-closed.** A non-empty value that
+    is not a whole number of seconds `>= 1` (including `0`, which is a
+    zero deadline rather than "no deadline") aborts boot, naming the
+    variable and the value. Unset or empty means the `30` s default and is
+    not an error. Enforced in composition, so it holds for **`hort-worker`
+    too** — unlike the rules above, which are `hort-server` `Config`
+    rules. Deliberately not a warn-and-default like
+    `HORT_UPSTREAM_USER_AGENT`: an operator raises this knob because
+    fetches are failing at the current limit, and a discarded value would
+    leave them watching the identical failures while believing they raised
+    it.
 
 ---
 

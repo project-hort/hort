@@ -146,6 +146,12 @@ spec:
             - name: HORT_UPSTREAM_USER_AGENT
               value: {{ .Values.upstream.userAgent | quote }}
             {{- end }}
+            # Total per-request deadline on every worker upstream fetch
+            # (composite scan, prefetch, provenance referrers, OCI index
+            # children) — same value as hort-server so one deadline applies
+            # across the deployment.
+            - name: HORT_UPSTREAM_TIMEOUT_SECS
+              value: {{ .Values.upstream.timeoutSeconds | quote }}
             # ----- Kubernetes downward API — POD_NAME feeds the
             #       worker_id default `${POD_NAME}-${random8hex}`. -----
             - name: POD_NAME
