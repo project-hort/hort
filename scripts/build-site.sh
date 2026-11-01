@@ -46,4 +46,13 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+# Diagram assets are content-addressed by their Markdown source.
+# Kroki is needed at build time only when SVGs must be generated.
+# A normal Ansible deployment can use the checked-in, already rendered SVGs,
+# but missing/stale assets always fail the build.
+if [[ -n "${KROKI_URL:-}" ]]; then
+  python3 scripts/site/render_diagrams.py --render --kroki-url "$KROKI_URL"
+else
+  python3 scripts/site/render_diagrams.py --check
+fi
 python3 scripts/site/generate.py "$@"

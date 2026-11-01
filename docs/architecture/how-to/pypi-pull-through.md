@@ -53,8 +53,6 @@ spec:
   description: "Pull-through cache for the public PyPI registry."
   format: pypi
   type: proxy
-  storage:
-    backend: filesystem
   proxy:
     upstreamUrl: https://pypi.org/
   isPublic: true
@@ -63,6 +61,8 @@ spec:
 
 `metadata.name` is the repository key — the `<repo>` segment in every
 URL `pip` will hit. It must match `^[a-z][a-z0-9-]{0,62}$`.
+
+Storage is selected for the deployment, not per repository; no repository-level path is needed.
 
 The `proxy:` block is required by the gitops validator for
 `type: proxy` repositories. The actual upstream-mapping row that

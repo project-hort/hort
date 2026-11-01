@@ -47,6 +47,8 @@
   ansible.builtin.command:
     cmd: "{{ website_build_script }}"
     chdir: "{{ website_repo_root }}"
+  environment:
+    KROKI_URL: "{{ website_kroki_url }}"
   delegate_to: localhost
   become: false
   run_once: true

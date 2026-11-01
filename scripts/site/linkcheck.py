@@ -17,6 +17,7 @@ import re
 import sys
 
 _HREF_RE = re.compile(r'href="([^"]+)"')
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 _ID_RE = re.compile(r'\bid="([^"]+)"')
 _LINK_TAG_RE = re.compile(r"<link\b[^>]*>", re.IGNORECASE)
 _SCRIPT_TAG_RE = re.compile(r"<script\b[^>]*>", re.IGNORECASE)
@@ -50,8 +51,22 @@ def check(dist):
         # must be same-origin-relative (never http(s)://).
         for tag in _LINK_TAG_RE.findall(content) + _SCRIPT_TAG_RE.findall(content):
             m = re.search(r'(?:href|src)="([^"]+)"', tag)
-            if m and m.group(1).startswith(("http://", "https://")):
+            if m and m.group(1).startswith(("http://", "https://")) and 'rel="canonical"' not in tag:
                 errors.append(f"{rel}: external asset reference not allowed: {m.group(1)}")
+
+        # Static diagrams must be present in the published site (no remote
+        # Kroki calls or missing image assets at runtime).
+        for tag in _IMG_TAG_RE.findall(content):
+            match = re.search(r'\bsrc="([^"]+)"', tag)
+            if not match:
+                continue
+            img = match.group(1)
+            if img.startswith(("http://", "https://", "//")):
+                errors.append(f"{rel}: external image not allowed: {img}")
+                continue
+            target_img = os.path.normpath(os.path.join(os.path.dirname(path), img))
+            if not os.path.isfile(target_img):
+                errors.append(f"{rel}: missing image asset: {img}")
 
         for href in _HREF_RE.findall(content):
             if href.startswith(("http://", "https://", "mailto:")):
