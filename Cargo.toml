@@ -106,14 +106,6 @@ members = [
     # `hort-adapters-*` dep.
     "crates/hort-secret-file",
 ]
-# tools/* hosts standalone, throwaway / one-off binaries (e.g.
-# `measurement-tools`). They are intentionally NOT workspace members: they
-# live outside the production dep graph, are not subject to the workspace
-# lint profile, and are exempt from the `Client::builder()` rule (ADR 0010)
-# because they have no production TLS surface. They build standalone via
-# `(cd tools/<name> && cargo build)`. The glob exclude keeps cargo from
-# auto-detecting their `Cargo.toml`s as members.
-exclude = ["tools/*"]
 
 [workspace.package]
 version = "0.17.2-dev"

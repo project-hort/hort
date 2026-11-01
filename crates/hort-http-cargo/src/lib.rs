@@ -877,8 +877,8 @@ fn parse_publish_body(body: &[u8]) -> Result<(&[u8], &[u8]), ApiError> {
     // before any slice so a bogus declaration cannot push the parser to
     // allocate or scan multi-MiB buffers. Publish metadata in practice
     // carries a single version's metadata, which is structurally
-    // comparable to a sparse-index entry — well under 64 KiB per the
-    // per-entry measurements in `crates/measurement-tools/src/cargo.rs`.
+    // comparable to a sparse-index entry — well under 64 KiB, measured
+    // per entry when this cap was chosen.
     // Decoupled from `CargoFormatHandler::metadata_expected_max_bytes()`
     // (the upstream-body cap, 8 MiB; see `hort-formats/src/cargo.rs`).
     // Diagnostic carries the cap word but no body bytes.
@@ -4242,8 +4242,8 @@ mod tests {
     // declare a multi-MiB metadata segment to amplify allocator/parser
     // pressure even though publish metadata in practice is one
     // version's metadata only (structurally comparable to a single
-    // sparse-index entry, well under 64 KiB per the per-entry
-    // measurements in `crates/measurement-tools/src/cargo.rs`).
+    // sparse-index entry, well under 64 KiB, measured per entry when
+    // this cap was chosen).
     //
     // The cap fires before the slice and the diagnostic carries no
     // input bytes.
