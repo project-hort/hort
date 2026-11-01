@@ -90,15 +90,6 @@ A version bump touches exactly these three files:
   crate versions; third-party dependencies are untouched)
 - `deploy/helm/hort-server/Chart.yaml` — `version` **and** `appVersion`
 
-**Not** in the cut, and deliberately so: `tools/measurement-tools/Cargo.lock`
-also pins the hort crates' versions (4 entries). That crate is excluded from
-the workspace by design (`exclude = ["backend", "tools/*"]` — see its own
-manifest header), it is in no released image or chart, and **no gate reads
-it**, so a pre-release cut leaves it alone; it goes stale between cycles and is
-refreshed by the `X.Y.Z-dev` marker bump below, which is a normal MR with a
-gate behind it. Do not add it to a pre-release cut to make a `grep` tidy — that
-puts a resolver run on the release commit for a file nothing consumes.
-
 ## Open a version cycle (once, right after a final ships)
 
 `develop` carries a `-dev` marker so a build off `develop` reports the honest
