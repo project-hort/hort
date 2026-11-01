@@ -286,43 +286,47 @@ pub(crate) async fn try_upstream_maven_pull(
     let blob_upstream_checksum = upstream_checksum;
     let coalesce_blob_result = ctx
         .pull_dedup
-        .coalesce_blob(blob_dedup_key, move || async move {
-            let fetch = blob_proxy
-                .fetch_artifact(blob_mapping, blob_path)
-                .await
-                .map_err(AppError::from)?;
-            // The artifact response's `Last-Modified` ≈ upstream publish time
-            // for an immutable Maven release; best-effort, absent → None.
-            let upstream_published_at = fetch.last_modified;
-            let reader: Box<dyn AsyncRead + Send + Unpin> =
-                Box::new(StreamReader::new(fetch.stream));
-            let request = VerifiedIngestRequest::UpstreamPublished {
-                repository_id: blob_repo_id,
-                coords: blob_coords,
-                content_type,
-                actor: ApiActor {
-                    user_id: Uuid::nil(),
-                },
-                payload_metadata: serde_json::json!({
-                    "source": "maven_upstream_pull",
-                    "upstream_url": blob_upstream_url,
-                }),
-                upstream_checksum: blob_upstream_checksum,
-                upstream_published_at,
-                trust_upstream_publish_time: blob_trust_publish_time,
-            };
-            let outcome = blob_ingest
-                .ingest_verified(
-                    request,
-                    // A Maven artifact claims only its own content; the
-                    // primary-content edge is derived inside the ingest.
-                    &[],
-                    reader,
-                    &MavenFormatHandler,
-                )
-                .await?;
-            Ok(outcome.artifact.sha256_checksum)
-        })
+        .coalesce_blob_with_not_found_ttl(
+            blob_dedup_key,
+            not_found_ttl(&mapping),
+            move || async move {
+                let fetch = blob_proxy
+                    .fetch_artifact(blob_mapping, blob_path)
+                    .await
+                    .map_err(AppError::from)?;
+                // The artifact response's `Last-Modified` ≈ upstream publish time
+                // for an immutable Maven release; best-effort, absent → None.
+                let upstream_published_at = fetch.last_modified;
+                let reader: Box<dyn AsyncRead + Send + Unpin> =
+                    Box::new(StreamReader::new(fetch.stream));
+                let request = VerifiedIngestRequest::UpstreamPublished {
+                    repository_id: blob_repo_id,
+                    coords: blob_coords,
+                    content_type,
+                    actor: ApiActor {
+                        user_id: Uuid::nil(),
+                    },
+                    payload_metadata: serde_json::json!({
+                        "source": "maven_upstream_pull",
+                        "upstream_url": blob_upstream_url,
+                    }),
+                    upstream_checksum: blob_upstream_checksum,
+                    upstream_published_at,
+                    trust_upstream_publish_time: blob_trust_publish_time,
+                };
+                let outcome = blob_ingest
+                    .ingest_verified(
+                        request,
+                        // A Maven artifact claims only its own content; the
+                        // primary-content edge is derived inside the ingest.
+                        &[],
+                        reader,
+                        &MavenFormatHandler,
+                    )
+                    .await?;
+                Ok(outcome.artifact.sha256_checksum)
+            },
+        )
         .await;
 
     let content_hash = match coalesce_blob_result {
@@ -621,36 +625,43 @@ async fn fetch_sidecar_body(
         .upstream_proxy
         .for_format(&crate::UPSTREAM_PROXY_FORMAT)
         .clone();
+    // Read the override off the resolved mapping BEFORE the clone the
+    // closure consumes.
+    let sidecar_not_found_ttl = not_found_ttl(mapping);
     let mapping = mapping.clone();
     let path = sidecar_path.to_string();
     let bytes = ctx
         .pull_dedup
-        .coalesce_metadata(dedup_key, move || async move {
-            let outcome = proxy
-                .fetch_metadata(mapping, path, Vec::new())
+        .coalesce_metadata_with_not_found_ttl(
+            dedup_key,
+            sidecar_not_found_ttl,
+            move || async move {
+                let outcome = proxy
+                    .fetch_metadata(mapping, path, Vec::new())
+                    .await
+                    .map_err(AppError::from)?;
+                let handle = outcome.cache_handle.as_ref().ok_or_else(|| {
+                    AppError::from(DomainError::Invariant(
+                        "maven sidecar fetch_metadata returned no cache_handle".to_string(),
+                    ))
+                })?;
+                // A sidecar is a bare digest line — no per-format projection.
+                let body = hort_app::project::project_cached(
+                    handle,
+                    hort_domain::ports::upstream_proxy::IdentityProjector,
+                )
                 .await
                 .map_err(AppError::from)?;
-            let handle = outcome.cache_handle.as_ref().ok_or_else(|| {
-                AppError::from(DomainError::Invariant(
-                    "maven sidecar fetch_metadata returned no cache_handle".to_string(),
-                ))
-            })?;
-            // A sidecar is a bare digest line — no per-format projection.
-            let body = hort_app::project::project_cached(
-                handle,
-                hort_domain::ports::upstream_proxy::IdentityProjector,
-            )
-            .await
-            .map_err(AppError::from)?;
-            if let Err(e) = tokio::fs::remove_file(&handle.path).await {
-                tracing::debug!(
-                    path = %handle.path.display(),
-                    error = %e,
-                    "maven sidecar tempfile cleanup failed (non-fatal)"
-                );
-            }
-            Ok(Bytes::from(body))
-        })
+                if let Err(e) = tokio::fs::remove_file(&handle.path).await {
+                    tracing::debug!(
+                        path = %handle.path.display(),
+                        error = %e,
+                        "maven sidecar tempfile cleanup failed (non-fatal)"
+                    );
+                }
+                Ok(Bytes::from(body))
+            },
+        )
         .await
         .map_err(|e| SidecarFetchError::Unavailable(e.to_string()))?;
 
@@ -658,6 +669,29 @@ async fn fetch_sidecar_body(
     // a non-UTF-8 sidecar parses to no valid hex token and fails downstream
     // as a ParseError, never a silent skip.
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The negative-cache TTL this upstream declares for a `404`, as the
+/// `Option<Duration>` override `PullDedup`'s coalesce entry points
+/// take. `None` — the mapping omitting `not_found_cache_seconds` — is
+/// the deployment-wide `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`.
+///
+/// Read here rather than inside `PullDedup` because the Maven pull has
+/// already resolved the mapping before it fetches anything, so the
+/// caller holds the value: giving `PullDedup` a port to look mappings
+/// up itself would add a dependency plus an invalidation problem on
+/// gitops apply for a value that is already in hand.
+///
+/// Both of the Maven pull's coalesce legs pass it — the sidecar
+/// metadata fetch and the artifact body — because a coordinate this
+/// upstream does not carry 404s on both, and a sidecar miss is the
+/// usual shape of that (`classify_sidecar_exhaustion`).
+fn not_found_ttl(
+    mapping: &hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping,
+) -> Option<std::time::Duration> {
+    mapping
+        .not_found_cache_seconds
+        .map(|secs| std::time::Duration::from_secs(u64::from(secs)))
 }
 
 /// Choose the coalescing key for the artifact-body leg, from the algorithm
@@ -841,6 +875,17 @@ mod tests {
     /// `seed_mapping` with the upstream named explicitly, for the tests that
     /// need two repositories pointing at two DIFFERENT origins.
     fn seed_mapping_at(mocks: &MockPorts, repo_id: Uuid, upstream_url: &str) -> Uuid {
+        seed_mapping_with_ttl(mocks, repo_id, upstream_url, None)
+    }
+
+    /// `seed_mapping_at` with the per-upstream not-found TTL declared,
+    /// for the tests that measure it.
+    fn seed_mapping_with_ttl(
+        mocks: &MockPorts,
+        repo_id: Uuid,
+        upstream_url: &str,
+        not_found_cache_seconds: Option<u32>,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         let now = Utc::now();
         mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
@@ -860,6 +905,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds,
             created_at: now,
             updated_at: now,
         });
@@ -1649,6 +1695,111 @@ mod tests {
     }
 
     // ---- The key shapes the two paths produce ------------------------------
+
+    // ---- The per-upstream not-found TTL reaches BOTH coalesce legs ---------
+    //
+    // `not_found_ttl` is passed at the sidecar metadata leg and at the
+    // artifact-body leg. The two are separate `PullDedup` entry points,
+    // and the window each writes is read back out of the store rather
+    // than inferred from the mapping, so a leg that dropped the
+    // override reports the 30 s deployment default here.
+
+    /// Seconds from now that the negative-cache record at `key` expires.
+    async fn negative_cache_window(ctx: &Arc<AppContext>, key: &DedupKey) -> u64 {
+        let bytes = ctx
+            .ephemeral_evictable
+            .get(key.serialised_for_test())
+            .await
+            .expect("the negative-cache read must succeed")
+            .expect("a miss must leave a negative-cache record");
+        let record: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("the stored record is JSON");
+        assert_eq!(record["kind"], "failed", "got {record}");
+        assert_eq!(record["upstream_kind"], "not_found", "got {record}");
+        let expires_at = record["expires_at"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no expires_at in {record}"));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_secs();
+        expires_at.saturating_sub(now)
+    }
+
+    /// The artifact-body leg: the sidecar resolves, the body 404s, and
+    /// the blob window must carry the declared hour. Contrasted against
+    /// the same pull on a mapping that declares nothing, which must
+    /// carry the deployment default.
+    #[tokio::test]
+    async fn per_upstream_not_found_ttl_reaches_the_artifact_body_leg() {
+        for (declared, expected_secs, label) in [
+            (Some(3600u32), 3600u64, "per-upstream hour"),
+            (None, 30u64, "deployment default"),
+        ] {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = proxy_maven_repo("maven-mirror");
+            mocks.repositories.insert(repo.clone());
+            seed_mapping_with_ttl(&mocks, repo.id, "https://repo1.maven.org/maven2", declared);
+
+            // Sidecar present, body absent — the artifact leg is the one
+            // that 404s, so the window measured below is the blob leg's.
+            let declared_hex = sha256_hex(b"bytes the upstream no longer serves");
+            mocks.upstream_proxy.insert_metadata(
+                "",
+                &format!("{ARTIFACT_PATH}.sha256"),
+                declared_hex.clone().into_bytes(),
+            );
+
+            let err =
+                try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(err, UpstreamPullError::NotFoundUpstream),
+                "{label}: expected NotFoundUpstream, got {err:?}"
+            );
+
+            let checksum =
+                UpstreamPublishedChecksum::new(HashAlgorithm::Sha256, declared_hex).unwrap();
+            let key = blob_dedup_key(HashAlgorithm::Sha256, &checksum, repo.id, ARTIFACT_PATH);
+            let window = negative_cache_window(&ctx, &key).await;
+            assert!(
+                window.abs_diff(expected_secs) <= 5,
+                "{label}: the artifact leg's window must be ~{expected_secs}s, got {window}s"
+            );
+        }
+    }
+
+    /// The sidecar metadata leg: nothing upstream at all, so `.sha512`
+    /// is the first fetch and the first miss.
+    #[tokio::test]
+    async fn per_upstream_not_found_ttl_reaches_the_sidecar_metadata_leg() {
+        for (declared, expected_secs, label) in [
+            (Some(3600u32), 3600u64, "per-upstream hour"),
+            (None, 30u64, "deployment default"),
+        ] {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = proxy_maven_repo("maven-mirror");
+            mocks.repositories.insert(repo.clone());
+            seed_mapping_with_ttl(&mocks, repo.id, "https://repo1.maven.org/maven2", declared);
+
+            let err =
+                try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(err, UpstreamPullError::NotFoundUpstream),
+                "{label}: a coordinate with neither sidecar nor body is a miss, got {err:?}"
+            );
+
+            let key = DedupKey::metadata("maven", repo.id, &format!("{ARTIFACT_PATH}.sha512"));
+            let window = negative_cache_window(&ctx, &key).await;
+            assert!(
+                window.abs_diff(expected_secs) <= 5,
+                "{label}: the sidecar leg's window must be ~{expected_secs}s, got {window}s"
+            );
+        }
+    }
 
     #[test]
     fn blob_dedup_key_uses_the_cross_format_sentinel_only_for_strong_digests() {

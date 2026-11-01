@@ -2136,6 +2136,14 @@ mod proxy_pull_through {
     }
 
     fn seed_mapping(mocks: &MockPorts, repo_id: Uuid) {
+        seed_mapping_with_not_found_ttl(mocks, repo_id, None);
+    }
+
+    fn seed_mapping_with_not_found_ttl(
+        mocks: &MockPorts,
+        repo_id: Uuid,
+        not_found_cache_seconds: Option<u32>,
+    ) {
         let now = Utc::now();
         mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
             id: Uuid::new_v4(),
@@ -2154,6 +2162,7 @@ mod proxy_pull_through {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds,
             created_at: now,
             updated_at: now,
         });
@@ -2260,6 +2269,73 @@ mod proxy_pull_through {
         let router = router(ctx);
         let (st, _) = get(&router, &format!("/maven/mvn-mirror/{REL}")).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// The per-upstream negative-cache TTL, **measured end to end**
+    /// through the serve route for both shapes of mapping.
+    ///
+    /// The route is driven for a coordinate the upstream carries
+    /// neither a sidecar nor a body for — the plain miss — and the
+    /// window the pull actually wrote is then read back out of the same
+    /// `EphemeralStore` the `PullDedup` instance uses. Nothing here is
+    /// asserted from the configured value: the expiry comes from the
+    /// stored record, so a mapping declaring an hour has to really
+    /// produce an hour and a mapping declaring nothing has to really
+    /// produce the deployment default.
+    ///
+    /// The window read is the `.sha512` sidecar leg's — the first fetch
+    /// a Maven pull issues, and the one a miss 404s on — which is also
+    /// what demonstrates the field reaches the *metadata* entry point
+    /// and not only the blob one.
+    #[tokio::test]
+    async fn per_upstream_not_found_ttl_is_measured_on_the_served_window() {
+        for (declared, expected_secs, label) in [
+            (Some(3600u32), 3600u64, "per-upstream hour"),
+            (None, 30u64, "deployment default"),
+        ] {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = proxy_repo(&mocks, "mvn-mirror");
+            seed_mapping_with_not_found_ttl(&mocks, repo.id, declared);
+
+            // Nothing seeded upstream: every sidecar 404s and so does
+            // the artifact probe, which is the plain-miss shape.
+            let router = router(ctx.clone());
+            let (st, _) = get(&router, &format!("/maven/mvn-mirror/{REL}")).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{label}: a plain miss is a 404");
+
+            let dedup_key = hort_app::pull_dedup::DedupKey::metadata(
+                "maven",
+                repo.id,
+                &format!("{REL}.sha512"),
+            );
+            let bytes = ctx
+                .ephemeral_evictable
+                .get(dedup_key.serialised_for_test())
+                .await
+                .expect("the negative-cache read must succeed")
+                .unwrap_or_else(|| {
+                    panic!("{label}: the sidecar miss must leave a negative-cache record")
+                });
+            let record: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("the stored record is JSON");
+            assert_eq!(record["kind"], "failed", "{label}: got {record}");
+            assert_eq!(
+                record["upstream_kind"], "not_found",
+                "{label}: got {record}"
+            );
+            let expires_at = record["expires_at"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{label}: no expires_at in {record}"));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_secs();
+            let window = expires_at.saturating_sub(now);
+            assert!(
+                window.abs_diff(expected_secs) <= 5,
+                "{label}: the served window must be ~{expected_secs}s, got {window}s"
+            );
+        }
     }
 
     /// Insert a `type: virtual` Maven repo over `members` in priority order

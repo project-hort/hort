@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `UpstreamMapping.spec.notFoundCacheSeconds` sets how long a 404 from that
+  upstream stays negative-cached, so a release mirror and a snapshot mirror no
+  longer share one deployment-wide window. Omitted keeps
+  `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`; effective on Maven proxies (#391).
+
 ### Fixed
 
 - A Maven proxy whose upstream has neither the artifact nor a checksum sidecar

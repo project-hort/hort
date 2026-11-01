@@ -68,7 +68,7 @@ const SELECT_COLS: &str = r#"
     upstream_auth_type, secret_ref, managed_by, managed_by_digest,
     insecure_upstream_url, trust_upstream_publish_time,
     mtls_cert_ref, mtls_key_ref, ca_bundle_ref, pinned_cert_sha256,
-    allowed_realm_hosts,
+    allowed_realm_hosts, not_found_cache_seconds,
     created_at, updated_at
 "#;
 
@@ -145,6 +145,13 @@ struct UpstreamMappingRow {
     /// schema, so an absent allowance decodes as the empty list rather
     /// than as `None`-means-what.
     allowed_realm_hosts: Vec<String>,
+    /// Per-upstream negative-cache TTL for a `404`, in seconds.
+    /// Nullable: `NULL` means the deployment-wide
+    /// `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`. Read as `i32` because the
+    /// column is a PostgreSQL `integer`; `row_to_mapping` narrows to
+    /// the domain's `u32` and surfaces an out-of-range value as a typed
+    /// adapter error rather than wrapping it.
+    not_found_cache_seconds: Option<i32>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -213,6 +220,21 @@ fn row_to_mapping(row: UpstreamMappingRow) -> DomainResult<RepositoryUpstreamMap
         }
         _ => {}
     }
+    // `not_found_cache_seconds` is a signed column carrying an
+    // unsigned domain value. The schema CHECK rejects `<= 0`, so a
+    // negative or zero value here means out-of-band SQL ran against a
+    // database whose constraint was dropped; surface it as a typed
+    // adapter error rather than saturating it into a TTL nobody asked
+    // for.
+    let not_found_cache_seconds = match row.not_found_cache_seconds {
+        None => None,
+        Some(secs) => Some(u32::try_from(secs).map_err(|_| {
+            DomainError::Invariant(format!(
+                "not_found_cache_seconds is {secs}, expected a positive integer (id={})",
+                row.id
+            ))
+        })?),
+    };
     // Row decoder funnels through `RepositoryUpstreamMapping::new` so
     // the value-object invariant gets re-checked against on-disk state.
     // A row that somehow ended up with a plaintext upstream and `false`
@@ -236,6 +258,7 @@ fn row_to_mapping(row: UpstreamMappingRow) -> DomainResult<RepositoryUpstreamMap
         ca_bundle_ref,
         pinned_cert_sha256: row.pinned_cert_sha256,
         allowed_realm_hosts: row.allowed_realm_hosts,
+        not_found_cache_seconds,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -311,11 +334,11 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
                        managed_by, managed_by_digest,
                        insecure_upstream_url, trust_upstream_publish_time,
                        mtls_cert_ref, mtls_key_ref, ca_bundle_ref, pinned_cert_sha256,
-                       allowed_realm_hosts,
+                       allowed_realm_hosts, not_found_cache_seconds,
                        created_at, updated_at
                    ) VALUES (
                        $1, $2, $3, $4, $5, $6, $7, 'local', NULL, $8, $9,
-                       $10, $11, $12, $13, $14, $15, $16
+                       $10, $11, $12, $13, $14, $15, $16, $17
                    )
                    ON CONFLICT (repository_id, path_prefix) DO UPDATE SET
                        upstream_url                = EXCLUDED.upstream_url,
@@ -331,6 +354,7 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
                        ca_bundle_ref               = EXCLUDED.ca_bundle_ref,
                        pinned_cert_sha256          = EXCLUDED.pinned_cert_sha256,
                        allowed_realm_hosts         = EXCLUDED.allowed_realm_hosts,
+                       not_found_cache_seconds     = EXCLUDED.not_found_cache_seconds,
                        updated_at                  = NOW()"#,
             )
             .bind(mapping.id)
@@ -347,6 +371,9 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
             .bind(ca_bundle_ref_json)
             .bind(mapping.pinned_cert_sha256.as_deref())
             .bind(mapping.allowed_realm_hosts.as_slice())
+            .bind(not_found_cache_seconds_to_db(
+                mapping.not_found_cache_seconds,
+            ))
             .bind(mapping.created_at)
             .bind(mapping.updated_at)
             .execute(&self.pool)
@@ -481,10 +508,10 @@ where
                managed_by, managed_by_digest,
                insecure_upstream_url, trust_upstream_publish_time,
                mtls_cert_ref, mtls_key_ref, ca_bundle_ref, pinned_cert_sha256,
-               allowed_realm_hosts
+               allowed_realm_hosts, not_found_cache_seconds
            ) VALUES (
                $1, $2, $3, $4, $5, $6, $7, 'gitops', $8, $9, $10,
-               $11, $12, $13, $14, $15
+               $11, $12, $13, $14, $15, $16
            )
            ON CONFLICT (repository_id, path_prefix) DO UPDATE SET
                upstream_url                = EXCLUDED.upstream_url,
@@ -500,6 +527,7 @@ where
                ca_bundle_ref               = EXCLUDED.ca_bundle_ref,
                pinned_cert_sha256          = EXCLUDED.pinned_cert_sha256,
                allowed_realm_hosts         = EXCLUDED.allowed_realm_hosts,
+               not_found_cache_seconds     = EXCLUDED.not_found_cache_seconds,
                updated_at                  = NOW()"#,
     )
     .bind(mapping.id)
@@ -517,6 +545,9 @@ where
     .bind(ca_bundle_ref_json)
     .bind(mapping.pinned_cert_sha256.as_deref())
     .bind(mapping.allowed_realm_hosts.as_slice())
+    .bind(not_found_cache_seconds_to_db(
+        mapping.not_found_cache_seconds,
+    ))
     .execute(exec)
     .await
     .map_err(|e| {
@@ -556,6 +587,24 @@ where
     .await
     .map_err(|e| map_sqlx_error(&e, "RepositoryUpstreamMapping", &id.to_string()))?;
     Ok(())
+}
+
+/// Per-upstream negative-cache TTL → the `integer` column, `None` →
+/// SQL NULL.
+///
+/// `i32::try_from` rather than `as i32`: a narrowing cast would wrap a
+/// value above `i32::MAX` to a negative, which the schema CHECK then
+/// rejects with a constraint-violation message naming neither the field
+/// nor the cause. The domain constructor already refuses such a value —
+/// `not_found_cache_seconds_reason` bounds the range at `i32::MAX` for
+/// exactly this column — so the fallback is unreachable from any
+/// constructed mapping and exists so the bind cannot be the place the
+/// invariant is lost. `None` is the honest encoding of "out of range":
+/// it means the deployment default, which is what a mapping whose
+/// override cannot be stored must fall back to rather than a wrapped
+/// number.
+fn not_found_cache_seconds_to_db(seconds: Option<u32>) -> Option<i32> {
+    seconds.and_then(|s| i32::try_from(s).ok())
 }
 
 /// `SecretRef` → JSONB column value, `None` → SQL NULL.
@@ -665,6 +714,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: now,
             updated_at: now,
         }
@@ -773,6 +823,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: now,
             updated_at: now,
         }
@@ -806,6 +857,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: now,
             updated_at: now,
         }
@@ -1917,6 +1969,204 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap_or_else(|e| panic!("the empty list must insert on `{auth}`: {e}"));
+        }
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    // -- `not_found_cache_seconds` ---------------------------------------
+    //
+    // The per-upstream negative-cache TTL for a `404`. Nullable, with
+    // `NULL` meaning the deployment-wide knob, so an existing row needs
+    // no backfill. One schema CHECK mirrors the domain rule.
+
+    /// The signed-column-to-unsigned-field narrowing, DB-free. `NULL`
+    /// decodes as `None` — the deployment default — and a positive
+    /// value decodes as itself.
+    #[test]
+    fn row_to_mapping_preserves_not_found_cache_seconds() {
+        let row = synthetic_row(None);
+        assert_eq!(row.not_found_cache_seconds, None);
+        let m = row_to_mapping(row).expect("decode must succeed");
+        assert_eq!(
+            m.not_found_cache_seconds, None,
+            "a NULL column is the deployment default"
+        );
+
+        let mut row = synthetic_row(None);
+        row.not_found_cache_seconds = Some(3600);
+        let m = row_to_mapping(row).expect("decode must succeed");
+        assert_eq!(m.not_found_cache_seconds, Some(3600));
+    }
+
+    /// A row that reached the table with a non-positive TTL (out-of-band
+    /// SQL against a database whose CHECK was dropped) surfaces as a
+    /// typed adapter error rather than saturating into a TTL nobody
+    /// asked for — `0` in particular is the value the whole rule exists
+    /// to refuse.
+    #[test]
+    fn row_to_mapping_rejects_a_non_positive_not_found_cache_seconds() {
+        for bad in [0i32, -1, i32::MIN] {
+            let mut row = synthetic_row(None);
+            row.not_found_cache_seconds = Some(bad);
+            let err = row_to_mapping(row)
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must not decode into a mapping"));
+            assert!(
+                matches!(err, DomainError::Validation(_) | DomainError::Invariant(_)),
+                "got {err:?} for {bad}"
+            );
+        }
+    }
+
+    /// The bind encoder, DB-free. `i32::try_from` rather than `as i32`,
+    /// so a value above `i32::MAX` cannot wrap to a negative the CHECK
+    /// then rejects with a message naming neither field nor cause.
+    #[test]
+    fn not_found_cache_seconds_to_db_never_wraps_to_a_negative() {
+        assert_eq!(not_found_cache_seconds_to_db(None), None);
+        assert_eq!(not_found_cache_seconds_to_db(Some(1)), Some(1));
+        assert_eq!(not_found_cache_seconds_to_db(Some(3600)), Some(3600));
+        assert_eq!(
+            not_found_cache_seconds_to_db(Some(i32::MAX as u32)),
+            Some(i32::MAX)
+        );
+        for unstorable in [i32::MAX as u32 + 1, u32::MAX] {
+            assert_eq!(
+                not_found_cache_seconds_to_db(Some(unstorable)),
+                None,
+                "{unstorable} must encode as NULL, never as a wrapped negative"
+            );
+        }
+    }
+
+    /// Round-trip through the `managed_by = 'gitops'` write — the only
+    /// production writer — and back out through
+    /// `list_managed_by_gitops`, the query the resolver cache the
+    /// pull-through path reads is filled from.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn save_managed_round_trips_not_found_cache_seconds() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = PgRepositoryUpstreamMappingRepo::new(pool.clone());
+
+        let mut m = make_managed_mapping(
+            repo,
+            "",
+            "https://upstream.example.com",
+            UpstreamAuth::Anonymous,
+            [0x5c; 32],
+        );
+        m.not_found_cache_seconds = Some(3600);
+        save_managed_in_tx(&pool, &m).await.expect("save_managed");
+
+        let row = adapter
+            .list_managed_by_gitops()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.repository_id == repo)
+            .expect("seeded gitops row must be listed");
+        assert_eq!(row.not_found_cache_seconds, Some(3600));
+
+        // And the override can be withdrawn: `None` on a re-apply
+        // clears the column back to the deployment default rather than
+        // leaving the previous hour in force.
+        m.not_found_cache_seconds = None;
+        save_managed_in_tx(&pool, &m).await.expect("re-save");
+        let row = adapter
+            .list_managed_by_gitops()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.repository_id == repo)
+            .expect("row still listed");
+        assert_eq!(
+            row.not_found_cache_seconds, None,
+            "withdrawing the override must clear the column"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Round-trip through the `managed_by = 'local'` upsert, the other
+    /// writer on this port.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn not_found_cache_seconds_round_trips_through_upsert() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = PgRepositoryUpstreamMappingRepo::new(pool.clone());
+
+        let mut m = make_mapping(
+            repo,
+            "",
+            "https://upstream.example.com",
+            UpstreamAuth::Anonymous,
+        );
+        m.not_found_cache_seconds = Some(86_400);
+        adapter.upsert(m).await.expect("upsert");
+
+        let listed = adapter.list_for_repository(repo).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].not_found_cache_seconds, Some(86_400));
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// The schema CHECK mirrors the value object, so out-of-band SQL
+    /// cannot write a TTL the pull-through path would read and act on.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn check_constraint_rejects_a_non_positive_not_found_cache_seconds() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        for bad in [0i32, -1, i32::MIN] {
+            let res = sqlx::query(
+                r#"INSERT INTO repository_upstream_mappings (
+                       id, repository_id, path_prefix, upstream_url,
+                       upstream_auth_type, not_found_cache_seconds
+                   ) VALUES ($1, $2, $3, $4, 'anonymous', $5)"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo)
+            .bind(format!("ck-{}", Uuid::new_v4().simple()))
+            .bind("https://registry.example.com")
+            .bind(bad)
+            .execute(&pool)
+            .await;
+            assert!(
+                res.is_err(),
+                "DB CHECK must reject not_found_cache_seconds={bad}"
+            );
+        }
+
+        // Counter-assertion: the guard is not rejecting everything. A
+        // positive value and SQL NULL (the default for every existing
+        // row) both insert cleanly.
+        for good in [Some(1i32), Some(3600), Some(i32::MAX), None] {
+            sqlx::query(
+                r#"INSERT INTO repository_upstream_mappings (
+                       id, repository_id, path_prefix, upstream_url,
+                       upstream_auth_type, not_found_cache_seconds
+                   ) VALUES ($1, $2, $3, $4, 'anonymous', $5)"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo)
+            .bind(format!("ok-{}", Uuid::new_v4().simple()))
+            .bind("https://registry.example.com")
+            .bind(good)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("not_found_cache_seconds={good:?} must insert: {e}"));
         }
 
         cleanup_repo(&pool, repo).await;
