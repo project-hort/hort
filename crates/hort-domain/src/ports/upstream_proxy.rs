@@ -157,6 +157,78 @@ pub struct ReferrerDescriptor {
     pub artifact_type: Option<String>,
 }
 
+/// The answer to "does the upstream have this?" — three states, because
+/// two would be a lie.
+///
+/// Existence is the first question of a pull-through fetch: asking for a
+/// checksum of something that may not be there answers a question nobody
+/// asked, and for a virtual repository a member that lacks a coordinate is
+/// the normal case rather than the exception. So the cheap question goes
+/// first — but only if its answer cannot be wrong in the one direction that
+/// matters.
+///
+/// **`Unknown` is why this is not a `bool`.** An upstream that refuses the
+/// question (`401`, `403`), does not implement the method (`405`), is
+/// failing (`5xx`), or never answered at all (timeout, transport failure)
+/// has said *nothing* about whether the artifact exists. Folding any of
+/// those into `Absent` would invent a miss for an artifact that is there —
+/// and a consumer acting on it would deny content it holds a working path
+/// to, which is strictly worse than the cost this enum exists to avoid.
+/// There is no fourth state and no `Option`: a caller must say what it does
+/// when the upstream did not answer, and the answer is always "fall back to
+/// the path you would have taken without asking".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamExistence {
+    /// The upstream answered for the resource itself (any `2xx`).
+    Present,
+    /// The upstream said, cleanly, that it does not have this. Only `404`
+    /// and `410` earn this.
+    Absent,
+    /// The upstream did not answer the question. Every other status, every
+    /// transport failure, every timeout, and every implementation that has
+    /// not been taught to ask.
+    Unknown,
+}
+
+impl UpstreamExistence {
+    /// Map an HTTP response status onto the three states.
+    ///
+    /// | Status | State | Why |
+    /// |---|---|---|
+    /// | `2xx` | `Present` | the upstream answered for the resource |
+    /// | `404`, `410` | `Absent` | the only two statuses that *are* "I do not have this" (RFC 9110 §15.5.5, §15.5.11) |
+    /// | `1xx`, `3xx` | `Unknown` | an interim or a redirect is not an answer about the resource |
+    /// | `401`, `403` | `Unknown` | the question was refused, not answered |
+    /// | `405` | `Unknown` | the upstream does not implement the method — it has said nothing about the artifact |
+    /// | `429`, every other `4xx` | `Unknown` | throttled or rejected, which is not an inventory statement |
+    /// | `5xx` | `Unknown` | the upstream is failing; an artifact it cannot serve today may still be there |
+    ///
+    /// The match is **total over `u16` with no wildcard**, so the compiler
+    /// — not a reviewer — guarantees every status has a stated answer, and
+    /// the two `Absent` arms are single-valued so no range edit can widen
+    /// them by accident. That direction is the whole point: a status this
+    /// table has never seen becomes `Unknown`, never `Absent`.
+    #[must_use]
+    pub fn from_http_status(status: u16) -> Self {
+        match status {
+            // Interim responses, and anything below the HTTP range.
+            0..=199 => Self::Unknown,
+            200..=299 => Self::Present,
+            // `3xx` points elsewhere rather than answering; `400` is a
+            // malformed request; `401` / `403` refuse the question.
+            300..=403 => Self::Unknown,
+            404 => Self::Absent,
+            // `405 Method Not Allowed` lands here: an upstream that will
+            // not answer a HEAD has made no statement about the artifact.
+            405..=409 => Self::Unknown,
+            410 => Self::Absent,
+            // Every remaining `4xx` (`429` included), every `5xx`, and
+            // every out-of-range code.
+            411..=u16::MAX => Self::Unknown,
+        }
+    }
+}
+
 /// Outbound port: fetch artifact content from an upstream registry.
 ///
 /// Method signatures are deliberately format-agnostic. OCI blobs
@@ -283,6 +355,55 @@ pub trait UpstreamProxy: Send + Sync {
     ) -> BoxFuture<'_, DomainResult<Vec<ReferrerDescriptor>>> {
         let _ = (mapping, upstream_name, digest);
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Ask whether the upstream has `path` at all — the cheap question
+    /// that precedes every expensive one.
+    ///
+    /// `path` is composed exactly as [`fetch_artifact`](Self::fetch_artifact)
+    /// composes it (mapping-relative, or an absolute URL used as-is with
+    /// the same mandatory SSRF check), so a `Present` answer is about the
+    /// resource the body fetch would go on to pull and not a near neighbour
+    /// of it.
+    ///
+    /// Consumers call this first and then act on
+    /// [`UpstreamExistence`]'s three states:
+    ///
+    /// - `Absent` → answer the request as a miss, having spent one round
+    ///   trip. For a virtual repository this is also what lets the walk
+    ///   continue to the next member.
+    /// - `Present` → proceed with the verified-pull sequence unchanged.
+    ///   Existence is *not* verification: nothing here says anything about
+    ///   a checksum, and ADR 0006's "verify before store" is untouched.
+    /// - `Unknown` → proceed with the verified-pull sequence unchanged,
+    ///   exactly as if this method had never been called. A consumer MUST
+    ///   NOT treat `Unknown` as a miss.
+    ///
+    /// # Why this returns no `Result`
+    ///
+    /// A failure *is* an answer here — `Unknown` — and a second channel for
+    /// it is a second chance to get it wrong: a `?` at a call site would
+    /// turn an upstream that could not say into the caller's own error, and
+    /// an `unwrap_or(Absent)` would invent the miss this enum exists to
+    /// prevent. With one channel, "did not answer" has exactly one spelling
+    /// and the mapping from a status to a state is decided in exactly one
+    /// place. The detail behind an `Unknown` is logged by the adapter, which
+    /// is the only layer that knows the URL and the status; the full pull
+    /// then runs anyway and surfaces the real error with its own detail.
+    ///
+    /// **Default impl returns `Unknown`** — which is precisely "I was not
+    /// taught to ask", and leaves every consumer on the path it took before
+    /// this method existed. `Absent` would be a catastrophic default and
+    /// `Present` a misleading one; only an implementation that actually
+    /// asked an upstream may return either. Non-generic, so the trait stays
+    /// dyn-compatible (ADR 0026).
+    fn probe_artifact(
+        &self,
+        mapping: RepositoryUpstreamMapping,
+        path: String,
+    ) -> BoxFuture<'_, UpstreamExistence> {
+        let _ = (mapping, path);
+        Box::pin(async { UpstreamExistence::Unknown })
     }
 }
 
@@ -649,6 +770,53 @@ mod tests {
         }
     }
 
+    /// An impl that overrides `probe_artifact` with a seeded verdict, so
+    /// the override is proved to be dispatched rather than merely declared.
+    struct ProbingProxy(UpstreamExistence);
+
+    impl UpstreamProxy for ProbingProxy {
+        fn fetch_blob(
+            &self,
+            _mapping: RepositoryUpstreamMapping,
+            _upstream_name: String,
+            _digest: String,
+        ) -> BoxFuture<'_, DomainResult<BlobFetch>> {
+            unreachable!("not exercised")
+        }
+        fn fetch_manifest(
+            &self,
+            _mapping: RepositoryUpstreamMapping,
+            _upstream_name: String,
+            _reference: String,
+            _accept: Vec<String>,
+        ) -> BoxFuture<'_, DomainResult<ManifestFetchOutcome>> {
+            unreachable!("not exercised")
+        }
+        fn fetch_artifact(
+            &self,
+            _mapping: RepositoryUpstreamMapping,
+            _path: String,
+        ) -> BoxFuture<'_, DomainResult<ArtifactFetch>> {
+            unreachable!("not exercised")
+        }
+        fn fetch_metadata(
+            &self,
+            _mapping: RepositoryUpstreamMapping,
+            _path: String,
+            _accept: Vec<String>,
+        ) -> BoxFuture<'_, DomainResult<MetadataFetchOutcome>> {
+            unreachable!("not exercised")
+        }
+        fn probe_artifact(
+            &self,
+            _mapping: RepositoryUpstreamMapping,
+            _path: String,
+        ) -> BoxFuture<'_, UpstreamExistence> {
+            let seeded = self.0;
+            Box::pin(async move { seeded })
+        }
+    }
+
     /// The default `fetch_referrers` impl returns an empty vec — the
     /// "no referrers" safe default — under dyn dispatch.
     #[tokio::test]
@@ -676,6 +844,134 @@ mod tests {
             .await
             .expect("override fetch_referrers");
         assert_eq!(out, seeded);
+    }
+
+    // -- UpstreamExistence ---------------------------------------------
+
+    /// The two statuses that mean "I do not have this", and nothing else
+    /// does. `410 Gone` is included because it is the upstream stating the
+    /// resource is deliberately no longer there — the same inventory fact
+    /// a `404` states (RFC 9110 §15.5.11).
+    #[test]
+    fn only_404_and_410_map_to_absent() {
+        assert_eq!(
+            UpstreamExistence::from_http_status(404),
+            UpstreamExistence::Absent
+        );
+        assert_eq!(
+            UpstreamExistence::from_http_status(410),
+            UpstreamExistence::Absent
+        );
+        // The neighbours of both, so an off-by-one range edit is caught.
+        for near in [403_u16, 405, 409, 411] {
+            assert_ne!(
+                UpstreamExistence::from_http_status(near),
+                UpstreamExistence::Absent,
+                "{near} must not be Absent — only 404 and 410 are an inventory statement"
+            );
+        }
+    }
+
+    /// **The regression this unit could introduce, pinned by name.**
+    ///
+    /// A `405 Method Not Allowed` is an upstream that will not answer the
+    /// question — many Maven mirrors and CDNs refuse HEAD outright. Reading
+    /// it as `Absent` would invent a miss for an artifact that is there,
+    /// which is worse than the four-round-trip cost this check removes:
+    /// hort would deny content it holds a working path to, and a virtual
+    /// repository would walk past the member that actually has it.
+    #[test]
+    fn http_405_is_unknown_not_absent() {
+        assert_eq!(
+            UpstreamExistence::from_http_status(405),
+            UpstreamExistence::Unknown,
+            "405 Method Not Allowed says nothing about the artifact"
+        );
+    }
+
+    /// Every other class, stated: an upstream that refuses, throttles,
+    /// redirects or is failing has said nothing, and a `2xx` is the only
+    /// thing that says "present".
+    #[test]
+    fn status_classes_map_to_their_stated_states() {
+        for present in [200_u16, 201, 204, 206, 299] {
+            assert_eq!(
+                UpstreamExistence::from_http_status(present),
+                UpstreamExistence::Present,
+                "{present} answered for the resource"
+            );
+        }
+        for unknown in [
+            0_u16,
+            100,
+            199, // interim / below the range
+            301,
+            302,
+            307,
+            399, // a redirect is not an answer
+            400,
+            401,
+            403, // refused, not answered
+            429,
+            451,
+            499, // throttled / rejected
+            500,
+            502,
+            503,
+            504,
+            599, // failing
+            600,
+            u16::MAX, // out of range entirely
+        ] {
+            assert_eq!(
+                UpstreamExistence::from_http_status(unknown),
+                UpstreamExistence::Unknown,
+                "{unknown} must be Unknown — anything but a clean 404/410 is not a miss"
+            );
+        }
+    }
+
+    /// The enum is a plain `Copy` value object: a consumer matches it in
+    /// one place and may hand it on without cloning. Also pins `Debug`,
+    /// which every failure message above renders through.
+    #[test]
+    fn existence_is_a_copyable_debuggable_value() {
+        let present = UpstreamExistence::Present;
+        let copied = present;
+        assert_eq!(present, copied);
+        // Spelled through `Clone` explicitly: the derive is part of the
+        // public shape (a consumer may hold the verdict in a cloneable
+        // struct), and `.clone()` on a `Copy` value reads as an accident.
+        let cloned: UpstreamExistence = Clone::clone(&present);
+        assert_eq!(cloned, UpstreamExistence::Present);
+        assert_eq!(format!("{:?}", UpstreamExistence::Absent), "Absent");
+        assert_eq!(format!("{:?}", UpstreamExistence::Unknown), "Unknown");
+        assert_ne!(UpstreamExistence::Absent, UpstreamExistence::Unknown);
+    }
+
+    /// The default `probe_artifact` impl returns `Unknown` under dyn
+    /// dispatch — "I was not taught to ask", which leaves a consumer on
+    /// the path it took before the method existed. An implementation that
+    /// never asked an upstream must never be able to say `Absent`.
+    #[tokio::test]
+    async fn probe_artifact_default_is_unknown_under_dyn_dispatch() {
+        let proxy: &dyn UpstreamProxy = &DefaultReferrersProxy;
+        let out = proxy
+            .probe_artifact(dummy_mapping(), "com/example/foo/1.0/foo-1.0.jar".into())
+            .await;
+        assert_eq!(out, UpstreamExistence::Unknown);
+    }
+
+    /// …and it is a real override point: an impl that answers `Absent`
+    /// is dispatched to through `&dyn UpstreamProxy`, which is how the
+    /// production adapter's answer reaches a format crate.
+    #[tokio::test]
+    async fn probe_artifact_override_is_dispatched_under_dyn_dispatch() {
+        let proxy: &dyn UpstreamProxy = &ProbingProxy(UpstreamExistence::Absent);
+        let out = proxy
+            .probe_artifact(dummy_mapping(), "com/example/foo/1.0/foo-1.0.jar".into())
+            .await;
+        assert_eq!(out, UpstreamExistence::Absent);
     }
 
     // -- UpstreamProxyByFormat -----------------------------------------
