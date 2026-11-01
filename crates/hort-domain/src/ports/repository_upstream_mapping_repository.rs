@@ -248,6 +248,42 @@ pub struct RepositoryUpstreamMapping {
     /// `secret_ref` is accepted (not inert — its consumer reads it the
     /// moment a secret is added).
     pub allowed_realm_hosts: Vec<String>,
+    /// How long a `404` from this upstream stays
+    /// negative-cached, in seconds. `None` — the default — means the
+    /// deployment-wide `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`, so an
+    /// absent value reproduces the pre-field behaviour exactly.
+    ///
+    /// # Why the TTL belongs here
+    ///
+    /// Absence is a property of the *upstream*, not of the deployment.
+    /// A release repository never gains a coordinate it refused — an
+    /// immutable release that is absent today is absent tomorrow — so a
+    /// long TTL costs nothing. A snapshot repository gains coordinates
+    /// constantly, and the same long TTL would answer `404` for a
+    /// snapshot that has since been published. One deployment-wide
+    /// number cannot be right for both, and a virtual repository
+    /// routinely mixes them.
+    ///
+    /// Validated by [`not_found_cache_seconds_reason`], which the gitops
+    /// validator calls too so the apply-time rejection and this
+    /// invariant are one rule. Zero is refused: a zero TTL re-fetches on
+    /// every retry inside the negative-cache window, defeating the
+    /// coalescing benefit on 404 storms — the same reason
+    /// `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS` refuses it. The schema CHECK
+    /// `chk_repository_upstream_mappings_not_found_cache_seconds`
+    /// mirrors the rule so a row inserted by raw SQL cannot escape it.
+    ///
+    /// # Consumer
+    ///
+    /// `PullDedup`'s negative-cache TTL resolution, reached by the
+    /// pull-through caller that already holds this mapping
+    /// (`coalesce_metadata_with_not_found_ttl` /
+    /// `coalesce_blob_with_not_found_ttl`). Both the cluster-wide
+    /// negative-cache entry and the in-process broadcast to Layer-A
+    /// followers are computed from the same override, so an in-process
+    /// follower and a second replica cannot disagree about how long one
+    /// coordinate stays absent.
+    pub not_found_cache_seconds: Option<u32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -284,6 +320,8 @@ pub struct RepositoryUpstreamMappingArgs {
     pub pinned_cert_sha256: Option<String>,
     /// See [`RepositoryUpstreamMapping::allowed_realm_hosts`].
     pub allowed_realm_hosts: Vec<String>,
+    /// See [`RepositoryUpstreamMapping::not_found_cache_seconds`].
+    pub not_found_cache_seconds: Option<u32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -394,6 +432,54 @@ pub fn allowed_realm_host_reason(host: &str) -> Option<String> {
     {
         return Some(format!(
             "{FORM}; `{host}` contains a character outside [A-Za-z0-9.-]"
+        ));
+    }
+    None
+}
+
+/// Validate a [`RepositoryUpstreamMapping::not_found_cache_seconds`]
+/// value. Returns `None` on accept, `Some(reason)` on reject.
+///
+/// **One definition, two callers** — the value-object constructor below
+/// and the gitops validator
+/// (`hort_config::upstream_mapping::validate_upstream_mapping`) both
+/// call this function, for the same reason
+/// [`allowed_realm_host_reason`] above is shared: a hand-maintained
+/// mirror drifts into a YAML that validates clean and then fails inside
+/// the constructor, and `hort-config` already depends on `hort-domain`,
+/// so sharing the function removes that surface instead of testing for
+/// it.
+///
+/// # Why zero is refused
+///
+/// A zero TTL would re-fetch on every retry within the negative-cache
+/// window, defeating the coalescing benefit on 404 storms. That is the
+/// deployment knob's own reason for refusing `0`
+/// (`HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS` surfaces
+/// `ConfigError::ValueNotPositive`), and it does not change when the
+/// value moves to a single upstream. An operator who wants no negative
+/// caching for an upstream is asking for something the window cannot
+/// give; refusing the value at apply time is what keeps them from
+/// setting it and getting coalescing loss instead.
+///
+/// The accepted range is bounded above by `i32::MAX`: the column is a
+/// PostgreSQL `integer`, so a larger value cannot round-trip through
+/// the row at all. The bound is a storage fact rather than a policy —
+/// `i32::MAX` seconds is ~68 years, far past any TTL an operator means.
+pub fn not_found_cache_seconds_reason(seconds: u32) -> Option<String> {
+    if seconds == 0 {
+        return Some(
+            "must be a positive number of seconds — a zero TTL re-fetches on every \
+             retry within the negative-cache window, defeating the coalescing \
+             benefit on 404 storms. Omit the field to use the deployment default."
+                .into(),
+        );
+    }
+    if seconds > i32::MAX as u32 {
+        return Some(format!(
+            "must not exceed {} seconds (the column is a PostgreSQL `integer`); \
+             got {seconds}",
+            i32::MAX
         ));
     }
     None
@@ -527,6 +613,18 @@ impl RepositoryUpstreamMapping {
             }
         }
 
+        // The per-upstream negative-cache TTL. `None` is the default and
+        // means the deployment-wide knob; a present value must be a
+        // positive number of seconds the column can hold. Same rule as
+        // the gitops validator, because both call the one function.
+        if let Some(seconds) = args.not_found_cache_seconds {
+            if let Some(reason) = not_found_cache_seconds_reason(seconds) {
+                return Err(DomainError::Validation(format!(
+                    "RepositoryUpstreamMapping.not_found_cache_seconds: {reason}"
+                )));
+            }
+        }
+
         Ok(Self {
             id: args.id,
             repository_id: args.repository_id,
@@ -544,6 +642,7 @@ impl RepositoryUpstreamMapping {
             ca_bundle_ref: args.ca_bundle_ref,
             pinned_cert_sha256: args.pinned_cert_sha256,
             allowed_realm_hosts: args.allowed_realm_hosts,
+            not_found_cache_seconds: args.not_found_cache_seconds,
             created_at: args.created_at,
             updated_at: args.updated_at,
         })
@@ -664,6 +763,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -801,6 +901,7 @@ mod tests {
             ca_bundle_ref,
             pinned_cert_sha256,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1205,6 +1306,7 @@ mod tests {
         RepositoryUpstreamMappingArgs {
             upstream_auth: auth,
             allowed_realm_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            not_found_cache_seconds: None,
             ..make_args("https://registry.example.com", false)
         }
     }
@@ -1377,6 +1479,89 @@ mod tests {
             assert!(
                 allowed_realm_host_reason(bad).is_some(),
                 "`{bad}` is not a bare hostname"
+            );
+        }
+    }
+
+    // -- `not_found_cache_seconds` -----------------------------------------
+    //
+    // The per-upstream negative-cache TTL for a `404`. One rule, three
+    // places: `not_found_cache_seconds_reason` below, the gitops
+    // validator (which calls the same function), and the schema CHECK
+    // `chk_repository_upstream_mappings_not_found_cache_seconds` in
+    // `035_upstream_mappings_not_found_cache_seconds.sql`.
+
+    fn args_with_not_found_ttl(seconds: Option<u32>) -> RepositoryUpstreamMappingArgs {
+        RepositoryUpstreamMappingArgs {
+            not_found_cache_seconds: seconds,
+            ..make_args("https://registry.example.com", false)
+        }
+    }
+
+    #[test]
+    fn constructor_defaults_not_found_cache_seconds_to_none() {
+        let m = RepositoryUpstreamMapping::new(args_with_not_found_ttl(None))
+            .expect("an absent override is the default everywhere");
+        assert_eq!(
+            m.not_found_cache_seconds, None,
+            "absent means the deployment-wide knob, carried as None"
+        );
+    }
+
+    #[test]
+    fn constructor_accepts_a_positive_not_found_cache_seconds() {
+        for seconds in [1u32, 30, 3600, 86_400, i32::MAX as u32] {
+            let m = RepositoryUpstreamMapping::new(args_with_not_found_ttl(Some(seconds)))
+                .unwrap_or_else(|e| panic!("{seconds}s must be accepted, got {e:?}"));
+            assert_eq!(m.not_found_cache_seconds, Some(seconds));
+        }
+    }
+
+    #[test]
+    fn constructor_rejects_a_zero_not_found_cache_seconds() {
+        let err = RepositoryUpstreamMapping::new(args_with_not_found_ttl(Some(0)))
+            .expect_err("zero defeats the coalescing window rather than disabling it");
+        assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not_found_cache_seconds") && msg.contains("positive"),
+            "the message must name the field and the rule, got `{msg}`"
+        );
+        assert!(
+            msg.contains("deployment default"),
+            "the message must name the remedy — omit the field, got `{msg}`"
+        );
+    }
+
+    #[test]
+    fn constructor_rejects_a_not_found_cache_seconds_the_column_cannot_hold() {
+        let too_big = i32::MAX as u32 + 1;
+        let err = RepositoryUpstreamMapping::new(args_with_not_found_ttl(Some(too_big)))
+            .expect_err("a value the integer column cannot hold must not be accepted");
+        assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not_found_cache_seconds") && msg.contains("integer"),
+            "the message must name the field and why the bound exists, got `{msg}`"
+        );
+    }
+
+    /// The shared rule, asserted on its own so the gitops validator's
+    /// verdict — which is this function and nothing else — is pinned at
+    /// the definition rather than only through the constructor.
+    #[test]
+    fn not_found_cache_seconds_reason_accepts_and_rejects_exactly_the_documented_set() {
+        for good in [1u32, 2, 30, 3600, 86_400, 2_147_483_647] {
+            assert_eq!(
+                not_found_cache_seconds_reason(good),
+                None,
+                "{good}s is a positive TTL the column can hold"
+            );
+        }
+        for bad in [0u32, 2_147_483_648, u32::MAX] {
+            assert!(
+                not_found_cache_seconds_reason(bad).is_some(),
+                "{bad} is not an acceptable TTL"
             );
         }
     }

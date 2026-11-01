@@ -5368,6 +5368,7 @@ mod tests {
                 ca_bundle_ref: None,
                 pinned_cert_sha256: None,
                 allowed_realm_hosts: Vec::new(),
+                not_found_cache_seconds: None,
             },
         }
     }
@@ -5403,6 +5404,18 @@ mod tests {
     ) -> Envelope<RepositorySpec> {
         let mut env = repo_env(name, "proxy");
         env.spec.format = "oci".into();
+        env
+    }
+
+    /// `notFoundCacheSeconds` is Maven-effective today, and the same
+    /// cross-spec validator rejects it elsewhere, so the TTL tests need
+    /// a Maven variant for the same reason the name-prefix tests need
+    /// an OCI one.
+    pub(in crate::use_cases::apply_config_use_case) fn maven_repo_env(
+        name: &str,
+    ) -> Envelope<RepositorySpec> {
+        let mut env = repo_env(name, "proxy");
+        env.spec.format = "maven".into();
         env
     }
 
@@ -5640,6 +5653,7 @@ mod tests {
                 ca_bundle_ref: None,
                 pinned_cert_sha256: None,
                 allowed_realm_hosts: Vec::new(),
+                not_found_cache_seconds: None,
             },
         }
     }

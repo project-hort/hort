@@ -340,7 +340,7 @@ over a public or untrusted link.
 
 | Variable | Type | Default | Required? | Semantics |
 |---|---|---|---|---|
-| `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS` | u64 | `30` | No | Negative-cache TTL for upstream `NotFound`. |
+| `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS` | u64 | `30` | No | Negative-cache TTL for upstream `NotFound`. **Deployment-wide default only** — an `UpstreamMapping` may override it per upstream with `spec.notFoundCacheSeconds`, since absence is a property of the upstream (an immutable release that is absent stays absent; a snapshot upstream gains coordinates constantly). See [the gitops how-to](../how-to/declare-gitops-config.md). Zero is rejected here and there, for the same reason: it re-fetches on every retry inside the window instead of disabling the cache. |
 | `HORT_PULL_DEDUP_TTL_UNAVAILABLE_SECS` | u64 | `10` | No | TTL for RateLimited / upstream-5xx / upstream-4xx / Unauthorized. |
 | `HORT_PULL_DEDUP_TTL_TIMEOUT_SECS` | u64 | `10` | No | TTL for Timeout / NetworkError. |
 | `HORT_PULL_DEDUP_TTL_CHECKSUM_MISMATCH_SECS` | u64 | `60` | No | TTL for ChecksumMismatch / ParseError / BodyTooLarge / PinMismatch / CaUnknown. |

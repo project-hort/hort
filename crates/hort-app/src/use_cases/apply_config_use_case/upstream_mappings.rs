@@ -399,6 +399,12 @@ fn build_upstream_mapping_from_spec(
         // entry and a non-`bearer_challenge` mapping that declares any,
         // and the value-object constructor below re-checks both.
         allowed_realm_hosts: env.spec.allowed_realm_hosts.clone(),
+        // Per-upstream negative-cache TTL for a `404`. `None` means the
+        // deployment-wide knob. Carried through verbatim; the
+        // per-envelope validator has already rejected a zero (and an
+        // unstorable value), and the value-object constructor below
+        // re-checks through the same shared domain function.
+        not_found_cache_seconds: env.spec.not_found_cache_seconds,
         created_at: now,
         updated_at: now,
     })?;
@@ -1023,6 +1029,7 @@ mod tests {
                 ca_bundle_ref: spec.ca_bundle_ref,
                 pinned_cert_sha256: spec.pinned_cert_sha256,
                 allowed_realm_hosts: Vec::new(),
+                not_found_cache_seconds: None,
                 created_at: now,
                 updated_at: now,
             })?;
@@ -1359,6 +1366,151 @@ mod tests {
                 .expect_err("anonymous has no realm to allow");
         assert!(
             err.to_string().contains("allowed_realm_hosts"),
+            "the refusal must name the field; got {err}"
+        );
+    }
+
+    /// End-to-end through the apply: a mapping declaring
+    /// `notFoundCacheSeconds` lands with that value on the persisted
+    /// row. This is the half that makes the field non-inert — the
+    /// pull-through caller reads exactly this value off exactly this
+    /// row and hands it to `PullDedup` (ADR 0015).
+    #[tokio::test]
+    async fn apply_upstream_mapping_threads_not_found_cache_seconds_to_persisted_row() {
+        let h = build_harness();
+        let mut mapping_env = upstream_mapping_env(
+            "maven-central",
+            "maven-central-proxy",
+            "",
+            "https://repo1.maven.org/maven2",
+        );
+        mapping_env.spec.not_found_cache_seconds = Some(3600);
+        let desired = DesiredState {
+            repositories: vec![maven_repo_env("maven-central-proxy")],
+            upstream_mappings: vec![mapping_env],
+            ..Default::default()
+        };
+
+        h.uc.apply(desired, env_oidc()).await.unwrap();
+
+        let listed = h.upstream.list_managed_by_gitops().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].not_found_cache_seconds,
+            Some(3600),
+            "the apply pipeline must thread notFoundCacheSeconds through to \
+             the row the pull-through path reads"
+        );
+    }
+
+    /// The default: a mapping that declares nothing lands with `None`,
+    /// which is what keeps every existing mapping on the deployment-wide
+    /// `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS` untouched.
+    #[tokio::test]
+    async fn apply_upstream_mapping_defaults_not_found_cache_seconds_to_none() {
+        let h = build_harness();
+        let desired = DesiredState {
+            repositories: vec![maven_repo_env("maven-central-proxy")],
+            upstream_mappings: vec![upstream_mapping_env(
+                "maven-central",
+                "maven-central-proxy",
+                "",
+                "https://repo1.maven.org/maven2",
+            )],
+            ..Default::default()
+        };
+
+        h.uc.apply(desired, env_oidc()).await.unwrap();
+
+        let listed = h.upstream.list_managed_by_gitops().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].not_found_cache_seconds, None,
+            "an undeclared TTL is the deployment default, not a surprise"
+        );
+    }
+
+    /// Diff-identity invariant, the same property the
+    /// `upstreamNamePrefix` test above pins for its field: the TTL
+    /// participates in the spec digest, so changing it across
+    /// re-applies rewrites the row rather than landing in `unchanged`.
+    /// `spec_digest_upstream_mapping` hashes the canonical spec, so
+    /// this holds by construction today — asserted anyway, because a
+    /// future hand-rolled digest that enumerates fields would silently
+    /// make an operator's edit a no-op.
+    #[tokio::test]
+    async fn changing_not_found_cache_seconds_rewrites_the_row_rather_than_no_op() {
+        let h = build_harness();
+        let mut before = upstream_mapping_env(
+            "maven-central",
+            "maven-central-proxy",
+            "",
+            "https://repo1.maven.org/maven2",
+        );
+        before.spec.not_found_cache_seconds = Some(600);
+        let mut after = before.clone();
+        after.spec.not_found_cache_seconds = Some(3600);
+
+        assert_ne!(
+            spec_digest_upstream_mapping(&before.spec),
+            spec_digest_upstream_mapping(&after.spec),
+            "the digest must move when the TTL moves — otherwise the diff \
+             layer classifies the edit as unchanged and the operator's new \
+             value never reaches the row"
+        );
+
+        h.uc.apply(
+            DesiredState {
+                repositories: vec![maven_repo_env("maven-central-proxy")],
+                upstream_mappings: vec![before],
+                ..Default::default()
+            },
+            env_oidc(),
+        )
+        .await
+        .unwrap();
+        let seeded = h.upstream.list_managed_by_gitops().await.unwrap();
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(seeded[0].not_found_cache_seconds, Some(600));
+
+        let report =
+            h.uc.apply(
+                DesiredState {
+                    repositories: vec![maven_repo_env("maven-central-proxy")],
+                    upstream_mappings: vec![after],
+                    ..Default::default()
+                },
+                env_oidc(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            report.updated >= 1,
+            "the TTL edit must produce an update, not a no-op; got report={report:?}"
+        );
+        let listed = h.upstream.list_managed_by_gitops().await.unwrap();
+        assert_eq!(listed.len(), 1, "an update, not a delete + create");
+        assert_eq!(
+            listed[0].not_found_cache_seconds,
+            Some(3600),
+            "the update path must write the new value"
+        );
+    }
+
+    /// The constructor is the apply's last line of defence, same as for
+    /// the realm allowance above: a spec that somehow reached stage 3
+    /// with a zero TTL is refused there rather than written. The
+    /// per-envelope validator rejects it first (`hort-config`'s
+    /// `validate_not_found_cache_seconds`); this asserts the re-check.
+    #[test]
+    fn build_upstream_mapping_from_spec_rejects_a_zero_not_found_cache_seconds() {
+        let mut env = upstream_mapping_env("u", "r", "", "https://registry.example.com");
+        env.spec.not_found_cache_seconds = Some(0);
+        let err =
+            build_upstream_mapping_from_spec(&env, Uuid::new_v4(), Uuid::new_v4(), &[7u8; 32])
+                .expect_err("a zero TTL defeats the window rather than disabling it");
+        assert!(
+            err.to_string().contains("not_found_cache_seconds"),
             "the refusal must name the field; got {err}"
         );
     }
