@@ -58,6 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `hort-cli admin task invoke --help` no longer advertises `scan`, which the
   server does not route and which answered `405`; the per-artifact instrument
   is `hort-cli admin rescan <ARTIFACT_ID>` (#388).
+- An OCI layer whose scan found no analyzer to claim it is no longer held
+  terminally while the manifest that names it serves, so its blob no longer
+  answers `503` on an image hort reports as released. Takes effect on a
+  ScanPolicy with `compositeVerdictMode: promoted`; a layer already held this
+  way stays terminal and needs `hort-cli curation waive` as well (#390).
 
 ## [0.17.0] - 2026-10-31
 

@@ -817,6 +817,14 @@ A backend returns `NothingAnalysable(reason)` in five situations:
   0064, amending ADR 0007), so an empty result over one layer is not an
   unassessed pairing. Without that mapping a layer would never reach a
   release authority of its own.
+
+  That narrowing holds only over a tree the analyzers walked **whole**.
+  The extractor never materialises a link entry, and Trivy selects
+  analyzers by path, so a layer whose `skipped_links` is nonzero was
+  handed a strict subset of what the archive declared and "every analyzer
+  agreed there is no package surface" is a statement about a tree that is
+  not the artifact. The narrowing is withdrawn there and the empty report
+  reads as `no_analyzer_matched` instead.
 - `unusable_archive` — the payload is an archive the adapter refused to
   materialise for a reason **about its own bytes**: a guard above
   tripped, an entry tried to escape the workspace, an entry name could
@@ -845,7 +853,13 @@ A backend returns `NothingAnalysable(reason)` in five situations:
   result stays an expected surface left unassessed. In `image` mode it is
   an assembled composition that reported nothing, which cannot be "no
   package surface by construction" — the composition *is* the thing that
-  was supposed to be assessed.
+  was supposed to be assessed. In `rootfs` mode over a layer whose link
+  entries were skipped (above) it is the withdrawn narrowing. Whether it
+  gates is decided by the **row**, not by the mode that produced it: an
+  absence of analysis says nothing about the layer's bytes, so on an OCI
+  blob under a promoted policy ADR 0064 D2 places it with the composition
+  exactly as it places the missing decoder — however this value was
+  reached, the adapter's empty report or the orchestrator's inert pairing.
 - `incomplete_composition` — a composed image could not be assembled: a
   constituent was missing from storage, unreadable, the repository has no
   upstream to acquire it from, or the composition tripped the whole-image
@@ -871,18 +885,28 @@ The reasons do **not** all gate the artifact, and
 `NotAnalysable::gates_release` is the single place that split is decided
 — read it rather than an enumeration here, which is what goes stale when
 a reason is added or split. It takes the artifact's kind and the resolved
-`compositeVerdictMode` as well as the reason, because two of the three
-answers are about the artifact rather than only about the refusal:
+`compositeVerdictMode` as well as the reason, because two of the five
+reasons are answered about the artifact rather than only about the
+refusal:
 
 - `not_applicable` never gates, anywhere. It is the absence of a surface:
   no scanner could ever find a threat level in an OCI manifest row or an
   image config blob, so a hold has nothing to wait on and would never
   lift.
-- `unsupported_container` does not gate an **OCI blob** under a
-  **promoted** policy, and gates everywhere else. The surface is real and
-  the composition that binds the layer assesses it (ADR 0064 D2).
-- everything else always gates: an expected surface went unassessed,
-  which is the absent verdict ADR 0007 holds on.
+- `unsupported_container` and `no_analyzer_matched` do not gate an **OCI
+  blob** under a **promoted** policy, and gate everywhere else. ADR 0064
+  D2's criterion is whether the scan is speaking about *the bytes* or
+  about *the resulting filesystem*, and it governs the absence of an
+  assessment exactly as it governs a finding: "I have no decoder for this
+  container" and "no analyzer claimed anything in this tree" are both
+  absences, neither says these bytes are dangerous, and the composition
+  that binds the layer is what assesses the filesystem.
+- `unusable_archive` and `incomplete_composition` always gate, and they
+  are on the two different sides of why. The first is about the bytes —
+  an extraction bound tripped, an entry tried to escape the workspace.
+  The second is the composition's *own* absent assessment, so there is
+  nothing above it to hand the obligation to. Either way an expected
+  surface went unassessed, which is the absent verdict ADR 0007 holds on.
 
 The orchestrator treats an abstention as **no contribution**. If any other
 backend produced a verdict, that verdict stands and the abstention is a
