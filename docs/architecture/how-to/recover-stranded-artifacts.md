@@ -29,7 +29,7 @@ reasons:
   re-evaluation.
 
 Before issue #6, both failure modes collapsed onto the same outcome: on
-retry exhaustion (`HORT_SCANNER_MAX_ATTEMPTS`, default 5), the artifact
+retry exhaustion (`HORT_SCANNER_MAX_ATTEMPTS`, default 6), the artifact
 went terminal `scan_indeterminate` either way. A scanner outage during
 ingest therefore **permanently stranded** every artifact pulled during
 it — `quarantine_status='quarantined'`, no release authority, and

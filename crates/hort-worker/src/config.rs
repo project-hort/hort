@@ -14,6 +14,14 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
+// The attempt-budget default is defined once, beside the retry curve it is
+// rated against: a budget is two numbers and `hort_app::retry_backoff` owns
+// both. A literal here would be a second default that agrees with that one
+// only until somebody changes it, and this is the number a deployment that
+// sets nothing actually runs on — so the inert half of such a change would
+// be the half every operator sees.
+use hort_app::retry_backoff::DEFAULT_MAX_ATTEMPTS;
+
 // -----------------------------------------------------------------
 // Public types
 // -----------------------------------------------------------------
@@ -563,7 +571,7 @@ impl WorkerConfig {
         let poll_interval =
             Duration::from_secs(parse_u64_default("HORT_SCANNER_POLL_INTERVAL_SECS", 5)?);
         let batch_size = parse_u32_default("HORT_SCANNER_BATCH_SIZE", 4)?;
-        let max_attempts = parse_u32_default("HORT_SCANNER_MAX_ATTEMPTS", 5)?;
+        let max_attempts = parse_u32_default("HORT_SCANNER_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)?;
         let lock_duration =
             Duration::from_secs(parse_u64_default("HORT_SCANNER_LOCK_DURATION_SECS", 900)?);
         let worker_id = parse_worker_id();
@@ -1164,7 +1172,11 @@ mod tests {
         );
         assert_eq!(cfg.poll_interval, Duration::from_secs(5));
         assert_eq!(cfg.batch_size, 4);
-        assert_eq!(cfg.max_attempts, 5);
+        // By value, not against `DEFAULT_MAX_ATTEMPTS`: this is the only
+        // assertion that says what an unconfigured worker actually gets, and
+        // comparing it to the constant the parse reads would pass whatever
+        // that constant said.
+        assert_eq!(cfg.max_attempts, 6);
         assert_eq!(cfg.lock_duration, Duration::from_secs(900));
         // Rotation env vars default to empty / None so the rotation
         // handler is structurally registered but becomes a no-op on

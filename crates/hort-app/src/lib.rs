@@ -106,7 +106,7 @@ pub mod rbac;
 // a discarded result is never silent and never reads two ways.
 pub(crate) mod result_write_fence;
 // The one retry-backoff curve a failing `jobs` row waits out, shared by
-// the task dispatcher and the scan orchestrator so "five attempts"
+// the task dispatcher and the scan orchestrator so one attempt budget
 // cannot mean two different windows depending on which one is asking.
 pub mod retry_backoff;
 // The vulnerability-scanner backends compiled into this build — the single

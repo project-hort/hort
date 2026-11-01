@@ -4313,8 +4313,8 @@ with the per-kind reason.
   dispatcher records as one) on a row that still had attempt budget
   left; `reschedule` was called with the shared retry curve's wait for
   that attempt (`hort_app::retry_backoff::compute_backoff` — 1, 5, 30,
-  then 60 minutes, the scan pipeline's own schedule). A five-attempt
-  budget therefore spans **96 minutes** from the first failure to the
+  then 60 minutes, the scan pipeline's own schedule). A six-attempt
+  budget therefore spans **156 minutes** from the first failure to the
   terminal row. A **destructive** row whose requester's authority could
   not be *read* at execution time also lands here with no handler run at
   all (see below).
@@ -4322,14 +4322,14 @@ with the per-kind reason.
   a terminal `failed` row carrying its last error. Three triggers reach
   it: the handler returned `TaskOutcome::Failed { retry: false }`; it
   asked to be retried on a row whose `attempts` had reached the
-  dispatcher's attempt cap (`HORT_SCANNER_MAX_ATTEMPTS`, default 5 —
+  dispatcher's attempt cap (`HORT_SCANNER_MAX_ATTEMPTS`, default 6 —
   the same number the abandoned-lease sweep spends and the same one
   `ScanOrchestrationConfig::max_attempts` carries); or the row is a
   **destructive**
   invocation whose requester's authority no longer holds, which the
   dispatcher refuses before calling the handler (below). The label
   reports what the dispatcher did to the row, not what the handler asked
-  for: a job that keeps failing the same way counts `failed_retry` four
+  for: a job that keeps failing the same way counts `failed_retry` five
   times and `failed_terminal` once, then stops being claimed.
 
 **Destructive-task execution-time authority.** Before invoking a

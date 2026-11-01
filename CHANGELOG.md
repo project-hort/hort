@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer share one deployment-wide window. Omitted keeps
   `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`; effective on Maven proxies (#391).
 
+### Changed
+
+- The default scan attempt budget (`HORT_SCANNER_MAX_ATTEMPTS`, chart
+  `worker.scanner.maxAttempts`) is now 6, so a persistently failing job takes
+  ~156 minutes instead of ~96 to become a permanent `failed` row.
+
 ### Fixed
 
 - A Maven proxy whose upstream has neither the artifact nor a checksum sidecar
