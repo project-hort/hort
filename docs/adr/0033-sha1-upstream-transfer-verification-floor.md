@@ -61,8 +61,14 @@ only for formats whose upstream guarantees only SHA-1 (Maven). Concretely:
    of the matching shape wins; an absent / unfetchable / malformed stronger
    sidecar falls through to the next. SHA-1 is used **only when nothing
    stronger is available** — it is the floor, not the default. All three absent
-   or malformed → `502` (unproxiable per ADR 0006 — no soft-fail, no
-   store-without-verify).
+   or malformed **while the artifact itself is present upstream** → `502`
+   (unproxiable per ADR 0006 — no soft-fail, no store-without-verify).
+   **Clarified 2026-11-01:** this clause always presupposed that there is a
+   transfer to verify. Where the artifact is absent upstream too, the request
+   is a miss and answers `404`; the sidecar leg reports exhaustion and a
+   classifier beside it decides which of the two it is, so an upstream that
+   simply does not hold the coordinate is never reported as one that cannot
+   be proxied.
 
 2. **Never a CAS key.** The content-addressable storage key is **always
    SHA-256**, computed independently over the streamed bytes, regardless of

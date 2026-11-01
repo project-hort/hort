@@ -192,7 +192,9 @@ decisions:
    (`.sha512` → `.sha256` → `.sha1`, the universal floor), verifies the
    streamed bytes against whichever digest won via `ingest_verified`, and
    stores under the independently-computed SHA-256 CAS key. All three sidecars
-   absent / malformed → `502` (unproxiable per ADR 0006 — no soft-fail). The
+   absent / malformed, **with the artifact present upstream** → `502`
+   (unproxiable per ADR 0006 — no soft-fail); absent sidecars *and* an absent
+   artifact are a miss and answer `404` (clarified 2026-11-01). The
    full rationale and threat model for permitting SHA-1 here is
    [ADR 0033](0033-sha1-upstream-transfer-verification-floor.md).
 
