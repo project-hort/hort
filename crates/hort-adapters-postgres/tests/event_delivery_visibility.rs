@@ -28,13 +28,19 @@
 //!    bounds what any of them can promise.
 //! 3. `an_xmin_horizon_does_not_close_the_late_commit_race` — the
 //!    obvious reader-side answer to (2) is a visibility horizon: return
-//!    only rows whose inserting transaction is already below
-//!    `pg_snapshot_xmin(pg_current_snapshot())`, so a cursor cannot pass
-//!    a row that was still in flight. It does not hold, because the
-//!    `nextval` order and the xid-assignment order are independent, and
-//!    several transactional write paths take their xid *before* they
-//!    draw a position. Pinned so a later reader does not adopt the
-//!    horizon on sight.
+//!    only rows whose inserting transaction has already settled, so a
+//!    cursor cannot pass a row that was still in flight. It does not
+//!    hold, because the `nextval` order and the xid-assignment order are
+//!    independent, and several transactional write paths take their xid
+//!    *before* they draw a position. Pinned so a later reader does not
+//!    adopt the horizon on sight. Asserted on
+//!    `pg_visible_in_snapshot(xmin, …)` — settled-ness of the row's own
+//!    inserting transaction — rather than on the naive
+//!    `xmin < pg_snapshot_xmin(…)` bound, which is a statement about the
+//!    oldest transaction running anywhere on the server and so fails
+//!    under unrelated neighbouring load; the test holds such a neighbour
+//!    open itself and carries the naive form alongside, which under that
+//!    neighbour delivers nothing at all.
 //!
 //! (2) and (3) pin **accepted behaviour**, not an open defect. ADR 0061
 //! takes the decision: the late-commit gap is accepted and documented,
@@ -338,12 +344,40 @@ async fn a_later_committing_transaction_can_hold_a_lower_global_position() {
 /// adopting the horizon.
 ///
 /// The horizon is the obvious reader-side fix: return only rows whose
-/// inserting transaction is below `pg_snapshot_xmin(pg_current_snapshot())`
-/// — i.e. rows whose transaction has already finished — so a cursor can
-/// never advance past a position that was still in flight. That reasoning
-/// needs the two orders to agree: it bounds *positions* by reasoning about
+/// inserting transaction has already finished, so a cursor can never
+/// advance past a position that was still in flight. That reasoning needs
+/// the two orders to agree: it bounds *positions* by reasoning about
 /// *transaction ids*, and it is sound only if a lower position implies a
 /// lower-or-equal xid.
+///
+/// ## Why the predicate below is `pg_visible_in_snapshot`
+///
+/// The horizon has two spellings and the difference decides whether this
+/// test states a property of its own database or of the server it happens
+/// to run on. `pg_visible_in_snapshot(xmin, pg_current_snapshot())` asks
+/// whether THIS row's inserting transaction completed before the snapshot
+/// was taken — two rows, one database, this test's own writes.
+/// `xmin < pg_snapshot_xmin(pg_current_snapshot())` asks whether the row's
+/// xid is below the oldest xid still running anywhere in the **cluster**,
+/// which any neighbouring session can move: one open transaction in
+/// another database pulls that bound below everything this test commits,
+/// the horizon read comes back empty, and the test goes red with nothing
+/// wrong with the change under it. Measured, not supposed — see the
+/// comment at the naive read below.
+///
+/// A false red costs a full re-verification and is indistinguishable from
+/// a real one, so the assertion is made on the exact filter and the naive
+/// one is carried beside it as the subset it is. That also makes the
+/// claim stronger than the one ADR 0061 needs: not even the most
+/// permissive settled-ness filter closes the race.
+///
+/// The test then holds a neighbouring transaction open across both reads
+/// on purpose, so the condition that used to make it red is the condition
+/// it runs in: a regression to the cluster-global predicate fails here
+/// deterministically instead of intermittently on someone else's branch.
+/// Under that neighbour the naive form delivers nothing at all, which is
+/// the stall half of ADR 0061's weighing — asserted rather than asserted
+/// about.
 ///
 /// The two orders are independent. A position is drawn by `nextval` when
 /// the events INSERT executes; an xid is assigned by the transaction's
@@ -375,6 +409,29 @@ async fn an_xmin_horizon_does_not_close_the_late_commit_race() {
     let repo_id = seed_repo(&pool).await;
     let event_store = PgEventStore::new(pool.clone()).await.expect("event store");
     let stream_id = StreamId::auth_attempts(Utc::now().date_naive()).to_string();
+
+    // A neighbouring transaction, opened FIRST so its xid is below every
+    // xid this test goes on to assign, and held open across both horizon
+    // reads below. It writes nothing and takes no lock — one
+    // `pg_current_xact_id()` is all it needs.
+    //
+    // This is the state the cluster is in whenever anything else is
+    // mid-write, and it is deliberately part of the test rather than a
+    // hazard the test hopes to avoid: `pg_snapshot_xmin` is the oldest
+    // *running* xid in the whole **cluster**, so this transaction — in any
+    // database of it — pulls that bound below both rows written below. The
+    // assertion that used to stand on `xmin < pg_snapshot_xmin(…)`
+    // therefore failed whenever a neighbour was mid-transaction, and it
+    // failed as `[] vs [N]` with nothing wrong with the change under it.
+    // Observed under a backlog of orphaned `hort_test_*` databases whose
+    // sweeper had fallen behind; held open here so a regression to that
+    // predicate is a deterministic local failure instead of a false red
+    // that arrives on someone else's branch.
+    let mut neighbour = pool.begin().await.expect("begin neighbour");
+    let xid_neighbour: i64 = sqlx::query_scalar("SELECT pg_current_xact_id()::text::bigint")
+        .fetch_one(&mut *neighbour)
+        .await
+        .expect("neighbour xid");
 
     // The append-last writer: its projection row goes in first, which is
     // what assigns its xid — the order `ref_lifecycle::move_ref` and
@@ -427,17 +484,22 @@ async fn an_xmin_horizon_does_not_close_the_late_commit_race() {
          xid order disagree, which is what the horizon cannot survive"
     );
 
-    // The horizon read: the same category read plus "only settled rows".
-    // The `::text::bigint` casts compare a 32-bit row `xmin` with a 64-bit
-    // snapshot xid and so ignore xid epoch — fine on a freshly created
-    // database, and one more cost of this shape rather than a detail.
+    // The horizon read: the same category read plus "only settled rows",
+    // where settled is asked of the ROW's inserting transaction —
+    // `pg_visible_in_snapshot` is "did this xid complete before the snapshot
+    // was taken?". That makes the predicate a property of the two rows this
+    // test inserted into its own database, which is what the assertion
+    // below is about.
+    //
+    // The `::text::xid8` cast carries a 32-bit row `xmin` into the 64-bit
+    // type at epoch 0, so it is sound up to the first xid wraparound of the
+    // cluster — one more cost of this shape rather than a detail.
     let horizon_read = r#"
         SELECT global_position
           FROM events
          WHERE stream_category = 'auth'
            AND global_position > $1
-           AND xmin::text::bigint
-               < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
+           AND pg_visible_in_snapshot(xmin::text::xid8, pg_current_snapshot())
          ORDER BY global_position
          LIMIT 100"#;
     let settled: Vec<i64> = sqlx::query_scalar(horizon_read)
@@ -448,24 +510,91 @@ async fn an_xmin_horizon_does_not_close_the_late_commit_race() {
     assert_eq!(
         settled,
         vec![position_append_last],
-        "the horizon returns the committed row — it is below the horizon because \
-         its xid is lower — and a reader that returns it advances its cursor to \
-         {position_append_last}, over the still-open {position_append_first}"
+        "the horizon returns the committed row — its inserting transaction \
+         completed before the snapshot — and a reader that returns it advances \
+         its cursor to {position_append_last}, over the still-open \
+         {position_append_first}"
+    );
+
+    // The naive spelling ADR 0061 names — `xmin < pg_snapshot_xmin(…)` — is
+    // this same filter approximated from below: a row whose xid is under the
+    // snapshot's xmin has certainly settled, so it returns a SUBSET of the
+    // rows above. What it excludes extra is settled rows whose xid is at or
+    // above the oldest xid still running anywhere in the cluster — which is
+    // not a property of this database, and is why the assertion above cannot
+    // be written on it.
+    //
+    // With `neighbour` still open, that bound sits below both rows and
+    // this read returns NOTHING: the feed stops on an
+    // unrelated transaction in which nothing of this test's is involved.
+    // That is the second half of ADR 0061's weighing made concrete — a
+    // horizon reader trades the bounded partial loss for a stall bounded
+    // only by the longest-running transaction on the server — and it is
+    // asserted rather than described.
+    let naive_horizon_read = r#"
+        SELECT global_position
+          FROM events
+         WHERE stream_category = 'auth'
+           AND global_position > $1
+           AND xmin::text::bigint
+               < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
+         ORDER BY global_position
+         LIMIT 100"#;
+    let naive: Vec<i64> = sqlx::query_scalar(naive_horizon_read)
+        .bind(0_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("naive horizon read while the append-first transaction is open");
+    assert!(
+        naive.is_empty(),
+        "with a neighbouring transaction open at xid {xid_neighbour}, the \
+         naive horizon's bound is below both rows, so it delivers nothing at \
+         all — not even the committed {position_append_last}. Got {naive:?}. \
+         A reader built on it stalls the whole feed on a transaction that \
+         wrote none of these events"
+    );
+
+    // The neighbour's work is done: with it closed, the naive bound rises
+    // past the committed row and the two spellings agree — which is where
+    // the horizon advances the cursor over the gap exactly as the exact
+    // form did above. Asserted as a subset rather than an equality, because
+    // another session of this cluster may be mid-transaction and that is
+    // precisely the premise this test no longer stands on.
+    neighbour.rollback().await.expect("release neighbour");
+    let naive_quiet: Vec<i64> = sqlx::query_scalar(naive_horizon_read)
+        .bind(0_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("naive horizon read after the neighbour closed");
+    assert!(
+        naive_quiet
+            .iter()
+            .all(|position| settled.contains(position)),
+        "the naive horizon can only ever return a subset of the settled rows. \
+         Got {naive_quiet:?} against exact {settled:?}"
+    );
+    assert!(
+        !naive_quiet.contains(&position_append_first),
+        "and it cannot contain the still-open {position_append_first}: an \
+         in-progress transaction's xid is never below the snapshot's xmin"
     );
 
     append_first.commit().await.expect("commit append-first");
 
-    let after_horizon: Vec<i64> = sqlx::query_scalar(horizon_read)
-        .bind(position_append_last)
-        .fetch_all(&pool)
-        .await
-        .expect("horizon read from the position the reader had reached");
-    assert!(
-        !after_horizon.contains(&position_append_first),
-        "a horizon reader that advanced to {position_append_last} never sees \
-         {position_append_first} either: an xmin horizon bounds positions by \
-         reasoning about transaction ids, and the two orders are independent"
-    );
+    for (shape, sql) in [("exact", horizon_read), ("naive", naive_horizon_read)] {
+        let after_horizon: Vec<i64> = sqlx::query_scalar(sql)
+            .bind(position_append_last)
+            .fetch_all(&pool)
+            .await
+            .expect("horizon read from the position the reader had reached");
+        assert!(
+            !after_horizon.contains(&position_append_first),
+            "a {shape}-horizon reader that advanced to {position_append_last} \
+             never sees {position_append_first} either: a horizon bounds \
+             positions by reasoning about transaction ids, and the two orders \
+             are independent"
+        );
+    }
 
     // Same for the shipped read, which is what the dispatcher and
     // `GET /api/v1/events` actually call — stated here so the two are
