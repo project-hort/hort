@@ -1166,6 +1166,91 @@ mod tests {
         );
     }
 
+    // ---- Branch: a 410 on the body leg is a miss, not a bad gateway -------
+    //
+    // These two cases are one test written twice, and the pair is the point:
+    // the Maven chain classifies the *sentinel*, never the status, so what
+    // decides the verdict here is which `UpstreamErrorKind` the adapter
+    // attached. Before the fix a `410` arrived as `Upstream4xx` (the second
+    // case) and the client got a 502; it now arrives as `NotFound` (the
+    // first) and the client gets a 404. The adapter half of the chain — that
+    // a real `410` off a real server is classified `NotFound` — is pinned in
+    // `hort-adapters-upstream-http` by `fetch_artifact_410_maps_to_not_found`
+    // and `the_status_classifier_reads_404_and_410_as_not_found_and_nothing_else`;
+    // this crate cannot see that classifier (an inbound HTTP adapter must
+    // not depend on an outbound one, ADR 0008), so it stands on the codec
+    // both sides share.
+
+    /// Drive a pull that reaches the **body leg** — a sidecar that resolves,
+    /// then the artifact fetch failing with `err` — and hand back the error
+    /// the chain produced. The two cases below differ in exactly one thing,
+    /// the `UpstreamErrorKind` the adapter attached, which is the subject.
+    async fn pull_with_a_failing_artifact_body(err: DomainError) -> UpstreamPullError {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_maven_repo("maven-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        // The sidecar resolves, so the pull reaches the body leg — this is
+        // the artifact fetch, not the exhaustion classifier's probe.
+        let body = b"the jar that used to be here".to_vec();
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{ARTIFACT_PATH}.sha512"),
+            sha512_hex(&body).into_bytes(),
+        );
+        mocks.upstream_proxy.fail_next_artifact_with(err);
+
+        try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+            .await
+            .unwrap_err()
+    }
+
+    /// A `410 Gone` on the artifact body is the upstream stating it does not
+    /// have this coordinate (RFC 9110 §15.5.11 — "likely to be permanent"),
+    /// so it reaches the client as a 404 a virtual repository can walk past.
+    #[tokio::test]
+    async fn a_gone_artifact_body_is_a_miss_not_an_artifact_fetch_failure() {
+        let err = pull_with_a_failing_artifact_body(
+            UpstreamErrorKind::NotFound.into_domain_error("artifact fetch returned 410 Gone"),
+        )
+        .await;
+
+        assert!(
+            matches!(err, UpstreamPullError::NotFoundUpstream),
+            "a permanently-gone coordinate is a miss, got {err:?}"
+        );
+        assert_eq!(
+            map_upstream_pull_error(&err).status(),
+            StatusCode::NOT_FOUND,
+            "and it reaches the client as a 404, not the 502 the generic 4xx bucket gave it"
+        );
+    }
+
+    /// The counter-case, and the before-state of the arm above: an error
+    /// classified `Upstream4xx` — which is where a `410` used to land — still
+    /// reaches `ArtifactFetchFailed` and a 502. Without this, the test above
+    /// would also pass against an `is_upstream_not_found` widened to match
+    /// every `upstream:` error, which would turn every transport failure
+    /// into a silent miss.
+    #[tokio::test]
+    async fn a_generic_4xx_artifact_body_is_still_an_artifact_fetch_failure() {
+        let err = pull_with_a_failing_artifact_body(
+            UpstreamErrorKind::Upstream4xx
+                .into_domain_error("artifact fetch returned 418 I'm a teapot"),
+        )
+        .await;
+
+        assert!(
+            matches!(err, UpstreamPullError::ArtifactFetchFailed(_)),
+            "a 4xx that states no inventory fact is not a miss, got {err:?}"
+        );
+        assert_eq!(
+            map_upstream_pull_error(&err).status(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
     // ---- Branch: the probe cannot answer → the refusal stands --------------
     //
     // Only a PROVEN miss reclassifies. An upstream that answered the probe

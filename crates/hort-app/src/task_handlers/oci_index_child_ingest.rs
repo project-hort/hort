@@ -2360,6 +2360,83 @@ mod tests {
         );
     }
 
+    /// **The reader path is not an admission gate, and a missing descriptor
+    /// `size` must not be allowed to become one.**
+    ///
+    /// The hosted manifest-`PUT` admission gate refuses an index whose child
+    /// descriptor declares no readable `size`
+    /// (`hort-http-oci`'s `check_child_against_descriptor`) — `size` is a
+    /// REQUIRED descriptor property, and refusing a document that does not
+    /// make a REQUIRED statement is the gate's job. Closing that the tidier
+    /// way — a `DescriptorProblem` variant, so the domain projection faults
+    /// on it — would reach **here** too, because a fault is seen by both
+    /// `IndexChildren` constructors and this path's `into_resolvable` *skips*
+    /// each one. The skipped child would then get no `oci_index_member` edge,
+    /// and that edge is the GC keepalive on its bytes: an index already in
+    /// the catalog would silently lose a member's protection and the bytes it
+    /// was holding alive would become collectable.
+    ///
+    /// So this test stands on the bytes being already stored and
+    /// digest-verified. Refusing them here would not un-store anything; it
+    /// would mint the manifest with a missing edge.
+    #[tokio::test]
+    async fn a_grandchild_descriptor_without_a_size_still_earns_its_member_edge() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(Vec::new())).await;
+        let grandchildren = [deterministic_sha(1), deterministic_sha(2)];
+        let body = index_body_without_child_sizes(&grandchildren);
+        let digest = seed_child(&f.proxy, &body, OCI_IMAGE_INDEX_MEDIA_TYPE, None);
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
+        assert_eq!(summary["outcome"], "ingested");
+        assert_eq!(summary["is_index"], true);
+        assert_eq!(
+            summary["membership_edges_written"], 2,
+            "a descriptor with no `size` is still an addressable child; dropping its \
+             edge would un-keepalive its bytes"
+        );
+
+        let edges = f.lifecycle.ingest_edge_kinds();
+        for grandchild in &grandchildren {
+            assert!(
+                edges.iter().any(|(_, kind, target)| {
+                    kind == OCI_INDEX_MEMBER_KIND && target == grandchild.as_ref()
+                }),
+                "no oci_index_member edge for sha256:{}: {edges:?}",
+                grandchild.as_ref()
+            );
+        }
+        // And the grandchildren are still enqueued, so the whole cascade
+        // below this index is unaffected too.
+        assert_eq!(summary["grandchildren_enqueued"], 2);
+    }
+
+    /// [`index_body`] with the `size` key omitted from every child
+    /// descriptor — the shape the admission gate refuses and this path must
+    /// still read.
+    fn index_body_without_child_sizes(children: &[ContentHash]) -> Vec<u8> {
+        let manifests: Vec<serde_json::Value> = children
+            .iter()
+            .map(|c| {
+                json!({
+                    "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
+                    "digest": format!("sha256:{}", c.as_ref()),
+                })
+            })
+            .collect();
+        json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_INDEX_MEDIA_TYPE,
+            "manifests": manifests,
+        })
+        .to_string()
+        .into_bytes()
+    }
+
     // =====================================================================
     // Nested index — one enqueue per grandchild
     // =====================================================================
