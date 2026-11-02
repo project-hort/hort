@@ -1,12 +1,23 @@
 //! Maven upstream pull-through orchestrator (ADR 0006, ADR 0033).
 //!
-//! Two-leg verified pull-through for a Maven-layout upstream:
+//! Verified pull-through for a Maven-layout upstream — existence first,
+//! then the two content legs:
 //!
 //! 1. Resolve the upstream mapping via [`UpstreamResolver`]. The requested
 //!    Maven path maps **1:1** to the upstream Maven layout
 //!    (`{group-path}/{artifact}/{version}/{filename}`), so the path is
 //!    composed onto `mapping.upstream_url` verbatim.
-//! 2. **Fetch the checksum sidecar, preferring strength:** `<path>.sha512` →
+//! 2. **Ask whether the upstream has the coordinate at all**
+//!    ([`UpstreamProxy::probe_artifact`]), because existence is logically
+//!    prior to "how do I verify it?" and a virtual repository's members
+//!    lack a coordinate as a matter of course. An
+//!    [`UpstreamExistence::Absent`] — only a clean `404` / `410` earns it —
+//!    is a miss in ONE upstream round trip. `Present` and `Unknown` both
+//!    fall through to the unchanged sequence below; `Unknown` (a `405`
+//!    from an upstream that refuses HEAD, a `401`, a `5xx`, a timeout) is
+//!    emphatically NOT a miss, and reading it as one would deny content
+//!    hort holds a working path to.
+//! 3. **Fetch the checksum sidecar, preferring strength:** `<path>.sha512` →
 //!    `<path>.sha256` → `<path>.sha1` (the universal floor — ADR 0033). The
 //!    first sidecar that fetches AND parses to a VALID digest of the matching
 //!    shape wins; a 404, a transport failure, OR a malformed/empty/wrong-shape
@@ -14,9 +25,14 @@
 //!    Parse the body to a bare lowercase hex digest (tolerating a trailing
 //!    ` filename` suffix). The `.sha1` floor is the guarantee (design §8) — a
 //!    corrupt `.sha512` must NOT block proxying an artifact that has a valid
-//!    `.sha1`. **Only when all three are absent / unfetchable / unparseable →
-//!    502** (unproxiable per ADR 0006 — NO soft-fail, NO unverified ingest).
-//! 3. Build `VerifiedIngestRequest::UpstreamPublished{ upstream_checksum }`
+//!    `.sha1`. All three absent / unfetchable / unparseable is **not yet a
+//!    verdict**: `classify_sidecar_exhaustion` then asks whether the upstream
+//!    has the artifact at all. It does → **502**, unproxiable per ADR 0006
+//!    (NO soft-fail, NO unverified ingest). It 404s the artifact too → **404**,
+//!    because a coordinate this upstream does not carry is a miss rather than
+//!    a gateway failure, and only a miss lets a virtual repository move on to
+//!    its next member.
+//! 4. Build `VerifiedIngestRequest::UpstreamPublished{ upstream_checksum }`
 //!    with the [`HashAlgorithm`] matching whichever sidecar won, fetch the
 //!    artifact bytes, and ingest via [`IngestUseCase::ingest_verified`] —
 //!    which rehashes the streamed bytes with the matching algorithm and
@@ -24,9 +40,11 @@
 //!    independently-computed SHA-256 regardless of which sidecar verified
 //!    transfer.
 //!
-//! Both legs are coalesced through [`PullDedup`] (per-format-per-repo
-//! [`DedupKey`]) so N parallel misses for the same artifact produce ≤ 1
-//! upstream fetch + ≤ 1 CAS write.
+//! Both **content** legs are coalesced through [`PullDedup`]
+//! (per-format-per-repo [`DedupKey`]) so N parallel misses for the same
+//! artifact produce ≤ 1 upstream fetch + ≤ 1 CAS write. The existence probe
+//! is not: a dedup window carries bytes (or a verified `ContentHash`) for
+//! followers to adopt, and a probe has neither.
 //!
 //! **Asymmetry with the trait-method floor (design §8/§15).** The
 //! [`MavenFormatHandler`]'s `upstream_checksum_metadata_path` /
@@ -51,12 +69,14 @@ use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
 use hort_app::error::AppError;
+use hort_app::metrics::UpstreamErrorKind;
 use hort_app::pull_dedup::DedupKey;
 use hort_app::use_cases::ingest_use_case::{RegisterExistingCasBlobRequest, VerifiedIngestRequest};
 use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::repository::Repository;
 use hort_domain::error::DomainError;
 use hort_domain::events::ApiActor;
+use hort_domain::ports::upstream_proxy::UpstreamExistence;
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::ArtifactCoords;
 use hort_formats::maven::{parse_sidecar_hex, MavenFormatHandler};
@@ -91,9 +111,12 @@ pub(crate) enum UpstreamPullError {
     #[error("no upstream mapping configured")]
     NoUpstreamMapping,
 
-    /// Upstream returned 404 for the artifact body itself (the sidecar
-    /// resolved, but the file is gone). Wire to 404 — the upstream simply
-    /// doesn't have this file.
+    /// Upstream returned 404 for the artifact body itself — either after a
+    /// sidecar resolved and the file turned out to be gone, or on
+    /// `classify_sidecar_exhaustion`'s probe, which asks the same question
+    /// for a coordinate that published no usable sidecar. Wire to 404 — the
+    /// upstream simply doesn't have this file, which is also what tells a
+    /// virtual repository to try its next member.
     #[error("upstream does not have this artifact")]
     NotFoundUpstream,
 
@@ -102,8 +125,11 @@ pub(crate) enum UpstreamPullError {
     /// (empty body, non-hex, wrong length). The serve-path falls through the
     /// preference list and only surfaces this once ALL THREE are exhausted with
     /// no valid digest — a corrupt stronger sidecar never blocks a valid floor
-    /// (design §8). The artifact is **unproxiable** per ADR 0006 — there is no
-    /// soft-fail / store-without-verify path. Wire to 502.
+    /// (design §8) — AND the artifact itself is there (or the upstream could
+    /// not say; see `classify_sidecar_exhaustion`). The bytes exist and
+    /// nothing can verify them, so the artifact is **unproxiable** per ADR
+    /// 0006 — there is no soft-fail / store-without-verify path. Wire to 502.
+    /// An upstream that has no sidecar *and* no artifact is a miss, not this.
     #[error("no usable upstream checksum sidecar (sha512/sha256/sha1 all absent or malformed)")]
     NoChecksumSidecar,
 
@@ -163,16 +189,72 @@ pub(crate) async fn try_upstream_maven_pull(
         return Err(UpstreamPullError::NoUpstreamMapping);
     };
 
-    // 2. Fetch the checksum sidecar, preferring strength. The first sidecar
+    // 2. Ask the cheap question first: does the upstream have this at all?
+    //    A checksum for a coordinate that is not there answers a question
+    //    nobody asked, and for a virtual repository a member that lacks a
+    //    coordinate is the normal case — so a miss must not cost the four
+    //    round trips the sidecar negotiation plus the exhaustion probe
+    //    spend proving it.
+    //
+    //    Matched exhaustively, with no wildcard: the only verdict that may
+    //    short-circuit is the upstream *stating* it does not have this, and
+    //    a fourth state would have to come here and say what it does.
+    //    `Unknown` — a 405, a 401, a 5xx, a timeout — is NOT a miss and
+    //    must fall through to the unchanged sequence below, which is what
+    //    keeps the answer right for every upstream that will not answer a
+    //    HEAD.
+    match ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .probe_artifact(mapping.clone(), artifact_path.to_string())
+        .await
+    {
+        UpstreamExistence::Absent => {
+            tracing::debug!(
+                artifact_path,
+                "Maven upstream does not carry this coordinate — a miss, in one round trip"
+            );
+            return Err(UpstreamPullError::NotFoundUpstream);
+        }
+        // The upstream has it: proceed to verification, which is a separate
+        // question this answer says nothing about (ADR 0006 is untouched —
+        // nothing is stored before a digest verifies the streamed bytes).
+        UpstreamExistence::Present => {}
+        // The upstream did not answer. Proceed exactly as if nothing had
+        // been asked; `classify_sidecar_exhaustion` below is the backstop
+        // that keeps a genuine miss a 404 on this path.
+        UpstreamExistence::Unknown => {
+            tracing::debug!(
+                artifact_path,
+                "Maven upstream did not answer the existence probe; \
+                 falling through to the full verified pull"
+            );
+        }
+    }
+
+    // 3. Fetch the checksum sidecar, preferring strength. The first sidecar
     //    that fetches AND parses to a VALID digest wins; a not-found, transport
     //    failure, OR a malformed body on a stronger digest falls through to the
     //    next (weaker) digest. Shape validation happens inside the loop so a
     //    corrupt `.sha512` never blocks a valid `.sha1` floor (design §8). All
-    //    three exhausted with no valid digest → NoChecksumSidecar (502).
+    //    three exhausted with no valid digest is not yet a verdict — the
+    //    classifier asks whether the upstream has the artifact at all before
+    //    choosing between "there but unverifiable" (502) and "absent" (404).
+    //    That classifier stays exactly as it is: the existence probe above
+    //    can only have returned `Present` or `Unknown` here, and under
+    //    `Unknown` the classifier is the only thing standing between a miss
+    //    and a 502.
     let (algorithm, upstream_checksum) =
-        fetch_strongest_sidecar(ctx, repo, &mapping, artifact_path).await?;
+        match fetch_strongest_sidecar(ctx, repo, &mapping, artifact_path).await {
+            Ok(sidecar) => sidecar,
+            Err(exhausted) => {
+                return Err(
+                    classify_sidecar_exhaustion(ctx, &mapping, artifact_path, exhausted).await,
+                )
+            }
+        };
 
-    // 3. Stream the artifact body and ingest_verified. The use case rehashes
+    // 4. Stream the artifact body and ingest_verified. The use case rehashes
     //    while streaming with the matching algorithm and returns Conflict on
     //    a mismatch — the security primitive against upstream tampering
     //    (ADR 0006). Coalesce the fetch + ingest so N parallel callers for
@@ -204,43 +286,47 @@ pub(crate) async fn try_upstream_maven_pull(
     let blob_upstream_checksum = upstream_checksum;
     let coalesce_blob_result = ctx
         .pull_dedup
-        .coalesce_blob(blob_dedup_key, move || async move {
-            let fetch = blob_proxy
-                .fetch_artifact(blob_mapping, blob_path)
-                .await
-                .map_err(AppError::from)?;
-            // The artifact response's `Last-Modified` ≈ upstream publish time
-            // for an immutable Maven release; best-effort, absent → None.
-            let upstream_published_at = fetch.last_modified;
-            let reader: Box<dyn AsyncRead + Send + Unpin> =
-                Box::new(StreamReader::new(fetch.stream));
-            let request = VerifiedIngestRequest::UpstreamPublished {
-                repository_id: blob_repo_id,
-                coords: blob_coords,
-                content_type,
-                actor: ApiActor {
-                    user_id: Uuid::nil(),
-                },
-                payload_metadata: serde_json::json!({
-                    "source": "maven_upstream_pull",
-                    "upstream_url": blob_upstream_url,
-                }),
-                upstream_checksum: blob_upstream_checksum,
-                upstream_published_at,
-                trust_upstream_publish_time: blob_trust_publish_time,
-            };
-            let outcome = blob_ingest
-                .ingest_verified(
-                    request,
-                    // A Maven artifact claims only its own content; the
-                    // primary-content edge is derived inside the ingest.
-                    &[],
-                    reader,
-                    &MavenFormatHandler,
-                )
-                .await?;
-            Ok(outcome.artifact.sha256_checksum)
-        })
+        .coalesce_blob_with_not_found_ttl(
+            blob_dedup_key,
+            not_found_ttl(&mapping),
+            move || async move {
+                let fetch = blob_proxy
+                    .fetch_artifact(blob_mapping, blob_path)
+                    .await
+                    .map_err(AppError::from)?;
+                // The artifact response's `Last-Modified` ≈ upstream publish time
+                // for an immutable Maven release; best-effort, absent → None.
+                let upstream_published_at = fetch.last_modified;
+                let reader: Box<dyn AsyncRead + Send + Unpin> =
+                    Box::new(StreamReader::new(fetch.stream));
+                let request = VerifiedIngestRequest::UpstreamPublished {
+                    repository_id: blob_repo_id,
+                    coords: blob_coords,
+                    content_type,
+                    actor: ApiActor {
+                        user_id: Uuid::nil(),
+                    },
+                    payload_metadata: serde_json::json!({
+                        "source": "maven_upstream_pull",
+                        "upstream_url": blob_upstream_url,
+                    }),
+                    upstream_checksum: blob_upstream_checksum,
+                    upstream_published_at,
+                    trust_upstream_publish_time: blob_trust_publish_time,
+                };
+                let outcome = blob_ingest
+                    .ingest_verified(
+                        request,
+                        // A Maven artifact claims only its own content; the
+                        // primary-content edge is derived inside the ingest.
+                        &[],
+                        reader,
+                        &MavenFormatHandler,
+                    )
+                    .await?;
+                Ok(outcome.artifact.sha256_checksum)
+            },
+        )
         .await;
 
     let content_hash = match coalesce_blob_result {
@@ -348,17 +434,20 @@ pub(crate) async fn try_upstream_maven_pull(
 /// matching-malicious `.sha512`, so forcing a downgrade is not a new attack.
 ///
 /// Returns `(HashAlgorithm, UpstreamPublishedChecksum)` (already shape-checked)
-/// on the first hit. Returns [`UpstreamPullError::NoChecksumSidecar`] only when
-/// ALL THREE are exhausted with no valid digest — the artifact is unproxiable
-/// per ADR 0006 (no soft-fail). A genuine checksum *mismatch* (artifact bytes ≠
-/// a valid sidecar digest) is detected later, by `ingest_verified`, and stays
-/// its own [`UpstreamPullError::ChecksumMismatch`] (502) path.
+/// on the first hit, and [`SidecarsExhausted`] when ALL THREE are exhausted
+/// with no valid digest. Exhaustion is **not** itself a verdict: this function
+/// is about sidecars, and whether the exhaustion means "there but
+/// unverifiable" or "absent" turns on a fact it never fetches, so
+/// [`classify_sidecar_exhaustion`] owns that decision. A genuine checksum
+/// *mismatch* (artifact bytes ≠ a valid sidecar digest) is detected later, by
+/// `ingest_verified`, and stays its own
+/// [`UpstreamPullError::ChecksumMismatch`] (502) path.
 async fn fetch_strongest_sidecar(
     ctx: &Arc<AppContext>,
     repo: &Repository,
     mapping: &hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping,
     artifact_path: &str,
-) -> Result<(HashAlgorithm, UpstreamPublishedChecksum), UpstreamPullError> {
+) -> Result<(HashAlgorithm, UpstreamPublishedChecksum), SidecarsExhausted> {
     for (algorithm, ext) in SIDECAR_PREFERENCE {
         let sidecar_path = format!("{artifact_path}.{ext}");
         match fetch_sidecar_body(ctx, repo, mapping, &sidecar_path).await {
@@ -385,7 +474,8 @@ async fn fetch_strongest_sidecar(
             },
             // Not-found (or any fetch failure) on this digest → fall through
             // to the next (weaker) digest. The floor `.sha1` exhausting the
-            // loop is the genuine "unproxiable" case.
+            // loop is what `classify_sidecar_exhaustion` then has to tell
+            // apart from the artifact not being there at all.
             Err(SidecarFetchError::Unavailable(msg)) => {
                 tracing::debug!(
                     algorithm = ext,
@@ -395,11 +485,100 @@ async fn fetch_strongest_sidecar(
             }
         }
     }
-    tracing::warn!(
+    tracing::debug!(
         artifact_path,
-        "Maven upstream publishes no usable sha512/sha256/sha1 sidecar — unproxiable (ADR 0006)"
+        "Maven upstream publishes no usable sha512/sha256/sha1 sidecar; classifying the exhaustion"
     );
-    Err(UpstreamPullError::NoChecksumSidecar)
+    Err(SidecarsExhausted)
+}
+
+/// [`fetch_strongest_sidecar`] fell off the end of the preference list with no
+/// usable digest.
+///
+/// Deliberately **not** an [`UpstreamPullError`]: on its own the exhaustion
+/// names no failure, and the one thing that can turn it into one is
+/// [`classify_sidecar_exhaustion`]. There is no `From` impl, so a later `?` at
+/// the call site cannot quietly route it back to a 502.
+struct SidecarsExhausted;
+
+/// Classify a sidecar exhaustion by asking the one question the sidecar leg
+/// never asks: does the upstream have this artifact at all?
+///
+/// - **the artifact fetch 404s → [`UpstreamPullError::NotFoundUpstream`]
+///   (404).** The upstream does not carry this coordinate, and "no usable
+///   sidecar" was a symptom of that rather than a refusal. This is the half
+///   that matters beyond one repository: a virtual repository reads a 404 from
+///   a member as "absent here" and continues its walk, and aborts on anything
+///   else — so answering 502 for a plain miss stops the walk at the first
+///   member whose upstream lacks the coordinate. For a virtual that mixes a
+///   release upstream with a snapshot upstream — the ordinary Maven topology —
+///   that is every snapshot request, under any member ordering.
+/// - **the artifact fetch succeeds → [`UpstreamPullError::NoChecksumSidecar`]
+///   (502).** ADR 0006's genuine unproxiable case: the bytes are there and
+///   nothing published can verify them, so hort refuses rather than storing
+///   unverified content.
+/// - **anything else → [`UpstreamPullError::NoChecksumSidecar`] (502)**, the
+///   answer this path has always given. Only a *proven* miss reclassifies; an
+///   upstream that could not say (5xx, network, timeout, an error carrying no
+///   classification at all) keeps the refusal, which is the stricter of the
+///   two answers.
+///
+/// The not-found question is put to the upstream port's own error vocabulary
+/// (`UpstreamErrorKind::from_domain_error`, the single decoder for the
+/// sentinel the adapter encodes) rather than to the rendered message — the
+/// typed `DomainError` is still in hand here, unlike at the post-coalesce
+/// artifact-leg arm, which only ever sees a stringified `AppError`.
+///
+/// The probe costs one upstream request and stores nothing: `fetch_artifact`
+/// returns at the response headers with the body unread, so the
+/// `ArtifactFetch` dropped here transfers no payload. It deliberately does
+/// **not** go through `PullDedup` — the artifact-body leg's window carries a
+/// verified `ContentHash` that followers adopt without fetching, and a probe
+/// has no verified bytes to contribute to one.
+async fn classify_sidecar_exhaustion(
+    ctx: &Arc<AppContext>,
+    mapping: &hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping,
+    artifact_path: &str,
+    _exhausted: SidecarsExhausted,
+) -> UpstreamPullError {
+    match ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .fetch_artifact(mapping.clone(), artifact_path.to_string())
+        .await
+    {
+        // Dropped unread — the headers answered the question, and the body is
+        // never pulled over the wire.
+        Ok(_unread) => {
+            tracing::warn!(
+                artifact_path,
+                "Maven upstream has the artifact but publishes no usable \
+                 sha512/sha256/sha1 sidecar — unproxiable (ADR 0006)"
+            );
+            UpstreamPullError::NoChecksumSidecar
+        }
+        Err(e)
+            if matches!(
+                UpstreamErrorKind::from_domain_error(&e),
+                Some(UpstreamErrorKind::NotFound)
+            ) =>
+        {
+            tracing::debug!(
+                artifact_path,
+                "Maven upstream has neither a usable sidecar nor the artifact — a miss"
+            );
+            UpstreamPullError::NotFoundUpstream
+        }
+        Err(e) => {
+            tracing::warn!(
+                artifact_path,
+                error = %e,
+                "Maven upstream publishes no usable sidecar and could not say whether the \
+                 artifact exists — treated as unproxiable (ADR 0006)"
+            );
+            UpstreamPullError::NoChecksumSidecar
+        }
+    }
 }
 
 /// Parse a fetched sidecar body into a shape-validated
@@ -421,7 +600,8 @@ fn parse_and_validate(
 /// A single sidecar fetch failed — every failure mode (404, 5xx, network)
 /// collapses to one variant because the negotiation treats them all as "this
 /// digest is unavailable, try the next". The floor exhausting the loop is the
-/// only place a fetch failure becomes terminal (→ `NoChecksumSidecar`).
+/// only place a fetch failure leaves the loop at all, as
+/// [`SidecarsExhausted`].
 enum SidecarFetchError {
     Unavailable(String),
 }
@@ -445,36 +625,43 @@ async fn fetch_sidecar_body(
         .upstream_proxy
         .for_format(&crate::UPSTREAM_PROXY_FORMAT)
         .clone();
+    // Read the override off the resolved mapping BEFORE the clone the
+    // closure consumes.
+    let sidecar_not_found_ttl = not_found_ttl(mapping);
     let mapping = mapping.clone();
     let path = sidecar_path.to_string();
     let bytes = ctx
         .pull_dedup
-        .coalesce_metadata(dedup_key, move || async move {
-            let outcome = proxy
-                .fetch_metadata(mapping, path, Vec::new())
+        .coalesce_metadata_with_not_found_ttl(
+            dedup_key,
+            sidecar_not_found_ttl,
+            move || async move {
+                let outcome = proxy
+                    .fetch_metadata(mapping, path, Vec::new())
+                    .await
+                    .map_err(AppError::from)?;
+                let handle = outcome.cache_handle.as_ref().ok_or_else(|| {
+                    AppError::from(DomainError::Invariant(
+                        "maven sidecar fetch_metadata returned no cache_handle".to_string(),
+                    ))
+                })?;
+                // A sidecar is a bare digest line — no per-format projection.
+                let body = hort_app::project::project_cached(
+                    handle,
+                    hort_domain::ports::upstream_proxy::IdentityProjector,
+                )
                 .await
                 .map_err(AppError::from)?;
-            let handle = outcome.cache_handle.as_ref().ok_or_else(|| {
-                AppError::from(DomainError::Invariant(
-                    "maven sidecar fetch_metadata returned no cache_handle".to_string(),
-                ))
-            })?;
-            // A sidecar is a bare digest line — no per-format projection.
-            let body = hort_app::project::project_cached(
-                handle,
-                hort_domain::ports::upstream_proxy::IdentityProjector,
-            )
-            .await
-            .map_err(AppError::from)?;
-            if let Err(e) = tokio::fs::remove_file(&handle.path).await {
-                tracing::debug!(
-                    path = %handle.path.display(),
-                    error = %e,
-                    "maven sidecar tempfile cleanup failed (non-fatal)"
-                );
-            }
-            Ok(Bytes::from(body))
-        })
+                if let Err(e) = tokio::fs::remove_file(&handle.path).await {
+                    tracing::debug!(
+                        path = %handle.path.display(),
+                        error = %e,
+                        "maven sidecar tempfile cleanup failed (non-fatal)"
+                    );
+                }
+                Ok(Bytes::from(body))
+            },
+        )
         .await
         .map_err(|e| SidecarFetchError::Unavailable(e.to_string()))?;
 
@@ -482,6 +669,29 @@ async fn fetch_sidecar_body(
     // a non-UTF-8 sidecar parses to no valid hex token and fails downstream
     // as a ParseError, never a silent skip.
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The negative-cache TTL this upstream declares for a `404`, as the
+/// `Option<Duration>` override `PullDedup`'s coalesce entry points
+/// take. `None` — the mapping omitting `not_found_cache_seconds` — is
+/// the deployment-wide `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`.
+///
+/// Read here rather than inside `PullDedup` because the Maven pull has
+/// already resolved the mapping before it fetches anything, so the
+/// caller holds the value: giving `PullDedup` a port to look mappings
+/// up itself would add a dependency plus an invalidation problem on
+/// gitops apply for a value that is already in hand.
+///
+/// Both of the Maven pull's coalesce legs pass it — the sidecar
+/// metadata fetch and the artifact body — because a coordinate this
+/// upstream does not carry 404s on both, and a sidecar miss is the
+/// usual shape of that (`classify_sidecar_exhaustion`).
+fn not_found_ttl(
+    mapping: &hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping,
+) -> Option<std::time::Duration> {
+    mapping
+        .not_found_cache_seconds
+        .map(|secs| std::time::Duration::from_secs(u64::from(secs)))
 }
 
 /// Choose the coalescing key for the artifact-body leg, from the algorithm
@@ -665,6 +875,17 @@ mod tests {
     /// `seed_mapping` with the upstream named explicitly, for the tests that
     /// need two repositories pointing at two DIFFERENT origins.
     fn seed_mapping_at(mocks: &MockPorts, repo_id: Uuid, upstream_url: &str) -> Uuid {
+        seed_mapping_with_ttl(mocks, repo_id, upstream_url, None)
+    }
+
+    /// `seed_mapping_at` with the per-upstream not-found TTL declared,
+    /// for the tests that measure it.
+    fn seed_mapping_with_ttl(
+        mocks: &MockPorts,
+        repo_id: Uuid,
+        upstream_url: &str,
+        not_found_cache_seconds: Option<u32>,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         let now = Utc::now();
         mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
@@ -684,6 +905,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds,
             created_at: now,
             updated_at: now,
         });
@@ -868,6 +1090,327 @@ mod tests {
             matches!(err, UpstreamPullError::NoChecksumSidecar),
             "expected NoChecksumSidecar, got {err:?}"
         );
+    }
+
+    // ---- Branch: sidecars exhausted AND the artifact absent → 404 ----------
+    //
+    // The exhaustion is classified rather than assumed: with nothing at all
+    // seeded upstream, the probe's 404 says the upstream does not carry this
+    // coordinate, so the pull is a miss. The 502 it used to answer made a
+    // miss indistinguishable from "the bytes are here and cannot be verified"
+    // — and a virtual repository, which continues its walk on a 404 and
+    // aborts on anything else, stopped at the first member whose upstream
+    // lacks the coordinate.
+
+    #[tokio::test]
+    async fn all_sidecars_absent_and_artifact_absent_returns_not_found_upstream() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_maven_repo("maven-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        // Nothing seeded: no sidecar AND no artifact body.
+        let err = try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::NotFoundUpstream),
+            "an upstream with neither a sidecar nor the artifact is a miss, got {err:?}"
+        );
+        assert_eq!(
+            map_upstream_pull_error(&err).status(),
+            StatusCode::NOT_FOUND,
+            "and it must reach the client as the same 404 the metadata path answers"
+        );
+    }
+
+    // ---- …and a malformed body is not a miss either, unless the file is gone -
+    //
+    // The malformed-sidecar fall-through reaches the same exhaustion, so it
+    // takes the same classification: present sidecars that parse to nothing
+    // plus an absent artifact is still an absent artifact.
+
+    #[tokio::test]
+    async fn all_present_sidecars_malformed_and_artifact_absent_returns_not_found_upstream() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_maven_repo("maven-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        // Every sidecar fetches and none parses; the artifact body is NOT
+        // seeded.
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{ARTIFACT_PATH}.sha512"),
+            b"   \n".to_vec(),
+        );
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{ARTIFACT_PATH}.sha256"),
+            b"not-a-valid-digest".to_vec(),
+        );
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{ARTIFACT_PATH}.sha1"),
+            b"deadbeef".to_vec(),
+        );
+
+        let err = try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::NotFoundUpstream),
+            "expected NotFoundUpstream, got {err:?}"
+        );
+    }
+
+    // ---- Branch: the probe cannot answer → the refusal stands --------------
+    //
+    // Only a PROVEN miss reclassifies. An upstream that answered the probe
+    // with a 5xx has not said the coordinate is absent, and treating it as
+    // absent would let a virtual repository walk past a member that may well
+    // hold the artifact — so the exhaustion keeps its 502.
+
+    #[tokio::test]
+    async fn sidecars_absent_and_probe_cannot_answer_returns_no_checksum_sidecar() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_maven_repo("maven-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        // No sidecar and no artifact fixture, but the probe — the only
+        // `fetch_artifact` call this path makes — fails with a classified
+        // 5xx instead of the mock's default not-found.
+        mocks.upstream_proxy.fail_next_artifact_with(
+            UpstreamErrorKind::Upstream5xx.into_domain_error("origin 503"),
+        );
+
+        let err = try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::NoChecksumSidecar),
+            "an upstream that could not say must keep the refusal, got {err:?}"
+        );
+    }
+
+    // ---- Existence first: the cost of each of the three answers ----------
+    //
+    // The verdicts are asserted here as REQUEST COUNTS, not only as
+    // statuses. A status-only test passes against the four-round-trip
+    // behaviour this unit exists to remove, so it would hide the regression
+    // it was written to catch. The mock counts each leg separately
+    // (`probe_calls` / `metadata_calls` / `artifact_calls`) so a test can
+    // say which requests were spent, not merely how many.
+
+    /// **`Absent` short-circuits, and a miss costs ONE upstream request.**
+    ///
+    /// Before this unit, the same miss cost four: `.sha512` 404 →
+    /// `.sha256` 404 → `.sha1` 404 → the exhaustion classifier's probe.
+    /// For a virtual repository over N members where only the last holds
+    /// the artifact, that was 4·(N−1) requests to walk the misses instead
+    /// of (N−1) — and for a virtual, a member that lacks a coordinate is
+    /// the normal case rather than the exception.
+    #[tokio::test]
+    async fn absent_upstream_is_a_miss_in_exactly_one_request() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_maven_repo("maven-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        // The upstream states, cleanly, that it does not carry this.
+        mocks
+            .upstream_proxy
+            .insert_existence("", ARTIFACT_PATH, UpstreamExistence::Absent);
+
+        let err = try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::NotFoundUpstream),
+            "a coordinate the upstream states it lacks is a miss, got {err:?}"
+        );
+        assert_eq!(
+            map_upstream_pull_error(&err).status(),
+            StatusCode::NOT_FOUND,
+            "and it reaches the client as a 404, which is what lets a virtual walk on"
+        );
+
+        // The cost, leg by leg. The sidecar negotiation and the exhaustion
+        // classifier must not have run at all: asking for a checksum of
+        // something the upstream just said it does not have answers a
+        // question nobody asked.
+        assert_eq!(mocks.upstream_proxy.probe_calls(), 1, "one existence probe");
+        assert_eq!(
+            mocks.upstream_proxy.metadata_calls(),
+            0,
+            "no sidecar may be fetched for a coordinate the upstream lacks"
+        );
+        assert_eq!(
+            mocks.upstream_proxy.artifact_calls(),
+            0,
+            "and the exhaustion classifier's artifact probe must not run either"
+        );
+    }
+
+    /// **`Present` costs exactly one more request than before, and the
+    /// happy path is otherwise unchanged.**
+    ///
+    /// Stated as two separate assertions rather than one total, because
+    /// "one more" is a claim about *which* legs ran: the two content legs
+    /// that existed before this unit run exactly once each, and the single
+    /// added leg is the probe. A total of three would also be satisfied by
+    /// a flow that dropped a sidecar fetch and gained two probes.
+    #[tokio::test]
+    async fn present_adds_exactly_one_request_to_the_sidecar_path() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_maven_repo("maven-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        let body = b"the actual jar body".to_vec();
+        mocks
+            .upstream_proxy
+            .insert_existence("", ARTIFACT_PATH, UpstreamExistence::Present);
+        // The strongest sidecar resolves first, so the negotiation makes
+        // exactly one metadata request — the shape that isolates the
+        // probe's cost from the fall-through's.
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{ARTIFACT_PATH}.sha512"),
+            sha512_hex(&body).into_bytes(),
+        );
+        mocks
+            .upstream_proxy
+            .insert_artifact("", ARTIFACT_PATH, body.clone());
+
+        let artifact =
+            try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+                .await
+                .expect("a present artifact with a valid sha512 must verify + ingest");
+        // Byte-for-byte the same outcome: SHA-256 CAS key over the streamed
+        // bytes, from the sidecar-verified transfer. Existence is not
+        // verification and nothing here is verified by the probe.
+        assert_eq!(artifact.sha256_checksum.as_ref(), sha256_hex(&body));
+
+        assert_eq!(
+            mocks.upstream_proxy.metadata_calls(),
+            1,
+            "the sidecar leg is unchanged: one fetch, the strongest digest"
+        );
+        assert_eq!(
+            mocks.upstream_proxy.artifact_calls(),
+            1,
+            "the body leg is unchanged: one streamed fetch"
+        );
+        assert_eq!(
+            mocks.upstream_proxy.probe_calls(),
+            1,
+            "and the probe is the one request this unit adds"
+        );
+    }
+
+    /// **A `405` is not a miss.** The regression this unit could introduce,
+    /// at the pull level: an upstream that refuses HEAD answers `Unknown`,
+    /// and `Unknown` must reproduce the previous behaviour exactly rather
+    /// than short-circuit to a 404. Here the artifact IS there and no
+    /// sidecar can verify it, so the honest answer is the ADR 0006 refusal
+    /// — the same `502` this path has always given.
+    ///
+    /// Had `405` been folded into `Absent`, this would answer 404 and hort
+    /// would deny content it holds a working path to — the inverse of the
+    /// defect that made a plain miss a 502, and worse than it, because a
+    /// refusal at least stops a virtual repository from serving the wrong
+    /// answer.
+    #[tokio::test]
+    async fn probe_405_is_unknown_and_keeps_the_unverifiable_refusal() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_maven_repo("maven-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        // What a `405 Method Not Allowed` (or a 401, a 5xx, a timeout)
+        // reaches this layer as — the upstream did not answer the question.
+        mocks
+            .upstream_proxy
+            .insert_existence("", ARTIFACT_PATH, UpstreamExistence::Unknown);
+        // The bytes are there; nothing published can verify them.
+        mocks
+            .upstream_proxy
+            .insert_artifact("", ARTIFACT_PATH, b"unverifiable".to_vec());
+
+        let err = try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::NoChecksumSidecar),
+            "an upstream that would not answer HEAD must keep the refusal, got {err:?}"
+        );
+        assert_ne!(
+            map_upstream_pull_error(&err).status(),
+            StatusCode::NOT_FOUND,
+            "an unanswered question must never be rendered as a miss"
+        );
+
+        // The full previous sequence ran: all three sidecars, then the
+        // exhaustion classifier's artifact probe.
+        assert_eq!(mocks.upstream_proxy.probe_calls(), 1);
+        assert_eq!(
+            mocks.upstream_proxy.metadata_calls(),
+            3,
+            "all three sidecars are still tried under Unknown"
+        );
+        assert_eq!(
+            mocks.upstream_proxy.artifact_calls(),
+            1,
+            "and the exhaustion classifier still asks its own question"
+        );
+    }
+
+    /// …and under `Unknown` the `classify_sidecar_exhaustion` backstop is
+    /// still what keeps a genuine miss a 404.
+    ///
+    /// This is the half that would break if the classifier were deleted as
+    /// redundant now that existence is asked first: for every upstream that
+    /// will not answer a HEAD — which is the population the classifier was
+    /// written for — the probe says nothing, and the classifier is the only
+    /// thing standing between a plain miss and a `502` that aborts a
+    /// virtual repository's walk.
+    #[tokio::test]
+    async fn probe_unknown_still_reaches_the_exhaustion_classifier_for_a_real_miss() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_maven_repo("maven-mirror");
+        mocks.repositories.insert(repo.clone());
+        seed_mapping(&mocks, repo.id);
+
+        // The upstream refuses to answer the cheap question, and in fact
+        // carries neither a sidecar nor the artifact.
+        mocks
+            .upstream_proxy
+            .insert_existence("", ARTIFACT_PATH, UpstreamExistence::Unknown);
+
+        let err = try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, UpstreamPullError::NotFoundUpstream),
+            "the exhaustion classifier must still turn a proven miss into a 404, got {err:?}"
+        );
+        assert_eq!(
+            map_upstream_pull_error(&err).status(),
+            StatusCode::NOT_FOUND
+        );
+        // The expensive path, in full — which is the price of an upstream
+        // that will not answer HEAD, and exactly what it cost before.
+        assert_eq!(mocks.upstream_proxy.probe_calls(), 1);
+        assert_eq!(mocks.upstream_proxy.metadata_calls(), 3);
+        assert_eq!(mocks.upstream_proxy.artifact_calls(), 1);
     }
 
     // ---- Branch: malformed stronger sidecar falls through to a valid floor --
@@ -1152,6 +1695,111 @@ mod tests {
     }
 
     // ---- The key shapes the two paths produce ------------------------------
+
+    // ---- The per-upstream not-found TTL reaches BOTH coalesce legs ---------
+    //
+    // `not_found_ttl` is passed at the sidecar metadata leg and at the
+    // artifact-body leg. The two are separate `PullDedup` entry points,
+    // and the window each writes is read back out of the store rather
+    // than inferred from the mapping, so a leg that dropped the
+    // override reports the 30 s deployment default here.
+
+    /// Seconds from now that the negative-cache record at `key` expires.
+    async fn negative_cache_window(ctx: &Arc<AppContext>, key: &DedupKey) -> u64 {
+        let bytes = ctx
+            .ephemeral_evictable
+            .get(key.serialised_for_test())
+            .await
+            .expect("the negative-cache read must succeed")
+            .expect("a miss must leave a negative-cache record");
+        let record: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("the stored record is JSON");
+        assert_eq!(record["kind"], "failed", "got {record}");
+        assert_eq!(record["upstream_kind"], "not_found", "got {record}");
+        let expires_at = record["expires_at"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no expires_at in {record}"));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_secs();
+        expires_at.saturating_sub(now)
+    }
+
+    /// The artifact-body leg: the sidecar resolves, the body 404s, and
+    /// the blob window must carry the declared hour. Contrasted against
+    /// the same pull on a mapping that declares nothing, which must
+    /// carry the deployment default.
+    #[tokio::test]
+    async fn per_upstream_not_found_ttl_reaches_the_artifact_body_leg() {
+        for (declared, expected_secs, label) in [
+            (Some(3600u32), 3600u64, "per-upstream hour"),
+            (None, 30u64, "deployment default"),
+        ] {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = proxy_maven_repo("maven-mirror");
+            mocks.repositories.insert(repo.clone());
+            seed_mapping_with_ttl(&mocks, repo.id, "https://repo1.maven.org/maven2", declared);
+
+            // Sidecar present, body absent — the artifact leg is the one
+            // that 404s, so the window measured below is the blob leg's.
+            let declared_hex = sha256_hex(b"bytes the upstream no longer serves");
+            mocks.upstream_proxy.insert_metadata(
+                "",
+                &format!("{ARTIFACT_PATH}.sha256"),
+                declared_hex.clone().into_bytes(),
+            );
+
+            let err =
+                try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(err, UpstreamPullError::NotFoundUpstream),
+                "{label}: expected NotFoundUpstream, got {err:?}"
+            );
+
+            let checksum =
+                UpstreamPublishedChecksum::new(HashAlgorithm::Sha256, declared_hex).unwrap();
+            let key = blob_dedup_key(HashAlgorithm::Sha256, &checksum, repo.id, ARTIFACT_PATH);
+            let window = negative_cache_window(&ctx, &key).await;
+            assert!(
+                window.abs_diff(expected_secs) <= 5,
+                "{label}: the artifact leg's window must be ~{expected_secs}s, got {window}s"
+            );
+        }
+    }
+
+    /// The sidecar metadata leg: nothing upstream at all, so `.sha512`
+    /// is the first fetch and the first miss.
+    #[tokio::test]
+    async fn per_upstream_not_found_ttl_reaches_the_sidecar_metadata_leg() {
+        for (declared, expected_secs, label) in [
+            (Some(3600u32), 3600u64, "per-upstream hour"),
+            (None, 30u64, "deployment default"),
+        ] {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = proxy_maven_repo("maven-mirror");
+            mocks.repositories.insert(repo.clone());
+            seed_mapping_with_ttl(&mocks, repo.id, "https://repo1.maven.org/maven2", declared);
+
+            let err =
+                try_upstream_maven_pull(&ctx, &repo, &coords_for(ARTIFACT_PATH), ARTIFACT_PATH)
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(err, UpstreamPullError::NotFoundUpstream),
+                "{label}: a coordinate with neither sidecar nor body is a miss, got {err:?}"
+            );
+
+            let key = DedupKey::metadata("maven", repo.id, &format!("{ARTIFACT_PATH}.sha512"));
+            let window = negative_cache_window(&ctx, &key).await;
+            assert!(
+                window.abs_diff(expected_secs) <= 5,
+                "{label}: the sidecar leg's window must be ~{expected_secs}s, got {window}s"
+            );
+        }
+    }
 
     #[test]
     fn blob_dedup_key_uses_the_cross_format_sentinel_only_for_strong_digests() {

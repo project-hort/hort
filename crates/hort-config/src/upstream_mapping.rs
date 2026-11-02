@@ -32,6 +32,10 @@
 //!                                     # exchange. Bare hostnames; the
 //!                                     # mapping's own origin is always
 //!                                     # allowed and is never listed.
+//!   # notFoundCacheSeconds: 3600      # how long a 404 from THIS
+//!                                     # upstream stays negative-cached.
+//!                                     # Omitted = the deployment's
+//!                                     # HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS.
 //! ```
 //!
 //! # Identity
@@ -44,7 +48,9 @@
 
 use std::path::Path;
 
-use hort_domain::ports::repository_upstream_mapping_repository::allowed_realm_host_reason;
+use hort_domain::ports::repository_upstream_mapping_repository::{
+    allowed_realm_host_reason, not_found_cache_seconds_reason,
+};
 use hort_domain::ports::secret_port::SecretRef;
 use serde::{Deserialize, Serialize};
 
@@ -182,6 +188,27 @@ pub struct UpstreamMappingSpec {
     /// a secret is added, so the field is conditional, not inert.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_realm_hosts: Vec<String>,
+    /// How long a `404` from this upstream stays negative-cached, in
+    /// seconds. Omitted — the default — means the deployment-wide
+    /// `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`.
+    ///
+    /// Absence is a property of the upstream rather than of the
+    /// deployment: a release upstream never gains a coordinate it
+    /// refused, so a long TTL is free there, while a snapshot upstream
+    /// gains coordinates constantly and the same long TTL would answer
+    /// `404` for a snapshot that has since been published. One
+    /// deployment-wide number cannot be right for both, and a virtual
+    /// repository routinely mixes them.
+    ///
+    /// Zero is **rejected at apply time** by
+    /// [`validate_not_found_cache_seconds`] rather than accepted: a
+    /// zero TTL re-fetches on every retry within the negative-cache
+    /// window, defeating the coalescing benefit on 404 storms. The
+    /// rule is the domain's own `not_found_cache_seconds_reason`, which
+    /// the value-object constructor calls too, so the apply-time
+    /// rejection and the invariant cannot drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_found_cache_seconds: Option<u32>,
 }
 
 /// `serde(skip_serializing_if)` predicate for the default-`false`
@@ -427,6 +454,50 @@ fn validate_allowed_realm_hosts(spec: &UpstreamMappingSpec, name: &str) -> Vec<V
     errors
 }
 
+/// Gitops-side validation of
+/// [`UpstreamMappingSpec::not_found_cache_seconds`] — the per-upstream
+/// negative-cache TTL for a `404`.
+///
+/// Unlike the sibling mirrors beside it ([`validate_tls_material`],
+/// [`validate_upstream_name_prefix`]) this is **not** a hand-maintained
+/// copy: it calls the domain's own `not_found_cache_seconds_reason`,
+/// the same function `RepositoryUpstreamMapping::new` calls, exactly as
+/// [`validate_allowed_realm_hosts`] shares
+/// `allowed_realm_host_reason`. There is therefore no drift surface to
+/// hold closed with an agreement corpus.
+///
+/// The rejection this row exists for is `0`. An accepted zero would be
+/// *enforced* — a zero-second negative-cache window — and what the
+/// operator would get is a re-fetch on every retry inside the window,
+/// i.e. the coalescing loss the window exists to prevent, not the
+/// "disable negative caching" they asked for. The deployment knob
+/// refuses `0` for that reason and this field inherits it rather than
+/// inventing a second answer.
+///
+/// Pre-write by construction, the same argument
+/// [`validate_tls_material`] makes beside it: the value is decidable
+/// from this one envelope, so per-spec validation is the earliest place
+/// the verdict exists and the only one provably before the bundle's
+/// first write. A rejection reachable only in the value-object
+/// constructor lands in the apply's third stage, after the repository
+/// and policy rows of the same bundle have committed.
+fn validate_not_found_cache_seconds(
+    spec: &UpstreamMappingSpec,
+    name: &str,
+) -> Vec<ValidationError> {
+    let Some(seconds) = spec.not_found_cache_seconds else {
+        return Vec::new();
+    };
+    match not_found_cache_seconds_reason(seconds) {
+        None => Vec::new(),
+        Some(reason) => vec![ValidationError::Invalid {
+            kind: Kind::UpstreamMapping,
+            name: name.to_string(),
+            detail: format!("spec.notFoundCacheSeconds {reason}"),
+        }],
+    }
+}
+
 /// Per-spec validation. Returns every violation rather than first-wins.
 pub fn validate_upstream_mapping(env: &Envelope<UpstreamMappingSpec>) -> Vec<ValidationError> {
     let mut errors = Vec::new();
@@ -526,6 +597,11 @@ pub fn validate_upstream_mapping(env: &Envelope<UpstreamMappingSpec>) -> Vec<Val
     // the earliest place the verdict exists and the only one that is
     // provably before the first write of the bundle.
     errors.extend(validate_allowed_realm_hosts(&env.spec, &name));
+
+    // Per-upstream negative-cache TTL — same pre-write reasoning
+    // again, and the rule itself is the domain's, called rather than
+    // restated.
+    errors.extend(validate_not_found_cache_seconds(&env.spec, &name));
 
     let auth_type = env.spec.auth.r#type.as_str();
     if !AUTH_VARIANTS.contains(&auth_type) {
@@ -947,6 +1023,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
         };
         let yaml_out = serde_saphyr::to_string(&spec).expect("default spec must serialise to YAML");
         assert!(
@@ -1556,6 +1633,138 @@ spec:
             assert_eq!(
                 validator_rejects, domain_rejects,
                 "the two must agree on `{host}`"
+            );
+        }
+    }
+
+    // -- `notFoundCacheSeconds` ----------------------------------------
+    //
+    // The per-upstream negative-cache TTL for a `404`. Omitted is the
+    // default and means the deployment-wide
+    // `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`; a present value must be a
+    // positive number of seconds the `integer` column can hold. The
+    // rule is the domain's `not_found_cache_seconds_reason`, called
+    // rather than restated.
+
+    fn not_found_ttl_yaml(value: Option<&str>) -> String {
+        let field = match value {
+            None => String::new(),
+            Some(v) => format!("\n  notFoundCacheSeconds: {v}"),
+        };
+        format!(
+            "
+  repository: r
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous{field}
+"
+        )
+    }
+
+    #[test]
+    fn not_found_cache_seconds_defaults_to_none_and_skips_serialisation() {
+        let env = parse_upstream_mapping(&p(), yaml("u", &not_found_ttl_yaml(None)).as_bytes())
+            .expect("the envelope must parse without the field");
+        assert_eq!(
+            env.spec.not_found_cache_seconds, None,
+            "omitted means the deployment default"
+        );
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "a mapping without the field must validate clean"
+        );
+        let out = serde_saphyr::to_string(&env.spec).expect("spec serialises");
+        assert!(
+            !out.contains("notFoundCacheSeconds"),
+            "the absent default must skip-serialize so an existing \
+             mapping's canonicalised digest does not flip; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_a_positive_not_found_cache_seconds() {
+        for v in ["1", "30", "3600", "86400", "2147483647"] {
+            let env =
+                parse_upstream_mapping(&p(), yaml("u", &not_found_ttl_yaml(Some(v))).as_bytes())
+                    .unwrap_or_else(|e| panic!("`{v}` must parse, got {e:?}"));
+            assert_eq!(
+                env.spec.not_found_cache_seconds,
+                Some(v.parse::<u32>().unwrap())
+            );
+            assert!(
+                validate_upstream_mapping(&env).is_empty(),
+                "`{v}` must validate clean"
+            );
+            let out = serde_saphyr::to_string(&env.spec).expect("spec serialises");
+            assert!(out.contains("notFoundCacheSeconds"), "got:\n{out}");
+        }
+    }
+
+    /// The rejection the field exists to make. An accepted zero would be
+    /// *enforced* — and what the operator would get is a re-fetch on
+    /// every retry inside the window, not the "no negative caching" they
+    /// asked for.
+    #[test]
+    fn validate_rejects_a_zero_not_found_cache_seconds() {
+        let env =
+            parse_upstream_mapping(&p(), yaml("u", &not_found_ttl_yaml(Some("0"))).as_bytes())
+                .expect("zero parses — the rejection is a validation verdict, not a parse error");
+        let errors = validate_upstream_mapping(&env);
+        let joined = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert_eq!(
+            errors.len(),
+            1,
+            "exactly one rejection, naming the field; got: {joined}"
+        );
+        assert!(
+            joined.contains("spec.notFoundCacheSeconds") && joined.contains("positive"),
+            "the message must name the field and the rule; got: {joined}"
+        );
+        assert!(
+            joined.contains("coalescing"),
+            "the message must say why zero is refused; got: {joined}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_not_found_cache_seconds_the_column_cannot_hold() {
+        let env = parse_upstream_mapping(
+            &p(),
+            yaml("u", &not_found_ttl_yaml(Some("2147483648"))).as_bytes(),
+        )
+        .expect("the value is within u32, so it parses");
+        let joined = validate_upstream_mapping(&env)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            joined.contains("spec.notFoundCacheSeconds") && joined.contains("integer"),
+            "got: {joined}"
+        );
+    }
+
+    /// Same property as the realm-host rule beside it: there is one
+    /// rule, so the validator and the value-object constructor cannot
+    /// disagree. Asserted over the boundary values rather than taken on
+    /// trust from the shared call.
+    #[test]
+    fn the_validator_and_the_constructor_share_one_not_found_ttl_rule() {
+        for v in ["0", "1", "30", "2147483647", "2147483648", "4294967295"] {
+            let env =
+                parse_upstream_mapping(&p(), yaml("u", &not_found_ttl_yaml(Some(v))).as_bytes())
+                    .unwrap_or_else(|e| panic!("`{v}` must parse, got {e:?}"));
+            let validator_rejects = validate_upstream_mapping(&env)
+                .iter()
+                .any(|e| e.to_string().contains("notFoundCacheSeconds"));
+            let domain_rejects = not_found_cache_seconds_reason(v.parse().unwrap()).is_some();
+            assert_eq!(
+                validator_rejects, domain_rejects,
+                "the two must agree on `{v}`"
             );
         }
     }

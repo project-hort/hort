@@ -109,7 +109,7 @@ use std::time::{Duration, Instant};
 
 use futures::TryStreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 
 use hort_app::metrics::{
@@ -125,7 +125,7 @@ use hort_domain::ports::repository_upstream_mapping_repository::{
 use hort_domain::ports::secret_port::{SecretPort, SecretRef, SecretSource, SecretValue};
 use hort_domain::ports::upstream_proxy::{
     ArtifactFetch, BlobFetch, BlobStream, ManifestFetchOutcome, MetadataFetchOutcome,
-    ReferrerDescriptor, UpstreamProxy,
+    ReferrerDescriptor, UpstreamExistence, UpstreamProxy,
 };
 use hort_domain::ports::BoxFuture;
 
@@ -455,6 +455,11 @@ const KIND_METADATA: &str = "metadata";
 const KIND_ARTIFACT: &str = "artifact";
 // OCI Referrers API fetch (ADR 0027).
 const KIND_REFERRERS: &str = "referrers";
+/// The HEAD existence probe (`UpstreamProxy::probe_artifact`). Its own
+/// `kind` value rather than `artifact`'s: a headers-only probe and a
+/// multi-megabyte body fetch share no latency distribution, and folding
+/// them into one histogram makes both unreadable.
+const KIND_EXISTS: &str = "exists";
 
 // The `METADATA_BODY_CAP_BYTES` and `MANIFEST_BODY_CAP_BYTES` constants
 // are retired. The cap was only load-bearing because the adapter was
@@ -2417,8 +2422,47 @@ fn secret_source_label(source: SecretSource) -> &'static str {
 // UpstreamProxy impl
 // ---------------------------------------------------------------------------
 
+/// The existence probe's outcome in two currencies.
+///
+/// `existence` is the three-state answer the port returns; `classified` is
+/// the same response rendered as the `DomainResult` every content leg
+/// produces, and it exists for one reason — so
+/// `hort_upstream_fetch_total` and `hort_upstream_tls_handshake_total`
+/// classify a probe exactly as they classify a GET, rather than growing a
+/// second taxonomy for the same statuses. The two are deliberately not one
+/// value: `classified` collapses `404` and `405` into neighbouring error
+/// kinds, which is fine for a metric label and is precisely the distinction
+/// `existence` must not lose.
+struct ProbeOutcome {
+    existence: UpstreamExistence,
+    classified: DomainResult<()>,
+}
+
 impl HttpUpstreamProxy {
-    /// Issue a GET that participates in the bearer-challenge flow.
+    /// Issue a GET that participates in the bearer-challenge flow, and
+    /// classify the outcome: a non-2xx becomes a classified `Err` via
+    /// [`classify_response`].
+    ///
+    /// This is the entry point every **content** leg uses — blob,
+    /// manifest, artifact, metadata, referrers — and its behaviour is
+    /// unchanged. The request itself (credential scope, client selection,
+    /// the challenge dance) is [`Self::send_with_challenge`]'s, which this
+    /// calls with [`Method::GET`] and whose doc comment carries the flow.
+    async fn fetch_with_challenge(
+        &self,
+        mapping: &RepositoryUpstreamMapping,
+        url: &str,
+        kind_label: &'static str,
+        extra_headers: &[(&'static str, String)],
+    ) -> DomainResult<reqwest::Response> {
+        let resp = self
+            .send_with_challenge(mapping, Method::GET, url, kind_label, extra_headers)
+            .await?;
+        classify_response(resp, kind_label)
+    }
+
+    /// Issue one request that participates in the bearer-challenge
+    /// flow, and hand the response back **unclassified**.
     ///
     /// `extra_headers` is applied on every attempt (e.g. `Accept`
     /// for manifest fetches). The closure rebuilds the request each
@@ -2440,8 +2484,8 @@ impl HttpUpstreamProxy {
     ///    `BearerChallenge`, Basic for `Basic`, none for
     ///    `Anonymous` — and none for a `ForeignOrigin` request).
     /// 2. Send. If !401 OR mapping is not `BearerChallenge` OR the
-    ///    request left the mapping's origin, return the response (or
-    ///    classify as error if !success).
+    ///    request left the mapping's origin, return the response as-is —
+    ///    status classification belongs to the caller.
     /// 3. On 401 + `BearerChallenge` + same origin: parse
     ///    `WWW-Authenticate`. On parse failure surface `Unauthorized`.
     ///    If we already had a cached token (auth.is_some()),
@@ -2487,9 +2531,29 @@ impl HttpUpstreamProxy {
     /// the realm's verdict) because there is nothing to carry: the
     /// predicate, the URL and the mapping are all in this frame, and a
     /// caller that cannot pass a client cannot pass the wrong one.
-    async fn fetch_with_challenge(
+    /// [`Self::fetch_with_challenge`] without the status classification:
+    /// the response is handed back **raw**, so a non-2xx arrives as
+    /// `Ok(resp)` rather than an `Err`.
+    ///
+    /// Everything that decides *what request to send* — the credential
+    /// scope, the per-mapping-vs-shared TLS client selection, the bearer
+    /// challenge dance and its at-most-one-round invariant — lives here,
+    /// which is why the existence probe goes through this function rather
+    /// than opening its own request. A second path to the upstream is a
+    /// second place for the credential and TLS decisions to diverge, and
+    /// that divergence is precisely the finding `credential_scope` closed.
+    ///
+    /// The raw response is what the probe needs and what a content fetch
+    /// must not have: `UpstreamExistence::from_http_status` distinguishes
+    /// `404` / `410` from `405` / `401` / `5xx`, a distinction
+    /// [`UpstreamErrorKind`] does not carry (`410` and `405` are both
+    /// `Upstream4xx`). Content legs keep going through
+    /// [`Self::fetch_with_challenge`], which applies
+    /// [`classify_response`] exactly as before.
+    async fn send_with_challenge(
         &self,
         mapping: &RepositoryUpstreamMapping,
+        method: Method,
         url: &str,
         kind_label: &'static str,
         extra_headers: &[(&'static str, String)],
@@ -2530,14 +2594,14 @@ impl HttpUpstreamProxy {
 
         let auth = self.authorization_header(mapping, scope).await?;
         let resp = self
-            .send_get(&client, url, extra_headers, auth.as_deref())
+            .send_request(&client, method.clone(), url, extra_headers, auth.as_deref())
             .await?;
 
         if resp.status() != StatusCode::UNAUTHORIZED
             || !matches!(mapping.upstream_auth, UpstreamAuth::BearerChallenge)
             || scope == CredentialScope::ForeignOrigin
         {
-            return classify_response(resp, kind_label);
+            return Ok(resp);
         }
 
         // 401 on a BearerChallenge mapping — run the challenge dance.
@@ -2755,7 +2819,13 @@ impl HttpUpstreamProxy {
         // Retry the original request once with the new bearer.
         let retry_auth = format!("Bearer {}", cached.token);
         let resp2 = self
-            .send_get(&client, url, extra_headers, Some(retry_auth.as_str()))
+            .send_request(
+                &client,
+                method,
+                url,
+                extra_headers,
+                Some(retry_auth.as_str()),
+            )
             .await?;
         if resp2.status() == StatusCode::UNAUTHORIZED {
             // At-most-one challenge round invariant.
@@ -2764,17 +2834,22 @@ impl HttpUpstreamProxy {
                 &format!("{kind_label} fetch returned 401 after re-exchange"),
             ));
         }
-        classify_response(resp2, kind_label)
+        Ok(resp2)
     }
 
-    async fn send_get(
+    /// Send one request with the resolved client, method, headers and
+    /// credential. The method is a parameter because the existence probe
+    /// asks with `HEAD` and every content leg asks with `GET`; nothing else
+    /// about the request differs, so nothing else is duplicated.
+    async fn send_request(
         &self,
         client: &Client,
+        method: Method,
         url: &str,
         extra_headers: &[(&'static str, String)],
         authorization: Option<&str>,
     ) -> DomainResult<reqwest::Response> {
-        let mut req = client.get(url);
+        let mut req = client.request(method, url);
         for (k, v) in extra_headers {
             req = req.header(*k, v);
         }
@@ -2910,6 +2985,98 @@ impl HttpUpstreamProxy {
             stream: Box::pin(stream),
             last_modified,
         })
+    }
+
+    /// Ask the upstream whether `path` is there, with a `HEAD` and
+    /// nothing else — the implementation of
+    /// [`UpstreamProxy::probe_artifact`].
+    ///
+    /// `HEAD` because the question is about existence: the upstream answers
+    /// from the same resource a `GET` would serve, over one round trip, and
+    /// sends no body. An upstream that does not implement `HEAD` answers
+    /// `405`, which is an `Unknown` — the caller then does exactly what it
+    /// would have done without asking.
+    ///
+    /// **Every failure is `Unknown`, and that is the whole safety
+    /// argument.** A URL that will not compose, an SSRF refusal, a TLS
+    /// material failure, a timeout, a transport error, a `401`, a `5xx` —
+    /// none of them is the upstream saying "I do not have this", so none of
+    /// them may be reported as `Absent`. The only `Absent` here comes from
+    /// [`UpstreamExistence::from_http_status`] reading a `404` or a `410`
+    /// off a response the upstream actually sent.
+    ///
+    /// The detail is logged here rather than returned, because this frame
+    /// is the only one that has the URL and the status. The caller gets
+    /// `Unknown`, runs the full pull anyway, and surfaces whatever real
+    /// error that pull hits with its own detail attached.
+    async fn do_probe_artifact(
+        &self,
+        mapping: &RepositoryUpstreamMapping,
+        path: &str,
+    ) -> ProbeOutcome {
+        // Composed by the same resolver the body fetch uses, SSRF check
+        // included, so a `Present` is about the resource
+        // `do_fetch_artifact` would go on to pull.
+        let url = match self.resolve_artifact_url(&mapping.upstream_url, path).await {
+            Ok(url) => url,
+            Err(e) => {
+                tracing::debug!(
+                    upstream = %mapping.upstream_url,
+                    path = %path,
+                    error = %e,
+                    "upstream existence probe could not resolve a URL; existence unknown"
+                );
+                return ProbeOutcome {
+                    existence: UpstreamExistence::Unknown,
+                    classified: Err(e),
+                };
+            }
+        };
+        tracing::debug!(
+            upstream = %mapping.upstream_url,
+            path = %path,
+            "probing artifact existence"
+        );
+        match self
+            .send_with_challenge(mapping, Method::HEAD, &url, KIND_EXISTS, &[])
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                let existence = UpstreamExistence::from_http_status(status.as_u16());
+                tracing::debug!(
+                    upstream = %mapping.upstream_url,
+                    path = %path,
+                    status = %status,
+                    existence = ?existence,
+                    "upstream existence probe answered"
+                );
+                // The verdict is read off the raw status above; the metric
+                // view is produced by the content legs' own
+                // `classify_response`, so a probe's `result` label and its
+                // TLS-handshake label read exactly as a GET's would.
+                ProbeOutcome {
+                    existence,
+                    classified: classify_response(resp, KIND_EXISTS).map(|_| ()),
+                }
+            }
+            Err(e) => {
+                // Reached only when no response arrived at all (transport,
+                // timeout, TLS, a refused realm exchange) — a status the
+                // upstream *did* send travels as `Ok` above, which is why a
+                // `404` can never land in this arm.
+                tracing::debug!(
+                    upstream = %mapping.upstream_url,
+                    path = %path,
+                    error = %e,
+                    "upstream existence probe did not answer; existence unknown"
+                );
+                ProbeOutcome {
+                    existence: UpstreamExistence::Unknown,
+                    classified: Err(e),
+                }
+            }
+        }
     }
 
     async fn do_fetch_metadata(
@@ -3525,6 +3692,40 @@ impl UpstreamProxy for HttpUpstreamProxy {
             result
         })
     }
+
+    fn probe_artifact(
+        &self,
+        mapping: RepositoryUpstreamMapping,
+        path: String,
+    ) -> BoxFuture<'_, UpstreamExistence> {
+        Box::pin(async move {
+            emit_insecure_if_opted_in(&self.config.format_label, &mapping);
+            let upstream = upstream_label(&mapping);
+            let started = Instant::now();
+            let outcome = self.do_probe_artifact(&mapping, &path).await;
+            let elapsed = started.elapsed();
+            // Classified from the probe's `DomainResult` view, not from the
+            // existence verdict: an `Absent` is a `not_found` and a `405`
+            // is an `upstream_4xx`, the same labels the GET legs emit for
+            // the same statuses. No new `result` values — only the new
+            // `kind`, `exists`.
+            emit_tls_handshake_metric_for_result(&outcome.classified);
+            let label = match &outcome.classified {
+                Ok(_) => UpstreamErrorKind::Success.as_str(),
+                Err(e) => classify_error(e)
+                    .map(|k| k.as_str())
+                    .unwrap_or(UpstreamErrorKind::ParseError.as_str()),
+            };
+            emit_metrics(
+                &self.config.format_label,
+                &upstream,
+                KIND_EXISTS,
+                elapsed,
+                label,
+            );
+            outcome.existence
+        })
+    }
 }
 
 /// Emit `hort_upstream_tls_handshake_total` on the fetch-error path
@@ -3682,6 +3883,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: now,
             updated_at: now,
         }
@@ -7698,6 +7900,178 @@ mod tests {
             bytes.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(bytes, b"absolute-url-bytes");
+    }
+
+    // ---- probe_artifact: the existence probe -----------------------------
+    //
+    // The probe is the one upstream leg whose wrong answer is worse than no
+    // answer at all: an invented `Absent` makes hort deny content it holds a
+    // working path to. So every status that is not a clean `404` / `410`
+    // gets a case here, against a real server, through the public port
+    // method.
+
+    /// A `200` on the HEAD is `Present` — and the request really is a
+    /// `HEAD`, not a GET that would pull the body to find out.
+    #[tokio::test]
+    async fn probe_artifact_head_200_is_present() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/com/example/foo/1.0/foo-1.0.jar"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-length", "1024"))
+            .mount(&server)
+            .await;
+
+        let proxy = proxy_for_format(&server, "maven");
+        let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+        assert_eq!(
+            proxy
+                .probe_artifact(m, "com/example/foo/1.0/foo-1.0.jar".into())
+                .await,
+            UpstreamExistence::Present
+        );
+        // Exactly one request, and it was the HEAD the mock matched. A GET
+        // would not have matched the mock above and would have answered 404
+        // → `Absent`, so this also pins the method.
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A `404` is the upstream saying it does not have this — the one
+    /// answer that earns a short-circuit.
+    #[tokio::test]
+    async fn probe_artifact_head_404_is_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/com/example/foo/1.0/foo-1.0.jar"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let proxy = proxy_for_format(&server, "maven");
+        let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+        assert_eq!(
+            proxy
+                .probe_artifact(m, "com/example/foo/1.0/foo-1.0.jar".into())
+                .await,
+            UpstreamExistence::Absent
+        );
+    }
+
+    /// `410 Gone` states the same inventory fact as a `404`.
+    #[tokio::test]
+    async fn probe_artifact_head_410_is_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(410))
+            .mount(&server)
+            .await;
+
+        let proxy = proxy_for_format(&server, "maven");
+        let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+        assert_eq!(
+            proxy.probe_artifact(m, "a/b/1.0/b-1.0.jar".into()).await,
+            UpstreamExistence::Absent
+        );
+    }
+
+    /// **The regression this unit could introduce, pinned against a real
+    /// server.** Plenty of Maven mirrors and CDNs refuse `HEAD` outright;
+    /// reading that refusal as `Absent` would invent a miss for an artifact
+    /// that is there.
+    #[tokio::test]
+    async fn probe_artifact_head_405_is_unknown_not_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(405).insert_header("allow", "GET"))
+            .mount(&server)
+            .await;
+
+        let proxy = proxy_for_format(&server, "maven");
+        let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+        let existence = proxy.probe_artifact(m, "a/b/1.0/b-1.0.jar".into()).await;
+        assert_eq!(
+            existence,
+            UpstreamExistence::Unknown,
+            "an upstream that will not answer HEAD has said nothing about the artifact"
+        );
+        assert_ne!(existence, UpstreamExistence::Absent);
+    }
+
+    /// A refused question is not an answered one: `401` and `403` are
+    /// `Unknown`. An upstream that requires a credential we do not have, or
+    /// an mTLS posture we are not presenting, still holds the artifact.
+    #[tokio::test]
+    async fn probe_artifact_head_401_and_403_are_unknown() {
+        for status in [401_u16, 403] {
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+
+            let proxy = proxy_for_format(&server, "maven");
+            // Anonymous, so a 401 does not start a challenge dance — the
+            // status reaches the classifier as-is.
+            let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+            assert_eq!(
+                proxy.probe_artifact(m, "a/b/1.0/b-1.0.jar".into()).await,
+                UpstreamExistence::Unknown,
+                "{status} must not be read as a miss"
+            );
+        }
+    }
+
+    /// A failing upstream is `Unknown`: an artifact it cannot serve this
+    /// second may be there the next.
+    #[tokio::test]
+    async fn probe_artifact_head_5xx_is_unknown() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let proxy = proxy_for_format(&server, "maven");
+        let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+        assert_eq!(
+            proxy.probe_artifact(m, "a/b/1.0/b-1.0.jar".into()).await,
+            UpstreamExistence::Unknown
+        );
+    }
+
+    /// A transport failure — nothing listening — is `Unknown`, not
+    /// `Absent`. This is the arm that proves the fold is on the *error*
+    /// path too: no response arrived, so no status was read, so no
+    /// inventory statement exists to act on.
+    #[tokio::test]
+    async fn probe_artifact_transport_failure_is_unknown() {
+        let proxy = proxy_with_no_server();
+        // A routable-but-dead address: the connect fails rather than
+        // resolving to a loopback the SSRF guard would refuse.
+        let m = mapping("http://192.0.2.1:9", "", UpstreamAuth::Anonymous);
+        assert_eq!(
+            proxy.probe_artifact(m, "a/b/1.0/b-1.0.jar".into()).await,
+            UpstreamExistence::Unknown
+        );
+    }
+
+    /// An SSRF refusal is `Unknown` too. The probe composes its URL
+    /// through the same resolver the body fetch uses, so an absolute
+    /// upstream-nominated URL pointing at loopback is refused before any
+    /// request is sent — and a refusal to ask is not an answer.
+    #[tokio::test]
+    async fn probe_artifact_ssrf_refusal_is_unknown() {
+        let proxy = proxy_with_no_server();
+        let m = mapping(
+            "https://repo1.maven.org/maven2",
+            "",
+            UpstreamAuth::Anonymous,
+        );
+        assert_eq!(
+            proxy
+                .probe_artifact(m, "http://127.0.0.1:1/evil.jar".into())
+                .await,
+            UpstreamExistence::Unknown
+        );
     }
 
     /// `resolve_artifact_url` returns the absolute URL verbatim when

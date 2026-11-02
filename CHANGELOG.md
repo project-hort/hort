@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-11-02
+
+### Added
+
+- `UpstreamMapping.spec.notFoundCacheSeconds` sets how long a 404 from that
+  upstream stays negative-cached, so a release mirror and a snapshot mirror no
+  longer share one deployment-wide window. Omitted keeps
+  `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`; effective on Maven proxies (#391).
+
+### Changed
+
+- The default scan attempt budget (`HORT_SCANNER_MAX_ATTEMPTS`, chart
+  `worker.scanner.maxAttempts`) is now 6, so a persistently failing job takes
+  ~156 minutes instead of ~96 to become a permanent `failed` row.
+
+### Fixed
+
+- A quarantined artifact's `Retry-After` no longer advertises one second while
+  its scan verdict is outstanding; the floor is
+  `HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`, default 20 s — set it to your scan
+  turnaround (#331).
+- A Maven proxy whose upstream has neither the artifact nor a checksum sidecar
+  now answers 404 rather than 502, so a virtual Maven repository serves a
+  coordinate only a later member holds (#391).
+
 ## [0.17.1] - 2026-11-01
 
 ### Added
@@ -58,6 +83,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `hort-cli admin task invoke --help` no longer advertises `scan`, which the
   server does not route and which answered `405`; the per-artifact instrument
   is `hort-cli admin rescan <ARTIFACT_ID>` (#388).
+- An OCI layer whose scan found no analyzer to claim it is no longer held
+  terminally while the manifest that names it serves, so its blob no longer
+  answers `503` on an image hort reports as released. Takes effect on a
+  ScanPolicy with `compositeVerdictMode: promoted`; a layer already held this
+  way stays terminal and needs `hort-cli curation waive` as well (#390).
 
 ## [0.17.0] - 2026-10-31
 

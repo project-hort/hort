@@ -47,10 +47,15 @@ import os
 import re
 import shutil
 import sys
+from pathlib import Path
 from string import Template
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mdconv  # noqa: E402
+import operator_docs  # noqa: E402
+import legacy_docs  # noqa: E402
+import diagrams  # noqa: E402
+import developer_docs  # noqa: E402
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 GITHUB_BLOB = "https://github.com/project-hort/hort/blob/main/"
@@ -92,6 +97,8 @@ def discover_project_hort_de_docs():
 
 def project_hort_de_source_to_output(src_rel):
     """docs/architecture/how-to/deploy/install.md -> docs/how-to/deploy/install.html"""
+    if src_rel in operator_docs.operator_sources():
+        return operator_docs.operator_output(src_rel)
     assert src_rel.startswith(DOCS_ROOT + "/")
     tail = src_rel[len(DOCS_ROOT) + 1 :]
     assert tail.endswith(".md")
@@ -99,7 +106,7 @@ def project_hort_de_source_to_output(src_rel):
 
 
 def project_hort_de_in_scope(resolved):
-    return resolved.startswith(_in_scope_prefixes())
+    return resolved.startswith(_in_scope_prefixes()) or resolved in operator_docs.operator_sources()
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +124,7 @@ HORT_RS_DOCS = [
     ("crates/hort-cli/README.md", "docs/cli-reference.html"),
 ]
 HORT_RS_DOC_MAP = dict(HORT_RS_DOCS)
+HORT_RS_DOC_MAP.update({source: developer_docs.path_for(source) for source in developer_docs.new_sources()})
 
 
 def hort_rs_in_scope(resolved):
@@ -149,7 +157,7 @@ SITES = {
             ("dl/", "Downloads"),
             (f"https://{PROJECT_HORT_DE}", "project-hort.de"),
         ],
-        "default_description": "Install hort-cli, the Hort command-line client.",
+        "default_description": "hort developer documentation: Rust crates, architecture, contributing and CLI downloads.",
     },
 }
 
@@ -233,6 +241,7 @@ PAGE_SHELL = Template(
 <title>$title</title>
 <meta name="description" content="$description">
 <link rel="stylesheet" href="$assets_href/style.css">
+<link rel="stylesheet" href="$assets_href/operator.css">
 </head><body>
 <header class="site-header">
   <a class="brand" href="$root_href/index.html">$brand</a>
@@ -257,7 +266,76 @@ $body
 )
 
 
+OPERATOR_SHELL = Template("""<!doctype html>
+<html lang="en" data-theme="dark"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>$title</title><meta name="description" content="$description">
+<link rel="icon" href="$assets_href/hort-logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="$assets_href/operator.css">
+<script>(function(){try{var v=localStorage.getItem('hort-theme');if(v==='dark'||v==='light')document.documentElement.dataset.theme=v}catch(e){}})()</script>
+</head><body class="operator-page">
+<header class="site-header"><nav class="container" aria-label="Main navigation">
+<a class="brand" href="$root_href/index.html"><img src="$assets_href/hort-logo.svg" alt="" width="84" height="62">hort</a>
+<button class="menu-toggle" id="menu-toggle" type="button" aria-controls="primary-navigation" aria-expanded="false" aria-label="Open navigation">Menu</button>
+<div class="navlinks" id="primary-navigation">
+<a href="$root_href/index.html">Overview</a><a aria-current="page" href="$root_href/docs/index.html">Docs</a>
+<a href="$root_href/index.html#architecture">Architecture</a><a href="https://github.com/project-hort/hort">GitHub</a>
+<button class="theme" id="theme-toggle" type="button" aria-label="Switch color theme">Light mode</button>
+</div></nav></header>
+<main id="main-content">$body</main>
+<footer class="site-footer"><div class="container"><span>hort · Open-source artifact infrastructure</span><span><a href="https://github.com/project-hort/hort">GitHub</a> · <a href="$root_href/index.html">Overview</a></span></div></footer>
+<script src="$assets_href/operator.js" defer></script>
+</body></html>""")
+
+
+
+DEVELOPER_SHELL = Template("""<!doctype html>
+<html lang="en" data-theme="dark"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>$title</title><meta name="description" content="$description">
+<link rel="icon" href="$assets_href/hort-logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="$assets_href/operator.css">
+<link rel="stylesheet" href="$assets_href/developer.css">
+<link rel="canonical" href="$canonical">
+<script>(function(){try{var v=localStorage.getItem('hort-theme');if(v==='dark'||v==='light')document.documentElement.dataset.theme=v}catch(e){}})()</script>
+</head><body class="operator-page developer-page">
+<header class="site-header"><nav class="container" aria-label="Main navigation">
+<a class="brand" href="$root_href/index.html"><img src="$assets_href/hort-logo.svg" width="84" height="62" alt="">hort<span class="brand-context">.rs</span></a>
+<button class="menu-toggle" id="menu-toggle" type="button" aria-controls="primary-navigation" aria-expanded="false" aria-label="Open navigation">Menu</button>
+<div class="navlinks" id="primary-navigation">
+<a href="$root_href/docs/index.html">Docs</a><a href="$root_href/docs/developer/crates/crate-map.html">Crates</a>
+<a href="$root_href/docs/developer/architecture/ports-and-adapters.html">Architecture</a>
+<a href="$root_href/docs/developer/contributing/testing-changes.html">Contributing</a>
+<a href="$root_href/dl/">Downloads</a><a href="https://project-hort.de/">Operators</a>
+<button class="theme" id="theme-toggle" type="button" aria-label="Switch color theme">Light mode</button>
+</div></nav></header>
+<main id="main-content">$body</main>
+<footer class="site-footer"><div class="container"><span>hort · Developer portal</span><span><a href="https://project-hort.de/">Operator docs</a> · <a href="https://github.com/project-hort/hort">GitHub</a></span></div></footer>
+<script src="$assets_href/operator.js" defer></script>
+</body></html>""")
+
+
 def render_page(site_key, output_rel, title, body_html, description=""):
+    if site_key == HORT_RS:
+        depth = output_rel.count("/")
+        root_href = "/".join([".."] * depth) if depth else "."
+        assets_href = (root_href + "/assets") if depth else "assets"
+        return DEVELOPER_SHELL.substitute(
+            title=html.escape(f"{title} — hort.rs", quote=False),
+            description=html.escape(description or SITES[HORT_RS]["default_description"], quote=True),
+            root_href=root_href, assets_href=assets_href,
+            canonical="https://hort.rs/" + output_rel,
+            body=body_html,
+        )
+    if site_key == PROJECT_HORT_DE and (output_rel == "docs/index.html" or output_rel.startswith("docs/operator/")):
+        depth = output_rel.count("/")
+        root_href = "/".join([".."] * depth) if depth else "."
+        assets_href = (root_href + "/assets") if depth else "assets"
+        return OPERATOR_SHELL.substitute(
+            title=html.escape(f"{title} — hort", quote=False),
+            description=html.escape(description or "hort operator documentation", quote=True),
+            root_href=root_href, assets_href=assets_href, body=body_html,
+        )
     site = SITES[site_key]
     depth = output_rel.count("/")
     root_href = "/".join([".."] * depth) if depth else "."
@@ -346,35 +424,15 @@ def extract_md_sections(md_text):
 
 
 def build_project_hort_de_landing(dist, readme_sections):
-    resolver = make_link_resolver(PROJECT_HORT_DE, "README.md", "index.html")
-
-    intro_html, _ = mdconv.convert(readme_sections.get("intro", ""), resolver)
-    formats_html, _ = mdconv.convert(
-        readme_sections.get("Supported formats", ""), resolver
-    )
-
-    body = f"""
-<div class="hero">
-{intro_html}
-</div>
-
-<div class="cta">
-  <a class="primary" href="docs/how-to/deploy/self-contained-registry-install.html">Quickstart: self-contained install</a>
-  <a class="secondary" href="docs/index.html">Browse the docs</a>
-  <a class="secondary" href="https://github.com/project-hort/hort">View on GitHub</a>
-</div>
-
-<h2>Supported formats</h2>
-{formats_html}
-"""
-    page_html = render_page(
-        PROJECT_HORT_DE,
-        "index.html",
-        PROJECT_HORT_DE,
-        body,
-        description="Hort: a secure, self-hostable, multi-format artifact repository and supply-chain registry.",
-    )
-    write(dist, "index.html", page_html)
+    """Publish approved homepage verbatim; docs stay generated from Markdown."""
+    landing_root = os.path.join(REPO_ROOT, "site", "landing")
+    with open(os.path.join(landing_root, "index.html"), encoding="utf-8") as fh:
+        html_source = fh.read()
+    write(dist, "index.html", html_source)
+    for name in ("404.html", "robots.txt", "sitemap.xml"):
+        src = os.path.join(landing_root, name)
+        if os.path.isfile(src):
+            shutil.copyfile(src, os.path.join(dist, name))
 
 
 def humanize_filename(fn):
@@ -402,9 +460,47 @@ def build_project_hort_de_docs(dist):
 
         records.append((src_rel, output_rel, category_sub, title))
 
-        page_html = render_page(PROJECT_HORT_DE, output_rel, title, body_html)
+        # Historical URLs are retained so existing links and heading anchors
+        # continue to work. These unreviewed sources are NOT current operator
+        # guidance. Make that status visible to humans and search engines.
+        status, successor = legacy_docs.classify(src_rel)
+        overview_rel = os.path.relpath('docs/index.html', os.path.dirname(output_rel) or '.').replace(os.sep, '/')
+        message = ('This historical page contains internal or developer-oriented material.' if status == 'developer' else
+                   'This historical page may contain outdated examples or instructions.')
+        successor_html = ''
+        if successor:
+            next_rel = os.path.relpath('docs/operator/' + successor + '.html', os.path.dirname(output_rel) or '.').replace(os.sep, '/')
+            successor_html = ' <a href="' + html.escape(next_rel, quote=True) + '">Read the current operator guide</a>.'
+        source_html = '<a href="' + GITHUB_BLOB + src_rel + '">Original Markdown source</a>'
+        banner = ('<aside class="legacy-notice" role="note" aria-label="Archived documentation">'
+                  '<strong>Archived documentation — not maintained.</strong> '
+                  + message + successor_html + ' <a href="' + html.escape(overview_rel, quote=True) +
+                  '">Current operator docs</a> · ' + source_html + '.</aside>')
+        page_html = render_page(PROJECT_HORT_DE, output_rel, title, banner + body_html)
+        page_html = page_html.replace('</head>', '<meta name="robots" content="noindex,follow"></head>', 1)
+        # A small scoped stylesheet avoids changing the currently published
+        # operator guides or their shared design.
+        page_html = page_html.replace('</head>', '<style>.legacy-notice{margin:1.5rem auto;padding:1.15rem 1.4rem;max-width:70rem;border:2px solid #c18a32;background:#ffedd0;color:#33200b;border-radius:12px;line-height:1.6}.legacy-notice a{color:#623a06;font-weight:700;text-decoration:underline}.legacy-notice strong{display:block;margin-bottom:.4rem}</style></head>', 1)
         write(dist, output_rel, page_html)
 
+    # Newly authored operator guides are the curated navigation. The historic
+    # documentation stays at its original URLs for compatibility, but is not
+    # promoted in the operator index.
+    for src_rel in operator_docs.operator_sources():
+        output_rel = operator_docs.operator_output(src_rel)
+        with open(os.path.join(REPO_ROOT, src_rel), encoding="utf-8") as fh:
+            text = fh.read()
+        resolver = make_link_resolver(PROJECT_HORT_DE, src_rel, output_rel)
+        body_html, headings = mdconv.convert(
+            text, resolver, lambda source: diagrams.html_figure(source, output_rel)
+        )
+        title = mdconv.strip_inline_markup(headings[0][2]) if headings else humanize_filename(src_rel)
+        chrome = '<div class="op-layout">' + operator_docs.sidebar(output_rel) + '<article class="op-article">' + body_html + '<p class="op-source"><a href="' + GITHUB_BLOB + src_rel + '">View Markdown source on GitHub</a></p></article>' + operator_docs.toc(headings) + '</div>'
+        page_html = render_page(PROJECT_HORT_DE, output_rel, title, chrome)
+        # The curated documentation is the canonical operator entry point.
+        canonical_url = "https://project-hort.de/" + output_rel
+        page_html = page_html.replace('</head>', '<link rel="canonical" href="' + canonical_url + '"></head>', 1)
+        write(dist, output_rel, page_html)
     return records
 
 
@@ -419,33 +515,36 @@ CATEGORY_ORDER = ["how-to", "how-to/deploy", "how-to/operate", "reference", "tut
 
 
 def build_project_hort_de_docs_index(dist, records):
-    by_category = {}
-    for src_rel, output_rel, category_sub, title in records:
-        by_category.setdefault(category_sub, []).append((title, output_rel))
+    output_rel = "docs/index.html"
+    intro = '<section class="op-intro"><p class="op-kicker">Documentation / Operators</p><h1>Operate hort with confidence.</h1><p>Task-focused guides for installing, configuring, securing, and observing your artifact infrastructure. Start with the quickstart, then explore the workflows you need.</p></section>'
+    body = '<div class="op-layout op-index">' + operator_docs.sidebar(output_rel, index=True) + '<article class="op-article">' + intro + '<div class="op-guide-grid">'
+    for category, entries in operator_docs.GROUPS:
+        body += '<section class="op-guide-card"><h2>' + html.escape(category) + '</h2><ul>'
+        for label, slug in entries:
+            body += '<li><a href="operator/' + slug + '.html">' + html.escape(label) + '</a></li>'
+        body += '</ul></section>'
+    body += '</div><p class="op-fine">Only curated operator guides are listed here. Older URLs remain available with archive notices while their content is reviewed and retired.</p></article></div>'
+    page_html = render_page(PROJECT_HORT_DE, output_rel, "Operator documentation", body)
+    page_html = page_html.replace('</head>', '<link rel="canonical" href="https://project-hort.de/docs/index.html"></head>', 1)
+    write(dist, output_rel, page_html)
 
-    parts = [
-        "<h1>Operator documentation</h1>",
-        "<p>Generated from this repository's <code>docs/architecture/</code> "
-        "tree (how-to, reference, tutorial) -- always in sync with the source "
-        "checked into the repo.</p>",
-        '<div class="docs-index">',
+
+def build_project_hort_de_sitemap(dist):
+    """Index the current operator corpus, never archived/legacy pages.
+
+    The static landing sitemap has only the homepage, so publishing it
+    unchanged hides every curated guide from sitemap-based discovery.
+    """
+    paths = ["", "docs/index.html"] + [
+        operator_docs.operator_output(src)
+        for src in operator_docs.operator_sources()
     ]
-    for cat in CATEGORY_ORDER:
-        entries = sorted(by_category.get(cat, []), key=lambda e: e[0])
-        if not entries:
-            continue
-        parts.append(f"<h3>{CATEGORY_LABELS[cat]}</h3>")
-        parts.append("<ul>")
-        for title, output_rel in entries:
-            rel = os.path.relpath(output_rel, "docs").replace(os.sep, "/")
-            parts.append(f'<li><a href="{rel}">{html.escape(title)}</a></li>')
-        parts.append("</ul>")
-    parts.append("</div>")
-
-    page_html = render_page(
-        PROJECT_HORT_DE, "docs/index.html", "Documentation", "\n".join(parts)
-    )
-    write(dist, "docs/index.html", page_html)
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
+    for path in paths:
+        lines.append('<url><loc>' + html.escape('https://project-hort.de/' + path) + '</loc></url>')
+    lines.append('</urlset>')
+    write(dist, 'sitemap.xml', '\n'.join(lines) + '\n')
 
 
 def build_project_hort_de(dist):
@@ -456,8 +555,9 @@ def build_project_hort_de(dist):
     build_project_hort_de_landing(dist, readme_sections)
     records = build_project_hort_de_docs(dist)
     build_project_hort_de_docs_index(dist, records)
+    build_project_hort_de_sitemap(dist)
     copy_assets(dist)
-    return len(records) + 2
+    return len(records) + len(operator_docs.operator_sources()) + 2
 
 
 # ---------------------------------------------------------------------------
@@ -474,114 +574,64 @@ HORT_RS_COSIGN_IDENTITY_REGEXP = "https://github.com/project-hort/.*"
 
 
 def build_hort_rs_landing(dist):
-    with open(
-        os.path.join(REPO_ROOT, DOCS_ROOT, "how-to", "install-cli.md"),
-        encoding="utf-8",
-    ) as fh:
-        install_cli_text = fh.read()
-    sections = extract_md_sections(install_cli_text)
-    resolver = make_link_resolver(
-        HORT_RS, f"{DOCS_ROOT}/how-to/install-cli.md", "index.html"
-    )
+    body = """<section class="dev-hero container">
+<p class="op-kicker">hort / Developer portal</p>
+<h1>Build with hort. Contribute to its foundations.</h1>
+<p class="dev-lead">Explore the Rust workspace, understand its architecture, and find the tools for developing and extending hort. Looking to deploy and operate hort? Start with the <a href="https://project-hort.de/docs/index.html">operator documentation</a>.</p>
+<div class="dev-actions"><a class="dev-primary" href="docs/developer/getting-started/local-development.html">Start developing</a><a class="dev-secondary" href="docs/developer/crates/crate-map.html">Explore crates</a><a class="dev-secondary" href="docs/install-cli.html">Install hort-cli</a></div>
+</section>
+<section class="container dev-section"><p class="op-kicker">Explore</p><div class="dev-card-grid">
+<a class="dev-card" href="docs/developer/getting-started/local-development.html"><strong>Local development</strong><span>Clone, build, run focused checks, and navigate the workspace.</span></a>
+<a class="dev-card" href="docs/developer/crates/crate-map.html"><strong>Crates &amp; APIs</strong><span>Understand layers, responsibilities, and stability boundaries.</span></a>
+<a class="dev-card" href="docs/developer/architecture/ports-and-adapters.html"><strong>Architecture &amp; extending</strong><span>Follow domain ports, adapters, and composition.</span></a>
+<a class="dev-card" href="docs/developer/contributing/testing-changes.html"><strong>Contributing</strong><span>Choose the right tests and prepare a reviewable change.</span></a>
+</div></section>
+<section class="container dev-section dev-download"><p class="op-kicker">Tooling</p><h2>hort-cli and release downloads</h2>
+<p>Install the command-line tool for operating hort, review the <a href="docs/cli-reference.html">CLI reference</a>, or use the <a href="dl/">versioned download archive</a>. Existing installer and download URLs remain available.</p>
+<div class="dev-actions"><a class="dev-secondary" href="docs/install-cli.html">CLI installation</a><a class="dev-secondary" href="dl/">Downloads</a><a class="dev-secondary" href="https://github.com/project-hort/hort">GitHub</a></div>
+</section>"""
+    write(dist, "index.html", render_page(HORT_RS, "index.html", "Developer portal", body))
 
-    intro_html, _ = mdconv.convert(sections.get("intro", ""), resolver)
-    linux_html, _ = mdconv.convert(sections.get("Linux / macOS", ""), resolver)
-    windows_html, _ = mdconv.convert(
-        sections.get("Windows (PowerShell)", ""), resolver
-    )
-    guarantee_html, _ = mdconv.convert(
-        sections.get("What the installer guarantees", ""), resolver
-    )
 
-    # Manual-download & verify: hand-authored -- this exact recipe (browse
-    # dl/<tag>/, verify locally) isn't documented anywhere in the four
-    # source files (they only cover the automated installer script), so it
-    # can't be extracted the way the sections above are. Uses the identical
-    # cosign parameters install-cli.sh itself verifies against.
-    manual_html = f"""
-<p>Prefer to fetch and verify a binary yourself? Every release is archived
-permanently at <a href="dl/">/dl/</a>, keyed by tag. Pick your platform's
-archive (e.g. <code>hort-cli-linux-amd64.tar.gz</code>) plus its
-<code>.sha256</code> and <code>.bundle</code> sidecars, then:</p>
-<pre><code># checksum
-sha256sum -c hort-cli-&lt;platform&gt;.tar.gz.sha256
-
-# keyless cosign signature (same identity the installer itself checks)
-cosign verify-blob \\
-  --certificate-oidc-issuer={HORT_RS_COSIGN_OIDC_ISSUER} \\
-  --certificate-identity-regexp='{HORT_RS_COSIGN_IDENTITY_REGEXP}' \\
-  --bundle hort-cli-&lt;platform&gt;.tar.gz.bundle \\
-  hort-cli-&lt;platform&gt;.tar.gz</code></pre>
-<p>Nothing here differs from the one-liner above -- it runs the identical
-checks. <code>dl/</code> exists for pinning an exact historical version,
-air-gapped installs, and auditing.</p>
-"""
-
-    body = f"""
-<div class="hero">
-{intro_html}
-</div>
-
-<h2>Install</h2>
-<h3>Linux / macOS</h3>
-{linux_html}
-<h3>Windows (PowerShell)</h3>
-{windows_html}
-
-<div class="cta">
-  <a class="secondary" href="docs/index.html">CLI docs</a>
-  <a class="secondary" href="dl/">Browse all versions</a>
-  <a class="secondary" href="https://github.com/project-hort/hort">View on GitHub</a>
-</div>
-
-<h2>Fail-closed by design</h2>
-{guarantee_html}
-
-<h2>Manual download &amp; verify</h2>
-{manual_html}
-"""
-    page_html = render_page(
-        HORT_RS,
-        "index.html",
-        HORT_RS,
-        body,
-        description="Install hort-cli: fail-closed, cosign-verified, single-command install for Linux, macOS, and Windows.",
-    )
-    write(dist, "index.html", page_html)
+def _developer_chrome(output_rel, src_rel, body_html, headings):
+    source = GITHUB_BLOB + src_rel
+    return ('<div class="op-layout">' + developer_docs.sidebar(output_rel)
+            + '<article class="op-article">' + body_html
+            + '<p class="op-source"><a href="' + source + '">View Markdown source on GitHub</a></p></article>'
+            + operator_docs.toc(headings) + '</div>')
 
 
 def build_hort_rs_docs(dist):
-    records = []  # (src_rel, output_rel, title)
-    for src_rel, output_rel in HORT_RS_DOCS:
-        with open(os.path.join(REPO_ROOT, src_rel), encoding="utf-8") as fh:
-            text = fh.read()
+    records = []
+    all_records = HORT_RS_DOCS + [(src, developer_docs.path_for(src)) for src in developer_docs.new_sources()]
+    for src_rel, output_rel in all_records:
+        text = (Path(REPO_ROOT) / src_rel).read_text(encoding="utf-8")
         resolver = make_link_resolver(HORT_RS, src_rel, output_rel)
-        body_html, headings = mdconv.convert(text, resolver)
-        title = headings[0][2] if headings else humanize_filename(src_rel)
-        title = mdconv.strip_inline_markup(title)
+        body_html, headings = mdconv.convert(text, resolver,
+            lambda source: diagrams.html_figure(source, output_rel))
+        title = mdconv.strip_inline_markup(headings[0][2]) if headings else humanize_filename(src_rel)
         records.append((src_rel, output_rel, title))
-        page_html = render_page(HORT_RS, output_rel, title, body_html)
-        write(dist, output_rel, page_html)
+        page = render_page(HORT_RS, output_rel, title,
+            _developer_chrome(output_rel, src_rel, body_html, headings))
+        write(dist, output_rel, page)
     return records
 
 
 def build_hort_rs_docs_index(dist, records):
-    parts = [
-        "<h1>hort-cli documentation</h1>",
-        "<p>Generated from this repository's own docs and "
-        "<code>crates/hort-cli/README.md</code> -- always in sync with the "
-        "source checked into the repo.</p>",
-        '<div class="docs-index"><ul>',
-    ]
-    for src_rel, output_rel, title in sorted(records, key=lambda r: r[2]):
-        rel = os.path.relpath(output_rel, "docs").replace(os.sep, "/")
-        parts.append(f'<li><a href="{rel}">{html.escape(title)}</a></li>')
-    parts.append("</ul></div>")
-
-    page_html = render_page(
-        HORT_RS, "docs/index.html", "Documentation", "\n".join(parts)
-    )
-    write(dist, "docs/index.html", page_html)
+    output_rel = "docs/index.html"
+    rows = ['<p class="op-kicker">Documentation / Developers</p><h1>Developer documentation</h1>',
+            '<p class="op-intro">Start with the Rust workspace, understand the crate boundaries, then extend and test. For deployments and operator workflows, visit <a href="https://project-hort.de/docs/index.html">project-hort.de</a>.</p>',
+            '<div class="op-guide-grid">']
+    for group, entries in developer_docs.GROUPS:
+        rows.append('<section class="op-guide-card"><h2>' + html.escape(group) + '</h2><ul>')
+        for label, slug in entries:
+            target = developer_docs.entry_path(slug)
+            href = os.path.relpath(target, 'docs').replace(os.sep, '/')
+            rows.append('<li><a href="' + html.escape(href, quote=True) + '">' + html.escape(label) + '</a></li>')
+        rows.append('</ul></section>')
+    rows.append('</div>')
+    body = '<div class="op-layout op-index">' + developer_docs.sidebar(output_rel) + '<article class="op-article">' + ''.join(rows) + '</article></div>'
+    write(dist, output_rel, render_page(HORT_RS, output_rel, "Documentation", body))
 
 
 def copy_hort_rs_apex_files(dist):

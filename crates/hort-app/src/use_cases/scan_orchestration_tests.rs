@@ -821,6 +821,19 @@ fn seed_none_status_artifact(
     id
 }
 
+/// Attempts already on a row whose budget is spent.
+///
+/// Every use-case factory in this file builds its config from
+/// `ScanOrchestrationConfig::defaults_for_worker` and none overrides
+/// `max_attempts`, so the cap `record_outcome` compares `job.attempts`
+/// against is the default one.
+/// Seeding from the default rather than re-typing its value is what keeps
+/// these at-the-cap arms from silently becoming below-the-cap arms — and
+/// asserting the opposite disposition — when the default moves. The value
+/// of the default itself is pinned in `crate::retry_backoff`'s own tests,
+/// not here.
+const BUDGET_SPENT: u32 = DEFAULT_MAX_ATTEMPTS;
+
 fn sample_scan_job(artifact_id: Uuid, attempts: u32) -> ScanJob {
     ScanJob {
         id: Uuid::new_v4(),
@@ -2042,7 +2055,7 @@ async fn no_record_outcome_arm_writes_the_jobs_row() {
         ),
         (
             "transient, budget spent",
-            5, // == default max_attempts → terminal.
+            BUDGET_SPENT, // terminal.
             ScanRunOutcome::Failed("dead".into()),
             ScanRowDisposition::Failed("dead".into()),
         ),
@@ -2119,7 +2132,7 @@ async fn record_outcome_failed_at_max_attempts_fails_the_row_but_quarantined_art
     let (uc, jobs, _events, _storage, artifacts, repositories, _policy) =
         make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
-    let job = sample_scan_job(artifact_id, 5); // == default max_attempts.
+    let job = sample_scan_job(artifact_id, BUDGET_SPENT);
 
     let disposition = uc
         .record_outcome(&job, ScanRunOutcome::Failed("dead".into()))
@@ -2155,7 +2168,7 @@ async fn record_outcome_failed_at_max_attempts_quarantined_artifact_commits_no_t
     let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
     let (uc, jobs, artifacts, repositories, lifecycle) = make_uc_with_lifecycle(policy_projections);
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
-    let job = sample_scan_job(artifact_id, 5);
+    let job = sample_scan_job(artifact_id, BUDGET_SPENT);
 
     let disposition = uc
         .record_outcome(&job, ScanRunOutcome::Failed("all backends down".into()))
@@ -2203,7 +2216,7 @@ async fn record_outcome_failed_at_max_attempts_hard_block_does_not_advance_last_
     let (uc, _jobs, artifacts, repositories, lifecycle) =
         make_uc_with_lifecycle(policy_projections);
     let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
-    let job = sample_scan_job(artifact_id, 5); // == default max_attempts.
+    let job = sample_scan_job(artifact_id, BUDGET_SPENT);
 
     uc.record_outcome(&job, ScanRunOutcome::Failed("all backends down".into()))
         .await
@@ -2236,7 +2249,7 @@ async fn record_outcome_failed_at_max_attempts_none_status_still_hard_blocks_to_
     let artifact_id = none_artifact.id;
     artifacts.insert(none_artifact);
     repositories.insert(repo);
-    let job = sample_scan_job(artifact_id, 5);
+    let job = sample_scan_job(artifact_id, BUDGET_SPENT);
 
     uc.record_outcome(&job, ScanRunOutcome::Failed("all backends down".into()))
         .await
@@ -2260,7 +2273,7 @@ async fn record_outcome_failed_permissive_none_hard_blocks() {
     let artifact_id = none_artifact.id;
     artifacts.insert(none_artifact);
     repositories.insert(repo);
-    let job = sample_scan_job(artifact_id, 5);
+    let job = sample_scan_job(artifact_id, BUDGET_SPENT);
 
     assert!(artifacts.get(artifact_id).unwrap().is_downloadable());
 
@@ -2310,7 +2323,7 @@ async fn record_outcome_failed_idempotent_when_already_scan_indeterminate() {
     let artifact_id = si_artifact.id;
     artifacts.insert(si_artifact);
     repositories.insert(repo);
-    let job = sample_scan_job(artifact_id, 5);
+    let job = sample_scan_job(artifact_id, BUDGET_SPENT);
 
     let disposition = uc
         .record_outcome(&job, ScanRunOutcome::Failed("still down".into()))
@@ -2443,7 +2456,7 @@ async fn scanner_label_for_failed_artifact_not_found_yields_none_sentinel() {
 
     // Artifact NOT seeded — `find_by_id` returns NotFound.
     let missing_id = Uuid::new_v4();
-    let job = sample_scan_job(missing_id, 5); // attempts == max → fail-closed path
+    let job = sample_scan_job(missing_id, BUDGET_SPENT); // fail-closed path
 
     // `record_scan_indeterminate` will fail because the artifact doesn't
     // exist. That propagates as `?` from `record_outcome`. We only care
@@ -2504,7 +2517,7 @@ async fn scanner_label_for_failed_no_policy_yields_default_backend_label() {
     let (uc, _jobs, artifacts, repositories, lifecycle) =
         make_uc_with_lifecycle(policy_projections);
     let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
-    let job = sample_scan_job(artifact_id, 5);
+    let job = sample_scan_job(artifact_id, BUDGET_SPENT);
 
     uc.record_outcome(&job, ScanRunOutcome::Failed("all down".into()))
         .await
@@ -2529,7 +2542,7 @@ async fn scanner_label_for_failed_policy_list_error_yields_none_sentinel() {
     let (uc, _jobs, artifacts, repositories, lifecycle) =
         make_uc_with_lifecycle(policy_projections);
     let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
-    let job = sample_scan_job(artifact_id, 5);
+    let job = sample_scan_job(artifact_id, BUDGET_SPENT);
 
     uc.record_outcome(&job, ScanRunOutcome::Failed("scanner error".into()))
         .await
@@ -2555,7 +2568,7 @@ async fn scanner_label_for_failed_non_empty_backends_yields_joined_label() {
     let (uc, _jobs, artifacts, repositories, lifecycle) =
         make_uc_with_lifecycle(policy_projections);
     let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
-    let job = sample_scan_job(artifact_id, 5);
+    let job = sample_scan_job(artifact_id, BUDGET_SPENT);
 
     uc.record_outcome(&job, ScanRunOutcome::Failed("backends down".into()))
         .await
@@ -4030,7 +4043,7 @@ mod metrics_emission_tests {
                 // artifact before mark_failed, so it must exist.
                 let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
                 // attempts == default max → terminal failure path.
-                let job = sample_scan_job(artifact_id, 5);
+                let job = sample_scan_job(artifact_id, BUDGET_SPENT);
                 uc.record_outcome(&job, ScanRunOutcome::Failed("dead".into()))
                     .await
                     .expect("record_outcome");
@@ -4060,7 +4073,7 @@ mod metrics_emission_tests {
                 let (uc, _jobs, _events, _storage, artifacts, repositories, _policy) =
                     make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
                 let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
-                let job = sample_scan_job(artifact_id, 5); // == max → terminal.
+                let job = sample_scan_job(artifact_id, BUDGET_SPENT); // terminal.
                 uc.record_outcome(&job, ScanRunOutcome::Failed("dead".into()))
                     .await
                     .expect("record_outcome");
@@ -4085,7 +4098,7 @@ mod metrics_emission_tests {
                 let (uc, _jobs, _events, _storage, artifacts, repositories, _policy) =
                     make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
                 let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
-                let job = sample_scan_job(artifact_id, 5); // == max → exhausted.
+                let job = sample_scan_job(artifact_id, BUDGET_SPENT); // exhausted.
                 uc.record_outcome(&job, ScanRunOutcome::Failed("dead".into()))
                     .await
                     .expect("record_outcome");
@@ -4206,7 +4219,7 @@ mod metrics_emission_tests {
                 let (uc, _jobs, _events, _storage, artifacts, repositories, _policy) =
                     make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
                 let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
-                let job = sample_scan_job(artifact_id, 5);
+                let job = sample_scan_job(artifact_id, BUDGET_SPENT);
                 uc.record_outcome(&job, ScanRunOutcome::Failed("dead".into()))
                     .await
                     .expect("record_outcome");
@@ -7215,6 +7228,7 @@ fn composite_upstream_mapping(repository_id: Uuid) -> RepositoryUpstreamMapping 
         ca_bundle_ref: None,
         pinned_cert_sha256: None,
         allowed_realm_hosts: Vec::new(),
+        not_found_cache_seconds: None,
         created_at: now,
         updated_at: now,
     }
@@ -7732,15 +7746,20 @@ async fn a_transient_acquisition_failure_asks_for_another_attempt() {
         DomainError::Invariant("upstream:upstream_5xx:503 Service Unavailable".to_string()),
     );
 
-    // Attempt 1 of 5: the request is granted.
+    // Attempt 1 of the budget: the request is granted.
     let job = scan_job_for_format(artifact_id, "oci");
     assert_eq!(job.attempts, 1);
     let outcome = uc.run_scan(&job).await.expect("run_scan");
     let ScanRunOutcome::Failed(err) = &outcome else {
         panic!("a transient acquisition failure earns a retry, got {outcome:?}");
     };
+    // Spelled against the constant, not a literal: the message carries the
+    // configured budget, so a literal here is a second copy of the default
+    // that goes stale the next time the budget moves.
     assert!(
-        err.contains("could not be produced on scan attempt 1 of 5"),
+        err.contains(&format!(
+            "could not be produced on scan attempt 1 of {DEFAULT_MAX_ATTEMPTS}"
+        )),
         "{err}"
     );
     assert!(err.contains("upstream_5xx"), "{err}");
@@ -7787,7 +7806,7 @@ async fn an_exhausted_attempt_budget_declines_the_retry_and_records_the_rows_own
 
     let job = ScanJob {
         format: "oci".to_string(),
-        ..sample_scan_job(artifact_id, 5)
+        ..sample_scan_job(artifact_id, BUDGET_SPENT)
     };
     let outcome = uc.run_scan(&job).await.expect("run_scan");
     assert!(
@@ -8449,15 +8468,95 @@ async fn a_promoted_constituent_stops_holding_on_a_missing_decoder_but_not_on_a_
     );
 }
 
+/// **The second refusal pair, end to end** — the one the live defect was.
+///
+/// A layer whose tree no analyzer claimed stops holding on a promoted
+/// policy: nothing in "no analyzer matched" is a statement that these
+/// bytes are dangerous, and ADR 0064 D2 governs the absence of an
+/// assessment exactly as it governs a finding. The layer lands on a
+/// completed not-applicable assessment, so it releases on its own time
+/// gate instead of sitting `scan_indeterminate` with `last_scan_at` NULL
+/// while the manifest that composes it serves — which is the state a
+/// client resolving a manifest and fetching its layers hits as a 503.
+///
+/// Paired with the refusal that must keep holding the same row for the
+/// opposite reason: `IncompleteComposition` is the *composition's* own
+/// absent assessment, so there is nothing above it to hand the
+/// obligation to, and moving it would release a layer on the strength of
+/// an image nobody assembled.
+#[tokio::test]
+async fn a_promoted_constituent_stops_holding_when_no_analyzer_matched_its_tree() {
+    let (outcome, _events, artifacts, artifact_id, uc, job) = constituent_scan(
+        seed_promoted_policy(vec!["trivy".into()]),
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NoAnalyzerMatched,
+        )),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "no analyzer claiming the layer's tree is an absence of analysis the \
+         composition carries, not a hold on the layer: {outcome:?}"
+    );
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    assert_ne!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "the layer must not be left terminal for an assessment it does not owe"
+    );
+
+    let (outcome, _events, artifacts, artifact_id, uc, job) = constituent_scan(
+        seed_promoted_policy(vec!["trivy".into()]),
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::IncompleteComposition,
+        )),
+    )
+    .await;
+    assert!(
+        matches!(outcome, ScanRunOutcome::NothingAnalysable { .. }),
+        "an image that was never assembled is the composition's own absent \
+         assessment: {outcome:?}"
+    );
+    uc.record_outcome(&job, outcome)
+        .await
+        .expect("record_outcome");
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("the artifact row")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "there is nothing above an unassembled composition for the obligation to move to"
+    );
+}
+
 /// And the other refusals keep holding a promoted constituent too — only
-/// the missing decoder moved. Stated separately from the pair above
-/// because this is about the rest of the enum: a refusal that drifted
-/// onto the non-gating side would release a layer nothing assessed.
+/// the two that state an *absence of analysis* moved. Stated separately
+/// from the pairs above because this is about the rest of the enum: a
+/// refusal that drifted onto the non-gating side would release a layer
+/// nothing assessed.
+///
+/// `UnusableArchive` is here even though ADR 0064 D2 names it in the same
+/// sentence as the decoder case: the trivy adapter reaches it both for
+/// "no decoder for this compression" (which D2 places with the
+/// composition) and for "an extraction bound tripped / an entry tried to
+/// escape the workspace" (which keeps gating), and until those are two
+/// reasons the fail-closed reading is the only safe one.
 #[tokio::test]
 async fn a_promoted_constituent_still_holds_on_every_other_refusal() {
     for refusal in [
         NotAnalysable::UnusableArchive,
-        NotAnalysable::NoAnalyzerMatched,
         NotAnalysable::IncompleteComposition,
     ] {
         let (outcome, _events, artifacts, artifact_id, uc, job) = constituent_scan(
@@ -8937,7 +9036,7 @@ async fn a_promoted_transient_refusal_holds_the_manifest_once_the_budget_is_spen
         DomainError::Invariant("upstream:timeout:deadline exceeded".to_string()),
     );
 
-    // Attempt 1 of 5: the request is granted and nothing holds yet —
+    // Attempt 1 of the budget: the request is granted and nothing holds yet —
     // identical to the unpromoted run, because whether a composition can
     // be *produced* does not depend on whose verdict it would be.
     let first = uc
@@ -8949,11 +9048,11 @@ async fn a_promoted_transient_refusal_holds_the_manifest_once_the_budget_is_spen
         "a transient refusal earns its retry under promotion too: {first:?}"
     );
 
-    // Attempt 5 of 5: the request is declined, and now the absence is
+    // The last attempt of the budget: the request is declined, and now the absence is
     // the manifest's.
     let last_attempt = ScanJob {
         format: "oci".to_string(),
-        ..sample_scan_job(artifact_id, 5)
+        ..sample_scan_job(artifact_id, BUDGET_SPENT)
     };
     let outcome = uc.run_scan(&last_attempt).await.expect("run_scan");
     let ScanRunOutcome::NothingAnalysable { ref reason, .. } = outcome else {

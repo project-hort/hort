@@ -88,7 +88,9 @@ pub(crate) async fn serve_sidecar(
     // Quarantine inheritance (§11): if the target is non-servable, return
     // the SAME response the file GET would — before any CAS read or cache
     // lookup, so a held digest is never computed or leaked.
-    if let Some(blocked) = crate::non_servable_response(&artifact) {
+    if let Some(blocked) =
+        crate::non_servable_response(&artifact, ctx.quarantine_retry_after_floor_secs)
+    {
         return Ok(blocked);
     }
 

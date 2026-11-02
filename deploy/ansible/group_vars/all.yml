@@ -52,6 +52,14 @@ hort_metrics_port: 9090
 # Empty (default) = every IP is rate-limited. Only list source ranges you trust.
 hort_ratelimit_exempt_cidrs: ""
 
+# HORT_SCANNER_MAX_ATTEMPTS — executions a failing job row gets before it
+# becomes a permanent `failed` row. Shared by both flavors so one override
+# reaches the podman and native worker env files alike. The retry curve waits
+# 1, 5, 30, 60 then 60 minutes, so six executions put ~156 minutes between a
+# job's first failure and its terminal row; raising this buys more window at
+# 60 minutes per extra attempt.
+hort_scanner_max_attempts: 6
+
 # ── Dex IdP sidecar (optional, shared by both flavors) ────────────────────────
 # Minimal OIDC IdP for the human-admin path: human admin is OIDC (Dex) ->
 # CliSession, not a static service-account token. Default OFF — the base deploy

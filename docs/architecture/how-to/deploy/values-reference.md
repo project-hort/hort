@@ -754,7 +754,7 @@ exposes named keys.
 
 | env var | default | purpose |
 |---|---|---|
-| `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS` | `30` | Negative-cache TTL for upstream `404` responses. Followers see the same `404` for this window without re-querying upstream. |
+| `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS` | `30` | Negative-cache TTL for upstream `404` responses. Followers see the same `404` for this window without re-querying upstream. This is the deployment-wide default; an `UpstreamMapping` can override it per upstream with `spec.notFoundCacheSeconds`. |
 | `HORT_PULL_DEDUP_TTL_UNAVAILABLE_SECS` | `10` | Short-cache TTL for upstream `5xx` and `429`. A single rate-limit burst against the upstream registry produces one upstream request and N short-cached `502 Bad Gateway` responses — set this conservatively to avoid amplifying transient upstream issues. |
 | `HORT_PULL_DEDUP_TTL_TIMEOUT_SECS` | `10` | Short-cache TTL for upstream timeouts and network errors. Same rationale as `UNAVAILABLE`. |
 | `HORT_PULL_DEDUP_TTL_CHECKSUM_MISMATCH_SECS` | `60` | Short-cache TTL for upstream-checksum-mismatch outcomes. Longer than `UNAVAILABLE` because checksum mismatch is a content-integrity signal, not a transient transport issue — re-fetching immediately wastes bandwidth on the same poisoned upstream. |
@@ -1182,7 +1182,7 @@ advisory-watch-tick, staging-sweep, etc.).
 | `worker.resources` | object | `{cpu, memory}` | no |
 | `worker.scanner.pollIntervalSecs` | integer | `5` | no |
 | `worker.scanner.batchSize` | integer | `4` | no |
-| `worker.scanner.maxAttempts` | integer | `5` | no |
+| `worker.scanner.maxAttempts` | integer | `6` | no |
 | `worker.scanner.lockDurationSecs` | integer | `900` | no |
 | `worker.scanner.trivy.enabled` | boolean | `true` | no |
 | `worker.scanner.trivy.binary` | string | `/usr/local/bin/trivy` | no |

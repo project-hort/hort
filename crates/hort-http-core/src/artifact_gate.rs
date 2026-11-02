@@ -30,6 +30,22 @@
 //!   (ADR 0008).
 //! - It builds no response for `None` / `Released`. Those return
 //!   [`None`] and the caller continues to its own happy path.
+//!
+//! ## The seconds and the envelope are scoped differently
+//!
+//! [`non_servable_response`] is the refusal envelope for the four
+//! hosted/proxy content routes above. OCI deliberately does not share
+//! it: an OCI refusal is an `{"errors":[{"code":…}]}` document defined
+//! by another protocol, built in `hort_http_oci::error`.
+//!
+//! What the two **do** share is [`quarantine_retry_after_seconds`].
+//! How long a held artifact tells a client to wait is a property of the
+//! hold, not of the protocol carrying the refusal, and the cost of
+//! transcribing it twice was measured: a container pull is an OCI
+//! request, so the copy that answered the pull was the OCI one, and a
+//! correction applied to this file alone would have left it untouched.
+
+use std::num::NonZeroU32;
 
 use axum::body::Body;
 use axum::http::StatusCode;
@@ -52,27 +68,77 @@ use hort_domain::events::RejectionReason;
 /// and such a row is outside the release sweep's candidacy filter
 /// (`quarantine_window_start IS NOT NULL`) as well, so "unknown" is the
 /// honest answer rather than a computed one.
-const DEFAULT_QUARANTINE_RETRY_AFTER_SECS: i64 = 3600;
+///
+/// Deliberately **not** subject to the floor below: the floor corrects a
+/// window-derived number that has gone too small, and an hour is never
+/// too small. The two branches answer different questions and keep
+/// their own reasoning.
+pub const DEFAULT_QUARANTINE_RETRY_AFTER_SECS: i64 = 3600;
+
+/// Default floor for the window-derived `Retry-After`, in seconds — what
+/// `HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS` carries when the operator
+/// sets nothing.
+///
+/// **The only definition of this number.** `hort_server::config` parses
+/// the env var with `.get()` of this constant as the default, and the
+/// mock-context builder seeds the same constant, so a test expectation
+/// and a production answer cannot drift apart.
+///
+/// 20 s is scan-interval-shaped: long enough that a client polling a
+/// held artifact costs one request per scan turnaround rather than one
+/// per second, short enough that a release landing early is not waited
+/// out. An operator whose scanners are slower raises it.
+///
+/// [`NonZeroU32`] rather than `u32` so "never advertise
+/// `Retry-After: 0`" (spec-legal, easy to misparse) is a property of the
+/// type instead of a `.max(1)` every consumer has to remember — the same
+/// carry as [`crate::middleware::load_shed::ConcurrencyLimitConfig`]'s
+/// caps, which hold their non-zero invariant from the env parse to the
+/// middleware constructor. The parse rejects `0` with
+/// `ConfigError::ValueNotPositive`, and it has to: a zero floor restores
+/// exactly the behaviour this constant exists to remove.
+pub const DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS: NonZeroU32 =
+    NonZeroU32::new(20).expect("20 is non-zero");
 
 /// Seconds to advertise in `Retry-After` for a quarantined artifact, or
 /// [`None`] when the hold has no deadline to advertise.
 ///
+/// **The one definition of this computation.** The OCI pull path calls
+/// it too (`hort_http_oci::quarantine::check_quarantine`) and wraps only
+/// its own protocol envelope around the answer.
+///
 /// A hold that resolves itself with the passage of time — the artifact's
-/// own scan verdict is what is outstanding — answers from its own window,
-/// clamped to `>= 1` so a client never gets `Retry-After: 0` (spec-legal
-/// but easy to misparse). A hold waiting on an **external** event, which
-/// is what `provenance_hold_indefinite` records, has no such deadline and
-/// therefore advertises none: the clamp would otherwise tell a
-/// well-behaved client to come back one second later, forever (ADR 0039
-/// D5).
-fn quarantine_retry_after_seconds(artifact: &Artifact) -> Option<i64> {
+/// own scan verdict is what is outstanding — answers from its own
+/// window, floored at `floor_secs`.
+///
+/// The floor is the correction for what the subtraction cannot know.
+/// `(deadline - now)` measures when the observation **window** ends, and
+/// the window ending is not the event the caller is waiting for:
+/// `ArtifactReleased` follows the scan verdict. Once the deadline is in
+/// the past the subtraction is negative, and the honest answer there is
+/// not "immediately" but "about as long as a scan takes" — which is why
+/// the floor is an operator knob rather than a constant. A floor only
+/// bites when the computed value is below it, so a genuine long window
+/// is unaffected.
+///
+/// A hold waiting on an **external** event, which is what
+/// `provenance_hold_indefinite` records, has no deadline at all and
+/// therefore advertises none: a floor there would tell a well-behaved
+/// client to come back in `floor_secs` seconds, forever (ADR 0039 D5).
+/// A floored lie is cheaper than a one-second lie and still a lie, so
+/// [`None`] stays [`None`].
+pub fn quarantine_retry_after_seconds(artifact: &Artifact, floor_secs: NonZeroU32) -> Option<i64> {
     if artifact.provenance_hold_indefinite {
         return None;
     }
     Some(
         artifact
             .quarantine_deadline
-            .map(|deadline| (deadline - Utc::now()).num_seconds().max(1))
+            .map(|deadline| {
+                (deadline - Utc::now())
+                    .num_seconds()
+                    .max(i64::from(floor_secs.get()))
+            })
             .unwrap_or(DEFAULT_QUARANTINE_RETRY_AFTER_SECS),
     )
 }
@@ -138,11 +204,23 @@ fn rejected_response(artifact: &Artifact) -> Response {
 /// The `match` is exhaustive with **no wildcard arm**, so a future
 /// [`QuarantineStatus`] variant is a compile error here rather than a
 /// fall-through that serves withheld bytes.
-pub fn non_servable_response(artifact: &Artifact) -> Option<Response> {
+///
+/// `retry_after_floor_secs` is the operator-configured floor
+/// (`AppContext::quarantine_retry_after_floor_secs`,
+/// `HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`). It arrives as an argument
+/// rather than through the context so this function — and the
+/// arithmetic behind it — stays a pure function of its inputs, unit
+/// testable without a composed application, and so the value a request
+/// answers with is the one the composition root wired rather than
+/// anything process-global.
+pub fn non_servable_response(
+    artifact: &Artifact,
+    retry_after_floor_secs: NonZeroU32,
+) -> Option<Response> {
     match artifact.quarantine_status {
         QuarantineStatus::Quarantined => {
             let mut builder = Response::builder().status(StatusCode::SERVICE_UNAVAILABLE);
-            if let Some(secs) = quarantine_retry_after_seconds(artifact) {
+            if let Some(secs) = quarantine_retry_after_seconds(artifact, retry_after_floor_secs) {
                 builder = builder.header("Retry-After", secs.to_string());
             }
             Some(
@@ -189,6 +267,12 @@ mod tests {
         (status, retry_after, serde_json::from_slice(&body).unwrap())
     }
 
+    /// A floor deliberately **not** equal to
+    /// [`DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`]. An expectation
+    /// derived from the default cannot tell "the argument is wired" from
+    /// "the number is baked into the arithmetic"; this one can.
+    const TEST_FLOOR: NonZeroU32 = NonZeroU32::new(45).expect("45 is non-zero");
+
     /// A `Rejected` artifact whose axis has already been hydrated, as
     /// every production read path hands it to the gate.
     fn rejected_with(axis: Option<RejectionReason>) -> Artifact {
@@ -199,52 +283,132 @@ mod tests {
 
     // -- Quarantined: the Retry-After rule --------------------------------
 
+    /// A window with real time left on it answers its own remaining
+    /// delta, and the floor is inert. The window is chosen an order of
+    /// magnitude above [`TEST_FLOOR`] so the two answers cannot be
+    /// confused: a regression that returned the floor unconditionally
+    /// fails the lower bound here.
     #[test]
     fn in_window_hold_keeps_its_computed_retry_after() {
+        const WINDOW_SECS: i64 = 600;
         let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
-        artifact.quarantine_deadline = Some(Utc::now() + Duration::seconds(60));
+        artifact.quarantine_deadline = Some(Utc::now() + Duration::seconds(WINDOW_SECS));
         // The hydration never sets this inside the window; pinned here so
         // the two inputs cannot be conflated into one.
         artifact.provenance_hold_indefinite = false;
-        let (status, retry_after, body) = parts(non_servable_response(&artifact).unwrap());
+        let (status, retry_after, body) =
+            parts(non_servable_response(&artifact, TEST_FLOOR).unwrap());
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let secs: i64 = retry_after
             .expect("an in-window hold keeps its computed Retry-After")
             .parse()
             .unwrap();
-        assert!((1..=60).contains(&secs), "retry-after out of range: {secs}");
+        // A few seconds of slack for the clock between seeding and the
+        // response; the floor is far below the bottom of this range.
+        assert!(
+            (WINDOW_SECS - 5..=WINDOW_SECS).contains(&secs),
+            "retry-after out of range: {secs}"
+        );
+        assert!(
+            secs > i64::from(TEST_FLOOR.get()),
+            "a long window must answer its own delta, not the floor: {secs}"
+        );
         assert_eq!(body["error"], "artifact is quarantined");
     }
 
+    /// A deadline already in the past answers the **configured floor**.
+    ///
+    /// What it used to answer was `1`: the subtraction is negative there
+    /// and the old clamp lifted it to one second, which a client
+    /// honouring `Retry-After` turns into one poll per second for as long
+    /// as the artifact's scan verdict takes to land. The window ending is
+    /// not what that client is waiting for.
     #[test]
-    fn elapsed_window_clamps_to_one_second() {
+    fn an_elapsed_window_answers_the_configured_floor() {
         let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
         artifact.quarantine_deadline = Some(Utc::now() - Duration::seconds(60));
-        let (_, retry_after, _) = parts(non_servable_response(&artifact).unwrap());
-        assert_eq!(retry_after.as_deref(), Some("1"));
+        let (_, retry_after, _) = parts(non_servable_response(&artifact, TEST_FLOOR).unwrap());
+        let expected = TEST_FLOOR.get().to_string();
+        assert_eq!(retry_after.as_deref(), Some(expected.as_str()));
+    }
+
+    /// The floor bites inside the window too, whenever what is left of it
+    /// is smaller than the floor — the state a zero-duration policy puts
+    /// every freshly-ingested artifact in. Nothing about "the window has
+    /// elapsed" is load-bearing; "the computed value is below the floor"
+    /// is.
+    #[test]
+    fn a_window_shorter_than_the_floor_answers_the_floor() {
+        let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
+        artifact.quarantine_deadline = Some(Utc::now() + Duration::seconds(2));
+        let (_, retry_after, _) = parts(non_servable_response(&artifact, TEST_FLOOR).unwrap());
+        let expected = TEST_FLOOR.get().to_string();
+        assert_eq!(retry_after.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
     fn a_hold_with_no_deadline_falls_back_to_the_unknown_hour() {
         let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
         artifact.quarantine_deadline = None;
-        let (_, retry_after, _) = parts(non_servable_response(&artifact).unwrap());
+        let (_, retry_after, _) = parts(non_servable_response(&artifact, TEST_FLOOR).unwrap());
         assert_eq!(
             retry_after.as_deref(),
             Some(DEFAULT_QUARANTINE_RETRY_AFTER_SECS.to_string().as_str())
         );
     }
 
+    /// The floor is not a substitute for the deadline-unknown fallback:
+    /// the two answer different questions, so an absent deadline keeps
+    /// its hour even under a floor that exceeds it. Asserted with an
+    /// absurd floor precisely because that is the only configuration in
+    /// which the two branches are distinguishable at all — under any
+    /// sane floor the hour is already above it.
+    #[test]
+    fn an_absent_deadline_is_not_floored() {
+        const ABSURD_FLOOR: NonZeroU32 = NonZeroU32::new(2 * 3600).expect("two hours is non-zero");
+        assert!(
+            i64::from(ABSURD_FLOOR.get()) > DEFAULT_QUARANTINE_RETRY_AFTER_SECS,
+            "the premise of this test is a floor above the fallback"
+        );
+        let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
+        artifact.quarantine_deadline = None;
+        let (_, retry_after, _) = parts(non_servable_response(&artifact, ABSURD_FLOOR).unwrap());
+        assert_eq!(
+            retry_after.as_deref(),
+            Some(DEFAULT_QUARANTINE_RETRY_AFTER_SECS.to_string().as_str()),
+            "an unknown deadline answers the hour, floored or not"
+        );
+    }
+
+    /// The default the operator gets when they set nothing is this
+    /// crate's constant and not a second copy of `20` somewhere in the
+    /// arithmetic.
+    #[test]
+    fn the_default_floor_is_what_an_elapsed_window_answers() {
+        let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
+        artifact.quarantine_deadline = Some(Utc::now() - Duration::seconds(60));
+        let secs =
+            quarantine_retry_after_seconds(&artifact, DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS)
+                .expect("a timed hold advertises a deadline");
+        assert_eq!(
+            secs,
+            i64::from(DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS.get())
+        );
+        assert_ne!(secs, 1, "the one-second clamp is what this replaced");
+    }
+
     /// ADR 0039 D5 — the hold whose window has elapsed and which is still
     /// waiting on a signature keeps the 503 and drops the header. Without
-    /// this the answer is `Retry-After: 1` on every pull, forever (the
-    /// clamp above).
+    /// this the answer is the floor above on every pull, forever: an
+    /// external signature is not an event a delta-seconds number can
+    /// describe at any value.
     #[test]
     fn a_hold_with_no_self_resolving_deadline_advertises_none() {
         let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
         artifact.quarantine_deadline = Some(Utc::now() - Duration::seconds(60));
         artifact.provenance_hold_indefinite = true;
-        let (status, retry_after, body) = parts(non_servable_response(&artifact).unwrap());
+        let (status, retry_after, body) =
+            parts(non_servable_response(&artifact, TEST_FLOOR).unwrap());
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             retry_after, None,
@@ -263,7 +427,7 @@ mod tests {
         let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
         artifact.quarantine_deadline = Some(Utc::now() + Duration::seconds(60));
         artifact.provenance_hold_indefinite = true;
-        let (_, retry_after, _) = parts(non_servable_response(&artifact).unwrap());
+        let (_, retry_after, _) = parts(non_servable_response(&artifact, TEST_FLOOR).unwrap());
         assert_eq!(retry_after, None);
     }
 
@@ -283,7 +447,8 @@ mod tests {
         );
         for sample in RejectionReason::ALL_KIND_SAMPLES {
             let artifact = rejected_with(Some(sample.clone()));
-            let (status, retry_after, body) = parts(non_servable_response(&artifact).unwrap());
+            let (status, retry_after, body) =
+                parts(non_servable_response(&artifact, TEST_FLOOR).unwrap());
             assert_eq!(status, StatusCode::FORBIDDEN, "{sample:?}");
             assert_eq!(retry_after, None, "a rejection is terminal: {sample:?}");
             assert_eq!(body["error"], "artifact is rejected");
@@ -304,7 +469,7 @@ mod tests {
     #[tokio::test]
     async fn no_refusal_body_carries_a_uuid_or_a_cve_identifier() {
         crate::test_support::assert_refusal_leaks_no_uuid_or_cve(|axis| async move {
-            let response = non_servable_response(&rejected_with(axis)).unwrap();
+            let response = non_servable_response(&rejected_with(axis), TEST_FLOOR).unwrap();
             let status = response.status();
             let bytes = to_bytes(response.into_body(), 4 * 1024).await.unwrap();
             (status, serde_json::from_slice(&bytes).unwrap())
@@ -323,7 +488,7 @@ mod tests {
     #[test]
     fn an_unrecoverable_axis_emits_no_field_and_tells_the_operator() {
         let artifact = rejected_with(None);
-        let (status, _, body) = parts(non_servable_response(&artifact).unwrap());
+        let (status, _, body) = parts(non_servable_response(&artifact, TEST_FLOOR).unwrap());
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "artifact is rejected");
         assert!(
@@ -355,7 +520,7 @@ mod tests {
     #[test]
     fn a_recoverable_axis_raises_no_alarm() {
         let artifact = rejected_with(Some(RejectionReason::Scanner));
-        let (status, _, body) = parts(non_servable_response(&artifact).unwrap());
+        let (status, _, body) = parts(non_servable_response(&artifact, TEST_FLOOR).unwrap());
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["axis"], "scanner");
         logs_assert(
@@ -373,7 +538,8 @@ mod tests {
     #[test]
     fn scan_indeterminate_is_terminal_and_carries_no_retry_after() {
         let artifact = sample_artifact(QuarantineStatus::ScanIndeterminate);
-        let (status, retry_after, body) = parts(non_servable_response(&artifact).unwrap());
+        let (status, retry_after, body) =
+            parts(non_servable_response(&artifact, TEST_FLOOR).unwrap());
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(retry_after, None);
         assert_eq!(body["error"], "artifact scan is indeterminate");
@@ -383,7 +549,7 @@ mod tests {
     fn a_servable_artifact_yields_no_response() {
         for status in [QuarantineStatus::None, QuarantineStatus::Released] {
             assert!(
-                non_servable_response(&sample_artifact(status)).is_none(),
+                non_servable_response(&sample_artifact(status), TEST_FLOOR).is_none(),
                 "{status:?} is servable; the caller owns the happy path"
             );
         }

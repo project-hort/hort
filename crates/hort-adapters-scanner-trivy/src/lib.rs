@@ -1503,6 +1503,16 @@ mod tests {
     /// regular file in the same layer. Before the fix this scan returned
     /// `NotApplicable`, which does not gate, so the layer released under
     /// `ScanSucceeded` without its package database ever being read.
+    ///
+    /// The two values are still different answers, and this adapter's job
+    /// is to return the right one — but *what* the gating one costs the
+    /// layer is `NotAnalysable::gates_release`'s call, not this
+    /// assertion's. On a constituent under a promoted composite verdict
+    /// it no longer holds the layer, because the composition is where
+    /// that symlink is materialised and the package database read
+    /// (ADR 0064 D2). Everywhere else — every unpromoted repository,
+    /// every non-constituent kind — it is the fail-closed hold this test
+    /// was written for.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_rootfs_report_with_no_results_over_a_tree_missing_link_entries_is_a_hold() {

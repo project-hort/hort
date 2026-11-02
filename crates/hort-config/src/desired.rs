@@ -1629,11 +1629,27 @@ fn push_upstream_mapping_reference_errors(
     }
 }
 
-/// `spec.upstreamNamePrefix` is OCI-effective only.
-/// A non-OCI repository (npm, PyPI, Cargo, Maven, etc.) carrying the
-/// field is rejected at gitops parse time — those format adapters
-/// don't consume the field, so silently persisting it would diverge
-/// gitops state from runtime behaviour.
+/// Two `UpstreamMapping` fields are **format-effective**: only one
+/// format's adapter consumes each, so a mapping declaring one against a
+/// repository of any other format would be persisted and then decide
+/// nothing. Both are rejected at gitops validate time rather than
+/// silently stored ([ADR 0015](../../docs/adr/0015-apply-time-linter-inert-fields-and-naming.md)).
+///
+/// - `spec.upstreamNamePrefix` — **OCI only**. The other format
+///   adapters don't splice it into outbound URL composition, and an
+///   operator can get the same shape by including the prefix in
+///   `upstreamUrl` because their format-native paths pin no fixed root.
+/// - `spec.notFoundCacheSeconds` — **Maven only**, today. The value is
+///   read by the *caller* that already resolved the mapping and handed
+///   to `PullDedup`'s coalesce entry points, and only the Maven
+///   pull-through legs pass it; every other format's legs pass `None`.
+///   So on a non-Maven repository the field would be an inert risk
+///   knob: the operator declares a 1-hour negative cache and gets the
+///   deployment's 30 s. Wiring another format is a call-site change
+///   with no schema or validator work, and **this rejection is deleted
+///   for that format in the same change** — keeping it past the
+///   condition that justified it would refuse a configuration that
+///   works.
 ///
 /// The check runs *after* `push_upstream_mapping_reference_errors`, so
 /// a mapping whose `spec.repository` doesn't resolve to a declared
@@ -1645,6 +1661,24 @@ fn push_upstream_mapping_format_compatibility_errors(
     state: &DesiredState,
     errors: &mut Vec<ValidationError>,
 ) {
+    /// `(field name, the one format whose adapter consumes it, what to
+    /// do instead)`, with the per-envelope predicate that says whether
+    /// this envelope declares the field at all.
+    type FormatEffectiveField = (&'static str, &'static str, &'static str);
+    const NAME_PREFIX: FormatEffectiveField = (
+        "spec.upstreamNamePrefix",
+        "oci",
+        "Either remove the field (no other format adapter consumes it) \
+         or change the repository's format to `oci`.",
+    );
+    const NOT_FOUND_TTL: FormatEffectiveField = (
+        "spec.notFoundCacheSeconds",
+        "maven",
+        "Remove the field — the pull-through legs of the other formats \
+         pass the deployment-wide HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS, so \
+         a value here would be stored and never read.",
+    );
+
     let repos_by_name: HashMap<&str, &str> = state
         .repositories
         .iter()
@@ -1652,26 +1686,30 @@ fn push_upstream_mapping_format_compatibility_errors(
         .collect();
 
     for env in &state.upstream_mappings {
-        let Some(_) = env.spec.upstream_name_prefix.as_ref() else {
+        let declared: [(FormatEffectiveField, bool); 2] = [
+            (NAME_PREFIX, env.spec.upstream_name_prefix.is_some()),
+            (NOT_FOUND_TTL, env.spec.not_found_cache_seconds.is_some()),
+        ];
+        if !declared.iter().any(|(_, set)| *set) {
             continue;
-        };
+        }
         let Some(&format) = repos_by_name.get(env.spec.repository.as_str()) else {
             // Dangling reference — already reported by
             // `push_upstream_mapping_reference_errors`. Skip.
             continue;
         };
-        if format != "oci" {
-            errors.push(ValidationError::Invalid {
-                kind: Kind::UpstreamMapping,
-                name: env.metadata.name.clone(),
-                detail: format!(
-                    "spec.upstreamNamePrefix is OCI-effective only; \
-                     repository `{}` has format `{format}`. Either remove \
-                     the field (no other format adapter consumes it) or \
-                     change the repository's format to `oci`.",
-                    env.spec.repository
-                ),
-            });
+        for ((field, effective_format, remedy), set) in declared {
+            if set && format != effective_format {
+                errors.push(ValidationError::Invalid {
+                    kind: Kind::UpstreamMapping,
+                    name: env.metadata.name.clone(),
+                    detail: format!(
+                        "{field} is {effective_format}-effective only; repository \
+                         `{}` has format `{format}`. {remedy}",
+                        env.spec.repository
+                    ),
+                });
+            }
         }
     }
 }
@@ -3683,6 +3721,113 @@ metadata:
         state
             .validate()
             .expect("npm + no field must validate clean (back-compat)");
+    }
+
+    fn um_yaml_with_not_found_ttl(
+        meta_name: &str,
+        repository: &str,
+        seconds: Option<u32>,
+    ) -> Vec<u8> {
+        let ttl_line = match seconds {
+            Some(v) => format!("  notFoundCacheSeconds: {v}\n"),
+            None => String::new(),
+        };
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: {meta_name}
+spec:
+  repository: {repository}
+  pathPrefix: ''
+  upstreamUrl: https://repo1.maven.org/maven2
+{ttl_line}  auth:
+    type: anonymous
+"
+        )
+        .into_bytes()
+    }
+
+    /// `notFoundCacheSeconds` is Maven-effective today: only the Maven
+    /// pull-through legs pass it to `PullDedup`. Declared against any
+    /// other format it would be stored and never read — the operator
+    /// sets an hour and gets the deployment's 30 s — so it is rejected
+    /// rather than silently persisted (ADR 0015).
+    #[test]
+    fn validate_rejects_not_found_cache_seconds_on_a_non_maven_repository() {
+        for (repo_format, repo_name) in [("npm", "npm-mirror"), ("oci", "oci-mirror")] {
+            let files = vec![
+                (
+                    p("repo.yaml"),
+                    repo_yaml_with_format(repo_name, repo_format, "proxy"),
+                ),
+                (
+                    p("mapping.yaml"),
+                    um_yaml_with_not_found_ttl("um", repo_name, Some(3600)),
+                ),
+            ];
+            let state = DesiredState::parse_files(files).unwrap();
+            let err = state
+                .validate()
+                .err()
+                .unwrap_or_else(|| panic!("{repo_format} + notFoundCacheSeconds must be rejected"));
+            let combined = err
+                .0
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                combined.contains("notFoundCacheSeconds"),
+                "error must name the offending field; got `{combined}`"
+            );
+            assert!(
+                combined.contains(repo_format),
+                "error must name the actual repository format; got `{combined}`"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_not_found_cache_seconds_on_a_maven_repository() {
+        let files = vec![
+            (
+                p("repo.yaml"),
+                repo_yaml_with_format("maven-mirror", "maven", "proxy"),
+            ),
+            (
+                p("mapping.yaml"),
+                um_yaml_with_not_found_ttl("um", "maven-mirror", Some(3600)),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        state.validate().expect("maven + field must validate clean");
+    }
+
+    /// Back-compat: every existing mapping omits the field, so no
+    /// format may be refused for lacking it.
+    #[test]
+    fn validate_accepts_any_format_without_not_found_cache_seconds() {
+        for (repo_format, repo_name) in [
+            ("npm", "npm-mirror"),
+            ("oci", "oci-mirror"),
+            ("maven", "maven-mirror"),
+        ] {
+            let files = vec![
+                (
+                    p("repo.yaml"),
+                    repo_yaml_with_format(repo_name, repo_format, "proxy"),
+                ),
+                (
+                    p("mapping.yaml"),
+                    um_yaml_with_not_found_ttl("um", repo_name, None),
+                ),
+            ];
+            let state = DesiredState::parse_files(files).unwrap();
+            state
+                .validate()
+                .unwrap_or_else(|e| panic!("{repo_format} + no field must validate clean: {e:?}"));
+        }
     }
 
     #[test]

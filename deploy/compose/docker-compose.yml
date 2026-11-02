@@ -417,7 +417,7 @@ services:
       # priority, not by claim throughput — the sweep was never claim-starved.)
       HORT_SCANNER_POLL_INTERVAL_SECS: "5"
       HORT_SCANNER_BATCH_SIZE: "4"
-      HORT_SCANNER_MAX_ATTEMPTS: "5"
+      HORT_SCANNER_MAX_ATTEMPTS: "6"
       HORT_SCANNER_LOCK_DURATION_SECS: "900"
       HORT_WORKER_ID: "hort-worker-v2"
       # Keyed (pinned-public-key) cosign provenance backend (ADR 0039).

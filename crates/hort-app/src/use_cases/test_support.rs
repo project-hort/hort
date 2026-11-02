@@ -91,7 +91,7 @@ use hort_domain::ports::stateful_upload_staging::{StagingAppend, StatefulUploadS
 use hort_domain::ports::storage::{CasIntegrityFailure, PutResult, StoragePort, StreamItem};
 use hort_domain::ports::upstream_proxy::{
     ArtifactFetch, BlobFetch, BlobStream, ManifestFetch, ManifestFetchOutcome,
-    MetadataFetchOutcome, ReferrerDescriptor, UpstreamProxy,
+    MetadataFetchOutcome, ReferrerDescriptor, UpstreamExistence, UpstreamProxy,
 };
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::ports::user_repository::UserRepository;
@@ -6639,6 +6639,33 @@ pub struct MockUpstreamProxy {
     artifacts: Mutex<HashMap<(String, String), MockArtifactEntry>>,
     /// One-shot failure for the next `fetch_artifact` call.
     next_artifact_error: Mutex<Option<DomainError>>,
+    /// Total `fetch_artifact` calls, fixture-match or not. The sibling of
+    /// `metadata_calls`: together with `probe_calls` they are what lets a
+    /// test assert the *cost* of a pull in upstream round trips, not only
+    /// its answer — and a cost regression is invisible to a test that
+    /// asserts the status alone.
+    artifact_calls: AtomicUsize,
+    /// Existence verdicts for `probe_artifact`, keyed by
+    /// `(path_prefix, path)` — the same key shape as `artifacts`.
+    ///
+    /// An **unseeded** key answers `UpstreamExistence::Unknown`, which is
+    /// deliberately not derived from whether `artifacts` holds the key.
+    /// Two reasons, and the second is the load-bearing one:
+    ///
+    /// - `Unknown` is what a real upstream says when it refuses HEAD, so
+    ///   it is a reachable production state rather than a shape no
+    ///   upstream can produce;
+    /// - it means a test that never heard of this method keeps the exact
+    ///   flow it had before the method existed. Deriving `Absent` from an
+    ///   unseeded `artifacts` entry would instead rewrite the premise of
+    ///   every fixture that deliberately omits a body — a follower
+    ///   adopting a dedup leader's already-verified content never fetches
+    ///   one, and that absence is the proof, not a miss.
+    ///
+    /// Seeding `Absent` or `Present` is therefore always explicit.
+    existence: Mutex<HashMap<(String, String), UpstreamExistence>>,
+    /// Total `probe_artifact` calls, seeded key or not.
+    probe_calls: AtomicUsize,
     /// Referrer fixtures keyed by
     /// `(path_prefix, upstream_name, digest)` (same key shape as
     /// `blobs`). Unseeded keys return the empty "no referrers" default,
@@ -6681,6 +6708,9 @@ impl MockUpstreamProxy {
             metadata_calls: AtomicUsize::new(0),
             artifacts: Mutex::new(HashMap::new()),
             next_artifact_error: Mutex::new(None),
+            artifact_calls: AtomicUsize::new(0),
+            existence: Mutex::new(HashMap::new()),
+            probe_calls: AtomicUsize::new(0),
             referrers: Mutex::new(HashMap::new()),
             next_referrers_error: Mutex::new(None),
             next_manifest_no_cache_handle: Mutex::new(false),
@@ -6744,6 +6774,27 @@ impl MockUpstreamProxy {
     /// Seed a one-shot failure on the next `fetch_artifact` call.
     pub fn fail_next_artifact_with(&self, err: DomainError) {
         *self.next_artifact_error.lock().unwrap() = Some(err);
+    }
+
+    /// Total `fetch_artifact` calls so far, fixture-match or not.
+    pub fn artifact_calls(&self) -> usize {
+        self.artifact_calls.load(Ordering::SeqCst)
+    }
+
+    /// Seed the `probe_artifact` existence verdict for
+    /// `(path_prefix, path)`. An unseeded key answers
+    /// [`UpstreamExistence::Unknown`] — see the field's own comment for
+    /// why that default is not derived from the artifact fixtures.
+    pub fn insert_existence(&self, path_prefix: &str, path: &str, existence: UpstreamExistence) {
+        self.existence
+            .lock()
+            .unwrap()
+            .insert((path_prefix.to_string(), path.to_string()), existence);
+    }
+
+    /// Total `probe_artifact` calls so far, seeded key or not.
+    pub fn probe_calls(&self) -> usize {
+        self.probe_calls.load(Ordering::SeqCst)
     }
 
     /// Seed a one-shot failure on the next `fetch_manifest` call.
@@ -7068,6 +7119,7 @@ impl UpstreamProxy for MockUpstreamProxy {
         mapping: RepositoryUpstreamMapping,
         path: String,
     ) -> BoxFuture<'_, DomainResult<ArtifactFetch>> {
+        self.artifact_calls.fetch_add(1, Ordering::SeqCst);
         let injected = self.next_artifact_error.lock().unwrap().take();
         let key = (mapping.path_prefix, path);
         let entry = self.artifacts.lock().unwrap().get(&key).cloned();
@@ -7118,6 +7170,27 @@ impl UpstreamProxy for MockUpstreamProxy {
             }
             Ok(entry)
         })
+    }
+
+    fn probe_artifact(
+        &self,
+        mapping: RepositoryUpstreamMapping,
+        path: String,
+    ) -> BoxFuture<'_, UpstreamExistence> {
+        self.probe_calls.fetch_add(1, Ordering::SeqCst);
+        // An unseeded key is `Unknown`, never `Absent`: the mock may only
+        // say "absent" where a test said so, because inventing a miss is
+        // the one failure this method's three states exist to prevent, and
+        // a double that can invent it in a fixture can teach a consumer to
+        // rely on it.
+        let seeded = self
+            .existence
+            .lock()
+            .unwrap()
+            .get(&(mapping.path_prefix, path))
+            .copied()
+            .unwrap_or(UpstreamExistence::Unknown);
+        Box::pin(async move { seeded })
     }
 }
 
@@ -7266,6 +7339,7 @@ mod upstream_metadata_mock_tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: now,
             updated_at: now,
         }
@@ -9079,6 +9153,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: now,
             updated_at: now,
         };
@@ -9852,6 +9927,7 @@ mod tests {
                 ca_bundle_ref: None,
                 pinned_cert_sha256: None,
                 allowed_realm_hosts: Vec::new(),
+                not_found_cache_seconds: None,
                 created_at: now,
                 updated_at: now,
             }

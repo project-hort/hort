@@ -96,8 +96,6 @@ spec:
   description: "Pull-through cache for the public npmjs.org registry"
   format: npm
   type: proxy
-  storage:
-    backend: filesystem
   proxy:
     upstreamUrl: "https://registry.npmjs.org"
   isPublic: true
@@ -1369,6 +1367,67 @@ this artifact's own `ScanSucceeded` / `ScanWaived`
 ([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)),
 whatever the anchor resolves to.
 
+### `kind: UpstreamMapping` — `spec.notFoundCacheSeconds`
+
+`spec.notFoundCacheSeconds: int` (optional; default = the deployment's
+`HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`, 30 s) is how long a `404` from
+**this** upstream stays negative-cached.
+
+```yaml
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: maven-central
+spec:
+  repository: maven-central-proxy
+  upstreamUrl: https://repo1.maven.org/maven2
+  auth:
+    type: anonymous
+  notFoundCacheSeconds: 3600
+```
+
+Absence is a property of the upstream, not of the deployment, and one
+number cannot be right for two upstreams with opposite behaviour:
+
+- A **release** upstream never gains a coordinate it refused. An
+  immutable release that is absent today is absent tomorrow, so a long
+  TTL costs nothing and saves a round-trip per repeat request.
+- A **snapshot** upstream gains coordinates constantly. The same long
+  TTL would answer `404` for a snapshot that has since been published.
+
+A virtual repository mixing a release upstream with a snapshot upstream
+— the ordinary Maven topology — has both at once, which is why the value
+belongs on the mapping rather than on the repository or the deployment.
+It is also why it is *not* on the repository: a virtual repository has
+no upstream, and the TTL is a statement about an upstream's behaviour.
+
+Omitting the field keeps the deployment-wide default, so no existing
+mapping changes behaviour.
+
+**`notFoundCacheSeconds: 0` is rejected at apply time**
+(`validate_not_found_cache_seconds`, per-envelope), and
+`hort-server validate-config` catches it offline. A zero TTL does not
+disable negative caching — it re-fetches on every retry inside the
+window, which is the coalescing loss the window exists to prevent. The
+deployment knob refuses `0` for the same reason. If you want this
+upstream re-checked promptly, give it a short positive value.
+
+The override applies to **`404` only**. Rate limiting, timeouts and a
+refuted checksum are statements about upstream health rather than about
+absence, and keep the deployment-wide
+`HORT_PULL_DEDUP_TTL_*` knobs.
+
+**The field is Maven-effective today, and declaring it elsewhere is
+rejected.** The value is read by the pull-through caller that already
+resolved the mapping, and only the Maven legs pass it to the coalescing
+window; the other formats' legs pass the deployment default. So a
+mapping declaring `notFoundCacheSeconds` against a repository of any
+other format is refused at validate time, exactly as
+`spec.upstreamNamePrefix` is refused outside OCI — storing it would mean
+an operator declaring an hour and getting 30 s. Wiring another format is
+a call-site change, and the rejection for that format goes away in the
+same change.
+
 ---
 
 ## 4b. The two machine-identity kinds
@@ -2003,8 +2062,6 @@ spec:
   name: "PyPI Curated"
   format: pypi
   type: hosted
-  storage:
-    backend: filesystem
   isPublic: true
   replicationPriority: local_only
   curationRules:

@@ -1,0 +1,36 @@
+# ScanPolicy for oci-trivy-composite-e2e — the enforcing, promoted
+# posture. Both halves are load-bearing and neither is a copy of
+# oci-trivy-e2e-scan.yaml's:
+#
+#   - `enforcement: reject` makes this a repository whose verdicts
+#     actually gate. Under `record` nothing gates, so a scenario run
+#     there cannot distinguish "the layer's absent assessment moved to
+#     the composition" from "no verdict was gating anything anyway".
+#   - `compositeVerdictMode: promoted` is the operator act ADR 0064 D6
+#     requires before a constituent's filesystem obligation may move at
+#     all. Without it the obligation would be dropped rather than moved:
+#     the composition decides nothing under `observed`, so a layer that
+#     stopped gating would be a layer nobody assessed.
+#
+# `scanBackends: ["trivy"]` is also required rather than incidental —
+# apply rejects `promoted` with an empty backend list, because a waived
+# scan returns before a composition is ever resolved.
+#
+# `quarantineDuration: 20s` keeps a genuine observation window (the
+# release waits on the window, not on a verdict) while staying inside a
+# scenario's patience.
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: oci-trivy-composite-e2e-scan
+spec:
+  scope:
+    repository: oci-trivy-composite-e2e
+  severityThreshold: high
+  quarantineDuration: 20s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["trivy"]
+  enforcement: reject
+  compositeVerdictMode: promoted
+  licensePolicy: {}

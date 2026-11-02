@@ -340,7 +340,7 @@ over a public or untrusted link.
 
 | Variable | Type | Default | Required? | Semantics |
 |---|---|---|---|---|
-| `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS` | u64 | `30` | No | Negative-cache TTL for upstream `NotFound`. |
+| `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS` | u64 | `30` | No | Negative-cache TTL for upstream `NotFound`. **Deployment-wide default only** — an `UpstreamMapping` may override it per upstream with `spec.notFoundCacheSeconds`, since absence is a property of the upstream (an immutable release that is absent stays absent; a snapshot upstream gains coordinates constantly). See [the gitops how-to](../how-to/declare-gitops-config.md). Zero is rejected here and there, for the same reason: it re-fetches on every retry inside the window instead of disabling the cache. |
 | `HORT_PULL_DEDUP_TTL_UNAVAILABLE_SECS` | u64 | `10` | No | TTL for RateLimited / upstream-5xx / upstream-4xx / Unauthorized. |
 | `HORT_PULL_DEDUP_TTL_TIMEOUT_SECS` | u64 | `10` | No | TTL for Timeout / NetworkError. |
 | `HORT_PULL_DEDUP_TTL_CHECKSUM_MISMATCH_SECS` | u64 | `60` | No | TTL for ChecksumMismatch / ParseError / BodyTooLarge / PinMismatch / CaUnknown. |
@@ -520,6 +520,7 @@ it is referenced, not scheduled here.
 | `HORT_OCI_MAX_SESSIONS_PER_PRINCIPAL` | u32 | `32` | No | Per-(repo, principal) OCI upload-session cap. |
 | `HORT_OCI_SESSION_MAX_AGE_SECS` | u64 | `3600` | No | OCI upload-session TTL. Hard-rejected above 7 days (`604800`) — a boot-time interlock. |
 | `HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS` | u64 | `10` | No | Bounded-await ceiling for the cold-pull-through blob-GET release race (issue #65): when a `Quarantined` artifact's window has already elapsed (release-pending on its own scan, not a genuine time-hold), the handler polls for up to this long before falling back to the pre-existing `503 + Retry-After`. `0` disables the wait entirely (pre-#65 behavior). Never delays a genuine, not-yet-elapsed time-quarantine — see `hort-http-oci::blobs::maybe_bounded_await_release`. |
+| `HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS` | u32 | `20` | No | Floor on the `Retry-After` a quarantined artifact advertises, applied by **every** content route (the four hosted/proxy formats and the OCI pull paths share one seconds computation). Only bites when the computed seconds-until-deadline falls below it, so a genuine long observation window is advertised unchanged; what it corrects is a deadline already in the past, where the remaining-window arithmetic goes negative and the real wait is the artifact's scan turnaround. Set it to match the deployment's scan interval. Minimum `1`; `0` aborts boot naming the variable — a zero floor re-advertises a near-immediate retry and turns one client poll into one per second. Does **not** apply to the indefinite provenance hold (which advertises no `Retry-After` at all, [ADR 0039](../../adr/0039-keyed-provenance-verification.md) D5) or to the 1-hour deadline-unknown fallback. |
 | `HORT_EVENT_CHAIN_CHECKPOINT_CADENCE_SECS` | u64 | `3600` | No | Signed-checkpoint cadence for the tamper-evident event chain (ADR 0002). Read by the always-on `eventstore-checkpoint` `dsn-direct` task. |
 | `HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS` | u64 | `86400` | No | Expected cadence of the `verify-event-chain` CronJob, used only to derive the staleness gauge (matches the chart's default `verifyEventChain` schedule). A query failure is logged and treated as "unknown" — never blocks boot. |
 | `HORT_EVENT_CHAIN_VERIFY_STALENESS_MULTIPLIER` | u32 | `3` | No | Multiplier on the expected interval above before the last-run gauge is considered stale (tolerates missed ticks before alarming). |
@@ -674,7 +675,7 @@ neither set the error surfaces the name `"DATABASE_URL"`.
 |---|---|---|---|---|
 | `HORT_SCANNER_POLL_INTERVAL_SECS` | u64 | `5` | No | Dispatcher poll interval. |
 | `HORT_SCANNER_BATCH_SIZE` | u32 | `4` | No | Jobs claimed per poll (clamped to `u16::MAX`). |
-| `HORT_SCANNER_MAX_ATTEMPTS` | u32 | `5` | No | Max scan attempts before a job is failed. |
+| `HORT_SCANNER_MAX_ATTEMPTS` | u32 | `6` | No | Max scan attempts before a job is failed. |
 | `HORT_SCANNER_LOCK_DURATION_SECS` | u64 | `900` (15 min) | No | Job lock / lease duration. |
 | `HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE` | bool | `true` | No | Break-glass switch for the cross-backend finding merge (ADR 0059). Default: for one advisory reported by two backends, the reading that actually assessed a severity supersedes one whose `Critical` is the fail-closed floor a backend fell back to — across tiers, so a scored `Medium` wins over an unassessed `Critical`. `false` reverts to strict always-fail-closed (the floor wins on tier alone), which makes the release gate **stricter**. Set from `worker.scanner.findingMerge.allowInformedDowngrade`. |
 

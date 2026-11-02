@@ -1,0 +1,50 @@
+# Kroki is a build-time tool only. Deployments serve local SVG files and
+# never call an external diagram-rendering API from user browsers.
+name: Site diagram rendering
+on:
+  pull_request:
+    paths:
+      - 'docs/operator/**'
+      - 'docs/developer/**'
+      - 'scripts/site/**'
+      - 'scripts/build-site.sh'
+      - 'site/assets/diagrams/**'
+      - 'site/assets/operator.css'
+      - '.github/workflows/site-diagrams.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'docs/operator/**'
+      - 'docs/developer/**'
+      - 'scripts/site/**'
+      - 'scripts/build-site.sh'
+      - 'site/assets/diagrams/**'
+      - '.github/workflows/site-diagrams.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagrams-and-site:
+    runs-on: ubuntu-latest
+    services:
+      kroki:
+        image: yuzutech/kroki:0.32.1
+        ports:
+          - 8000:8000
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check source-hashed, committed diagrams
+        run: python3 scripts/site/render_diagrams.py --check
+      - name: Validate Kroki rendering (Graphviz built into Kroki)
+        run: python3 scripts/site/render_diagrams.py --render --force --kroki-url http://127.0.0.1:8000
+      - name: Build public sites and verify links/assets
+        run: scripts/build-site.sh
+      - name: Check diagram unit tests
+        run: python3 -m unittest discover -s scripts/site/tests -v
+      - name: Upload pre-rendered static website
+        uses: actions/upload-artifact@v4
+        with:
+          name: hort-sites-with-pre-rendered-diagrams
+          path: site/dist/
+          if-no-files-found: error

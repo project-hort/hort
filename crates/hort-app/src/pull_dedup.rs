@@ -235,6 +235,46 @@ fn ttl_for(kind: UpstreamErrorKind, cfg: &PullDedupConfig) -> Duration {
     }
 }
 
+/// [`ttl_for`] with the caller's per-upstream not-found override
+/// applied.
+///
+/// `not_found_override` is `Some(_)` only for a caller that holds an
+/// upstream mapping declaring `not_found_cache_seconds`; `None`
+/// reproduces [`ttl_for`] exactly, which is what every non-overriding
+/// entry point passes.
+///
+/// # Why only `NotFound`
+///
+/// The operator's statement is about **absence**: a release upstream
+/// never gains a coordinate it refused, a snapshot upstream gains them
+/// constantly, and no single deployment-wide number is right for both.
+/// The other three clusters are about transient upstream *health* —
+/// rate limiting, timeouts, a refuted checksum — and nothing about a
+/// particular upstream makes a different retry window right for them,
+/// so they keep reading the deployment knob through [`ttl_for`].
+///
+/// `Success` is not overridden either. It cannot produce a `Failed`
+/// outcome, so the arm exists only to keep [`ttl_for`] total; routing
+/// an unreachable kind through an operator's not-found value would
+/// make the override's reach harder to state than it is.
+///
+/// Both the cluster negative-cache entry and the in-process broadcast
+/// to Layer-A followers resolve their expiry through this one function.
+/// They are two independent calculations for the same miss, so an
+/// override reaching one and not the other would let an in-process
+/// follower and a second replica disagree about how long one
+/// coordinate stays absent.
+fn effective_ttl_for(
+    kind: UpstreamErrorKind,
+    cfg: &PullDedupConfig,
+    not_found_override: Option<Duration>,
+) -> Duration {
+    match (kind, not_found_override) {
+        (UpstreamErrorKind::NotFound, Some(ttl)) => ttl,
+        _ => ttl_for(kind, cfg),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Keys
 // ---------------------------------------------------------------------------
@@ -752,6 +792,34 @@ impl PullDedup {
     /// `UpstreamProxy::fetch_metadata(...) -> DomainResult<Vec<u8>>`
     /// call as `... .await.map(Bytes::from).map_err(AppError::from)`
     /// inside the closure.
+    pub async fn coalesce_metadata<F, Fut>(
+        &self,
+        key: DedupKey,
+        fetch_fn: F,
+    ) -> Result<Bytes, AppError>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, AppError>> + Send,
+    {
+        self.coalesce_metadata_with_not_found_ttl(key, None, fetch_fn)
+            .await
+    }
+
+    /// [`Self::coalesce_metadata`] with a per-upstream not-found
+    /// negative-cache TTL.
+    ///
+    /// `not_found_ttl` is the value the caller read off the upstream
+    /// mapping it already resolved (`not_found_cache_seconds`);
+    /// `None` — what [`Self::coalesce_metadata`] passes — means the
+    /// deployment-wide `ttl_not_found`. Nothing else about the
+    /// coalescing window changes: the override is not part of
+    /// [`DedupKey`], because the key is identity and two callers
+    /// declaring different TTLs for one artifact must still join one
+    /// window rather than open two.
+    ///
+    /// The override reaches **both** expiry calculations for a miss —
+    /// the cluster negative-cache entry and the in-process broadcast to
+    /// Layer-A followers — through [`effective_ttl_for`].
     #[instrument(
         skip(self, fetch_fn),
         fields(
@@ -762,9 +830,10 @@ impl PullDedup {
             key_hash = tracing::field::Empty,
         ),
     )]
-    pub async fn coalesce_metadata<F, Fut>(
+    pub async fn coalesce_metadata_with_not_found_ttl<F, Fut>(
         &self,
         key: DedupKey,
+        not_found_ttl: Option<Duration>,
         fetch_fn: F,
     ) -> Result<Bytes, AppError>
     where
@@ -774,7 +843,7 @@ impl PullDedup {
         let span = tracing::Span::current();
         span.record("key_hash", key.key_hash().as_str());
         let adapted = || async move { fetch_fn().await.map(BlobOrMetadataOk::Metadata) };
-        let outcome = self.coalesce_inner(key, adapted).await?;
+        let outcome = self.coalesce_inner(key, not_found_ttl, adapted).await?;
         match outcome {
             BlobOrMetadataOk::Metadata(b) => Ok(b),
             BlobOrMetadataOk::Blob(_) => Err(AppError::External(
@@ -810,6 +879,24 @@ impl PullDedup {
         self.coalesce_to_hash(key, fetch_fn).await
     }
 
+    /// [`Self::coalesce_blob`] with a per-upstream not-found
+    /// negative-cache TTL. See
+    /// [`Self::coalesce_metadata_with_not_found_ttl`] for what
+    /// `not_found_ttl` means and what it leaves unchanged.
+    pub async fn coalesce_blob_with_not_found_ttl<F, Fut>(
+        &self,
+        key: DedupKey,
+        not_found_ttl: Option<Duration>,
+        fetch_fn: F,
+    ) -> Result<ContentHash, AppError>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<ContentHash, AppError>> + Send,
+    {
+        self.coalesce_to_hash_inner(key, not_found_ttl, fetch_fn)
+            .await
+    }
+
     /// Metadata- or blob-keyed, hash-broadcasting single-flight; use
     /// when the coalesced result is a CAS content hash, not inline
     /// bytes.
@@ -824,6 +911,28 @@ impl PullDedup {
     /// metadata-keyed callers (e.g. the OCI manifest tag-pull leg)
     /// whose result is a hash in CAS rather than inline manifest
     /// bytes. No bytes transit the ephemeral store.
+    pub async fn coalesce_to_hash<F, Fut>(
+        &self,
+        key: DedupKey,
+        fetch_fn: F,
+    ) -> Result<ContentHash, AppError>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<ContentHash, AppError>> + Send,
+    {
+        self.coalesce_to_hash_inner(key, None, fetch_fn).await
+    }
+
+    /// The hash-broadcasting single-flight both
+    /// [`Self::coalesce_to_hash`] and
+    /// [`Self::coalesce_blob_with_not_found_ttl`] run, carrying the
+    /// per-upstream not-found override.
+    ///
+    /// Private: the override belongs on the entry points a
+    /// pull-through caller holding a mapping actually uses, and the
+    /// OCI tag-pull leg — the only other `coalesce_to_hash` caller —
+    /// passes `None`. A fourth public method taking an override no
+    /// caller supplies would be surface with no consumer.
     #[instrument(
         skip(self, fetch_fn),
         fields(
@@ -834,9 +943,10 @@ impl PullDedup {
             key_hash = tracing::field::Empty,
         ),
     )]
-    pub async fn coalesce_to_hash<F, Fut>(
+    async fn coalesce_to_hash_inner<F, Fut>(
         &self,
         key: DedupKey,
+        not_found_ttl: Option<Duration>,
         fetch_fn: F,
     ) -> Result<ContentHash, AppError>
     where
@@ -846,7 +956,7 @@ impl PullDedup {
         let span = tracing::Span::current();
         span.record("key_hash", key.key_hash().as_str());
         let adapted = || async move { fetch_fn().await.map(BlobOrMetadataOk::Blob) };
-        let outcome = self.coalesce_inner(key, adapted).await?;
+        let outcome = self.coalesce_inner(key, not_found_ttl, adapted).await?;
         match outcome {
             BlobOrMetadataOk::Blob(h) => Ok(h),
             BlobOrMetadataOk::Metadata(_) => Err(AppError::External(
@@ -862,6 +972,7 @@ impl PullDedup {
     async fn coalesce_inner<F, Fut>(
         &self,
         key: DedupKey,
+        not_found_ttl: Option<Duration>,
         fetch_fn: F,
     ) -> Result<BlobOrMetadataOk, AppError>
     where
@@ -953,13 +1064,14 @@ impl PullDedup {
         // -----------------------------------------------------------
         // Layer B — election + heartbeat + fetch.
         // -----------------------------------------------------------
-        self.layer_b_election(key, fetch_fn).await
+        self.layer_b_election(key, not_found_ttl, fetch_fn).await
     }
 
     /// Layer-B leader election, heartbeat, and fetch dispatch.
     async fn layer_b_election<F, Fut>(
         &self,
         key: DedupKey,
+        not_found_ttl: Option<Duration>,
         fetch_fn: F,
     ) -> Result<BlobOrMetadataOk, AppError>
     where
@@ -1051,7 +1163,9 @@ impl PullDedup {
                         key.format_label(),
                         DedupOutcomeLabel::LayerBUnavailable,
                     );
-                    return self.run_as_leader_layer_b_down(&key, fetch_fn).await;
+                    return self
+                        .run_as_leader_layer_b_down(&key, not_found_ttl, fetch_fn)
+                        .await;
                 }
             }
         } else {
@@ -1077,13 +1191,15 @@ impl PullDedup {
                         key.format_label(),
                         DedupOutcomeLabel::LayerBUnavailable,
                     );
-                    return self.run_as_leader_layer_b_down(&key, fetch_fn).await;
+                    return self
+                        .run_as_leader_layer_b_down(&key, not_found_ttl, fetch_fn)
+                        .await;
                 }
             }
         };
         debug_assert!(elected);
 
-        self.run_as_leader(&key, fetch_fn).await
+        self.run_as_leader(&key, not_found_ttl, fetch_fn).await
     }
 
     /// Leader path with a healthy Layer B. Set up the Layer-A
@@ -1092,6 +1208,7 @@ impl PullDedup {
     async fn run_as_leader<F, Fut>(
         &self,
         key: &DedupKey,
+        not_found_ttl: Option<Duration>,
         fetch_fn: F,
     ) -> Result<BlobOrMetadataOk, AppError>
     where
@@ -1199,7 +1316,7 @@ impl PullDedup {
             },
             Err(e) => {
                 let kind = classify_app_error(e);
-                let ttl = ttl_for(kind, &self.config);
+                let ttl = effective_ttl_for(kind, &self.config, not_found_ttl);
                 DedupOutcome::Failed {
                     kind,
                     message: e.to_string(),
@@ -1262,6 +1379,7 @@ impl PullDedup {
     async fn run_as_leader_layer_b_down<F, Fut>(
         &self,
         key: &DedupKey,
+        not_found_ttl: Option<Duration>,
         fetch_fn: F,
     ) -> Result<BlobOrMetadataOk, AppError>
     where
@@ -1326,8 +1444,9 @@ impl PullDedup {
             Err(e) => DedupOutcome::Failed {
                 kind: classify_app_error(e),
                 message: e.to_string(),
-                expires_at_unix_secs: now_unix_secs()
-                    .saturating_add(ttl_for(classify_app_error(e), &self.config).as_secs()),
+                expires_at_unix_secs: now_unix_secs().saturating_add(
+                    effective_ttl_for(classify_app_error(e), &self.config, not_found_ttl).as_secs(),
+                ),
             },
         };
         let _ = tx_strong.send(outcome);
@@ -2157,6 +2276,273 @@ mod tests {
     fn ttl_for_success_uses_not_found_knob_defensive() {
         let cfg = PullDedupConfig::defaults();
         assert_eq!(ttl_for(UpstreamErrorKind::Success, &cfg), cfg.ttl_not_found);
+    }
+
+    // ------- Per-upstream not-found TTL override ----------------
+    //
+    // `effective_ttl_for` is `ttl_for` plus the caller's
+    // `Option<Duration>` not-found override. The table above pins the
+    // class-to-knob mapping; these pin what the override does and does
+    // not reach.
+
+    #[test]
+    fn effective_ttl_for_without_an_override_is_ttl_for() {
+        let cfg = PullDedupConfig::defaults();
+        for kind in ALL_UPSTREAM_ERROR_KINDS {
+            assert_eq!(
+                effective_ttl_for(kind, &cfg, None),
+                ttl_for(kind, &cfg),
+                "`None` must reproduce the deployment knob for {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_ttl_for_applies_the_override_to_not_found_only() {
+        let cfg = PullDedupConfig::defaults();
+        let override_ttl = Duration::from_secs(3600);
+        for kind in ALL_UPSTREAM_ERROR_KINDS {
+            let got = effective_ttl_for(kind, &cfg, Some(override_ttl));
+            if matches!(kind, UpstreamErrorKind::NotFound) {
+                assert_eq!(got, override_ttl, "NotFound takes the override");
+            } else {
+                assert_eq!(
+                    got,
+                    ttl_for(kind, &cfg),
+                    "{kind:?} is about upstream health, not absence — it keeps the knob"
+                );
+            }
+        }
+    }
+
+    /// Every variant, so a future `UpstreamErrorKind` addition is a
+    /// compile error here rather than an untested arm. Mirrors the
+    /// no-wildcard discipline `ttl_for` itself carries.
+    const ALL_UPSTREAM_ERROR_KINDS: [UpstreamErrorKind; 15] = [
+        UpstreamErrorKind::NotFound,
+        UpstreamErrorKind::RateLimited,
+        UpstreamErrorKind::Upstream5xx,
+        UpstreamErrorKind::Upstream4xx,
+        UpstreamErrorKind::Unauthorized,
+        UpstreamErrorKind::Timeout,
+        UpstreamErrorKind::NetworkError,
+        UpstreamErrorKind::ChecksumMismatch,
+        UpstreamErrorKind::ParseError,
+        UpstreamErrorKind::BodyTooLarge,
+        UpstreamErrorKind::MetadataTooLarge,
+        UpstreamErrorKind::ManifestTooLarge,
+        UpstreamErrorKind::VersionObjectTooLarge,
+        UpstreamErrorKind::PinMismatch,
+        UpstreamErrorKind::CaUnknown,
+    ];
+
+    /// The expiry the stored cluster negative-cache record carries,
+    /// **read back from the store** rather than inferred from the
+    /// config. Returns seconds from now.
+    fn stored_negative_cache_window(store: &InMemoryEphemeralStore, key: &DedupKey) -> u64 {
+        let bytes = store
+            .live(key.serialised_for_test())
+            .expect("a terminal Failed record must be in the cluster store")
+            .value;
+        match decode_outcome(&bytes).expect("the stored record must decode") {
+            DedupOutcome::Failed {
+                expires_at_unix_secs,
+                ..
+            } => expires_at_unix_secs.saturating_sub(now_unix_secs()),
+            other => panic!("expected a Failed record, got {other:?}"),
+        }
+    }
+
+    fn not_found_err() -> AppError {
+        AppError::External("upstream:not_found: no such coordinate".into())
+    }
+
+    /// Cluster negative-cache entry (the healthy-Layer-B leader's
+    /// terminal record): a mapping declaring an hour really caches the
+    /// miss for an hour, and one declaring nothing really falls back to
+    /// the deployment default. Both numbers are read out of the store.
+    #[test]
+    fn per_upstream_override_sets_the_cluster_negative_cache_window() {
+        capture(|| async {
+            for (override_ttl, expected_secs, label) in [
+                (
+                    Some(Duration::from_secs(3600)),
+                    3600u64,
+                    "per-upstream hour",
+                ),
+                (None, 30u64, "deployment default"),
+            ] {
+                let inner = Arc::new(InMemoryEphemeralStore::new());
+                let store: Arc<dyn EphemeralStore> = inner.clone();
+                let dd = PullDedup::new(store, fast_cfg());
+                let key = DedupKey::blob_by_url("maven", uuid::Uuid::nil(), "u-ttl-cluster");
+
+                let res = dd
+                    .coalesce_blob_with_not_found_ttl(key.clone(), override_ttl, || async {
+                        Err(not_found_err())
+                    })
+                    .await;
+                assert!(res.is_err(), "the leader's fetch failed");
+
+                let window = stored_negative_cache_window(&inner, &key);
+                assert!(
+                    window.abs_diff(expected_secs) <= 2,
+                    "{label}: the stored record must expire ~{expected_secs}s out, got {window}s"
+                );
+            }
+        });
+    }
+
+    /// Non-`NotFound` failures are untouched on the same path: a
+    /// mapping declaring an hour for absence does not thereby hold a
+    /// rate-limit or checksum failure for an hour.
+    #[test]
+    fn per_upstream_override_leaves_other_failure_classes_on_the_knob() {
+        capture(|| async {
+            for (msg, expected_secs) in [
+                ("upstream rate limited 429", 10u64),
+                ("upstream checksum mismatch", 60u64),
+            ] {
+                let inner = Arc::new(InMemoryEphemeralStore::new());
+                let store: Arc<dyn EphemeralStore> = inner.clone();
+                let dd = PullDedup::new(store, fast_cfg());
+                let key = DedupKey::blob_by_url("maven", uuid::Uuid::nil(), "u-ttl-other");
+
+                let _ = dd
+                    .coalesce_blob_with_not_found_ttl(
+                        key.clone(),
+                        Some(Duration::from_secs(3600)),
+                        || async move { Err(AppError::External(msg.into())) },
+                    )
+                    .await;
+
+                let window = stored_negative_cache_window(&inner, &key);
+                assert!(
+                    window.abs_diff(expected_secs) <= 2,
+                    "`{msg}` must keep the deployment knob (~{expected_secs}s), got {window}s"
+                );
+            }
+        });
+    }
+
+    /// The local in-process follower expiry — the OTHER of the two
+    /// independent calculations for one miss. The Layer-B-down leader
+    /// broadcasts a `Failed` terminal on Layer A and writes nothing to
+    /// the cluster store, so this value is reachable only on the
+    /// broadcast; a correct cluster TTL beside a stale local one is the
+    /// regression this unit could introduce.
+    ///
+    /// Measured by subscribing to the leader's own Layer-A sender and
+    /// reading the broadcast payload. There is no `Retry-After` on this
+    /// path — `handle_follower_outcome` reconstructs a plain `AppError`
+    /// from the leader's message — so nothing here asserts a header.
+    #[test]
+    fn per_upstream_override_sets_the_local_follower_expiry() {
+        capture(|| async {
+            for (override_ttl, expected_secs, label) in [
+                (
+                    Some(Duration::from_secs(3600)),
+                    3600u64,
+                    "per-upstream hour",
+                ),
+                (None, 30u64, "deployment default"),
+            ] {
+                // Layer B down: `put_if_absent` errors, so the leader
+                // takes `run_as_leader_layer_b_down` and its terminal
+                // outcome exists only as the Layer-A broadcast.
+                let store: Arc<dyn EphemeralStore> = Arc::new(FailingEphemeralStore);
+                let dd = Arc::new(PullDedup::new(store, fast_cfg()));
+                let key = DedupKey::blob_by_url("maven", uuid::Uuid::nil(), "u-ttl-local");
+
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+                let dd_leader = dd.clone();
+                let key_leader = key.clone();
+                let leader = tokio::spawn(async move {
+                    let _ = dd_leader
+                        .coalesce_blob_with_not_found_ttl(key_leader, override_ttl, || async move {
+                            let _ = release_rx.await;
+                            Err(not_found_err())
+                        })
+                        .await;
+                });
+
+                // Join the leader's broadcast before it completes.
+                let mut rx = loop {
+                    if let Some(tx) = dd
+                        .layer_a
+                        .get(&key)
+                        .and_then(|entry| entry.value().upgrade())
+                    {
+                        break tx.subscribe();
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                };
+                let _ = release_tx.send(());
+
+                let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("the leader must broadcast its terminal outcome")
+                    .expect("the broadcast must carry a value, not a channel error");
+                leader.await.expect("leader task");
+
+                match outcome {
+                    DedupOutcome::Failed {
+                        kind,
+                        expires_at_unix_secs,
+                        ..
+                    } => {
+                        assert_eq!(kind, UpstreamErrorKind::NotFound);
+                        let window = expires_at_unix_secs.saturating_sub(now_unix_secs());
+                        assert!(
+                            window.abs_diff(expected_secs) <= 2,
+                            "{label}: the broadcast expiry must be ~{expected_secs}s out, \
+                             got {window}s"
+                        );
+                    }
+                    other => panic!("expected a Failed broadcast, got {other:?}"),
+                }
+            }
+        });
+    }
+
+    /// The two entry points that take no override must behave exactly
+    /// as they did: `None` all the way down. Pins the delegation rather
+    /// than trusting it, because a wrapper passing a stray value would
+    /// change every non-Maven caller's negative-cache window.
+    #[test]
+    fn the_overrideless_entry_points_use_the_deployment_knob() {
+        capture(|| async {
+            let inner = Arc::new(InMemoryEphemeralStore::new());
+            let store: Arc<dyn EphemeralStore> = inner.clone();
+            let dd = PullDedup::new(store, fast_cfg());
+
+            let meta_key = DedupKey::metadata("npm", uuid::Uuid::nil(), "u-ttl-plain-meta");
+            let _ = dd
+                .coalesce_metadata(meta_key.clone(), || async { Err(not_found_err()) })
+                .await;
+            assert!(
+                stored_negative_cache_window(&inner, &meta_key).abs_diff(30) <= 2,
+                "coalesce_metadata must keep the deployment knob"
+            );
+
+            let blob_key = DedupKey::blob_by_url("npm", uuid::Uuid::nil(), "u-ttl-plain-blob");
+            let _ = dd
+                .coalesce_blob(blob_key.clone(), || async { Err(not_found_err()) })
+                .await;
+            assert!(
+                stored_negative_cache_window(&inner, &blob_key).abs_diff(30) <= 2,
+                "coalesce_blob must keep the deployment knob"
+            );
+
+            let hash_key = DedupKey::metadata("oci", uuid::Uuid::nil(), "u-ttl-plain-hash");
+            let _ = dd
+                .coalesce_to_hash(hash_key.clone(), || async { Err(not_found_err()) })
+                .await;
+            assert!(
+                stored_negative_cache_window(&inner, &hash_key).abs_diff(30) <= 2,
+                "coalesce_to_hash must keep the deployment knob"
+            );
+        });
     }
 
     // ------- DedupKey shape + key_hash --------------------------

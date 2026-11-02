@@ -3920,6 +3920,7 @@ fn proxy_mapping(repo_id: Uuid) -> RepositoryUpstreamMapping {
         ca_bundle_ref: None,
         pinned_cert_sha256: None,
         allowed_realm_hosts: Vec::new(),
+        not_found_cache_seconds: None,
         created_at: now,
         updated_at: now,
     }

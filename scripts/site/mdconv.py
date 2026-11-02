@@ -231,7 +231,7 @@ def _render_table(lines, start, link_resolver):
     return "".join(out), i
 
 
-def convert(markdown_text, link_resolver):
+def convert(markdown_text, link_resolver, diagram_renderer=None):
     """Convert `markdown_text` to an HTML fragment.
 
     Returns (html_fragment, headings) where headings is a list of
@@ -271,9 +271,13 @@ def convert(markdown_text, link_resolver):
                 body_lines.append(lines[i])
                 i += 1
             i += 1  # skip closing fence
-            code = html.escape("\n".join(body_lines))
-            cls = f' class="language-{lang}"' if lang else ""
-            out.append(f"<pre><code{cls}>{code}</code></pre>")
+            code_source = "\n".join(body_lines)
+            if lang.lower() in ("graphviz", "dot") and diagram_renderer is not None:
+                out.append(diagram_renderer(code_source))
+            else:
+                code = html.escape(code_source)
+                cls = f' class="language-{lang}"' if lang else ""
+                out.append(f"<pre><code{cls}>{code}</code></pre>")
             continue
 
         if _HR_RE.match(line):

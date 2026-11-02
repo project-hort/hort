@@ -232,10 +232,12 @@ impl ScanRequested {
 /// [`NotAnalysable::gates_release`](crate::ports::scanner::NotAnalysable::gates_release)
 /// answering `false`: always for
 /// [`NotAnalysable::NotApplicable`](crate::ports::scanner::NotAnalysable::NotApplicable),
-/// and for `UnsupportedContainer` on a constituent whose composition
-/// carries the filesystem verdict (ADR 0064 D2). Every other abstention
-/// is an *expected* surface that could not be assessed and still fails
-/// closed, so it never reaches this type.
+/// and for `UnsupportedContainer` / `NoAnalyzerMatched` on a constituent
+/// whose composition carries the filesystem verdict (ADR 0064 D2) —
+/// neither of those two says anything about the layer's bytes, and D2
+/// governs the absence of an assessment exactly as it governs a finding.
+/// Every other abstention is an *expected* surface that could not be
+/// assessed and still fails closed, so it never reaches this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanAssessment {
@@ -256,9 +258,10 @@ pub enum ScanAssessment {
     ///   backend abstained with
     ///   [`NotAnalysable::NotApplicable`](crate::ports::scanner::NotAnalysable::NotApplicable).
     /// - **A surface that is not this artifact's to assess** — an OCI
-    ///   layer this adapter has no decoder for, under a policy that has
-    ///   promoted the composite verdict. The composition that binds the
-    ///   layer decodes it and carries its filesystem verdict
+    ///   layer this adapter has no decoder for, or one whose materialised
+    ///   tree no analyzer claimed, under a policy that has promoted the
+    ///   composite verdict. The composition that binds the layer decodes
+    ///   it, assembles it whole and carries its filesystem verdict
     ///   (ADR 0064 D2), so there is nothing here for a hold to wait on
     ///   either. The layer still releases only on its own time gate.
     NotApplicable,

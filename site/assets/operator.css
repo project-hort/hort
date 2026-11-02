@@ -1,0 +1,34 @@
+/* Operator docs use the same visual language and semantic tokens as the product homepage. */
+:root{color-scheme:dark;--bg:#0b171c;--surface:#112a31;--surface2:#18353d;--text:#f4f8f7;--muted:#b3c7c9;--line:#35535a;--accent:#8be5cc;--accent-text:#102d35;--link:#a6f3df}
+html[data-theme=light]{color-scheme:light;--bg:#f4f8f7;--surface:#fff;--surface2:#e8f1ef;--text:#102d35;--muted:#4d6970;--line:#cbdedb;--accent:#246b72;--accent-text:#fff;--link:#126a72}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body.operator-page{margin:0;max-width:none;padding:0;background:var(--bg);color:var(--text);font:16px/1.6 Inter,system-ui,-apple-system,sans-serif}
+a{color:var(--link)}a:hover{text-decoration:underline}a:focus-visible,button:focus-visible{outline:3px solid var(--accent);outline-offset:4px}
+.container{width:min(1160px,calc(100% - 44px));margin:auto}
+.site-header{border-bottom:1px solid var(--line)}.site-header nav{display:flex;align-items:center;justify-content:space-between;gap:20px;min-height:82px}
+.brand{display:flex;align-items:center;gap:8px;text-decoration:none;color:var(--text);font-size:23px;font-weight:750;letter-spacing:-.04em}.brand:hover{text-decoration:none}.brand img{width:84px;height:62px;object-fit:contain;display:block}
+.navlinks{display:flex;align-items:center;gap:20px}.navlinks a{text-decoration:none;color:var(--muted);font-size:14px}.navlinks a:hover,.navlinks a[aria-current]{color:var(--text)}button{font:inherit;cursor:pointer}.theme,.menu-toggle{min-height:42px;background:var(--surface);border:1px solid var(--line);color:var(--text);border-radius:9px;padding:7px 12px;font-size:13px}.menu-toggle{display:none}
+.site-footer{border-top:1px solid var(--line);padding:35px 0 50px;color:var(--muted);font-size:13px}.site-footer .container{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}
+.op-layout{width:min(1460px,calc(100% - 48px));display:grid;grid-template-columns:minmax(195px,245px) minmax(0,1fr) minmax(150px,210px);gap:clamp(18px,3vw,45px);margin:0 auto;padding:42px 0 86px;align-items:start}
+.op-layout.op-index{grid-template-columns:minmax(195px,245px) minmax(0,1fr)}
+.op-sidebar,.op-toc{position:sticky;top:20px;max-height:calc(100vh - 40px);overflow:auto;font-size:14px}
+.op-sidebar{padding:18px;background:var(--surface);border:1px solid var(--line);border-radius:14px}
+.op-sidebar h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;margin:24px 0 8px;color:var(--muted);border:0;padding:0}
+.op-sidebar ul,.op-toc ul{list-style:none;margin:0;padding:0}.op-sidebar li{margin:0}.op-sidebar a{display:block;padding:6px 9px;text-decoration:none;border-radius:7px;line-height:1.4}
+.op-sidebar a[aria-current=page]{background:var(--accent);color:var(--accent-text);font-weight:700}.op-sidebar-title{font-weight:750;font-size:16px;margin:0 0 12px}.op-start{font-weight:650}
+.op-article{min-width:0;max-width:830px;font-size:16px;line-height:1.75}.op-article h1{font-size:clamp(32px,3.2vw,48px);line-height:1.12;letter-spacing:-.035em;margin:0 0 22px}.op-article h2{font-size:clamp(24px,2.5vw,30px);line-height:1.25;margin:42px 0 14px;letter-spacing:-.03em}.op-article h3{font-size:20px;margin:30px 0 12px}.op-article p,.op-article li{color:var(--text)}
+.op-article pre{background:var(--surface);padding:20px;overflow-x:auto;border:1px solid var(--line);border-radius:12px;font:13px/1.7 'JetBrains Mono',ui-monospace,monospace}.op-article code{font-family:'JetBrains Mono',ui-monospace,monospace;overflow-wrap:anywhere}.op-article :not(pre)>code{background:var(--surface2);border-radius:5px;padding:.12em .32em}.op-article pre code{overflow-wrap:normal}
+.op-article table{display:block;overflow-x:auto;border-collapse:collapse;width:100%}.op-article th,.op-article td{border:1px solid var(--line);padding:9px 12px;text-align:left}.op-article th{background:var(--surface2)}.op-article blockquote{border-left:4px solid var(--accent);padding:5px 20px;background:var(--surface);margin-left:0}
+.op-toc{border-left:1px solid var(--line);padding-left:18px;color:var(--muted)}.op-toc strong{display:block;margin-bottom:10px}.op-toc a{display:block;padding:6px 0;text-decoration:none;font-size:13px}.op-toc .toc-level-3{padding-left:14px}
+.op-source,.op-fine{margin-top:45px;font-size:13px;color:var(--muted)!important}.op-kicker{color:var(--accent)!important;font-weight:750;letter-spacing:.08em;text-transform:uppercase;font-size:12px}.op-intro{max-width:760px}
+.op-guide-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:34px}.op-guide-card{padding:25px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}.op-guide-card h2{margin:0 0 12px;font-size:19px}.op-guide-card ul{padding-left:20px;margin:0}
+.op-article :target{scroll-margin-top:22px}
+@media(max-width:1100px){.op-layout{grid-template-columns:minmax(190px,245px) minmax(0,1fr)}.op-toc{display:none}}
+@media(max-width:700px){.container{width:calc(100% - 32px)}.site-header nav{position:relative;min-height:72px}.menu-toggle{display:inline-flex;align-items:center;justify-content:center;margin-left:auto}.brand img{width:66px;height:52px}.navlinks{display:none;position:absolute;z-index:20;top:calc(100% - 1px);left:0;right:0;flex-direction:column;align-items:stretch;gap:0;padding:10px;background:var(--surface);border:1px solid var(--line);border-radius:0 0 12px 12px;box-shadow:0 18px 35px #0003}.navlinks.is-open{display:flex}.navlinks a{display:block;padding:12px;font-size:15px}.navlinks .theme{margin-top:6px;width:100%}.op-layout,.op-layout.op-index{display:block;width:calc(100% - 32px);padding:22px 0 60px}.op-sidebar{position:static;max-height:none;margin-bottom:26px}.op-sidebar ul{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.op-guide-grid{grid-template-columns:1fr}.op-article h1{font-size:34px}.op-article pre{padding:12px}}
+@media(max-width:390px){.op-sidebar ul{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+
+/* Build-time Kroki SVGs: readable on dark and light themes, never loaded remotely. */
+.doc-diagram{margin:26px 0 30px;padding:12px;border:1px solid var(--line);border-radius:14px;background:#F4F8F7;overflow-x:auto}
+.doc-diagram img{display:block;width:100%;height:auto;max-height:460px;object-fit:contain;margin:0 auto}
+.doc-diagram figcaption{color:#345D63;font-size:13px;line-height:1.45;text-align:center;padding:10px 4px 2px}
+@media(max-width:700px){.doc-diagram{padding:7px}.doc-diagram img{min-width:340px;max-height:380px}.doc-diagram figcaption{min-width:340px}}

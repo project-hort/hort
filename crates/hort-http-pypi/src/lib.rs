@@ -738,7 +738,7 @@ async fn render_pypi_file_response(
     artifact: hort_domain::entities::artifact::Artifact,
     actor: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
-    if let Some(blocked) = non_servable_response(&artifact) {
+    if let Some(blocked) = non_servable_response(&artifact, ctx.quarantine_retry_after_floor_secs) {
         return Ok(blocked);
     }
 
@@ -1815,6 +1815,7 @@ mod tests {
                 ca_bundle_ref: None,
                 pinned_cert_sha256: None,
                 allowed_realm_hosts: Vec::new(),
+                not_found_cache_seconds: None,
                 created_at: now,
                 updated_at: now,
             });
@@ -4821,6 +4822,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: now,
             updated_at: now,
         });
@@ -4933,6 +4935,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: now,
             updated_at: now,
         });
@@ -5218,6 +5221,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: now,
             updated_at: now,
         });
@@ -5307,6 +5311,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: now,
             updated_at: now,
         });
@@ -6266,8 +6271,10 @@ mod tests {
 
     /// Quarantined parent wheel → 503 + Retry-After matching the
     /// wheel-download handler's shape. Asserts the same status code AND
-    /// header presence; the exact seconds value is non-deterministic
-    /// (computed from `quarantine_deadline - Utc::now()`).
+    /// header presence; the exact seconds value depends on the clock and
+    /// the configured floor (`quarantine_deadline - Utc::now()`, floored
+    /// at `AppContext::quarantine_retry_after_floor_secs`), which
+    /// `hort_http_core::artifact_gate` asserts directly.
     #[tokio::test]
     async fn metadata_endpoint_quarantined_wheel_returns_503_with_retry_after() {
         let h = harness();
@@ -7739,6 +7746,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: now,
             updated_at: now,
         });

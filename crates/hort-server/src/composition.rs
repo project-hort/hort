@@ -2091,6 +2091,12 @@ pub async fn build_app_context(
     // `Config::oci_pullthrough_release_wait_secs`
     // (`HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS`). `0` disables it.
     oci_pullthrough_release_wait_secs: u64,
+    // Floor on the quarantine `Retry-After` every content route
+    // advertises. Threaded from
+    // `Config::quarantine_retry_after_floor_secs`
+    // (`HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`), already widened to
+    // `NonZeroU32` by the caller because the env parse rejects zero.
+    quarantine_retry_after_floor_secs: std::num::NonZeroU32,
     public_base_url: Option<url::Url>,
     trust_config: hort_http_core::middleware::trust::TrustConfig,
     rate_limit_config: hort_http_core::middleware::rate_limit::RateLimitConfig,
@@ -3411,6 +3417,7 @@ pub async fn build_app_context(
         publish_body_limit_bytes,
         upstream_projector_version_object_max_bytes,
         oci_pullthrough_release_wait_secs,
+        quarantine_retry_after_floor_secs,
         auth,
         extra_trust_anchors,
         // Pass through the optional cache so
@@ -4956,6 +4963,7 @@ mod tests {
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
+            not_found_cache_seconds: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

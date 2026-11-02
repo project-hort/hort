@@ -32,3 +32,10 @@ website_dist_dir: "{{ website_repo_root }}/site/dist/{{ website_fqdn }}"
 # matching install/cosign.pin) already on the TARGET host's PATH; this role
 # does not bootstrap it (see the script's own header comment for why).
 website_dl_archive_enabled: false
+
+# Optional trusted Kroki endpoint reachable from the Ansible CONTROL node.
+# When set, build-site.sh pre-renders new/changed Markdown graphviz diagrams
+# before building the site. When unset, it verifies the content-addressed,
+# checked-in SVG artifacts and fails closed if anything is missing.
+# No Kroki service is required on the website/server after publication.
+website_kroki_url: ""

@@ -378,7 +378,11 @@ log "  child layer digests = ${LAYER_DIGESTS[*]}"
 #       and the sign itself, with margin.
 # Statuses are deliberately NOT asserted beyond "curl completed" — this is a
 # forcing step, not an assertion; the 60s polls in Step 6/8 stay as a
-# backstop.
+# backstop. Every status here is legitimately a hold-503 or a 200 depending
+# on where the window and the cascade have got to, which is why asserting
+# one of them would be asserting the clock. The SAME request IS asserted
+# once the tree has released, in Step 9c — a forcing GET that discards its
+# status looks like layer-blob coverage in an inventory and is none.
 # ---------------------------------------------------------------------
 log ""
 log "--- Step 3: force constituent ingest (config blob + every layer blob)"
@@ -656,6 +660,35 @@ if bounded_poll \
 else
     fail "release acceptance after warm pass: signed index pulls anonymously with --all" \
          "the signed index never became fully (--all) anonymously pullable within ${ANON_PULL_WAIT_SECS}s (window, cascade, LATE-JOINER clearance, or release-sweep gate not satisfied)"
+fi
+
+# ---------------------------------------------------------------------
+# Step 9c: a LAYER BLOB, fetched by digest, answers 200.
+#
+# Step 3 issues exactly this request as a forcing GET and throws the status
+# away, on purpose — at that point in the lifecycle a hold-503 is the
+# designed answer. Here the tree has released (9b pulled it anonymously in
+# full), so the status is no longer about the clock and the request is the
+# one a client actually makes: resolve a manifest, then fetch the layers it
+# names. A released image whose layer blob answers 503 is an image hort
+# reports as deliverable and does not deliver, and the only thing that
+# notices is the client. Asserted ANONYMOUSLY, so a write-authorized
+# hold-read exemption cannot stand in for a release.
+#
+# One blob, not the whole set: 9b already pulled every constituent of every
+# platform: this assertion exists to put a status code on the layer-blob
+# route rather than to re-walk the tree.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 9c: ANONYMOUS GET a released layer blob by digest (must serve)"
+
+LAYER_BLOB_CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+    "${BASE_URL}/blobs/sha256:${LAYER_HASHES[0]}" 2>/dev/null || echo 000)"
+if [ "$LAYER_BLOB_CODE" = "200" ]; then
+    pass "ANONYMOUS GET layer blob sha256:${LAYER_HASHES[0]} -> 200 (a released image's layers are deliverable)"
+else
+    fail "ANONYMOUS GET a released layer blob -> 200" \
+         "got HTTP ${LAYER_BLOB_CODE} for ${BASE_URL}/blobs/sha256:${LAYER_HASHES[0]}. 503 means the layer row is still held while the manifest that names it serves — check artifacts.quarantine_status and last_scan_at for that blob: 'scan_indeterminate' with a NULL last_scan_at is a scan that abstained and fell to the fail-closed hold."
 fi
 
 # ---------------------------------------------------------------------
