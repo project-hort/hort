@@ -30,7 +30,7 @@ use hort_domain::ports::quarantine_release::ReleaseExpiredSummary;
 use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInvalidator;
 
 use crate::event_store_publisher::EventStorePublisher;
-use crate::use_cases::ingest_use_case::CLEARANCE_VERIFY_PRIORITY;
+use crate::use_cases::ingest_use_case::{INGEST_TRIGGER_SOURCE, PROVENANCE_VERIFY_KIND};
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::referenced_descendant::is_parent_gated_blob_constituent;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
@@ -38,6 +38,7 @@ use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scan_findings_repository::ScanFindingsRow;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::sbom::Sbom;
+use hort_domain::types::task_tier::CLEARANCE_GATING_VERIFY_PRIORITY;
 use hort_domain::types::{
     highest_severity, severity_label, severity_summary_from_findings, ArtifactCoords, ArtifactKind,
     ContentHash, Finding,
@@ -2221,12 +2222,15 @@ impl QuarantineUseCase {
         match self
             .jobs
             .enqueue_task(
-                "provenance-verify",
+                PROVENANCE_VERIFY_KIND,
                 &params,
-                None,                      // actor_id: system-driven expiry backstop
-                CLEARANCE_VERIFY_PRIORITY, // #44: clearance-gating verify preempts bulk ingest
-                "ingest", // reuse the ingest-time verify trigger source (CHECK-valid)
-                None,     // no idempotency key — the in-flight guard above is the dedup
+                None, // actor_id: system-driven expiry backstop
+                // Clearance-gating: this verify is the last thing between
+                // a held artifact and a release decision, so it preempts
+                // the bulk ingest-time verify backlog.
+                CLEARANCE_GATING_VERIFY_PRIORITY,
+                INGEST_TRIGGER_SOURCE, // reuse the ingest-time verify trigger source (CHECK-valid)
+                None, // no idempotency key — the in-flight guard above is the dedup
             )
             .await
         {
@@ -8472,11 +8476,14 @@ spec:
         );
         assert!(actor_id.is_none(), "expiry backstop is system-driven");
         assert_eq!(jobs.enqueue_idem_keys(), vec![None]);
-        // #44: the expiry-backstop verify is clearance-gating → elevated tier.
+        // The expiry-backstop verify is clearance-gating → elevated tier.
+        // Pinned against the literal, not the constant: the number this
+        // producer writes is what must not move until the ordinals are
+        // re-derived from the tier.
         assert_eq!(
             jobs.enqueue_priorities(),
-            vec![CLEARANCE_VERIFY_PRIORITY],
-            "expiry-backstop provenance-verify must enqueue at the elevated clearance tier (#44)"
+            vec![10],
+            "expiry-backstop provenance-verify must enqueue at the elevated clearance tier"
         );
     }
 

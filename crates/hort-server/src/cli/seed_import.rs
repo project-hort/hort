@@ -70,6 +70,7 @@ use uuid::Uuid;
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::ContentHash;
 
 use crate::config::MinimalConfig;
@@ -90,12 +91,14 @@ use crate::{pg_identity, telemetry};
 /// touch the test in lock-step with the CHECK.
 const SEED_IMPORT_TRIGGER_SOURCE: &str = "seed-import";
 
-/// `priority` for the enqueued row. The trigger-source
-/// ranking is `ingest=0 → advisory=5 → cron=10 → manual=20`. Manual
-/// invocation drains first; that matches the operator expectation
-/// for a one-shot cutover ("run the import, don't wait behind every
-/// scheduled cron tick").
-const MANUAL_PRIORITY: i16 = 20;
+/// `jobs.kind` of the row this subcommand enqueues. The ordinal it
+/// carries is not named here: it is decided from `(kind,
+/// trigger_source)` in `hort_domain::types::task_tier`. The pair
+/// `('seed-import', 'seed-import')` is what gives this row the
+/// operator tier while the scans and verifies the import itself goes on
+/// to enqueue — same trigger source, different kind — stay at the
+/// schema default.
+const KIND: &str = "seed-import";
 
 /// Arguments to `hort-server seed-import`.
 ///
@@ -149,12 +152,13 @@ async fn run_async(args: SeedImportArgs) -> anyhow::Result<()> {
     // The worker reads `params.items` — see `SeedImportHandler::run`.
     let params = serde_json::json!({ "items": items });
 
+    let priority = queue_priority(KIND, SEED_IMPORT_TRIGGER_SOURCE);
     let outcome = jobs
         .enqueue_task(
-            "seed-import",
+            KIND,
             &params,
             None, // actor_id — see module docstring; v1 attributes to system
-            MANUAL_PRIORITY,
+            priority,
             SEED_IMPORT_TRIGGER_SOURCE,
             None, // non-destructive task kind — no DB-side idempotency key (ADR 0028)
         )
@@ -173,8 +177,8 @@ async fn run_async(args: SeedImportArgs) -> anyhow::Result<()> {
 
     info!(
         job_id = %id,
-        kind = "seed-import",
-        priority = MANUAL_PRIORITY,
+        kind = KIND,
+        priority,
         trigger_source = SEED_IMPORT_TRIGGER_SOURCE,
         item_count = items.len(),
         "seed-import job enqueued"
@@ -341,7 +345,7 @@ mod tests {
         // priority=20 matches the manual tier — seed-import
         // is operator-driven so it inherits the manual-tier priority
         // (drains first ahead of cron / advisory ticks).
-        assert_eq!(MANUAL_PRIORITY, 20);
+        assert_eq!(queue_priority(KIND, SEED_IMPORT_TRIGGER_SOURCE), 20);
     }
 
     // ---- TSV parser tests --------------------------------------------------

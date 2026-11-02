@@ -78,6 +78,7 @@ use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::storage::StoragePort;
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::{ArtifactCoords, PageRequest};
 
 use crate::append_conflict::{append_with_conflict_retry, ConflictCycleOutcome};
@@ -294,6 +295,14 @@ pub struct RemoveExclusionCommand {
 /// and explicit rather than a loop.
 const POLICY_APPEND_ATTEMPTS: u8 = 2;
 
+/// `jobs.kind` of the async scan-policy re-evaluation pass (ADR 0041).
+const POLICY_REEVALUATION_KIND: &str = "policy-reevaluation";
+
+/// `jobs.trigger_source` the re-evaluation enqueue carries. The mutation
+/// that triggers it is operator- or gitops-driven, and no dedicated CHECK
+/// literal exists for the gitops path — that surface is out of scope here.
+const REEVALUATION_TRIGGER_SOURCE: &str = "manual";
+
 /// What a policy mutation wants, re-decided against a given state
 /// (ADR 0060 step (b)).
 ///
@@ -473,11 +482,11 @@ impl PolicyUseCase {
         match self
             .jobs
             .enqueue_task(
-                "policy-reevaluation",
+                POLICY_REEVALUATION_KIND,
                 &params,
                 None, // system/gitops-driven; no operator actor on the row
-                0i16, // default priority — a background population pass
-                "manual",
+                queue_priority(POLICY_REEVALUATION_KIND, REEVALUATION_TRIGGER_SOURCE),
+                REEVALUATION_TRIGGER_SOURCE,
                 None, // non-destructive kind → no DB-side idempotency key
             )
             .await

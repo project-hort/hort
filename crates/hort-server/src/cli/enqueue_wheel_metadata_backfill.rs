@@ -69,6 +69,7 @@ use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
 use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::types::task_tier::queue_priority;
 
 use crate::config::MinimalConfig;
 use crate::{pg_identity, telemetry};
@@ -79,13 +80,12 @@ use crate::{pg_identity, telemetry};
 /// | 'seed-import' | 'prefetch'`).
 const CRON_TRIGGER_SOURCE: &str = "cron";
 
-/// `priority` for the enqueued row. The trigger-source
-/// ranking is `ingest=0 → advisory=5 → cron=10 → manual=20`. Matches the
-/// release-sweep + prefetch-tick priority — backfill ticks are
-/// co-equal with quarantine release sweeps in the cron tier. The
-/// worker's claim query orders `priority DESC, created_at ASC`, so
-/// this slots into the same drain tier.
-const CRON_PRIORITY: i16 = 10;
+/// `jobs.kind` of the row this subcommand enqueues. The ordinal it
+/// carries is not named here: it is decided from `(kind,
+/// trigger_source)` in `hort_domain::types::task_tier`, so every
+/// cron-triggered row drains in the same tier by construction rather
+/// than by six constants agreeing.
+const KIND: &str = "wheel-metadata-backfill";
 
 /// Arguments to `hort-server enqueue-wheel-metadata-backfill`.
 ///
@@ -133,12 +133,13 @@ async fn run_async(args: EnqueueWheelMetadataBackfillArgs) -> anyhow::Result<()>
         None => serde_json::json!({}),
     };
 
+    let priority = queue_priority(KIND, CRON_TRIGGER_SOURCE);
     let outcome = jobs
         .enqueue_task(
-            "wheel-metadata-backfill",
+            KIND,
             &params,
             None, // actor_id — system-driven cron
-            CRON_PRIORITY,
+            priority,
             CRON_TRIGGER_SOURCE,
             None, // non-destructive task kind — no DB-side idempotency key (ADR 0028)
         )
@@ -153,8 +154,8 @@ async fn run_async(args: EnqueueWheelMetadataBackfillArgs) -> anyhow::Result<()>
 
     info!(
         job_id = %id,
-        kind = "wheel-metadata-backfill",
-        priority = CRON_PRIORITY,
+        kind = KIND,
+        priority,
         trigger_source = CRON_TRIGGER_SOURCE,
         batch_size = ?args.batch_size,
         "wheel-metadata-backfill job enqueued"
@@ -235,7 +236,8 @@ mod tests {
     fn constants_match_init33_trigger_source_ranking() {
         assert_eq!(CRON_TRIGGER_SOURCE, "cron");
         assert_eq!(
-            CRON_PRIORITY, 10,
+            queue_priority(KIND, CRON_TRIGGER_SOURCE),
+            10,
             "wheel-metadata-backfill must share priority with quarantine-release-sweep + \
              prefetch-tick (the cron tier); changing this skews the worker claim queue"
         );

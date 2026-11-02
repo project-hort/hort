@@ -177,6 +177,7 @@ use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstre
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::BoxFuture;
+use hort_domain::types::task_tier::queue_priority;
 
 use crate::use_cases::index_serve_filter::{ordering_for_format, VersionOrdering};
 use crate::use_cases::prefetch_use_case::PrefetchUseCase;
@@ -809,6 +810,10 @@ impl TaskHandler for PrefetchTickHandler {
                     // scheduled row for the same coordinate.
                     let format_key = repo.format.to_string();
                     let normalised = handler.normalize_name(package);
+                    // Loop-invariant: every row in this batch is the same
+                    // `(kind, trigger_source)` pair, so the ordinal is
+                    // resolved once rather than per planned version.
+                    let priority = queue_priority(PREFETCH_INGEST_KIND, SCHEDULED_TRIGGER_SOURCE);
                     let rows: Vec<PrefetchEnqueueRow> = planned
                         .iter()
                         .map(|version| PrefetchEnqueueRow {
@@ -818,7 +823,7 @@ impl TaskHandler for PrefetchTickHandler {
                                 "package": normalised,
                                 "version": version,
                             }),
-                            priority: 0,
+                            priority,
                             trigger_source: SCHEDULED_TRIGGER_SOURCE.to_string(),
                             target_key: super::prefetch_target_key(
                                 repo.id,

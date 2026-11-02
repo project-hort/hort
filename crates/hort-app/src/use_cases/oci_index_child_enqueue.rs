@@ -100,10 +100,11 @@ use uuid::Uuid;
 
 use hort_domain::oci::index_child_descriptors;
 use hort_domain::ports::jobs_repository::{IdempotentEnqueueRow, JobsRepository};
+use hort_domain::types::task_tier::queue_priority;
 
 use crate::task_handlers::oci_index_child_ingest::{
-    child_ingest_idempotency_key, child_ingest_params, CHILD_INGEST_ENQUEUE_PRIORITY,
-    CHILD_INGEST_TRIGGER_SOURCE, OCI_INDEX_CHILD_INGEST_KIND,
+    child_ingest_idempotency_key, child_ingest_params, CHILD_INGEST_TRIGGER_SOURCE,
+    OCI_INDEX_CHILD_INGEST_KIND,
 };
 
 /// Facade over [`JobsRepository`] for the eager index-child enqueue.
@@ -179,7 +180,7 @@ impl OciIndexChildEnqueueUseCase {
             .map(|child| IdempotentEnqueueRow {
                 kind: OCI_INDEX_CHILD_INGEST_KIND.to_string(),
                 params: child_ingest_params(repository_id, requested_name, &child.hash),
-                priority: CHILD_INGEST_ENQUEUE_PRIORITY,
+                priority: queue_priority(OCI_INDEX_CHILD_INGEST_KIND, CHILD_INGEST_TRIGGER_SOURCE),
                 trigger_source: CHILD_INGEST_TRIGGER_SOURCE.to_string(),
                 idempotency_key: child_ingest_idempotency_key(repository_id, &child.hash),
             })
@@ -287,7 +288,7 @@ mod tests {
         assert_eq!(cohort.len(), 2);
         for (row, child) in cohort.iter().zip(children.iter()) {
             assert_eq!(row.kind, OCI_INDEX_CHILD_INGEST_KIND);
-            assert_eq!(row.priority, CHILD_INGEST_ENQUEUE_PRIORITY);
+            assert_eq!(row.priority, 0);
             assert_eq!(row.trigger_source, CHILD_INGEST_TRIGGER_SOURCE);
             assert_eq!(row.params["repository_id"], json!(repo_id));
             assert_eq!(

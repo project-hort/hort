@@ -78,6 +78,7 @@ use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, E
 use hort_domain::ports::jobs_repository::{
     CompensatingDelete, EnqueueOutcome, JobRow, JobsRepository, ListJobsFilter, ListJobsPage,
 };
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::IdempotencyKey;
 
 use crate::error::{AppError, AppResult};
@@ -95,6 +96,15 @@ use crate::rbac::RbacEvaluator;
 /// parallelism; exhausting it falls through to the existing
 /// compensating-delete-and-surface-the-error path unchanged.
 const TASK_AUDIT_APPEND_RETRY_ATTEMPTS: u32 = 5;
+
+/// `jobs.trigger_source` every admin task invoke carries.
+///
+/// The POST is operator-initiated even when the operator is a chart
+/// CronJob, and `'manual'` is the only migration-009 CHECK literal that
+/// fits "an outside caller asked us to enqueue this". An earlier draft
+/// passed `"api"`, which is not in the CHECK and surfaced as a 23514
+/// constraint violation → 500 to the caller.
+const ADMIN_INVOKE_TRIGGER_SOURCE: &str = "manual";
 
 /// Application use case for admin-task enqueue operations.
 pub struct TaskUseCase {
@@ -353,22 +363,18 @@ impl TaskUseCase {
         //    gated). Shared logic — no parallel evaluator.
         self.authorize_kind(actor, kind, params)?;
 
-        // 3. Insert jobs row. `trigger_source = "manual"` mirrors
-        //    `TriggerSource::Manual` — the admin-task POST is operator-
-        //    initiated even when the operator is a chart CronJob, and
-        //    `"manual"` is the only literal in
-        //    `migration_009`'s CHECK constraint that fits "an outside
-        //    caller asked us to enqueue this". Earlier drafts passed
-        //    `"api"`, which was not in the allow-list and surfaced as
-        //    a 23514 constraint violation → 500 to the caller.
+        // 3. Insert jobs row. The ordinal is decided from `(kind,
+        //    trigger_source)`, not named here; see
+        //    `ADMIN_INVOKE_TRIGGER_SOURCE` for why this path's trigger
+        //    source is `'manual'`.
         let outcome = self
             .jobs
             .enqueue_task(
                 kind,
                 params,
                 Some(actor.user_id),
-                0,
-                "manual",
+                queue_priority(kind, ADMIN_INVOKE_TRIGGER_SOURCE),
+                ADMIN_INVOKE_TRIGGER_SOURCE,
                 idempotency_key,
             )
             .await?;

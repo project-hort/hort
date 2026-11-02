@@ -51,19 +51,13 @@ use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::sbom_component_repository::SbomComponentRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
+use hort_domain::types::task_tier::scan_queue_priority;
 
 use crate::metrics::{emit_scan_jobs_enqueued, TriggerSourceLabel};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Priority bucket for advisory-enqueued scans.
-///
-/// Lower than cron (10) and manual (20) — the cron rescan is the
-/// safety-net path that catches anything advisory missed, so it gets
-/// claimed first.
-const ADVISORY_PRIORITY: i16 = 5;
 
 /// `trigger_source` literal — must match the SQL CHECK constraint on
 /// `jobs.trigger_source` (`'manual' | 'cron' | 'advisory' | 'ingest'`).
@@ -292,7 +286,7 @@ impl TaskHandler for AdvisoryWatchTickHandler {
                                 artifact.repository_id,
                                 &artifact.sha256_checksum,
                                 &format,
-                                ADVISORY_PRIORITY,
+                                scan_queue_priority(ADVISORY_TRIGGER_SOURCE),
                                 ADVISORY_TRIGGER_SOURCE,
                             )
                             .await
@@ -1128,7 +1122,6 @@ mod tests {
         assert_eq!(calls[0].artifact_id, aid);
         assert_eq!(calls[0].repository_id, rid);
         assert_eq!(calls[0].format, "npm");
-        assert_eq!(calls[0].priority, ADVISORY_PRIORITY);
         assert_eq!(calls[0].priority, 5);
         assert_eq!(calls[0].trigger_source, ADVISORY_TRIGGER_SOURCE);
         assert_eq!(calls[0].trigger_source, "advisory");

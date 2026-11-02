@@ -193,6 +193,7 @@ use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::ports::BoxFuture;
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::{ArtifactCoords, ContentHash, IdempotencyKey};
 
 use crate::use_cases::ingest_use_case::{IngestUseCase, VerifiedIngestRequest};
@@ -235,11 +236,6 @@ const FALLBACK_MEDIA_TYPE: &str = "application/octet-stream";
 /// ([`crate::use_cases::oci_index_child_enqueue`]) so a row minted by the
 /// handler's own recursion is indistinguishable from one minted at a pull leg.
 pub(crate) const CHILD_INGEST_TRIGGER_SOURCE: &str = "ingest";
-
-/// `jobs.priority` bound on every `oci-index-child-ingest` row. Eager child
-/// ingest is a latency optimisation, never urgent work: it drains behind
-/// manual, cron and advisory rows, matching the cascade's priority-0 posture.
-pub(crate) const CHILD_INGEST_ENQUEUE_PRIORITY: i16 = 0;
 
 /// The recursion depth a row minted at a pull-through leg carries: the index
 /// the client pulled is the root, so the children it declares are level zero.
@@ -1052,7 +1048,7 @@ impl OciIndexChildIngestHandler {
                     grandchild,
                     depth,
                 ),
-                priority: CHILD_INGEST_ENQUEUE_PRIORITY,
+                priority: queue_priority(OCI_INDEX_CHILD_INGEST_KIND, CHILD_INGEST_TRIGGER_SOURCE),
                 trigger_source: CHILD_INGEST_TRIGGER_SOURCE.to_string(),
                 idempotency_key: child_ingest_idempotency_key(repo.id, grandchild),
             })
@@ -1223,7 +1219,7 @@ mod tests {
             status: JobStatus::Running,
             params: Some(serde_json::Value::Null),
             actor_id: None,
-            priority: CHILD_INGEST_ENQUEUE_PRIORITY,
+            priority: 0,
             trigger_source: CHILD_INGEST_TRIGGER_SOURCE.to_string(),
             attempts: 1,
             created_at: now,
@@ -2471,7 +2467,7 @@ mod tests {
                 row.kind, OCI_INDEX_CHILD_INGEST_KIND,
                 "recursion by own kind"
             );
-            assert_eq!(row.priority, CHILD_INGEST_ENQUEUE_PRIORITY);
+            assert_eq!(row.priority, 0);
             assert_eq!(row.trigger_source, CHILD_INGEST_TRIGGER_SOURCE);
             let expected = format!("sha256:{}", grandchild.as_ref());
             assert_eq!(row.params["child_digest"], expected);
