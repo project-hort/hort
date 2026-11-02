@@ -1389,15 +1389,24 @@ warm:base-images:
 
 # Read-only readiness probe: reports the complete cold set ahead of a
 # release, without side effects (no prefetch POST — see
-# scripts/ci/vetted-index-preflight.sh). Scheduled only — this is a
-# pre-release signal an operator checks before cutting a release, not
-# something every develop push needs to re-run.
+# scripts/ci/vetted-index-preflight.sh).
+#
+# Reachable on develop as well as on a schedule, for the same reason its
+# three sibling warm jobs are: the project runs no pipeline schedules, so a
+# schedule-only rule is a job that cannot run. This is the readable report
+# of which locked deps the released_only index does not serve yet — the
+# difference between "still in quarantine, wait" and "rejected, intervene"
+# for a blocked publish — and the GitHub equivalent only exists inside
+# release.yml, whose job logs need admin rights. allow_failure: true keeps
+# a cold set from failing a develop pipeline; the job reports, it does not
+# gate.
 prefetch:verify:
   stage: test
   image: alpine:3.24
   needs: []
   allow_failure: true
   rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $HORT_PREFETCH_ENABLED == "true"'
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PREFETCH_ENABLED == "true"'
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:

@@ -1138,17 +1138,6 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::types::Finding>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
-        fn repo_security_score(
-            &self,
-            _r: Uuid,
-        ) -> BoxFuture<
-            '_,
-            DomainResult<
-                Option<hort_domain::ports::repo_security_score_repository::RepoSecurityScore>,
-            >,
-        > {
-            Box::pin(async { Ok(None) })
-        }
         fn first_observed_at<'a>(
             &'a self,
             _a: Uuid,

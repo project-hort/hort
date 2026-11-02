@@ -1213,7 +1213,7 @@ async fn set_tag_ref(
 /// **A claim, not a row.** The claim rides the manifest's own ingest
 /// transition (see [`run_manifest_ingest`]), so the referrer and the row
 /// that keeps its subject's bytes alive commit together or not at all. It
-/// used to be an `insert_for_repo` issued after the ingest had returned,
+/// used to be a separate index write issued after the ingest had returned,
 /// which is a window in which the manifest is live, servable through the
 /// Referrers API, and its subject has one fewer claim against the storage
 /// GC — the GC deletes a CAS blob exactly when no `content_references` row
@@ -1263,7 +1263,7 @@ fn subject_content_reference_claim(
 /// when it collects the manifest bytes.
 ///
 /// **A claim set, not a row set.** These used to be two post-ingest
-/// `insert_for_repo` loops, which meant a failure left the manifest live
+/// index-write loops, which meant a failure left the manifest live
 /// with its constituents holding one fewer claim against the storage GC and
 /// no sweep able to re-derive a tree edge. They now ride the manifest's own
 /// ingest transition. The ordering worry that kept them outside it — that a
@@ -1752,9 +1752,10 @@ async fn delete_by_digest(
     // residual state — a tombstoned source with edges still standing —
     // is the same one the purge sweep is there to clear.
     //
-    // Cleanup goes through the use case (ADR 0008). Same no-authz
-    // trust contract as `insert_for_repo` above (caller has
-    // `WriteRepoAccess`). The explicit `repo_id` keeps the call site
+    // Cleanup goes through the use case (ADR 0008). No-authz trust
+    // contract: this handler already holds `WriteRepoAccess` for
+    // `repo_id`, so the use case forwards without re-resolving
+    // visibility. The explicit `repo_id` keeps the call site
     // semantically scoped even though the underlying port keys delete
     // by `source` alone.
     if let Err(e) = ctx
@@ -2386,7 +2387,7 @@ fn check_child_against_descriptor(
 /// here: there is no insert left in this function. The claims this returns
 /// ride the referrer's own ingest transition, so a failed edge fails the
 /// mint and the client's retry of the GET re-runs the whole pull. This was
-/// an `insert_for_repo` loop with a `warn!`-and-continue arm per edge,
+/// a post-ingest index-write loop with a `warn!`-and-continue arm per edge,
 /// which left the manifest committed and servable while a blob it
 /// references carried one fewer claim against the storage GC — and nothing
 /// repairs a tree edge afterwards, because the refcount-reconcile sweep

@@ -70,5 +70,16 @@ server {
     location / {
         try_files $uri $uri/ =404;
     }
+
+    # Serve the site's own 404 page instead of nginx's built-in one. The
+    # page is served AT the requested path, so every reference it makes is
+    # root-relative (site/landing/404.html) — a relative one would resolve
+    # against the requested directory and render the page unstyled under
+    # any path below the root.
+    #
+    # A site tree that ships no 404.html is unaffected: recursive_error_pages
+    # is off by default, so the internal redirect's own 404 is answered with
+    # nginx's built-in page rather than looping.
+    error_page 404 /404.html;
 }
 {% endif %}

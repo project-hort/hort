@@ -1,6 +1,6 @@
 //! PostgreSQL adapter for [`RetentionScanReader`] — the read surface
-//! the retention evaluator uses against the `scan_findings` and
-//! `repo_security_scores` projections from migration 009.
+//! the retention evaluator uses against the `scan_findings` projection
+//! from migration 009.
 //!
 //! Implements the dedicated retention read port against the scan
 //! projections.
@@ -75,7 +75,6 @@ use uuid::Uuid;
 
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::repo_security_score_repository::RepoSecurityScore;
 use hort_domain::ports::retention_scan_reader::{FirstObservations, RetentionScanReader};
 use hort_domain::types::{ComponentRelation, Finding, FindingStatement, SeverityBasis};
 
@@ -172,45 +171,6 @@ impl FindingRow {
     }
 }
 
-/// sqlx row shape for the `repo_security_scores` columns the freshness
-/// gate needs. Counts are `int4` (signed) in the migration; clamped to
-/// `u32` at the boundary, mirroring the existing
-/// `repo_security_score_repository` adapter.
-#[derive(sqlx::FromRow)]
-struct ScoreRow {
-    repository_id: Uuid,
-    quarantined_count: i32,
-    rejected_count: i32,
-    released_count: i32,
-    critical_count: i32,
-    high_count: i32,
-    medium_count: i32,
-    low_count: i32,
-    last_scan_at: Option<DateTime<Utc>>,
-    updated_at: DateTime<Utc>,
-}
-
-fn clamp(v: i32) -> u32 {
-    u32::try_from(v).unwrap_or(0)
-}
-
-impl ScoreRow {
-    fn into_domain(self) -> RepoSecurityScore {
-        RepoSecurityScore {
-            repository_id: self.repository_id,
-            quarantined_count: clamp(self.quarantined_count),
-            rejected_count: clamp(self.rejected_count),
-            released_count: clamp(self.released_count),
-            critical_count: clamp(self.critical_count),
-            high_count: clamp(self.high_count),
-            medium_count: clamp(self.medium_count),
-            low_count: clamp(self.low_count),
-            last_scan_at: self.last_scan_at,
-            updated_at: self.updated_at,
-        }
-    }
-}
-
 /// sqlx row shape for the first-observation read. `MIN` over a grouped
 /// set is non-NULL whenever the group exists, but sqlx types an aggregate
 /// as nullable; the mapping drops a `None` rather than substituting a
@@ -262,30 +222,6 @@ impl RetentionScanReader for PgRetentionScanReader {
             rows.into_iter()
                 .map(FindingRow::into_domain)
                 .collect::<DomainResult<Vec<_>>>()
-        })
-    }
-
-    fn repo_security_score(
-        &self,
-        repo_id: Uuid,
-    ) -> BoxFuture<'_, DomainResult<Option<RepoSecurityScore>>> {
-        Box::pin(async move {
-            let row = sqlx::query_as::<_, ScoreRow>(
-                r#"
-                SELECT
-                    repository_id,
-                    quarantined_count, rejected_count, released_count,
-                    critical_count, high_count, medium_count, low_count,
-                    last_scan_at, updated_at
-                FROM repo_security_scores
-                WHERE repository_id = $1
-                "#,
-            )
-            .bind(repo_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| DomainError::Invariant(format!("repo_security_scores find: {e}")))?;
-            Ok(row.map(ScoreRow::into_domain))
         })
     }
 
@@ -360,13 +296,6 @@ mod tests {
     }
 
     #[test]
-    fn clamp_negative_goes_to_zero() {
-        assert_eq!(clamp(-5), 0);
-        assert_eq!(clamp(0), 0);
-        assert_eq!(clamp(42), 42);
-    }
-
-    #[test]
     fn finding_row_maps_severity_and_projected_fix_versions() {
         let r = FindingRow {
             purl: "pkg:npm/x@1".into(),
@@ -428,28 +357,6 @@ mod tests {
         assert!(err.to_string().contains("projection corruption"));
     }
 
-    #[test]
-    fn score_row_into_domain_clamps_and_preserves_last_scan() {
-        let now = Utc::now();
-        let r = ScoreRow {
-            repository_id: Uuid::nil(),
-            quarantined_count: -3,
-            rejected_count: 1,
-            released_count: 2,
-            critical_count: 0,
-            high_count: 4,
-            medium_count: 0,
-            low_count: 0,
-            last_scan_at: Some(now),
-            updated_at: now,
-        };
-        let s = r.into_domain();
-        assert_eq!(s.quarantined_count, 0);
-        assert_eq!(s.rejected_count, 1);
-        assert_eq!(s.high_count, 4);
-        assert_eq!(s.last_scan_at, Some(now));
-    }
-
     /// DB-backed: empty + populated `scan_findings` round-trip. Gated
     /// on `DATABASE_URL` so unit-only runs skip cleanly (mirrors
     /// `scan_findings_repository`'s integration-test gating).
@@ -461,8 +368,7 @@ mod tests {
         };
 
         // Seed repo + artifact (FK: scan_findings.artifact_id →
-        // artifacts(id); repo_security_scores.repository_id →
-        // repositories(id)).
+        // artifacts(id)).
         let repo_id = Uuid::new_v4();
         let rkey = format!("it-retread-{}", repo_id.simple());
         sqlx::query(
@@ -508,8 +414,6 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        // No score row yet.
-        assert!(reader.repo_security_score(repo_id).await.unwrap().is_none());
 
         // One scan's two rows: a scored finding (no `informational_class`
         // column → relies on the nullable column reading back NULL) and an
@@ -556,16 +460,6 @@ mod tests {
             .execute(&pool)
             .await
             .expect("pair the rows with the last-scan anchor");
-        sqlx::query(
-            r#"INSERT INTO repo_security_scores
-               (repository_id, released_count, critical_count, last_scan_at)
-               VALUES ($1, 1, 1, now())"#,
-        )
-        .bind(repo_id)
-        .execute(&pool)
-        .await
-        .expect("insert score");
-
         let fs = reader
             .list_findings_for_artifact(artifact_id)
             .await
@@ -593,12 +487,7 @@ mod tests {
         assert_eq!(info.informational_class.as_deref(), Some("unmaintained"));
         assert!(info.is_informational());
 
-        let sc = reader.repo_security_score(repo_id).await.unwrap();
-        let sc = sc.expect("score row now present");
-        assert!(sc.last_scan_at.is_some());
-        assert_eq!(sc.critical_count, 1);
-
-        // Cleanup (CASCADE handles findings + scores).
+        // Cleanup (CASCADE handles the findings rows).
         sqlx::query("DELETE FROM public.repositories WHERE id = $1")
             .bind(repo_id)
             .execute(&pool)
