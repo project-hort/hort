@@ -600,13 +600,16 @@ pub fn item_delimiter(bytes: &[u8], from: usize) -> Option<(usize, u8)> {
 /// production code.
 ///
 /// Scoped **per item** rather than "from the first `#[cfg(test)]` to the
-/// end of the file", which is the shape `capped_stream_reads` can afford
-/// because it scans files whose inline test module comes last. The
-/// adapter crates do not honour that: `purge_gc.rs` attaches the
-/// attribute to a test-only `use`, a test-only field and a test-only
-/// method with 850 lines of production code after them, and a truncating
-/// rule would read that file — and `artifact_repo.rs`, and
-/// `upstream-http/src/lib.rs` — as having almost no code at all.
+/// end of the file", and no guard can afford the truncating shape — the
+/// premise it rests on, that an inline test module comes last in the file,
+/// is false in this workspace. `purge_gc.rs` attaches the attribute to a
+/// test-only `use` at line 202, a test-only field and a test-only
+/// interruption hook, with the rest of the file's production code after
+/// them. Measured over `crates/*/src`: a truncating rule never reads
+/// **14 files / 3 635 lines** of production code, 487 of them in
+/// `purge_gc.rs`. `capped_stream_reads` carried that rule from the day it
+/// landed and reported green over its own blind spot until it was moved
+/// onto this function.
 ///
 /// Only the exact `#[cfg(test)]` spelling counts.
 /// `#[cfg(any(test, feature = "test-support"))]` deliberately does not:
