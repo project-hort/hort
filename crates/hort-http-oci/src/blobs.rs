@@ -651,7 +651,11 @@ pub(super) async fn serve(
         QuarantineStatus::None | QuarantineStatus::Released => {}
         QuarantineStatus::Quarantined => {
             if !write_authorized_existence_probe {
-                return quarantine::check_quarantine(&artifact, repo_key);
+                return quarantine::check_quarantine(
+                    &artifact,
+                    repo_key,
+                    ctx.quarantine_retry_after_floor_secs,
+                );
             }
             // else: the write-authorized existence probe — fall
             // through, but ONLY the HEAD branch below actually serves it
@@ -1975,7 +1979,11 @@ mod tests {
 
     // -- #65 bounded-await release race -------------------------------------
 
-    use hort_http_core::test_support::with_oci_pullthrough_release_wait_secs;
+    use std::num::NonZeroU32;
+
+    use hort_http_core::test_support::{
+        with_oci_pullthrough_release_wait_secs, with_quarantine_retry_after_floor_secs,
+    };
 
     /// Cold pull-through blob: `Quarantined` with an ALREADY-ELAPSED window
     /// (the referenced-tree-descendant zero-window case) whose own async
@@ -2338,22 +2346,30 @@ mod tests {
 
     /// The hold half of the same gap. A blob whose window has elapsed and
     /// whose scan does NOT land inside the bound is handed back by the
-    /// loop and 503s — and that 503's `Retry-After` is now computed from
+    /// loop and 503s — and that 503's `Retry-After` is now derived from
     /// the artifact's own window instead of the flat "deadline unknown"
     /// hour an unhydrated row fell through to.
     ///
-    /// The computed value is 1: an elapsed window is in the past, and
-    /// `check_quarantine` clamps a past deadline to one second. For this
-    /// hold that is the honest answer — what it waits on is the
-    /// artifact's own scan verdict, which does arrive. The hold that
-    /// waits on an external event instead advertises no deadline at all
-    /// (ADR 0039 D5), asserted by
+    /// An elapsed window is in the past, so what the derivation yields
+    /// there is the operator-configured floor
+    /// (`HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`). For this hold a number
+    /// is the honest answer — what it waits on is the artifact's own scan
+    /// verdict, which does arrive — and the floor is how long that
+    /// typically takes; one second, which this path used to advertise,
+    /// is how often a `Retry-After`-honouring client would then poll. The
+    /// hold that waits on an external event instead advertises no
+    /// deadline at all (ADR 0039 D5), asserted by
     /// `get_blob_required_pending_elapsed_window_returns_503_without_consuming_bound`.
-    /// What the bound asserts here is that the header is *derived*: a
-    /// flat hour on a window that has already elapsed is the one value
-    /// that cannot be right, and it is what this path used to answer.
+    ///
+    /// The floor configured here is deliberately neither the harness
+    /// default nor `3600`, which is what makes this a test of the whole
+    /// path rather than of the arithmetic: the number on the wire can
+    /// only have come from this context, through the handler, into
+    /// `check_quarantine`. A flat hour would mean the row reaching the
+    /// refusal carried no deadline.
     #[test]
     fn get_blob_elapsed_window_bound_fallback_503_reports_the_hydrated_window() {
+        const FLOOR: NonZeroU32 = NonZeroU32::new(37).expect("37 is non-zero");
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
@@ -2362,8 +2378,10 @@ mod tests {
 
         let (status, retry_after) = run(async {
             let h = harness();
-            let ctx =
-                with_provenance_hold_hydration(&with_oci_pullthrough_release_wait_secs(&h.ctx, 1));
+            let ctx = with_quarantine_retry_after_floor_secs(
+                &with_provenance_hold_hydration(&with_oci_pullthrough_release_wait_secs(&h.ctx, 1)),
+                FLOOR,
+            );
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
@@ -2398,9 +2416,10 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(
-            secs, 1,
-            "the elapsed window clamps to 1; anything else means the row reaching \
-             `check_quarantine` carried no deadline"
+            secs,
+            i64::from(FLOOR.get()),
+            "an elapsed window answers the configured floor; another value means the \
+             floor this context wired did not reach `check_quarantine`"
         );
         assert_ne!(
             secs, 3600,

@@ -436,6 +436,26 @@ pub struct Config {
     /// artifact's OWN existing `ScanSucceeded`/`ScanWaived`-authorized
     /// release to land; it never grants a release itself.
     pub oci_pullthrough_release_wait_secs: u64,
+    /// Floor on the `Retry-After` a quarantined artifact advertises, in
+    /// seconds. Parsed from `HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`;
+    /// default
+    /// [`hort_http_core::artifact_gate::DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`]
+    /// (20), which is the one definition of that number.
+    ///
+    /// Applies to the window-derived value only, on every content route
+    /// that can refuse a held artifact (the four hosted/proxy formats and
+    /// the OCI pull paths, which share one seconds computation). A floor
+    /// only bites when the computed value is below it, so a genuine long
+    /// window is unaffected; what it corrects is a deadline already in
+    /// the past, where the subtraction is negative and the honest wait is
+    /// the artifact's scan turnaround rather than "immediately".
+    /// Set this to match the deployment's scan interval.
+    ///
+    /// Zero surfaces as [`ConfigError::ValueNotPositive`] — a zero floor
+    /// restores exactly the defect the floor exists to remove, and the
+    /// value is carried as a `NonZeroU32` from here to the gate so no
+    /// consumer needs its own clamp.
+    pub quarantine_retry_after_floor_secs: u32,
     /// Selection between the in-memory and
     /// Redis backends for the `EphemeralStore` port. Default in dev /
     /// test is [`EphemeralStoreBackend::Memory`]; operators running
@@ -932,6 +952,7 @@ impl std::fmt::Debug for Config {
             oci_max_sessions_per_principal,
             oci_session_max_age_secs,
             oci_pullthrough_release_wait_secs,
+            quarantine_retry_after_floor_secs,
             ephemeral_store_backend,
             redis_url: _,
             redis_url_evictable: _,
@@ -1020,6 +1041,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "oci_pullthrough_release_wait_secs",
                 oci_pullthrough_release_wait_secs,
+            )
+            .field(
+                "quarantine_retry_after_floor_secs",
+                quarantine_retry_after_floor_secs,
             )
             .field("ephemeral_store_backend", ephemeral_store_backend)
             .field("redis_url", &"<redacted>")
@@ -2078,6 +2103,10 @@ impl Config {
         // 0 disables (today's immediate-503 behaviour).
         let oci_pullthrough_release_wait_secs = parse_oci_pullthrough_release_wait_secs()?;
 
+        // Floor on the quarantine `Retry-After` every content route
+        // advertises. Zero is rejected by the parse.
+        let quarantine_retry_after_floor_secs = parse_quarantine_retry_after_floor_secs()?;
+
         // `EphemeralStore` backend + Redis URL.
         // Default is Memory so dev / test envs boot without a Redis
         // sidecar. When backend is Redis, `HORT_REDIS_URL` is required.
@@ -2324,6 +2353,7 @@ impl Config {
             oci_max_sessions_per_principal,
             oci_session_max_age_secs,
             oci_pullthrough_release_wait_secs,
+            quarantine_retry_after_floor_secs,
             ephemeral_store_backend,
             redis_url,
             redis_url_evictable,
@@ -2961,6 +2991,26 @@ fn parse_oci_session_max_age_secs() -> Result<u64, ConfigError> {
 /// `parse_positive`) is used specifically to allow it.
 fn parse_oci_pullthrough_release_wait_secs() -> Result<u64, ConfigError> {
     parse_u64("HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS", 10)
+}
+
+/// Parse `HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`.
+///
+/// Absent or empty env var → the 20-second default, whose single
+/// definition is
+/// [`hort_http_core::artifact_gate::DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`]
+/// (the same arrangement as `HORT_MAX_INFLIGHT` and its
+/// `load_shed::DEFAULT_MAX_INFLIGHT`). Non-integer values surface as
+/// [`ConfigError::InvalidInt`]; zero surfaces as
+/// [`ConfigError::ValueNotPositive`] — a `Retry-After: 0` is spec-legal
+/// but easy to misparse, and more to the point a zero floor restores the
+/// behaviour the floor exists to remove (a hold past its deadline
+/// advertising one second while its scan verdict is still outstanding,
+/// which turns one client poll into one per second).
+fn parse_quarantine_retry_after_floor_secs() -> Result<u32, ConfigError> {
+    parse_positive::<u32>(
+        "HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS",
+        hort_http_core::artifact_gate::DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS.get(),
+    )
 }
 
 /// Parse `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS`.
@@ -4008,6 +4058,43 @@ mod tests {
         );
     }
 
+    /// The quarantine `Retry-After` floor: the default is the shared
+    /// constant and not a second copy of the number, and zero is refused.
+    ///
+    /// Zero matters more than it looks: a zero floor restores exactly the
+    /// behaviour the floor exists to remove — a hold whose deadline has
+    /// passed advertising a near-immediate retry while its scan verdict is
+    /// still outstanding — so accepting it would hand an operator a
+    /// config-only route back to the defect.
+    #[test]
+    fn parse_quarantine_retry_after_floor_default_and_zero_rejection() {
+        const VAR: &str = "HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS";
+        // Absent → the one definition of the default, read from the
+        // crate that owns the computation it floors.
+        temp_env::with_var(VAR, None::<&str>, || {
+            assert_eq!(
+                parse_quarantine_retry_after_floor_secs().unwrap(),
+                hort_http_core::artifact_gate::DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS.get(),
+            );
+        });
+        // A set value is honoured, so the knob is a knob.
+        temp_env::with_var(VAR, Some("90"), || {
+            assert_eq!(parse_quarantine_retry_after_floor_secs().unwrap(), 90);
+        });
+        temp_env::with_var(VAR, Some("0"), || {
+            assert!(matches!(
+                parse_quarantine_retry_after_floor_secs().unwrap_err(),
+                ConfigError::ValueNotPositive { var, got: 0 } if var == VAR
+            ));
+        });
+        temp_env::with_var(VAR, Some("not-a-number"), || {
+            assert!(matches!(
+                parse_quarantine_retry_after_floor_secs().unwrap_err(),
+                ConfigError::InvalidInt { var, .. } if var == VAR
+            ));
+        });
+    }
+
     // -- Debug-redaction regression tests ----------------------------------
     //
     // `StorageConfig::S3` carries AWS credentials. The struct must NOT
@@ -4101,6 +4188,8 @@ mod tests {
             oci_max_sessions_per_principal: 32,
             oci_session_max_age_secs: 3600,
             oci_pullthrough_release_wait_secs: 10,
+            quarantine_retry_after_floor_secs:
+                hort_http_core::artifact_gate::DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS.get(),
             ephemeral_store_backend: EphemeralStoreBackend::Memory,
             redis_url: None,
             // Per-class overrides default to None
@@ -4225,6 +4314,8 @@ mod tests {
             oci_max_sessions_per_principal: 32,
             oci_session_max_age_secs: 3600,
             oci_pullthrough_release_wait_secs: 10,
+            quarantine_retry_after_floor_secs:
+                hort_http_core::artifact_gate::DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS.get(),
             ephemeral_store_backend: EphemeralStoreBackend::Redis,
             redis_url: Some(format!(
                 "redis://user:{SENSITIVE_REDIS_PASSWORD}@localhost:6379/0"

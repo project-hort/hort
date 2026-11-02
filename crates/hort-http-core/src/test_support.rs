@@ -1819,6 +1819,12 @@ pub fn build_mock_ctx_with_label_flag(
         // bounded-await set this explicitly to a short value via
         // `with_*`.
         oci_pullthrough_release_wait_secs: 0,
+        // Seeded from the production default's one definition rather
+        // than a literal, so a test that derives its expectation from
+        // the same constant is asserting the operator's answer and not a
+        // harness-local number that happens to agree with it today.
+        quarantine_retry_after_floor_secs:
+            crate::artifact_gate::DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS,
         auth: AuthContext::Disabled,
         // Default to None in all mock contexts.
         // Tests that need to exercise extra-CA behaviour supply it directly.
@@ -2122,6 +2128,7 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         upstream_projector_version_object_max_bytes: base
             .upstream_projector_version_object_max_bytes,
         oci_pullthrough_release_wait_secs: base.oci_pullthrough_release_wait_secs,
+        quarantine_retry_after_floor_secs: base.quarantine_retry_after_floor_secs,
         auth: AuthContext::Disabled,
         // Carry forward from base; callers that need
         // to test with extra anchors override this field in the mutate closure.
@@ -2263,6 +2270,19 @@ pub fn with_oci_pullthrough_release_wait_secs(
     secs: u64,
 ) -> Arc<AppContext> {
     rebuild(base, |ctx| ctx.oci_pullthrough_release_wait_secs = secs)
+}
+
+/// Override the quarantine `Retry-After` floor
+/// (`HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`) on a mock context. The
+/// harness seeds
+/// [`crate::artifact_gate::DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`],
+/// so a test reaches for this when it needs an answer that could not be
+/// produced by a number baked into the arithmetic.
+pub fn with_quarantine_retry_after_floor_secs(
+    base: &Arc<AppContext>,
+    secs: std::num::NonZeroU32,
+) -> Arc<AppContext> {
+    rebuild(base, |ctx| ctx.quarantine_retry_after_floor_secs = secs)
 }
 
 /// Wire the OCI signing-key handle on a mock

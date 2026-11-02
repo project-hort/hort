@@ -177,7 +177,11 @@ policy duration the content route's `Retry-After` counts down to
 (`ArtifactUseCase::package_hold_deadlines` and
 `ArtifactUseCase::hydrate_quarantine_deadline` share one window
 resolver), so the two surfaces cannot name different instants; where it
-cannot be computed the field is absent rather than guessed.
+cannot be computed the field is absent rather than guessed. The one
+asymmetry is deliberate: `Retry-After` is floored
+(`HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`) because a client that reads
+it polls on it, while `available_after` is an instant a reader looks at
+once and so reports the window unmodified.
 
 Unlike the hold-read exemption above, this is not identity-dependent:
 npm composes the ordinary reader's pipeline for every caller and derives

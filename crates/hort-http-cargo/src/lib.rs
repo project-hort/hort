@@ -440,7 +440,7 @@ async fn render_cargo_crate_response(
     artifact: hort_domain::entities::artifact::Artifact,
     actor: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
-    if let Some(blocked) = non_servable_response(&artifact) {
+    if let Some(blocked) = non_servable_response(&artifact, ctx.quarantine_retry_after_floor_secs) {
         return Ok(blocked);
     }
 
@@ -1617,8 +1617,8 @@ mod tests {
     /// ADR 0039 D5 — a quarantined crate still waiting on a signature
     /// after its observation window elapsed has no deadline to advertise:
     /// what it waits for is an external event, not the clock. Before
-    /// this, cargo answered `Retry-After: 1` on every pull of such a
-    /// crate, forever.
+    /// this, cargo answered a `Retry-After` on every pull of such a
+    /// crate, forever — a number no value of which could be right.
     #[tokio::test]
     async fn download_indefinite_hold_is_503_with_no_retry_after() {
         let h = harness();

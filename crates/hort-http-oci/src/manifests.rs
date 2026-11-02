@@ -347,7 +347,11 @@ pub(super) async fn serve(
         QuarantineStatus::None | QuarantineStatus::Released => {}
         QuarantineStatus::Quarantined => {
             if !write_authorized_hold_read {
-                return quarantine::check_quarantine(&artifact, repo_key);
+                return quarantine::check_quarantine(
+                    &artifact,
+                    repo_key,
+                    ctx.quarantine_retry_after_floor_secs,
+                );
             }
             // else: ADR 0039 §10 write-authorized hold-read — fall
             // through to serve the manifest (HEAD and GET alike).
@@ -2777,8 +2781,9 @@ mod tests {
             // The window this test asserts has to be seeded. The harness's
             // permissive GLOBAL policy carries
             // `quarantine_duration_secs = 0`, which resolves the computed
-            // deadline onto the row's anchor and clamps `Retry-After` to
-            // the useless `1`. A repo-scoped policy shadows the global for
+            // deadline onto the row's anchor, so the advertised
+            // `Retry-After` would be the floor and say nothing about any
+            // window. A repo-scoped policy shadows the global for
             // this repository only (`resolve_active_policy_for_repo`'s
             // `repo_scoped.or(global)` precedence).
             h.policy_projections
@@ -2823,7 +2828,7 @@ mod tests {
         // `ArtifactUseCase::hydrate_quarantine_deadline` resolves
         // `anchor + resolved-policy-duration`. The bound is what makes the
         // assertion worth having — the two plausible wrong answers both
-        // sit outside it: the bare-anchor clamp-to-1s (what a
+        // sit outside it: the bare-anchor floor (what a
         // `quarantine_duration_secs = 0` policy produces, and what this
         // path answered before a real window was resolved) and the
         // deadline-unknown 3600 fallback. Allow a little slack for clock
@@ -2847,8 +2852,8 @@ mod tests {
     //
     // A `Required`-mode artifact that is still unsigned once its
     // observation window has elapsed is waiting on a signature reaching
-    // Hort, not on the clock. The clamp in `check_quarantine` would
-    // otherwise answer `Retry-After: 1` on every pull, forever. These
+    // Hort, not on the clock. The floor in `check_quarantine` would
+    // otherwise answer that floor on every pull, forever. These
     // two tests drive the whole read path — policy resolution, the
     // clearance stream read, the hydrated flag, the response — through
     // the live handler for both verbs, because the plumbing between the
