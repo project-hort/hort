@@ -592,8 +592,9 @@ impl IntoResponse for OciError {
             // delta-seconds integer or an HTTP-date. We use the
             // integer form — simpler and the spec table specifies it.
             // `HeaderValue::from` on i64 is infallible for any numeric
-            // value; the `max(1)` clamp at the caller site guarantees
-            // a positive delta.
+            // value; the non-zero floor the caller site applies
+            // (`hort_http_core::artifact_gate::quarantine_retry_after_seconds`)
+            // guarantees a positive delta.
             response.headers_mut().insert("Retry-After", secs.into());
         }
         if let Some(current) = range_current {

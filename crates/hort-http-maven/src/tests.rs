@@ -838,7 +838,8 @@ async fn sidecar_of_rejected_file_inherits_the_axis_the_file_names() {
 /// ADR 0039 D5 — a quarantined jar still waiting on a signature after its
 /// observation window elapsed has no deadline to advertise: what it waits
 /// for is an external event, not the clock. Before this, Maven answered
-/// `Retry-After: 1` on every pull of such a jar, forever.
+/// a `Retry-After` on every pull of such a jar, forever — a number no
+/// value of which could be right.
 #[tokio::test]
 async fn indefinite_hold_file_get_is_503_with_no_retry_after() {
     let (ctx, mocks) = build_mock_ctx(handle());

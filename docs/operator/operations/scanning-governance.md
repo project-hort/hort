@@ -27,6 +27,8 @@ Offline validation checks configuration rules but cannot confirm that scanning t
 
 Depending on the OCI workflow and scan state, a client may receive `503` and `Retry-After` during quarantine. Treat that as a possible policy-controlled response, not automatically as an infrastructure outage. Prefer immutable digests when validating image identity.
 
+The advertised interval never drops below `HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS` (default 20 seconds). Once an artifact's observation window has elapsed the outstanding item is the scan verdict rather than the clock, so the floor — not the remaining window — is what a client is told to wait; set it to your scan turnaround so a polling client makes one request per scan instead of one per second. A `503` carrying no `Retry-After` at all is the externally-gated provenance hold, which waiting does not clear.
+
 ## Handle findings and exceptions
 
 Keep **waivers, blocks and exclusions** distinct in review procedures. Grant curator privileges only to authorized operators and record the reason, scope, approver, and expiry/review date of an exception in your operational process. Before removing an exclusion, assess the effect on artifacts previously evaluated under it.

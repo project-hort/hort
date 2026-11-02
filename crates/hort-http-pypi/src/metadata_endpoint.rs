@@ -209,7 +209,10 @@ pub(crate) async fn serve_pep658_metadata(
         .await
         .map_err(ApiError::from)?;
 
-    Ok(render_outcome(outcome))
+    Ok(render_outcome(
+        outcome,
+        ctx.quarantine_retry_after_floor_secs,
+    ))
 }
 
 /// Strategy-2 proxy cache-miss dispatch for the PEP 658 `.metadata`
@@ -260,7 +263,10 @@ async fn serve_proxy_with_pull_fallback(
     match first_attempt {
         Ok(outcome) => {
             tracing::debug!("proxy .metadata cache hit — serving from CAS without pull-through");
-            return Ok(render_outcome(outcome));
+            return Ok(render_outcome(
+                outcome,
+                ctx.quarantine_retry_after_floor_secs,
+            ));
         }
         Err(AppError::Domain(DomainError::NotFound {
             entity: "Artifact", ..
@@ -317,7 +323,10 @@ async fn serve_proxy_with_pull_fallback(
                         .serve(&repo_key, &artifact_path, actor)
                         .await
                         .map_err(ApiError::from)?;
-                    Ok(render_outcome(outcome))
+                    Ok(render_outcome(
+                        outcome,
+                        ctx.quarantine_retry_after_floor_secs,
+                    ))
                 }
                 // Pull-through failed — render the same wire shape the
                 // wheel-download handler does for the equivalent
@@ -390,7 +399,10 @@ async fn serve_virtual_pep658_metadata(
                 .serve(&member.key, artifact_path, actor)
                 .await
                 .map_err(ApiError::from)?;
-            Ok(render_outcome(outcome))
+            Ok(render_outcome(
+                outcome,
+                ctx.quarantine_retry_after_floor_secs,
+            ))
         }
         // Authoritative proxy member's pull failed → surface verbatim (no
         // fall-through), matching the wheel-download virtual path.
@@ -419,11 +431,16 @@ async fn serve_virtual_pep658_metadata(
 /// `Retry-After` arithmetic: ADR 0039 D5 (a hold with no self-resolving
 /// deadline advertises no deadline) lives in that function, and the copy
 /// that used to live here never had it.
-fn render_outcome(outcome: WheelMetadataServeOutcome) -> Response {
+fn render_outcome(
+    outcome: WheelMetadataServeOutcome,
+    retry_after_floor_secs: std::num::NonZeroU32,
+) -> Response {
     match outcome {
         WheelMetadataServeOutcome::Available(blob) => build_metadata_response(blob),
-        WheelMetadataServeOutcome::NonServable(artifact) => non_servable_response(&artifact)
-            .unwrap_or_else(|| withheld_without_a_refusal(&artifact)),
+        WheelMetadataServeOutcome::NonServable(artifact) => {
+            non_servable_response(&artifact, retry_after_floor_secs)
+                .unwrap_or_else(|| withheld_without_a_refusal(&artifact))
+        }
     }
 }
 
@@ -584,8 +601,10 @@ mod tests {
             hort_domain::entities::artifact::QuarantineStatus::Released,
         ] {
             let artifact = hort_app::use_cases::test_support::sample_artifact(status);
-            let response =
-                render_outcome(WheelMetadataServeOutcome::NonServable(Box::new(artifact)));
+            let response = render_outcome(
+                WheelMetadataServeOutcome::NonServable(Box::new(artifact)),
+                hort_http_core::artifact_gate::DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS,
+            );
             assert_eq!(
                 response.status(),
                 StatusCode::NOT_FOUND,

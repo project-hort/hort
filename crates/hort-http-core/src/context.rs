@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -854,6 +855,26 @@ pub struct AppContext {
     /// release predicate; it only polls for the artifact's OWN already-
     /// authorized release to land).
     pub oci_pullthrough_release_wait_secs: u64,
+    /// Floor (in seconds) under which a quarantined artifact's
+    /// `Retry-After` is never advertised. Default value settled in
+    /// `Config::from_env`
+    /// (`HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`, `20` —
+    /// [`crate::artifact_gate::DEFAULT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`]
+    /// is the one definition of that number).
+    ///
+    /// Read by **every** content route that can refuse a held artifact:
+    /// the four hosted/proxy formats through
+    /// [`crate::artifact_gate::non_servable_response`] and the OCI pull
+    /// paths through `hort_http_oci::quarantine::check_quarantine`, which
+    /// share one seconds computation and differ only in the protocol
+    /// envelope they wrap it in.
+    ///
+    /// Plain config value (not an `Arc<dyn Port>`) — matches the
+    /// architect-skill rule that AppContext fields are either a port
+    /// handle or a plain config value. [`std::num::NonZeroU32`] because
+    /// the env parse rejects `0` and the gate's "never `Retry-After: 0`"
+    /// guarantee then needs no second clamp downstream.
+    pub quarantine_retry_after_floor_secs: NonZeroU32,
     /// Authentication + RBAC wiring. `AuthContext::Disabled` preserves the
     /// anonymous pass-through — the router skips attaching
     /// `require_principal` and handlers keep their `Uuid::nil()` placeholder
@@ -1074,6 +1095,8 @@ pub struct AppContextParts {
     pub upstream_projector_version_object_max_bytes: u64,
     /// See [`AppContext::oci_pullthrough_release_wait_secs`].
     pub oci_pullthrough_release_wait_secs: u64,
+    /// See [`AppContext::quarantine_retry_after_floor_secs`].
+    pub quarantine_retry_after_floor_secs: NonZeroU32,
     pub auth: AuthContext,
     /// See [`AppContext::extra_trust_anchors`].
     pub extra_trust_anchors: Option<ExtraTrustAnchors>,
@@ -1176,6 +1199,7 @@ impl AppContext {
             upstream_projector_version_object_max_bytes: parts
                 .upstream_projector_version_object_max_bytes,
             oci_pullthrough_release_wait_secs: parts.oci_pullthrough_release_wait_secs,
+            quarantine_retry_after_floor_secs: parts.quarantine_retry_after_floor_secs,
             auth: parts.auth,
             extra_trust_anchors: parts.extra_trust_anchors,
             pat_cache: parts.pat_cache,

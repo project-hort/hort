@@ -652,6 +652,13 @@ async fn run_async() -> anyhow::Result<()> {
         cfg.upstream_manifest_cache_max_bytes,
         cfg.upstream_projector_version_object_max_bytes,
         cfg.oci_pullthrough_release_wait_secs,
+        // Zero rejected at parse-time in `Config::from_env`, so the
+        // `NonZeroU32::new(..).expect(..)` here is total — the same
+        // carry as the concurrency caps above.
+        std::num::NonZeroU32::new(cfg.quarantine_retry_after_floor_secs).expect(
+            "HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS non-zero invariant enforced by \
+             Config::from_env",
+        ),
         cfg.public_base_url.clone(),
         trust_config,
         rate_limit_config,

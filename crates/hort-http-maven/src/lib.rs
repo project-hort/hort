@@ -511,8 +511,9 @@ async fn resolve_unresolved_snapshot(
 /// sidecar reveals nothing the file's own status response does not.
 pub(crate) fn non_servable_response(
     artifact: &hort_domain::entities::artifact::Artifact,
+    retry_after_floor_secs: std::num::NonZeroU32,
 ) -> Option<Response> {
-    hort_http_core::artifact_gate::non_servable_response(artifact)
+    hort_http_core::artifact_gate::non_servable_response(artifact, retry_after_floor_secs)
 }
 
 /// Render the final file HTTP response: surface the quarantine gate via
@@ -525,7 +526,7 @@ async fn render_file_response(
     is_head: bool,
     actor: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
-    if let Some(blocked) = non_servable_response(&artifact) {
+    if let Some(blocked) = non_servable_response(&artifact, ctx.quarantine_retry_after_floor_secs) {
         return Ok(blocked);
     }
 

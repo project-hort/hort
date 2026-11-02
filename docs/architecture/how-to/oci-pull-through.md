@@ -69,7 +69,16 @@ The response body is the canonical OCI error envelope:
 ```
 
 The `Retry-After` value is the computed seconds-until-quarantine-
-deadline (clamped to ≥ 1; default 1 hour when no deadline is set).
+deadline, floored at `HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`
+(default 20 s; 1 hour when no deadline is set at all). The floor matters
+on the common cold-pull case: the observation window is already over
+there and what the pull is actually waiting for is the scan verdict, so
+the raw arithmetic is negative and an unfloored value would tell a
+client honouring the header to come back every second until the scan
+lands. Raise the floor to match your scan turnaround. A hold waiting on
+an external provenance signature carries **no** `Retry-After` at all and
+no floor changes that
+([ADR 0039](../../adr/0039-keyed-provenance-verification.md) D5).
 
 ### Why not a silent substitution to the prior tag target?
 
@@ -373,6 +382,15 @@ The manifest is quarantined. Either wait the indicated number of
 seconds and retry, OR switch to a digest-pinned pull (§3) for a
 previously-released digest, OR adjust the repository's `ScanPolicy`
 (§5).
+
+A `Retry-After` that keeps coming back as the same small number is the
+floor (`HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`, default 20 s), not an
+estimate: the window has elapsed and the scan verdict has not landed
+yet. If pulls routinely spend longer than that in the 503, raise the
+floor to your scan turnaround so clients poll once instead of
+repeatedly. A 503 with **no** `Retry-After` is a different state — a
+provenance hold waiting on a signature, which no amount of waiting
+resolves.
 
 ### `502 Bad Gateway`
 

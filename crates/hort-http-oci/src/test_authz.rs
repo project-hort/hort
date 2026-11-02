@@ -317,7 +317,8 @@ pub(crate) fn seed_required_provenance_policy(
 /// context now does, as does
 /// `hort_http_core::test_support::with_provenance_hold_hydration`), a held
 /// row's computed deadline collapses onto its anchor and
-/// `check_quarantine`'s past-deadline clamp answers `Retry-After: 1`. A
+/// `check_quarantine` answers the configured `Retry-After` floor rather
+/// than anything about a window. A
 /// test whose subject is the advertised window therefore has to seed the
 /// window it means to assert; the resolver's `repo_scoped.or(global)`
 /// precedence (`resolve_active_policy_for_repo`) makes this shadow the

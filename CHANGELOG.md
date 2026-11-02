@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A quarantined artifact's `Retry-After` no longer advertises one second while
+  its scan verdict is outstanding; the floor is
+  `HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`, default 20 s — set it to your scan
+  turnaround (#331).
 - A Maven proxy whose upstream has neither the artifact nor a checksum sidecar
   now answers 404 rather than 502, so a virtual Maven repository serves a
   coordinate only a later member holds (#391).
