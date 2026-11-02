@@ -25,9 +25,13 @@
 //!
 //! See metrics-catalog.md (`hort_admin_tasks_*`):
 //!
-//! - `hort_admin_tasks_enqueued_total{kind}` — currently unused by the
-//!   dispatcher itself; enqueued events are emitted by the HTTP handler.
-//!   Documented here for completeness.
+//! - `hort_admin_tasks_enqueued_total{kind, result}` — NOT emitted by the
+//!   dispatcher; the HTTP invoke handler
+//!   (`hort-http-admin-tasks::handlers::invoke`) owns it, and `result ∈
+//!   {ok, rbac_denied, validation_error}` describes the *acceptance* of an
+//!   operator request, not the fate of a claimed row. Listed here only so
+//!   the `hort_admin_tasks_*` family reads complete from one place; the
+//!   label set is the handler's, so change it there.
 //! - `hort_admin_tasks_completed_total{kind, result}` — one increment per
 //!   `record_outcome_for_row` call. `result ∈ {completed, failed_retry,
 //!   failed_terminal}`. A retryable failure on a row that has spent its
