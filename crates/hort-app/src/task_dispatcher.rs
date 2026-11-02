@@ -21,6 +21,17 @@
 //! [`crate::destructive_task_reauthorization`] for the decision and why
 //! a refusal is terminal while an unreadable authority store is not.
 //!
+//! # Audit event emitted
+//!
+//! A failure the dispatcher wrote to the row also lands on the audit
+//! stream as `TaskFailed` — `final_attempt: false` from the
+//! `reschedule` path, `true` from `mark_failed`. It is the counterpart
+//! of the enqueue path's `TaskInvoked` and shares its stream routing, so
+//! a destructive kind's invocation and its failure are one trail on the
+//! never-deleted stream. [`TaskDispatcher::append_failure_audit`]
+//! carries the conditions: the write must have landed, and the kind must
+//! be one an operator can invoke.
+//!
 //! # Metrics emitted
 //!
 //! See metrics-catalog.md (`hort_admin_tasks_*`):
@@ -65,7 +76,10 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use hort_domain::events::{Actor, InternalActor};
+use hort_domain::events::{
+    Actor, DomainEvent, InternalActor, TaskFailed, ADMIN_INVOKABLE_TASK_KINDS,
+};
+use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
     JobRow, JobsRepository, PendingKindBacklog, RequeueOutcome, REQUEUE_ON_LEASE_EXPIRY_KINDS,
 };
@@ -78,6 +92,7 @@ use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::result_write_fence::surface_attempted_result_write;
 use crate::retry_backoff::compute_backoff;
+use crate::use_cases::task_use_case::TaskUseCase;
 
 // ---------------------------------------------------------------------------
 // Metric name constants
@@ -232,11 +247,17 @@ pub struct TaskDispatcher {
     /// Per-kind semaphore enforcing `max_concurrency`.
     semaphores: HashMap<&'static str, Arc<Semaphore>>,
     job_repo: Arc<dyn JobsRepository>,
-    /// `EventStore` is held for future use (e.g. emitting `TaskInvoked`
-    /// audit events). Currently unused by the dispatcher
-    /// itself — scan-kind outcome events are emitted inside
-    /// `ScanTaskHandler::run` via `ScanOrchestrationUseCase::record_outcome`.
-    #[allow(dead_code)]
+    /// Where the dispatcher appends the `TaskFailed` audit record for a
+    /// failure it closed a row out on — see
+    /// [`Self::append_failure_audit`] for the routing, the
+    /// kinds it skips and why the append can never change the row's
+    /// state.
+    ///
+    /// Nothing else in the dispatcher writes events: a scan's own
+    /// outcome vocabulary is emitted inside `ScanTaskHandler::run` via
+    /// `ScanOrchestrationUseCase::record_outcome`, and `TaskInvoked`
+    /// belongs to the enqueue path (`TaskUseCase::enqueue`), not to
+    /// execution.
     event_store: Arc<EventStorePublisher>,
     /// Re-checks a destructive invocation's requester against the live
     /// authority state before its handler is invoked.
@@ -960,6 +981,10 @@ impl TaskDispatcher {
     /// owns events and artifact state and reports what the row should
     /// become; `crates/hort-app/tests/jobs_row_has_one_owner.rs` is what
     /// keeps a second writer from reappearing in this layer.
+    ///
+    /// Both failure transitions also append the `TaskFailed` audit
+    /// record — see [`Self::append_failure_audit`], which is called only
+    /// when the write landed and only for a kind the event admits.
     async fn record_outcome_for_row(&self, job: &JobRow, kind: &str, outcome: TaskOutcome) {
         match outcome {
             TaskOutcome::Completed { result_summary } => {
@@ -999,7 +1024,7 @@ impl TaskDispatcher {
                         .job_repo
                         .reschedule(job.id, job.attempts, backoff, &reason)
                         .await;
-                    surface_attempted_result_write(
+                    let landed = surface_attempted_result_write(
                         written,
                         "reschedule",
                         job.id,
@@ -1012,6 +1037,9 @@ impl TaskDispatcher {
                         "result" => RESULT_FAILED_RETRY,
                     )
                     .increment(1);
+                    if landed {
+                        self.append_failure_audit(job, kind, &reason, false).await;
+                    }
                 } else {
                     if retry {
                         // A task that has failed its whole budget is an
@@ -1033,7 +1061,7 @@ impl TaskDispatcher {
                         .job_repo
                         .mark_failed(job.id, job.attempts, &reason)
                         .await;
-                    surface_attempted_result_write(
+                    let landed = surface_attempted_result_write(
                         written,
                         "mark_failed",
                         job.id,
@@ -1046,8 +1074,120 @@ impl TaskDispatcher {
                         "result" => RESULT_FAILED_TERMINAL,
                     )
                     .increment(1);
+                    if landed {
+                        self.append_failure_audit(job, kind, &reason, true).await;
+                    }
                 }
             }
+        }
+    }
+
+    /// Append the `TaskFailed` audit record for a failure this
+    /// execution wrote to the row.
+    ///
+    /// The `jobs` row records a failure for seven days and then the
+    /// retention sweep removes it; this is the durable half. It pairs
+    /// with the enqueue path's `TaskInvoked`, and the pairing is the
+    /// whole design — four conditions follow from it, and each one is
+    /// load-bearing.
+    ///
+    /// **Routed through [`TaskUseCase::task_audit_stream`], never
+    /// re-derived.** A destructive kind's `TaskInvoked` lands on
+    /// `StreamId::eventstore_retention()`, the stream
+    /// `EventStore::delete_stream` / `archive_stream` are forbidden to
+    /// touch. Its `TaskFailed` has to land there too, or an
+    /// `eventstore-archive` run could truncate the record of its own
+    /// failure while the record of its invocation survives — and the
+    /// refused or failed destructive run is the half an operator came
+    /// to read. A second copy of the routing rule here is how the two
+    /// halves would come to disagree.
+    ///
+    /// **Only when the result write landed** — the caller branches on
+    /// [`surface_attempted_result_write`]'s answer. The fenced write is
+    /// `AND attempts = $2`; a refusal means the abandoned-lease sweep
+    /// handed the row to a later execution while this handler ran, so
+    /// this execution's failure is not the row's state. An audit record
+    /// claiming otherwise is a false record about a row somebody else
+    /// owns.
+    ///
+    /// **Skipped for a kind outside [`ADMIN_INVOKABLE_TASK_KINDS`]**,
+    /// which the dispatcher does run: `TaskFailed::validate` rejects
+    /// such a kind and the production event store validates every event
+    /// it appends, so an unconditional append would produce a rejected
+    /// write for exactly those. That validation is the right shape and
+    /// this is the side that narrows — `TaskFailed` is the counterpart
+    /// of `TaskInvoked`, which can only ever carry an allowlisted kind,
+    /// so the pair is symmetric by construction. The two such kinds
+    /// have records of their own: a `scan` row's failure is the scan
+    /// vocabulary's business (`ScanCompleted` on a verdict,
+    /// `ScanIndeterminate` when the budget is spent — and a scan row is
+    /// only ever minted by `enqueue_scan`, never by an operator), and
+    /// an `oci-index-child-ingest` failure costs nothing but the
+    /// ergonomics win, because the child stays reachable through the
+    /// lazy pull path that re-derives it.
+    ///
+    /// **Never changes the task's outcome.** The row is the operational
+    /// record and this is the audit record, so the append comes after
+    /// the write and an event-store failure is logged and nothing else.
+    /// A store that is down must not be able to hold a row open.
+    async fn append_failure_audit(
+        &self,
+        job: &JobRow,
+        kind: &str,
+        reason: &str,
+        final_attempt: bool,
+    ) {
+        if !ADMIN_INVOKABLE_TASK_KINDS.contains(&kind) {
+            tracing::debug!(
+                job_id = %job.id,
+                kind,
+                final_attempt,
+                "TaskDispatcher: no TaskFailed audit event for this kind — it is not \
+                 operator-invokable, so it has no TaskInvoked to pair with and the event's \
+                 own validation rejects it; the row and the kind's own event vocabulary \
+                 are its record",
+            );
+            return;
+        }
+
+        // `reason` is already bounded: every production failure is built
+        // through `TaskOutcome::fail`, whose `REASON_MAX_BYTES` is the
+        // same number as this event's own cap, deliberately so the event
+        // and `jobs.last_error` cannot disagree about what was
+        // truncated. Re-truncating here would be a second copy of that
+        // bound; leaving it means a producer that ever bypassed the
+        // constructor shows up as a rejected append rather than as two
+        // silently different texts.
+        let append = AppendEvents {
+            stream_id: TaskUseCase::task_audit_stream(kind),
+            expected_version: ExpectedVersion::Any,
+            events: vec![EventToAppend::new(DomainEvent::TaskFailed(TaskFailed {
+                task_job_id: job.id,
+                kind: kind.to_string(),
+                reason: reason.to_string(),
+                final_attempt,
+            }))],
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            // The same actor this execution's `TaskContext` already
+            // carries, so one dispatched run is attributed one way
+            // rather than two. Deliberately not the row's `actor_id`:
+            // the requester asked for the task, the worker is what
+            // failed it, and attributing the failure to the requester
+            // would read as the operator having done something wrong.
+            actor: Actor::Internal(InternalActor::Timer),
+        };
+        if let Err(e) = self.event_store.append(append).await {
+            tracing::error!(
+                error = %e,
+                job_id = %job.id,
+                kind,
+                final_attempt,
+                "TaskDispatcher: the TaskFailed audit event did not reach the event store. \
+                 The row's state is already written and stands — the failure is \
+                 operator-visible there, but absent from the audit trail, so it is lost \
+                 once the row's retention horizon removes it",
+            );
         }
     }
 }
@@ -1175,7 +1315,7 @@ mod tests {
     use chrono::Utc;
     use hort_domain::error::DomainError;
     use hort_domain::error::DomainResult;
-    use hort_domain::events::DESTRUCTIVE_TASK_KINDS;
+    use hort_domain::events::{DESTRUCTIVE_TASK_KINDS, EVENT_TASK_KINDS};
     use hort_domain::ports::jobs_repository::{
         JobRow, JobStatus, JobsRepository, RequeuedJob, ResultWriteOutcome, ScanJob,
     };
@@ -1600,6 +1740,109 @@ mod tests {
         }
     }
 
+    /// An `EventStore` that records every batch it was handed, and can
+    /// be told to refuse them.
+    ///
+    /// It does **not** round-trip — `read_stream` serves nothing, and
+    /// no production code reads back what the dispatcher appends — so
+    /// the "a double that round-trips must refuse what production
+    /// refuses" rule does not reach it. What a test needs here is the
+    /// batch's stream id, its payload and the fact that an append was
+    /// attempted at all.
+    struct RecordingEventStore {
+        batches: Mutex<Vec<AppendEvents>>,
+        fails: bool,
+    }
+
+    impl RecordingEventStore {
+        fn new() -> Self {
+            Self {
+                batches: Mutex::new(Vec::new()),
+                fails: false,
+            }
+        }
+
+        /// Every append errors — the event store being down while the
+        /// row's own write already landed.
+        fn failing() -> Self {
+            Self {
+                batches: Mutex::new(Vec::new()),
+                fails: true,
+            }
+        }
+
+        fn batches(&self) -> Vec<AppendEvents> {
+            self.batches.lock().unwrap().clone()
+        }
+
+        /// The single `TaskFailed` payload this store was handed, with
+        /// the stream it was routed to. Panics unless exactly one batch
+        /// of exactly one `TaskFailed` was appended, because every
+        /// caller is asserting about one failure.
+        fn only_task_failed(&self) -> (StreamId, TaskFailed) {
+            let batches = self.batches();
+            assert_eq!(batches.len(), 1, "expected exactly one append: {batches:?}");
+            let batch = &batches[0];
+            assert_eq!(batch.events.len(), 1, "expected a single-event batch");
+            match &batch.events[0].event {
+                DomainEvent::TaskFailed(e) => (batch.stream_id.clone(), e.clone()),
+                other => panic!("expected TaskFailed, got {}", other.event_type()),
+            }
+        }
+    }
+
+    impl EventStore for RecordingEventStore {
+        fn append(&self, batch: AppendEvents) -> BoxFuture<'_, DomainResult<AppendResult>> {
+            self.batches.lock().unwrap().push(batch);
+            let fails = self.fails;
+            Box::pin(async move {
+                if fails {
+                    Err(DomainError::Invariant("event store down".into()))
+                } else {
+                    Ok(AppendResult {
+                        stream_position: 0,
+                        global_positions: vec![0],
+                    })
+                }
+            })
+        }
+
+        fn read_stream(
+            &self,
+            _stream_id: &StreamId,
+            _from: ReadFrom,
+            _max_count: u64,
+        ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn read_category(
+            &self,
+            _category: hort_domain::events::StreamCategory,
+            _from: SubscribeFrom,
+            _max_count: u64,
+        ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
+            Box::pin(async { Ok(hort_domain::ports::event_store::SealOutcome::Sealed) })
+        }
+
+        fn archive_stream(
+            &self,
+            _stream_id: StreamId,
+            _target: &str,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
+            Box::pin(async { Ok(hort_domain::ports::event_store::SealOutcome::Sealed) })
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Handler helpers
     // -----------------------------------------------------------------------
@@ -1766,9 +2009,19 @@ mod tests {
         repo: Arc<dyn JobsRepository>,
         reauthorizer: Arc<DestructiveTaskReauthorizer>,
     ) -> TaskDispatcher {
+        make_dispatcher_with_events(repo, reauthorizer, Arc::new(NoopEventStore))
+    }
+
+    /// [`make_dispatcher_with`] for a test that reads back what the
+    /// dispatcher appended — see [`RecordingEventStore`].
+    fn make_dispatcher_with_events<S: EventStore + 'static>(
+        repo: Arc<dyn JobsRepository>,
+        reauthorizer: Arc<DestructiveTaskReauthorizer>,
+        events: Arc<S>,
+    ) -> TaskDispatcher {
         TaskDispatcher::new(
             repo,
-            crate::event_store_publisher::wrap_for_test(Arc::new(NoopEventStore)),
+            crate::event_store_publisher::wrap_for_test(events),
             reauthorizer,
             "test-worker",
             Duration::from_secs(60),
@@ -2527,6 +2780,321 @@ mod tests {
             repo.reschedule_calls().is_empty() && repo.mark_failed_calls().is_empty(),
             "a refusal must not be answered with a different write: the row belongs to \
              whoever holds it now"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The failure half of the audit pair — `TaskFailed`
+    // -----------------------------------------------------------------------
+
+    /// Drive one row through `dispatch_one` against a caller-supplied
+    /// repo and event store, so a test can read the row writes and the
+    /// appends together.
+    ///
+    /// No metrics recorder, unlike [`dispatch_one_row`]: these cases are
+    /// about the event, and the outcome counters have their own
+    /// coverage above.
+    fn dispatch_one_row_recording(
+        repo: &Arc<DispatcherMockRepo>,
+        events: &Arc<RecordingEventStore>,
+        kind: &'static str,
+        attempts: u32,
+        handler: Arc<dyn TaskHandler>,
+    ) -> Uuid {
+        assert_eq!(
+            handler.kind(),
+            kind,
+            "the audited kind is the HANDLER's, so the row's kind has to match it"
+        );
+        let mut row = make_job_row(kind);
+        row.attempts = attempts;
+        let row_id = row.id;
+        let dispatcher = Arc::new(make_dispatcher_with_events(
+            repo.clone() as Arc<dyn JobsRepository>,
+            authorizing_reauthorizer(),
+            events.clone(),
+        ));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(dispatcher.dispatch_one(row, handler));
+        row_id
+    }
+
+    /// The retryable path appends `final_attempt: false`.
+    ///
+    /// The row is going back to `pending`, so the failure is real but
+    /// not the last word — and the field exists to carry exactly that
+    /// distinction. An audit reader that could not tell a rescheduled
+    /// failure from a terminal one would read the attempt budget's
+    /// whole curve as repeated final failures.
+    #[test]
+    fn a_rescheduled_failure_appends_task_failed_as_not_final() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let events = Arc::new(RecordingEventStore::new());
+        let row_id = dispatch_one_row_recording(
+            &repo,
+            &events,
+            "noop",
+            TEST_ATTEMPT_CAP - 1,
+            Arc::new(RetryHandler("noop")),
+        );
+
+        assert_eq!(
+            repo.reschedule_calls(),
+            vec![(row_id, "transient error".to_string())],
+            "the row still goes back to pending — the event is additive"
+        );
+        let (stream, event) = events.only_task_failed();
+        assert_eq!(stream, StreamId::authorization());
+        assert_eq!(
+            event,
+            TaskFailed {
+                task_job_id: row_id,
+                kind: "noop".to_string(),
+                reason: "transient error".to_string(),
+                final_attempt: false,
+            }
+        );
+    }
+
+    /// The terminal path appends `final_attempt: true`, carrying the
+    /// same text the row's `last_error` got.
+    #[test]
+    fn a_terminal_failure_appends_task_failed_as_final() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let events = Arc::new(RecordingEventStore::new());
+        let row_id = dispatch_one_row_recording(
+            &repo,
+            &events,
+            "noop",
+            TEST_ATTEMPT_CAP,
+            Arc::new(RetryHandler("noop")),
+        );
+
+        assert_eq!(
+            repo.mark_failed_calls(),
+            vec![(row_id, "transient error".to_string())],
+            "at the cap the row is terminal"
+        );
+        assert!(repo.reschedule_calls().is_empty());
+        let (stream, event) = events.only_task_failed();
+        assert_eq!(stream, StreamId::authorization());
+        assert_eq!(
+            event,
+            TaskFailed {
+                task_job_id: row_id,
+                kind: "noop".to_string(),
+                reason: "transient error".to_string(),
+                final_attempt: true,
+            }
+        );
+    }
+
+    /// A destructive kind's `TaskFailed` lands on the same stream its
+    /// `TaskInvoked` did — the never-deleted one.
+    ///
+    /// This is the whole reason the routing is a call into
+    /// `TaskUseCase::task_audit_stream` rather than a second copy of the
+    /// rule. Split across two streams, an `eventstore-archive` could
+    /// truncate the record of its own failure while the record of its
+    /// invocation survived on the exempt stream — and the failed
+    /// destructive run is the half an operator came to read.
+    #[test]
+    fn a_destructive_kinds_task_failed_lands_beside_its_task_invoked() {
+        for kind in DESTRUCTIVE_TASK_KINDS {
+            let repo = Arc::new(DispatcherMockRepo::new());
+            let events = Arc::new(RecordingEventStore::new());
+            dispatch_one_row_recording(
+                &repo,
+                &events,
+                kind,
+                TEST_ATTEMPT_CAP,
+                Arc::new(RetryHandler(kind)),
+            );
+
+            let (stream, event) = events.only_task_failed();
+            assert_eq!(
+                stream,
+                TaskUseCase::task_audit_stream(kind),
+                "{kind}: the pair has to share the enqueue path's own routing"
+            );
+            assert_eq!(
+                stream,
+                StreamId::eventstore_retention(),
+                "{kind}: a destructive kind's audit trail is the exempt stream"
+            );
+            assert_ne!(stream, StreamId::authorization());
+            assert!(event.final_attempt);
+        }
+    }
+
+    /// A refused result write appends nothing, on both failure paths.
+    ///
+    /// The fence is `AND attempts = $2`: a refusal means the
+    /// abandoned-lease sweep handed the row to a later execution while
+    /// this handler ran, so this execution's failure is not the row's
+    /// state. An audit record saying it is would be a false record
+    /// about a row somebody else owns — and, unlike the row, the event
+    /// store has no fence of its own to catch it.
+    #[test]
+    fn a_refused_result_write_appends_no_audit_event() {
+        for (attempts, write) in [
+            (TEST_ATTEMPT_CAP - 1, "reschedule"),
+            (TEST_ATTEMPT_CAP, "mark_failed"),
+        ] {
+            let repo = Arc::new(DispatcherMockRepo::new());
+            repo.write_log
+                .refuse(ResultWriteOutcome::Superseded { current_attempt: 9 });
+            let events = Arc::new(RecordingEventStore::new());
+            dispatch_one_row_recording(
+                &repo,
+                &events,
+                "noop",
+                attempts,
+                Arc::new(RetryHandler("noop")),
+            );
+
+            assert_eq!(
+                repo.write_log.attempts(),
+                vec![attempts],
+                "{write} must still be attempted — the refusal is the repo's answer"
+            );
+            assert!(
+                events.batches().is_empty(),
+                "{write} was refused, so there is no failure of this execution's to audit; \
+                 got {:?}",
+                events.batches(),
+            );
+        }
+    }
+
+    /// An event-store failure changes neither the row nor the outcome.
+    ///
+    /// The row is the operational record and the event is the audit
+    /// record, in that order: the append happens after the write, and a
+    /// store that is down is logged and let go. A worker that failed a
+    /// task differently — or held the row open — because its audit
+    /// store was unreachable would turn an observability outage into a
+    /// queue outage.
+    #[test]
+    fn an_event_store_failure_leaves_the_row_and_the_outcome_unchanged() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let events = Arc::new(RecordingEventStore::failing());
+        let row_id = dispatch_one_row_recording(
+            &repo,
+            &events,
+            "noop",
+            TEST_ATTEMPT_CAP,
+            Arc::new(RetryHandler("noop")),
+        );
+
+        assert_eq!(
+            repo.mark_failed_calls(),
+            vec![(row_id, "transient error".to_string())],
+            "the row is closed out exactly as it would have been"
+        );
+        assert!(
+            repo.reschedule_calls().is_empty(),
+            "a failed append must not be answered with a different row write"
+        );
+        assert_eq!(
+            events.batches().len(),
+            1,
+            "the append is attempted once and not retried"
+        );
+    }
+
+    /// A kind outside `ADMIN_INVOKABLE_TASK_KINDS` closes its row out
+    /// and appends nothing.
+    ///
+    /// `TaskFailed::validate` rejects such a kind and the production
+    /// event store validates every event it appends, so an
+    /// unconditional append here would write nothing but rejections for
+    /// exactly the kinds the dispatcher runs and no operator can
+    /// invoke. `scan` is the documented example: its rows are minted
+    /// only by `enqueue_scan`, and its failures are the scan
+    /// vocabulary's business.
+    #[test]
+    fn a_kind_outside_the_admin_invoke_allowlist_appends_no_audit_event() {
+        for kind in ["scan", "oci-index-child-ingest"] {
+            assert!(
+                !ADMIN_INVOKABLE_TASK_KINDS.contains(&kind),
+                "{kind} is the premise of this test — it must stay off the allowlist"
+            );
+            let repo = Arc::new(DispatcherMockRepo::new());
+            let events = Arc::new(RecordingEventStore::new());
+            let row_id = dispatch_one_row_recording(
+                &repo,
+                &events,
+                kind,
+                TEST_ATTEMPT_CAP,
+                Arc::new(RetryHandler(kind)),
+            );
+
+            assert_eq!(
+                repo.mark_failed_calls(),
+                vec![(row_id, "transient error".to_string())],
+                "{kind}: the row is still closed out — only the event is skipped"
+            );
+            assert!(
+                events.batches().is_empty(),
+                "{kind}: an append the event store would reject must not be issued; got {:?}",
+                events.batches(),
+            );
+        }
+    }
+
+    /// A success appends nothing — the counter-assertion that the emit
+    /// is scoped to the two failure paths and not to every outcome.
+    #[test]
+    fn a_completed_outcome_appends_no_audit_event() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let events = Arc::new(RecordingEventStore::new());
+        let row_id = dispatch_one_row_recording(
+            &repo,
+            &events,
+            "noop",
+            1,
+            Arc::new(NoopHandler::new("noop", runs)),
+        );
+
+        assert_eq!(repo.mark_completed_calls(), vec![row_id]);
+        assert!(
+            events.batches().is_empty(),
+            "there is no TaskCompleted in the vocabulary and no reason to invent one here; \
+             got {:?}",
+            events.batches(),
+        );
+    }
+
+    /// The census behind the skip, pinned where the skip stands.
+    ///
+    /// Three `jobs.kind` values are valid rows the admin invoke path
+    /// cannot produce. Two of them have a `TaskHandler` and so reach
+    /// the dispatcher's failure paths — `scan` and
+    /// `oci-index-child-ingest`, both covered by
+    /// [`a_kind_outside_the_admin_invoke_allowlist_appends_no_audit_event`].
+    /// `verify-event-chain` has no handler at all: its rows are written
+    /// directly by the `hort-server verify-event-chain` subcommand as a
+    /// liveness breadcrumb, so no dispatcher ever closes one out.
+    ///
+    /// A fourth arrival widens the set of failures that go unaudited,
+    /// which is a decision rather than an oversight — this is what puts
+    /// it in front of whoever adds it.
+    #[test]
+    fn the_kinds_with_no_task_failed_record_are_the_three_outside_the_allowlist() {
+        let mut outside: Vec<&str> = EVENT_TASK_KINDS
+            .iter()
+            .copied()
+            .filter(|k| !ADMIN_INVOKABLE_TASK_KINDS.contains(k))
+            .collect();
+        outside.sort_unstable();
+        assert_eq!(
+            outside,
+            vec!["oci-index-child-ingest", "scan", "verify-event-chain"],
         );
     }
 

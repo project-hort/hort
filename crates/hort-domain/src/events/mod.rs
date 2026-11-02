@@ -640,8 +640,17 @@ pub enum InternalActor {
     /// The retention scheduler. Carries the
     /// `ArtifactExpired` / `ArtifactPurged` decisions emitted by the
     /// `RetentionEvaluateHandler` / `RetentionPurgeHandler` task
-    /// handlers and the destructive-task `TaskInvoked` / `TaskFailed`
-    /// audit (ADR 0028). Distinct from
+    /// handlers.
+    ///
+    /// It deliberately does **not** carry the destructive-task
+    /// `TaskInvoked` / `TaskFailed` audit pair, and the asymmetry is the
+    /// point: `TaskInvoked` is attributed to the **requester**
+    /// (`Actor::Api`, from the enqueue path), because who asked for a
+    /// destructive task is the accountability-bearing fact and this
+    /// variant would erase it; `TaskFailed` is attributed to the actor the
+    /// dispatcher puts on every dispatched execution, because the worker
+    /// is what failed the run. One run, two halves, each attributed to
+    /// whoever acted. Distinct from
     /// [`Self::Timer`] (the quarantine-expiry sweep) so a destructive
     /// retention-purge / event-store-archive append is attributable to
     /// the retention subsystem specifically, not conflated with the

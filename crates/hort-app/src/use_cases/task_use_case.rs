@@ -252,11 +252,14 @@ impl TaskUseCase {
     ///
     /// **Split emit-sites (intentional):**
     /// `TaskUseCase` only ever emits `TaskInvoked`; the `TaskFailed`
-    /// audit record is emitted by the worker dispatcher (in
-    /// worker code), not here.
-    /// This shared pure helper is the single reuse point a future
-    /// `TaskFailed` emit-site is expected to call so both records land on
-    /// the same exempt stream.
+    /// audit record is emitted by
+    /// [`TaskDispatcher::record_outcome_for_row`](crate::task_dispatcher::TaskDispatcher),
+    /// which is where a `jobs` row's result state is written. This
+    /// shared pure helper is what both call, so the invocation and the
+    /// failure of one run cannot come to disagree about which stream
+    /// they belong on — a destructive kind's pair stays whole on the
+    /// exempt stream, where an `eventstore-archive` cannot truncate the
+    /// record of its own failure.
     #[must_use]
     pub fn task_audit_stream(kind: &str) -> StreamId {
         if task_kind_is_destructive(kind) {
