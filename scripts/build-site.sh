@@ -56,3 +56,10 @@ else
   python3 scripts/site/render_diagrams.py --check
 fi
 python3 scripts/site/generate.py "$@"
+
+# The published vhost sends "Content-Security-Policy: default-src 'self'",
+# so a browser refuses any <style> block, src-less <script> or style=""
+# attribute in a page it just fetched -- which renders the page unstyled
+# and its interactive parts dead while the link check above still passes,
+# because a link checker resolves references and cannot evaluate a policy.
+python3 scripts/site/cspcheck.py "$@"
