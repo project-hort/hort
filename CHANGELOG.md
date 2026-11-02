@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A pull-through upstream answering `410 Gone` for an artifact, blob or
+  manifest is now a miss (404) rather than a bad gateway (502/503), so a client
+  stops retrying and a virtual repository walks on to the next member (#395).
+- An OCI image index whose child descriptor declares no readable `size` is now
+  refused with `MANIFEST_INVALID` instead of being accepted; `size` is a
+  REQUIRED descriptor property. Re-push such an index with a conformant
+  `manifests[].size` (#395).
+
 ## [0.17.2] - 2026-11-02
 
 ### Added

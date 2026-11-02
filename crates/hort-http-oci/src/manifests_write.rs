@@ -2243,13 +2243,31 @@ async fn resolve_referenced_blobs(
 ///
 /// # What is compared, and what is not
 ///
-/// **`size`**: compared when the descriptor declared one. A disagreement is a
-/// `MANIFEST_INVALID` refusal of the index, before anything is minted — the
-/// index is making a false statement about content this registry would then
-/// serve under it. A descriptor that declared no readable `size` is
-/// non-conformant (`size` is REQUIRED) but states nothing to disagree with, so
-/// it is logged and admitted; tightening that into a refusal is a decision
-/// about rejecting indexes hort accepts today, not a consequence of this one.
+/// **`size`**: both a disagreement and an *absence* are a `MANIFEST_INVALID`
+/// refusal of the index, before anything is minted. A disagreement is the
+/// index making a false statement about content this registry would then
+/// serve under it. An absence is the same document failing to make the
+/// statement at all: the image spec lists `size` as REQUIRED in the same
+/// wording it uses for `digest` — "This REQUIRED property specifies the size,
+/// in bytes, of the raw content" — and a child whose `digest` does not
+/// resolve is already refused, so there is no reading of the spec under which
+/// one REQUIRED property is a hard refusal and its neighbour a log line. An
+/// unreadable `size` (a float, a string, out of `i64` range) arrives here as
+/// the same `None` and takes the same answer: the declaration hort cannot
+/// read is a declaration it cannot hold the stored bytes against.
+///
+/// **The refusal is this function's and stays this function's.** It is
+/// deliberately NOT a [`hort_domain::oci::DescriptorProblem`] variant, and
+/// `index_child_descriptors` still projects an absent `size` as
+/// `declared_size: None` rather than a fault. A fault is seen by **both**
+/// constructors of `IndexChildren`: the admission constructor refuses on the
+/// first one, which is what is wanted here, but the reader constructor
+/// *skips* each one — and its caller derives the `oci_index_member`
+/// content-reference edges that keep the storage GC off a member's bytes. A
+/// missing `size` promoted to a fault would therefore make an
+/// already-stored index silently drop that child's keepalive edge and leave
+/// the bytes collectable. Admission may refuse the document; a reader of
+/// already-stored bytes must not.
 ///
 /// **`mediaType`**: deliberately NOT compared. The apparent counterpart is
 /// `Artifact::content_type`, and it is not the descriptor's `mediaType` — it
@@ -2283,9 +2301,21 @@ fn check_child_against_descriptor(
             child_digest = %r.digest_raw,
             descriptor = %format_args!("manifests[{position}]"),
             "image index child descriptor declares no readable `size`, which the image \
-             spec requires; nothing to hold the stored child against"
+             spec requires; refusing the index"
         );
-        return Ok(());
+        // Never-echo, for the reason the size-disagreement arm below records:
+        // the response carries a constant reason plus hort's own slot number
+        // and nothing the declarant supplied — here there is not even a value
+        // to withhold, because the field is absent or unreadable.
+        return Err(Box::new(
+            OciError::ManifestInvalid {
+                detail: Some(serde_json::json!({
+                    "reason": "image index child descriptor declares no readable `size`",
+                    "descriptor": format!("manifests[{position}]"),
+                })),
+            }
+            .into_response(),
+        ));
     };
     if declared == stored.size_bytes {
         return Ok(());
@@ -6970,37 +7000,131 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
     }
 
-    #[test]
-    fn put_index_whose_child_descriptor_omits_the_size_is_admitted() {
-        // `size` is REQUIRED by the spec, so such an index is non-conformant —
-        // but it declares nothing to disagree with, and refusing it would
-        // reject indexes hort accepts today over a field this change does not
-        // decide. Admitted, with the non-conformance logged.
-        let status = run(async {
-            let h = harness();
-            let repo = oci_repo("myrepo");
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"the-child-manifest");
-            let body = build_index_json_from_descriptors(
-                &[serde_json::json!({
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": format!("sha256:{}", child.hash.as_ref()),
-                })],
-                "application/vnd.oci.image.index.v1+json",
-            );
-            let router = router().with_state(h.ctx.clone());
-            router
-                .oneshot(put_index_request(
-                    "/v2/myrepo/library/nginx/manifests/v1",
-                    body,
-                    "application/vnd.oci.image.index.v1+json",
-                ))
-                .await
-                .unwrap()
-                .status()
+    /// Every way a descriptor can fail to make a readable `size` statement:
+    /// the key absent, and the three JSON shapes `lenient_i64` declines to
+    /// read (a float, a string, a value past `i64::MAX`). All four reach
+    /// `check_child_against_descriptor` as the same `declared_size: None`, so
+    /// all four must take the same answer — a reader who learns that an
+    /// absent `size` is refused should not have to guess what a
+    /// `"size": "1024"` does.
+    ///
+    /// Each is built on `child`'s digest, so the descriptor resolves and the
+    /// refusal is about the `size` alone rather than an unaddressable child.
+    fn descriptors_without_a_readable_size(child: &SeededIndexChild) -> Vec<serde_json::Value> {
+        let base = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": format!("sha256:{}", child.hash.as_ref()),
         });
-        assert_eq!(status, StatusCode::CREATED);
+        let with_size = |v: serde_json::Value| {
+            let mut d = base.clone();
+            d["size"] = v;
+            d
+        };
+        vec![
+            base.clone(),
+            with_size(serde_json::json!(child.size as f64 + 0.5)),
+            with_size(serde_json::json!(child.size.to_string())),
+            with_size(serde_json::json!(u64::MAX)),
+        ]
+    }
+
+    #[test]
+    fn put_index_whose_child_descriptor_declares_no_readable_size_is_refused() {
+        // `size` is REQUIRED by the image spec in the same wording as
+        // `digest` — "This REQUIRED property specifies the size, in bytes, of
+        // the raw content" — and a child whose `digest` does not resolve is
+        // already refused. One REQUIRED property cannot be a hard refusal
+        // while its neighbour is a log line.
+        //
+        // Driven through `put_index_with_descriptors`, so each index also
+        // carries one conformant sibling at `manifests[0]`: the refusal has
+        // to be the refusal of the *index*, not of one descriptor, and the
+        // sibling's own member edge must not be left behind.
+        for shape in descriptors_without_a_readable_size(&SeededIndexChild {
+            // Only the `size` shape varies here; the digest is rebuilt
+            // against the actually-seeded child inside the closure.
+            hash: hex::encode(Sha256::digest(b"placeholder")).parse().unwrap(),
+            size: 4096,
+        }) {
+            // `Null` for the absent-key case, which is what `Value`'s index
+            // operator yields for a key that is not there — the four shapes
+            // stay distinguishable in the assertion messages.
+            let declared = shape["size"].clone();
+            let out = put_index_with_descriptors(|good| {
+                let mut d = shape.clone();
+                d["digest"] = serde_json::json!(format!("sha256:{}", good.hash.as_ref()));
+                vec![d]
+            });
+            let text = String::from_utf8_lossy(&out.body);
+            assert_eq!(
+                out.status,
+                StatusCode::BAD_REQUEST,
+                "size shape {declared} must be refused: body = {text}"
+            );
+            assert_eq!(envelope_code(&out.body), "MANIFEST_INVALID", "{declared}");
+            assert!(
+                !out.index_minted,
+                "the check runs in the pre-mint resolution, so {declared} leaves no index"
+            );
+            assert_eq!(
+                out.member_edges, 0,
+                "and no sibling keeps an edge from a refused index ({declared})"
+            );
+            // The constant reason plus hort's own slot number, and nothing
+            // else: there is no declarant value to echo on this arm, and the
+            // response must not grow one.
+            let parsed: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+            assert_eq!(
+                &parsed["errors"][0]["detail"],
+                &serde_json::json!({
+                    "reason": "image index child descriptor declares no readable `size`",
+                    "descriptor": "manifests[1]",
+                }),
+                "{declared}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_missing_size_refusal_is_the_descriptor_check_and_not_the_projection() {
+        // Counter-assertion to the test above, and the one that matters most:
+        // the refusal belongs to `check_child_against_descriptor` ALONE. A
+        // `DescriptorProblem` variant for a missing `size` would read as the
+        // tidier close, and it would be seen by both `IndexChildren`
+        // constructors — including `into_resolvable`, whose caller derives
+        // the `oci_index_member` GC-keepalive edges over already-stored
+        // bytes. So this pins that the domain projection still resolves such
+        // a child, which is what the reader path stands on. The matching
+        // assertion on the reader path itself lives in
+        // `hort-app`'s `oci_index_child_ingest` tests
+        // (`a_child_descriptor_without_a_size_still_earns_its_member_edge`).
+        let hex = hex::encode(Sha256::digest(b"a-child"));
+        let body = build_index_json_from_descriptors(
+            &[serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": format!("sha256:{hex}"),
+            })],
+            "application/vnd.oci.image.index.v1+json",
+        );
+        let children = hort_domain::oci::index_child_descriptors(&body).expect("valid index");
+        assert_eq!(children.declared(), 1);
+        let resolved = children
+            .clone()
+            .into_all_declared()
+            .expect("an absent `size` is not a projection fault");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].hash.as_ref(), hex.as_str());
+        assert_eq!(
+            resolved[0].declared_size, None,
+            "the projection reports the absence rather than faulting on it"
+        );
+        let mut faults = Vec::new();
+        assert_eq!(
+            children.into_resolvable(|f| faults.push(f)).len(),
+            1,
+            "the reader constructor must still hand this child back"
+        );
+        assert!(faults.is_empty(), "and must not report it as a fault");
     }
 
     #[test]
