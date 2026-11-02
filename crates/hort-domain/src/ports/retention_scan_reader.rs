@@ -17,16 +17,16 @@
 //!
 //! # Source of the rows
 //!
-//! - `repo_security_score` reads the per-repo `repo_security_scores`
-//!   projection. **No production caller today.** The freshness gate it
-//!   was written for reads the artifact's own most-recent
-//!   `ScanCompleted` off its event stream instead
-//!   (`RetentionUseCase::scan_is_fresh`), because this row's
-//!   `last_scan_at` is a per-repo `MAX`: a fresh scan on a *different*
-//!   artifact in the same repository would otherwise rescue a stale one
-//!   from the gate. The method stays because the per-repo aggregate is
-//!   the natural read for a repository-level retention signal, but
-//!   nothing is deciding on it — do not describe it as the gate's input.
+//! There is deliberately **no per-repo aggregate read here.** The
+//! freshness gate this port serves reads the artifact's own most-recent
+//! `ScanCompleted` off its event stream
+//! (`RetentionUseCase::scan_is_fresh`), because a per-repo
+//! `MAX(last_scan_at)` would let a fresh scan on a *different* artifact
+//! in the same repository rescue a stale one from the gate. The
+//! `repo_security_scores` projection is read by
+//! `SecurityScoreUseCase`, which is the operator-facing surface for it;
+//! a second read path from this port had no consumer and no caller.
+//!
 //! - `list_findings_for_artifact` reads the per-finding `scan_findings`
 //!   projection, scoped to the artifact's **last** scan. That projection
 //!   is per-scan history — every run writes under a fresh `scan_id` and
@@ -58,7 +58,6 @@ use uuid::Uuid;
 use crate::error::DomainResult;
 use crate::types::Finding;
 
-use super::repo_security_score_repository::RepoSecurityScore;
 use super::BoxFuture;
 
 /// Our own first observation of each named vulnerability, as
@@ -69,9 +68,8 @@ pub type FirstObservations = Vec<(String, DateTime<Utc>)>;
 
 /// Read-only outbound port for the retention evaluator.
 ///
-/// Three reads, all against shipped scan projections. The Postgres
-/// adapter implements it against `scan_findings` + `repo_security_scores`;
-/// unit tests use an in-memory mock.
+/// Two reads, both against the shipped `scan_findings` projection. The
+/// Postgres adapter implements them; unit tests use an in-memory mock.
 pub trait RetentionScanReader: Send + Sync {
     /// The `scan_findings` rows the artifact's **last scan** recorded,
     /// mapped to the shipped [`Finding`] value type. Earlier scans' rows
@@ -91,17 +89,6 @@ pub trait RetentionScanReader: Send + Sync {
         &self,
         artifact_id: Uuid,
     ) -> BoxFuture<'_, DomainResult<Vec<Finding>>>;
-
-    /// The per-repository `repo_security_scores` projection row, or
-    /// `None` when the repository has no row yet (no scan has ever
-    /// completed in it).
-    ///
-    /// The row's `last_scan_at` is a per-repo `MAX` and is **not** what
-    /// the scan-freshness gate reads — see the module docs.
-    fn repo_security_score(
-        &self,
-        repo_id: Uuid,
-    ) -> BoxFuture<'_, DomainResult<Option<RepoSecurityScore>>>;
 
     /// Our own earliest observation of each named vulnerability on this
     /// artifact — `MIN(scan_findings.detected_at)` per
@@ -155,12 +142,6 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<Vec<Finding>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
-        fn repo_security_score(
-            &self,
-            _repo_id: Uuid,
-        ) -> BoxFuture<'_, DomainResult<Option<RepoSecurityScore>>> {
-            Box::pin(async { Ok(None) })
-        }
         fn first_observed_at<'a>(
             &'a self,
             _artifact_id: Uuid,
@@ -171,14 +152,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_reader_returns_empty_findings_and_no_score() {
+    async fn empty_reader_returns_empty_findings_and_observations() {
         let r = EmptyReader;
         assert!(r
             .list_findings_for_artifact(Uuid::nil())
             .await
             .unwrap()
             .is_empty());
-        assert!(r.repo_security_score(Uuid::nil()).await.unwrap().is_none());
         assert!(r
             .first_observed_at(Uuid::nil(), &["cve-1".to_string()])
             .await
@@ -200,12 +180,6 @@ mod tests {
             ) -> BoxFuture<'_, DomainResult<Vec<Finding>>> {
                 Box::pin(async { Err(DomainError::Invariant("findings read failed".into())) })
             }
-            fn repo_security_score(
-                &self,
-                _repo_id: Uuid,
-            ) -> BoxFuture<'_, DomainResult<Option<RepoSecurityScore>>> {
-                Box::pin(async { Err(DomainError::Invariant("score read failed".into())) })
-            }
             fn first_observed_at<'a>(
                 &'a self,
                 _artifact_id: Uuid,
@@ -217,10 +191,6 @@ mod tests {
         let r = ErrReader;
         assert!(matches!(
             r.list_findings_for_artifact(Uuid::nil()).await.unwrap_err(),
-            DomainError::Invariant(_)
-        ));
-        assert!(matches!(
-            r.repo_security_score(Uuid::nil()).await.unwrap_err(),
             DomainError::Invariant(_)
         ));
         assert!(matches!(

@@ -27,7 +27,8 @@
 //!   artifact with no `ScanCompleted` on its own stream cannot prove
 //!   per-artifact freshness and is treated as stale (fail-safe).
 //!   (Per-artifact — deliberately tighter than the per-repo
-//!   `repo_security_score.last_scan_at` reading.) Stale →
+//!   `repo_security_scores.last_scan_at` projection, which this
+//!   evaluator does not read.) Stale →
 //!   `skipped_stale_scan` metric + `tracing::debug!`,
 //!   NOT an error, the sweep continues. The interval is resolved per
 //!   the policy chain (repo-scoped scan policy → … → default

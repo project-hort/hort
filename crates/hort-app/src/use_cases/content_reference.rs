@@ -16,17 +16,28 @@
 //!
 //! # Write side
 //!
-//! [`Self::insert_for_repo`] and [`Self::delete_by_source_for_repo`]
-//! are *no-authz forwards* over the port. The trust contract is
-//! documented per-method: callers MUST hold a pre-authz'd `repo_id` —
-//! in OCI the only caller is the manifest-PUT / manifest-DELETE handler
-//! which has already extracted [`WriteRepoAccess`]. Re-checking
-//! visibility here would pay an extra DB roundtrip on every write and
-//! defend against a callsite shape that doesn't exist. The shape the
-//! port enforces — `(repository_id, source_artifact_id, kind)` PK +
-//! idempotent upsert per `kind` (sibling rows
-//! under different kinds for the same source coexist) — is sufficient
-//! for the current caller set.
+//! [`Self::delete_by_source_for_repo`] is a *no-authz forward* over the
+//! port: callers MUST hold a pre-authz'd `repo_id` — in OCI the only
+//! caller is the manifest-DELETE handler, which has already extracted
+//! [`WriteRepoAccess`]. Re-checking visibility here would pay an extra
+//! DB roundtrip on every write and defend against a callsite shape that
+//! doesn't exist.
+//!
+//! **There is deliberately no insert on this use case.** An edge is
+//! minted inside the claiming artifact's own ingest transition, so the
+//! referrer and the row that keeps its target's bytes alive commit
+//! together or not at all. An edge written *after* that transition has
+//! committed leaves a live, servable manifest whose target carries one
+//! fewer claim against the storage GC — which deletes a CAS blob
+//! exactly when no `content_references` row targets its hash — and
+//! nothing re-derives a tree edge afterwards, because the
+//! refcount-reconcile sweep derives `primary_content` / `metadata_blob`
+//! from the artifact row and no relational row records what a manifest
+//! references. So a post-commit edge writer on a minting path is a
+//! defect, and this use case does not offer one. A repair path, which
+//! by construction has no transition to ride
+//! (`oci_membership_edge_backfill`, `wheel_metadata_backfill`), writes
+//! through [`ContentReferenceIndex`] directly.
 //!
 //! # Observability
 //!
@@ -101,36 +112,6 @@ impl ContentReferenceUseCase {
         Ok((repo, rows))
     }
 
-    /// Write-side: insert a reference scoped to a pre-authz'd repo.
-    ///
-    /// **Trust contract — no authz here.** Callers MUST hold a
-    /// pre-authz'd `repo_id` (in OCI's case: extracted via
-    /// `WriteRepoAccess` upstream of this call). The `repo_id` argument
-    /// is provided so future audits can grep for cross-repo write
-    /// confusion at the use-case boundary; the port itself derives the
-    /// repo from the `row.repository_id` field per the
-    /// [`ContentReferenceIndex`] contract.
-    ///
-    /// Idempotent upsert per the [`ContentReferenceIndex::insert`] port
-    /// docstring — a repeat call with the same
-    /// `(repository_id, source_artifact_id, kind)` refreshes the row.
-    /// Inserts under a different `kind` add sibling rows.
-    #[tracing::instrument(skip(self, row))]
-    pub async fn insert_for_repo(&self, repo_id: Uuid, row: ContentReference) -> AppResult<()> {
-        // `repo_id` is part of the signature so the call site reads as
-        // "insert into repo X". The port itself reads `row.repository_id`
-        // (kept distinct because the port pre-dates this use case). A
-        // mismatch would surface as a write to the `row.repository_id`
-        // repo, not the `repo_id` argument — which is a callsite bug at
-        // the OCI handler, but defensive validation here would only
-        // trade one panic for another. The OCI handler builds
-        // `reference_row` with `repository_id: repo_id` directly so the
-        // two are identical by construction.
-        let _ = repo_id;
-        self.content_references.insert(row).await?;
-        Ok(())
-    }
-
     /// Read-side: **batched** PK lookup of `wheel_metadata`-style
     /// per-source-attribute rows for a pre-authz'd repo.
     ///
@@ -173,17 +154,18 @@ impl ContentReferenceUseCase {
     /// Cleanup-side: drop every reference sourced from
     /// `source_artifact_id`.
     ///
-    /// **Trust contract — no authz here.** Same rationale as
-    /// [`Self::insert_for_repo`]. Caller (OCI manifest DELETE) holds
-    /// `WriteRepoAccess` for `repo_id`. The port's
+    /// **Trust contract — no authz here.** Caller (OCI manifest DELETE)
+    /// holds `WriteRepoAccess` for `repo_id`, so re-resolving visibility
+    /// here would pay an extra DB roundtrip to re-answer a question the
+    /// handler already answered. The port's
     /// [`ContentReferenceIndex::delete_by_source`] sweeps every row
     /// keyed by `source` — the migration's FK cascade also runs on
     /// `artifacts(id)` delete, so this is belt-and-suspenders.
     ///
-    /// `repo_id` is in the signature so callsite intent is explicit
-    /// (see the [`Self::insert_for_repo`] docstring); it is not passed
-    /// to the underlying port because `delete_by_source` is keyed only
-    /// by the source artifact id (which is globally unique).
+    /// `repo_id` is in the signature so the call site reads as "clean up
+    /// inside repo X"; it is not passed to the underlying port because
+    /// `delete_by_source` is keyed only by the source artifact id (which
+    /// is globally unique).
     #[tracing::instrument(skip(self))]
     pub async fn delete_by_source_for_repo(
         &self,
@@ -359,11 +341,13 @@ mod tests {
         let repo = public_repo("public-pkg");
         let repo_id = repo.id;
         repos.insert(repo);
-        // Seed the index via the use case's own write path so the test
-        // exercises both the trust-contract write and the read.
+        // Seed via the port: the row is this read test's precondition,
+        // not its subject, and the index is the only writer of an edge
+        // outside a minting transition.
         let uc = build_uc(repos, index.clone(), RbacAccess::Disabled);
         let source = Uuid::new_v4();
-        uc.insert_for_repo(repo_id, sample_row(repo_id, source, "oci_subject"))
+        index
+            .insert(sample_row(repo_id, source, "oci_subject"))
             .await
             .unwrap();
 
@@ -388,8 +372,8 @@ mod tests {
             index.clone(),
             enabled(rbac_with_reader_role(repo_id)),
         );
-        // Seed via direct port — the write trust-contract test below
-        // already covers `insert_for_repo`.
+        // Seed via direct port — the row is this test's precondition,
+        // not its subject.
         index
             .insert(sample_row(repo_id, Uuid::new_v4(), "oci_subject"))
             .await
@@ -526,119 +510,11 @@ mod tests {
         assert!(err.to_string().contains("db down"));
     }
 
-    // -- insert_for_repo — no-authz contract -------------------------------
-
-    /// Acceptance: `insert_for_repo` does NOT consult RBAC. The caller
-    /// asserts via WriteRepoAccess upstream; this method just forwards.
-    /// Proven here by passing an empty-RBAC enabled access context: the
-    /// write still succeeds because the access use case is never asked.
-    #[tokio::test]
-    async fn insert_for_repo_does_not_consult_authz() {
-        let repos = Arc::new(MockRepositoryRepository::new());
-        let index = Arc::new(MockContentReferenceIndex::new());
-        // Empty RBAC: nobody has any permissions. If `insert_for_repo`
-        // were checking authz, it would fail here.
-        let uc = build_uc(
-            repos,
-            index.clone(),
-            enabled(RbacEvaluator::new(Vec::new())),
-        );
-        let repo_id = Uuid::new_v4();
-        let source = Uuid::new_v4();
-        // No repository was even inserted — proves we never look up the
-        // repo on the write path. Pure forward to the port.
-        uc.insert_for_repo(repo_id, sample_row(repo_id, source, "oci_subject"))
-            .await
-            .unwrap();
-        assert_eq!(index.entry_count(), 1);
-    }
-
-    /// Idempotent upsert — calling insert twice with the same PK
-    /// `(repo_id, source, kind)` keeps the row count at one. Mirrors
-    /// the OCI idempotent-PUT contract.
-    #[tokio::test]
-    async fn insert_for_repo_is_upsert_idempotent() {
-        let repos = Arc::new(MockRepositoryRepository::new());
-        let index = Arc::new(MockContentReferenceIndex::new());
-        let uc = build_uc(repos, index.clone(), RbacAccess::Disabled);
-        let repo_id = Uuid::new_v4();
-        let source = Uuid::new_v4();
-        uc.insert_for_repo(repo_id, sample_row(repo_id, source, "oci_subject"))
-            .await
-            .unwrap();
-        uc.insert_for_repo(repo_id, sample_row(repo_id, source, "oci_subject"))
-            .await
-            .unwrap();
-        assert_eq!(index.entry_count(), 1, "upsert must not duplicate");
-    }
-
-    /// Stub for testing port-error propagation on the write side.
-    struct FailingInsertIndex;
-    impl ContentReferenceIndex for FailingInsertIndex {
-        fn insert(
-            &self,
-            _row: ContentReference,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
-            Box::pin(async { Err(DomainError::Invariant("write conflict".into())) })
-        }
-        fn find_by_target(
-            &self,
-            _repo: Uuid,
-            _target: &ContentHash,
-            _kind_filter: Option<&str>,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<Vec<ContentReference>>> {
-            Box::pin(async { Ok(vec![]) })
-        }
-        fn delete_by_source(
-            &self,
-            _src: Uuid,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn find_by_source_and_kind(
-            &self,
-            _repo: Uuid,
-            _src: Uuid,
-            _kind: &str,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<Option<ContentReference>>> {
-            Box::pin(async { Ok(None) })
-        }
-        fn find_by_sources_and_kind(
-            &self,
-            _repo: Uuid,
-            _sources: &[Uuid],
-            _kind: &str,
-        ) -> BoxFuture<
-            '_,
-            hort_domain::error::DomainResult<std::collections::HashMap<Uuid, ContentReference>>,
-        > {
-            Box::pin(async { Ok(std::collections::HashMap::new()) })
-        }
-    }
-
-    #[tokio::test]
-    async fn insert_for_repo_propagates_port_error() {
-        let repos = Arc::new(MockRepositoryRepository::new());
-        let index = Arc::new(FailingInsertIndex);
-        let rac = Arc::new(RepositoryAccessUseCase::new(
-            repos,
-            RbacAccess::Disabled,
-            true,
-        ));
-        let uc = ContentReferenceUseCase::new(index, rac);
-        let repo_id = Uuid::new_v4();
-        let source = Uuid::new_v4();
-        let err = uc
-            .insert_for_repo(repo_id, sample_row(repo_id, source, "oci_subject"))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("write conflict"));
-    }
-
     // -- delete_by_source_for_repo — no-authz contract ---------------------
 
     /// Acceptance: `delete_by_source_for_repo` does NOT consult RBAC.
-    /// Same shape as the insert acceptance test.
+    /// Proven by an empty-RBAC enabled access context: the delete still
+    /// succeeds because the access use case is never asked.
     #[tokio::test]
     async fn delete_by_source_for_repo_does_not_consult_authz() {
         let repos = Arc::new(MockRepositoryRepository::new());
@@ -650,7 +526,10 @@ mod tests {
         );
         let repo_id = Uuid::new_v4();
         let source = Uuid::new_v4();
-        uc.insert_for_repo(repo_id, sample_row(repo_id, source, "oci_subject"))
+        // Seed via the port — the row is the precondition for the delete
+        // this test is about.
+        index
+            .insert(sample_row(repo_id, source, "oci_subject"))
             .await
             .unwrap();
         assert_eq!(index.entry_count(), 1);

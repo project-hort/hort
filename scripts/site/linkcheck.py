@@ -23,6 +23,26 @@ _LINK_TAG_RE = re.compile(r"<link\b[^>]*>", re.IGNORECASE)
 _SCRIPT_TAG_RE = re.compile(r"<script\b[^>]*>", re.IGNORECASE)
 
 
+def resolve_reference(site_root, page_path, url):
+    """Filesystem path a page's reference points at.
+
+    A reference starting with "/" is anchored at the SITE root -- which is
+    how a browser resolves it and how nginx serves it. os.path.join would
+    instead discard the page's directory and hand back the FILESYSTEM root,
+    so a root-relative reference would be reported missing wherever it
+    actually sits. That matters because a page nginx serves through
+    `error_page` is served AT THE REQUESTED PATH rather than its own, so
+    every reference such a page makes has to be root-relative to survive an
+    arbitrary request depth (site/landing/404.html).
+
+    Shared with scripts/site/cspcheck.py so the two checkers cannot
+    disagree about where a reference resolves.
+    """
+    if url.startswith("/"):
+        return os.path.normpath(os.path.join(site_root, url.lstrip("/")))
+    return os.path.normpath(os.path.join(os.path.dirname(page_path), url))
+
+
 def _ids_in_file(path):
     with open(path, encoding="utf-8") as fh:
         return set(_ID_RE.findall(fh.read()))
@@ -64,7 +84,7 @@ def check(dist):
             if img.startswith(("http://", "https://", "//")):
                 errors.append(f"{rel}: external image not allowed: {img}")
                 continue
-            target_img = os.path.normpath(os.path.join(os.path.dirname(path), img))
+            target_img = resolve_reference(dist, path, img)
             if not os.path.isfile(target_img):
                 errors.append(f"{rel}: missing image asset: {img}")
 
@@ -82,7 +102,7 @@ def check(dist):
             else:
                 path_part, frag = href, None
 
-            target = os.path.normpath(os.path.join(os.path.dirname(path), path_part))
+            target = resolve_reference(dist, path, path_part)
             # A directory-style href ("dl/", or one that happens to resolve
             # to an existing directory) implies its index.html, matching
             # how any static file server actually resolves it.

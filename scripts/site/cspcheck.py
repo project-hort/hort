@@ -35,6 +35,7 @@ from html.parser import HTMLParser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import generate  # noqa: E402
+import linkcheck  # noqa: E402
 
 # The site list is the generator's own, never a second copy: a site added to
 # generate.py must not be able to ship unchecked because this file was not
@@ -137,8 +138,11 @@ def check(site_dist):
         for line, kind, url in references:
             if url.startswith(("http://", "https://", "//")):
                 continue  # linkcheck owns the no-external-asset rule
-            target = os.path.normpath(
-                os.path.join(os.path.dirname(path), url.split("#", 1)[0])
+            # Same resolver linkcheck uses, so a root-relative asset
+            # reference is anchored at the site root rather than the
+            # filesystem root.
+            target = linkcheck.resolve_reference(
+                site_dist, path, url.split("#", 1)[0]
             )
             if not os.path.isfile(target):
                 errors.append(
