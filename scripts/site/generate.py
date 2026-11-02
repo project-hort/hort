@@ -272,7 +272,7 @@ OPERATOR_SHELL = Template("""<!doctype html>
 <title>$title</title><meta name="description" content="$description">
 <link rel="icon" href="$assets_href/hort-logo.svg" type="image/svg+xml">
 <link rel="stylesheet" href="$assets_href/operator.css">
-<script>(function(){try{var v=localStorage.getItem('hort-theme');if(v==='dark'||v==='light')document.documentElement.dataset.theme=v}catch(e){}})()</script>
+<script src="$assets_href/theme-init.js"></script>
 </head><body class="operator-page">
 <header class="site-header"><nav class="container" aria-label="Main navigation">
 <a class="brand" href="$root_href/index.html"><img src="$assets_href/hort-logo.svg" alt="" width="84" height="62">hort</a>
@@ -297,7 +297,7 @@ DEVELOPER_SHELL = Template("""<!doctype html>
 <link rel="stylesheet" href="$assets_href/operator.css">
 <link rel="stylesheet" href="$assets_href/developer.css">
 <link rel="canonical" href="$canonical">
-<script>(function(){try{var v=localStorage.getItem('hort-theme');if(v==='dark'||v==='light')document.documentElement.dataset.theme=v}catch(e){}})()</script>
+<script src="$assets_href/theme-init.js"></script>
 </head><body class="operator-page developer-page">
 <header class="site-header"><nav class="container" aria-label="Main navigation">
 <a class="brand" href="$root_href/index.html"><img src="$assets_href/hort-logo.svg" width="84" height="62" alt="">hort<span class="brand-context">.rs</span></a>
@@ -478,9 +478,10 @@ def build_project_hort_de_docs(dist):
                   '">Current operator docs</a> · ' + source_html + '.</aside>')
         page_html = render_page(PROJECT_HORT_DE, output_rel, title, banner + body_html)
         page_html = page_html.replace('</head>', '<meta name="robots" content="noindex,follow"></head>', 1)
-        # A small scoped stylesheet avoids changing the currently published
-        # operator guides or their shared design.
-        page_html = page_html.replace('</head>', '<style>.legacy-notice{margin:1.5rem auto;padding:1.15rem 1.4rem;max-width:70rem;border:2px solid #c18a32;background:#ffedd0;color:#33200b;border-radius:12px;line-height:1.6}.legacy-notice a{color:#623a06;font-weight:700;text-decoration:underline}.legacy-notice strong{display:block;margin-bottom:.4rem}</style></head>', 1)
+        # The archive banner's styling lives in the shared external
+        # stylesheet (site/assets/operator.css, which this shell already
+        # links): a <style> block here would be refused by the published
+        # Content-Security-Policy, default-src 'self' with no unsafe-inline.
         write(dist, output_rel, page_html)
 
     # Newly authored operator guides are the curated navigation. The historic

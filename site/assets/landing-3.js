@@ -1,0 +1,1 @@
+document.querySelectorAll('[data-open-scenario]').forEach(link=>link.addEventListener('click',()=>{const target=document.querySelector('[data-scenario="'+link.dataset.openScenario+'"]');if(target)target.click();}));

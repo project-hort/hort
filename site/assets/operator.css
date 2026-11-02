@@ -32,3 +32,9 @@ a{color:var(--link)}a:hover{text-decoration:underline}a:focus-visible,button:foc
 .doc-diagram img{display:block;width:100%;height:auto;max-height:460px;object-fit:contain;margin:0 auto}
 .doc-diagram figcaption{color:#345D63;font-size:13px;line-height:1.45;text-align:center;padding:10px 4px 2px}
 @media(max-width:700px){.doc-diagram{padding:7px}.doc-diagram img{min-width:340px;max-height:380px}.doc-diagram figcaption{min-width:340px}}
+
+/* Archive banner on legacy documentation pages. Shipped here rather
+   than in a per-page <style> block because the published
+   Content-Security-Policy is default-src 'self' with no
+   unsafe-inline, so an inline block never reaches the renderer. */
+.legacy-notice{margin:1.5rem auto;padding:1.15rem 1.4rem;max-width:70rem;border:2px solid #c18a32;background:#ffedd0;color:#33200b;border-radius:12px;line-height:1.6}.legacy-notice a{color:#623a06;font-weight:700;text-decoration:underline}.legacy-notice strong{display:block;margin-bottom:.4rem}
