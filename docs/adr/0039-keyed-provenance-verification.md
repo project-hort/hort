@@ -867,6 +867,26 @@ window keeps exactly the meaning ADR 0054 gives it — a proxy for elapsed
 D4: the window stops being consulted as a signing deadline, so it goes back to
 meaning one thing.
 
+**Footnote (2026-11-02) — the clamp this decision reasons against is gone, and
+D5 is unchanged by that.** The `.max(1)` described above no longer exists:
+the window-derived `Retry-After` is now floored at an operator value
+(`HORT_QUARANTINE_RETRY_AFTER_FLOOR_SECS`, default 20 s), because the
+deadline-has-passed case was never confined to unsigned holds — a plain timed
+hold is also routinely past its window with its scan verdict still
+outstanding, and `1` turned one client poll into one per second there too.
+The seconds computation now lives once, in
+`hort_http_core::artifact_gate::quarantine_retry_after_seconds`, which both
+the OCI envelope and the core `503` call.
+
+**That correction does not subsume D5, and the distinction is why this
+footnote exists rather than a deletion.** A floor makes the advertised number
+*plausible*; it does not make it *true*. For a hold waiting on an external
+signature no number is true, because nothing about the passage of time
+resolves it. So **`None` stays `None`** — a floored answer would say "come
+back in 20 seconds" forever exactly as `1` said "come back in one second"
+forever. The two states are still told apart by the presence of the header
+and by nothing else, which is the decision this section records.
+
 ### D6 — the invariant that makes it machine-checkable
 
 **`quarantine_status = Rejected` without an `ArtifactRejected` event on the
