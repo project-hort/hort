@@ -152,12 +152,15 @@ use super::sweep_horizon::resolve_sweep_horizon;
 /// **Lower bound — the off-shift gap.** Most kinds here run on a daily
 /// CronJob (`retention-purge`, `eventstore-archive`,
 /// `service-account-rotation`, `quarantine-release-sweep`, …), and for a
-/// worker-dispatched task the `jobs` row is the *only* durable record of
-/// a failure: terminal failures are recorded by
-/// `JobsRepository::mark_failed`, a column update with no event-store
-/// append to fall back on. Once the row is swept the failure detail
-/// (`last_error`, `attempts`, timings) is gone outright. The window must
-/// therefore span the longest interval between a failure and the first
+/// worker-dispatched task the `jobs` row is where the *detail* of a
+/// failure lives: `last_error`, `attempts`, the timings and
+/// `result_summary`. The dispatcher also appends a `TaskFailed` audit
+/// event for every failure it writes, on a stream no retention rule
+/// deletes — so a swept row no longer loses the fact of the failure, its
+/// reason text or whether it was final. It does lose everything else,
+/// and for `verify-event-chain` (no `TaskHandler`, so no dispatcher and
+/// no event) the row remains the whole record. The window must therefore
+/// still span the longest interval between a failure and the first
 /// operator who could look at it — a Friday-evening failure read on
 /// Monday morning, plus margin. 7 days clears that; 72 hours does not,
 /// and 24 hours routinely would not survive a weekend.

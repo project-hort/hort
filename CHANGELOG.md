@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A failed admin task now writes a `TaskFailed` audit event alongside its
+  `jobs` row, so a failure outlives the row's 7-day retention; subscribers to
+  the task event types will begin receiving it (#331).
+
 ### Fixed
 
 - A pull-through upstream answering `410 Gone` for an artifact, blob or

@@ -307,15 +307,30 @@ impl RepositoryUpstreamMappingChanged {
 ///
 /// **Consumers:** `TaskUseCase::enqueue` gates the incoming `kind` string
 /// against this set before any I/O; `TaskInvoked::validate` and
-/// `TaskFailed::validate` reject any `kind` not in this set (the emitter
-/// inventory backing that choice: `TaskInvoked` is emitted only from the
-/// admin-invoke path, so it can only ever carry a kind already drawn from
-/// this list; `TaskFailed` has no production emitter today — the worker
-/// dispatcher records terminal failures via `JobsRepository::mark_failed`
-/// only, a DB-column update with no corresponding event-store append — so
-/// validating it against this same narrower set is a no-widening choice,
-/// not an observed constraint; see [`EVENT_TASK_KINDS`] for the superset
-/// this repo's SQL CHECK actually accepts).
+/// `TaskFailed::validate` reject any `kind` not in this set. The emitter
+/// inventory backing that choice:
+///
+/// - `TaskInvoked` is emitted only from the admin-invoke path, so it can
+///   only ever carry a kind already drawn from this list.
+/// - `TaskFailed` is emitted by `TaskDispatcher::record_outcome_for_row`
+///   on both of its failure transitions — and the dispatcher **does**
+///   run kinds outside this set, so that emit site tests this list and
+///   skips the append rather than issuing one `validate` would reject.
+///   The two it skips are `scan` (rows minted only by
+///   `JobsRepository::enqueue_scan`; failures recorded by the scan's own
+///   vocabulary — `ScanCompleted` on a verdict, `ScanIndeterminate` when
+///   the attempt budget is spent) and `oci-index-child-ingest` (eager
+///   ingest of work the lazy pull path re-derives on the next client
+///   request). `verify-event-chain`, the third kind outside this set,
+///   has no `TaskHandler` at all — its rows are a liveness breadcrumb
+///   written by the `hort-server verify-event-chain` subcommand, so no
+///   dispatcher ever closes one out.
+///
+/// Narrowing on the emit side rather than widening this list is the
+/// deliberate direction: `TaskFailed` is the counterpart of
+/// `TaskInvoked`, which can only carry an allowlisted kind, so the pair
+/// is symmetric by construction. See [`EVENT_TASK_KINDS`] for the
+/// superset this repo's SQL CHECK actually accepts.
 ///
 /// This is **not** every `jobs.kind` the SQL CHECK constraint accepts —
 /// see [`EVENT_TASK_KINDS`] for that full mirror, and for which migration
@@ -614,10 +629,11 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
 ///
 /// No *runtime* path reads this constant —
 /// `TaskInvoked::validate` / `TaskFailed::validate` deliberately stay on
-/// the narrower [`ADMIN_INVOKABLE_TASK_KINDS`] (see that constant's doc
-/// for why: no current emitter of either event carries a kind outside the
-/// admin-invoke set, so validating against the wider SQL-CHECK set would
-/// be validation widening with no producing emitter).
+/// the narrower [`ADMIN_INVOKABLE_TASK_KINDS`]. The `TaskFailed` emit
+/// site (`TaskDispatcher::record_outcome_for_row`) can reach a kind in
+/// this wider set and narrows itself instead, skipping the append for
+/// the three kinds below rather than having the event admit them — see
+/// that constant's doc for the per-kind reasons.
 ///
 /// This set is exactly [`ADMIN_INVOKABLE_TASK_KINDS`] plus the three
 /// DB-CHECK-only kinds that are valid `jobs.kind` values but never
@@ -913,8 +929,18 @@ impl TaskInvoked {
 // TaskFailed (admin-endpoint audit)
 // ---------------------------------------------------------------------------
 
-/// An admin-task failed. Emitted on
+/// An admin-task failed.
+///
+/// **Stream** — the same kind-routed audit stream the task's
+/// `TaskInvoked` landed on, resolved by
+/// `TaskUseCase::task_audit_stream`: a destructive kind goes to
+/// `StreamId::eventstore_retention()` (the never-deleted
+/// [`StreamCategory::Admin`](super::super::events::StreamCategory::Admin)
+/// audit-meta stream), every other kind to
 /// [`StreamCategory::Authorization`](super::super::events::StreamCategory::Authorization).
+/// The two records of one run have to be readable as one trail, and an
+/// `eventstore-archive` must not be able to truncate the record of its
+/// own failure.
 ///
 /// **Emission sources:**
 ///
@@ -939,11 +965,26 @@ impl TaskInvoked {
 ///      purging the row does not undo what it did, and the execution has
 ///      to be reconciled from the task's own side effects.
 ///
-/// 2. *Worker terminal-failure path* — the
-///    worker dispatcher emits `TaskFailed` when a `TaskHandler` returns
-///    a terminal error. `final_attempt = true` distinguishes "we will
-///    not retry" from `final_attempt = false` ("we will retry on next
-///    claim").
+/// 2. *Worker failure paths* — `TaskDispatcher::record_outcome_for_row`
+///    appends this event for each of the two row transitions a failure
+///    can produce, and `final_attempt` is which one it was: `false`
+///    from the `reschedule` path (the row goes back to `pending` with
+///    attempt budget left), `true` from `mark_failed` (terminal, either
+///    by the handler's own `retry: false` verdict or because the budget
+///    is spent). Two conditions narrow it, both deliberate:
+///    - *the row write must have landed.* The fenced write is
+///      `AND attempts = $2`; a refusal means a later execution owns the
+///      row, and an audit record about a row this execution no longer
+///      owns is a false record.
+///    - *the kind must be in [`ADMIN_INVOKABLE_TASK_KINDS`]*, which
+///      `validate` below requires. The dispatcher also runs kinds no
+///      operator can invoke (`scan`, `oci-index-child-ingest`) and
+///      skips the append for those rather than issuing a write the
+///      event store would reject — see that constant's doc.
+///
+///    The append happens after the row write and never changes it: the
+///    `jobs` row is the operational record, this is the audit record,
+///    and an event-store failure is logged and nothing else.
 ///
 /// Only infrastructure failures after the RBAC check produce this event —
 /// RBAC denial is logged at `info!` and returns `AppError::Forbidden`
