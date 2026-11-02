@@ -253,30 +253,91 @@ crates/
 
 All artifact lifecycle changes produce domain events. Events are immutable once appended.
 
+**The `DomainEvent` enum in `crates/hort-domain/src/events/domain_event.rs` is the authority, and it is wider than any table below.** Do not build an
+`event_type IN (…)` query, a validation allow-list, or a specification's event
+set by reading a table here — enumerate the enum:
+
+```bash
+awk '/pub enum DomainEvent/,/^}/' crates/hort-domain/src/events/domain_event.rs \
+  | grep -oE '^    [A-Z][A-Za-z0-9]*' | tr -d ' ' | sort
+```
+
+This is not a stylistic preference. A diagnostic query built from the
+artifact-lifecycle table below was blind to `ProvenanceRejected` — the event
+that had actually set the terminal state it was looking for — and would have
+answered "no rejection in the window" over a stream carrying one. A table
+enumerated by hand omits whatever shipped after it was last edited; the enum
+cannot.
+
+**Artifact lifecycle** (`events/artifact_events.rs` — `StreamCategory::Artifact`):
+
 | Event | Trigger |
 |-------|---------|
 | `ArtifactIngested` | First upload or proxy fetch completes |
 | `ChecksumVerified` | Upstream checksum matches stored content |
-| `ChecksumMismatch` | Upstream checksum does not match — artifact must be rejected |
-| `ArtifactQuarantined` | Quarantine period begins; `quarantine_until` set |
+| `ChecksumMismatch` | Upstream checksum does not match — artifact must be rejected (lands on the **repository** stream; no artifact row is minted) |
+| `ArtifactQuarantined` | Quarantine period begins; window anchor set |
 | `ScanRequested` | Scanner job submitted |
 | `ScanCompleted` | Scanner result received (clean or findings) |
+| `ScanIndeterminate` | Terminal scan failure: every configured backend errored and the job exhausted its retry budget. Fail-closed (ADR 0007) — deliberately **not** a reuse of `ScanCompleted` |
+| `ArtifactBecameVulnerable` | A prior-scanned artifact carries findings absent from its previous scan — the discrete "newly vulnerable" alarm unit. Never fired on a first scan |
+| `ProvenanceVerified` | A supply-chain attestation verified against the policy's allowed signer identities (ADR 0027). `cascaded_from: Some(root)` marks a clearance derived from the signature over the subject at `root` rather than a direct verification |
+| `ProvenanceRejected` | A provenance check rejected the artifact (ADR 0027) — terminal on its own axis, like `ScanCompleted(findings)` |
 | `ArtifactReleased` | Quarantine period expired; artifact available for download and promotion |
 | `ArtifactRejected` | Scanner found disqualifying findings; permanently blocked |
+| `ArtifactReEvaluated` | Audit record for a re-evaluation pass decision after a gate-affecting `ScanPolicy` change (ADR 0041) |
+| `ArtifactCorrupted` | The CAS integrity scrubber found a stored blob whose computed SHA-256 disagrees with its CAS key, under `HORT_CAS_SCRUB_ACTION_ON_MISMATCH=tombstone` |
 | `PromotionRequested` | User or policy requests promotion to target repository |
 | `PolicyEvaluated` | Quality gate result recorded |
 | `ApprovalRequested` | Manual review required |
 | `ApprovalDecided` | Human reviewer approved or rejected |
 | `ArtifactPromoted` | Promotion completed; artifact live in target repo |
 | `PromotionRejected` | Promotion blocked by policy or reviewer |
-| `ArtifactDownloaded` | Artifact content served — high-volume, write to separate stream |
-| `PolicyCreated` | New scan policy defined |
-| `PolicyUpdated` | Policy threshold or setting changed |
-| `ExclusionAdded` | CVE or finding exclusion added to a policy; may trigger artifact re-evaluation |
-| `ExclusionRemoved` | Exclusion revoked |
-| `PolicyArchived` | Policy deactivated |
+| `ArtifactExpired` | A retention policy fired; the artifact is now eligible for purge |
+| `ArtifactPurged` | The storage delete completed, or the blob was confirmed already absent (re-emission is correct, not an error) |
+| `ArtifactDeleted` | Deleted from its repository — the terminal transition on the operator/registry-API axis |
 
-Auxiliary concepts (users, RBAC, repository configuration, API tokens) remain CRUD. They do not need event sourcing.
+**Policy lifecycle** (`events/policy_events.rs`): `PolicyCreated`,
+`PolicyUpdated`, `ExclusionAdded`, `ExclusionRemoved`, `PolicyArchived`,
+`PolicyReactivated`.
+
+**Download audit** (`events/download_events.rs`): `ArtifactDownloaded` —
+high-volume, its own stream category.
+
+**Everything else that is event-sourced.** The claim that auxiliary concepts
+"remain CRUD" has been false since the authorization and identity axes moved
+onto the log, and reading it as current is how the table above gets mistaken
+for the whole vocabulary. Projections for these concepts are still CRUD rows;
+the **decisions** that move them are events, because an authorization change
+needs the same append-only authorship trail as `ArtifactReleased`:
+
+| Module | Events |
+|---|---|
+| `authorization_events.rs` | `ClaimMappingApplied`, `ClaimMappingRevoked`, `PermissionGrantApplied`, `PermissionGrantRevoked`, `RepositoryUpstreamMappingChanged`, `TaskInvoked`, `TaskFailed` |
+| `api_token_events.rs` | `ApiTokenIssued`, `ApiTokenRevoked`, `ApiTokenIssuanceDenied`, `ApiTokenUsed` |
+| `auth_events.rs` | `AuthenticationAttempted`, `OidcKeyRotated`, `AdminStatusChanged` |
+| `service_account_events.rs` | `ServiceAccountCreated`, `ServiceAccountUpdated`, `ServiceAccountDeleted`, `ServiceAccountTokenRotated` |
+| `oidc_issuer_events.rs` | `OidcIssuerCreated`, `OidcIssuerUpdated`, `OidcIssuerDeleted` |
+| `subscription_events.rs` | `SubscriptionCreated`, `SubscriptionCreationDenied`, `SubscriptionUpdated`, `SubscriptionPaused`, `SubscriptionResumed`, `SubscriptionDeleted`, `SubscriptionDisabled` |
+| `artifact_group_events.rs` | `ArtifactGroupInitiated`, `ArtifactGroupMemberAdded`, `ArtifactGroupMemberRemoved`, `ArtifactGroupPrimaryRoleAssigned` |
+| `ref_events.rs` | `RefMoved`, `RefRetired` |
+| `curation_events.rs` | `CurationApplied` |
+| `cas_scrub_events.rs` | `CasIntegrityMismatch` |
+| `retention_events.rs` | `StreamSealed` (eventstore-retention tombstone on the never-deleted audit-meta stream) |
+| `crate::retention`, bridged by the `RetentionPolicyChanged` wrapper | `RetentionPolicyEvent::{Created, Updated, Archived, Evaluated}` on `StreamCategory::RetentionPolicy` |
+
+Repository **configuration** proper stays CRUD; the audit of what changed it
+does not.
+
+**`RetentionPolicyChanged` is the one variant whose stored `event_type` is not
+its variant name** — `event_type()` discriminates the inner variant and writes
+`"RetentionPolicyCreated"` / `"RetentionPolicyUpdated"` /
+`"RetentionPolicyArchived"` / `"RetentionPolicyEvaluated"`. A query filtering
+on `event_type` needs those four strings; one filtering on
+`"RetentionPolicyChanged"` matches no stored row. This is why the enumeration
+command above is a starting point and not the finished predicate: for an
+`event_type` filter, read `DomainEvent::event_type` rather than the variant
+list.
 
 **Policy definitions are event-sourced**, not CRUD. Adding a CVE exclusion or lowering a severity threshold can cause previously rejected artifacts to become available — that decision and its authorship belong in the same append-only log as `ArtifactReleased`. The current policy state is a projection from policy lifecycle events.
 

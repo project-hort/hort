@@ -125,9 +125,9 @@ Rust 1.97+ with the following project configuration:
 
 ### Test Coverage Tiers
 
-Coverage requirements vary by crate layer. Core crates contain the security-critical domain logic (artifact lifecycle, quarantine invariants, CAS guarantees, policy evaluation) and must be exhaustively tested.
+Coverage ambition varies by crate layer. Core crates contain the security-critical domain logic (artifact lifecycle, quarantine invariants, CAS guarantees, policy evaluation) and must be exhaustively tested.
 
-| Crate | Required coverage | Rationale |
+| Crate | Target coverage | Rationale |
 |---|---|---|
 | `hort-domain` | **100%** | Pure Rust, zero I/O — every branch is testable and must be tested. This is the security boundary. |
 | `hort-app` | **100%** | Orchestration logic that enforces invariants across ports. Mock all outbound ports. |
@@ -137,7 +137,21 @@ Coverage requirements vary by crate layer. Core crates contain the security-crit
 | `hort-http-<format>` | **>= 85%** | Per-format HTTP handler tests. |
 | `hort-formats` | **>= 85%** | WASM host tests. |
 
-**Enforcement:** `hort-domain` and `hort-app` coverage is checked by the `coverage` CI job. Any new public function or branch in these crates without a corresponding test is a blocking review finding. The 100% target means every match arm, every error path, and every boundary condition — not just happy paths.
+**These are targets, not acceptance criteria, and the two `100%` rows are not met today.** Measured on 2026-11-02 with the command the CI job itself runs — `cargo llvm-cov --workspace --lib --summary-only` with `DATABASE_URL` unset — `hort-domain` is at **97.89%** lines (707 of 33,464 uncovered) and `hort-app` at **94.18%** (7,588 of 130,284). Re-measure rather than quoting those: they move with every change, and aggregating the per-file summary per crate is
+
+```bash
+cargo llvm-cov --workspace --lib --summary-only | awk '
+  $1 ~ /^hort-[a-z-]+\// { split($1, p, "/"); l[p[1]] += $8; m[p[1]] += $9 }
+  END { for (c in l) printf "%-28s %.2f%%\n", c, 100*(l[c]-m[c])/l[c] }' | sort
+```
+
+**What CI actually gates** — there is **no per-crate threshold anywhere in the pipeline**, so reading the table as a pass/fail bar states a condition no job checks and no change can satisfy without closing pre-existing gaps that are not its business:
+
+- **Workspace-total floor.** GitHub `ci.yml` → `coverage` runs `cargo llvm-cov --workspace --lib --no-run --fail-under-lines 50`. Measured 2026-11-02: 88.24% lines workspace-wide.
+- **New/changed lines >= 70%.** The same job's *New code coverage gate* intersects the diff's added `.rs` line numbers with `lcov.info` and fails below 70%, skipping when too few lines changed.
+- **GitLab `test:coverage` enforces nothing.** It runs `cargo llvm-cov --workspace --lib` plus `report --summary-only` and uploads `lcov.info` / `coverage-sonar.xml`; the verdict on new-code coverage is Sonar's own server-side gate.
+
+**The per-change criterion, which is the one to carry into a directive and a review:** *a change adds no uncovered lines.* Measure it as the intersection of the diff's added line numbers with `cargo llvm-cov --show-missing-lines`, per touched file. It is stricter than any percentage threshold — a percentage hides a new uncovered branch behind pre-existing coverage — and, unlike the 100% rows above, it is satisfiable by the change under review. For `hort-domain` and `hort-app` specifically, a new public function or branch without a corresponding test stays a blocking review finding: every match arm, every error path, every boundary condition — not just happy paths.
 
 **DB-backed test isolation (parallel-safety contract).** The DB-backed suites have **three modes**, and a reviewer has to know which one a test is in:
 
@@ -602,7 +616,7 @@ inherited rationale when the threat surface changes" rule.
 
 Additionally, before pushing:
 - Check for code duplication: if structurally similar blocks appear 3+ times in new code, refactor into a shared helper
-- Check test coverage: `hort-domain` and `hort-app` require 100% coverage; all other crates require 85%+ (see Test Coverage Tiers above)
+- Check test coverage: the change adds no uncovered lines (intersect the diff's added line numbers with `cargo llvm-cov --show-missing-lines`, per touched file). The per-crate percentages in *Test Coverage Tiers* above are targets, not gates — no CI job checks one; what CI gates is the workspace-total floor and >= 70% on new/changed lines.
 - Check migration numbering: verify the migration number is not already taken (`ls migrations/ | tail -5`)
 - **Regenerate third-party attribution on ANY dependency-graph change** — if the
   change adds/removes/re-versions a **non-workspace** crate in `Cargo.lock` (a dep

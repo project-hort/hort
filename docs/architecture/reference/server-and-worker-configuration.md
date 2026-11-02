@@ -67,14 +67,43 @@ each subcommand prints `Error: {err:?}` (full `anyhow` context chain)
 and exits non-zero; a Tokio-runtime build failure prints
 `error: building tokio runtime: {err}`.
 
-> **Why `migrate`/`admin`/`reconcile-groups` use `MinimalConfig`**
+> **Why the DB-only subcommands use `MinimalConfig`**
 > ([ADR 0009](../../adr/0009-least-privilege-runtime-migrate-subcommand.md)):
 > the runtime DSN is least-privilege (DML only) and
-> these DB-only subcommands must not require the storage /
+> these subcommands must not require the storage /
 > public-base-url / OIDC surface. `MinimalConfig` parses exactly the
-> five shared variables in
-> [§ Core (shared)](#core-shared--minimalconfig). `serve` and `scrub`
-> parse the full surface and enforce every interlock. Migrations are
+> variables in [§ Core (shared)](#core-shared--minimalconfig), plus
+> `HORT_TOKEN_ALLOW_ADMIN` (which `admin bootstrap-session` gates on).
+>
+> **Twelve subcommands take this path**, not the three an earlier revision
+> of this note named — so check the list rather than inferring from the
+> three:
+>
+> - `migrate`
+> - `admin issue-svc-token`, `admin bootstrap-session` (both of `admin`)
+> - `reconcile-groups`
+> - `verify-event-chain`
+> - `seed-import`
+> - the six `enqueue-*` commands: `enqueue-prefetch-tick`,
+>   `enqueue-quarantine-release-sweep`,
+>   `enqueue-prefetch-row-retention-sweep`,
+>   `enqueue-scan-row-retention-sweep`,
+>   `enqueue-jobs-row-retention-sweep`,
+>   `enqueue-wheel-metadata-backfill`
+>
+> Re-derive the list instead of trusting the count — it grows with every
+> new `enqueue-*`:
+>
+> ```bash
+> grep -rln 'MinimalConfig::from_env' crates/hort-server/src/cli/
+> ```
+>
+> That returns **11 files** for 12 subcommands — `admin.rs` hosts two of
+> them.
+>
+> `serve` and `scrub` parse the full surface and enforce every interlock;
+> `validate-config`, `license` and `attribution` are DSN-free and parse
+> neither. Migrations are
 > owned **only** by `hort-server migrate` — the `serve` path calls
 > `migrate::assert_current` (a read-only check on `_sqlx_migrations`)
 > and refuses to run `migrate::run`.

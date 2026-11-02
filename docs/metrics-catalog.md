@@ -4353,15 +4353,37 @@ metrics count the dispatcher-level view (one increment per claimed row);
 `hort_scan_jobs_total` counts the scan-specific state transition.
 
 Cardinality:
-- `hort_admin_tasks_enqueued_total`: `kind` × 3 result values.
-  v1: 1 kind (`scan`) × 3 = 3 series max (fewer if error paths are never
-  hit in steady state).
-- `hort_admin_tasks_completed_total`: closed by `kind` × 3 result values.
-  v1: 1 × 3 = 3 series.
-- `hort_admin_tasks_duration_seconds`: 1 histogram per kind.
-  v1: 1 histogram.
-- `hort_admin_tasks_in_flight`: 1 gauge per kind.
-  v1: 1 gauge.
+Each bound below names the set it is derived from, because every one of
+these counts moves when a kind is added. Re-derive rather than trusting the
+integers; `scan` in particular is **not** an admin-invokable kind (see
+`ADMIN_INVOKABLE_TASK_KINDS`' own `NOTE`), so it contributes no
+`hort_admin_tasks_enqueued_total` series at all.
+
+- `hort_admin_tasks_enqueued_total`: `kind` × 3 result values (`ok`,
+  `rbac_denied`, `validation_error`). The `kind` label is set by the HTTP
+  invoke handler, so it is bounded by the **routed** `post(invoke::<…>)`
+  endpoints in `hort-http-admin-tasks::router` — **11** today, hence **33
+  series max** (fewer if the error paths are never hit in steady state).
+  Deliberately not bounded by `ADMIN_INVOKABLE_TASK_KINDS` (23), which is
+  the wider set gating the DSN-direct `hort-server enqueue-*` subcommands
+  and event validation too; those enqueue without passing through the
+  handler and so emit nothing here.
+
+  ```bash
+  grep -c 'post(invoke::<' crates/hort-http-admin-tasks/src/lib.rs
+  ```
+
+- `hort_admin_tasks_completed_total`: closed by `kind` × 3 result values
+  (`completed`, `failed_retry`, `failed_terminal`). Emitted once per
+  claimed row, so the `kind` label is bounded by the valid `jobs.kind`
+  values — `EVENT_TASK_KINDS`, **26** today (`ADMIN_INVOKABLE_TASK_KINDS`
+  plus `scan`, `verify-event-chain` and `oci-index-child-ingest`) — giving
+  **78 series max**. `verify-event-chain` never reaches the dispatcher (it
+  is a liveness breadcrumb the CLI subcommand writes directly, with no
+  registered handler), so 25 kinds is the reachable bound.
+- `hort_admin_tasks_duration_seconds`: 1 histogram per kind, same 26-kind
+  bound — and only for a kind that actually entered `TaskHandler::run`.
+- `hort_admin_tasks_in_flight`: 1 gauge per kind, same 26-kind bound.
 - `hort_admin_tasks_lease_requeued_total`: bounded by the 19 kinds in
   `REQUEUE_ON_LEASE_EXPIRY_KINDS` × 2 result values = 38 series, and only
   a kind that has actually been abandoned ever creates one.

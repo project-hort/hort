@@ -1651,26 +1651,36 @@ impl QuarantineUseCase {
         })
     }
 
-    /// #65 — whether `artifact`'s quarantine window has genuinely
-    /// elapsed, using the SAME anchor + resolved-policy-duration
-    /// computation ([`resolve_active_policy_for_repo`] +
+    /// Whether `artifact`'s quarantine window has genuinely elapsed,
+    /// using the SAME anchor + resolved-policy-duration computation
+    /// ([`resolve_active_policy_for_repo`] +
     /// [`effective_quarantine_deadline`]) as the `record_scan_result`
     /// inline fast-path and the `release_expired` sweep's candidacy
     /// filter.
     ///
-    /// Deliberately NOT the same signal as
+    /// Deliberately a separate signal from
     /// `ArtifactUseCase::hydrate_quarantine_deadline`, which format
-    /// crates read for the `check_quarantine` `Retry-After` computation:
-    /// that hydration sets `quarantine_deadline = quarantine_window_start`
-    /// (the bare ingest-time anchor, with no duration added) because
-    /// `ArtifactUseCase` holds no policy-projection port — so it always
-    /// reads as "elapsed" the instant the anchor is in the past, which is
-    /// true for every `Quarantined` artifact almost immediately. Using
-    /// that signal here would make a bounded-await candidacy check that
-    /// never actually excludes a genuine, still-running, multi-minute (or
-    /// longer) hold. This method resolves the real matched-policy
-    /// duration instead, so a still-running hold correctly reads as NOT
-    /// elapsed.
+    /// crates read for the `check_quarantine` `Retry-After` computation
+    /// — but **not** because the two compute different arithmetic. That
+    /// hydration once set `quarantine_deadline = quarantine_window_start`
+    /// (the bare ingest-time anchor, no duration added) because
+    /// `ArtifactUseCase` held no policy-projection port; it now resolves
+    /// the real matched-policy duration through the same
+    /// `resolve_active_policy_for_repo` helper and the same
+    /// `DefaultPolicy::quarantine_duration_secs` fallback, so both
+    /// deadlines agree.
+    ///
+    /// What keeps them separate is **authority, not arithmetic**: the
+    /// hydration is read-path only — it appends no event and is never
+    /// consulted by the release predicate — and exists so an
+    /// adapter-free `hort-http-<format>` crate, which cannot resolve a
+    /// `ScanPolicy` itself, can still emit an honest `Retry-After`
+    /// (ADR 0008). This method is the candidacy filter the release
+    /// paths share, and resolving the window here is what lets a
+    /// bounded-await gate exclude a genuine, still-running,
+    /// multi-minute (or longer) hold instead of awaiting it on every
+    /// GET. Collapsing the two would put a read-path convenience value
+    /// on the release side of ADR 0007's fail-closed line.
     ///
     /// Read-only candidacy check — consults no release authority and
     /// mutates nothing; never itself an authorization to release (ADR

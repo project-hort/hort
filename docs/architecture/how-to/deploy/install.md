@@ -96,10 +96,13 @@ The chart takes **two DSNs**, never one:
 
 - `hort_admin` — DDL role. Used **only** by the migrations Job;
   owns the schema.
-- `hort_app_role` — DML role. Used by the runtime Deployment. Has
-  `INSERT, SELECT` on `events` (append-only event store); no
-  `UPDATE`, `DELETE`, or DDL anywhere. A compromised pod cannot
-  mutate the audit log.
+- `hort_app_role` — DML role. Used by the runtime Deployment. Full DML
+  (`SELECT, INSERT, UPDATE, DELETE`) on the projection tables the
+  runtime writes — `artifacts`, `jobs`, `api_tokens` and the rest —
+  but **`INSERT, SELECT` only on `events`**, and no DDL anywhere. A
+  compromised pod can move the projections it was always going to move;
+  it cannot mutate or truncate the append-only audit log, and cannot
+  change the schema.
 
 Generate the two passwords first — these are the values you put in
 the Secrets in §3:
@@ -109,46 +112,30 @@ HORT_ADMIN_PASSWORD="$(pwgen -s 32 1)"
 HORT_APP_PASSWORD="$(pwgen -s 32 1)"
 ```
 
-> **Abbreviated excerpt** — use the complete recipe in
-> [`postgres-roles.md`](postgres-roles.md) for a production
-> provisioning. It includes `CREATEROLE` on `hort_admin` and the
-> `ALTER DEFAULT PRIVILEGES` grants that the migrations need for
-> tables created after initial install.
+> **Run the recipe in [`postgres-roles.md`](postgres-roles.md)** — it is
+> the single source for these grants, and this page deliberately does not
+> carry a second copy. Two copies of a grant set drift, and the failure
+> mode is expensive: a runtime role short one privilege produces a server
+> that starts clean and then hits `permission denied` on the first ingest,
+> one write path at a time, with an error that reads like a code bug. No
+> boot gate catches it.
+>
+> That page covers what this one cannot summarise without re-deriving it:
+> `CREATEROLE` on `hort_admin`, the `ALTER DEFAULT PRIVILEGES` grants the
+> migrations need for tables created after the initial install, and the
+> deliberate narrowings — `INSERT, SELECT` only on `events`, `SELECT` only
+> on the migration bookkeeping (`_sqlx_migrations`,
+> `schema_compat_register`), and no `CREATE ON SCHEMA public`.
 
-Connect to Postgres as a superuser and provision:
+Provision both roles there, then return here. One ordering detail from that
+recipe matters to this page's timeline: the **table-level** grants land
+*after* the migrations Job has completed (§7 verifies this), because
+`hort_admin` creates every schema object — so the
+`ALTER DEFAULT PRIVILEGES` block is what carries privileges to tables a
+later migration adds.
 
-```sql
-CREATE DATABASE hort;
-\connect hort
-
--- DDL role: owns the schema, runs migrations.
-CREATE ROLE hort_admin LOGIN PASSWORD '<HORT_ADMIN_PASSWORD>';
-GRANT ALL PRIVILEGES ON DATABASE hort TO hort_admin;
-GRANT ALL ON SCHEMA public TO hort_admin;
-ALTER DATABASE hort OWNER TO hort_admin;
-
--- DML role: runtime. Table-level grants land AFTER migrations.
-CREATE ROLE hort_app_role LOGIN PASSWORD '<HORT_APP_PASSWORD>';
-GRANT CONNECT ON DATABASE hort TO hort_app_role;
-GRANT USAGE ON SCHEMA public TO hort_app_role;
-```
-
-After the migrations Job has completed (§7 verifies this), reconnect
-as `hort_admin` and grant the runtime role exactly what the binary
-needs:
-
-```sql
-\connect hort hort_admin
-
-GRANT INSERT, SELECT ON events TO hort_app_role;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO hort_app_role;
--- Read-only on projection tables (repositories, RBAC, …); gitops
--- mutations go through the admin Job, never the runtime Deployment.
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO hort_app_role;
-REVOKE UPDATE, DELETE, TRUNCATE ON events FROM hort_app_role;
-```
-
-Verify the role separation:
+Once provisioned, verify the one narrowing a compromised runtime pod
+would most like to escape:
 
 ```bash
 psql "postgres://hort_app_role:${HORT_APP_PASSWORD}@<host>:5432/hort" \
@@ -156,8 +143,10 @@ psql "postgres://hort_app_role:${HORT_APP_PASSWORD}@<host>:5432/hort" \
 # Expected: ERROR: permission denied for table events
 ```
 
-If the `UPDATE` is permission-denied, the role split is correct. If
-it succeeds, re-run the `REVOKE` block above.
+If the `UPDATE` is permission-denied, the role split is correct. If it
+succeeds, the `events` re-hardening step did not take — re-run it from
+[`postgres-roles.md`](postgres-roles.md#defense-in-depth-the-chart-re-hardens-events-and-the-migration-bookkeeping-automatically),
+which is also where the chart's automatic re-hardening is described.
 
 ---
 
