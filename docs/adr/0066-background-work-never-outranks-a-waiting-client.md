@@ -1,6 +1,6 @@
 # 0066 — Background work never outranks the path a client is waiting on
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Enforced by:** *to be built with this decision.* Structurally, by making the
   classification a domain type: a call site that wants a rank names a class, and
   the queue's ordinal is written in one place from that class. The
@@ -14,7 +14,8 @@
   [0007](0007-fail-closed-quarantine-release-predicate.md) — 0007 decides *when*
   an artifact may be released; this decides that the mechanism performing that
   release is not displaced by maintenance. Source: `backlog/074` and issue #399,
-  which hold the measurements and the mechanism analysis.
+  which hold the measurements and the mechanism analysis, and the
+  maintainer's 2026-11-02 decision.
 
 ## Context
 
