@@ -46,6 +46,7 @@ use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::rescan_candidates::{RescanCandidate, RescanCandidatesRepository};
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
+use hort_domain::types::task_tier::scan_queue_priority;
 
 use crate::metrics::{
     emit_scan_jobs_enqueued, set_cron_rescan_eligible_artifacts,
@@ -64,12 +65,6 @@ use crate::metrics::{
 /// 1000-row batch cap prevents one invocation from creating an
 /// enormous queue burst, and ENV-tuning is deliberately not offered.
 const BATCH_SIZE: u32 = 1000;
-
-/// Priority bucket for cron-enqueued scans.
-///
-/// Lower than manual (20), higher than advisory (5). The framework
-/// orders claims `priority DESC, created_at ASC`.
-const CRON_RESCAN_PRIORITY: i16 = 10;
 
 /// `trigger_source` literal — must match the SQL CHECK constraint on
 /// `jobs.trigger_source` (`'manual' | 'cron' | 'advisory' | 'ingest'`).
@@ -125,7 +120,7 @@ impl CronRescanTickHandler {
                     c.repository_id,
                     &c.content_hash,
                     &c.format,
-                    CRON_RESCAN_PRIORITY,
+                    scan_queue_priority(CRON_TRIGGER_SOURCE),
                     CRON_TRIGGER_SOURCE,
                 )
                 .await
@@ -601,7 +596,6 @@ mod tests {
             assert_eq!(call.repository_id, c.repository_id);
             assert_eq!(call.format, c.format);
             assert_eq!(call.priority, 10);
-            assert_eq!(call.priority, CRON_RESCAN_PRIORITY);
             assert_eq!(call.trigger_source, "cron");
             assert_eq!(call.trigger_source, CRON_TRIGGER_SOURCE);
         }
@@ -808,7 +802,7 @@ mod tests {
                 call.trigger_source, "cron",
                 "stranded re-enqueue still uses trigger_source=cron (same handler)"
             );
-            assert_eq!(call.priority, CRON_RESCAN_PRIORITY);
+            assert_eq!(call.priority, 10);
         }
     }
 

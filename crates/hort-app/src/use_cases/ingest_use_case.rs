@@ -36,6 +36,9 @@ use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
+use hort_domain::types::task_tier::{
+    queue_priority, scan_queue_priority, CLEARANCE_GATING_VERIFY_PRIORITY,
+};
 use hort_domain::types::{ArtifactCoords, ContentHash, PayloadAccess};
 
 use crate::error::{AppError, AppResult};
@@ -56,15 +59,19 @@ use crate::use_cases::{
     UnpairedAppend, EVENT_APPEND_RETRY_ATTEMPTS,
 };
 
-/// Enqueue priority for **clearance-gating** `provenance-verify` jobs — the
-/// signature-arrival hook and the expiry backstop. Set to the cron/sweep tier
-/// (10) so these latency-sensitive, post-hold jobs preempt the bulk priority-0
-/// ingest scan/verify backlog in the shared `ORDER BY priority DESC` claim.
-/// Under full-suite load a priority-0 signature-arrival verify was starved
-/// behind the backlog, so a signed image's release lagged past the E2E poll
-/// window (#44). Bulk ingest-time scan/verify stay at priority 0 — they ARE the
-/// backlog; only the sign-triggered clearance jobs (rare) jump the queue.
-pub(crate) const CLEARANCE_VERIFY_PRIORITY: i16 = 10;
+/// `jobs.kind` of the provenance gate (ADR 0027) — what
+/// `IngestEnqueue::ProvenanceVerify` lands, and what the
+/// signature-arrival hook and the expiry backstop enqueue directly.
+pub(crate) const PROVENANCE_VERIFY_KIND: &str = "provenance-verify";
+
+/// `jobs.kind` of the transitive prefetch cascade driver.
+const PREFETCH_DEPENDENCIES_KIND: &str = "prefetch-dependencies";
+
+/// `jobs.trigger_source` every enqueue this use case makes at ingest
+/// time carries. One of the migration-009 CHECK literals; the
+/// `register_by_hash` path stamps its own instead, because its caller
+/// class is what distinguishes it.
+pub(crate) const INGEST_TRIGGER_SOURCE: &str = "ingest";
 
 /// Request payload for [`IngestUseCase::ingest`].
 ///
@@ -1742,11 +1749,16 @@ impl IngestUseCase {
                     match self
                         .jobs
                         .enqueue_task(
-                            "provenance-verify",
+                            PROVENANCE_VERIFY_KIND,
                             &params,
                             None, // actor_id: system-driven signature-arrival hook
-                            CLEARANCE_VERIFY_PRIORITY, // #44: preempt bulk ingest so sign→release isn't queue-depth-dependent
-                            "ingest",
+                            // Preempts the bulk ingest backlog: a
+                            // priority-0 signature-arrival verify queues
+                            // behind every ingest-time scan, so a signed
+                            // image's release lags by the queue depth
+                            // rather than by the verify's own cost.
+                            CLEARANCE_GATING_VERIFY_PRIORITY,
+                            INGEST_TRIGGER_SOURCE,
                             None, // no idempotency key — a re-verify is harmless (idempotent verdict)
                         )
                         .await
@@ -3654,18 +3666,18 @@ impl IngestUseCase {
             "artifact_id": artifact_id,
             "current_depth": 0u32,
         });
-        // `priority = 0` — cascade rows drain after operator/cron work.
+        // Cascade rows drain after operator/cron work.
         // `trigger_source = "ingest"` — the cascade is event-driven by the
         // ingest; the CHECK in migration 009 lists `ingest` as a valid
         // trigger source.
         match self
             .jobs
             .enqueue_task(
-                "prefetch-dependencies",
+                PREFETCH_DEPENDENCIES_KIND,
                 &params,
                 None, // actor_id: system-driven post-ingest hook
-                0i16,
-                "ingest",
+                queue_priority(PREFETCH_DEPENDENCIES_KIND, INGEST_TRIGGER_SOURCE),
+                INGEST_TRIGGER_SOURCE,
                 None, // non-destructive task — no DB-side idempotency key (ADR 0028)
             )
             .await
@@ -4040,14 +4052,14 @@ impl IngestUseCase {
         if scan_decision.scan_will_run {
             enqueues.push(IngestEnqueue::Scan {
                 format: scan_enqueue_format.clone(),
-                priority: 0, // default tier for ingest-time enqueue
-                trigger_source: "ingest".to_string(),
+                priority: scan_queue_priority(INGEST_TRIGGER_SOURCE),
+                trigger_source: INGEST_TRIGGER_SOURCE.to_string(),
             });
         }
         if scan_decision.provenance_will_run {
             enqueues.push(IngestEnqueue::ProvenanceVerify {
-                priority: 0, // default tier for ingest-time enqueue
-                trigger_source: "ingest".to_string(),
+                priority: queue_priority(PROVENANCE_VERIFY_KIND, INGEST_TRIGGER_SOURCE),
+                trigger_source: INGEST_TRIGGER_SOURCE.to_string(),
             });
         }
 
@@ -5099,13 +5111,13 @@ impl IngestUseCase {
         if scan_will_run {
             enqueues.push(IngestEnqueue::Scan {
                 format: scan_enqueue_format.clone(),
-                priority: 0, // default tier, mirrors ingest_inner's ingest-time enqueue
+                priority: scan_queue_priority(trigger_source),
                 trigger_source: trigger_source.to_string(),
             });
         }
         if provenance_will_run {
             enqueues.push(IngestEnqueue::ProvenanceVerify {
-                priority: 0,
+                priority: queue_priority(PROVENANCE_VERIFY_KIND, trigger_source),
                 trigger_source: trigger_source.to_string(),
             });
         }
@@ -5203,11 +5215,11 @@ impl IngestUseCase {
             match self
                 .jobs
                 .enqueue_task(
-                    "prefetch-dependencies",
+                    PREFETCH_DEPENDENCIES_KIND,
                     &params,
                     None,
-                    0i16,
-                    "ingest",
+                    queue_priority(PREFETCH_DEPENDENCIES_KIND, INGEST_TRIGGER_SOURCE),
+                    INGEST_TRIGGER_SOURCE,
                     None, // non-destructive task — no DB-side idempotency key (ADR 0028)
                 )
                 .await
@@ -16540,7 +16552,8 @@ mod tests {
                 sample_actor(),
                 serde_json::Value::Null,
                 upstream_digest,
-                Some(subject_hash), &[],
+                Some(subject_hash),
+                &[],
                 content_stream(content),
             )
             .await
@@ -16568,12 +16581,15 @@ mod tests {
             // No idempotency key — a re-verify is a harmless idempotent
             // verdict.
             assert_eq!(jobs.enqueue_idem_keys(), vec![None]);
-            // #44: the signature-arrival verify is clearance-gating, so it
-            // enqueues at the elevated tier to preempt the bulk ingest backlog.
+            // The signature-arrival verify is clearance-gating, so it
+            // enqueues at the elevated tier to preempt the bulk ingest
+            // backlog. Pinned against the literal, not the constant: the
+            // number this producer writes is what must not move until the
+            // ordinals are re-derived from the tier.
             assert_eq!(
                 jobs.enqueue_priorities(),
-                vec![CLEARANCE_VERIFY_PRIORITY],
-                "signature-arrival provenance-verify must enqueue at the elevated clearance tier (#44)"
+                vec![10],
+                "signature-arrival provenance-verify must enqueue at the elevated clearance tier"
             );
         });
     }

@@ -82,6 +82,7 @@ use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::BoxFuture;
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::PageRequest;
 
 // ---------------------------------------------------------------------------
@@ -1075,7 +1076,7 @@ impl PrefetchDependenciesHandler {
                             "package": cold.normalised,
                             "version": concrete,
                         }),
-                        priority: 0,
+                        priority: queue_priority(KIND_PREFETCH_INGEST, PREFETCH_TRIGGER_SOURCE),
                         trigger_source: PREFETCH_TRIGGER_SOURCE.to_string(),
                         target_key: key.clone(),
                     });
@@ -1103,7 +1104,10 @@ impl PrefetchDependenciesHandler {
                                 "version": concrete,
                                 "current_depth": next_depth,
                             }),
-                            priority: 0,
+                            priority: queue_priority(
+                                KIND_PREFETCH_DEPENDENCIES,
+                                PREFETCH_TRIGGER_SOURCE,
+                            ),
                             trigger_source: PREFETCH_TRIGGER_SOURCE.to_string(),
                             target_key: key,
                         });

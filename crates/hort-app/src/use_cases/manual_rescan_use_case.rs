@@ -65,16 +65,11 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::error::DomainError;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::types::task_tier::scan_queue_priority;
 
 use crate::error::{AppError, AppResult};
 use crate::metrics::{emit_scan_jobs_enqueued, TriggerSourceLabel};
 use crate::use_cases::repository_access::{AccessLevel, RepositoryAccessUseCase};
-
-/// Priority bucket for manual rescans.
-///
-/// Higher than cron (10) and advisory (5); manual operator action
-/// jumps the queue.
-const MANUAL_RESCAN_PRIORITY: i16 = 20;
 
 /// `trigger_source` literal for manual rescans
 /// ([`hort_domain::ports::jobs_repository::TriggerSource::Manual`]).
@@ -170,7 +165,7 @@ impl ManualRescanUseCase {
                 artifact.repository_id,
                 &artifact.sha256_checksum,
                 &format,
-                MANUAL_RESCAN_PRIORITY,
+                scan_queue_priority(MANUAL_TRIGGER_SOURCE),
                 MANUAL_TRIGGER_SOURCE,
             )
             .await?;
@@ -184,7 +179,7 @@ impl ManualRescanUseCase {
         tracing::debug!(
             %artifact_id,
             %job_id,
-            priority = MANUAL_RESCAN_PRIORITY,
+            priority = scan_queue_priority(MANUAL_TRIGGER_SOURCE),
             trigger_source = MANUAL_TRIGGER_SOURCE,
             "manual rescan enqueued",
         );
@@ -322,7 +317,6 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.artifact_id, artifact_id);
         assert_eq!(call.repository_id, repo_id);
-        assert_eq!(call.priority, MANUAL_RESCAN_PRIORITY);
         assert_eq!(
             call.priority, 20,
             "manual-rescan priority contract: manual = 20"

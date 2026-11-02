@@ -157,6 +157,7 @@ use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::{
     RepositoryUpstreamMapping, RepositoryUpstreamMappingRepository,
 };
+use hort_domain::types::task_tier::queue_priority;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
@@ -870,8 +871,7 @@ impl SelfServicePrefetchUseCase {
         // `IngestUseCase` on-ingest hook, gated on the repo's
         // `TransitiveDeps` trigger.
         //
-        // priority is `0i16` (operator-initiated prefetches are not
-        // high-priority); trigger_source is `"self_service"`, which the
+        // trigger_source is `"self_service"`, which the
         // migration-009 comment frames as the operator-initiated ROOT
         // enqueue — distinct from the cascade-spawned `"prefetch"`
         // children (an unexpectedly high `self_service` rate is a
@@ -888,7 +888,7 @@ impl SelfServicePrefetchUseCase {
                 PREFETCH_INGEST_KIND,
                 &params,
                 None,
-                0i16,
+                queue_priority(PREFETCH_INGEST_KIND, PREFETCH_TRIGGER_SOURCE),
                 PREFETCH_TRIGGER_SOURCE,
                 None, // non-destructive — no DB-side idempotency key (ADR 0028)
             )

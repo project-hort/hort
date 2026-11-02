@@ -62,6 +62,7 @@ use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
 use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::types::task_tier::queue_priority;
 
 use crate::config::MinimalConfig;
 use crate::{pg_identity, telemetry};
@@ -71,11 +72,12 @@ use crate::{pg_identity, telemetry};
 /// The scheduled CronJob is the `'cron'` trigger source.
 const CRON_TRIGGER_SOURCE: &str = "cron";
 
-/// `priority` for the enqueued row. The trigger-source
-/// ranking is `ingest=0` → `advisory=5` → `cron=10` → `manual=20`.
-/// Matches the release-sweep + prefetch-tick priority — the
-/// three CronJobs in the cron tier drain together.
-const CRON_PRIORITY: i16 = 10;
+/// `jobs.kind` of the row this subcommand enqueues. The ordinal it
+/// carries is not named here: it is decided from `(kind,
+/// trigger_source)` in `hort_domain::types::task_tier`, so every
+/// cron-triggered row drains in the same tier by construction rather
+/// than by six constants agreeing.
+const KIND: &str = "prefetch-row-retention-sweep";
 
 /// Arguments to `hort-server enqueue-prefetch-row-retention-sweep`.
 ///
@@ -118,12 +120,13 @@ async fn run_async(_args: EnqueuePrefetchRowRetentionSweepArgs) -> anyhow::Resul
     // supported path. `actor_id` is `None` because the scheduled path is
     // system-driven (a CronJob is not a human caller; the runtime DSN
     // owns nothing identity-wise).
+    let priority = queue_priority(KIND, CRON_TRIGGER_SOURCE);
     let outcome = jobs
         .enqueue_task(
-            "prefetch-row-retention-sweep",
+            KIND,
             &serde_json::json!({}),
             None, // actor_id — system-driven cron
-            CRON_PRIORITY,
+            priority,
             CRON_TRIGGER_SOURCE,
             None, // non-destructive task kind — no DB-side idempotency key (ADR 0028)
         )
@@ -138,8 +141,8 @@ async fn run_async(_args: EnqueuePrefetchRowRetentionSweepArgs) -> anyhow::Resul
 
     info!(
         job_id = %id,
-        kind = "prefetch-row-retention-sweep",
-        priority = CRON_PRIORITY,
+        kind = KIND,
+        priority,
         trigger_source = CRON_TRIGGER_SOURCE,
         "prefetch-row-retention-sweep job enqueued"
     );
@@ -207,7 +210,8 @@ mod tests {
     fn constants_match_init33_trigger_source_ranking() {
         assert_eq!(CRON_TRIGGER_SOURCE, "cron");
         assert_eq!(
-            CRON_PRIORITY, 10,
+            queue_priority(KIND, CRON_TRIGGER_SOURCE),
+            10,
             "prefetch-row-retention-sweep must share priority with the other \
              cron-tier CronJobs (quarantine-release-sweep + prefetch-tick); \
              changing this skews the worker claim queue"
