@@ -67,10 +67,12 @@ use hort_adapters_postgres::user_repo::PgUserRepository;
 use hort_app::destructive_task_reauthorization::DestructiveTaskReauthorizer;
 use hort_app::task_dispatcher::TaskDispatcher;
 use hort_domain::error::DomainResult;
+use hort_domain::policy::DEFAULT_CLASS_SERVICE_THRESHOLD_SECS;
 use hort_domain::ports::jobs_repository::{JobsRepository, REQUEUE_ON_LEASE_EXPIRY_KINDS};
 use hort_domain::ports::rescan_candidates::RescanCandidatesRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
+use hort_domain::types::task_tier::DEFAULT_RESERVED_SLOTS_PER_CLASS;
 use hort_domain::types::ContentHash;
 
 /// The attempt budget these tests build the dispatcher with —
@@ -283,6 +285,12 @@ async fn dispatch_scan_rows(pool: &PgPool, outcome: TaskOutcome) {
         0, // poll as fast as the test can drive it
         4,
         ATTEMPT_CAP,
+        DEFAULT_RESERVED_SLOTS_PER_CLASS,
+        // The per-class service threshold (ADR 0066 D5). Irrelevant to
+        // what these tests assert — no verdict is read back — but the
+        // constructor takes the operator's number rather than supplying
+        // one, so the test states which number it stands in for.
+        Duration::from_secs(DEFAULT_CLASS_SERVICE_THRESHOLD_SECS),
     );
     assert_eq!(
         dispatcher.attempt_cap(),
@@ -354,7 +362,13 @@ async fn a_transient_scan_failure_with_budget_left_stays_a_scheduled_retry() {
     // Still held by the backoff: the real claim statement must not return it.
     let jobs = PgJobsRepository::new(pool.clone());
     let claimed = jobs
-        .claim_pending_by_kinds(&["scan"], 10, "it-second-worker", LEASE)
+        .claim_pending_by_kinds(
+            &["scan"],
+            10,
+            "it-second-worker",
+            LEASE,
+            &hort_adapters_postgres::test_support::claim_reservation(),
+        )
         .await
         .expect("claim_pending_by_kinds");
     assert!(

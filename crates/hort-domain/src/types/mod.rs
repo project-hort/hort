@@ -25,9 +25,7 @@ pub use finding::{
 };
 pub use idempotency_key::IdempotencyKey;
 pub use sbom::{Ecosystem, PayloadAccess, Sbom, SbomComponent, SeekableRead};
-pub use task_tier::{
-    queue_priority, scan_queue_priority, TaskTier, CLEARANCE_GATING_VERIFY_PRIORITY,
-};
+pub use task_tier::{queue_priority, scan_queue_priority, TaskTier};
 
 // ---------------------------------------------------------------------------
 // PageRequest

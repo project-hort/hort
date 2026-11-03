@@ -637,6 +637,7 @@ async fn run_async() -> anyhow::Result<()> {
         caching_resolver,
         pat_listener,
         notification_runtime,
+        jobs: jobs_port,
     } = build_app_context(
         pool,
         storage_port,
@@ -897,6 +898,23 @@ async fn run_async() -> anyhow::Result<()> {
         })
     };
 
+    // Per-class queue-service sampler. Polls the jobs port on its own
+    // cadence, evaluates the pure per-class service predicate
+    // (ADR 0066 D5) and publishes the verdict as a gauge on THIS
+    // process's `/metrics` — the scrape an operator already has, since
+    // the worker's own metrics listener is opt-in and off by default.
+    // Spawned here rather than in composition for the reason the
+    // resolver refresh above is: composition does not own the shutdown
+    // token. Read-only — it enqueues nothing and executes no task, so
+    // the scheduler-free property of `hort-server` (ADR 0028) is
+    // untouched.
+    let class_service_sampler = composition::spawn_queue_class_service_sampler(
+        jobs_port,
+        composition::class_service_threshold_from_env(),
+        composition::CLASS_SERVICE_SAMPLE_INTERVAL,
+        shutdown_handle.token(),
+    );
+
     // `NotificationDispatcher` task. The dispatcher
     // takes ownership of the publisher's broadcast subscription, the
     // per-subscription RBAC ArcSwap, and the `subscription_changes`
@@ -1075,6 +1093,11 @@ async fn run_async() -> anyhow::Result<()> {
     // signal. Same JoinError semantics as the RBAC task above.
     if let Err(err) = resolver_refresh_task.await {
         warn!(error = %err, "upstream resolver refresh task exited abnormally");
+    }
+
+    // And the per-class queue-service sampler, same contract again.
+    if let Err(err) = class_service_sampler.await {
+        warn!(error = %err, "per-class queue-service sampler exited abnormally");
     }
 
     info!("hort-server shutdown complete");

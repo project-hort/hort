@@ -345,10 +345,23 @@ mod tests {
         // when the worker's claim path inserts a row that fails the
         // CHECK.
         assert_eq!(SEED_IMPORT_TRIGGER_SOURCE, "seed-import");
-        // priority=20 matches the manual tier — seed-import
-        // is operator-driven so it inherits the manual-tier priority
-        // (drains first ahead of cron / advisory ticks).
-        assert_eq!(queue_priority(KIND, SEED_IMPORT_TRIGGER_SOURCE), 20);
+        // The subcommand's own row is operator-driven, so it ranks with
+        // the operator band and ahead of every cron / advisory tick.
+        // Asserted as relations rather than as a number: one row drives
+        // the import and the scans it enqueues are one per artifact in
+        // it, so this row has to sit in front of them or the operator
+        // waits for their backlog instead of for the import.
+        assert!(
+            queue_priority(KIND, SEED_IMPORT_TRIGGER_SOURCE)
+                > queue_priority("scan", SEED_IMPORT_TRIGGER_SOURCE),
+            "the import's own row must outrank the per-artifact scans it enqueues under the \
+             same trigger source"
+        );
+        assert!(
+            queue_priority(KIND, SEED_IMPORT_TRIGGER_SOURCE)
+                > queue_priority("scan", TriggerSource::Cron.as_str()),
+            "and must outrank the scheduled rescan ticks nobody is waiting on"
+        );
     }
 
     // ---- TSV parser tests --------------------------------------------------

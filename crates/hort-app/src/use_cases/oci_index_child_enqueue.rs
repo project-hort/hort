@@ -288,7 +288,10 @@ mod tests {
         assert_eq!(cohort.len(), 2);
         for (row, child) in cohort.iter().zip(children.iter()) {
             assert_eq!(row.kind, OCI_INDEX_CHILD_INGEST_KIND);
-            assert_eq!(row.priority, 0);
+            assert_eq!(
+                row.priority,
+                queue_priority(OCI_INDEX_CHILD_INGEST_KIND, CHILD_INGEST_TRIGGER_SOURCE)
+            );
             assert_eq!(row.trigger_source, CHILD_INGEST_TRIGGER_SOURCE);
             assert_eq!(row.params["repository_id"], json!(repo_id));
             assert_eq!(

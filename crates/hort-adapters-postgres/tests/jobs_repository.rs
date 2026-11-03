@@ -37,7 +37,10 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
-use hort_domain::ports::jobs_repository::{JobStatus, JobsRepository, ResultWriteOutcome};
+use hort_domain::ports::jobs_repository::{
+    JobStatus, JobsRepository, ResultWriteOutcome, TriggerSource,
+};
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::ContentHash;
 
 /// Connect as the migration superuser; run all migrations cleanly.
@@ -795,7 +798,16 @@ async fn find_active_provenance_returns_none_when_only_completed_row_exists() {
 /// `QuarantineUseCase::enqueue_final_provenance_verify` drives it: check
 /// [`JobsRepository::find_active_provenance_for_artifact`] first; enqueue via
 /// [`JobsRepository::enqueue_task`] (same kind, same `params` shape, same
-/// priority/trigger-source literals) only when nothing is in-flight.
+/// trigger source and the ordinal that follows from it) only when nothing
+/// is in-flight.
+///
+/// The trigger source and the ordinal are taken the way the producer takes
+/// them — `TriggerSource::Clearance` through
+/// [`queue_priority`] — rather than re-typed. A reproduction that spells
+/// its own pair stops reproducing the moment the producer's changes, and
+/// this one already did: the clearance verifies borrowed `'ingest'` until
+/// the literal existed, so a hard-coded `(10, "ingest")` here would still
+/// pass while the row production writes no longer looks like it.
 async fn s4_guarded_tick(jobs: &Arc<dyn JobsRepository>, artifact_id: Uuid) {
     let active = jobs
         .find_active_provenance_for_artifact(artifact_id)
@@ -803,11 +815,17 @@ async fn s4_guarded_tick(jobs: &Arc<dyn JobsRepository>, artifact_id: Uuid) {
         .expect("find_active_provenance_for_artifact");
     if active.is_none() {
         let params = serde_json::json!({ "artifact_id": artifact_id });
-        // 10 == `CLEARANCE_VERIFY_PRIORITY` (`hort_app::use_cases::ingest_use_case`,
-        // `pub(crate)` — not importable across the crate boundary).
-        jobs.enqueue_task("provenance-verify", &params, None, 10, "ingest", None)
-            .await
-            .expect("enqueue_task");
+        let trigger_source = TriggerSource::Clearance.as_str();
+        jobs.enqueue_task(
+            "provenance-verify",
+            &params,
+            None,
+            queue_priority("provenance-verify", trigger_source),
+            trigger_source,
+            None,
+        )
+        .await
+        .expect("enqueue_task");
     }
 }
 

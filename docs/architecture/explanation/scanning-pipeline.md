@@ -165,14 +165,22 @@ surfaces enqueue them, distinguishable forever after by
   artifact gets its first scan this way.
 - **Manual** — `POST /api/v1/artifacts/:id/rescan`
   (`crates/hort-http-admin-security/src/router.rs` →
-  `ManualRescanUseCase`), priority 20. Write-gated on the parent
-  repository with the standard anti-enumeration collapse, and
-  conflict-checked: an in-flight scan for the artifact returns the
-  existing job id as a conflict rather than stacking a duplicate.
-- **Cron rescan** — priority 10 (below).
-- **Advisory watch** — priority 5 (below). The deliberate ordering
-  puts the cron safety-net above the advisory fan-out and manual
-  operator intent above both.
+  `ManualRescanUseCase`). Write-gated on the parent repository with the
+  standard anti-enumeration collapse, and conflict-checked: an in-flight
+  scan for the artifact returns the existing job id as a conflict rather
+  than stacking a duplicate.
+- **Cron rescan** — the periodic safety net (below).
+- **Advisory watch** — the per-ecosystem fan-out (below).
+
+The ordinal each of those carries is **not** a per-trigger-source
+number any more: it is derived from *who is waiting* on the row
+(ADR 0066, `hort_domain::types::task_tier`). The ingest scan is the path
+a client is waiting on and ranks top; the manual rescan is an operator
+reading an answer and ranks in the middle, above the admin task invokes
+that share its `'manual'` trigger source; the cron and advisory rescans
+are work nobody waits on and share the bottom band, where the claim's
+`created_at ASC` tiebreak orders them. `queue_priority` is the one place
+the number is decided — no producer names one.
 
 A partial unique index on `(artifact_id) WHERE kind='scan'` over
 non-terminal rows makes "one in-flight scan per artifact" a database
@@ -980,8 +988,9 @@ never needs leader election to avoid double-firing.
 `CronRescanTickHandler`) is the safety net. Per tick it selects up to
 1000 released artifacts whose policy-derived rescan interval has
 elapsed (`ScanPolicy.rescanIntervalHours`, default 24, `0` disables)
-and that have no in-flight scan, and enqueues each at priority 10 with
-`trigger_source="cron"`. It is interval-driven and
+and that have no in-flight scan, and enqueues each with
+`trigger_source="cron"` at the ordinal that follows from it — the bottom
+band, because nobody is waiting on a scheduled rescan. It is interval-driven and
 advisory-independent: once the tick is scheduled, a released artifact
 gets re-adjudicated on its policy's cadence even if every feed went
 silent.

@@ -3601,23 +3601,28 @@ counter):
 
 - `ingest` — first-scan at ingest time. Emitted by the ingest
   enqueue path (`IngestUseCase::ingest_verified` → `enqueue_scan` with
-  `trigger_source="ingest"` and `priority=0`).
+  `trigger_source="ingest"`). A client is waiting on this scan, so it
+  carries the top ordinal band (ADR 0066).
 - `cron` — periodic eligibility sweep. Emitted by
   [`CronRescanTickHandler::run`](../crates/hort-app/src/task_handlers/cron_rescan_tick.rs)
   once per tick, with the count equal to the number of rows that
   successfully landed (Conflict swallowed by the partial unique index
   `(artifact_id) WHERE kind='scan'` is excluded). Default schedule
-  `*/5 * * * *`; default `priority=10`.
+  `*/5 * * * *`; nobody waits on a scheduled rescan, so it carries the
+  bottom ordinal band.
 - `advisory` — per-ecosystem advisory-watch fan-out. Emitted by
   [`AdvisoryWatchTickHandler::run`](../crates/hort-app/src/task_handlers/advisory_watch_tick.rs)
   once per tick with the landed-rows count. Default schedule
-  `0 */6 * * *`; default `priority=5`. The wire string is `advisory`,
-  NOT `advisory_watch` — it must match the SQL CHECK literal exactly.
+  `0 */6 * * *`; it shares the bottom ordinal band with the cron
+  rescan. The wire string is `advisory`, NOT `advisory_watch` — it must
+  match the SQL CHECK literal exactly.
 - `manual` — operator-triggered rescan via `POST /api/v1/artifacts/:id/rescan`.
   Emitted by [`ManualRescanUseCase::trigger`](../crates/hort-app/src/use_cases/manual_rescan_use_case.rs)
   on success only — RBAC denial, in-flight conflict, and port-side
-  conflict paths do NOT increment the counter. Default `priority=20`
-  (jumps the queue ahead of cron and advisory).
+  conflict paths do NOT increment the counter. An operator is reading
+  this answer, so it carries the middle ordinal band — ahead of cron and
+  advisory, and ahead of the admin task invokes that share its
+  `'manual'` trigger source.
 
 **`hort_advisory_diff_processed_total` result semantics** (closed
 taxonomy of 5; one emission per ecosystem per advisory-watch tick from
@@ -4188,6 +4193,14 @@ The `TaskDispatcher` (generalised multi-kind worker poll loop,
 task kind registered with the dispatcher. In the initial v1
 deployment the only registered kind is `"scan"`.
 
+**Not every series in this family is the dispatcher's.** The per-process
+emitter is named in each row below, because three of them are not emitted
+by a worker at all: the `hort_admin_tasks_class_*` **gauges** come from
+`hort-server`'s own sampler, which re-derives the per-class service verdict
+from durable `jobs` rows on its own cadence so the verdict lands on a
+surface an operator scrapes (ADR 0066 D5; see *Per-class service semantics*
+below). `hort_admin_tasks_enqueued_total` is the HTTP invoke handler's.
+
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
 | `hort_admin_tasks_enqueued_total` | counter | `kind`, `result` | — | emitted by the HTTP handler (`hort-http-admin-tasks`) on every terminal path of `POST /api/v1/admin/tasks/{kind}`; not emitted by the dispatcher itself |
@@ -4199,6 +4212,10 @@ deployment the only registered kind is `"scan"`.
 | `hort_admin_tasks_claim_unmappable_total` | counter | (none) | — | emitted by the Postgres jobs adapter: one increment per claimed row that failed `JobRow` projection and was resolved terminally instead of being stranded in `running` |
 | `hort_admin_tasks_lease_requeued_total` | counter | `kind`, `result` | — | `result ∈ {requeued, retries_exhausted}` — one increment per row the abandoned-lease sweep resolved (a row left in `running` by a worker that stopped renewing its claim) |
 | `hort_admin_tasks_lease_renew_failed_total` | counter | `kind`, `result` | — | `result ∈ {lost, error}` — `lost` fires when the row is no longer this worker's; the dispatcher then **discards** that handler's outcome rather than writing over the row's current holder. `error` is a transient database failure on the renewal statement and has no such consequence. `lost` is a **lower bound** on discarded results, not a count of them: it only fires if a renewal happened to run between the handover and the outcome write, which a worker that was paused and then returned immediately never gives it. The authority is the result write's own `(id, attempts)` fence in the jobs adapter, and a result it refuses is a WARN naming the job id and both attempts, with no counter of its own |
+| `hort_admin_tasks_class_starved_total` | counter | `class`, `reason` | — | **emitted by the worker**, one increment per per-class audit pass (every 60 s) at which that class had work waiting and nothing of the same class had completed inside the threshold. `class ∈ {interactive, normal, bulk}`; `reason ∈ {not_claimed, awaiting_capacity}` — `not_claimed` means the waiting rows are `pending` and are not being taken up (the claim), `awaiting_capacity` means rows of the class hold a claim and have been queued behind a run permit past the threshold (the run permit). The threshold is `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` (default 300 s), read by the worker **and** by `hort-server` |
+| `hort_admin_tasks_class_unserved` | gauge | `class` | — | **emitted by `hort-server`**, re-sampled every 60 s: `1` when that class has work waiting and nothing of the same class completed inside the threshold, `0` when the class completed something inside it or has nothing waiting. Same verdict (same pure predicate, same durable facts) as the worker counter above; this is the half on a surface a scrape reaches, since the worker's own `/metrics` listener is opt-in and off by default |
+| `hort_admin_tasks_class_pending_eligible` | gauge | `class` | jobs | **emitted by `hort-server`**, re-sampled every 60 s: claim-eligible pending rows (`status='pending'` and the lock free/expired) whose `jobs.priority` falls in that class's band |
+| `hort_admin_tasks_class_awaiting_capacity` | gauge | `class` | jobs | **emitted by `hort-server`**, re-sampled every 60 s: rows in that class's band that a **live** worker holds without having granted them capacity — `status='running'`, `locked_until > now()`, and `capacity_waiting_since IS NOT NULL`. Counts the rows no read of the pending backlog can see; includes the sub-second window between a claim and the grant that follows it, so a busy worker reads a small non-zero value as a matter of course |
 
 **Starvation semantics** (issue #131). A `provenance-verify` backlog once
 grew to ~1450 rows over 33 minutes while the same dispatcher claimed and
@@ -4235,6 +4252,61 @@ closes that hole:
 
 Operators alarm on `increase(hort_admin_tasks_starved_total[15m]) > 0`.
 `hort_admin_tasks_pending_eligible` is the accompanying depth signal.
+
+**Per-class service semantics** (issue #399, ADR 0066 D5 — *"every class is
+guaranteed service; the guarantee is observable; and the observation reaches
+a human"*). The four `hort_admin_tasks_class_*` series answer a different
+question from the per-kind ones above, on the axis the guarantee is written
+on, and two of the three things they see are structural blind spots of the
+per-kind audit:
+
+- **A kind carries several classes.** `scan` carries six trigger sources
+  across all three classes. The per-kind audit's last-claimed clock is
+  re-armed by a row of *any* class, so a kind claimed steadily with one
+  class never claimed reads as healthy there; its remaining axis
+  (`oldest_row_stalled`) approximates service by the age of one row, which
+  is the axis ADR 0066 removed from the capacity reservation.
+- **A row waiting for a worker run permit is `running`.** It is outside the
+  claim-eligible backlog by construction, so no per-kind read of `pending`
+  rows can see it at any threshold. `hort_admin_tasks_class_awaiting_capacity`
+  is the only place that wait is counted.
+- **The verdict is not a worker-process metric.** The worker's `/metrics`
+  listener is `HORT_WORKER_METRICS_BIND` and is **off by default**, and a
+  process-local counter is lost on restart — which is exactly when a stall
+  is being investigated. So the verdict is re-derived by `hort-server` from
+  durable `jobs` rows and emitted on the server's scrape; the worker's
+  ERROR log and `hort_admin_tasks_class_starved_total` remain the local
+  trail.
+
+**What the verdict is computed from** (`hort_domain::policy::evaluate_class_service`,
+a pure function): per class, the reference instant is
+`max(newest completed_at in the class, arrival of the oldest waiting item)`,
+and the class is unserved when `now` is more than the threshold past it.
+Recent service re-arms the reference, so a deep queue that is draining is
+**not** reported however old its oldest remaining row is; the arrival floor
+keeps a class that was simply idle for an hour from being reported the
+moment its first row arrives.
+
+**The class label is read off `jobs.priority`, not from `(kind,
+trigger_source)`.** The sample is grouped by the ordinal bands the classes
+occupy (`TaskTier::priority_band`), passed to SQL as plain bounds so the
+class vocabulary stays in one place (ADR 0066 D6). One consequence is worth
+knowing: a row an **older binary** queued carries an ordinal from the
+pre-ADR-0066 scheme (`0`, `5`, `10`, `20`, all below the `Normal` floor) and
+is therefore counted under `class="bulk"` whatever `TaskTier::classify`
+would say about its columns. That is ADR 0066 D7's accepted window and it
+drains with those rows.
+
+Operators alarm on `max_over_time(hort_admin_tasks_class_unserved[15m]) > 0`,
+with a `for:` comfortably above the 60 s sample interval.
+`hort_admin_tasks_class_pending_eligible` and
+`hort_admin_tasks_class_awaiting_capacity` are the accompanying depth
+signals, and the one that is non-zero says which allocation point to look
+at. The threshold errs loud by design: ADR 0066 states that *"a false alarm
+is recoverable, a silent stall is the failure being removed"*, so raise
+`HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` (on **both** the server and the
+worker, or the gauge and the log will answer at different thresholds)
+rather than tuning it quiet elsewhere.
 
 **`hort_admin_tasks_enqueued_total` result semantics** (implemented in `hort-http-admin-tasks`):
 
@@ -4389,11 +4461,25 @@ integers; `scan` in particular is **not** an admin-invokable kind (see
   a kind that has actually been abandoned ever creates one.
 - `hort_admin_tasks_lease_renew_failed_total`: the same 19 kinds × 2
   result values = 38 series.
+- `hort_admin_tasks_class_starved_total`: bounded by the **3** classes
+  (`TaskTier::ALL`) × 2 reason values = 6 series, and only a class that has
+  actually been starved ever creates one. The class vocabulary is closed by
+  decision (ADR 0066 D1: a fourth class would have to name a fourth answer
+  to "who is waiting"), so this bound does not move when a kind is added.
+- `hort_admin_tasks_class_unserved`,
+  `hort_admin_tasks_class_pending_eligible`,
+  `hort_admin_tasks_class_awaiting_capacity`: 3 series each — one per class,
+  all three emitted on every sampler pass including the healthy path, so a
+  scrape never has to distinguish absence from zero.
 
 Source: `hort-http-admin-tasks::handlers::invoke` constants
 `METRIC_ENQUEUED`, `RESULT_OK`, `RESULT_RBAC_DENIED`, `RESULT_VALIDATION_ERROR`;
 `hort_app::task_dispatcher` constants `METRIC_COMPLETED`, `METRIC_DURATION`,
-`METRIC_IN_FLIGHT`, `METRIC_LEASE_REQUEUED`, `METRIC_LEASE_RENEW_FAILED`.
+`METRIC_IN_FLIGHT`, `METRIC_LEASE_REQUEUED`, `METRIC_LEASE_RENEW_FAILED`,
+`METRIC_CLASS_STARVED`; `hort_server::composition` constants
+`CLASS_UNSERVED_METRIC`, `CLASS_PENDING_ELIGIBLE_METRIC`,
+`CLASS_AWAITING_CAPACITY_METRIC` (the three server-emitted gauges) and
+`CLASS_SERVICE_SAMPLE_INTERVAL` (their cadence).
 
 ### Policy enforcement
 

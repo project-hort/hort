@@ -151,6 +151,8 @@ async fn run_async(_args: EnqueueQuarantineReleaseSweepArgs) -> anyhow::Result<(
 mod tests {
     use super::*;
 
+    use hort_domain::types::task_tier::scan_queue_priority;
+
     use clap::Parser;
 
     #[derive(Debug, Parser)]
@@ -197,10 +199,32 @@ mod tests {
     /// template + the worker dispatch table both reference these
     /// implicitly through the inserted row; a silent drift here would
     /// break the claim ordering.
+    ///
+    /// The ordinal is asserted as a **relation** rather than a number:
+    /// this row's whole reason for ranking where it does is that it
+    /// outranks the scheduled rescan flood it used to tie with. At an
+    /// equal ordinal the claim's `created_at ASC` tiebreak resolves
+    /// against the sweep — a backlog is always older than the next
+    /// scheduled run — which is how a pushed, window-elapsed artifact
+    /// came to sit unreleased (ADR 0066 D3).
     #[test]
     fn constants_match_init33_trigger_source_ranking() {
         assert_eq!(CRON_TRIGGER_SOURCE, "cron");
-        // priority=10 matches CronRescanTickHandler's CRON_RESCAN_PRIORITY.
-        assert_eq!(queue_priority(KIND, CRON_TRIGGER_SOURCE), 10);
+        assert_eq!(
+            queue_priority(KIND, CRON_TRIGGER_SOURCE),
+            queue_priority(KIND, TriggerSource::Manual.as_str()),
+            "this kind is client-waited whatever triggers it, so the `'cron'` its CronJob \
+             stamps must not rank it any lower than a hand-invoked sweep"
+        );
+        assert!(
+            queue_priority(KIND, CRON_TRIGGER_SOURCE) > scan_queue_priority(CRON_TRIGGER_SOURCE),
+            "the release sweep must outrank the scheduled rescan flood that shares its \
+             trigger source"
+        );
+        assert!(
+            queue_priority(KIND, CRON_TRIGGER_SOURCE)
+                > queue_priority("jobs-row-retention-sweep", CRON_TRIGGER_SOURCE),
+            "and the other cron-triggered CronJob rows, which nobody waits on"
+        );
     }
 }

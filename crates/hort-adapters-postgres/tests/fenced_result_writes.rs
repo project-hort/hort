@@ -95,7 +95,13 @@ async fn seed_pending_scan(pool: &PgPool) -> Uuid {
 /// own, because the increment of `attempts` IS the fact under test.
 async fn claim_for(repo: &PgJobsRepository, pool: &PgPool, worker: &str, job_id: Uuid) -> u32 {
     let claimed = repo
-        .claim_pending_by_kinds(REQUEUE_ON_LEASE_EXPIRY_KINDS, 10, worker, LEASE)
+        .claim_pending_by_kinds(
+            REQUEUE_ON_LEASE_EXPIRY_KINDS,
+            10,
+            worker,
+            LEASE,
+            &hort_adapters_postgres::test_support::claim_reservation(),
+        )
         .await
         .expect("claim_pending_by_kinds");
     let row = claimed

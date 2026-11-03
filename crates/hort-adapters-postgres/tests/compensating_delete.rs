@@ -90,6 +90,7 @@ async fn claimed_row_survives_the_compensating_delete() {
             1,
             "worker-compensating-delete",
             Duration::from_secs(60),
+            &hort_adapters_postgres::test_support::claim_reservation(),
         )
         .await
         .expect("claim_pending_by_kinds");
@@ -156,6 +157,7 @@ async fn claimed_rows_idempotency_key_survives() {
             1,
             "worker-compensating-delete",
             Duration::from_secs(60),
+            &hort_adapters_postgres::test_support::claim_reservation(),
         )
         .await
         .expect("claim_pending_by_kinds");

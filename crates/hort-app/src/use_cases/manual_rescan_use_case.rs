@@ -203,6 +203,7 @@ mod tests {
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::caller::CallerPrincipal;
     use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+    use hort_domain::types::task_tier::queue_priority;
 
     use crate::rbac::RbacEvaluator;
     use crate::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
@@ -319,8 +320,14 @@ mod tests {
         assert_eq!(call.artifact_id, artifact_id);
         assert_eq!(call.repository_id, repo_id);
         assert_eq!(
-            call.priority, 20,
-            "manual-rescan priority contract: manual = 20"
+            call.priority,
+            scan_queue_priority(MANUAL_TRIGGER_SOURCE),
+            "the rescan's ordinal is the one the table decides, never a number named here"
+        );
+        assert!(
+            call.priority > queue_priority("noop", MANUAL_TRIGGER_SOURCE),
+            "an operator is reading this answer, so it must outrank the admin task invokes \
+             that share the `'manual'` trigger source and are bookkeeping"
         );
         assert_eq!(call.trigger_source, MANUAL_TRIGGER_SOURCE);
         assert_eq!(call.trigger_source, "manual");
