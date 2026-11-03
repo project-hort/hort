@@ -1037,6 +1037,27 @@ pub async fn soft_delete_artifact(pool: &PgPool, artifact_id: uuid::Uuid) {
     );
 }
 
+/// The claim reservation a production worker polls with — the bands
+/// [`waited_on_bands`](hort_domain::types::task_tier::waited_on_bands)
+/// answers, at the default share.
+///
+/// Every DB-backed test that calls
+/// [`JobsRepository::claim_pending_by_kinds`](hort_domain::ports::jobs_repository::JobsRepository::claim_pending_by_kinds)
+/// passes this, including the tests that are about something else
+/// entirely (the lease sweep, the compensating delete, the result-write
+/// fence). That is deliberate: those tests' properties are
+/// reservation-independent, so running them against the reservation the
+/// worker actually uses makes them cover the real statement — a
+/// reservation CTE that claimed a row twice, or stranded one, would
+/// surface in `scan_row_single_owner` rather than only in the fairness
+/// tests. Shared rather than re-typed per file so a change to the
+/// production default cannot leave four copies behind.
+pub fn claim_reservation() -> hort_domain::ports::jobs_repository::ClaimReservation {
+    hort_domain::ports::jobs_repository::ClaimReservation::waited_on(
+        hort_domain::types::task_tier::DEFAULT_RESERVED_SLOTS_PER_CLASS,
+    )
+}
+
 /// True when `err` reflects a connection that was never acquired — the pool
 /// timed out waiting for one, or was closed out from under the wait — rather
 /// than a failure encountered while actually executing a migration.

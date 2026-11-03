@@ -66,8 +66,8 @@ use hort_domain::ports::event_store::{
 use hort_domain::ports::format_handler::{FormatHandler, GroupMembership, MetadataStrategy};
 use hort_domain::ports::identity_provider::{IdentityProvider, IdpClaims, OidcValidationError};
 use hort_domain::ports::jobs_repository::{
-    CompensatingDelete, JobRow, JobsRepository, ListJobsFilter, ListJobsPage, ResultWriteOutcome,
-    ScanJob,
+    ClaimReservation, CompensatingDelete, JobRow, JobsRepository, ListJobsFilter, ListJobsPage,
+    ResultWriteOutcome, ScanJob,
 };
 use hort_domain::ports::kubernetes_secret_writer::{
     KubernetesSecretWriter, ManagedSecret, ManagedSecretSpec,
@@ -7960,9 +7960,21 @@ pub struct MockJobsRepository {
     /// the non-destructive path passes `None`.
     enqueue_idem_keys: Mutex<Vec<Option<IdempotencyKey>>>,
     /// Recorded `priority` arguments from `enqueue_task` calls, in lock-step
-    /// with `enqueue_calls`. Lets tests assert the enqueue tier (e.g. the
-    /// elevated clearance-gating provenance-verify priority, #44).
+    /// with `enqueue_calls`. Lets tests assert the enqueue tier — e.g. that
+    /// the clearance-gating `provenance-verify` carries the ordinal its
+    /// producer named before the trigger source existed.
     enqueue_priorities: Mutex<Vec<i16>>,
+    /// Recorded `trigger_source` arguments from `enqueue_task` calls, in
+    /// lock-step with `enqueue_calls`.
+    ///
+    /// Recorded rather than dropped because `(kind, trigger_source)` is
+    /// what decides both the tier and the ordinal of the row
+    /// (`hort_domain::types::task_tier`), so a producer that stamps the
+    /// wrong one files its work under the wrong class — and a mock that
+    /// discarded the argument could not tell. The two clearance-gating
+    /// verifies borrowed the ingest-time literal for exactly as long as
+    /// nothing asserted on it.
+    enqueue_trigger_sources: Mutex<Vec<String>>,
     /// When `Some`, the NEXT `enqueue_task`
     /// call returns `EnqueueOutcome::Duplicate { existing_job_id }`
     /// instead of `Enqueued`. One-shot, mirrors the `fail_next_enqueue`
@@ -8059,6 +8071,20 @@ pub struct MockJobsRepository {
     /// — mirroring what the real dispatcher persists via
     /// `mark_completed` and the next tick's fresh job row reads back.
     last_result_summary_by_kind: Mutex<HashMap<String, serde_json::Value>>,
+    /// Seed for `queue_sample_by_band`, one entry per band in the order
+    /// the caller passes them (`class_bands()` order for every
+    /// production caller). Empty by default, which is what makes a
+    /// per-class service audit over this mock inert rather than
+    /// mislabelling a class — a caller checks the length against its own
+    /// band list before pairing them.
+    band_samples: Mutex<Vec<hort_domain::ports::jobs_repository::BandQueueSample>>,
+    /// When `Some`, `queue_sample_by_band` returns this error instead of
+    /// the seeded samples.
+    band_samples_error: Mutex<Option<DomainError>>,
+    /// The band bounds every `queue_sample_by_band` call arrived with,
+    /// in order — so a test can assert the observation asks about every
+    /// class rather than only the reserved ones.
+    band_sample_calls: Mutex<Vec<Vec<hort_domain::ports::jobs_repository::PriorityBand>>>,
 }
 
 /// Recorded call to `enqueue_scan` — used by the manual-rescan use case
@@ -8081,6 +8107,7 @@ impl Default for MockJobsRepository {
             enqueue_calls: Mutex::new(Vec::new()),
             enqueue_idem_keys: Mutex::new(Vec::new()),
             enqueue_priorities: Mutex::new(Vec::new()),
+            enqueue_trigger_sources: Mutex::new(Vec::new()),
             next_duplicate: Mutex::new(None),
             idempotency_rows: Mutex::new(None),
             delete_calls: Mutex::new(Vec::new()),
@@ -8109,6 +8136,9 @@ impl Default for MockJobsRepository {
             other_kind_retention_calls: Mutex::new(Vec::new()),
             other_kind_retention_deleted_count: Mutex::new(None),
             last_result_summary_by_kind: Mutex::new(HashMap::new()),
+            band_samples: Mutex::new(Vec::new()),
+            band_samples_error: Mutex::new(None),
+            band_sample_calls: Mutex::new(Vec::new()),
         }
     }
 }
@@ -8180,6 +8210,14 @@ impl MockJobsRepository {
     /// with [`enqueue_calls`].
     pub fn enqueue_priorities(&self) -> Vec<i16> {
         self.enqueue_priorities.lock().unwrap().clone()
+    }
+
+    /// Recorded `trigger_source` arguments from `enqueue_task` calls, in
+    /// lock-step with [`enqueue_calls`]. `(kind, trigger_source)` is what
+    /// the tier and the ordinal are both derived from, so this is the half
+    /// of the row that says *why* the work exists.
+    pub fn enqueue_trigger_sources(&self) -> Vec<String> {
+        self.enqueue_trigger_sources.lock().unwrap().clone()
     }
 
     /// Recorded job ids passed to `delete_job`.
@@ -8353,6 +8391,27 @@ impl MockJobsRepository {
             .unwrap()
             .insert(kind.into(), value);
     }
+
+    /// Seed what `queue_sample_by_band` answers — one sample per band,
+    /// in the order the caller passes its bands.
+    pub fn seed_band_samples(
+        &self,
+        samples: Vec<hort_domain::ports::jobs_repository::BandQueueSample>,
+    ) {
+        *self.band_samples.lock().unwrap() = samples;
+    }
+
+    /// Make `queue_sample_by_band` fail — the "the diagnostic read did
+    /// not answer" path, which must leave every consumer accusing
+    /// nobody.
+    pub fn fail_band_samples(&self, error: DomainError) {
+        *self.band_samples_error.lock().unwrap() = Some(error);
+    }
+
+    /// The band bounds every `queue_sample_by_band` call arrived with.
+    pub fn band_sample_calls(&self) -> Vec<Vec<hort_domain::ports::jobs_repository::PriorityBand>> {
+        self.band_sample_calls.lock().unwrap().clone()
+    }
 }
 
 /// What a mock's three result writes recorded, and what they answer.
@@ -8401,6 +8460,22 @@ impl ResultWriteLog {
 }
 
 impl JobsRepository for MockJobsRepository {
+    fn queue_sample_by_band<'a>(
+        &'a self,
+        bands: &'a [hort_domain::ports::jobs_repository::PriorityBand],
+    ) -> BoxFuture<'a, DomainResult<Vec<hort_domain::ports::jobs_repository::BandQueueSample>>>
+    {
+        self.band_sample_calls.lock().unwrap().push(bands.to_vec());
+        let error = self.band_samples_error.lock().unwrap().clone();
+        let samples = self.band_samples.lock().unwrap().clone();
+        Box::pin(async move {
+            match error {
+                Some(e) => Err(e),
+                None => Ok(samples),
+            }
+        })
+    }
+
     fn claim_scan_jobs<'a>(
         &'a self,
         _worker_id: &'a str,
@@ -8519,7 +8594,7 @@ impl JobsRepository for MockJobsRepository {
         params: &'a serde_json::Value,
         actor_id: Option<Uuid>,
         priority: i16,
-        _trigger_source: &'a str,
+        trigger_source: &'a str,
         idempotency_key: Option<&'a IdempotencyKey>,
     ) -> BoxFuture<'a, DomainResult<hort_domain::ports::jobs_repository::EnqueueOutcome>> {
         self.enqueue_calls
@@ -8527,6 +8602,10 @@ impl JobsRepository for MockJobsRepository {
             .unwrap()
             .push((kind.to_string(), params.clone(), actor_id));
         self.enqueue_priorities.lock().unwrap().push(priority);
+        self.enqueue_trigger_sources
+            .lock()
+            .unwrap()
+            .push(trigger_source.to_string());
         // Record the idempotency_key
         // verbatim (cloned, since the borrow does not outlive the call).
         self.enqueue_idem_keys
@@ -8642,6 +8721,7 @@ impl JobsRepository for MockJobsRepository {
         _batch_size: u16,
         _worker_id: &'a str,
         _lock_duration: std::time::Duration,
+        _reservation: &'a ClaimReservation,
     ) -> BoxFuture<'a, DomainResult<Vec<JobRow>>> {
         // Pop the front batch if any are seeded; return empty vec otherwise.
         let batch = self

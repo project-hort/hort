@@ -29,6 +29,16 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::error::{DomainError, DomainResult};
+/// The `jobs.priority` bounds a capacity allocation or a service
+/// observation is handed, re-exported from the class vocabulary that
+/// defines them.
+///
+/// Re-exported rather than left to each caller's own import because the
+/// Postgres adapter is the layer handed these bounds and is
+/// structurally forbidden from naming the class module at all
+/// (`task_class_is_single_sourced`, ADR 0066 D6). By the time a band
+/// reaches SQL it is two numbers, and this path is what says so.
+pub use crate::types::task_tier::PriorityBand;
 use crate::types::{ContentHash, IdempotencyKey};
 
 use super::BoxFuture;
@@ -332,6 +342,30 @@ pub enum TriggerSource {
     /// in the audit trail, and `ingest_use_case`'s own tests assert on
     /// the literal.
     RegisterByHash,
+    /// `'clearance'` — a `provenance-verify` that is the last thing
+    /// between an artifact **already held** and a release decision: the
+    /// signature-arrival hook (a subject-based signature referrer just
+    /// landed, so the held subject can clear now instead of at its
+    /// window edge) and the expiry backstop (the window elapsed and the
+    /// candidate is still `Pending`).
+    ///
+    /// Distinct from [`Self::Ingest`], which the two producers borrowed
+    /// because it was the only literal the CHECK admitted that would
+    /// build. The facts the two carry are materially different — the
+    /// ingest-time verify is one per ingest and *is* the backlog; a
+    /// clearance verify is one per held artifact reaching its window —
+    /// and nothing on the row said so, so an audit of what the queue is
+    /// spending itself on saw an ingest that is not one. The borrowing
+    /// also forced the clearance producers to name an ordinal directly,
+    /// because the pair `('provenance-verify', 'ingest')` cannot
+    /// separate the two (ADR 0066 D6: no producer names a number).
+    ///
+    /// The class is **unchanged** by the separation: both are
+    /// [`TaskTier::Interactive`](crate::types::TaskTier::Interactive),
+    /// because who waits does not change. What the literal buys is
+    /// separation *within* the class, by volume, which is what the
+    /// ordinal is for.
+    Clearance,
 }
 
 // The set, spoken once. Order is the migration's order, so a diff
@@ -347,6 +381,7 @@ trigger_source_wire! {
     SelfService => "self_service",
     Scheduled => "scheduled",
     RegisterByHash => "register-by-hash",
+    Clearance => "clearance",
 }
 
 impl TriggerSource {
@@ -519,6 +554,81 @@ pub struct ScanKindFields {
     pub format: String,
 }
 
+/// How a claim batch holds capacity for the classes someone is waiting
+/// on — ADR 0066 D4 at the first of the two points where the system
+/// allocates capacity.
+///
+/// Ranking alone does not reserve anything: it decides who wins a
+/// comparison, so a flood at one rank still occupies every slot of the
+/// batch, which is the reported failure (two thousand scheduled rescans,
+/// a batch size of four, one worker). This holds
+/// [`Self::slots_per_band`] slots for each band that has an eligible row
+/// before the rest of the batch is allocated by rank.
+///
+/// # Why bands and not classes
+///
+/// The claim is SQL, and the `(kind, trigger_source) → class` table is
+/// the domain's
+/// ([`TaskTier::classify`](crate::types::task_tier::TaskTier::classify),
+/// ADR 0066 D6). A copy of it in SQL is how the trigger-source set came
+/// to be written down three times with no two agreeing, so the
+/// classification does **not** travel to the adapter — only the
+/// `jobs.priority` ranges the classes occupy, which the ordinal has been
+/// a faithful projection of since the ordinal was derived from the
+/// class. The adapter binds the bounds and never learns what a class is;
+/// `task_class_is_single_sourced` is the guard that keeps it that way.
+///
+/// Build this from
+/// [`waited_on_bands`](crate::types::task_tier::waited_on_bands), which
+/// is the one definition of which classes get a share and in what order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimReservation {
+    /// The bands that get a reserved share, **highest class first**.
+    ///
+    /// The order is load-bearing: when the batch cannot satisfy every
+    /// reservation — at `HORT_SCANNER_BATCH_SIZE = 1` it never can —
+    /// the bands are honoured in this order and the remainder is
+    /// dropped. Empty means no reservation at all, which is the
+    /// pre-ADR-0066 claim exactly.
+    pub bands: Vec<PriorityBand>,
+    /// Rows held for each band that has at least one eligible row.
+    ///
+    /// `0` disables the reservation. The operator's number
+    /// (`HORT_SCANNER_RESERVED_SLOTS_PER_CLASS`), defaulting to the
+    /// domain's "at least one slot per non-empty waited-on class".
+    pub slots_per_band: u16,
+}
+
+impl ClaimReservation {
+    /// The reservation ADR 0066 D4 describes: `slots_per_band` rows held
+    /// for each non-empty waited-on class, honoured highest class first.
+    ///
+    /// The one way a production caller builds one — the band list comes
+    /// from [`waited_on_bands`](crate::types::task_tier::waited_on_bands)
+    /// rather than from the caller, so a second call site cannot hold
+    /// slots for a different set of classes than the first.
+    pub fn waited_on(slots_per_band: u16) -> Self {
+        Self {
+            bands: crate::types::task_tier::waited_on_bands(),
+            slots_per_band,
+        }
+    }
+
+    /// The reservation that holds nothing — the claim as it behaved
+    /// before ADR 0066 D4.
+    ///
+    /// For a caller that is not allocating worker capacity: the port's
+    /// own default-implementation test. Named rather than spelled out at
+    /// each site so "this call does not reserve" reads as a decision
+    /// instead of as an empty vector.
+    pub fn none() -> Self {
+        Self {
+            bands: Vec::new(),
+            slots_per_band: 0,
+        }
+    }
+}
+
 /// One kind's claim-eligible pending backlog, as observed by
 /// [`JobsRepository::eligible_pending_by_kind`].
 ///
@@ -539,6 +649,62 @@ pub struct PendingKindBacklog {
     pub count: i64,
     /// `created_at` of the oldest claim-eligible pending row of this kind.
     pub oldest_created_at: DateTime<Utc>,
+}
+
+/// One `jobs.priority` band's queue-service facts, as observed by
+/// [`JobsRepository::queue_sample_by_band`].
+///
+/// The band is a class's ordinal footprint
+/// ([`TaskTier::priority_band`](crate::types::task_tier::TaskTier::priority_band)),
+/// so each of these is one class's picture of the two points at which
+/// the worker allocates capacity — but the band travels to the adapter
+/// as two numbers and comes back positionally, because the adapter does
+/// not learn what a class is (ADR 0066 D6). Pairing a sample back up
+/// with its class is the caller's, via
+/// [`class_bands`](crate::types::task_tier::class_bands).
+///
+/// Every field is a *sample*: one statement's view of the queue at one
+/// instant. The verdict over it is
+/// [`policy::evaluate_class_service`](crate::policy::evaluate_class_service),
+/// which is pure and takes the clock as an argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandQueueSample {
+    /// Claim-eligible pending rows in this band — the same eligibility
+    /// [`PendingKindBacklog`] counts (`status = 'pending'` and the lock
+    /// free or expired), grouped by band instead of by kind.
+    pub pending_eligible: i64,
+    /// `created_at` of the oldest of those rows; `None` when there are
+    /// none.
+    pub oldest_pending_at: Option<DateTime<Utc>>,
+    /// Rows in this band that a **live worker holds without having
+    /// granted them capacity** — claimed, `status = 'running'`, lease
+    /// unexpired, and still queued behind a run permit
+    /// (`jobs.capacity_waiting_since IS NOT NULL`, migration 038).
+    ///
+    /// This is the half no read of the pending backlog can see, and the
+    /// reason it needs its own column: once the lease renewal starts at
+    /// the claim, `locked_until` says only that a live worker owns the
+    /// row, never whether a handler is running it.
+    ///
+    /// Includes the brief window between a claim and the grant that
+    /// follows it microseconds later, so a busy worker shows a small
+    /// non-zero count as a matter of course. The verdict is not
+    /// sensitive to that: it asks how long the oldest wait has lasted.
+    pub awaiting_capacity: i64,
+    /// `capacity_waiting_since` of the oldest row awaiting capacity;
+    /// `None` when there are none.
+    pub oldest_capacity_wait_at: Option<DateTime<Utc>>,
+    /// Newest `completed_at` of any row in this band — the durable
+    /// "this class is being served" fact, and the one the verdict rests
+    /// on.
+    ///
+    /// Durable rather than process-local on purpose: the worker's
+    /// in-process last-claimed clock is lost on restart, which is
+    /// exactly when a stall is being investigated, and it is per-kind
+    /// (re-armed by a row of any class) rather than per-class. `None`
+    /// means no row of this class has ever completed on this
+    /// deployment.
+    pub last_served_at: Option<DateTime<Utc>>,
 }
 
 /// Domain projection of a `kind='scan'` row in the `jobs` table.
@@ -1233,6 +1399,11 @@ pub trait JobsRepository: Send + Sync {
     /// a worker that dies mid-task lets the lock expire so another worker can
     /// re-claim the row.
     ///
+    /// `reservation` is the first of the two points at which ADR 0066 D4
+    /// requires that no class be displaced: it holds part of the batch
+    /// for the classes someone is waiting on, so a flood at one rank
+    /// cannot occupy every slot. See [`ClaimReservation`].
+    ///
     /// **Default implementation:** returns
     /// `Err(DomainError::Invariant("not implemented"))` so existing test
     /// fixtures that pre-date this method continue to compile without
@@ -1244,8 +1415,9 @@ pub trait JobsRepository: Send + Sync {
         batch_size: u16,
         worker_id: &'a str,
         lock_duration: Duration,
+        reservation: &'a ClaimReservation,
     ) -> BoxFuture<'a, DomainResult<Vec<JobRow>>> {
-        let _ = (kinds, batch_size, worker_id, lock_duration);
+        let _ = (kinds, batch_size, worker_id, lock_duration, reservation);
         Box::pin(async {
             Err(DomainError::Invariant(
                 "claim_pending_by_kinds not implemented".into(),
@@ -1271,6 +1443,75 @@ pub trait JobsRepository: Send + Sync {
     /// with the real grouped aggregate.
     fn eligible_pending_by_kind(&self) -> BoxFuture<'_, DomainResult<Vec<PendingKindBacklog>>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Sample the queue's service facts for each `jobs.priority` band in
+    /// `bands`, **in the order given**, one [`BandQueueSample`] per band.
+    ///
+    /// The input is the per-class observation the ADR 0066 D5 guarantee
+    /// is read from — build it from
+    /// [`class_bands`](crate::types::task_tier::class_bands), which
+    /// covers every class including [`TaskTier::Bulk`](crate::types::task_tier::TaskTier::Bulk)
+    /// (whose service has no reserved share behind it, and therefore
+    /// most needs observing).
+    ///
+    /// **The bands travel as bounds, not as classes** — the same
+    /// contract [`ClaimReservation`] has, and for the same reason: a
+    /// `(kind, trigger_source)` table in SQL is how that vocabulary came
+    /// to be written down three times with no two copies agreeing (ADR
+    /// 0066 D6, `task_class_is_single_sourced`). The adapter binds two
+    /// numbers per band and the positional result is matched back to a
+    /// class by the caller.
+    ///
+    /// A band with nothing in it yields a sample of zeroes and `None`s
+    /// rather than being omitted, so the result is always index-aligned
+    /// with `bands` and a class that has gone completely quiet is
+    /// distinguishable from one the statement did not look at.
+    ///
+    /// **Default implementation:** returns `Ok(Vec::new())` — "this
+    /// repository observes no bands", the same additive default
+    /// [`Self::eligible_pending_by_kind`] uses. Callers zip the result
+    /// against their band list, so an empty vector makes the
+    /// observation inert for a mock rather than mislabelling anything.
+    fn queue_sample_by_band<'a>(
+        &'a self,
+        bands: &'a [PriorityBand],
+    ) -> BoxFuture<'a, DomainResult<Vec<BandQueueSample>>> {
+        let _ = bands;
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Record that `job_id` is no longer waiting for capacity — the
+    /// dispatcher has granted it a run permit and its handler is about
+    /// to run.
+    ///
+    /// Clears `jobs.capacity_waiting_since` (migration 038), which the
+    /// claim set. Fenced on `locked_by = worker_id` and
+    /// `status = 'running'` for the reason [`Self::renew_lease`] is: a
+    /// worker whose row was swept and handed on must not write to the
+    /// row its successor now holds. `Ok(false)` means the fence
+    /// refused — the row moved on — and is not an error: the renewal's
+    /// own `lost` flag is what the dispatcher acts on.
+    ///
+    /// Idempotent and cheap to lose. If this write fails, the row keeps
+    /// a non-NULL `capacity_waiting_since` while its handler runs, so
+    /// the class reads as having one more row waiting for capacity than
+    /// it does — until the outcome write moves the row out of
+    /// `running`, which bounds the error by the handler's own runtime.
+    /// That direction is deliberate (ADR 0066: a false alarm is
+    /// recoverable, a silent stall is the failure being removed).
+    ///
+    /// **Default implementation:** returns `Ok(true)`. A mock has no
+    /// capacity wait recorded, so "the row is no longer waiting" is the
+    /// honest answer — the additive-default pattern of
+    /// [`Self::renew_lease`].
+    fn clear_capacity_wait<'a>(
+        &'a self,
+        job_id: Uuid,
+        worker_id: &'a str,
+    ) -> BoxFuture<'a, DomainResult<bool>> {
+        let _ = (job_id, worker_id);
+        Box::pin(async { Ok(true) })
     }
 
     /// Batch-insert prefetch cascade jobs with
@@ -1624,8 +1865,10 @@ pub struct PrefetchEnqueueRow {
     /// `prefetch` rows: `{"repository_id":…,"package":…,"version":…}`.
     /// For `prefetch-dependencies` rows: `{"artifact_id":…,"current_depth":…}`.
     pub params: serde_json::Value,
-    /// Priority ranking (see [`TriggerSource`]). Cascade rows carry priority 0
-    /// (the schema default) so manual / cron / advisory drain first.
+    /// Priority ranking, decided by
+    /// [`queue_priority`](crate::types::queue_priority) from `(kind,
+    /// trigger_source)`. Cascade rows carry the `Bulk` band — the schema
+    /// default — so the operator and client-waited work drains first.
     pub priority: i16,
     /// One of the wire literals in [`TriggerSource::ALL`].
     /// Cascade-spawned rows carry `"prefetch"` to distinguish from
@@ -1776,6 +2019,21 @@ mod tests {
             .await
             .expect("requeue_abandoned")
             .is_empty());
+        assert!(
+            repo.queue_sample_by_band(&crate::types::task_tier::waited_on_bands())
+                .await
+                .expect("queue_sample_by_band")
+                .is_empty(),
+            "the default observes no bands, which makes a per-class audit over a fixture \
+             inert rather than mislabelling a class"
+        );
+        assert!(
+            repo.clear_capacity_wait(Uuid::nil(), "w")
+                .await
+                .expect("clear_capacity_wait"),
+            "the default answers 'no longer waiting' — a fixture has no capacity wait \
+             recorded to end"
+        );
     }
 
     /// Compile-time assertion that `JobsRepository` is dyn-compatible.
@@ -2024,8 +2282,11 @@ mod tests {
     }
 
     /// Regression guard — `ScanJob` carries `trigger_source` and
-    /// `priority`. A cron-enqueued row with `priority=10` round-trips
-    /// through the struct and Clone preserves both fields.
+    /// `priority`. A row at an ordinal other than the column default
+    /// round-trips through the struct and Clone preserves both fields.
+    /// The `10` below is an arbitrary non-default value, not a number the
+    /// ordinal table answers for this pair — the struct is being tested,
+    /// not the ranking.
     #[test]
     fn scan_job_carries_trigger_source_and_priority() {
         let now = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
@@ -2078,9 +2339,10 @@ mod tests {
         assert_eq!(TriggerSource::SelfService.as_str(), "self_service");
         assert_eq!(TriggerSource::Scheduled.as_str(), "scheduled");
         assert_eq!(TriggerSource::RegisterByHash.as_str(), "register-by-hash");
+        assert_eq!(TriggerSource::Clearance.as_str(), "clearance");
     }
 
-    /// `ALL` is the set: nine entries, no duplicate wire literal, and
+    /// `ALL` is the set: ten entries, no duplicate wire literal, and
     /// every entry round-trips through `as_str` → `FromStr`.
     ///
     /// Membership is no longer this test's job — `ALL` and `as_str` come
@@ -2096,7 +2358,7 @@ mod tests {
     fn trigger_source_all_is_the_set() {
         assert_eq!(
             TriggerSource::ALL.len(),
-            9,
+            10,
             "the `trigger_source_wire!` list grew or shrank; bump this count \
              together with the redefining migration's IN-list"
         );
@@ -2361,7 +2623,13 @@ mod tests {
     async fn claim_pending_by_kinds_default_impl_returns_invariant_error() {
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let err = repo
-            .claim_pending_by_kinds(&["noop"], 10, "worker-test", Duration::from_secs(60))
+            .claim_pending_by_kinds(
+                &["noop"],
+                10,
+                "worker-test",
+                Duration::from_secs(60),
+                &ClaimReservation::none(),
+            )
             .await
             .unwrap_err();
         assert!(

@@ -240,6 +240,15 @@ async fn build_app_context_registers_seed_import_handler() {
         // against the operator's number, and at the default it would
         // pass against a hard-coded one too.
         max_attempts: 7,
+        // Likewise NOT the default `1`: the assertion below is that the
+        // dispatcher reserves the operator's number of slots per class,
+        // and at the default it would pass against a hard-coded one too.
+        reserved_slots_per_class: 3,
+        // Likewise NOT the domain default of 300 s: the assertion below
+        // is that the per-class audit answers at the operator's
+        // threshold, and at the default it would pass against a
+        // hard-coded one too.
+        class_service_threshold: std::time::Duration::from_secs(111),
         lock_duration: std::time::Duration::from_secs(900),
         worker_id: "hort-worker-smoke".to_string(),
         finding_merge_allow_informed_downgrade: true,
@@ -294,6 +303,32 @@ async fn build_app_context_registers_seed_import_handler() {
         output.dispatcher.attempt_cap(),
         cfg.max_attempts,
         "the dispatcher must close rows out against WorkerConfig::max_attempts          (HORT_SCANNER_MAX_ATTEMPTS), the same field ScanOrchestrationConfig::max_attempts          is assigned from"
+    );
+
+    // The per-class reserved share reaches the dispatcher, which is the
+    // only place it can be seen to: one of the two allocation points it
+    // governs — the per-kind run permits — is internal to the process,
+    // so a share that was configured and never threaded would be
+    // indistinguishable from the default (ADR 0066 D4).
+    assert_eq!(
+        output.dispatcher.reserved_slots_per_class(),
+        cfg.reserved_slots_per_class,
+        "the dispatcher must reserve WorkerConfig::reserved_slots_per_class          (HORT_SCANNER_RESERVED_SLOTS_PER_CLASS) slots per non-empty waited-on class"
+    );
+
+    // The per-class service threshold reaches the dispatcher, for the
+    // sharper version of the same reason: the verdict it feeds is
+    // emitted by a DIFFERENT process (`hort-server`'s gauge), so a
+    // threshold that was configured here and never threaded would look
+    // exactly like one that was never set — the worker's log would
+    // simply answer at the default while the operator's gauge answered
+    // at theirs (ADR 0066 D5).
+    assert_eq!(
+        output.dispatcher.class_service_threshold(),
+        cfg.class_service_threshold,
+        "the dispatcher must audit per-class service against \
+         WorkerConfig::class_service_threshold \
+         (HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS)"
     );
 
     let kinds: std::collections::HashSet<&str> =
@@ -366,6 +401,8 @@ fn build_app_context_signature_compiles() {
             poll_interval: std::time::Duration::from_secs(5),
             batch_size: 4,
             max_attempts: 5,
+            reserved_slots_per_class: 1,
+            class_service_threshold: std::time::Duration::from_secs(300),
             lock_duration: std::time::Duration::from_secs(900),
             worker_id: String::new(),
             finding_merge_allow_informed_downgrade: true,

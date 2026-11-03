@@ -21,6 +21,8 @@ use std::time::Duration;
 // sets nothing actually runs on — so the inert half of such a change would
 // be the half every operator sees.
 use hort_app::retry_backoff::DEFAULT_MAX_ATTEMPTS;
+use hort_domain::policy::DEFAULT_CLASS_SERVICE_THRESHOLD_SECS;
+use hort_domain::types::task_tier::DEFAULT_RESERVED_SLOTS_PER_CLASS;
 
 // -----------------------------------------------------------------
 // Public types
@@ -219,6 +221,41 @@ pub struct WorkerConfig {
     pub poll_interval: Duration,
     pub batch_size: u32,
     pub max_attempts: u32,
+    /// Slots the dispatcher holds for each non-empty waited-on class at
+    /// both points where it allocates capacity — the claim batch and
+    /// the per-kind run permits (ADR 0066 D4). Parsed from
+    /// `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS`, **default
+    /// [`DEFAULT_RESERVED_SLOTS_PER_CLASS`]** (`1`).
+    ///
+    /// One number for both allocations deliberately: D4 says a design
+    /// that closes one point and not the other is incomplete rather
+    /// than partial, and two knobs would let a deployment be configured
+    /// into exactly that state. `0` turns the reservation off at both.
+    ///
+    /// Why it is configuration at all: ADR 0066 declines to fix the
+    /// shares, because with a single worker replica the share is the
+    /// whole control surface.
+    pub reserved_slots_per_class: u16,
+    /// How long work of a class may wait with nothing of that class
+    /// served before the dispatcher's per-class audit calls the class
+    /// unserved (ADR 0066 D5). Parsed from
+    /// `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS`, **default
+    /// [`DEFAULT_CLASS_SERVICE_THRESHOLD_SECS`]** (300 s).
+    ///
+    /// **Shared with `hort-server`**, which reads the same variable to
+    /// decide the operator-facing `hort_admin_tasks_class_unserved`
+    /// gauge: the worker's ERROR log is the local trail and the
+    /// server's gauge is the surface a scrape reaches, and they are
+    /// verdicts of the same pure predicate over the same durable facts.
+    /// Set it on both deployments or on neither — set on one only, the
+    /// log and the gauge answer at different thresholds. The default is
+    /// the domain's so that "neither" is always consistent.
+    ///
+    /// `0` is a coherent setting that reports any waiting class as
+    /// unserved; the direction to err in is the loud one (ADR 0066: "a
+    /// false alarm is recoverable, a silent stall is the failure being
+    /// removed").
+    pub class_service_threshold: Duration,
     pub lock_duration: Duration,
     pub worker_id: String,
     /// Break-glass switch for the cross-backend finding merge's
@@ -363,6 +400,8 @@ impl std::fmt::Debug for WorkerConfig {
             poll_interval,
             batch_size,
             max_attempts,
+            reserved_slots_per_class,
+            class_service_threshold,
             lock_duration,
             worker_id,
             finding_merge_allow_informed_downgrade,
@@ -404,6 +443,8 @@ impl std::fmt::Debug for WorkerConfig {
             .field("poll_interval", poll_interval)
             .field("batch_size", batch_size)
             .field("max_attempts", max_attempts)
+            .field("reserved_slots_per_class", reserved_slots_per_class)
+            .field("class_service_threshold", class_service_threshold)
             .field("lock_duration", lock_duration)
             .field("worker_id", worker_id)
             .field(
@@ -572,6 +613,25 @@ impl WorkerConfig {
             Duration::from_secs(parse_u64_default("HORT_SCANNER_POLL_INTERVAL_SECS", 5)?);
         let batch_size = parse_u32_default("HORT_SCANNER_BATCH_SIZE", 4)?;
         let max_attempts = parse_u32_default("HORT_SCANNER_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)?;
+        // The per-class reserved share, for both the claim batch and
+        // the run permits. Clamped to `u16` the way `batch_size` is
+        // clamped at the dispatcher boundary: the knob is a count of
+        // slots inside a batch, and a value past `u16::MAX` is an
+        // operator typo rather than an intent the dispatcher could
+        // honour.
+        let reserved_slots_per_class = u16::try_from(parse_u32_default(
+            "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS",
+            u32::from(DEFAULT_RESERVED_SLOTS_PER_CLASS),
+        )?)
+        .unwrap_or(u16::MAX);
+        // The per-class service threshold the dispatcher audits
+        // against. `hort-server` reads the same variable for the gauge
+        // an operator scrapes — see the field doc — and the default
+        // comes from the domain so the two agree when neither is set.
+        let class_service_threshold = Duration::from_secs(parse_u64_default(
+            "HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS",
+            DEFAULT_CLASS_SERVICE_THRESHOLD_SECS,
+        )?);
         let lock_duration =
             Duration::from_secs(parse_u64_default("HORT_SCANNER_LOCK_DURATION_SECS", 900)?);
         let worker_id = parse_worker_id();
@@ -701,6 +761,8 @@ impl WorkerConfig {
             poll_interval,
             batch_size,
             max_attempts,
+            reserved_slots_per_class,
+            class_service_threshold,
             lock_duration,
             worker_id,
             finding_merge_allow_informed_downgrade,
@@ -1083,6 +1145,10 @@ mod tests {
         "HORT_SCANNER_POLL_INTERVAL_SECS",
         "HORT_SCANNER_BATCH_SIZE",
         "HORT_SCANNER_MAX_ATTEMPTS",
+        "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS",
+        // Per-class service threshold (ADR 0066 D5) — read by
+        // `hort-server` too.
+        "HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS",
         "HORT_SCANNER_LOCK_DURATION_SECS",
         "HORT_WORKER_ID",
         "POD_NAME",
@@ -1636,6 +1702,38 @@ mod tests {
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+    }
+
+    // -- Per-class service threshold (ADR 0066 D5) ------------------------
+
+    /// Unset means the domain's number — the same one `hort-server`
+    /// falls back to, which is what makes the worker's log and the
+    /// operator's gauge agree on a deployment that configures neither.
+    #[test]
+    fn class_service_threshold_defaults_to_the_domain_number() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+
+        let cfg = WorkerConfig::from_env().expect("parses with required vars");
+        assert_eq!(
+            cfg.class_service_threshold,
+            Duration::from_secs(DEFAULT_CLASS_SERVICE_THRESHOLD_SECS),
+            "the default must come from the one domain definition, not from a local literal"
+        );
+    }
+
+    #[test]
+    fn class_service_threshold_override_is_parsed() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var("HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS", "90");
+
+        let cfg = WorkerConfig::from_env().expect("parses with the threshold override");
+        assert_eq!(cfg.class_service_threshold, Duration::from_secs(90));
     }
 
     // -- Worker /metrics listener bind (HORT_WORKER_METRICS_BIND) ---------

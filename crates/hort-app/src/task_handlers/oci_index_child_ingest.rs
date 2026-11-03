@@ -2467,7 +2467,10 @@ mod tests {
                 row.kind, OCI_INDEX_CHILD_INGEST_KIND,
                 "recursion by own kind"
             );
-            assert_eq!(row.priority, 0);
+            assert_eq!(
+                row.priority,
+                queue_priority(OCI_INDEX_CHILD_INGEST_KIND, CHILD_INGEST_TRIGGER_SOURCE)
+            );
             assert_eq!(row.trigger_source, CHILD_INGEST_TRIGGER_SOURCE);
             let expected = format!("sha256:{}", grandchild.as_ref());
             assert_eq!(row.params["child_digest"], expected);

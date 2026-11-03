@@ -182,9 +182,17 @@ Individual URL failures are non-fatal — the leaf completes with
 config.json / metadata fetch or compose failure short-circuits the
 leaf (it never falls back to a guessed URL).
 
-All prefetch rows carry `priority = 0`, so manual, cron, and advisory
-work drains first. Warming is a background concern; starving it under
-load is acceptable because the cascade is stateless and re-derivable.
+A prefetch row's ordinal is not a per-trigger-source number: it follows
+from *who is waiting* on the row (ADR 0066,
+`hort_domain::types::task_tier`). Nobody waits on a warm, so the
+scheduled tick's leaves, the cascade's own child rows and the cascade
+root an ingest seeds all sit in the bottom band — the root included,
+because the push that caused it has already answered and the next pull
+of any dependent re-derives what the walk missed. The operator's
+`hort-cli prefetch` root is the one exception: an operator is reading
+that answer, so it ranks in the middle band. Warming is a background
+concern; starving it under load is acceptable because the cascade is
+stateless and re-derivable.
 
 ## The transitive cascade
 

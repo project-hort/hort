@@ -30,7 +30,7 @@ use hort_domain::ports::quarantine_release::ReleaseExpiredSummary;
 use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInvalidator;
 
 use crate::event_store_publisher::EventStorePublisher;
-use crate::use_cases::ingest_use_case::{INGEST_TRIGGER_SOURCE, PROVENANCE_VERIFY_KIND};
+use crate::use_cases::ingest_use_case::{CLEARANCE_TRIGGER_SOURCE, PROVENANCE_VERIFY_KIND};
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::referenced_descendant::is_parent_gated_blob_constituent;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
@@ -38,7 +38,7 @@ use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scan_findings_repository::ScanFindingsRow;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::sbom::Sbom;
-use hort_domain::types::task_tier::CLEARANCE_GATING_VERIFY_PRIORITY;
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::{
     highest_severity, severity_label, severity_summary_from_findings, ArtifactCoords, ArtifactKind,
     ContentHash, Finding,
@@ -2226,10 +2226,12 @@ impl QuarantineUseCase {
                 &params,
                 None, // actor_id: system-driven expiry backstop
                 // Clearance-gating: this verify is the last thing between
-                // a held artifact and a release decision, so it preempts
-                // the bulk ingest-time verify backlog.
-                CLEARANCE_GATING_VERIFY_PRIORITY,
-                INGEST_TRIGGER_SOURCE, // reuse the ingest-time verify trigger source (CHECK-valid)
+                // a held artifact and a release decision, so the row says
+                // so and the ordinal follows from it — preempting the
+                // bulk ingest-time verify backlog, which is one row per
+                // ingest.
+                queue_priority(PROVENANCE_VERIFY_KIND, CLEARANCE_TRIGGER_SOURCE),
+                CLEARANCE_TRIGGER_SOURCE,
                 None, // no idempotency key — the in-flight guard above is the dedup
             )
             .await
@@ -2445,6 +2447,7 @@ mod tests {
     };
     use hort_domain::ports::content_reference_index::ContentReference;
     use hort_domain::ports::event_store::ExpectedVersion;
+    use hort_domain::ports::jobs_repository::TriggerSource;
     use hort_domain::types::ComponentRelation;
     use uuid::Uuid;
 
@@ -8476,14 +8479,32 @@ spec:
         );
         assert!(actor_id.is_none(), "expiry backstop is system-driven");
         assert_eq!(jobs.enqueue_idem_keys(), vec![None]);
-        // The expiry-backstop verify is clearance-gating → elevated tier.
-        // Pinned against the literal, not the constant: the number this
-        // producer writes is what must not move until the ordinals are
-        // re-derived from the tier.
+        // What the backstop's row says about itself. It is one row per
+        // held artifact reaching its window, and it used to carry the
+        // literal of the one-per-ingest backlog, so an audit of the
+        // queue could not tell the two apart. The ordinal is the one the
+        // table decides for this pair, and the relation beneath it is
+        // the claim worth making: this row outranks that backlog.
+        assert_eq!(
+            jobs.enqueue_trigger_sources(),
+            vec![TriggerSource::Clearance.as_str().to_string()],
+            "the expiry backstop must stamp its own trigger source, not borrow the \
+             ingest-time verify's"
+        );
         assert_eq!(
             jobs.enqueue_priorities(),
-            vec![10],
-            "expiry-backstop provenance-verify must enqueue at the elevated clearance tier"
+            vec![queue_priority(
+                PROVENANCE_VERIFY_KIND,
+                CLEARANCE_TRIGGER_SOURCE
+            )],
+            "expiry-backstop provenance-verify must enqueue at the ordinal the table \
+             decides for its own trigger source"
+        );
+        assert!(
+            jobs.enqueue_priorities()[0]
+                > queue_priority(PROVENANCE_VERIFY_KIND, TriggerSource::Ingest.as_str()),
+            "it must outrank the ingest-time verify backlog, or a held artifact waits for \
+             the backlog rather than for its own verify"
         );
     }
 

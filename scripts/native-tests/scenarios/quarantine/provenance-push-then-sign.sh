@@ -125,8 +125,9 @@ UNSIGNED_SOURCE_IMAGE="${UNSIGNED_SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:6.5
 # <= this for the release/reject legs to complete in-run. Kept at 300 for
 # headroom (#44): the real fix is that the clearance-gating provenance-verify
 # now enqueues at the elevated job priority so it preempts the full-suite
-# bulk ingest backlog and emits ProvenanceVerified promptly; the already
-# priority-10 release-sweep then releases on its next tick. This window is
+# bulk ingest backlog and emits ProvenanceVerified promptly; the release
+# sweep, which is client-waited whatever triggers it and so outranks the
+# scheduled rescans, then releases on its next tick. This window is
 # just margin, not the fix.
 WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-300}"
 # [6/6]'s negative leg waits for the release sweep to have CONSIDERED the

@@ -2547,7 +2547,10 @@ mod tests {
                 row.trigger_source, "scheduled",
                 "SEED trigger source (not \"prefetch\") so the on-ingest cascade fires"
             );
-            assert_eq!(row.priority, 0);
+            assert_eq!(
+                row.priority,
+                queue_priority(PREFETCH_INGEST_KIND, SCHEDULED_TRIGGER_SOURCE)
+            );
             assert!(!row.target_key.is_empty(), "L3 dedup key must be populated");
             assert_eq!(row.params["repository_id"], serde_json::json!(repo_id));
             assert_eq!(row.params["package"], "express");

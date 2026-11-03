@@ -199,18 +199,18 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
-    /// Constants stay aligned with the two sibling row-retention sweeps
-    /// (trigger-source ranking; CHECK constraint values). Same priority
-    /// as the other cron-tier CronJobs so they drain in the same tier.
+    /// Constants stay aligned with the trigger-source ranking and the
+    /// CHECK constraint values. The CronJob template and the worker
+    /// dispatch table both reference them implicitly through the
+    /// inserted row; a silent drift here would break the claim
+    /// ordering.
+    ///
+    /// The ordinal is asserted as relations rather than as a number by
+    /// [`crate::cli::assert_scheduled_maintenance_ordinal`], which is
+    /// where the reasoning for both of them lives.
     #[test]
     fn constants_match_cron_trigger_source_ranking() {
         assert_eq!(CRON_TRIGGER_SOURCE, "cron");
-        assert_eq!(
-            queue_priority(KIND, CRON_TRIGGER_SOURCE),
-            10,
-            "jobs-row-retention-sweep must share priority with the other cron-tier \
-             CronJobs (quarantine-release-sweep + the two row-retention sweeps); \
-             changing this skews the worker claim queue"
-        );
+        crate::cli::assert_scheduled_maintenance_ordinal(KIND);
     }
 }

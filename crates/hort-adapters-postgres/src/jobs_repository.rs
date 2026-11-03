@@ -15,9 +15,9 @@ use uuid::Uuid;
 
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::jobs_repository::{
-    CompensatingDelete, EnqueueOutcome, JobRow, JobStatus, JobsRepository, KindFields,
-    ListJobsFilter, ListJobsPage, PendingKindBacklog, RequeueOutcome, RequeuedJob,
-    ResultWriteOutcome, ScanJob, ScanKindFields, TriggerSource,
+    BandQueueSample, ClaimReservation, CompensatingDelete, EnqueueOutcome, JobRow, JobStatus,
+    JobsRepository, KindFields, ListJobsFilter, ListJobsPage, PendingKindBacklog, PriorityBand,
+    RequeueOutcome, RequeuedJob, ResultWriteOutcome, ScanJob, ScanKindFields, TriggerSource,
 };
 use hort_domain::types::{ContentHash, IdempotencyKey};
 use serde_json::Value as JsonValue;
@@ -113,45 +113,130 @@ pub(crate) async fn enqueue_provenance_verify_in_tx(
 /// regression is pinned by
 /// [`claim_pending_by_kinds_sql_returning_includes_scan_typed_columns`].
 ///
-/// Reserved-oldest-slot fairness shape: `oldest` claims exactly one row —
-/// the single globally oldest eligible row across every registered kind,
-/// ordered by `created_at ASC` alone (priority-blind) — while `ranked`
-/// claims the remaining `batch_size - 1` slots by the pre-existing
-/// `priority DESC, created_at ASC` order, explicitly excluding whatever
-/// `oldest` already picked so the same row is never claimed twice. Without
-/// the reserved slot, a sustained high-priority stream of the same kind can
-/// starve an old low-priority row indefinitely; the reserved slot bounds
-/// that wait to roughly one batch-drain cycle regardless of priority.
-/// `oldest` is `MATERIALIZED` deliberately: it is referenced twice (by
-/// `ranked`'s exclusion and by `claimed`'s union), and the default
-/// multiply-referenced-CTE materialization is exactly what is wanted here —
-/// spelling it out guards against a future edit that drops a reference and
-/// silently flips the default to inlining, which would re-run the `FOR
-/// UPDATE SKIP LOCKED` select twice and risk locking two different rows
-/// instead of reusing the one already picked. `LEAST($2, 1)` /
-/// `GREATEST($2 - 1, 0)` degrade to claiming nothing when `batch_size` is
-/// 0, matching the pre-existing `LIMIT $2` behavior instead of always
-/// locking one row regardless of the caller's requested batch size.
-const CLAIM_PENDING_BY_KINDS_SQL: &str = "WITH oldest AS MATERIALIZED (\n\
+/// # How the batch is allocated: three CTEs, in this order
+///
+/// ADR 0066 D4, point one — non-displacement where the system decides
+/// *which work is taken up*. The batch is handed out in three passes,
+/// each excluding what the earlier ones already picked so no row is
+/// claimed twice:
+///
+/// 1. **`reserved`** — [`ClaimReservation::slots_per_band`] rows for
+///    each band in [`ClaimReservation::bands`] that has an eligible
+///    row, best-ranked first within a band, the bands honoured in the
+///    order the caller listed them (highest class first) and the whole
+///    pass capped at `batch_size`. This is the pass that makes a flood
+///    at one rank unable to occupy the batch: ranking decides who wins
+///    a comparison, it does not reserve anything.
+/// 2. **`oldest`** — one priority-blind row, the globally oldest
+///    eligible one, out of whatever `batch_size` the reservation left.
+///    This is the pre-existing reserved-oldest slot, and it is kept
+///    *beneath* the reservation rather than replaced: it is the only
+///    guarantee of service for a class with no reserved share (nobody
+///    waits on bulk work, so it gets none) and for an old row of a
+///    flooded class, which is in the flood's own band and so beyond any
+///    per-class reservation's reach. ADR 0066 places aging exactly
+///    there — "worth having as a safety net beneath (4), not as a
+///    substitute for it".
+/// 3. **`ranked`** — the remainder, by the `priority DESC,
+///    created_at ASC` order the claim has always used.
+///
+/// **At `batch_size = 1` the reservation takes the slot and `oldest`
+/// gets none.** That is the reconciliation, and it is a decision rather
+/// than an artefact of the CTE order: the age slot is the mitigation ADR
+/// 0066 replaces ("age is the wrong axis to reserve on" — it protects
+/// the oldest row, and in the state that matters the oldest row is
+/// itself part of the backlog), so leaving it ahead of the per-class
+/// reservation would mean the replacement never takes effect at the one
+/// batch size where a single slot decides everything.
+///
+/// # The classification does not reach this SQL
+///
+/// The reservation is expressed on `priority` against **bind
+/// parameters** — `$5` / `$6` are the bands' inclusive bounds and `$7`
+/// is the share. The `(kind, trigger_source) → class` table stays in
+/// `hort_domain::types::task_tier` (ADR 0066 D6); a copy of it here is
+/// how the trigger-source set came to be written down three times with
+/// no two agreeing, and `task_class_is_single_sourced` is the guard that
+/// rejects one. Nothing in this string names a class, a trigger source
+/// or an ordinal.
+///
+/// A consequence worth knowing: the bands classify the **ordinal**, not
+/// the row. A row an older binary queued carries an ordinal from the
+/// previous scheme and so reads as the lowest band whatever its columns
+/// say — ADR 0066 D7's accepted, un-backfilled window. It is safe in the
+/// direction that matters: such a row can miss a reserved slot, never
+/// consume one, and `oldest` still reaches it.
+///
+/// # Shapes that are load-bearing
+///
+/// `reserved` and `oldest` are `MATERIALIZED` deliberately: each is
+/// referenced more than once (by the later passes' exclusions and by
+/// `claimed`'s union), and the default multiply-referenced-CTE
+/// materialization is exactly what is wanted — spelling it out guards
+/// against a future edit that drops a reference and silently flips the
+/// default to inlining, which would re-run the `FOR UPDATE SKIP LOCKED`
+/// select twice and risk locking different rows instead of reusing the
+/// ones already picked.
+///
+/// `reserved` takes its rows through a `CROSS JOIN LATERAL` so the
+/// `LIMIT` applies **per band** rather than to the pass as a whole; the
+/// outer `ORDER BY ord ... LIMIT $2` is what caps the pass at the batch
+/// and drops the lowest-class reservations first when the batch cannot
+/// hold them all. The lateral may therefore lock a row the outer `LIMIT`
+/// discards — bounded by one row per band, released at statement end,
+/// and the alternative (selecting without the lock) would let two
+/// workers pick the same row.
+///
+/// Every `LIMIT` is wrapped so it cannot go negative — a negative
+/// `LIMIT` is an error, not a clamp. `GREATEST(LEAST($2 - n, 1), 0)` and
+/// `GREATEST($2 - n - m, 0)` degrade to claiming nothing once the batch
+/// is spent, matching the pre-existing behaviour at `batch_size = 0`
+/// instead of locking a row the caller did not ask for.
+const CLAIM_PENDING_BY_KINDS_SQL: &str = "WITH reserved AS MATERIALIZED (\n\
+                     SELECT held.id FROM (\n\
+                         SELECT picked.id AS id, band.ord AS ord\n\
+                         FROM unnest($5::smallint[], $6::smallint[])\n\
+                              WITH ORDINALITY AS band(lowest, highest, ord)\n\
+                         CROSS JOIN LATERAL (\n\
+                             SELECT j.id FROM public.jobs j\n\
+                             WHERE j.status = 'pending'\n\
+                               AND j.kind = ANY($1::text[])\n\
+                               AND (j.locked_until IS NULL OR j.locked_until < now())\n\
+                               AND j.priority >= band.lowest\n\
+                               AND j.priority <= band.highest\n\
+                             ORDER BY j.priority DESC, j.created_at ASC\n\
+                             FOR UPDATE SKIP LOCKED\n\
+                             LIMIT $7\n\
+                         ) AS picked\n\
+                     ) AS held\n\
+                     ORDER BY held.ord\n\
+                     LIMIT GREATEST($2, 0)\n\
+                 ),\n\
+                 oldest AS MATERIALIZED (\n\
                      SELECT id FROM public.jobs\n\
                      WHERE status = 'pending'\n\
                        AND kind = ANY($1::text[])\n\
                        AND (locked_until IS NULL OR locked_until < now())\n\
+                       AND id NOT IN (SELECT id FROM reserved)\n\
                      ORDER BY created_at ASC, id ASC\n\
                      FOR UPDATE SKIP LOCKED\n\
-                     LIMIT LEAST($2, 1)\n\
+                     LIMIT GREATEST(LEAST($2 - (SELECT count(*) FROM reserved), 1), 0)\n\
                  ),\n\
                  ranked AS (\n\
                      SELECT id FROM public.jobs\n\
                      WHERE status = 'pending'\n\
                        AND kind = ANY($1::text[])\n\
                        AND (locked_until IS NULL OR locked_until < now())\n\
+                       AND id NOT IN (SELECT id FROM reserved)\n\
                        AND id NOT IN (SELECT id FROM oldest)\n\
                      ORDER BY priority DESC, created_at ASC\n\
                      FOR UPDATE SKIP LOCKED\n\
-                     LIMIT GREATEST($2 - 1, 0)\n\
+                     LIMIT GREATEST($2 - (SELECT count(*) FROM reserved)\n\
+                                       - (SELECT count(*) FROM oldest), 0)\n\
                  ),\n\
                  claimed AS (\n\
+                     SELECT id FROM reserved\n\
+                     UNION ALL\n\
                      SELECT id FROM oldest\n\
                      UNION ALL\n\
                      SELECT id FROM ranked\n\
@@ -161,6 +246,7 @@ const CLAIM_PENDING_BY_KINDS_SQL: &str = "WITH oldest AS MATERIALIZED (\n\
                      locked_by = $3,\n\
                      locked_until = now() + $4,\n\
                      attempts = attempts + 1,\n\
+                     capacity_waiting_since = now(),\n\
                      updated_at = now()\n\
                  WHERE id IN (SELECT id FROM claimed)\n\
                  RETURNING id, kind, status, params, actor_id, priority, trigger_source,\n\
@@ -239,6 +325,89 @@ const RENEW_LEASE_SQL: &str = "UPDATE public.jobs SET\n\
                  WHERE id = $1\n\
                    AND locked_by = $2\n\
                    AND status = 'running'";
+
+/// `UPDATE` behind [`JobsRepository::clear_capacity_wait`] — the row has
+/// been granted its run permit, so it is no longer queued for capacity.
+///
+/// The mirror of the claim's `capacity_waiting_since = now()`: between
+/// the two writes the row is `running` and waiting, which is the state
+/// `locked_until` stopped being able to express once the lease renewal
+/// moved to the claim (migration 038).
+///
+/// Carries [`RENEW_LEASE_SQL`]'s fence verbatim, and for the same
+/// reason — a worker whose row was swept and handed on must not write
+/// to the row its successor now holds — so the two writes the
+/// dispatcher makes against a *running* row agree about who may make
+/// them. `rows_affected() == 0` is "the row moved on", not an error.
+const CLEAR_CAPACITY_WAIT_SQL: &str = "UPDATE public.jobs SET\n\
+                     capacity_waiting_since = NULL,\n\
+                     updated_at = now()\n\
+                 WHERE id = $1\n\
+                   AND locked_by = $2\n\
+                   AND status = 'running'";
+
+/// The per-band queue-service sample behind
+/// [`JobsRepository::queue_sample_by_band`].
+///
+/// One pass over `public.jobs` answering five questions per band, which
+/// is why it is one statement with `FILTER` aggregates rather than three
+/// reads: the three facts have to describe the same instant, or a class
+/// could read as "nothing waiting" and "never served" from two
+/// different moments and be reported as neither.
+///
+/// `unnest(...) WITH ORDINALITY` + `LEFT JOIN` is what makes the result
+/// index-aligned with the caller's band list: a band with no rows at all
+/// still produces its row, with zero counts and NULL timestamps. The
+/// bounds arrive as two `smallint[]` binds — the band is two numbers
+/// here and nothing more, exactly as in [`CLAIM_PENDING_BY_KINDS_SQL`]
+/// (ADR 0066 D6: the class vocabulary does not travel to SQL).
+///
+/// The three predicates, each of which is a different question:
+///
+/// - **pending-eligible** mirrors the claim's own eligibility
+///   (`status = 'pending'` and the lock free or expired) minus the kind
+///   filter, so the per-band count is comparable with the per-kind one.
+/// - **awaiting capacity** is `status = 'running'` with a non-NULL
+///   `capacity_waiting_since` AND a live lease. The lease half is
+///   load-bearing: a row whose worker died also carries a non-NULL
+///   `capacity_waiting_since` until the abandoned-lease sweep requeues
+///   it, and a dead owner is not a capacity shortage.
+/// - **last served** is the newest `completed_at` of any row in the
+///   band, which is the durable "this class is being served" fact.
+///   Unbounded on purpose: `NULL` then means "no row of this class has
+///   ever completed" rather than "none completed inside some window a
+///   reader would also have to know about".
+const QUEUE_SAMPLE_BY_BAND_SQL: &str = "SELECT band.ord AS ord,\n\
+                     count(j.id) FILTER (\n\
+                         WHERE j.status = 'pending'\n\
+                           AND (j.locked_until IS NULL OR j.locked_until < now())\n\
+                     ) AS pending_eligible,\n\
+                     min(j.created_at) FILTER (\n\
+                         WHERE j.status = 'pending'\n\
+                           AND (j.locked_until IS NULL OR j.locked_until < now())\n\
+                     ) AS oldest_pending_at,\n\
+                     count(j.id) FILTER (\n\
+                         WHERE j.status = 'running'\n\
+                           AND j.capacity_waiting_since IS NOT NULL\n\
+                           AND j.locked_until IS NOT NULL\n\
+                           AND j.locked_until > now()\n\
+                     ) AS awaiting_capacity,\n\
+                     min(j.capacity_waiting_since) FILTER (\n\
+                         WHERE j.status = 'running'\n\
+                           AND j.capacity_waiting_since IS NOT NULL\n\
+                           AND j.locked_until IS NOT NULL\n\
+                           AND j.locked_until > now()\n\
+                     ) AS oldest_capacity_wait_at,\n\
+                     max(j.completed_at) FILTER (\n\
+                         WHERE j.status = 'completed'\n\
+                     ) AS last_served_at\n\
+                 FROM unnest($1::smallint[], $2::smallint[])\n\
+                      WITH ORDINALITY AS band(lowest, highest, ord)\n\
+                 LEFT JOIN public.jobs j\n\
+                      ON j.priority >= band.lowest\n\
+                     AND j.priority <= band.highest\n\
+                 GROUP BY band.ord\n\
+                 ORDER BY band.ord";
 
 /// Build the statement behind one of the three result writes
 /// ([`JobsRepository::mark_completed`], [`JobsRepository::reschedule`],
@@ -1406,16 +1575,27 @@ impl JobsRepository for PgJobsRepository {
         batch_size: u16,
         worker_id: &'a str,
         lock_duration: Duration,
+        reservation: &'a ClaimReservation,
     ) -> BoxFuture<'a, DomainResult<Vec<JobRow>>> {
         let kinds_owned: Vec<String> = kinds.iter().map(ToString::to_string).collect();
         let worker_id = worker_id.to_string();
         let interval = duration_to_pg_interval(lock_duration);
         let limit: i64 = i64::from(batch_size);
+        // The reservation reaches SQL as three plain numbers per band
+        // and nothing else: two bounds on `priority` and how many rows
+        // to hold. Which class a band belongs to — and the
+        // `(kind, trigger_source)` table that decides it — stays in the
+        // domain layer (ADR 0066 D6).
+        let band_lows: Vec<i16> = reservation.bands.iter().map(|b| b.lowest).collect();
+        let band_highs: Vec<i16> = reservation.bands.iter().map(|b| b.highest).collect();
+        let reserved_per_band: i64 = i64::from(reservation.slots_per_band);
         Box::pin(async move {
             tracing::debug!(
                 kinds = ?kinds_owned,
                 batch_size,
                 worker_id = %worker_id,
+                reserved_bands = band_lows.len(),
+                reserved_per_band,
                 "claim_pending_by_kinds",
             );
             // Two-CTE claim across multiple kinds:
@@ -1429,6 +1609,9 @@ impl JobsRepository for PgJobsRepository {
                 .bind(limit)
                 .bind(&worker_id)
                 .bind(interval)
+                .bind(&band_lows)
+                .bind(&band_highs)
+                .bind(reserved_per_band)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Job", "claim_pending_by_kinds"))?;
@@ -1610,6 +1793,87 @@ impl JobsRepository for PgJobsRepository {
                                 )))
                             }
                         },
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn clear_capacity_wait<'a>(
+        &'a self,
+        job_id: Uuid,
+        worker_id: &'a str,
+    ) -> BoxFuture<'a, DomainResult<bool>> {
+        let worker_id = worker_id.to_string();
+        Box::pin(async move {
+            tracing::debug!(%job_id, worker_id = %worker_id, "clear_capacity_wait");
+            let res = sqlx::query(CLEAR_CAPACITY_WAIT_SQL)
+                .bind(job_id)
+                .bind(&worker_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "Job", "clear_capacity_wait"))?;
+            Ok(res.rows_affected() == 1)
+        })
+    }
+
+    fn queue_sample_by_band<'a>(
+        &'a self,
+        bands: &'a [PriorityBand],
+    ) -> BoxFuture<'a, DomainResult<Vec<BandQueueSample>>> {
+        // The bands reach SQL as two numbers each and nothing else —
+        // see `QUEUE_SAMPLE_BY_BAND_SQL` and ADR 0066 D6.
+        let lows: Vec<i16> = bands.iter().map(|b| b.lowest).collect();
+        let highs: Vec<i16> = bands.iter().map(|b| b.highest).collect();
+        Box::pin(async move {
+            if lows.is_empty() {
+                return Ok(Vec::new());
+            }
+            tracing::debug!(bands = lows.len(), "queue_sample_by_band");
+            let rows = sqlx::query(QUEUE_SAMPLE_BY_BAND_SQL)
+                .bind(&lows)
+                .bind(&highs)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "Job", "queue_sample_by_band"))?;
+            // `ORDER BY band.ord` makes the result index-aligned with
+            // the caller's list, and the caller labels each sample with
+            // the class whose band it passed at that index. A short or
+            // re-ordered result would therefore mislabel a class, so the
+            // length is checked rather than zipped over.
+            //
+            // Unreachable from the statement as written — `WITH
+            // ORDINALITY` + `LEFT JOIN` + `GROUP BY band.ord` answer
+            // once per band whether or not any row falls in it, which
+            // `queue_sample_by_band_sql_answers_once_per_band` pins —
+            // so this is the same kind of defence as the unmappable
+            // claimed row above: an invariant stated where it is
+            // produced, in a shape a future edit to the SQL would
+            // surface as an error instead of as a mislabelled class.
+            if rows.len() != lows.len() {
+                return Err(DomainError::Invariant(format!(
+                    "queue_sample_by_band returned {} rows for {} bands; the statement groups \
+                     by a WITH ORDINALITY band and must answer once per band",
+                    rows.len(),
+                    lows.len(),
+                )));
+            }
+            rows.iter()
+                .map(|row| {
+                    Ok(BandQueueSample {
+                        pending_eligible: row
+                            .try_get("pending_eligible")
+                            .map_err(|e| invariant(&e))?,
+                        oldest_pending_at: row
+                            .try_get("oldest_pending_at")
+                            .map_err(|e| invariant(&e))?,
+                        awaiting_capacity: row
+                            .try_get("awaiting_capacity")
+                            .map_err(|e| invariant(&e))?,
+                        oldest_capacity_wait_at: row
+                            .try_get("oldest_capacity_wait_at")
+                            .map_err(|e| invariant(&e))?,
+                        last_served_at: row.try_get("last_served_at").map_err(|e| invariant(&e))?,
                     })
                 })
                 .collect()
@@ -2056,6 +2320,153 @@ mod tests {
         );
     }
 
+    /// The capacity-wait clear carries the renewal's fence verbatim.
+    ///
+    /// Same reason, same shape: a worker whose row was swept and handed
+    /// on must not write to the row its successor now holds, and
+    /// `status = 'running'` keeps a clear that races the outcome write
+    /// from touching a terminal row. Two writes the dispatcher makes
+    /// against a *running* row, one fence.
+    #[test]
+    fn clear_capacity_wait_sql_is_fenced_like_the_renewal() {
+        let sql = CLEAR_CAPACITY_WAIT_SQL;
+        for token in [
+            "WHERE id = $1",
+            "AND locked_by = $2",
+            "AND status = 'running'",
+            "capacity_waiting_since = NULL",
+        ] {
+            assert!(
+                sql.contains(token),
+                "clear_capacity_wait SQL missing {token:?}"
+            );
+        }
+        let (set_clause, predicate) = sql
+            .split_once("WHERE")
+            .expect("clear_capacity_wait SQL has a WHERE clause");
+        assert!(
+            !set_clause.contains("status") && !set_clause.contains("locked"),
+            "the clear ends a capacity wait and nothing else: assigning the status or the \
+             lease here would move the row's lifecycle behind the handler's back\n{sql}"
+        );
+        // The renewal's fence, token for token — asserted against
+        // `RENEW_LEASE_SQL` itself rather than re-typed, so the two
+        // cannot drift apart silently.
+        let renewal_predicate = RENEW_LEASE_SQL
+            .split_once("WHERE")
+            .map(|(_, p)| p)
+            .expect("renew_lease SQL has a WHERE clause");
+        assert_eq!(
+            normalise_ws(predicate),
+            normalise_ws(renewal_predicate),
+            "the two writes the dispatcher makes against a running row must share one fence"
+        );
+    }
+
+    /// Collapse whitespace so two statements' predicates compare as the
+    /// clauses they are rather than as the line-wrapping they carry.
+    fn normalise_ws(sql: &str) -> String {
+        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The claim resets the capacity wait on every row it claims.
+    ///
+    /// Without the reset, a row that was claimed, executed, rescheduled
+    /// and re-claimed would carry the PREVIOUS execution's cleared
+    /// state into its new claim and read as executing while it waits.
+    /// The claim is the only statement that can give the column a clean
+    /// slate, because it is the only one that knows a new claim is
+    /// starting.
+    #[test]
+    fn claim_pending_by_kinds_sql_restarts_the_capacity_wait() {
+        let sql = CLAIM_PENDING_BY_KINDS_SQL;
+        assert!(
+            sql.contains("capacity_waiting_since = now(),"),
+            "the claim must mark every claimed row as waiting for capacity — the \
+             dispatcher's grant is what clears it:\n{sql}"
+        );
+        // And it is in the UPDATE's SET clause, not in a CTE predicate:
+        // a claimed row is marked by the write, not selected by it.
+        let (_ctes, update) = sql
+            .split_once("UPDATE public.jobs SET")
+            .expect("the claim ends in an UPDATE");
+        let (set_clause, _rest) = update
+            .split_once("WHERE id IN")
+            .expect("the UPDATE has a WHERE clause");
+        assert!(
+            set_clause.contains("capacity_waiting_since = now()"),
+            "the reset belongs in the claim's own SET clause:\n{sql}"
+        );
+    }
+
+    /// The per-band sample answers once per band, for every band, and
+    /// asks the three questions the verdict needs.
+    ///
+    /// The `LEFT JOIN` is the load-bearing half: an inner join would
+    /// drop a band with no rows at all, and the result would then be
+    /// shorter than the band list — so every class after the empty one
+    /// would be labelled with its neighbour's facts.
+    #[test]
+    fn queue_sample_by_band_sql_answers_once_per_band() {
+        let sql = QUEUE_SAMPLE_BY_BAND_SQL;
+        for token in [
+            "unnest($1::smallint[], $2::smallint[])",
+            "WITH ORDINALITY AS band(lowest, highest, ord)",
+            "LEFT JOIN public.jobs j",
+            "ON j.priority >= band.lowest",
+            "AND j.priority <= band.highest",
+            "GROUP BY band.ord",
+            "ORDER BY band.ord",
+        ] {
+            assert!(
+                sql.contains(token),
+                "queue_sample_by_band SQL missing {token:?}"
+            );
+        }
+        // The pending half mirrors the claim's own eligibility.
+        assert!(
+            sql.contains("WHERE j.status = 'pending'")
+                && sql.contains("AND (j.locked_until IS NULL OR j.locked_until < now())"),
+            "the pending count must mirror the claim's eligibility predicate:\n{sql}"
+        );
+        // The capacity half requires a LIVE lease. Without it, a row
+        // whose worker died reads as a capacity shortage until the
+        // abandoned-lease sweep gets to it — a different defect wearing
+        // this one's label.
+        assert!(
+            sql.contains("AND j.capacity_waiting_since IS NOT NULL")
+                && sql.contains("AND j.locked_until > now()"),
+            "a row awaiting capacity is one a LIVE worker holds:\n{sql}"
+        );
+        // And the service half is the newest completion, unbounded, so
+        // `NULL` means "never" rather than "not inside some window".
+        assert!(
+            sql.contains("max(j.completed_at) FILTER (")
+                && sql.contains("WHERE j.status = 'completed'"),
+            "the service fact is the newest completed row in the band:\n{sql}"
+        );
+        // The statement must not learn what a class is — the bands are
+        // two numbers (ADR 0066 D6, `task_class_is_single_sourced`).
+        assert!(
+            !sql.contains("trigger_source") && !sql.contains("kind"),
+            "the sample keys on the priority band alone; a kind or trigger-source \
+             predicate here would be a second copy of the class mapping:\n{sql}"
+        );
+        for pat in [
+            "jobsWHERE",
+            "'pending'AND",
+            "now())AS",
+            "ordinality AS band(lowest, highest, ord)LEFT",
+            "band.ordORDER",
+        ] {
+            assert!(
+                !sql.contains(pat),
+                "conjoined-token pattern `{pat}` — a `\\n` is missing on a line \
+                 continuation:\n{sql}"
+            );
+        }
+    }
+
     /// The renewal is fenced on both the holder and the status.
     ///
     /// `locked_by = $2` stops a worker whose row was swept from
@@ -2102,7 +2513,7 @@ mod tests {
         let sql = CLAIM_PENDING_BY_KINDS_SQL;
 
         // Positive shape: keyword pairs MUST be separated by whitespace.
-        // Each substring below was (or, for the reserved-oldest-slot CTEs,
+        // Each substring below was (or, for the three allocation CTEs,
         // would be) a token-mashing site if a `\n` were dropped.
         let must_contain = [
             "FROM public.jobs",
@@ -2110,11 +2521,14 @@ mod tests {
             "'pending'\n",
             "ANY($1::text[])\n",
             "now())\n",
-            "LIMIT LEAST($2, 1)\n",
-            "LIMIT GREATEST($2 - 1, 0)\n",
+            "LIMIT GREATEST(LEAST($2 - (SELECT count(*) FROM reserved), 1), 0)\n",
+            "LIMIT $7\n",
+            "WITH ORDINALITY AS band(lowest, highest, ord)\n",
+            "FROM reserved\n",
             "FROM oldest\n",
             "FROM ranked\n",
             "NOT IN (SELECT id FROM oldest)\n",
+            "NOT IN (SELECT id FROM reserved)\n",
             "UPDATE public.jobs SET\n",
             "now()\n",
             "FROM claimed)\n",
@@ -2140,6 +2554,9 @@ mod tests {
             "FOR UPDATE SKIP LOCKEDLIMIT",
             "now()WHERE",
             "oldest)ORDER",
+            "reserved)ORDER",
+            "$6::smallint[])WITH",
+            "ord)CROSS",
         ];
         for pat in &must_not_contain {
             assert!(
@@ -2151,24 +2568,47 @@ mod tests {
         }
     }
 
+    /// The `oldest` CTE's own text, isolated from the two CTEs around
+    /// it.
+    ///
+    /// Taken as the span between the two CTE headers rather than as
+    /// "everything before `ranked`", which is what it used to be: the
+    /// reservation CTE now sits ahead of `oldest` and legitimately
+    /// orders by `priority`, so the old span would make the
+    /// priority-blindness assertion below pass by reading a different
+    /// CTE's text.
+    fn oldest_cte_text(sql: &str) -> &str {
+        let after = sql
+            .split_once("oldest AS MATERIALIZED (")
+            .map(|(_, rest)| rest)
+            .expect("CLAIM_PENDING_BY_KINDS_SQL must contain an `oldest` CTE");
+        after
+            .split_once("ranked AS (")
+            .map(|(cte, _)| cte)
+            .expect("CLAIM_PENDING_BY_KINDS_SQL must contain a `ranked` CTE")
+    }
+
     /// Regression guard for the reserved-oldest-slot fairness shape: one
-    /// slot per poll MUST be reserved for the single oldest eligible row
-    /// across kinds, priority-blind, and it MUST be excluded from the
+    /// slot per poll is reserved for the single oldest eligible row
+    /// across kinds, priority-blind, and it is excluded from the
     /// priority-ordered slots so the same row is never double-claimed.
     /// A prior bug class (see the token-mashing guard above) proved that
     /// this query's shape is easy to silently corrupt during an edit; this
     /// test pins the fairness-specific invariants the token-mashing guard
     /// does not cover.
+    ///
+    /// The slot is now allocated *after* the per-class reservation
+    /// (ADR 0066 D4) rather than first, which is what the `$2 - (SELECT
+    /// count(*) FROM reserved)` budget expresses — but the slot itself
+    /// is unchanged, and the reasons it exists are unchanged, so the
+    /// properties below still hold verbatim.
     #[test]
     fn claim_pending_by_kinds_sql_reserves_one_priority_blind_oldest_slot() {
         let sql = CLAIM_PENDING_BY_KINDS_SQL;
+        let oldest_cte = oldest_cte_text(sql);
 
         // The reserved slot's ordering must NOT reference priority — it is
         // the single globally oldest row regardless of priority.
-        let oldest_cte = sql
-            .split_once("ranked AS (")
-            .map(|(before, _)| before)
-            .expect("CLAIM_PENDING_BY_KINDS_SQL must contain a `ranked` CTE");
         assert!(
             oldest_cte.contains("ORDER BY created_at ASC, id ASC"),
             "the `oldest` CTE must order by created_at alone (priority-blind). \
@@ -2179,9 +2619,20 @@ mod tests {
             "the `oldest` CTE must not reference priority — it reserves a slot \
              for the oldest row REGARDLESS of priority. Full `oldest` CTE:\n{oldest_cte}"
         );
+        // It takes AT MOST one row, and none once the per-class
+        // reservation has spent the batch. `LEAST(_, 1)` is the cap and
+        // `GREATEST(_, 0)` is what keeps the budget from going negative
+        // — a negative LIMIT is an error, not a clamp.
+        assert!(
+            oldest_cte
+                .contains("LIMIT GREATEST(LEAST($2 - (SELECT count(*) FROM reserved), 1), 0)"),
+            "the `oldest` CTE must take at most one row, out of the batch the \
+             reservation left, and must never ask for a negative LIMIT. Full \
+             `oldest` CTE:\n{oldest_cte}"
+        );
 
         // The ranked (priority-ordered) slots must exclude whatever the
-        // oldest CTE already picked, and must keep the pre-existing
+        // earlier CTEs already picked, and must keep the pre-existing
         // priority-ordered contract for the remaining slots.
         assert!(
             sql.contains("ORDER BY priority DESC, created_at ASC"),
@@ -2189,23 +2640,102 @@ mod tests {
              created_at ASC order for the non-reserved slots. Full SQL:\n{sql}"
         );
 
-        // Both CTEs preserve FOR UPDATE SKIP LOCKED semantics.
+        // All three CTEs preserve FOR UPDATE SKIP LOCKED semantics.
         assert_eq!(
             sql.matches("FOR UPDATE SKIP LOCKED").count(),
-            2,
-            "both the `oldest` and `ranked` CTEs must claim with FOR UPDATE \
-             SKIP LOCKED. Full SQL:\n{sql}"
+            3,
+            "the `reserved`, `oldest` and `ranked` CTEs must each claim with \
+             FOR UPDATE SKIP LOCKED. Full SQL:\n{sql}"
         );
 
-        // `oldest` is referenced twice (by `ranked`'s exclusion and by
-        // `claimed`'s union) — it must be MATERIALIZED so the FOR UPDATE
-        // SKIP LOCKED select runs once, not once per reference.
+        // `reserved` and `oldest` are each referenced more than once (by
+        // the later CTEs' exclusions and budgets, and by `claimed`'s
+        // union) — both must be MATERIALIZED so the FOR UPDATE SKIP
+        // LOCKED select runs once, not once per reference.
+        for cte in ["reserved", "oldest"] {
+            assert!(
+                sql.contains(&format!("{cte} AS MATERIALIZED (")),
+                "the `{cte}` CTE must be explicitly MATERIALIZED — it is \
+                 referenced more than once, and relying on the default \
+                 multiply-referenced materialization is exactly the kind of \
+                 implicit contract this file pins explicitly. Full SQL:\n{sql}"
+            );
+        }
+    }
+
+    /// **The per-class reservation is expressed on `priority` against
+    /// bind parameters, and names nothing else** — ADR 0066 D6.
+    ///
+    /// The whole point of handing the adapter band *bounds* is that the
+    /// `(kind, trigger_source) → class` table stays in
+    /// `hort_domain::types::task_tier`. A `CASE WHEN trigger_source IN
+    /// (…)` here would compile, run, and pass every behavioural test in
+    /// the tree while re-typing the mapping that has already been
+    /// written down three times with no two copies agreeing. The
+    /// workspace guard `task_class_is_single_sourced` is the general
+    /// statement; this is the local one, where an edit to this constant
+    /// will see it.
+    #[test]
+    fn claim_pending_by_kinds_sql_learns_no_classification() {
+        let sql = CLAIM_PENDING_BY_KINDS_SQL;
+
+        // The reservation reads `priority` only against the bound band
+        // bounds — never against a literal of its own.
+        let reserved_cte = sql
+            .split_once("oldest AS MATERIALIZED (")
+            .map(|(before, _)| before)
+            .expect("CLAIM_PENDING_BY_KINDS_SQL must contain a `reserved` CTE");
+        for pat in [
+            "j.priority >= band.lowest",
+            "j.priority <= band.highest",
+            "unnest($5::smallint[], $6::smallint[])",
+            "LIMIT $7",
+        ] {
+            assert!(
+                reserved_cte.contains(pat),
+                "the `reserved` CTE must express the per-class reservation as \
+                 `{pat}`. Full `reserved` CTE:\n{reserved_cte}"
+            );
+        }
+
+        // Nothing anywhere in the statement names the classification or
+        // its inputs. `trigger_source` appears in the RETURNING list —
+        // projecting the column is not deciding anything from it — so
+        // the scan is for the shapes that WOULD decide: a comparison, a
+        // CASE, or a trigger-source literal.
+        for forbidden in [
+            "CASE",
+            "trigger_source =",
+            "trigger_source IN",
+            "trigger_source IS",
+            "= trigger_source",
+        ] {
+            assert!(
+                !sql.contains(forbidden),
+                "the claim must not decide anything from the classification or its \
+                 inputs — found `{forbidden}`. The `(kind, trigger_source)` table is \
+                 `hort_domain::types::task_tier`'s; this statement is handed band \
+                 bounds. Full SQL:\n{sql}"
+            );
+        }
+        for literal in TriggerSource::ALL {
+            let quoted = format!("'{}'", literal.as_str());
+            assert!(
+                !sql.contains(&quoted),
+                "the claim must not name the trigger-source literal {quoted} — a \
+                 literal here is the first line of a re-typed classification. Full \
+                 SQL:\n{sql}"
+            );
+        }
+
+        // Counter-assertion: the scan above is not vacuous. The
+        // statement does contain SQL string literals (the two status
+        // values), so "contains no quoted literal at all" is not what
+        // makes the trigger-source check pass.
         assert!(
-            sql.contains("WITH oldest AS MATERIALIZED ("),
-            "the `oldest` CTE must be explicitly MATERIALIZED — it is \
-             referenced twice, and relying on the default multiply-referenced \
-             materialization is exactly the kind of implicit contract this \
-             file pins explicitly. Full SQL:\n{sql}"
+            sql.contains("'pending'") && sql.contains("'running'"),
+            "the statement must still carry its status literals, or the \
+             literal scan above proves nothing. Full SQL:\n{sql}"
         );
     }
 
@@ -3965,5 +4495,306 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup");
+    }
+    // -----------------------------------------------------------------
+    // Per-class queue-service sample + the capacity-wait column
+    // (migration 038, ADR 0066 D5). Carry `#[serial(hort_pg_db)]` per
+    // CLAUDE.md's parallel-safety contract.
+    // -----------------------------------------------------------------
+
+    /// The bands a service observation reads, as the app layer passes
+    /// them: every class, highest first.
+    fn observed_bands() -> Vec<PriorityBand> {
+        hort_domain::types::task_tier::class_bands()
+            .into_iter()
+            .map(|(_, band)| band)
+            .collect()
+    }
+
+    /// Index of a class's band in [`observed_bands`] — the position the
+    /// adapter answers at, which is how a caller labels a sample.
+    fn band_index(tier: hort_domain::types::task_tier::TaskTier) -> usize {
+        hort_domain::types::task_tier::class_bands()
+            .into_iter()
+            .position(|(candidate, _)| candidate == tier)
+            .expect("every class has an observed band")
+    }
+
+    async fn enqueue_at(repo: &PgJobsRepository, priority: i16) -> Uuid {
+        match repo
+            .enqueue_task(
+                "noop",
+                &serde_json::json!({}),
+                None,
+                priority,
+                "manual",
+                None,
+            )
+            .await
+            .expect("enqueue_task")
+        {
+            EnqueueOutcome::Enqueued { job_id } => job_id,
+            other => panic!("expected a fresh enqueue, got {other:?}"),
+        }
+    }
+
+    async fn capacity_wait_of(pool: &PgPool, job_id: Uuid) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar("SELECT capacity_waiting_since FROM public.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .expect("read capacity_waiting_since")
+    }
+
+    /// The claim marks a row as waiting for capacity, the clear ends the
+    /// wait, and a re-claim starts a fresh one.
+    ///
+    /// This is the whole queued-vs-executing distinction `locked_until`
+    /// stopped being able to express once the lease renewal moved to
+    /// the claim: on a `running` row with a live lease, the column is
+    /// what says which of the two states the row is in. The re-claim
+    /// half is the one a reader would not think to check — a row that
+    /// has already executed once carries a cleared column, and without
+    /// the claim's reset it would read as executing while its next
+    /// claim queued behind a permit.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn the_claim_starts_a_capacity_wait_and_the_grant_ends_it() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+        let job_id = enqueue_at(&repo, 0).await;
+
+        let claimed = repo
+            .claim_pending_by_kinds(
+                &["noop"],
+                4,
+                "worker-a",
+                Duration::from_secs(900),
+                &crate::test_support::claim_reservation(),
+            )
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "the seeded row must be claimed");
+        assert!(
+            capacity_wait_of(&pool, job_id).await.is_some(),
+            "a claimed row has not been granted capacity yet, and must say so"
+        );
+
+        assert!(
+            repo.clear_capacity_wait(job_id, "worker-a")
+                .await
+                .expect("clear_capacity_wait"),
+            "the holder's own clear must land"
+        );
+        assert!(
+            capacity_wait_of(&pool, job_id).await.is_none(),
+            "the granted row is executing, not queued"
+        );
+
+        // Re-drive the row: reschedule back to pending, claim again.
+        repo.reschedule(job_id, 1, Duration::ZERO, "test re-drive")
+            .await
+            .expect("reschedule");
+        let reclaimed = repo
+            .claim_pending_by_kinds(
+                &["noop"],
+                4,
+                "worker-a",
+                Duration::from_secs(900),
+                &crate::test_support::claim_reservation(),
+            )
+            .await
+            .expect("re-claim");
+        assert_eq!(reclaimed.len(), 1, "the rescheduled row must be claimable");
+        assert!(
+            capacity_wait_of(&pool, job_id).await.is_some(),
+            "the claim must restart the wait — a row carrying the previous execution's \
+             cleared column would read as executing while it queues"
+        );
+    }
+
+    /// The clear is fenced on the holder: a worker that lost the row
+    /// cannot end its successor's wait.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn the_capacity_wait_clear_is_fenced_on_the_holder() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+        let job_id = enqueue_at(&repo, 0).await;
+        repo.claim_pending_by_kinds(
+            &["noop"],
+            4,
+            "worker-a",
+            Duration::from_secs(900),
+            &crate::test_support::claim_reservation(),
+        )
+        .await
+        .expect("claim");
+
+        assert!(
+            !repo
+                .clear_capacity_wait(job_id, "worker-b")
+                .await
+                .expect("clear_capacity_wait"),
+            "a stranger's clear must not land, and must report that it did not"
+        );
+        assert!(
+            capacity_wait_of(&pool, job_id).await.is_some(),
+            "the holder's wait must survive a stranger's clear"
+        );
+    }
+
+    /// The sample answers once per band, in band order, and puts each
+    /// row's facts in its own class's band.
+    ///
+    /// Three rows at three ordinals: the statement knows nothing about
+    /// classes — it is handed two numbers per band — so this is where
+    /// "the ordinal is a faithful projection of the class" is checked
+    /// against a real database rather than assumed.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn queue_sample_by_band_separates_the_classes() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        use hort_domain::types::task_tier::{queue_priority, TaskTier};
+        let repo = PgJobsRepository::new(pool.clone());
+
+        // One pending row per class, placed by the ordinal the one
+        // definition writes for a row of that class.
+        let interactive = enqueue_at(&repo, queue_priority("noop", "ingest")).await;
+        let _normal = enqueue_at(&repo, queue_priority("noop", "manual")).await;
+        let _bulk_a = enqueue_at(&repo, queue_priority("noop", "cron")).await;
+        let _bulk_b = enqueue_at(&repo, queue_priority("noop", "cron")).await;
+
+        let samples = repo
+            .queue_sample_by_band(&observed_bands())
+            .await
+            .expect("queue_sample_by_band");
+        assert_eq!(
+            samples.len(),
+            observed_bands().len(),
+            "one answer per band, or a caller would label a class with its neighbour's facts"
+        );
+        assert_eq!(
+            samples[band_index(TaskTier::Interactive)].pending_eligible,
+            1
+        );
+        assert_eq!(samples[band_index(TaskTier::Normal)].pending_eligible, 1);
+        assert_eq!(samples[band_index(TaskTier::Bulk)].pending_eligible, 2);
+        for tier in TaskTier::ALL {
+            assert!(
+                samples[band_index(tier)].oldest_pending_at.is_some(),
+                "{tier:?} has pending rows, so it must carry the oldest one's arrival"
+            );
+            assert_eq!(
+                samples[band_index(tier)].last_served_at,
+                None,
+                "nothing has completed yet, so no class has been served"
+            );
+        }
+
+        // Complete the Interactive row: that class, and only that
+        // class, is now on record as served.
+        repo.mark_completed(interactive, 0, serde_json::json!({}))
+            .await
+            .expect("mark_completed");
+        let samples = repo
+            .queue_sample_by_band(&observed_bands())
+            .await
+            .expect("queue_sample_by_band");
+        assert!(
+            samples[band_index(TaskTier::Interactive)]
+                .last_served_at
+                .is_some(),
+            "the completed row is this class's durable 'being served' fact"
+        );
+        assert_eq!(
+            samples[band_index(TaskTier::Interactive)].pending_eligible,
+            0,
+            "and it is no longer waiting"
+        );
+        assert_eq!(samples[band_index(TaskTier::Normal)].last_served_at, None);
+        assert_eq!(samples[band_index(TaskTier::Bulk)].last_served_at, None);
+    }
+
+    /// A row awaiting capacity is one a **live** worker holds.
+    ///
+    /// A dead worker's row carries the same non-NULL
+    /// `capacity_waiting_since` until the abandoned-lease sweep requeues
+    /// it, and counting it as a capacity shortage would report a worker
+    /// death under this unit's label — a different defect wearing the
+    /// wrong name, and one whose remedy (raise the reserved share) would
+    /// do nothing.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_lapsed_lease_is_not_counted_as_a_capacity_wait() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        use hort_domain::types::task_tier::{queue_priority, TaskTier};
+        let repo = PgJobsRepository::new(pool.clone());
+        let job_id = enqueue_at(&repo, queue_priority("noop", "manual")).await;
+        repo.claim_pending_by_kinds(
+            &["noop"],
+            4,
+            "worker-a",
+            Duration::from_secs(900),
+            &crate::test_support::claim_reservation(),
+        )
+        .await
+        .expect("claim");
+
+        let samples = repo
+            .queue_sample_by_band(&observed_bands())
+            .await
+            .expect("queue_sample_by_band");
+        let normal = &samples[band_index(TaskTier::Normal)];
+        assert_eq!(
+            normal.awaiting_capacity, 1,
+            "a live worker holds this row and has not run it yet"
+        );
+        assert!(normal.oldest_capacity_wait_at.is_some());
+
+        // The worker stops renewing and its lease lapses.
+        sqlx::query(
+            "UPDATE public.jobs SET locked_until = now() - interval '1 hour' WHERE id = $1",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("expire the lease");
+
+        let samples = repo
+            .queue_sample_by_band(&observed_bands())
+            .await
+            .expect("queue_sample_by_band");
+        let normal = &samples[band_index(TaskTier::Normal)];
+        assert_eq!(
+            normal.awaiting_capacity, 0,
+            "a row whose owner is presumed dead is the sweep's business, not a capacity \
+             shortage"
+        );
+        assert_eq!(normal.oldest_capacity_wait_at, None);
+    }
+
+    /// No bands, no statement — the degenerate input a caller with an
+    /// empty class list would produce.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn queue_sample_by_band_with_no_bands_asks_nothing() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+        assert!(repo
+            .queue_sample_by_band(&[])
+            .await
+            .expect("an empty band list is not an error")
+            .is_empty());
     }
 }

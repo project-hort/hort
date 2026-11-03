@@ -36,9 +36,7 @@ use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
-use hort_domain::types::task_tier::{
-    queue_priority, scan_queue_priority, CLEARANCE_GATING_VERIFY_PRIORITY,
-};
+use hort_domain::types::task_tier::{queue_priority, scan_queue_priority};
 use hort_domain::types::{ArtifactCoords, ContentHash, PayloadAccess};
 
 use crate::error::{AppError, AppResult};
@@ -91,6 +89,24 @@ pub(crate) const REGISTER_BY_HASH_TRIGGER_SOURCE: &str = TriggerSource::Register
 /// `hort-server seed-import` cutover, whose own `jobs` row carries the
 /// same literal.
 pub(crate) const SEED_IMPORT_TRIGGER_SOURCE: &str = TriggerSource::SeedImport.as_str();
+
+/// `jobs.trigger_source` on a **clearance-gating** `provenance-verify`
+/// — the last thing between an artifact already held and a release
+/// decision. Two producers stamp it: the `ingest_signature_manifest`
+/// re-verify below (a subject-based signature referrer just landed, so
+/// the held subject can clear now rather than at its window edge) and
+/// `QuarantineUseCase::enqueue_final_provenance_verify` (the window
+/// elapsed with the candidate still `Pending`).
+///
+/// Distinct from [`INGEST_TRIGGER_SOURCE`], which both producers
+/// borrowed because it was the only CHECK-valid literal that came
+/// close. The ingest-time verify is one per ingest and so *is* the
+/// backlog; a clearance verify is one per held artifact reaching its
+/// window. The pair `('provenance-verify', 'ingest')` could say neither,
+/// which is why each producer used to name its own ordinal — the one
+/// violation of ADR 0066 D6 ("no producer names a number") that
+/// survived the vocabulary step.
+pub(crate) const CLEARANCE_TRIGGER_SOURCE: &str = TriggerSource::Clearance.as_str();
 
 /// Request payload for [`IngestUseCase::ingest`].
 ///
@@ -1771,13 +1787,15 @@ impl IngestUseCase {
                             PROVENANCE_VERIFY_KIND,
                             &params,
                             None, // actor_id: system-driven signature-arrival hook
-                            // Preempts the bulk ingest backlog: a
-                            // priority-0 signature-arrival verify queues
-                            // behind every ingest-time scan, so a signed
-                            // image's release lags by the queue depth
+                            // Clearance-gating, so the row says so and
+                            // the ordinal follows from it: this verify
+                            // preempts the bulk ingest backlog, because
+                            // a signature-arrival verify ranked with
+                            // every ingest-time scan makes a signed
+                            // image's release lag by the queue depth
                             // rather than by the verify's own cost.
-                            CLEARANCE_GATING_VERIFY_PRIORITY,
-                            INGEST_TRIGGER_SOURCE,
+                            queue_priority(PROVENANCE_VERIFY_KIND, CLEARANCE_TRIGGER_SOURCE),
+                            CLEARANCE_TRIGGER_SOURCE,
                             None, // no idempotency key — a re-verify is harmless (idempotent verdict)
                         )
                         .await
@@ -3685,10 +3703,13 @@ impl IngestUseCase {
             "artifact_id": artifact_id,
             "current_depth": 0u32,
         });
-        // Cascade rows drain after operator/cron work.
         // `trigger_source = "ingest"` — the cascade is event-driven by the
         // ingest; the CHECK in migration 009 lists `ingest` as a valid
-        // trigger source.
+        // trigger source. The ordinal the table answers for that pair is
+        // the bottom band all the same: the cascade is a warm-up walk and
+        // the push it rides on has already answered, so the root ranks
+        // with the children the walk enqueues rather than with the gates
+        // the push is actually waiting on.
         match self
             .jobs
             .enqueue_task(
@@ -16158,6 +16179,28 @@ mod tests {
             );
             assert_eq!(params["current_depth"], 0);
             assert!(actor_id.is_none(), "cascade hook is system-driven");
+            // The band, through the table rather than as a number. The
+            // cascade root carries `'ingest'` because an ingest caused
+            // it, and the table files it with the cascade's own children
+            // anyway: nobody waits on a warm-up walk, and one root per
+            // artifact is a flood that would otherwise preempt the
+            // operator work it drains behind.
+            assert_eq!(
+                jobs.enqueue_trigger_sources(),
+                vec![INGEST_TRIGGER_SOURCE.to_string()],
+            );
+            assert_eq!(
+                jobs.enqueue_priorities(),
+                vec![queue_priority(
+                    PREFETCH_DEPENDENCIES_KIND,
+                    INGEST_TRIGGER_SOURCE
+                )],
+                "the cascade root must enqueue at the ordinal the table decides for its pair"
+            );
+            assert!(
+                jobs.enqueue_priorities()[0] < scan_queue_priority(INGEST_TRIGGER_SOURCE),
+                "it must not outrank the ingest-time gates the same push is waiting on"
+            );
         });
     }
 
@@ -16285,6 +16328,70 @@ mod tests {
                 "a non-cascade-internal verified ingest seeds the cascade (depth 0)",
             );
             assert_eq!(cascade_calls[0].1["current_depth"], 0);
+        });
+    }
+
+    /// The second producer of the cascade root: `register_by_hash`'s
+    /// own hook (the OCI cross-repository mount and the pull-dedup
+    /// followers), which mirrors `ingest_inner`'s.
+    ///
+    /// Asserted here because the two hooks are separate code paths that
+    /// each call the table for themselves, and the thing worth pinning
+    /// is that they agree — a root minted over content already in CAS
+    /// is the same warm-up walk nobody waits on as a root spawned by a
+    /// push, and it stamps the same pair.
+    #[test]
+    fn cascade_hook_on_register_by_hash_enqueues_the_root_in_the_bulk_band() {
+        let repo = repo_with_transitive_deps_trigger();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, storage, repos, policy_projections, jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            seed_permissive_global_policy(&policy_projections);
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            uc.register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("register_by_hash must succeed");
+
+            let cascade_calls: Vec<_> = jobs
+                .enqueue_calls()
+                .into_iter()
+                .filter(|(kind, _, _)| kind == PREFETCH_DEPENDENCIES_KIND)
+                .collect();
+            assert_eq!(
+                cascade_calls.len(),
+                1,
+                "the register_by_hash hook fires one depth-0 root when the TransitiveDeps \
+                 trigger is configured"
+            );
+            assert_eq!(cascade_calls[0].1["current_depth"], 0);
+            assert!(
+                cascade_calls[0].2.is_none(),
+                "the hook is system-driven (no actor_id)"
+            );
+
+            // Same pair, and the band through the table — not a number.
+            assert_eq!(
+                jobs.enqueue_trigger_sources(),
+                vec![INGEST_TRIGGER_SOURCE.to_string()],
+            );
+            assert_eq!(
+                jobs.enqueue_priorities(),
+                vec![queue_priority(
+                    PREFETCH_DEPENDENCIES_KIND,
+                    INGEST_TRIGGER_SOURCE
+                )],
+                "both cascade producers must enqueue at the ordinal the table decides"
+            );
+            assert!(
+                jobs.enqueue_priorities()[0] < scan_queue_priority(REGISTER_BY_HASH_TRIGGER_SOURCE),
+                "a mount's warm-up walk must not outrank the gates the mount itself is \
+                 waiting on"
+            );
         });
     }
 
@@ -18183,15 +18290,35 @@ mod tests {
             // No idempotency key — a re-verify is a harmless idempotent
             // verdict.
             assert_eq!(jobs.enqueue_idem_keys(), vec![None]);
-            // The signature-arrival verify is clearance-gating, so it
-            // enqueues at the elevated tier to preempt the bulk ingest
-            // backlog. Pinned against the literal, not the constant: the
-            // number this producer writes is what must not move until the
-            // ordinals are re-derived from the tier.
+            // Both halves of the row, because this hook used to get
+            // one of them wrong: it stamped `'ingest'`, so a
+            // signature-arrival verify was indistinguishable from the
+            // ingest-time backlog it is supposed to preempt. The
+            // ordinal is the one the table decides for this pair, not a
+            // re-typed number — and the claim that makes it worth
+            // asserting is the relation beneath it: this row outranks
+            // the one-per-ingest verify backlog it used to share an
+            // ordinal with.
+            assert_eq!(
+                jobs.enqueue_trigger_sources(),
+                vec![TriggerSource::Clearance.as_str().to_string()],
+                "the signature-arrival verify must stamp its own trigger source, not borrow \
+                 the ingest-time verify's"
+            );
             assert_eq!(
                 jobs.enqueue_priorities(),
-                vec![10],
-                "signature-arrival provenance-verify must enqueue at the elevated clearance tier"
+                vec![queue_priority(
+                    PROVENANCE_VERIFY_KIND,
+                    CLEARANCE_TRIGGER_SOURCE
+                )],
+                "signature-arrival provenance-verify must enqueue at the ordinal the table \
+                 decides for its own trigger source"
+            );
+            assert!(
+                jobs.enqueue_priorities()[0]
+                    > queue_priority(PROVENANCE_VERIFY_KIND, INGEST_TRIGGER_SOURCE),
+                "it must outrank the ingest-time verify backlog, or a held artifact waits \
+                 for the backlog rather than for its own verify"
             );
         });
     }

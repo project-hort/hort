@@ -597,7 +597,12 @@ mod tests {
             assert_eq!(call.artifact_id, c.artifact_id);
             assert_eq!(call.repository_id, c.repository_id);
             assert_eq!(call.format, c.format);
-            assert_eq!(call.priority, 10);
+            assert_eq!(call.priority, scan_queue_priority(CRON_TRIGGER_SOURCE));
+            assert!(
+                call.priority < scan_queue_priority(TriggerSource::Ingest.as_str()),
+                "a rescan nobody is waiting on must not outrank the ingest-time scan that \
+                 stands between a client's bytes and being served"
+            );
             assert_eq!(call.trigger_source, "cron");
             assert_eq!(call.trigger_source, CRON_TRIGGER_SOURCE);
         }
@@ -804,7 +809,7 @@ mod tests {
                 call.trigger_source, "cron",
                 "stranded re-enqueue still uses trigger_source=cron (same handler)"
             );
-            assert_eq!(call.priority, 10);
+            assert_eq!(call.priority, scan_queue_priority(CRON_TRIGGER_SOURCE));
         }
     }
 

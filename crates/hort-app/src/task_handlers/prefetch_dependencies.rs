@@ -57,10 +57,20 @@
 //!
 //! # Low priority
 //!
-//! All cascade-spawned rows carry `priority = 0` (the schema
-//! default) so manual / cron / advisory work drains
-//! first. The cascade is a background warm; starving it under
-//! load is fine — the next pull re-derives.
+//! All cascade-spawned rows carry `trigger_source = 'prefetch'`, which
+//! `hort_domain::types::task_tier` classifies as work nobody is waiting
+//! on — so they sit in the bottom ordinal band (the schema default) and
+//! every client-waited and operator-waited row drains ahead of them. The
+//! cascade is a background warm; starving it under load is fine — the
+//! next pull re-derives.
+//!
+//! The **root** row the ingest hook enqueues is in the same band even
+//! though it carries `trigger_source = 'ingest'`: `task_tier` classifies
+//! `kind = 'prefetch-dependencies'` off the kind, before the trigger
+//! source, because the push that caused the root has already answered
+//! `201` and the re-derivation above is what makes a walk that never ran
+//! cost nothing. Otherwise one root per ingested artifact would be a
+//! top-band flood on every bulk push.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

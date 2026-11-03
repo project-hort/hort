@@ -339,6 +339,47 @@ fn dispatch(command: Command) -> ExitCode {
     }
 }
 
+/// Assert that a scheduled-maintenance CronJob subcommand's row carries
+/// the ordinal its class names.
+///
+/// Two relations, and deliberately no number: the ordinal is decided in
+/// one place (`hort_domain::types::task_tier::queue_priority`) and a
+/// subcommand test that re-typed its answer would be the per-producer
+/// ordinal arriving back through the test suite.
+///
+/// - **Same band as the scheduled rescan tick.** Nobody is waiting on
+///   either, so they drain together.
+/// - **Strictly below the quarantine-release sweep**, which shares the
+///   `'cron'` trigger source and is the path a client is waiting on
+///   however it is triggered (ADR 0066 D3). The sweep tying with this
+///   band is what left a pushed, window-elapsed artifact unreleased: at
+///   an equal ordinal the claim's `created_at ASC` tiebreak resolves
+///   against the sweep, because a backlog is always older than the next
+///   scheduled run.
+///
+/// Shared by the five `enqueue-*` subcommands that write such a row —
+/// one invariant, asserted once. Five copies of it is the shape the
+/// ordinal itself had before it was decided in one place.
+#[cfg(test)]
+pub(crate) fn assert_scheduled_maintenance_ordinal(kind: &str) {
+    use hort_domain::ports::jobs_repository::TriggerSource;
+    use hort_domain::types::task_tier::{queue_priority, scan_queue_priority};
+
+    let cron = TriggerSource::Cron.as_str();
+    assert_eq!(
+        queue_priority(kind, cron),
+        scan_queue_priority(cron),
+        "{kind} is scheduled maintenance nobody waits on, so it must drain in the same band \
+         as the scheduled rescan tick"
+    );
+    assert!(
+        queue_priority(kind, cron) < queue_priority("quarantine-release-sweep", cron),
+        "{kind} must NOT share a rank with the quarantine-release sweep: that sweep is \
+         client-waited even though a timer enqueues it, and a tie there is resolved against \
+         it by the claim's age tiebreak"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     //! Dispatcher tests — exercise clap parsing only. Subcommand
@@ -591,5 +632,18 @@ mod tests {
     fn unknown_subcommand_errors() {
         let err = Cli::try_parse_from(["hort-server", "nosuch"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    // Counter-assertion for the shared ordinal helper the five
+    // scheduled-maintenance subcommands call: it can still fail. Handed
+    // the release sweep — the one `'cron'` kind that is client-waited —
+    // it must reject rather than accept, so a layout that flattened the
+    // sweep back into the scheduled band fails at all six call sites
+    // instead of at none.
+
+    #[test]
+    #[should_panic(expected = "must drain in the same band")]
+    fn the_scheduled_maintenance_ordinal_helper_rejects_the_release_sweep() {
+        assert_scheduled_maintenance_ordinal("quarantine-release-sweep");
     }
 }

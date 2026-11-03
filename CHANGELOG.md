@@ -13,6 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `jobs` row, so a failure outlives the row's 7-day retention; subscribers to
   the task event types will begin receiving it (#331).
 
+### Changed
+
+- Queued work is now ranked by who is waiting on it, and a flood of
+  background work can no longer occupy a worker's whole claim batch or
+  all of a kind's run permits, so scheduled maintenance no longer
+  outranks or crowds out the publish and release paths, and a
+  clearance-gating `provenance-verify` — the last gate before a release
+  decision — is distinguishable from the bulk ingest-time verify rather
+  than sharing its `trigger_source`. Rows already queued keep the rank
+  they were enqueued with and drain normally; no migration or backfill.
+  `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS` (default `1`) sets how many
+  slots each waited-on class is held at both points, and background work
+  therefore drains more slowly under load. A queued task no longer spends
+  a retry attempt while it waits for capacity, so work that only waited
+  is no longer failed terminally for waiting. Whether each class is being
+  served — including the rows that hold a claim while they wait for
+  capacity — is now on `hort-server`'s `/metrics`
+  (`hort_admin_tasks_class_unserved{class}`), at the window
+  `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` sets (default `300`; set it on
+  the server and the worker) (#399).
+
 ### Fixed
 
 - The OCI cross-repository blob mount

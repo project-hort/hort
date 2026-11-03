@@ -1123,7 +1123,15 @@ mod tests {
         assert_eq!(calls[0].artifact_id, aid);
         assert_eq!(calls[0].repository_id, rid);
         assert_eq!(calls[0].format, "npm");
-        assert_eq!(calls[0].priority, 5);
+        assert_eq!(
+            calls[0].priority,
+            scan_queue_priority(ADVISORY_TRIGGER_SOURCE)
+        );
+        assert!(
+            calls[0].priority < scan_queue_priority(TriggerSource::Ingest.as_str()),
+            "an advisory-driven rescan nobody is waiting on must not outrank the \
+             ingest-time scan"
+        );
         assert_eq!(calls[0].trigger_source, ADVISORY_TRIGGER_SOURCE);
         assert_eq!(calls[0].trigger_source, "advisory");
 
