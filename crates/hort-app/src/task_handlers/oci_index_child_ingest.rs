@@ -187,7 +187,7 @@ use hort_domain::oci::{
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceClaim;
 use hort_domain::ports::format_handler::FormatHandler;
-use hort_domain::ports::jobs_repository::{IdempotentEnqueueRow, JobsRepository};
+use hort_domain::ports::jobs_repository::{IdempotentEnqueueRow, JobsRepository, TriggerSource};
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
@@ -235,7 +235,7 @@ const FALLBACK_MEDIA_TYPE: &str = "application/octet-stream";
 /// operator. Shared with the pull-through producer
 /// ([`crate::use_cases::oci_index_child_enqueue`]) so a row minted by the
 /// handler's own recursion is indistinguishable from one minted at a pull leg.
-pub(crate) const CHILD_INGEST_TRIGGER_SOURCE: &str = "ingest";
+pub(crate) const CHILD_INGEST_TRIGGER_SOURCE: &str = TriggerSource::Ingest.as_str();
 
 /// The recursion depth a row minted at a pull-through leg carries: the index
 /// the client pulled is the root, so the children it declares are level zero.

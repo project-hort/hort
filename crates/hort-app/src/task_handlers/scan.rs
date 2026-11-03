@@ -145,6 +145,15 @@ impl TaskHandler for ScanTaskHandler {
             // `hort_scan_jobs_enqueued_total{trigger_source}` metric (and any
             // future per-priority observability) has typed access without
             // a second round-trip.
+            //
+            // Any globally valid trigger source is accepted on a scan
+            // row, for the reason recorded at the other reader of the
+            // same column (`row_to_scan_job` in the Postgres jobs
+            // adapter): scan-specific rejection would make a row the
+            // schema accepts and a producer can write unrunnable, and an
+            // artifact left ungated costs more than a scan filed under
+            // the wrong trigger source. A literal outside the set stays
+            // an `Invariant` — that is schema drift, not a mislabel.
             let trigger_source = TriggerSource::from_str(&row.trigger_source).map_err(|e| {
                 DomainError::Invariant(format!(
                     "scan job {}: trigger_source {:?} not a known literal: {e}",

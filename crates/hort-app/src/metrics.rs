@@ -105,11 +105,15 @@ pub mod labels {
     /// Closed taxonomy.
     pub const INGEST_SOURCE: &str = "ingest_source";
     /// `trigger_source` label on
-    /// `hort_scan_jobs_enqueued_total`. Values come from
-    /// [`hort_domain::ports::jobs_repository::TriggerSource::as_str`] —
-    /// `"ingest"` / `"cron"` / `"advisory"` / `"manual"`. The wire
-    /// strings mirror the SQL CHECK constraint on
-    /// `jobs.trigger_source` verbatim. Closed taxonomy of 4.
+    /// `hort_scan_jobs_enqueued_total`. Every value is a wire string
+    /// from [`hort_domain::ports::jobs_repository::TriggerSource`], the
+    /// one definition of what `jobs.trigger_source` may hold.
+    ///
+    /// Closed taxonomy of 4, and a deliberate **subset** of that set
+    /// rather than a mirror of it: this counter fires from the four
+    /// `enqueue_scan` producers only (see [`TriggerSourceLabel`]). The
+    /// subset is a cardinality decision, which is why it has its own
+    /// type; the literals are not re-typed with it.
     pub const TRIGGER_SOURCE: &str = "trigger_source";
     /// Per-OSV-ecosystem label on
     /// `hort_advisory_diff_processed_total` and
@@ -2710,6 +2714,7 @@ pub fn emit_scan_terminal(result: ScanTerminalResult) {
 // ---------------------------------------------------------------------------
 
 use hort_domain::ports::composite_scan_observation::GateDecision;
+use hort_domain::ports::jobs_repository::TriggerSource;
 
 /// `result` label value of `hort_scan_composite_assessment_total`.
 ///
@@ -3568,15 +3573,25 @@ pub fn register_scan_metrics() {
 // ---------------------------------------------------------------------------
 
 /// `trigger_source` label value for `hort_scan_jobs_enqueued_total`.
-/// Mirrors [`hort_domain::ports::jobs_repository::TriggerSource`]
-/// — the wire strings are the literal SQL CHECK constraint values on
-/// `jobs.trigger_source` (`'ingest' | 'cron' | 'advisory' | 'manual'`).
-/// Closed taxonomy of 4.
+///
+/// A **closed taxonomy of 4, and a deliberate subset** of
+/// [`TriggerSource`] — the one definition of what `jobs.trigger_source`
+/// may hold. It is a separate type because the metric's cardinality is
+/// its own decision: the counter fires from the four `enqueue_scan`
+/// producers (ingest, cron, advisory, manual rescan) and from nowhere
+/// else, so admitting the remaining members would advertise series that
+/// can never tick. A fifth producer calling
+/// [`emit_scan_jobs_enqueued`] has to add a variant here, which is the
+/// review conversation about the new series.
+///
+/// The wire strings are **not** re-typed: [`Self::source`] selects the
+/// domain variant and [`Self::as_str`] reads the literal off it. So a
+/// label can only ever carry a value the column accepts — which is what
+/// the old wording ("mirrors the SQL CHECK … `'ingest' | 'cron' |
+/// 'advisory' | 'manual'`") claimed while the CHECK admitted eight.
 ///
 /// String values are normative — they appear verbatim in
-/// `docs/metrics-catalog.md` and in the SQL CHECK. A drift here would
-/// either fail the INSERT loudly or, if the CHECK were ever loosened,
-/// silently file scan-enqueues under the wrong observability bucket.
+/// `docs/metrics-catalog.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerSourceLabel {
     /// First-scan at ingest. Drives the ingest enqueue path.
@@ -3590,15 +3605,22 @@ pub enum TriggerSourceLabel {
 }
 
 impl TriggerSourceLabel {
-    /// Wire string. Catalog rule: must match `docs/metrics-catalog.md`
-    /// AND the SQL CHECK on `jobs.trigger_source` exactly.
-    pub const fn as_str(self) -> &'static str {
+    /// The member of [`TriggerSource`] this label selects. The subset
+    /// relation is spelled here, once, as a total function into the set.
+    pub const fn source(self) -> TriggerSource {
         match self {
-            Self::Ingest => "ingest",
-            Self::Cron => "cron",
-            Self::Advisory => "advisory",
-            Self::Manual => "manual",
+            Self::Ingest => TriggerSource::Ingest,
+            Self::Cron => TriggerSource::Cron,
+            Self::Advisory => TriggerSource::Advisory,
+            Self::Manual => TriggerSource::Manual,
         }
+    }
+
+    /// Wire string — read off [`Self::source`], so it is the same
+    /// literal the `jobs.trigger_source` column carries. Catalog rule:
+    /// must match `docs/metrics-catalog.md`.
+    pub const fn as_str(self) -> &'static str {
+        self.source().as_str()
     }
 }
 
@@ -7400,37 +7422,52 @@ mod tests {
         assert_eq!(super::TriggerSourceLabel::Manual.as_str(), "manual");
     }
 
-    #[test]
-    fn trigger_source_label_values_are_unique() {
-        let variants = [
-            super::TriggerSourceLabel::Ingest,
-            super::TriggerSourceLabel::Cron,
-            super::TriggerSourceLabel::Advisory,
-            super::TriggerSourceLabel::Manual,
-        ];
-        let set: HashSet<&'static str> = variants.iter().map(|v| v.as_str()).collect();
-        assert_eq!(set.len(), variants.len(), "label values must be unique");
-    }
+    /// The four label variants, as the only place they are enumerated in
+    /// this test module.
+    const LABEL_VARIANTS: [super::TriggerSourceLabel; 4] = [
+        super::TriggerSourceLabel::Ingest,
+        super::TriggerSourceLabel::Cron,
+        super::TriggerSourceLabel::Advisory,
+        super::TriggerSourceLabel::Manual,
+    ];
 
     #[test]
-    fn trigger_source_label_mirrors_domain_trigger_source_wire_form() {
-        // Cross-check against the domain enum so the two layers can never
-        // drift. hort-app::TriggerSourceLabel is the metric label;
-        // hort_domain::ports::jobs_repository::TriggerSource is the SQL
-        // wire form. The two MUST agree.
+    fn trigger_source_label_values_are_unique() {
+        let set: HashSet<&'static str> = LABEL_VARIANTS.iter().map(|v| v.as_str()).collect();
+        assert_eq!(
+            set.len(),
+            LABEL_VARIANTS.len(),
+            "label values must be unique"
+        );
+    }
+
+    /// Every label value is a member of the one definition of the set.
+    ///
+    /// Not "the two lists are equal" — the label taxonomy is a
+    /// deliberate subset (the counter fires from the four `enqueue_scan`
+    /// producers only). What must hold is the subset relation: a label
+    /// that is not a `jobs.trigger_source` literal would file
+    /// scan-enqueues under a bucket no row can carry.
+    #[test]
+    fn trigger_source_label_values_are_all_members_of_the_domain_set() {
         use hort_domain::ports::jobs_repository::TriggerSource as Ts;
-        assert_eq!(
-            super::TriggerSourceLabel::Ingest.as_str(),
-            Ts::Ingest.as_str()
-        );
-        assert_eq!(super::TriggerSourceLabel::Cron.as_str(), Ts::Cron.as_str());
-        assert_eq!(
-            super::TriggerSourceLabel::Advisory.as_str(),
-            Ts::Advisory.as_str()
-        );
-        assert_eq!(
-            super::TriggerSourceLabel::Manual.as_str(),
-            Ts::Manual.as_str()
+        let wire: HashSet<&'static str> = Ts::ALL.iter().map(|v| v.as_str()).collect();
+        for label in LABEL_VARIANTS {
+            assert!(
+                wire.contains(label.as_str()),
+                "label {label:?} carries {:?}, which is not in TriggerSource::ALL ({wire:?})",
+                label.as_str()
+            );
+            // ...and the selection really is the matching member, not
+            // merely *some* member with the right string.
+            assert_eq!(label.as_str(), label.source().as_str());
+        }
+        // Counter-assertion: the relation is a strict subset, so a
+        // future change that quietly widened the label taxonomy to the
+        // whole set would have to delete this line.
+        assert!(
+            LABEL_VARIANTS.len() < Ts::ALL.len(),
+            "the label taxonomy is a deliberate subset of the trigger-source set"
         );
     }
 

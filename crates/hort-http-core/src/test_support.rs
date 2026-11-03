@@ -2458,6 +2458,37 @@ pub fn with_task_use_case(base: &Arc<AppContext>, new_uc: Arc<TaskUseCase>) -> A
     rebuild(base, |ctx| ctx.task_use_case = new_uc)
 }
 
+/// Swap the wired [`IngestUseCase`] on a mock context, leaving every
+/// other field pointer-identical.
+///
+/// The caller composes the use case, which is the whole point: the
+/// shape this exists for is a *publish* path driven through real
+/// outbound adapters, and [`IngestUseCase::new`] takes the
+/// `ArtifactLifecyclePort` — which is owned by the use cases rather
+/// than held in an [`AppContext`] slot, so no `with_*` helper can
+/// reach it. [`with_storage`] rebuilds the use case here and therefore
+/// has to name `MockPorts.lifecycle`; a test that needs the *Postgres*
+/// lifecycle cannot be served that way and must hand in the whole use
+/// case instead (same shape as [`with_task_use_case`]).
+///
+/// This is the seam `with_artifacts`'s doc comment says a publish-path
+/// real-adapter test needs. It is narrower than driving
+/// `hort_server::composition::build_app_context`: that function wants a
+/// live OIDC issuer, an upstream resolver and ~30 further parameters, so
+/// a test reaching for it to exercise one INSERT would be testing the
+/// composition root instead of the path.
+///
+/// **The halves must agree.** Whatever the supplied use case reads and
+/// writes — repository rows, artifact rows, event streams — has to be
+/// the same universe the handler under test resolves against, because
+/// nothing here cross-checks them. The established way to arrange that
+/// is the hybrid `legacy_quarantine_status_fails_closed_real_db` uses:
+/// insert the real rows the foreign keys need, and seed the mock
+/// repository with entities carrying those same ids.
+pub fn with_ingest_use_case(base: &Arc<AppContext>, new_uc: Arc<IngestUseCase>) -> Arc<AppContext> {
+    rebuild(base, |ctx| ctx.ingest_use_case = new_uc)
+}
+
 /// Swap the wired
 /// [`EventStore`] handle on a mock context. Used by the `/readyz`
 /// handler test that drives the unhealthy branch by injecting a

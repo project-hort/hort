@@ -31,7 +31,7 @@ use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersi
 
 use crate::event_store_publisher::EventStorePublisher;
 use hort_domain::ports::format_handler::{FormatHandler, MetadataStrategy};
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::storage::{PutResult, StoragePort};
@@ -68,10 +68,29 @@ pub(crate) const PROVENANCE_VERIFY_KIND: &str = "provenance-verify";
 const PREFETCH_DEPENDENCIES_KIND: &str = "prefetch-dependencies";
 
 /// `jobs.trigger_source` every enqueue this use case makes at ingest
-/// time carries. One of the migration-009 CHECK literals; the
-/// `register_by_hash` path stamps its own instead, because its caller
-/// class is what distinguishes it.
-pub(crate) const INGEST_TRIGGER_SOURCE: &str = "ingest";
+/// time carries, taken from the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]). The
+/// `register_by_hash` path stamps one of the two below instead, because
+/// its caller class is what distinguishes it.
+pub(crate) const INGEST_TRIGGER_SOURCE: &str = TriggerSource::Ingest.as_str();
+
+/// `jobs.trigger_source` on the enqueues `register_by_hash` makes for a
+/// caller that supplies **no** quarantine-anchor override: the OCI
+/// cross-repository blob mount and the cross-repository pull-dedup
+/// followers.
+///
+/// Distinct from [`INGEST_TRIGGER_SOURCE`] because the caller class is
+/// what separates a mount or a coalesced follower from an ordinary
+/// ingest in the audit trail. The literal had no CHECK entry until
+/// migration 036, which is why the mount answered `500` whenever the
+/// target repository's gate requested a scan.
+pub(crate) const REGISTER_BY_HASH_TRIGGER_SOURCE: &str = TriggerSource::RegisterByHash.as_str();
+
+/// `jobs.trigger_source` on the enqueues `register_by_hash` makes for a
+/// caller that **does** supply a quarantine-anchor override — the
+/// `hort-server seed-import` cutover, whose own `jobs` row carries the
+/// same literal.
+pub(crate) const SEED_IMPORT_TRIGGER_SOURCE: &str = TriggerSource::SeedImport.as_str();
 
 /// Request payload for [`IngestUseCase::ingest`].
 ///
@@ -4977,9 +4996,9 @@ impl IngestUseCase {
         // (ADR 0039's 2026-09-12 amendment, D1/D4), so the anchor this fn
         // stamps does not bound the provenance axis.
         let trigger_source = if quarantine_anchor_override.is_some() {
-            "seed-import"
+            SEED_IMPORT_TRIGGER_SOURCE
         } else {
-            "register-by-hash"
+            REGISTER_BY_HASH_TRIGGER_SOURCE
         };
 
         let matched_policy: Option<ScanPolicyProjection> =

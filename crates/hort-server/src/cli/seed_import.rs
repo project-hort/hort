@@ -69,7 +69,7 @@ use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
 use hort_domain::entities::repository::RepositoryFormat;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::ContentHash;
 
@@ -84,12 +84,15 @@ use crate::{pg_identity, telemetry};
 /// per-row `actor_id` attribution (which stays a separate larger ask
 /// — see the module docstring).
 ///
-/// Constraint: the literal must match the `'seed-import'` arm in
-/// `009_scan_jobs_and_findings.sql`'s `trigger_source` CHECK. The
-/// `constants_match_init33_trigger_source_ranking` test below pins
-/// both the literal and the priority so a future rename has to
-/// touch the test in lock-step with the CHECK.
-const SEED_IMPORT_TRIGGER_SOURCE: &str = "seed-import";
+/// Constraint: the literal is taken from the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]), so it
+/// cannot be a value the `jobs.trigger_source` CHECK refuses — the SQL
+/// side is bound to that type over the *effective* list by
+/// `crates/hort-adapters-postgres/tests/jobs_trigger_source_check_lockstep_guard.rs`.
+/// The `constants_match_init33_trigger_source_ranking` test below still
+/// pins both the wire literal and the priority, so a rename of the
+/// variant has to touch that test too.
+const SEED_IMPORT_TRIGGER_SOURCE: &str = TriggerSource::SeedImport.as_str();
 
 /// `jobs.kind` of the row this subcommand enqueues. The ordinal it
 /// carries is not named here: it is decided from `(kind,

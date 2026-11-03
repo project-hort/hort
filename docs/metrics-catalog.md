@@ -3535,7 +3535,7 @@ the OSV bulk diff).
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
-| `hort_scan_jobs_enqueued_total` | counter | `trigger_source` | — | `trigger_source ∈ {ingest, cron, advisory, manual}` — exact mirror of the SQL CHECK on `jobs.trigger_source` |
+| `hort_scan_jobs_enqueued_total` | counter | `trigger_source` | — | `trigger_source ∈ {ingest, cron, advisory, manual}` — a deliberate subset of the `jobs.trigger_source` value set (`TriggerSourceLabel`; the counter fires from the four `enqueue_scan` producers only) |
 | `hort_advisory_diff_processed_total` | counter | `ecosystem`, `result` | — | OSV bulk-archive ecosystem labels (`npm`, `PyPI`, `crates.io`, `Maven`, `Go`, `RubyGems`, `NuGet`, `Packagist`, `Hex`, `Pub`, `Conda`); `result ∈ {ok, fetch_error, parse_error, timeout, incomplete}` |
 | `hort_advisory_diff_duration_seconds` | histogram | `ecosystem` | seconds | per OSV bulk-archive ecosystem label |
 | `hort_cron_rescan_eligible_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation; operator alarms on sustained `> batch_size` (cron loop can't keep up) |
@@ -3546,7 +3546,7 @@ the OSV bulk diff).
 | `hort_patch_candidates_listed_total` | counter | `repository`, `result` | — | `repository ∈ {"_all", <key>}` for v1: `_all` for an unscoped read (no `?repository` filter), the resolved repository key when the handler successfully resolved `?repository=<key>` to a row. `"unknown"` is reserved for future non-HTTP / dispatcher paths — the HTTP handler short-circuits to 404 on lookup failure before reaching the use case. `result ∈ {ok, denied, invalid, error}` |
 
 Source of truth for the result enums:
-- `hort_app::metrics::TriggerSourceLabel` for `hort_scan_jobs_enqueued_total.trigger_source`. Mirrors `hort_domain::ports::jobs_repository::TriggerSource` (the SQL wire form). The two MUST agree — a drift is enforced as a compile-equality test.
+- `hort_app::metrics::TriggerSourceLabel` for `hort_scan_jobs_enqueued_total.trigger_source`. A deliberate 4-value **subset** of `hort_domain::ports::jobs_repository::TriggerSource` (the one definition of the `jobs.trigger_source` value set): the counter fires from the four `enqueue_scan` producers only. The wire strings are not re-typed — `TriggerSourceLabel::as_str` reads the literal off the domain variant its `source()` selects — and `trigger_source_label_values_are_all_members_of_the_domain_set` pins the subset relation in both directions.
 - `hort_app::metrics::AdvisoryDiffResult` for `hort_advisory_diff_processed_total.result`.
 - `hort_app::metrics::PatchCandidateListResult` for `hort_patch_candidates_listed_total.result` (operator-action signal for `GET /admin/quarantine/patch-candidates`).
 - `hort_app::metrics::PolicyReEvaluationResult` for `hort_policy_reevaluation_artifacts_total.result` (the async scan-policy re-evaluation outcome — ADR 0041).

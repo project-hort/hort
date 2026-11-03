@@ -64,16 +64,17 @@ use uuid::Uuid;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::error::DomainError;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::types::task_tier::scan_queue_priority;
 
 use crate::error::{AppError, AppResult};
 use crate::metrics::{emit_scan_jobs_enqueued, TriggerSourceLabel};
 use crate::use_cases::repository_access::{AccessLevel, RepositoryAccessUseCase};
 
-/// `trigger_source` literal for manual rescans
-/// ([`hort_domain::ports::jobs_repository::TriggerSource::Manual`]).
-const MANUAL_TRIGGER_SOURCE: &str = "manual";
+/// `trigger_source` literal for manual rescans, taken from the one
+/// definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]).
+const MANUAL_TRIGGER_SOURCE: &str = TriggerSource::Manual.as_str();
 
 /// Application use case for the manual rescan endpoint.
 pub struct ManualRescanUseCase {

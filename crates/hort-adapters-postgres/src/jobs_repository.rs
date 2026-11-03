@@ -653,6 +653,31 @@ fn row_to_scan_job(row: &sqlx::postgres::PgRow) -> DomainResult<ScanJob> {
             "jobs row {id}: priority {priority_i16} outside u8 range"
         ))
     })?;
+    // A `kind='scan'` row is accepted with ANY globally valid trigger
+    // source — the whole of `TriggerSource::ALL`, not a scan-specific
+    // subset — and that is a decision rather than an oversight.
+    //
+    // The schema admits the combination: the `jobs_trigger_source_check`
+    // IN-list is not conditioned on `kind`, and the `enqueue_scan` port
+    // method takes an unrestricted `&str`. So a scan row carrying
+    // `'prefetch'`, `'self_service'` or `'scheduled'` is constructible
+    // today even though no current producer writes one (the self-service
+    // and tick producers enqueue prefetch kinds, the cascade enqueues
+    // prefetch or prefetch-dependencies).
+    //
+    // Rejecting those here would reintroduce, kind-scoped, the defect
+    // this mapper was fixed for when it knew only four of the nine
+    // literals: a scan row the column accepts, a producer can write, and
+    // the claim path refuses — a row that cannot be claimed. And a
+    // refusal here fails the WHOLE claim batch, not only the offending
+    // row. Weigh the two failures: a mislabelled
+    // scan that RUNS leaves an audit inaccuracy, while a scan that does
+    // not run leaves an artifact ungated. For a scanning system the
+    // second is worse, so the read side accepts what the schema accepts.
+    //
+    // What stays rejected is a literal outside the set entirely — that
+    // is schema drift, not a mislabel, and there is no gate to lose by
+    // refusing a row no migration in the chain can have produced.
     let trigger_source_str: String = row.try_get("trigger_source").map_err(|e| invariant(&e))?;
     let trigger_source = TriggerSource::from_str(&trigger_source_str).map_err(|e| {
         DomainError::Invariant(format!(
@@ -1229,9 +1254,11 @@ impl JobsRepository for PgJobsRepository {
             //
             // Columns explicitly set: `kind` (migration-009 CHECK
             // includes `'verify-event-chain'`), `status='completed'`
-            // (CHECK IN-list), `trigger_source='scheduled'` (a valid
-            // migration-009 CHECK literal — the CronJob is the scheduled
-            // driver), and `completed_at` (the run timestamp). The
+            // (CHECK IN-list), `trigger_source` (bound from
+            // `TriggerSource::Scheduled` — the CronJob is the scheduled
+            // driver, and taking the literal from the one definition of
+            // the set keeps this statement from being a place the set is
+            // re-spelled), and `completed_at` (the run timestamp). The
             // remaining NOT NULL columns ride their schema DEFAULTs:
             // `params` → `'{}'::jsonb`, `priority` → 0 (CHECK 0..=100),
             // `attempts` → 0, `created_at`/`updated_at` → now(). No
@@ -1240,9 +1267,10 @@ impl JobsRepository for PgJobsRepository {
             sqlx::query(
                 "INSERT INTO public.jobs\n\
                      (kind, status, trigger_source, completed_at)\n\
-                 VALUES ($1, 'completed', 'scheduled', $2)",
+                 VALUES ($1, 'completed', $2, $3)",
             )
             .bind(&kind)
+            .bind(TriggerSource::Scheduled.as_str())
             .bind(at)
             .execute(&self.pool)
             .await

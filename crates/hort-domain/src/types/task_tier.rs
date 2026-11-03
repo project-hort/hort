@@ -41,6 +41,20 @@
 //! rather than apologising for it — so the change that removes it has to
 //! delete an assertion.
 //!
+//! # The trigger-source vocabulary is not this module's
+//!
+//! Both faces key on `jobs.trigger_source`, and the set that column may
+//! hold is defined once, in
+//! [`ports::jobs_repository::TriggerSource`](crate::ports::jobs_repository::TriggerSource).
+//! This module held its own private copy of the set for one release,
+//! because the public type then named four of the CHECK's eight literals
+//! and widening it would have changed what two scan-row read paths
+//! accept — a behaviour change, and not that release's business. The
+//! copy is gone: a copy is how the set came to be written down three
+//! times with no two agreeing. Both matches below are wildcard-free over
+//! the one type, so a new literal has to be given a tier and an ordinal
+//! here before the build passes.
+//!
 //! # Scope of the vocabulary
 //!
 //! A tier is a property of work the dispatcher schedules. `kind =
@@ -49,6 +63,8 @@
 //! registration, its row is a liveness breadcrumb inserted `status =
 //! 'completed'` by the `hort-server verify-event-chain` subcommand, and
 //! nothing ever claims it. It gets no branch here for that reason.
+
+use crate::ports::jobs_repository::TriggerSource;
 
 // ---------------------------------------------------------------------------
 // Kind literals this module's tables key on
@@ -86,9 +102,16 @@ const KIND_QUARANTINE_RELEASE_SWEEP: &str = "quarantine-release-sweep";
 /// Recognising nothing is the safe answer here: the column's `CHECK
 /// (priority BETWEEN 0 AND 100)` and the claim query's `ORDER BY priority
 /// DESC` make `0` the *last* row claimed, so an unparseable trigger
-/// source cannot displace anything. It is also the value such a row
-/// already carries today, because the only producer writing a
-/// trigger source outside the CHECK writes this number too.
+/// source cannot displace anything.
+///
+/// No producer in the tree writes a trigger source this module cannot
+/// parse — [`TriggerSource`] is the set and the writers' constants are
+/// defined from it — so the fallback is reached only by a row written by
+/// a binary whose set was wider, or edited by hand. It was reachable from
+/// production until `'register-by-hash'` joined the set, and that
+/// producer wrote this same number, which is why
+/// [`TriggerSource::RegisterByHash`] maps here explicitly: the ordinal a
+/// mount's enqueue carries is unchanged by it becoming parseable.
 const SCHEMA_DEFAULT_PRIORITY: i16 = 0;
 
 /// Ordinal for an advisory-driven rescan. Below cron deliberately: the
@@ -164,11 +187,11 @@ impl TaskTier {
     /// value only a newer writer would produce.
     ///
     /// `None` means "this row does not classify" — its `trigger_source`
-    /// is not one of the migration-009 CHECK literals. A row like that
-    /// does not acquire a tier by default, which is why the match below
-    /// has no wildcard arm: a ninth CHECK literal has to be added to
-    /// [`TriggerSource`] to be parsed at all, and adding it there fails
-    /// the build here until somebody decides which class it belongs to.
+    /// is not one of [`TriggerSource::ALL`]. A row like that does not
+    /// acquire a tier by default, which is why the match below has no
+    /// wildcard arm: a new literal has to be added to [`TriggerSource`]
+    /// to be parsed at all, and adding it there fails the build here
+    /// until somebody decides which class it belongs to.
     pub fn classify(kind: &str, trigger_source: &str) -> Option<Self> {
         // D3: the path that makes an artifact available is client-waited
         // even when it is scheduled. Read before the trigger source, so
@@ -177,11 +200,13 @@ impl TaskTier {
         if kind == KIND_QUARANTINE_RELEASE_SWEEP {
             return Some(Self::Interactive);
         }
-        Some(match TriggerSource::parse(trigger_source)? {
+        Some(match trigger_source.parse::<TriggerSource>().ok()? {
             // A client pushed, or pulled through, and the gates this
             // enqueues are what stand between those bytes and being
-            // served.
-            TriggerSource::Ingest => Self::Interactive,
+            // served. `RegisterByHash` is the same claim through a
+            // different door: a cross-repository mount or a pull-dedup
+            // follower is a client request waiting on its 201.
+            TriggerSource::Ingest | TriggerSource::RegisterByHash => Self::Interactive,
             // An operator asked and is reading the answer.
             TriggerSource::Manual | TriggerSource::SeedImport | TriggerSource::SelfService => {
                 Self::Normal
@@ -212,7 +237,7 @@ impl TaskTier {
 /// reason [`TaskTier::classify`]'s does not: a new CHECK literal must
 /// make a decision here, not inherit one.
 pub fn queue_priority(kind: &str, trigger_source: &str) -> i16 {
-    let Some(source) = TriggerSource::parse(trigger_source) else {
+    let Ok(source) = trigger_source.parse::<TriggerSource>() else {
         return SCHEMA_DEFAULT_PRIORITY;
     };
     match source {
@@ -249,6 +274,11 @@ pub fn queue_priority(kind: &str, trigger_source: &str) -> i16 {
         TriggerSource::Prefetch | TriggerSource::SelfService | TriggerSource::Scheduled => {
             SCHEMA_DEFAULT_PRIORITY
         }
+        // The mount / pull-dedup-follower registration. The schema
+        // default is the number this path already wrote: before the
+        // literal joined the CHECK it did not parse, so it fell to the
+        // `else` above and took this value.
+        TriggerSource::RegisterByHash => SCHEMA_DEFAULT_PRIORITY,
     }
 }
 
@@ -265,85 +295,23 @@ pub fn scan_queue_priority(trigger_source: &str) -> i16 {
     queue_priority(KIND_SCAN, trigger_source)
 }
 
-// ---------------------------------------------------------------------------
-// TriggerSource
-// ---------------------------------------------------------------------------
-
-/// Closed mirror of the `jobs.trigger_source` CHECK (migration 009), so
-/// that both tables above can match over it exhaustively.
-///
-/// Deliberately **not**
-/// [`ports::jobs_repository::TriggerSource`](crate::ports::jobs_repository::TriggerSource),
-/// which covers four of the eight CHECK literals — its `FromStr` rejects
-/// `'seed-import'`, `'prefetch'`, `'self_service'` and `'scheduled'` —
-/// and is parsed only off a `kind = 'scan'` row. Widening that type would
-/// change what two scan-row read paths accept, which is a behaviour
-/// change and not this module's business; narrowing the tier derivation
-/// to its four literals would leave half the queue unclassifiable.
-///
-/// Private on purpose: it exists to give the two public functions an
-/// exhaustive match, not to become a second trigger-source vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TriggerSource {
-    /// `'ingest'` — an ingest, a pull-through, or a hook on one.
-    Ingest,
-    /// `'cron'` — the rescan tick and the `enqueue-*` CronJobs.
-    Cron,
-    /// `'advisory'` — the advisory-watch sweep.
-    Advisory,
-    /// `'manual'` — an admin task invoke, a manual rescan, a
-    /// gitops-driven policy re-evaluation.
-    Manual,
-    /// `'seed-import'` — the `hort-server seed-import` subcommand.
-    SeedImport,
-    /// `'prefetch'` — a row the transitive prefetch cascade spawned for
-    /// itself.
-    Prefetch,
-    /// `'self_service'` — the operator-initiated `hort-cli prefetch`
-    /// root.
-    SelfService,
-    /// `'scheduled'` — the prefetch tick's root enqueues.
-    Scheduled,
-}
-
-impl TriggerSource {
-    /// Parse a `jobs.trigger_source` cell. `None` for anything outside
-    /// the CHECK.
-    fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "ingest" => Self::Ingest,
-            "cron" => Self::Cron,
-            "advisory" => Self::Advisory,
-            "manual" => Self::Manual,
-            "seed-import" => Self::SeedImport,
-            "prefetch" => Self::Prefetch,
-            "self_service" => Self::SelfService,
-            "scheduled" => Self::Scheduled,
-            _ => return None,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every literal in the migration-009 `jobs.trigger_source` CHECK, in
-    /// the order the migration lists them.
+    /// Every literal `jobs.trigger_source` may hold, read off the one
+    /// definition rather than re-typed.
     ///
-    /// Re-typed here rather than imported because the CHECK is SQL: this
-    /// list is the test's own statement of what the column may hold, and
-    /// it is what makes "every CHECK literal classifies" checkable.
-    const CHECK_TRIGGER_SOURCES: &[&str] = &[
-        "manual",
-        "cron",
-        "advisory",
-        "ingest",
-        "seed-import",
-        "prefetch",
-        "self_service",
-        "scheduled",
-    ];
+    /// It used to be re-typed here, on the argument that the CHECK is SQL
+    /// and the test owed the reader its own statement of the column's
+    /// contents. That argument is spent: the set is now
+    /// [`TriggerSource`], the SQL CHECK is checked against it by
+    /// `jobs_trigger_source_check_lockstep_guard`, and a local copy would
+    /// only let this module's tests keep passing over a set the column no
+    /// longer has.
+    fn check_trigger_sources() -> Vec<&'static str> {
+        TriggerSource::ALL.iter().map(|v| v.as_str()).collect()
+    }
 
     /// Every literal in the `jobs.kind` CHECK as migration 027 leaves it.
     const CHECK_KINDS: &[&str] = &[
@@ -460,7 +428,7 @@ mod tests {
     /// make twenty-four assertions vacuously true.
     #[test]
     fn the_ordinal_table_is_not_uniformly_the_schema_default() {
-        let answers: Vec<i16> = CHECK_TRIGGER_SOURCES
+        let answers: Vec<i16> = check_trigger_sources()
             .iter()
             .map(|s| queue_priority("scan", s))
             .collect();
@@ -485,7 +453,7 @@ mod tests {
     /// literal — so a producer using it is not on a second table.
     #[test]
     fn scan_queue_priority_agrees_with_the_general_table() {
-        for source in CHECK_TRIGGER_SOURCES {
+        for source in check_trigger_sources() {
             assert_eq!(
                 scan_queue_priority(source),
                 queue_priority("scan", source),
@@ -506,7 +474,7 @@ mod tests {
     /// nothing a newer writer would have had to put there.
     #[test]
     fn every_check_trigger_source_classifies() {
-        for source in CHECK_TRIGGER_SOURCES {
+        for source in check_trigger_sources() {
             for kind in CHECK_KINDS {
                 assert!(
                     TaskTier::classify(kind, source).is_some(),
@@ -516,15 +484,18 @@ mod tests {
         }
     }
 
-    /// A `trigger_source` outside the CHECK does not acquire a tier, and
+    /// A `trigger_source` outside the set does not acquire a tier, and
     /// takes the schema default ordinal.
     ///
-    /// `"register-by-hash"` is not hypothetical: `register_by_hash`
-    /// stamps it on the enqueues of a mount or follower registration,
-    /// and it is absent from the CHECK.
+    /// No producer in the tree writes one any more —
+    /// `"register-by-hash"` used to be the live exemplar here and is now
+    /// in the set — so the inputs below are the shapes a hand-edited row
+    /// or a wider future writer could present: a retired literal
+    /// (`"api"`), the empty string, a wrong case, and the underscored
+    /// near-miss of a real literal.
     #[test]
     fn an_unknown_trigger_source_acquires_no_tier() {
-        for source in ["register-by-hash", "api", "", "Cron", "advisory_watch"] {
+        for source in ["api", "", "Cron", "advisory_watch", "self-service"] {
             assert_eq!(
                 TaskTier::classify("scan", source),
                 None,
@@ -536,6 +507,44 @@ mod tests {
                 "{source:?} got an ordinal other than the schema default"
             );
         }
+    }
+
+    /// `'register-by-hash'` — the literal admitted into the set when the
+    /// OCI cross-repository mount's `500` was fixed.
+    ///
+    /// Two separate claims, and only the first is a change:
+    ///
+    /// - it now **classifies**, as [`TaskTier::Interactive`]. A mount is
+    ///   a client request waiting on its `201`, so it belongs with the
+    ///   ingest-time gates rather than with the background sweeps. Before
+    ///   the literal joined the set it did not parse and `classify`
+    ///   answered `None`.
+    /// - its **ordinal is unchanged**: the schema default, which is
+    ///   exactly what the unparseable literal already fell through to.
+    ///   `SELECT priority FROM jobs` for a mount's freshly enqueued scan
+    ///   is byte-identical across this change.
+    #[test]
+    fn register_by_hash_is_interactive_and_keeps_the_schema_default_ordinal() {
+        assert_eq!(
+            TaskTier::classify("scan", "register-by-hash"),
+            Some(TaskTier::Interactive)
+        );
+        assert_eq!(
+            TaskTier::classify("provenance-verify", "register-by-hash"),
+            Some(TaskTier::Interactive)
+        );
+        assert_eq!(
+            queue_priority("scan", "register-by-hash"),
+            SCHEMA_DEFAULT_PRIORITY
+        );
+        assert_eq!(
+            queue_priority("provenance-verify", "register-by-hash"),
+            SCHEMA_DEFAULT_PRIORITY
+        );
+        assert_eq!(
+            scan_queue_priority("register-by-hash"),
+            SCHEMA_DEFAULT_PRIORITY
+        );
     }
 
     /// The trigger axis, per CHECK literal.
@@ -606,7 +615,7 @@ mod tests {
     /// scheduled tasks".
     #[test]
     fn the_release_sweep_is_client_waited_even_when_scheduled() {
-        for source in CHECK_TRIGGER_SOURCES {
+        for source in check_trigger_sources() {
             assert_eq!(
                 TaskTier::classify("quarantine-release-sweep", source),
                 Some(TaskTier::Interactive),
@@ -686,16 +695,24 @@ mod tests {
         assert!(!set.insert(TaskTier::Normal));
     }
 
+    /// This module reads the trigger source through the one definition's
+    /// [`FromStr`](std::str::FromStr), not through a local parse of its
+    /// own — so the set it keys on cannot be a release behind the
+    /// column's.
+    ///
+    /// Kept after the private mirror was deleted because it is the pin
+    /// on *which* parse the two tables use: a reintroduced local
+    /// `fn parse` would keep every other test in this file green.
     #[test]
     fn trigger_source_parses_every_check_literal_and_nothing_else() {
-        for source in CHECK_TRIGGER_SOURCES {
+        for source in check_trigger_sources() {
             assert!(
-                TriggerSource::parse(source).is_some(),
+                source.parse::<TriggerSource>().is_ok(),
                 "{source} does not parse"
             );
         }
-        assert_eq!(TriggerSource::parse("seedimport"), None);
-        assert_eq!(TriggerSource::parse("self-service"), None);
+        assert!("seedimport".parse::<TriggerSource>().is_err());
+        assert!("self-service".parse::<TriggerSource>().is_err());
         // Copy + Debug + Eq, so the two tables can match on it by value.
         let s = TriggerSource::Cron;
         assert_eq!(s, s);
