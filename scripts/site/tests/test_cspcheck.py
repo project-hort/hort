@@ -15,6 +15,7 @@ import unittest
 SCRIPT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPT_ROOT))
 import cspcheck
+import linkcheck
 
 CLEAN = (
     '<!doctype html><html lang="en"><head><title>t</title>'
@@ -141,6 +142,17 @@ class CheckTests(unittest.TestCase):
                 'src="assets/landing-2.js"', 'src="https://cdn.example/x.js"'),
                 assets=('landing.css', 'landing-1.js'))
             self.assertTrue(run(lambda: cspcheck.check(site))[0])
+
+    def test_protocol_relative_script_is_rejected_by_link_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            site = self._site(tmp, CLEAN.replace(
+                'src="assets/landing-2.js"', 'src="//cdn.example/app.js"'),
+                assets=('landing.css', 'landing-1.js'))
+            self.assertTrue(run(lambda: cspcheck.check(site))[0])
+            ok, report = run(lambda: linkcheck.check(site))
+            self.assertFalse(ok, report)
+            self.assertIn('external asset reference not allowed: '
+                          '//cdn.example/app.js', report)
 
     def test_empty_tree_fails_rather_than_reporting_a_vacuous_zero(self):
         with tempfile.TemporaryDirectory() as tmp:

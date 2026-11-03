@@ -137,7 +137,7 @@ def check(site_dist):
             errors.append(f"{label}/{rel}:{line}: {description}")
         for line, kind, url in references:
             if url.startswith(("http://", "https://", "//")):
-                continue  # linkcheck owns the no-external-asset rule
+                continue  # Remote references have no path in the built tree.
             # Same resolver linkcheck uses, so a root-relative asset
             # reference is anchored at the site root rather than the
             # filesystem root.

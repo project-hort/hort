@@ -68,10 +68,10 @@ def check(dist):
         id_cache[path] = ids_here
 
         # No CDN / external assets: every <link>/<script> tag's href/src
-        # must be same-origin-relative (never http(s)://).
+        # must be same-origin-relative (never http(s):// or //).
         for tag in _LINK_TAG_RE.findall(content) + _SCRIPT_TAG_RE.findall(content):
             m = re.search(r'(?:href|src)="([^"]+)"', tag)
-            if m and m.group(1).startswith(("http://", "https://")) and 'rel="canonical"' not in tag:
+            if m and m.group(1).startswith(("http://", "https://", "//")) and 'rel="canonical"' not in tag:
                 errors.append(f"{rel}: external asset reference not allowed: {m.group(1)}")
 
         # Static diagrams must be present in the published site (no remote

@@ -34,6 +34,7 @@ fi
 # configured registry files. Only the longest matching registry prefix applies.
 registry_rows=()
 mirror_rows=()
+pending_mirrors=()
 declare -A aliases=() alias_files=()
 section=""
 prefix=""
@@ -43,15 +44,22 @@ policy=""
 flush_mirror() {
     local source="${prefix:-${location}}"
     if [[ -n "${source}" && -n "${mirror}" && "${policy}" != tag-only ]]; then
-        mirror_rows+=("${source}|${mirror}")
+        pending_mirrors+=("${source}|${mirror}")
     fi
     mirror="" policy=""
 }
 flush_registry() {
     local source="${prefix:-${location}}"
+    local row
+    local -a retained_mirrors=()
     if [[ -n "${source}" ]]; then
         registry_rows+=("${source}|${location:-${source}}")
+        for row in "${mirror_rows[@]}"; do
+            [[ "${row%%|*}" == "${source}" ]] || retained_mirrors+=("${row}")
+        done
+        mirror_rows=("${retained_mirrors[@]}" "${pending_mirrors[@]}")
     fi
+    pending_mirrors=()
 }
 for file in "${config_files[@]}"; do
     if [[ ! -r "${file}" ]]; then
@@ -112,7 +120,7 @@ resolve_url() {
     for row in "${registry_rows[@]}"; do
         IFS='|' read -r source location <<< "${row}"
         if [[ "${repo}" == "${source}"/* || "${repo}" == "${source}" ]]; then
-            if ((${#source} > ${#selected_prefix})); then
+            if ((${#source} >= ${#selected_prefix})); then
                 selected_prefix="${source}"
                 selected_location="${location}"
             fi
