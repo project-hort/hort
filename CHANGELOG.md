@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A held artifact now records whether the publisher must sign it, sign its
+  parent, or wait for an operator to repair verification. Subscribers to
+  provenance event types will begin receiving `ProvenanceHeld` events (#400).
 - A failed admin task now writes a `TaskFailed` audit event alongside its
   `jobs` row, so a failure outlives the row's 7-day retention; subscribers to
   the task event types will begin receiving it (#331).
@@ -36,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retention previews now identify missing reclaimable content by hash separately
+  from storage failures. Release preflight now names terminal rejection and
+  its re-scan or curator-waiver recovery paths when a dependency remains
+  absent after warming and quarantine (#400).
+- The curation queue now distinguishes an unscanned artifact from a clean
+  scan and identifies OCI blobs and manifests by path. On
+  `GET /api/v1/admin/curation/queue` each row gains a `path`, and
+  `finding_count` is **absent** rather than `0` for an artifact that has never
+  been scanned — a client that reads it as a required field needs updating
+  (#400).
 - The OCI cross-repository blob mount
   (`POST /v2/<name>/blobs/uploads/?mount=…&from=…`, used by `skopeo copy` and
   cross-repository re-tagging) answered `500` whenever the target repository's

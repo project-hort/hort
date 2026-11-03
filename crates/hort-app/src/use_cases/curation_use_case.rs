@@ -3043,10 +3043,11 @@ mod tests {
             format: RepositoryFormat::Npm,
             package_name: "evil-pkg".into(),
             version: Some("1.0.0".into()),
+            path: "evil-pkg/-/evil-pkg-1.0.0.tgz".into(),
             quarantine_status: QuarantineStatus::Quarantined,
             quarantine_window_start: DateTime::<Utc>::from_timestamp(1_700_000_000, 0),
             quarantine_deadline: DateTime::<Utc>::from_timestamp(1_700_086_400, 0),
-            finding_count: 3,
+            finding_count: Some(3),
             max_severity: None,
             rejection_reason_kind: None,
         }

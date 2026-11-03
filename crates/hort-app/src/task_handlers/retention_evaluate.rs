@@ -154,7 +154,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use hort_domain::error::DomainResult;
+use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::retention_candidate_reader::RetentionCandidateReader;
 use hort_domain::ports::retention_policy_projection_repository::RetentionPolicyProjectionRepository;
@@ -868,23 +868,30 @@ fn proposal_digest(scope: &str, pairs: &ProposalPairs) -> serde_json::Value {
 async fn sum_target_sizes(
     storage: &dyn StoragePort,
     hashes: Vec<ContentHash>,
-) -> Result<u64, &'static str> {
+) -> Result<u64, String> {
     let mut probes = futures::stream::iter(hashes)
-        .map(|hash| async move { storage.size_of(&hash).await })
+        .map(|hash| async move { (hash.clone(), storage.size_of(&hash).await) })
         .buffer_unordered(SIZE_PROBE_CONCURRENCY);
 
     let mut total: u128 = 0;
-    while let Some(outcome) = probes.next().await {
+    while let Some((hash, outcome)) = probes.next().await {
         match outcome {
             Ok(size) => total = total.saturating_add(u128::from(size)),
             Err(error) => {
-                tracing::warn!(error = %error, "retention dry-run storage size lookup failed");
-                return Err("a reclaimable target size was unavailable");
+                tracing::warn!(hash = %hash, error = %error, "retention dry-run storage size lookup failed");
+                return Err(match error {
+                    DomainError::NotFound {
+                        entity: "content", ..
+                    } => {
+                        format!("reclaimable target {hash} is missing from storage")
+                    }
+                    _ => format!("storage did not answer for reclaimable target {hash}: {error}"),
+                });
             }
         }
     }
 
-    u64::try_from(total).map_err(|_| "byte total overflowed u64")
+    u64::try_from(total).map_err(|_| "byte total overflowed u64".to_string())
 }
 
 /// Phrase a bound rejection so the operator can act on it: which ceiling, what
@@ -1170,6 +1177,7 @@ mod tests {
     struct InertStorage {
         sizes: std::collections::HashMap<ContentHash, u64>,
         fail_size: bool,
+        missing_size: Option<ContentHash>,
         /// When set, only this target's probe fails and every other one
         /// answers from `sizes`. Lets one run carry both a failing probe and
         /// a sum that would overflow, which is what pins which verdict wins.
@@ -1187,6 +1195,12 @@ mod tests {
         fn failing() -> Self {
             Self {
                 fail_size: true,
+                ..Default::default()
+            }
+        }
+        fn missing(hash: ContentHash) -> Self {
+            Self {
+                missing_size: Some(hash),
                 ..Default::default()
             }
         }
@@ -1252,6 +1266,12 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                if self.missing_size.as_ref() == Some(&hash) {
+                    return Err(DomainError::NotFound {
+                        entity: "content",
+                        id: hash.to_string(),
+                    });
+                }
                 if self.fail_size || self.fail_only.as_ref() == Some(&hash) {
                     return Err(DomainError::Invariant("size unavailable".into()));
                 }
@@ -2034,6 +2054,45 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("size"));
+    }
+
+    #[tokio::test]
+    async fn preview_distinguishes_missing_target_from_store_failure_without_partial_bytes() {
+        let hash = hash_n(7);
+        let preview = || {
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![
+                hash.clone()
+            ])))
+        };
+        let missing = preview_handler(preview(), Arc::new(InertStorage::missing(hash.clone())))
+            .build_preview(Utc::now(), &[])
+            .await;
+        let unavailable = preview_handler(preview(), Arc::new(InertStorage::failing()))
+            .build_preview(Utc::now(), &[])
+            .await;
+
+        for outcome in [&missing, &unavailable] {
+            assert_eq!(outcome["freed_bytes"]["status"], "omitted");
+            assert!(outcome["freed_bytes"]["bytes"].is_null(), "{outcome}");
+        }
+        let missing_reason = missing["freed_bytes"]["reason"].as_str().expect("reason");
+        let unavailable_reason = unavailable["freed_bytes"]["reason"]
+            .as_str()
+            .expect("reason");
+        assert!(missing_reason.contains("missing"), "{missing_reason}");
+        assert!(
+            unavailable_reason.contains("storage did not answer"),
+            "{unavailable_reason}"
+        );
+        assert_ne!(missing_reason, unavailable_reason);
+        assert!(
+            missing_reason.contains(&hash.to_string()),
+            "{missing_reason}"
+        );
+        assert!(
+            unavailable_reason.contains(&hash.to_string()),
+            "{unavailable_reason}"
+        );
     }
 
     #[tokio::test]

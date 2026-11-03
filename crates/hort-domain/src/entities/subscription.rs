@@ -259,6 +259,7 @@ pub enum EventTypeKind {
     /// Provenance check (ADR 0027) rejected the
     /// artifact. Same (no-)repository-association posture.
     ProvenanceRejected,
+    ProvenanceHeld,
     ArtifactReEvaluated,
     PromotionRequested,
     PolicyEvaluated,
@@ -401,6 +402,7 @@ impl EventTypeKind {
             DomainEvent::ScanIndeterminate(_) => EventTypeKind::ScanIndeterminate,
             DomainEvent::ProvenanceVerified(_) => EventTypeKind::ProvenanceVerified,
             DomainEvent::ProvenanceRejected(_) => EventTypeKind::ProvenanceRejected,
+            DomainEvent::ProvenanceHeld(_) => EventTypeKind::ProvenanceHeld,
             DomainEvent::ArtifactReEvaluated(_) => EventTypeKind::ArtifactReEvaluated,
             DomainEvent::PromotionRequested(_) => EventTypeKind::PromotionRequested,
             DomainEvent::PolicyEvaluated(_) => EventTypeKind::PolicyEvaluated,
@@ -541,6 +543,9 @@ impl EventTypeKind {
                 DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
             }
             DomainEvent::ProvenanceRejected(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ProvenanceHeld(e) => {
                 DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
             }
             DomainEvent::ArtifactReEvaluated(e) => {

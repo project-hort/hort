@@ -324,7 +324,7 @@ async fn list_queue_returns_quarantined_artifact_with_findings() {
     assert_eq!(row.package_name, "pkg");
     assert_eq!(row.version.as_deref(), Some("1.0"));
     assert_eq!(row.quarantine_status, QuarantineStatus::Quarantined);
-    assert_eq!(row.finding_count, 1);
+    assert_eq!(row.finding_count, Some(1));
     assert_eq!(row.max_severity, Some(SeverityThreshold::High));
     assert!(row.rejection_reason_kind.is_none());
     // Deadline = window_start + 86400 sec — verify it's the expected
@@ -1034,7 +1034,11 @@ async fn list_queue_finding_count_is_the_last_scan_not_the_union() {
         .iter()
         .find(|e| e.artifact_id == artifact)
         .expect("artifact in queue");
-    assert_eq!(entry.finding_count, 1, "the last scan found one finding");
+    assert_eq!(
+        entry.finding_count,
+        Some(1),
+        "the last scan found one finding"
+    );
     assert_eq!(
         entry.max_severity,
         Some(SeverityThreshold::Low),
@@ -1102,7 +1106,7 @@ async fn list_queue_clean_last_scan_reads_as_clean() {
         .iter()
         .find(|e| e.artifact_id == artifact)
         .expect("a clean-last-scan artifact still surfaces in the queue");
-    assert_eq!(entry.finding_count, 0);
+    assert_eq!(entry.finding_count, Some(0));
     assert_eq!(entry.max_severity, None);
 
     // The earlier scan's rows are still there — this unit removes no
@@ -1174,7 +1178,8 @@ async fn list_queue_last_scan_subset_is_the_subset_not_the_union() {
         .find(|e| e.artifact_id == artifact)
         .expect("artifact in queue");
     assert_eq!(
-        entry.finding_count, 1,
+        entry.finding_count,
+        Some(1),
         "a DISTINCT-shaped fix would answer 2 here"
     );
     assert_eq!(entry.max_severity, Some(SeverityThreshold::High));
@@ -1184,16 +1189,13 @@ async fn list_queue_last_scan_subset_is_the_subset_not_the_union() {
 
 #[tokio::test]
 #[serial(hort_pg_db)]
-async fn list_queue_never_scanned_artifact_reads_as_clean() {
+async fn list_queue_never_scanned_is_distinct_from_clean_scan() {
     let Some(pool) = maybe_pool().await else {
         return;
     };
     let repo_id = seed_repo(&pool, "npm").await;
     let now = truncate_us(Utc::now());
-    // No scan at all: `last_scan_at` is NULL, the anchor matches nothing,
-    // and `COALESCE(f.finding_count, 0)` has to render that as a clean row
-    // rather than dropping the artifact out of the queue.
-    let artifact = seed_artifact(
+    let unscanned = seed_artifact(
         &pool,
         repo_id,
         "pkg",
@@ -1203,6 +1205,17 @@ async fn list_queue_never_scanned_artifact_reads_as_clean() {
         Some(now - Duration::hours(1)),
     )
     .await;
+    let clean = seed_artifact(
+        &pool,
+        repo_id,
+        "pkg",
+        "2.0",
+        Some("quarantined"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+    seed_scan(&pool, clean, now, &[]).await;
 
     let adapter = PgCurationQueueRepository::new(pool.clone());
     let rows = adapter
@@ -1216,12 +1229,81 @@ async fn list_queue_never_scanned_artifact_reads_as_clean() {
         .await
         .expect("list_queue");
 
-    let entry = rows
+    let unscanned_entry = rows
         .iter()
-        .find(|e| e.artifact_id == artifact)
+        .find(|e| e.artifact_id == unscanned)
         .expect("a never-scanned quarantined artifact still surfaces");
-    assert_eq!(entry.finding_count, 0);
-    assert_eq!(entry.max_severity, None);
+    let clean_entry = rows
+        .iter()
+        .find(|e| e.artifact_id == clean)
+        .expect("a clean-scanned quarantined artifact still surfaces");
+    assert_eq!(unscanned_entry.finding_count, None);
+    assert_eq!(unscanned_entry.max_severity, None);
+    assert_eq!(clean_entry.finding_count, Some(0));
+    assert_eq!(clean_entry.max_severity, None);
+    assert_ne!(unscanned_entry.finding_count, clean_entry.finding_count);
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_oci_rows_carry_distinct_paths() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "oci").await;
+    let now = truncate_us(Utc::now());
+    let blob = seed_artifact(
+        &pool,
+        repo_id,
+        "library/nginx",
+        "",
+        Some("quarantined"),
+        now,
+        Some(now),
+    )
+    .await;
+    let manifest = seed_artifact(
+        &pool,
+        repo_id,
+        "library/nginx",
+        "",
+        Some("quarantined"),
+        now,
+        Some(now),
+    )
+    .await;
+    let blob_path = format!("blobs/sha256:{}", "a".repeat(64));
+    let manifest_path = format!("manifests/sha256:{}", "b".repeat(64));
+    for (id, path) in [(blob, &blob_path), (manifest, &manifest_path)] {
+        sqlx::query("UPDATE artifacts SET version = NULL, path = $1 WHERE id = $2")
+            .bind(path)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("set OCI coords");
+    }
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            ..CurationQueueFilter::default()
+        })
+        .await
+        .expect("list_queue");
+    let blob_entry = rows.iter().find(|e| e.artifact_id == blob).expect("blob");
+    let manifest_entry = rows
+        .iter()
+        .find(|e| e.artifact_id == manifest)
+        .expect("manifest");
+    assert_eq!(blob_entry.package_name, manifest_entry.package_name);
+    assert_eq!(blob_entry.version, None);
+    assert_eq!(manifest_entry.version, None);
+    assert_eq!(blob_entry.path, blob_path);
+    assert_eq!(manifest_entry.path, manifest_path);
+    assert_ne!(blob_entry.path, manifest_entry.path);
 
     cleanup_repo(&pool, repo_id).await;
 }

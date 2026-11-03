@@ -2588,8 +2588,8 @@ mod tests {
         // removed. The round trip itself must still pass for every one of
         // them; only this anti-silent-truncation tripwire is rebased.
         assert_eq!(
-            exercised, 71,
-            "expected all 71 DomainEvent test instances to be exercised, got {exercised}"
+            exercised, 72,
+            "expected all 72 DomainEvent test instances to be exercised, got {exercised}"
         );
     }
 }

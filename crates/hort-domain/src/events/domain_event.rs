@@ -9,8 +9,8 @@ use super::artifact_events::{
     ApprovalDecided, ApprovalRequested, ArtifactBecameVulnerable, ArtifactCorrupted,
     ArtifactDeleted, ArtifactExpired, ArtifactIngested, ArtifactPromoted, ArtifactPurged,
     ArtifactQuarantined, ArtifactReEvaluated, ArtifactRejected, ArtifactReleased, ChecksumMismatch,
-    ChecksumVerified, PolicyEvaluated, PromotionRejected, PromotionRequested, ProvenanceRejected,
-    ProvenanceVerified, ScanCompleted, ScanIndeterminate, ScanRequested,
+    ChecksumVerified, PolicyEvaluated, PromotionRejected, PromotionRequested, ProvenanceHeld,
+    ProvenanceRejected, ProvenanceVerified, ScanCompleted, ScanIndeterminate, ScanRequested,
 };
 use super::artifact_group_events::{
     ArtifactGroupInitiated, ArtifactGroupMemberAdded, ArtifactGroupMemberRemoved,
@@ -84,12 +84,14 @@ pub enum DomainEvent {
     /// `#[non_exhaustive]` enum.
     ProvenanceVerified(ProvenanceVerified),
     /// A provenance check (ADR 0027) rejected the
-    /// artifact (forged/untrusted signature, malformed bundle, or
-    /// unsigned-under-`Required`). Drives `QuarantineStatus -> Rejected`,
+    /// artifact (forged/untrusted signature or malformed bundle).
+    /// Drives `QuarantineStatus -> Rejected`,
     /// terminal under the release surfaces (like `ScanCompleted(findings)`).
     /// Lands on `StreamCategory::Artifact`. Additive on this
     /// `#[non_exhaustive]` enum.
     ProvenanceRejected(ProvenanceRejected),
+    /// A required-mode provenance hold, emitted once per change of reason.
+    ProvenanceHeld(ProvenanceHeld),
     /// Post-exclusion-add re-evaluation of a
     /// previously rejected artifact. Companion to the
     /// `ArtifactQuarantined` / `ArtifactReleased { PolicyReEvaluation }`
@@ -335,6 +337,7 @@ impl DomainEvent {
             Self::ScanIndeterminate(_) => "ScanIndeterminate",
             Self::ProvenanceVerified(_) => "ProvenanceVerified",
             Self::ProvenanceRejected(_) => "ProvenanceRejected",
+            Self::ProvenanceHeld(_) => "ProvenanceHeld",
             Self::ArtifactReEvaluated(_) => "ArtifactReEvaluated",
             Self::PromotionRequested(_) => "PromotionRequested",
             Self::PolicyEvaluated(_) => "PolicyEvaluated",
@@ -528,6 +531,7 @@ impl DomainEvent {
             | Self::ScanIndeterminate(_)
             | Self::ProvenanceVerified(_)
             | Self::ProvenanceRejected(_)
+            | Self::ProvenanceHeld(_)
             | Self::ArtifactReEvaluated(_)
             | Self::PromotionRequested(_)
             | Self::PolicyEvaluated(_)
@@ -617,6 +621,7 @@ impl DomainEvent {
             | Self::ScanIndeterminate(_)
             | Self::ProvenanceVerified(_)
             | Self::ProvenanceRejected(_)
+            | Self::ProvenanceHeld(_)
             | Self::ArtifactReEvaluated(_)
             | Self::PromotionRequested(_)
             | Self::PolicyEvaluated(_)
@@ -684,6 +689,7 @@ impl DomainEvent {
             Self::ScanIndeterminate(e) => e.validate(),
             Self::ProvenanceVerified(e) => e.validate(),
             Self::ProvenanceRejected(e) => e.validate(),
+            Self::ProvenanceHeld(e) => e.validate(),
             Self::ArtifactReEvaluated(e) => e.validate(),
             Self::PromotionRequested(e) => e.validate(),
             Self::PolicyEvaluated(e) => e.validate(),
@@ -756,8 +762,8 @@ pub(crate) mod tests {
     };
     use super::super::artifact_events::{
         ApprovalDecision, ArtifactCorrupted, ArtifactDeleted, ArtifactExpired, ArtifactPurged,
-        IngestSource, PolicyResult, ProvenanceRejected, ProvenanceVerified, ReEvaluationTrigger,
-        RejectionReason, ReleaseReason, ScanAssessment, SeveritySummary,
+        IngestSource, PolicyResult, ProvenanceHeld, ProvenanceRejected, ProvenanceVerified,
+        ReEvaluationTrigger, RejectionReason, ReleaseReason, ScanAssessment, SeveritySummary,
     };
     use super::super::artifact_group_events::{
         ArtifactGroupInitiated, ArtifactGroupMemberAdded, ArtifactGroupMemberRemoved,
@@ -795,7 +801,7 @@ pub(crate) mod tests {
     use crate::entities::repository::RepositoryFormat;
     use crate::entities::scan_policy::SeverityThreshold;
     use crate::entities::subscription::{DisableReason, SubscriptionDenialReason};
-    use crate::ports::provenance::{ProvenanceRejectReason, SignerIdentity};
+    use crate::ports::provenance::{ProvenanceHoldReason, ProvenanceRejectReason, SignerIdentity};
     use crate::retention::{
         ExpirationReason, PolicyPredicate, RetentionPolicyEvent, RetentionScope,
     };
@@ -810,7 +816,18 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    /// Returns the canonical 64-variant vector used to cover every
+    #[test]
+    fn provenance_hold_rejects_empty_backend() {
+        let event = DomainEvent::ProvenanceHeld(ProvenanceHeld {
+            artifact_id: Uuid::new_v4(),
+            content_hash: sha256(),
+            backend: String::new(),
+            reason: ProvenanceHoldReason::Indeterminate,
+        });
+        assert!(event.validate().is_err());
+    }
+
+    /// Returns the canonical one-instance-per-variant vector used to cover every
     /// `DomainEvent` match arm. Factored out so tests in sibling modules
     /// (e.g. `events::chain`) can reuse it without maintaining a second
     /// list. This is `pub(crate)` so it is reachable from `#[cfg(test)]`
@@ -928,6 +945,12 @@ pub(crate) mod tests {
                 content_hash: sha256(),
                 backend: "cosign".into(),
                 reason: ProvenanceRejectReason::UntrustedIdentity,
+            }),
+            DomainEvent::ProvenanceHeld(ProvenanceHeld {
+                artifact_id: Uuid::nil(),
+                content_hash: sha256(),
+                backend: "cosign".into(),
+                reason: ProvenanceHoldReason::PendingSignature,
             }),
             DomainEvent::ArtifactReEvaluated(ArtifactReEvaluated {
                 artifact_id: Uuid::nil(),

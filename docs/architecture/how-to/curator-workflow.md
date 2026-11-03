@@ -164,8 +164,9 @@ to.
 
 ```sh
 hort-cli curation queue --status quarantined --repo npm-proxy
-# Identify the artifact_id. Then look at its finding count and scan
-# status. A waive is appropriate when finding_count = 0 (clean scan)
+# Identify the artifact_id and, for OCI, the path. Then look at its
+# finding count and scan status. A waive is appropriate when
+# finding_count = 0 (a completed clean scan)
 # or the findings are known false-positives you intend to follow up
 # with --exclude-finding.
 ```
@@ -174,9 +175,9 @@ hort-cli curation queue --status quarantined --repo npm-proxy
 which is the same scan the release verdict is derived from. A finding an
 earlier scan reported and a later one did not is not counted here — the
 row is in the queue because of what is true now, not because of what was
-ever true. Both read `0` / empty for an artifact that has never been
-scanned, which is a different situation: `scan_status` is what tells the
-two apart.
+ever true. An artifact that has never been scanned shows `unscanned` in
+both finding columns instead of `0` / empty. OCI rows also show their
+stored path, which distinguishes blobs and manifests of the same image.
 
 **Issue the waive:**
 
