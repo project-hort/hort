@@ -28,8 +28,9 @@ policy-driven scanning, and an auditable, event-sourced artifact lifecycle.
   artifacts become available; indeterminate scan results do not silently pass.
 - **Tamper-evident event store.** Artifact lifecycle transitions are recorded as
   immutable domain events in per-stream cryptographic chains, making changes
-  to the event history detectable. Repository configuration, identities, and
-  permission grants are managed separately, not event-sourced.
+  to the event history detectable. Identity and permission-grant *decisions*
+  are recorded the same way; the configuration they produce is held as
+  ordinary state.
 - **Independent workers.** Scanning and background tasks run in separate
   `hort-worker` processes, allowing independent CPU and memory allocation.
 - **Configuration as code.** Define repositories, upstreams, policies, and

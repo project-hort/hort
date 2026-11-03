@@ -22,7 +22,7 @@ Hort's architecture is the as-built, authoritative design described below — a 
 ### Target Architecture (summary)
 
 - **Hexagonal / onion layering**: Domain layer (pure Rust, zero I/O) → application layer → outbound port traits → adapters (Postgres, S3, scanner, WASM host)
-- **Event-sourced artifact lifecycle**: All artifact state transitions produce immutable domain events (`ArtifactIngested`, `ArtifactQuarantined`, `ScanCompleted`, `ArtifactReleased`, `ArtifactPromoted`, etc.). Repository config, users, and RBAC stay CRUD.
+- **Event-sourced artifact lifecycle**: All artifact state transitions produce immutable domain events (`ArtifactIngested`, `ArtifactQuarantined`, `ScanCompleted`, `ArtifactReleased`, `ArtifactPromoted`, etc.). Repository configuration proper stays CRUD; the authorization and identity **decisions** that change it are events, because an authorization change needs the same append-only authorship trail as `ArtifactReleased` (see the architect guide's "Everything else that is event-sourced" table).
 - **Enforced CAS**: `StoragePort::put(stream) → ContentHash`. Streaming — SHA-256 computed incrementally, no buffering. Callers never supply storage keys. Content hash is always SHA-256 of the raw bytes.
 - **Mandatory upstream verification**: every pull-through fetch verifies a checksum (protocol-native digest for OCI, parsed upstream metadata for Cargo / PyPI / npm). No operator opt-in; a format that cannot verify cannot proxy. See ADR 0006.
 - **WASM format modules**: Format handlers (npm, PyPI, Maven, OCI, etc.) are deploy-time WASM modules loaded from `$WASM_PLUGIN_DIR`. Each declares capability groups in a manifest. OCI/Git LFS (stateful upload) may stay compiled-in as Tier C.
