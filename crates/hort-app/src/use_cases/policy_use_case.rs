@@ -9279,7 +9279,10 @@ mod tests {
         // stays at position 0, inside any capped read.
         let stream_id = StreamId::artifact(artifact_id);
         let mut over_cap = vec![persisted_scan_completed(artifact_id, 1, 0)];
-        over_cap.extend((1..201).map(|i| persisted_scan_completed(artifact_id, 1, i)));
+        over_cap.extend(
+            (1..crate::use_cases::STREAM_EVENT_CAP + 1)
+                .map(|i| persisted_scan_completed(artifact_id, 1, i)),
+        );
         events.seed_stream(stream_id, over_cap);
         artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
 

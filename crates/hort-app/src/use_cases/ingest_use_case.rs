@@ -2480,14 +2480,14 @@ impl IngestUseCase {
         // audit events forever. The workspace-wide `STREAM_EVENT_CAP`
         // is calibrated for *artifact* streams (finite lifecycle, ~5–10
         // events). Capping the audit stream silently drops
-        // `ChecksumMismatch` events past the 200th — exactly when an
+        // `ChecksumMismatch` events past that cap — exactly when an
         // audit trail matters most (sustained tampering = many events).
         // The "auditors run … get zero rows by design" invariant
         // requires uncapped emission on the repository aggregate.
         //
         // Issue #88: this unbounded stream must NOT derive its append
         // version from `read_unpaired_append_version`'s capped forward-scan —
-        // past 201 accumulated events (exactly the "sustained tampering"
+        // past the cap (exactly the "sustained tampering"
         // case above) that read returns a STALE position and every
         // subsequent append fails `Conflict` deterministically and
         // permanently (the #87-class bug, on this stream instead of the
@@ -15551,19 +15551,19 @@ mod tests {
     /// `ChecksumMismatch` audit events forever. The workspace-wide
     /// `STREAM_EVENT_CAP` (200) is calibrated for *artifact* streams
     /// (finite lifecycle, ~5–10 events); capping the audit stream would
-    /// silently drop mismatch events past the 200th — exactly when an
+    /// silently drop mismatch events past the cap — exactly when an
     /// audit trail matters most (sustained tampering = many events).
     ///
     /// Issue #88 revised the mechanism entirely: `append_repository_event`
     /// no longer calls `read_unpaired_append_version` (whose capped forward-scan
     /// is only correct for a *bounded* stream) at all — it appends at
     /// `ExpectedVersion::Any` with bounded conflict-retry. This test
-    /// drives 250 (`STREAM_EVENT_CAP + 50`) consecutive `ChecksumMismatch`
+    /// drives `STREAM_EVENT_CAP + 50` consecutive `ChecksumMismatch`
     /// appends and asserts every one succeeds AND that zero `read_stream`
     /// calls ever happen — the strongest possible pin against the
     /// capped-read staleness bug recurring on this stream (a real,
-    /// unbounded-past-201-events repository stream would have made every
-    /// append past #201 fail `Conflict` under the pre-#88 mechanism, since
+    /// repository stream past the cap would have made later appends fail
+    /// `Conflict` under the old mechanism, since
     /// that mechanism's version-number read was a truncated,
     /// increasingly-stale scan-from-start — see the mod.rs doc on
     /// `read_unpaired_append_version` for the full mechanism).

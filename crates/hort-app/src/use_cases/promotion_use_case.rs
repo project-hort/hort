@@ -903,7 +903,7 @@ mod tests {
         repos.insert(target);
 
         let stream_id = StreamId::artifact(artifact_id);
-        let over_cap: Vec<_> = (0..201)
+        let over_cap: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP + 1)
             .map(|i| dummy_persisted_with_event(&stream_id, i, dummy_scan_requested(artifact_id)))
             .collect();
         events.set_stream(&stream_id, over_cap);
@@ -915,7 +915,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            err.to_string().contains("200-event cap"),
+            err.to_string()
+                .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)),
             "the refusal must name the cap it is enforcing; got {err}"
         );
         assert!(

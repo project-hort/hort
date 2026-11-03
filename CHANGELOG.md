@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Artifact scan subscribers now receive `ScanCompleted` and its policy verdict
+  only when findings or the policy decision change; the latest scan time and
+  findings rows still refresh on every scan. The per-artifact event bound is
+  also raised, so an artifact whose history had outgrown it is scannable and
+  releasable again (#406).
 - Queued work is now ranked by who is waiting on it, and a flood of
   background work can no longer occupy a worker's whole claim batch or
   all of a kind's run permits, so scheduled maintenance no longer

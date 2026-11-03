@@ -12,6 +12,7 @@
 //! decision does not lean on the listing.
 
 use super::*;
+use crate::use_cases::STREAM_EVENT_CAP;
 
 use chrono::{DateTime, Duration};
 use hort_domain::entities::artifact::Artifact;
@@ -934,7 +935,7 @@ async fn a_candidate_whose_stream_breached_the_event_cap_is_reported_as_failed()
     let f = build();
     let (artifact, entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
         let mut stream = vec![quarantined(id, 0, anchor)];
-        stream.extend((1..201).map(|i| persisted_scan_completed(id, 0, i)));
+        stream.extend((1..STREAM_EVENT_CAP + 1).map(|i| persisted_scan_completed(id, 0, i)));
         stream
     });
     f.queue.set_entries(vec![entry]);
@@ -945,7 +946,9 @@ async fn a_candidate_whose_stream_breached_the_event_cap_is_reported_as_failed()
     assert_eq!(report.failed.len(), 1);
     assert_eq!(report.failed[0].0, artifact.id);
     assert!(
-        report.failed[0].1.contains("200-event cap"),
+        report.failed[0]
+            .1
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")),
         "the failure must name the cap it is enforcing; got {}",
         report.failed[0].1
     );

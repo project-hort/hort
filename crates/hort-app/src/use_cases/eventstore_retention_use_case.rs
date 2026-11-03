@@ -55,7 +55,7 @@
 //!    `skipped_non_terminal` + `warn!` (NOT an error), continue. A stream
 //!    that breached `STREAM_EVENT_CAP` cannot be read to its tail, so it
 //!    is reported as a read error (`errors += 1`, never sealed) rather
-//!    than sealed on the 200th event as if that were the terminal.
+//!    than sealed on the cap-boundary event as if that were the terminal.
 //! 4. **C-1 floor proof** — `now - first_event_at < floor` ⇒
 //!    `skipped_floor_not_elapsed` + `debug!`, continue. The floor is
 //!    proven against the **oldest** event's `stored_at` (every later
@@ -573,7 +573,7 @@ impl EventStoreRetentionUseCase {
         // that can prove it reached the tail: `read_artifact_stream` reads
         // one event past `STREAM_EVENT_CAP` and refuses a stream longer
         // than that. Sealing deletes a stream — deciding "terminal" from
-        // the 200th event of a longer stream would delete an audit trail
+        // a cap-boundary event of a longer stream would delete an audit trail
         // that had not terminated.
         let events = match crate::use_cases::read_artifact_stream(&*self.events, &stream_id).await {
             Ok(e) => e,
