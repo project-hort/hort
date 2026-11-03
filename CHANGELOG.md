@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- OCI digest request parameters that violate the descriptor grammar now return
+  `DIGEST_INVALID`; malformed image-index child digests return `MANIFEST_INVALID`
+  instead of `UNSUPPORTED` (#407).
 - Retention previews now identify missing reclaimable content by hash separately
   from storage failures. Release preflight now names terminal rejection and
   its re-scan or curator-waiver recovery paths when a dependency remains

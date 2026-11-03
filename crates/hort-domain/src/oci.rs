@@ -653,7 +653,7 @@ pub enum DescriptorProblem {
     MissingMediaType,
     /// No `digest` — the descriptor names no content at all.
     MissingDigest,
-    /// An `<algorithm>:<encoded>` digest whose algorithm is not `sha256` —
+    /// A grammatical `<algorithm>:<encoded>` digest whose algorithm is not `sha256` —
     /// `sha512:…`, `blake3:…`. The declaration is **well-formed**: the OCI
     /// image spec's descriptor grammar admits any algorithm and says
     /// "Implementations SHOULD allow digests with unrecognized algorithms to
@@ -662,6 +662,9 @@ pub enum DescriptorProblem {
     /// keyspace cannot address, which is a different answer and belongs to a
     /// different wire code.
     UnsupportedAlgorithm,
+    /// The digest has a separator but violates the OCI descriptor grammar:
+    /// an empty or malformed algorithm, or an empty or forbidden encoded part.
+    MalformedDigest,
     /// No `<algorithm>:` separator at all, so nothing identifies an algorithm.
     /// Unlike [`Self::UnsupportedAlgorithm`] this does not comply with the
     /// descriptor digest grammar, so it is a malformed declaration rather than
@@ -1256,9 +1259,11 @@ pub fn strict_manifest_nomination(
 /// boundary, because an unrecognised algorithm and an ungrammatical digest are
 /// two different answers (see [`DescriptorProblem::is_well_formed_but_unsupported`]).
 ///
-/// The three-way split — no `<algorithm>:` prefix, a prefix naming an algorithm
-/// other than `sha256`, and a `sha256:` body that is not 64 lowercase hex —
-/// is the same split the OCI HTTP adapter draws on a **request-line** digest
+/// Grammar is checked before algorithm support: a digest with no separator or
+/// an invalid algorithm or encoded portion is malformed. A grammatical digest
+/// naming an algorithm other than `sha256` is unsupported, and a `sha256:` body
+/// must contain exactly 64 lowercase hex characters. This is the same rule the OCI
+/// HTTP adapter draws on a **request-line** digest
 /// (`hort-http-oci`'s `digest::parse_digest`). Two boundaries, two inputs; one
 /// rule. This is the copy that applies to a digest read out of a *document*.
 fn strict_sha256_digest(digest: Option<&str>) -> Result<ContentHash, DescriptorProblem> {
@@ -1268,6 +1273,23 @@ fn strict_sha256_digest(digest: Option<&str>) -> Result<ContentHash, DescriptorP
     let Some((algorithm, encoded)) = digest.split_once(':') else {
         return Err(DescriptorProblem::NoAlgorithmPrefix);
     };
+    let algorithm_is_grammatical = algorithm.split(['+', '.', '_', '-']).all(|component| {
+        !component.is_empty()
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    });
+    let encoded_is_grammatical = !encoded.is_empty()
+        && encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'=' | b'_' | b'-'));
+    if !algorithm_is_grammatical || !encoded_is_grammatical {
+        return Err(if algorithm == "sha256" {
+            DescriptorProblem::MalformedSha256
+        } else {
+            DescriptorProblem::MalformedDigest
+        });
+    }
     if algorithm != "sha256" {
         return Err(DescriptorProblem::UnsupportedAlgorithm);
     }
@@ -1535,6 +1557,7 @@ pub fn is_image_index(manifest_json: &[u8]) -> bool {
 /// SHOULD pass validation, so the document is valid and only unservable) from
 /// one that matches no digest grammar at all
 /// ([`DescriptorProblem::NoAlgorithmPrefix`] /
+/// [`DescriptorProblem::MalformedDigest`] /
 /// [`DescriptorProblem::MalformedSha256`], an invalid document).
 ///
 /// An index declaring more than [`MAX_INDEX_CHILDREN`] children is **rejected**

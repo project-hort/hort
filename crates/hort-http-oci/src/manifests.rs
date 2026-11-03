@@ -2117,6 +2117,44 @@ mod tests {
     use hort_http_core::context::AppContext;
     use hort_http_core::test_support::build_mock_ctx;
 
+    async fn assert_digest_reference_error(raw: &str, expected_code: &str) {
+        let response = resolve_digest_reference(raw).expect_err("digest must be refused");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 4 * 1024).await.unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(envelope["errors"][0]["code"], expected_code);
+        assert!(
+            !String::from_utf8_lossy(&body).contains(raw),
+            "the response must not echo the requested digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_sha512_digest_is_invalid_on_the_request_line() {
+        assert_digest_reference_error("sha512:", "DIGEST_INVALID").await;
+    }
+
+    #[tokio::test]
+    async fn forbidden_sha512_encoded_character_is_invalid_on_the_request_line() {
+        assert_digest_reference_error("sha512:!", "DIGEST_INVALID").await;
+    }
+
+    #[tokio::test]
+    async fn empty_algorithm_is_invalid_on_the_request_line() {
+        assert_digest_reference_error(":abc", "DIGEST_INVALID").await;
+    }
+
+    #[tokio::test]
+    async fn uppercase_algorithm_is_invalid_on_the_request_line() {
+        assert_digest_reference_error(&format!("SHA256:{}", "a".repeat(64)), "DIGEST_INVALID")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn grammatical_sha512_digest_is_unsupported_on_the_request_line() {
+        assert_digest_reference_error(&format!("sha512:{}", "a".repeat(128)), "UNSUPPORTED").await;
+    }
+
     // ---------------- Fixtures ----------------
 
     fn oci_repo(key: &str) -> Repository {
