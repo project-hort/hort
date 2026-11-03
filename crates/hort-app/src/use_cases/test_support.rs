@@ -2511,6 +2511,47 @@ impl MockEventStore {
             .unwrap_or_default()
     }
 
+    /// Fold `batch`'s events onto the end of the stream
+    /// [`EventStore::read_stream`] serves, assigning the stream and
+    /// global positions the store would.
+    ///
+    /// This is what [`MockArtifactLifecycle::with_commit_visible_events`]
+    /// uses to make a committed transition readable, mirroring the
+    /// Postgres adapter — whose `commit_*` appends to the event store
+    /// inside the same transaction as the artifact row, so a reader that
+    /// comes along afterwards sees both. Validates every event exactly as
+    /// [`EventStore::append`] does, for the reason that method documents:
+    /// a batch this folds in is a batch a later read decides on, so an
+    /// event it accepts and the production adapter would reject is an
+    /// event no producer in the system can write.
+    pub fn fold_batch_into_stream(&self, batch: &AppendEvents) -> DomainResult<()> {
+        for to_append in &batch.events {
+            to_append.event.validate()?;
+        }
+        let mut streams = self.streams.lock().unwrap();
+        let stream = streams.entry(batch.stream_id.to_string()).or_default();
+        let first_position = stream.last().map_or(0, |last| last.stream_position + 1);
+        for (offset, to_append) in batch.events.iter().enumerate() {
+            let position = first_position + offset as u64;
+            stream.push(PersistedEvent {
+                event_id: to_append.event_id,
+                stream_id: batch.stream_id.clone(),
+                stream_position: position,
+                // The mock has no cross-stream sequence; the per-stream
+                // position is the only ordering anything reading an
+                // artifact stream through this double consults.
+                global_position: position,
+                event: to_append.event.clone(),
+                correlation_id: batch.correlation_id,
+                causation_id: batch.causation_id,
+                actor: batch.actor.clone(),
+                event_version: 1,
+                stored_at: Utc::now(),
+            });
+        }
+        Ok(())
+    }
+
     /// Arm a one-shot stream replacement: the NEXT `read_stream` of
     /// `stream_id` serves the CURRENT content, then `events` replaces it
     /// so every subsequent read sees the new state. Models a concurrent
@@ -2891,6 +2932,11 @@ pub struct MockArtifactLifecycle {
     /// for why a commit-structure test has to discriminate on content
     /// rather than on call order.
     content_error: Mutex<Option<ArmedContentFailure>>,
+    /// When `Some`, [`ArtifactLifecyclePort::commit_transition`] and
+    /// [`ArtifactLifecyclePort::commit_transition_with_enqueues`] fold the
+    /// batch they accepted into this store's readable streams. Opt-in via
+    /// [`with_commit_visible_events`](Self::with_commit_visible_events).
+    commit_visible_events: Mutex<Option<Arc<MockEventStore>>>,
 }
 
 /// One [`MockArtifactLifecycle::fail_commits_carrying`] arming: the
@@ -2935,6 +2981,43 @@ impl MockArtifactLifecycle {
             optimistic_concurrency: Mutex::new(None),
             next_error: Mutex::new(std::collections::VecDeque::new()),
             content_error: Mutex::new(None),
+            commit_visible_events: Mutex::new(None),
+        }
+    }
+
+    /// Make every `commit_transition` / `commit_transition_with_enqueues`
+    /// batch readable through `events` afterwards — the Postgres
+    /// adapter's own semantics, since its `commit_*` appends to the event
+    /// store inside the same transaction as the artifact row.
+    ///
+    /// **Wire this wherever a test's production path reads the artifact's
+    /// stream back.** Unwired, the double accepts the batch and drops it:
+    /// `read_stream` then reports an empty stream for an artifact this
+    /// very harness committed events for, and a test can assert a
+    /// behaviour that rests on a stream production would have filled. The
+    /// case that forced it is `register_by_hash`'s gate-aware dedup, which
+    /// asks whether the gate's events are on the stream — with the batch
+    /// dropped, a healthy row whose gate ran reads as gate-less.
+    ///
+    /// Scoped to the two creation-transition commits on purpose:
+    /// `commit_scan_result*` has its own event-store wiring
+    /// ([`with_scan_result_paired_mocks`](Self::with_scan_result_paired_mocks)),
+    /// and folding a batch in twice would be worse than folding it in
+    /// never.
+    pub fn with_commit_visible_events(self, events: Arc<MockEventStore>) -> Self {
+        *self.commit_visible_events.lock().unwrap() = Some(events);
+        self
+    }
+
+    /// Fold a committed batch into the paired store, when one is wired.
+    /// Called before the transition is recorded so a rejected event
+    /// leaves no half-applied commit behind — the same ordering the
+    /// failure-injection guards use.
+    fn publish_commit(&self, batch: &AppendEvents) -> DomainResult<()> {
+        let paired = self.commit_visible_events.lock().unwrap().clone();
+        match paired {
+            Some(events) => events.fold_batch_into_stream(batch),
+            None => Ok(()),
         }
     }
 
@@ -3269,6 +3352,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         if let Err(e) = self.check_expected_version(&events) {
             return Box::pin(async move { Err(e) });
         }
+        if let Err(e) = self.publish_commit(&events) {
+            return Box::pin(async move { Err(e) });
+        }
         let count = events.events.len() as u64;
         // Propagate the metadata into the paired metadata repo (when
         // wired). Done before recording the transition so the
@@ -3382,6 +3468,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
             if let Some(refs) = paired_refs {
                 refs.insert_all_or_nothing(&recorded_edges).await?;
             }
+            self.publish_commit(&events)?;
             self.ingest_enqueues
                 .lock()
                 .unwrap()
@@ -3541,6 +3628,117 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
                 global_positions: (0..count).collect(),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod commit_visible_events_tests {
+    //! The two halves of
+    //! [`MockArtifactLifecycle::with_commit_visible_events`]: a committed
+    //! batch becomes readable, and a batch production could not write is
+    //! refused rather than folded in.
+
+    use super::*;
+    use hort_domain::ports::event_store::EventToAppend;
+
+    fn artifact_for_stream() -> Artifact {
+        sample_artifact(QuarantineStatus::None)
+    }
+
+    fn batch(artifact: &Artifact, event: DomainEvent) -> AppendEvents {
+        AppendEvents {
+            stream_id: StreamId::artifact(artifact.id),
+            expected_version: ExpectedVersion::Any,
+            events: vec![EventToAppend::new(event)],
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: Actor::Api(api_actor()),
+        }
+    }
+
+    /// Without this the double drops what it accepted, and a production
+    /// path that reads the artifact's stream back sees an empty one.
+    #[tokio::test]
+    async fn a_committed_batch_is_readable_off_the_paired_store() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let events = Arc::new(MockEventStore::new());
+        let lifecycle =
+            MockArtifactLifecycle::new(artifacts).with_commit_visible_events(Arc::clone(&events));
+        let artifact = artifact_for_stream();
+
+        lifecycle
+            .commit_transition(
+                &artifact,
+                batch(
+                    &artifact,
+                    DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
+                        artifact_id: artifact.id,
+                        quarantine_window_start: Utc::now(),
+                    }),
+                ),
+                None,
+            )
+            .await
+            .expect("the commit must succeed");
+
+        let stream = events.stream_snapshot(&StreamId::artifact(artifact.id));
+        assert_eq!(stream.len(), 1, "{stream:?}");
+        assert_eq!(stream[0].stream_position, 0);
+        assert!(matches!(
+            stream[0].event,
+            DomainEvent::ArtifactQuarantined(_)
+        ));
+    }
+
+    /// An event the production adapter's `validate_and_serialize` would
+    /// reject fails the commit here too. A double that folded it in would
+    /// let a later read decide on an event no producer in the system can
+    /// write — the `finding_count` / `severity_summary` disagreement that
+    /// hid a real divergence behind an impossible corpus.
+    #[tokio::test]
+    async fn a_batch_production_would_reject_fails_the_commit() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let events = Arc::new(MockEventStore::new());
+        let lifecycle =
+            MockArtifactLifecycle::new(artifacts).with_commit_visible_events(Arc::clone(&events));
+        let artifact = artifact_for_stream();
+
+        let err = lifecycle
+            .commit_transition(
+                &artifact,
+                batch(
+                    &artifact,
+                    DomainEvent::ScanCompleted(ScanCompleted {
+                        artifact_id: artifact.id,
+                        scanner: "trivy".into(),
+                        finding_count: 3,
+                        severity_summary: SeveritySummary {
+                            critical: 0,
+                            high: 0,
+                            medium: 0,
+                            low: 0,
+                            negligible: 0,
+                        },
+                        findings_blob: None,
+                        assessment: ScanAssessment::Analysed,
+                    }),
+                ),
+                None,
+            )
+            .await
+            .expect_err("an event validate() rejects must fail the commit");
+
+        assert!(matches!(err, DomainError::Validation(_)), "{err:?}");
+        assert!(
+            events
+                .stream_snapshot(&StreamId::artifact(artifact.id))
+                .is_empty(),
+            "and nothing is folded in"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "nor recorded as a transition"
+        );
     }
 }
 
