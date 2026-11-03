@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registration or seed import no longer leaves an unscanned, immediately
   downloadable artifact behind: the registration and its quarantine/scan gate
   now commit together or not at all (#403).
+- An artifact left unquarantined and unscanned by an earlier failed
+  registration is now healed by repeating the mount (the same `skopeo copy`,
+  re-tag or seed import), which runs the quarantine/scan gate instead of
+  reporting success and changing nothing. Such an artifact is held — `503`
+  on download — until the scan verdict it was always owed arrives (#404).
 - A pull-through upstream answering `410 Gone` for an artifact, blob or
   manifest is now a miss (404) rather than a bad gateway (502/503), so a client
   stops retrying and a virtual repository walks on to the next member (#395).
