@@ -2885,6 +2885,36 @@ pub struct MockArtifactLifecycle {
     /// N consecutive failures (the provenance cascade's
     /// conflict-retry-conflict path needs two).
     next_error: Mutex<std::collections::VecDeque<DomainError>>,
+    /// When `Some`, every creation-transition commit whose content
+    /// satisfies the predicate fails with the paired error. Armed via
+    /// [`MockArtifactLifecycle::fail_commits_carrying`]; see that method
+    /// for why a commit-structure test has to discriminate on content
+    /// rather than on call order.
+    content_error: Mutex<Option<ArmedContentFailure>>,
+}
+
+/// One [`MockArtifactLifecycle::fail_commits_carrying`] arming: the
+/// content predicate and the error a match returns.
+type ArmedContentFailure = (
+    Box<dyn Fn(&CommitContent<'_>) -> bool + Send + Sync>,
+    DomainError,
+);
+
+/// One creation-transition commit's content, as a
+/// [`MockArtifactLifecycle::fail_commits_carrying`] predicate sees it:
+/// every argument the commit would apply, before any of it is applied.
+pub struct CommitContent<'a> {
+    /// The artifact state this commit would persist.
+    pub artifact: &'a Artifact,
+    /// The event batch it would append.
+    pub events: &'a AppendEvents,
+    /// The job rows it would enqueue (empty on
+    /// [`ArtifactLifecyclePort::commit_transition`], which has no
+    /// enqueue argument).
+    pub enqueues: &'a [IngestEnqueue],
+    /// The `content_references` edges it would write (likewise empty on
+    /// [`ArtifactLifecyclePort::commit_transition`]).
+    pub edges: &'a [ContentReference],
 }
 
 impl MockArtifactLifecycle {
@@ -2904,6 +2934,7 @@ impl MockArtifactLifecycle {
             content_references: Mutex::new(None),
             optimistic_concurrency: Mutex::new(None),
             next_error: Mutex::new(std::collections::VecDeque::new()),
+            content_error: Mutex::new(None),
         }
     }
 
@@ -3111,6 +3142,56 @@ impl MockArtifactLifecycle {
         self.next_error.lock().unwrap().push_back(err);
     }
 
+    /// Fail every creation-transition commit whose **content** satisfies
+    /// `predicate`, as often as one arrives — the content-addressed
+    /// counterpart of [`Self::fail_next_commit`].
+    ///
+    /// The discriminator is the content and deliberately not the ordinal,
+    /// because an ordinal cannot state the property a test about commit
+    /// structure is asserting. "Fail the second call" is a claim about a
+    /// split that, once the split is gone, selects nothing and passes
+    /// vacuously; "fail the commit carrying the quarantine transition, or
+    /// a non-empty enqueue list" selects the gate-bearing commit in either
+    /// shape, so the same test is red against a mint-then-gate split and
+    /// green against one merged commit.
+    ///
+    /// Armed once and not consumed: a predicate that matches twice fails
+    /// twice. Checked by [`Self::commit_transition`] and
+    /// [`Self::commit_transition_with_enqueues`] — the two creation
+    /// primitives — before anything is recorded, so a hit leaves no
+    /// transition, no enqueue, no edge and no artifact behind.
+    pub fn fail_commits_carrying(
+        &self,
+        predicate: impl Fn(&CommitContent<'_>) -> bool + Send + Sync + 'static,
+        err: DomainError,
+    ) {
+        *self.content_error.lock().unwrap() = Some((Box::new(predicate), err));
+    }
+
+    /// `Err` with the armed error when a [`Self::fail_commits_carrying`]
+    /// predicate matches this commit's content; `Ok(())` otherwise.
+    fn check_content_failure(
+        &self,
+        artifact: &Artifact,
+        events: &AppendEvents,
+        enqueues: &[IngestEnqueue],
+        edges: &[ContentReference],
+    ) -> DomainResult<()> {
+        let armed = self.content_error.lock().unwrap();
+        let Some((predicate, err)) = armed.as_ref() else {
+            return Ok(());
+        };
+        if predicate(&CommitContent {
+            artifact,
+            events,
+            enqueues,
+            edges,
+        }) {
+            return Err(err.clone());
+        }
+        Ok(())
+    }
+
     /// Apply a verdict's status write to the queryable mock projection
     /// with the SAME semantics as the Postgres adapter's
     /// `save_verdict_status_in_tx`, so app-layer pins built on this
@@ -3177,6 +3258,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         // First, as in the adapter: the pair's identity is a
         // precondition on the arguments, not an outcome of the write.
         if let Err(e) = require_paired_artifact_stream(artifact, &events) {
+            return Box::pin(async move { Err(e) });
+        }
+        if let Err(e) = self.check_content_failure(artifact, &events, &[], &[]) {
             return Box::pin(async move { Err(e) });
         }
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
@@ -3284,6 +3368,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
             require_paired_artifact_stream(artifact, &events)?;
             // Failure-injection up front (mirrors `commit_transition`), before
             // recording anything, so a forced error leaves no stray enqueue.
+            self.check_content_failure(artifact, &events, &recorded, &recorded_edges)?;
             if let Some(err) = self.next_error.lock().unwrap().pop_front() {
                 return Err(err);
             }

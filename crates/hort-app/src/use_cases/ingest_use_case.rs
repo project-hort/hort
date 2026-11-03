@@ -4774,9 +4774,10 @@ impl IngestUseCase {
         let now = Utc::now();
         // Bound `mut`: every caller (seed-import, OCI cross-repo blob
         // mount, and the cross-repo pull-dedup followers) may transition
-        // the artifact to `Quarantined` after the `ArtifactIngested`
-        // commit lands, per the generalized gate below (issue #107 Item
-        // 1). Only a `quarantineDuration: 0` policy leaves it `None`.
+        // the artifact to `Quarantined` before it is committed, per the
+        // generalized gate below, so the single commit persists the gated
+        // state rather than this permissive initial one. Only a
+        // `quarantineDuration: 0` policy leaves it `None`.
         let mut artifact = Artifact {
             id: artifact_id,
             repository_id,
@@ -4845,55 +4846,10 @@ impl IngestUseCase {
             repo_key: Some(repo_key.clone()),
         })?;
 
-        // The registration's refcount edges, committed WITH the row that
-        // claims them. This path mints a per-repo artifact over a CAS blob
-        // the source repository's artifact already holds, so the new row
-        // needs its own `primary_content` claim: CAS deduplicates, and
-        // without this edge the new artifact counts zero against bytes it
-        // shares with the source. Release and purge that sibling and the
-        // storage GC's count reaches zero with this artifact still live and
-        // servable — a missing edge does not delay collection, it brings it
-        // forward. No `metadata_blob` edge: `register_by_hash` never splits
-        // (the bytes are already in CAS, owned by the source).
-        //
-        // A failed edge now fails the registration, which is the recoverable
-        // direction: the mount/follower/seed caller retries, where an
-        // edgeless committed artifact cannot be repaired from the artifact
-        // row alone by anything in the request path.
-        let edges = Self::ingest_edges(
-            &artifact,
-            repository_id,
-            // `register_by_hash` never splits the payload metadata into CAS.
-            None,
-            &claimed_edges,
-            now,
-        );
-
-        self.lifecycle
-            .commit_transition_with_enqueues(
-                &artifact,
-                AppendEvents {
-                    stream_id: stream_id.clone(),
-                    expected_version,
-                    events: vec![EventToAppend {
-                        event_id: ingested_event_id,
-                        event: DomainEvent::ArtifactIngested(ingested_event),
-                    }],
-                    correlation_id,
-                    causation_id: None,
-                    actor: Actor::Api(actor.clone()),
-                },
-                Some(artifact_metadata),
-                // The gate's scan / provenance enqueues ride the follow-on
-                // commit below, which is where that decision is resolved.
-                &[],
-                &edges,
-            )
-            .await
-            .map_err(|e| RegisterError::Other {
-                err: AppError::Domain(e),
-                repo_key: Some(repo_key.clone()),
-            })?;
+        // Everything from here to the single commit below resolves the
+        // gate; the mint's own event is pushed onto `events` inside it, and
+        // the commit carries both. The edges are built down there too, so
+        // they ride the same call.
 
         // Quarantine-by-default, generalized to EVERY
         // `register_by_hash_inner` caller (issue #107 Item 1).
@@ -4966,20 +4922,25 @@ impl IngestUseCase {
         //    `Artifact::reject_from_scan`).
         // 4. Land whatever combination of `ArtifactQuarantined` +
         //    `ScanRequested` + the `Scan`/`ProvenanceVerify` job-row
-        //    enqueues applies, ATOMICALLY, in ONE follow-on commit
-        //    (`commit_transition_with_enqueues`, ADR 0002/0004 no-strand
-        //    — mirrors `ingest_inner`'s own guarantee that a quarantine
-        //    transition and its scan/provenance enqueue can never land
-        //    separately). `trigger_source` on the enqueued jobs
-        //    distinguishes the caller class: `"seed-import"` when the
-        //    caller supplied a backdated anchor, `"register-by-hash"`
-        //    otherwise (mount + follower callers, which always pass
-        //    `None`). The commit is skipped entirely when there is
-        //    nothing to append or enqueue (a fully waived policy —
+        //    enqueues applies on the SAME commit as the mint — one
+        //    `commit_transition_with_enqueues` for `ArtifactIngested`, the
+        //    gate's events, the artifact row in its final gated state, its
+        //    metadata, the job rows and the `primary_content` edge (ADR
+        //    0002/0004 no-strand), which is `ingest_inner`'s own shape. The
+        //    atomicity has to span the mint, not just the gate: a gate in
+        //    its own commit is atomic with itself while the mint it follows
+        //    has already published a servable artifact, so its failure
+        //    leaves one behind that is never scanned and owes a verdict
+        //    nothing records. See the commit site for that remainder in
+        //    full.
+        //    `trigger_source` on the enqueued jobs distinguishes the caller
+        //    class: `"seed-import"` when the caller supplied a backdated
+        //    anchor, `"register-by-hash"` otherwise (mount + follower
+        //    callers, which always pass `None`). A fully waived policy —
         //    `quarantineDuration: 0` AND `scanBackends: []` AND
-        //    `provenanceMode: off` — under which the artifact stays
-        //    `None` with no gate at all, matching `ingest_inner`'s
-        //    identical case).
+        //    `provenanceMode: off` — appends and enqueues nothing, so the
+        //    commit carries the bare mint and the artifact stays `None`,
+        //    matching `ingest_inner`'s identical case.
         //
         // **Not** `ScanWaived`, **not** permissive (when duration > 0). A
         // dirty scan still transitions the artifact to `Rejected` via
@@ -5036,13 +4997,22 @@ impl IngestUseCase {
         // Threaded to the gate log below so an operator can tell WHICH
         // source anchored the window without reconstructing the evidence.
         let mut anchor_source = AnchorSource::Mint;
-        let mut events: Vec<EventToAppend> = Vec::new();
+        // The batch opens with the mint's own genesis event and the gate
+        // appends to it, so the artifact's first and only commit carries
+        // its final gated state.
+        let mut events: Vec<EventToAppend> = vec![EventToAppend {
+            event_id: ingested_event_id,
+            event: DomainEvent::ArtifactIngested(ingested_event),
+        }];
         if quarantined {
             // The descendant carve-out, evaluated exactly as
-            // `ingest_inner` evaluates it. Like there, the lookup cannot
-            // match this registration's OWN `primary_content` row — that
-            // is written below, after the mint — so it only ever sees edges
-            // written by OTHER, already-ingested artifacts.
+            // `ingest_inner` evaluates it — and from the same position:
+            // this registration's own edges are built below and ride the
+            // commit this gate feeds, so none of them exists yet. Even
+            // once written, `is_referenced_tree_descendant` excludes
+            // `primary_content` as self-referential. Either way the lookup
+            // only ever sees edges written by OTHER, already-ingested
+            // artifacts.
             //
             // Both probes are skipped entirely when an explicit anchor is
             // supplied: the override wins absolutely, so they could only
@@ -5141,48 +5111,73 @@ impl IngestUseCase {
             });
         }
 
-        if !events.is_empty() || !enqueues.is_empty() {
-            let expected_version = read_unpaired_append_version(
-                &*self.events,
-                &stream_id,
-                true,
-                UnpairedAppend::SameCallFollowUp,
+        // The registration's refcount edges, committed WITH the row that
+        // claims them. This path mints a per-repo artifact over a CAS blob
+        // the source repository's artifact already holds, so the new row
+        // needs its own `primary_content` claim: CAS deduplicates, and
+        // without this edge the new artifact counts zero against bytes it
+        // shares with the source. Release and purge that sibling and the
+        // storage GC's count reaches zero with this artifact still live and
+        // servable — a missing edge does not delay collection, it brings it
+        // forward. No `metadata_blob` edge: `register_by_hash` never splits
+        // (the bytes are already in CAS, owned by the source).
+        //
+        // A failed edge now fails the registration, which is the recoverable
+        // direction: the mount/follower/seed caller retries, where an
+        // edgeless committed artifact cannot be repaired from the artifact
+        // row alone by anything in the request path.
+        let edges = Self::ingest_edges(
+            &artifact,
+            repository_id,
+            // `register_by_hash` never splits the payload metadata into CAS.
+            None,
+            &claimed_edges,
+            now,
+        );
+
+        // ONE commit, carrying the mint AND the gate it resolved above:
+        // `ArtifactIngested`, the `ArtifactQuarantined` / `ScanRequested`
+        // the gate produced, the artifact row in its final gated state,
+        // its metadata, the `Scan` / `ProvenanceVerify` job rows and the
+        // `primary_content` edge land in one transaction or none at all
+        // (ADR 0002/0004 no-strand), exactly as `ingest_inner`'s own
+        // single commit does.
+        //
+        // Splitting this — minting first and gating in a follow-on commit
+        // — is what the shape must never go back to. The mint alone
+        // publishes a SERVABLE artifact: `QuarantineStatus::None` is the
+        // most permissive state in the system, `Artifact::is_downloadable`
+        // admits it and the default `ReleasedOnly` index mode serves it.
+        // So a failure of the second commit leaves exactly the remainder
+        // nothing in the request path can repair — a servable artifact
+        // with one `ArtifactIngested` on its stream, no quarantine anchor,
+        // and no `jobs` row to make anyone aware a verdict is owed. The
+        // atomicity that matters is therefore between the mint and the
+        // gate, not merely within the gate.
+        self.lifecycle
+            .commit_transition_with_enqueues(
+                &artifact,
+                AppendEvents {
+                    stream_id,
+                    expected_version,
+                    events,
+                    correlation_id,
+                    causation_id: None,
+                    actor: Actor::Api(actor),
+                },
+                Some(artifact_metadata),
+                &enqueues,
+                &edges,
             )
             .await
             .map_err(|e| RegisterError::Other {
-                err: e,
+                err: AppError::Domain(e),
                 repo_key: Some(repo_key.clone()),
             })?;
 
-            self.lifecycle
-                .commit_transition_with_enqueues(
-                    &artifact,
-                    AppendEvents {
-                        stream_id,
-                        expected_version,
-                        events,
-                        correlation_id,
-                        causation_id: None,
-                        // System actor — this follow-on commit is
-                        // mechanical bookkeeping regardless of caller
-                        // (mirrors `ingest_inner`'s strict-mode
-                        // quarantine step).
-                        actor: hort_domain::events::system_actor(),
-                    },
-                    None, // metadata was persisted on the preceding ingest transition
-                    &enqueues,
-                    // No edges: this is the gate follow-up, not the mint.
-                    // The registration's own `primary_content` edge is
-                    // written below, against the `commit_transition` that
-                    // minted the row.
-                    &[],
-                )
-                .await
-                .map_err(|e| RegisterError::Other {
-                    err: AppError::Domain(e),
-                    repo_key: Some(repo_key.clone()),
-                })?;
-
+        // Emitted only when the gate resolved to something, so a fully
+        // waived policy (nothing appended, nothing enqueued) stays silent.
+        if quarantined || scan_will_run || provenance_will_run {
             tracing::info!(
                 %artifact_id,
                 trigger_source,
@@ -5195,9 +5190,10 @@ impl IngestUseCase {
         }
 
         // Late-joiner provenance self-clear — the same post-commit hook
-        // `ingest_inner` runs, on this path's own quarantine commit. The
-        // OCI cross-repo blob mount lands a fresh per-repo row over
-        // content whose subject may already be verified in this repo.
+        // `ingest_inner` runs, behind this path's own single commit, so the
+        // quarantine it may clear is already durable. The OCI cross-repo
+        // blob mount lands a fresh per-repo row over content whose subject
+        // may already be verified in this repo.
         self.resolve_late_joiner_clearance(
             &artifact,
             provenance_mode,
@@ -8830,22 +8826,20 @@ mod tests {
                 assert_eq!(outcome.artifact.sha256_checksum, hash);
                 assert_eq!(outcome.artifact.size_bytes, 4242);
 
-                // Two transitions: the `ArtifactIngested` commit, then
-                // the generalized gate's follow-on commit (issue #107
-                // Item 1) — the shared permissive-global test policy has
-                // `quarantine_duration_secs: 0` (no quarantine) but
-                // `scan_backends: ["trivy"]` (non-empty), so
-                // `ScanRequested` + a `Scan` job enqueue land in a second
-                // commit even though nothing quarantines.
-                // `ingested_event_id` equals the id on the event actually
-                // committed (same contract as `ingest`).
+                // ONE transition carrying the mint and the generalized
+                // gate together — the shared permissive-global test policy
+                // has `quarantine_duration_secs: 0` (no quarantine) but
+                // `scan_backends: ["trivy"]` (non-empty), so `ScanRequested`
+                // + a `Scan` job enqueue ride the same commit as
+                // `ArtifactIngested`. `ingested_event_id` equals the id on
+                // the event actually committed (same contract as `ingest`).
                 let transitions = lifecycle.committed_transitions();
-                assert_eq!(transitions.len(), 2);
+                assert_eq!(transitions.len(), 1, "{transitions:?}");
                 let appended = &transitions[0].1.events[0];
                 assert!(matches!(appended.event, DomainEvent::ArtifactIngested(_)));
                 assert_eq!(outcome.ingested_event_id, appended.event_id);
                 assert!(matches!(
-                    transitions[1].1.events[0].event,
+                    transitions[0].1.events[1].event,
                     DomainEvent::ScanRequested(_)
                 ));
 
@@ -9158,18 +9152,18 @@ mod tests {
             assert_eq!(outcome.artifact.sha256_checksum, hash);
             assert_eq!(outcome.artifact.repository_id, target_id);
 
-            // Two transitions — see the identical note in
-            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
-            // gate: the shared permissive-global test policy still scans
-            // even though it does not quarantine).
+            // ONE transition — see the identical note in
+            // `register_by_hash_some_src_happy_path` (the shared
+            // permissive-global test policy still scans even though it does
+            // not quarantine, and that `ScanRequested` rides the mint).
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2);
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
             assert!(matches!(
                 transitions[0].1.events[0].event,
                 DomainEvent::ArtifactIngested(_)
             ));
             assert!(matches!(
-                transitions[1].1.events[0].event,
+                transitions[0].1.events[1].event,
                 DomainEvent::ScanRequested(_)
             ));
         });
@@ -9305,27 +9299,24 @@ mod tests {
                 "follower registration must not call storage.put"
             );
 
-            // Two commits per caller: `ArtifactIngested`, then the
-            // generalized gate's follow-on `ScanRequested` commit (issue
-            // #107 Item 1 — the shared permissive-global test policy
-            // still scans even though it does not quarantine). Leader:
-            // transitions[0..2). Follower's own repo-B mint:
-            // transitions[2..4) — the same `ArtifactIngested` event the
-            // leader's non-concurrent cross-repo dedup emits, now
-            // followed by its own scan enqueue too.
+            // One commit per caller, each carrying its own mint AND its own
+            // gate — the shared permissive-global test policy still scans
+            // even though it does not quarantine, so `ScanRequested` rides
+            // the `ArtifactIngested` batch. Leader: transitions[0].
+            // Follower's own repo-B mint: transitions[1].
             let transitions = lifecycle.committed_transitions();
             assert_eq!(
                 transitions.len(),
-                4,
-                "two commits (Ingested + scan-gate) for the leader's resolve, \
-                 two for the follower's repo-B mint"
+                2,
+                "one commit for the leader's resolve, one for the follower's \
+                 repo-B mint: {transitions:?}"
             );
             assert!(matches!(
-                transitions[2].1.events[0].event,
+                transitions[1].1.events[0].event,
                 DomainEvent::ArtifactIngested(_)
             ));
             assert!(matches!(
-                transitions[3].1.events[0].event,
+                transitions[1].1.events[1].event,
                 DomainEvent::ScanRequested(_)
             ));
         });
@@ -9362,13 +9353,13 @@ mod tests {
                 first.artifact.id, second.artifact.id,
                 "idempotent: same repo-B row returned, no second mint"
             );
-            // Two commits for the FIRST call (`ArtifactIngested` + the
-            // gate's follow-on `ScanRequested`, issue #107 Item 1); the
-            // second call short-circuits on the same-path-same-hash
-            // dedup guard before ever reaching the gate, so it adds none.
+            // One commit for the FIRST call (`ArtifactIngested` +
+            // `ScanRequested` in one batch); the second call
+            // short-circuits on the same-path-same-hash dedup guard before
+            // ever reaching the gate, so it adds none.
             assert_eq!(
                 lifecycle.committed_transitions().len(),
-                2,
+                1,
                 "same-path-same-hash dedup must not emit a second commit"
             );
         });
@@ -9538,25 +9529,23 @@ mod tests {
                 "the lookup failure must not prevent the quarantine transition"
             );
 
-            // Two commits — ArtifactIngested, then the quarantine
-            // follow-on (`commit_transition_with_enqueues`).
+            // One commit — ArtifactIngested and the quarantine transition
+            // in the same `commit_transition_with_enqueues`.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2, "{transitions:?}");
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
 
             // Default policy (no operator policy resolved — the lookup
-            // failed) still scans by default. Index 0 is the mint, which
-            // rides the same method to carry its `primary_content` edge and
-            // enqueues nothing.
+            // failed) still scans by default, and that enqueue rides the
+            // one commit alongside the `primary_content` edge.
             let enqueues = lifecycle.ingest_enqueues();
-            assert_eq!(enqueues.len(), 2, "{enqueues:?}");
-            assert!(enqueues[0].1.is_empty(), "the mint enqueues nothing");
+            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
             assert!(
-                enqueues[1].1.iter().any(|e| matches!(
+                enqueues[0].1.iter().any(|e| matches!(
                     e,
                     IngestEnqueue::Scan { trigger_source, .. } if trigger_source == "seed-import"
                 )),
                 "policy-lookup failure must still fall back to the scanning DefaultPolicy: {:?}",
-                enqueues[1].1
+                enqueues[0].1
             );
         });
     }
@@ -9596,13 +9585,12 @@ mod tests {
                 .await
                 .expect("metadata round-trip path must succeed");
 
-            // Two transitions — `ArtifactIngested` (asserted below),
-            // then the generalized gate's follow-on `ScanRequested`
-            // commit (issue #107 Item 1; the shared permissive-global
-            // test policy still scans even though it does not
-            // quarantine). Only the FIRST commit is this test's concern.
+            // One transition, carrying `ArtifactIngested` (asserted below)
+            // and the gate's `ScanRequested` in the same batch (the shared
+            // permissive-global test policy still scans even though it does
+            // not quarantine). Only the mint event is this test's concern.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2);
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
 
             // Event payload carries the exact JSON the caller supplied.
             match &transitions[0].1.events[0].event {
@@ -9692,11 +9680,10 @@ mod tests {
                 "new artifact is a fresh row"
             );
 
-            // Two transitions — see the identical note in
-            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
-            // gate).
+            // One transition — see the identical note in
+            // `register_by_hash_some_src_happy_path`.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2);
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
         });
     }
 
@@ -10048,15 +10035,14 @@ mod tests {
                 // Same artifact row — idempotent on the aggregate id.
                 assert_eq!(first.artifact.id, second.artifact.id);
 
-                // Two commits total: `ArtifactIngested` + the generalized
-                // gate's follow-on `ScanRequested` (issue #107 Item 1)
-                // for the FIRST call only — the second call's dedup path
-                // short-circuits before the lifecycle port (and before
-                // the gate) entirely.
+                // One commit total: `ArtifactIngested` + the gate's
+                // `ScanRequested` in one batch, for the FIRST call only —
+                // the second call's dedup path short-circuits before the
+                // lifecycle port (and before the gate) entirely.
                 let transitions = lifecycle.committed_transitions();
                 assert_eq!(
                     transitions.len(),
-                    2,
+                    1,
                     "same-path-same-hash dedup must not emit a second commit"
                 );
             });
@@ -10120,11 +10106,11 @@ mod tests {
                 "expected Conflict, got {err:?}"
             );
 
-            // Two commits from the first (successful) placement only —
-            // `ArtifactIngested` + the generalized gate's follow-on
-            // `ScanRequested` (issue #107 Item 1); the conflict
-            // rejection on the second call did not emit any event.
-            assert_eq!(lifecycle.committed_transitions().len(), 2);
+            // One commit from the first (successful) placement only —
+            // `ArtifactIngested` + the gate's `ScanRequested` in one
+            // batch; the conflict rejection on the second call did not
+            // emit any event.
+            assert_eq!(lifecycle.committed_transitions().len(), 1);
         });
     }
 
@@ -10158,12 +10144,12 @@ mod tests {
                 outcome.artifact.size_bytes, expected_size as i64,
                 "register_by_hash must source size_bytes authoritatively from storage.size_of"
             );
-            // Event payload carries the same authoritative size. Two
-            // transitions total — see the identical note in
-            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
-            // gate); only the FIRST commit is this test's concern.
+            // Event payload carries the same authoritative size. One
+            // transition total — see the identical note in
+            // `register_by_hash_some_src_happy_path`; only the mint event
+            // is this test's concern.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2);
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
             match &transitions[0].1.events[0].event {
                 DomainEvent::ArtifactIngested(ev) => {
                     assert_eq!(ev.size_bytes, expected_size as i64);
@@ -10209,11 +10195,10 @@ mod tests {
                 "register_by_hash writes exactly one refcount row (primary_content)"
             );
 
-            // Two transitions — see the identical note in
-            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
-            // gate).
+            // One transition — see the identical note in
+            // `register_by_hash_some_src_happy_path`.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2);
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
             let artifact = &transitions[0].0;
 
             let rows = content_refs
@@ -10991,8 +10976,8 @@ mod tests {
             assert_eq!(
                 lifecycle.committed_transitions().len(),
                 0,
-                "no transition may commit — not the mint, and therefore not the \
-                 generalized gate's follow-on either"
+                "no transition may commit — the edge rides the same call as the \
+                 mint and the gate, so a failed edge takes all three with it"
             );
             assert_eq!(
                 content_refs.entry_count(),
@@ -11036,8 +11021,8 @@ mod tests {
                 .expect("register_by_hash must succeed");
             let artifact = outcome.artifact;
 
-            // The mint carries the edge; the gate's follow-on commit carries
-            // none (it is a transition over an artifact that already exists).
+            // One call carries the whole registration, the edge included —
+            // there is no second commit for an edge to be topped up on.
             assert_eq!(
                 lifecycle.ingest_edge_kinds(),
                 vec![(
@@ -15148,34 +15133,38 @@ mod tests {
                 "non-seed anchor must be `now` (no backdated override supplied)"
             );
 
+            // One commit, carrying the mint and the gate it resolved: the
+            // artifact row never reaches the backend at
+            // `QuarantineStatus::None`.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2, "{transitions:?}");
-            assert!(transitions[1]
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
+            let kinds: Vec<&str> = transitions[0]
                 .1
                 .events
                 .iter()
-                .any(|e| matches!(e.event, DomainEvent::ArtifactQuarantined(_))));
-            assert!(transitions[1]
-                .1
-                .events
-                .iter()
-                .any(|e| matches!(e.event, DomainEvent::ScanRequested(_))));
+                .map(|e| e.event.event_type())
+                .collect();
+            assert_eq!(
+                kinds,
+                vec!["ArtifactIngested", "ArtifactQuarantined", "ScanRequested"],
+                "mint and gate ride one batch: {kinds:?}"
+            );
+            assert_eq!(
+                transitions[0].0.quarantine_status,
+                QuarantineStatus::Quarantined,
+                "the row this commit persists is already gated"
+            );
 
-            // Index 0 is the mint: the genesis commit rides
-            // `commit_transition_with_enqueues` too — not for enqueues (it
-            // has none) but to carry the artifact's `primary_content` edge
-            // in its own transaction. The gate's batch is index 1.
             let enqueues = lifecycle.ingest_enqueues();
-            assert_eq!(enqueues.len(), 2, "{enqueues:?}");
-            assert!(enqueues[0].1.is_empty(), "the mint enqueues nothing");
+            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
             assert!(
-                enqueues[1].1.iter().any(|e| matches!(
+                enqueues[0].1.iter().any(|e| matches!(
                     e,
                     IngestEnqueue::Scan { trigger_source, .. } if trigger_source == "register-by-hash"
                 )),
                 "non-seed caller's enqueue must carry trigger_source=register-by-hash, \
                  not seed-import: {:?}",
-                enqueues[1].1
+                enqueues[0].1
             );
         });
     }
@@ -15210,26 +15199,26 @@ mod tests {
             );
 
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2, "{transitions:?}");
-            let follow_on_kinds: Vec<&str> = transitions[1]
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
+            let kinds: Vec<&str> = transitions[0]
                 .1
                 .events
                 .iter()
                 .map(|e| e.event.event_type())
                 .collect();
             assert_eq!(
-                follow_on_kinds,
-                vec!["ArtifactQuarantined"],
-                "no ScanRequested under an explicit scan_backends:[] waiver: {follow_on_kinds:?}"
+                kinds,
+                vec!["ArtifactIngested", "ArtifactQuarantined"],
+                "no ScanRequested under an explicit scan_backends:[] waiver: {kinds:?}"
             );
             // `commit_transition_with_enqueues` records a `(id, enqueues)`
-            // entry on EVERY call, including ones with an empty `enqueues`
+            // entry on EVERY call, including one with an empty `enqueues`
             // slice (the call happened; nothing was requested) — assert
-            // the SLICES are empty, not that no call was recorded. Two
-            // calls: the mint (riding this method for its `primary_content`
-            // edge) and the gate's quarantine commit.
+            // the SLICE is empty, not that no call was recorded. The one
+            // call carries the mint, the quarantine transition and the
+            // artifact's `primary_content` edge.
             let enqueues = lifecycle.ingest_enqueues();
-            assert_eq!(enqueues.len(), 2, "{enqueues:?}");
+            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
             assert!(
                 enqueues.iter().all(|(_, e)| e.is_empty()),
                 "no Scan job enqueue under an explicit scan_backends:[] waiver: {enqueues:?}"
@@ -15283,14 +15272,14 @@ mod tests {
     }
 
     /// non-seed x fully-waived policy (duration=0 AND scan_backends=[] AND
-    /// provenance_mode=off): the generalized gate has NOTHING to append or
-    /// enqueue, so it must skip its follow-on commit ENTIRELY — exactly one
-    /// `ArtifactIngested` commit, artifact stays `None`/downloadable.
-    /// Exercises the `!events.is_empty() || !enqueues.is_empty()` guard's
-    /// false arm, which no other test reaches (every other register_by_hash
-    /// test's policy enqueues at least a scan).
+    /// provenance_mode=off): the gate has NOTHING to append or enqueue, so
+    /// the one commit carries the bare mint — a single `ArtifactIngested`,
+    /// no enqueue, artifact stays `None`/downloadable. The only cell of the
+    /// matrix in which the committed `None` status is the intended end
+    /// state rather than a stage; every other register_by_hash test's
+    /// policy appends or enqueues something.
     #[test]
-    fn register_by_hash_non_seed_fully_waived_policy_skips_follow_on_commit_entirely() {
+    fn register_by_hash_non_seed_fully_waived_policy_commits_the_bare_mint() {
         let repo = pypi_repository();
         let repo_id = repo.id;
 
@@ -15317,12 +15306,18 @@ mod tests {
                 "a fully-waived policy (duration=0, scan off, provenance off) leaves the \
                  artifact None/downloadable, matching ingest_inner's identical case"
             );
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
+            let kinds: Vec<&str> = transitions[0]
+                .1
+                .events
+                .iter()
+                .map(|e| e.event.event_type())
+                .collect();
             assert_eq!(
-                lifecycle.committed_transitions().len(),
-                1,
-                "nothing to append or enqueue -> the follow-on commit must be skipped \
-                 entirely, not sent empty: {:?}",
-                lifecycle.committed_transitions()
+                kinds,
+                vec!["ArtifactIngested"],
+                "a fully-waived policy appends nothing beyond the mint: {kinds:?}"
             );
             // One recorded call — the mint, which carries the artifact's
             // `primary_content` edge and no enqueue at all.
@@ -15333,6 +15328,250 @@ mod tests {
                     .all(|(_, e)| e.is_empty()),
                 "{:?}",
                 lifecycle.ingest_enqueues()
+            );
+        });
+    }
+
+    // =====================================================================
+    // Mint and gate are ONE commit — the pair the registration path must
+    // never split again.
+    //
+    // The first pins what the merged shape commits; the second pins what
+    // is left behind when that commit fails; the third pins that the
+    // second's failure seam is selective rather than blanket. None of them
+    // is about a cause — a `trigger_source` CHECK, a deadlock, a dropped
+    // connection — because the remainder is the same whatever the route:
+    // the first commit of a split pair already publishes a SERVABLE
+    // artifact (`QuarantineStatus::None` is the most permissive state in
+    // the system, `Artifact::is_downloadable` admits it, and the default
+    // `ReleasedOnly` index mode serves it), so a failure after it leaves
+    // an artifact that is never scanned and no job row to record that a
+    // verdict is owed.
+    // =====================================================================
+
+    /// What holds the merged shape: under a quarantining, scanning policy
+    /// the registration makes exactly ONE lifecycle call, and that one call
+    /// carries all of it — the mint event, the gate's events, the artifact
+    /// row already at `Quarantined`, its metadata projection, the scan
+    /// enqueue and the `primary_content` edge.
+    ///
+    /// A re-split fails this test in whichever form it takes: a second
+    /// `commit_transition_with_enqueues`, a second plain
+    /// `commit_transition`, or a best-effort second commit whose error is
+    /// swallowed all land a second entry in `committed_transitions()`.
+    #[test]
+    fn register_by_hash_mint_and_gate_ride_one_commit() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs, content_refs, _events) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+            policies.insert(global_scan_policy()); // duration = 24h, scan_backends = ["osv"]
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash.clone(), None, &test_handler())
+                .await
+                .expect("registration under a quarantining, scanning policy must succeed");
+            let artifact_id = outcome.artifact.id;
+
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(
+                transitions.len(),
+                1,
+                "the mint and the gate must be ONE commit — a second entry here is the \
+                 split that leaves a servable, never-scanned artifact behind: {transitions:?}"
+            );
+            let (committed, batch, metadata) = &transitions[0];
+
+            let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+            assert_eq!(
+                kinds,
+                vec!["ArtifactIngested", "ArtifactQuarantined", "ScanRequested"],
+                "one batch carries the mint event and both gate events: {kinds:?}"
+            );
+            assert_eq!(
+                batch.expected_version,
+                ExpectedVersion::NoStream,
+                "the batch is the stream's genesis — there is no earlier append of \
+                 this registration's to be ordered after"
+            );
+
+            // The row this commit persists is the GATED one: the backend
+            // never sees the permissive `None` the struct was built with.
+            assert_eq!(committed.quarantine_status, QuarantineStatus::Quarantined);
+            assert!(
+                !committed.is_downloadable(),
+                "the only artifact state this path ever persists under a quarantining \
+                 policy must not be servable"
+            );
+            assert!(committed.quarantine_window_start.is_some());
+            assert!(
+                metadata.is_some(),
+                "the metadata projection rides the same commit as the row it describes"
+            );
+
+            // The gate's enqueue and the mint's edge ride that SAME call —
+            // asserted through the per-call snapshots, which say *which*
+            // write carried them, rather than through the index contents,
+            // which do not.
+            let enqueues = lifecycle.ingest_enqueues();
+            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+            assert_eq!(enqueues[0].0, artifact_id);
+            assert!(
+                enqueues[0].1.iter().any(|e| matches!(
+                    e,
+                    IngestEnqueue::Scan { trigger_source, .. }
+                        if trigger_source == "register-by-hash"
+                )),
+                "the scan job rides the commit that gated the row: {:?}",
+                enqueues[0].1
+            );
+            assert_eq!(
+                lifecycle.ingest_edge_kinds(),
+                vec![(
+                    artifact_id,
+                    "primary_content".to_string(),
+                    hash.as_ref().to_owned()
+                )],
+                "and so does the artifact's claim on its own bytes"
+            );
+            assert_eq!(content_refs.entry_count(), 1, "the edge reached the index");
+        });
+    }
+
+    /// The gate-bearing commit fails, and NOTHING servable is left behind.
+    ///
+    /// The discriminator is the commit's **content**, never its ordinal: a
+    /// double armed to fail "the second call" states a property of a split
+    /// that, once merged, selects nothing and passes vacuously. Armed on
+    /// content — "the commit carrying the quarantine transition, or a
+    /// non-empty enqueue list" — the same test selects the gate-bearing
+    /// commit in either shape. Against the split it fails the follow-on
+    /// and finds the mint's servable `QuarantineStatus::None` row, its
+    /// `primary_content` edge and its event still committed; against one
+    /// commit it fails the whole registration and finds none of them.
+    ///
+    /// The injected error is a `DomainError::Invariant`, deliberately not
+    /// anything the `jobs.trigger_source` CHECK would produce: that cause
+    /// is fixed, and the hazard this pins is the class, not the cause.
+    #[test]
+    fn register_by_hash_failed_gate_commit_leaves_nothing_servable() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, lifecycle, storage, repos, policies, _jobs, content_refs, _events) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+            policies.insert(global_scan_policy()); // duration = 24h, scan_backends = ["osv"]
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            lifecycle.fail_commits_carrying(
+                |c| {
+                    c.events
+                        .events
+                        .iter()
+                        .any(|e| matches!(e.event, DomainEvent::ArtifactQuarantined(_)))
+                        || !c.enqueues.is_empty()
+                },
+                DomainError::Invariant(
+                    "synthetic gate-commit failure (not the trigger_source CHECK)".into(),
+                ),
+            );
+
+            let err = uc
+                .register_by_hash(req_legacy(repo_id), hash.clone(), None, &test_handler())
+                .await
+                .expect_err("a failed gate-bearing commit must fail the registration");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Invariant(_))),
+                "expected the injected Invariant, got {err:?}"
+            );
+
+            // The remainder. An artifact row here is the defect itself: it
+            // would carry `QuarantineStatus::None`, which `is_downloadable`
+            // admits and the default `ReleasedOnly` index mode serves.
+            let left_behind = artifacts
+                .find_by_repo_and_checksum(repo_id, &hash)
+                .await
+                .unwrap();
+            assert!(
+                left_behind.is_none(),
+                "a failed gate commit left an artifact behind: status={:?}, \
+                 downloadable={:?} — it will never be scanned and no job row says \
+                 a verdict is owed",
+                left_behind.as_ref().map(|a| a.quarantine_status),
+                left_behind.as_ref().map(Artifact::is_downloadable),
+            );
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "no transition may commit: {:?}",
+                lifecycle.committed_transitions()
+            );
+            assert_eq!(
+                content_refs.entry_count(),
+                0,
+                "and no edge claiming its bytes may survive either"
+            );
+            // The other half of the remainder, which held in the split
+            // shape too and must keep holding: no `jobs` row exists, so
+            // nothing would have made anyone aware a verdict was owed.
+            assert!(
+                lifecycle.scan_enqueues().is_empty(),
+                "{:?}",
+                lifecycle.scan_enqueues()
+            );
+        });
+    }
+
+    /// Counter-assertion to the class test above: the seam it stands on is
+    /// SELECTIVE. A predicate naming content this path never commits must
+    /// leave the registration untouched — without this, a double that
+    /// failed every commit would make that test green for the wrong
+    /// reason, and the test would say nothing about *which* commit carries
+    /// the gate.
+    #[test]
+    fn register_by_hash_commit_failure_seam_fires_only_on_matching_content() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            policies.insert(global_scan_policy());
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            // `ArtifactRejected` is never part of a registration's batch.
+            lifecycle.fail_commits_carrying(
+                |c| {
+                    c.events
+                        .events
+                        .iter()
+                        .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_)))
+                },
+                DomainError::Invariant("must never fire on a registration batch".into()),
+            );
+
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("a non-matching predicate must not fail the registration");
+            assert_eq!(
+                outcome.artifact.quarantine_status,
+                QuarantineStatus::Quarantined
+            );
+            assert_eq!(
+                lifecycle.committed_transitions().len(),
+                1,
+                "{:?}",
+                lifecycle.committed_transitions()
             );
         });
     }

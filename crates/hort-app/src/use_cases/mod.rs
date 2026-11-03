@@ -458,17 +458,22 @@ pub(crate) async fn read_artifact_stream(
 /// None of the variants is read at runtime. That is the point: it is a
 /// declaration by the call site, checked by review and by the reader,
 /// not a branch.
+///
+/// **"A second append inside the same call" is deliberately not a
+/// variant.** A mint and whatever that same call derives from resolved
+/// configuration belong in ONE
+/// [`commit_transition_with_enqueues`](hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort::commit_transition_with_enqueues)
+/// — both minting paths do that — because the first commit of the pair
+/// already publishes a servable artifact, so a failure of the second
+/// leaves a remainder nothing in the request path can repair. A new site
+/// that wants such a witness is asking for that split back, and the
+/// answer is to merge the appends, not to name the exception.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnpairedAppend {
     /// The artifact was minted in this call and its stream does not
     /// exist yet, so there is no stored evidence to pair with: the
     /// genesis event is the stream's first.
     GenesisAppend,
-    /// A follow-up append on a stream **this same call** created, whose
-    /// content is derived from resolved configuration rather than from
-    /// anything on the stream. Nothing a previous writer put there is
-    /// read, because there is no previous writer.
-    SameCallFollowUp,
     /// Every appended event's content comes from the caller's request.
     /// The stream is not consulted, so there is no decision for the
     /// version to protect beyond "this append is ordered after whatever
