@@ -282,9 +282,9 @@ pub enum ProvenanceRejectReason {
 /// accompanies this.
 ///
 /// Carries `Serialize`/`Deserialize` for symmetry with
-/// [`ProvenanceRejectReason`] and so a future hold record can carry the
-/// reason; **no event payload references it today** (a hold emits no
-/// event at all — that absence *is* the hold).
+/// [`ProvenanceRejectReason`]. The `ProvenanceHeld` event records the
+/// publisher-facing [`ProvenanceHoldReason`] instead: all indeterminate
+/// causes ask the publisher to take the same action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndeterminateReason {
     /// Attestation material could not be obtained at all — the fetch
@@ -320,6 +320,18 @@ pub enum IndeterminateReason {
     /// [`ProvenanceOutcome::NoAttestation`] and send the operator to the
     /// publisher's signer for a fault of ours.
     VerifierUnavailable,
+}
+
+/// What a required-mode provenance hold is waiting for. This is the
+/// publisher-facing outcome, not the cause of a failed verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProvenanceHoldReason {
+    /// The artifact can be signed directly.
+    PendingSignature,
+    /// A constituent needs its subject to arrive and be signed.
+    PendingSubject,
+    /// Verification could not be completed; the operator must investigate.
+    Indeterminate,
 }
 
 /// The outcome of a single verification.

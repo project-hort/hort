@@ -104,8 +104,9 @@
 //! since come clean. `last_scan_at` advances on that clean run, matches no
 //! row, and the artifact reads as clean — which is the point.
 //!
-//! A `last_scan_at` of NULL (never scanned) matches nothing, and
-//! `COALESCE(f.finding_count, 0)` renders that as a clean row.
+//! A `last_scan_at` of NULL (never scanned) matches nothing. The outer
+//! projection uses that anchor to leave the finding summary absent;
+//! a completed clean scan still reports zero findings.
 //!
 //! See `docs/architecture/how-to/curator-workflow.md` for operator guidance.
 
@@ -203,6 +204,8 @@ const QUEUE_SQL: &str = r#"
                     r.format::text              AS format,
                     a.name                      AS package_name,
                     a.version                   AS version,
+                    a.path                      AS path,
+                    a.last_scan_at              AS last_scan_at,
                     a.quarantine_status         AS quarantine_status,
                     a.quarantine_window_start   AS quarantine_window_start,
                     CASE
@@ -345,6 +348,8 @@ struct CurationQueueRow {
     format: String,
     package_name: String,
     version: Option<String>,
+    path: String,
+    last_scan_at: Option<DateTime<Utc>>,
     quarantine_status: Option<String>,
     quarantine_window_start: Option<DateTime<Utc>>,
     quarantine_deadline: Option<DateTime<Utc>>,
@@ -400,6 +405,12 @@ impl CurationQueueRow {
         let rejection_reason_kind = self
             .rejection_reason_kind_raw
             .map(|raw| normalise_rejection_reason_kind(&raw));
+        let finding_count = self
+            .last_scan_at
+            .map(|_| i64_finding_count_to_u32(self.finding_count));
+        let max_severity = self
+            .last_scan_at
+            .and_then(|_| self.max_severity_rank.and_then(severity_from_rank));
 
         Ok(CurationQueueEntry {
             artifact_id: self.artifact_id,
@@ -408,11 +419,12 @@ impl CurationQueueRow {
             format,
             package_name: self.package_name,
             version: self.version,
+            path: self.path,
             quarantine_status,
             quarantine_window_start: self.quarantine_window_start,
             quarantine_deadline: self.quarantine_deadline,
-            finding_count: i64_finding_count_to_u32(self.finding_count),
-            max_severity: self.max_severity_rank.and_then(severity_from_rank),
+            finding_count,
+            max_severity,
             rejection_reason_kind,
         })
     }

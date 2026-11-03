@@ -36,6 +36,9 @@ pub struct CurationQueueEntry {
     pub format: RepositoryFormat,
     pub package_name: String,
     pub version: Option<String>,
+    /// Stored artifact path; identifies OCI blobs and manifests whose
+    /// `version` is absent.
+    pub path: String,
     pub quarantine_status: QuarantineStatus,
     pub quarantine_window_start: Option<DateTime<Utc>>,
     /// Computed by the adapter from `(window_start, policy.duration)`
@@ -45,12 +48,12 @@ pub struct CurationQueueEntry {
     /// rows. `scan_findings` is per-scan history, so this is deliberately
     /// not the count over every scan the artifact ever had: that number
     /// grows with the rescan count and contradicts the scan the release
-    /// verdict is derived from. `0` for an artifact whose last scan found
-    /// nothing, and for one never scanned.
-    pub finding_count: u32,
+    /// verdict is derived from. `Some(0)` means the last scan found
+    /// nothing; `None` means no scan has been recorded.
+    pub finding_count: Option<u32>,
     /// Highest severity in the **last** scan's findings — not the highest
     /// the artifact has ever carried. `None` when that scan reported
-    /// nothing.
+    /// nothing or no scan has been recorded.
     pub max_severity: Option<SeverityThreshold>,
     /// Discriminator from the latest `ArtifactRejected` event's
     /// `rejected_by` payload (`"scanner" | "curator" |

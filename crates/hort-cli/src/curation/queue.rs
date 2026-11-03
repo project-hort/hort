@@ -34,8 +34,11 @@
 //! `CurationQueueResponseDto` pretty-printed.
 //!
 //! `--output table` (default): one row per entry with columns
-//! `ARTIFACT_ID  REPO  FORMAT  PACKAGE  VERSION  STATUS  DEADLINE
-//! FINDINGS  SEVERITY  REJECT_REASON`. `DEADLINE` renders as ISO-8601
+//! `ARTIFACT_ID  REPO  FORMAT  PACKAGE  VERSION  PATH  STATUS  DEADLINE
+//! FINDINGS  SEVERITY  REJECT_REASON`. `PATH` identifies OCI blobs and
+//! manifests whose `VERSION` is absent. An artifact with no completed
+//! scan shows `unscanned` in both finding columns; a clean scan shows
+//! `0` findings. `DEADLINE` renders as ISO-8601
 //! UTC (rather than relative duration — operators viewing the curation
 //! queue care about the exact wall-clock the artifact becomes eligible
 //! for auto-release, not a `in 6h` hand-wave). `REJECT_REASON` is the
@@ -99,12 +102,14 @@ pub struct CurationQueueEntryDto {
     pub package_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    pub path: String,
     pub quarantine_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantine_window_start: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantine_deadline: Option<DateTime<Utc>>,
-    pub finding_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finding_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_severity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,6 +235,7 @@ fn render_table(rows: &[CurationQueueEntryDto], out: &mut impl Write) -> std::io
         "FORMAT",
         "PACKAGE",
         "VERSION",
+        "PATH",
         "STATUS",
         "DEADLINE",
         "FINDINGS",
@@ -246,12 +252,19 @@ fn render_table(rows: &[CurationQueueEntryDto], out: &mut impl Write) -> std::io
                 r.format.clone(),
                 r.package_name.clone(),
                 r.version.clone().unwrap_or_else(|| "-".to_string()),
+                r.path.clone(),
                 r.quarantine_status.clone(),
                 r.quarantine_deadline
                     .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
                     .unwrap_or_else(|| "-".to_string()),
-                r.finding_count.to_string(),
-                r.max_severity.clone().unwrap_or_else(|| "-".to_string()),
+                r.finding_count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "unscanned".to_string()),
+                if r.finding_count.is_none() {
+                    "unscanned".to_string()
+                } else {
+                    r.max_severity.clone().unwrap_or_else(|| "-".to_string())
+                },
                 r.rejection_reason_kind
                     .clone()
                     .unwrap_or_else(|| "-".to_string()),
@@ -408,10 +421,11 @@ mod tests {
             format: "npm".into(),
             package_name: "evil-pkg".into(),
             version: Some("1.0.0".into()),
+            path: "evil-pkg/-/evil-pkg-1.0.0.tgz".into(),
             quarantine_status: "quarantined".into(),
             quarantine_window_start: None,
             quarantine_deadline: None,
-            finding_count: 3,
+            finding_count: Some(3),
             max_severity: Some("high".into()),
             rejection_reason_kind: None,
         }
@@ -465,5 +479,54 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         // At least three '-' columns (version, severity, reject_reason).
         assert!(out.matches(" -").count() >= 3, "dashes in output: {out}");
+    }
+
+    #[test]
+    fn render_table_distinguishes_unscanned_from_clean() {
+        let mut unscanned = sample_entry();
+        unscanned.finding_count = None;
+        unscanned.max_severity = None;
+        let mut clean = sample_entry();
+        clean.artifact_id = "33333333-3333-3333-3333-333333333333".into();
+        clean.finding_count = Some(0);
+        clean.max_severity = None;
+
+        let mut buf = Vec::new();
+        render_table(&[unscanned, clean], &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let mut lines = output.lines();
+        let headings: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        let findings = headings.iter().position(|h| *h == "FINDINGS").unwrap();
+        let severity = headings.iter().position(|h| *h == "SEVERITY").unwrap();
+        let unscanned_cells: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        let clean_cells: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        assert_ne!(unscanned_cells[findings], clean_cells[findings]);
+        assert_ne!(unscanned_cells[findings], "0");
+        assert_eq!(clean_cells[findings], "0");
+        assert_ne!(unscanned_cells[severity], clean_cells[severity]);
+    }
+
+    #[test]
+    fn render_table_distinguishes_oci_rows_by_path() {
+        let mut blob = sample_entry();
+        blob.format = "oci".into();
+        blob.package_name = "library/nginx".into();
+        blob.version = None;
+        blob.path = "blobs/sha256:aaaa".into();
+        let mut manifest = blob.clone();
+        manifest.artifact_id = "33333333-3333-3333-3333-333333333333".into();
+        manifest.path = "manifests/sha256:bbbb".into();
+
+        let mut buf = Vec::new();
+        render_table(&[blob, manifest], &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let mut lines = output.lines();
+        let headings: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        let path = headings.iter().position(|h| *h == "PATH").unwrap();
+        let blob_cells: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        let manifest_cells: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        assert_eq!(blob_cells[path], "blobs/sha256:aaaa");
+        assert_eq!(manifest_cells[path], "manifests/sha256:bbbb");
+        assert_ne!(blob_cells[path], manifest_cells[path]);
     }
 }

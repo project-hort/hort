@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::entities::artifact::QuarantineStatus;
 use crate::entities::scan_policy::SeverityThreshold;
 use crate::error::{DomainError, DomainResult};
-use crate::ports::provenance::{ProvenanceRejectReason, SignerIdentity};
+use crate::ports::provenance::{ProvenanceHoldReason, ProvenanceRejectReason, SignerIdentity};
 use crate::retention::ExpirationReason;
 use crate::types::checksum::HashAlgorithm;
 use crate::types::{ArtifactCoords, ContentHash, Finding};
@@ -894,9 +894,9 @@ impl ProvenanceVerified {
 /// (`quarantine_status = 'rejected'`), terminal under the release
 /// surfaces — like `ScanCompleted(findings)`.
 ///
-/// Emitted under `VerifyIfPresent` when a present bundle is forged /
-/// untrusted, and under `Required` for both that case and the
-/// unsigned-but-required case (`reason: Unsigned`). `reason` is the typed
+/// Emitted when a present bundle is forged or untrusted. Historical
+/// events can carry `Unsigned`; an absent signature now holds instead.
+/// `reason` is the typed
 /// [`ProvenanceRejectReason`] so an audit query can distinguish a forged
 /// signature from a malformed bundle from an unsigned-under-`Required`
 /// artifact.
@@ -916,6 +916,26 @@ pub struct ProvenanceRejected {
 }
 
 impl ProvenanceRejected {
+    pub fn validate(&self) -> DomainResult<()> {
+        validate_string("backend", &self.backend, MAX_SCANNER_LEN)
+    }
+}
+
+/// A required-mode provenance check held an artifact pending a change or
+/// an operator repair. Recorded only when the hold reason changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProvenanceHeld {
+    /// The artifact on whose stream this event lands.
+    pub artifact_id: Uuid,
+    /// The CAS content hash of the held artifact.
+    pub content_hash: ContentHash,
+    /// The verifier backend that reached the hold.
+    pub backend: String,
+    /// What the hold waits for.
+    pub reason: ProvenanceHoldReason,
+}
+
+impl ProvenanceHeld {
     pub fn validate(&self) -> DomainResult<()> {
         validate_string("backend", &self.backend, MAX_SCANNER_LEN)
     }

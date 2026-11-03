@@ -293,7 +293,7 @@ pub trait ArtifactLifecyclePort: Send + Sync {
     }
 
     /// Atomically append a **provenance-verdict** transition
-    /// (`ProvenanceVerified`, or `ProvenanceRejected` + its
+    /// (`ProvenanceVerified`, `ProvenanceHeld`, or `ProvenanceRejected` + its
     /// `ArtifactRejected` companion) and persist ONLY the
     /// `quarantine_status` column — never the artifact's full row.
     ///

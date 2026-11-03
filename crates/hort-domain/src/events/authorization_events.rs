@@ -534,7 +534,8 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // bundles off the OCI Referrers surface, streams the CAS preimage,
     // dispatches the cosign verifier, and threads the folded verdict
     // through `Artifact::complete_provenance`. **Non-destructive** — it
-    // only records a `ProvenanceVerified` / `ProvenanceRejected` verdict
+    // records a `ProvenanceVerified` / `ProvenanceRejected` verdict or a
+    // `ProvenanceHeld` reason transition
     // (each subject to the fail-closed release gate — ADR 0007); it never
     // deletes or releases
     // an artifact on its own. Run summary in `result_summary`:

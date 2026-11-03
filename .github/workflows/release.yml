@@ -533,10 +533,11 @@ jobs:
               echo "::warning::prefetch POST failed — likely cause: the gha-release-prefetch-cargo-virtual grant is not applied yet (issue #138). Cold deps below still block this publish."
             fi
 
-            echo "::error::hort-publish preflight: ${cold_count} locked dependency version(s) are not yet served by the vetted index (cargo-virtual, released_only) — publish would otherwise fail one miss at a time. A prefetch warm was just started for the full locked set; re-run this release after the crates-proxy quarantine window (24h, or 3d once #126's playbook run is applied) so every cold dep above has cleared quarantine. Cold set:"
+            echo "::error::hort-publish preflight: ${cold_count} locked dependency version(s) are not yet served by the vetted index (cargo-virtual, released_only) — publish would otherwise fail one miss at a time. Cold set:"
             while read -r name version; do
               echo "::error::  ${name} ${version}"
             done < "${tmpdir}/cold.txt"
+            echo "::error::A version may be absent because it was never ingested, is still in the quarantine window, or was terminally rejected; this index check does not distinguish them. A prefetch warm was requested for the full locked set. After a successful warm, re-run after the crates-proxy quarantine window (24h, or 3d if configured). If a version remains missing, investigate its rejection verdict: re-scan can clear a scanner rejection, and a curator waiver can override eligible rejections. Waiting alone cannot clear a terminal rejection."
             exit 1
           fi
 

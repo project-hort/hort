@@ -1484,10 +1484,11 @@ pub fn queue_entry_for(artifact: &Artifact, repository_key: &str) -> CurationQue
         format: RepositoryFormat::Oci,
         package_name: artifact.name.clone(),
         version: artifact.version.clone(),
+        path: artifact.path.clone(),
         quarantine_status: artifact.quarantine_status,
         quarantine_window_start: artifact.quarantine_window_start,
         quarantine_deadline: None,
-        finding_count: 0,
+        finding_count: None,
         max_severity: None,
         rejection_reason_kind: None,
     }
@@ -2999,7 +3000,7 @@ impl MockArtifactLifecycle {
     /// asks whether the gate's events are on the stream — with the batch
     /// dropped, a healthy row whose gate ran reads as gate-less.
     ///
-    /// Scoped to the two creation-transition commits on purpose:
+    /// Used by creation-transition and provenance-verdict commits:
     /// `commit_scan_result*` has its own event-store wiring
     /// ([`with_scan_result_paired_mocks`](Self::with_scan_result_paired_mocks)),
     /// and folding a batch in twice would be worse than folding it in
@@ -3413,6 +3414,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
             Ok(m) => m,
             Err(e) => return Box::pin(async move { Err(e) }),
         };
+        if let Err(e) = self.publish_commit(&events) {
+            return Box::pin(async move { Err(e) });
+        }
         let count = events.events.len() as u64;
         self.transitions
             .lock()

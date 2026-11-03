@@ -25,7 +25,7 @@
 //! - A bundle-fetch / CAS-read failure that retries cannot resolve is
 //!   `Indeterminate{AttestationFetchFailed}` in every mode — the material
 //!   was never seen, so nothing about the artifact was established.
-//!   Under [`ProvenanceMode::Required`] the artifact HOLDS: no event, so
+//!   Under [`ProvenanceMode::Required`] the artifact HOLDS and records why, so
 //!   a **never-verified** `Required` artifact still never timer-releases
 //!   (it stays `Pending` in the release sweep's clearance computation).
 //!   Fail-closed, and not terminal — terminality needs a positive
@@ -156,13 +156,13 @@ pub enum ProvenanceVerdictSummary {
     /// (`VerifyIfPresent`/`Off` no-op, no event) — a previously-silent
     /// case, made observable here.
     NoAttestation,
-    /// A `Required`-mode **subject** was found unsigned: no event, status
+    /// A `Required`-mode **subject** was found unsigned: status
     /// stays `Quarantined` (HELD, read as `Pending` by the release gate).
     /// Distinct from `NoAttestation` so the task handler's `result_summary`
     /// separates "waiting to be signed" from "allowed unsigned".
     HeldPendingSignature,
     /// A `Required`-mode **constituent** (an OCI config/layer blob) was
-    /// found unsigned: no event, status stays `Quarantined` (HELD).
+    /// found unsigned: status stays `Quarantined` (HELD).
     /// Distinct from [`Self::HeldPendingSignature`] because nothing is
     /// waiting for *this* row to be signed — it can never carry its own
     /// attestation. It is waiting for its **subject** to arrive and clear
@@ -170,7 +170,7 @@ pub enum ProvenanceVerdictSummary {
     /// different operator action (push/sign the parent, not this row).
     HeldPendingSubject,
     /// A `Required`-mode artifact whose verification **could not be
-    /// carried out**: no event, status stays `Quarantined` (HELD).
+    /// carried out**: status stays `Quarantined` (HELD).
     /// Distinct from the two above because the thing to fix is on *our*
     /// side — a trust root with no usable key, attestation material that
     /// could never be fetched, a verifier that returned no verdict — and
@@ -212,8 +212,8 @@ pub enum ProvenanceRunOutcome {
     /// no outcome. `Required` mode only.
     SkippedAlreadyCleared,
     /// A verdict was produced and applied. `event_appended` is `true` when
-    /// `complete_provenance` emitted events (Verified / Rejected) and
-    /// `false` for the `NoAttestation` hold / allowed-unsigned no-op.
+    /// a verified or rejected verdict, or a new hold reason, was recorded.
+    /// An unchanged hold and the permissive no-op report `false`.
     /// `verdict` carries the coarse outcome bucket the task handler maps to
     /// `result_summary`.
     Applied {
@@ -284,6 +284,23 @@ enum HoldReason {
     /// check"), and the specific reason rides the verdict's own audit
     /// trail rather than splitting a reporting label three ways.
     Indeterminate,
+}
+
+impl From<HoldReason> for hort_domain::ports::provenance::ProvenanceHoldReason {
+    fn from(value: HoldReason) -> Self {
+        match value {
+            HoldReason::PendingSignature => Self::PendingSignature,
+            HoldReason::PendingSubject => Self::PendingSubject,
+            HoldReason::Indeterminate => Self::Indeterminate,
+        }
+    }
+}
+
+/// The latest hold reason and the version observed in the same stream read.
+#[derive(Clone, Copy)]
+struct HoldAtVersion {
+    expected_version: ExpectedVersion,
+    current_reason: Option<hort_domain::ports::provenance::ProvenanceHoldReason>,
 }
 
 impl HoldReason {
@@ -518,20 +535,43 @@ impl ProvenanceOrchestrationUseCase {
             );
         })?;
         let expected_version = paired.expected_version();
-        let artifact = paired.into_artifact();
+        let repository_id = paired.artifact().repository_id;
 
-        let repo = self.repositories.find_by_id(artifact.repository_id).await?;
+        let repo = self.repositories.find_by_id(repository_id).await?;
         let format = repo.format.to_string();
 
         // Resolve the policy (repo-scoped → global). Mode drives every
         // downstream decision.
         let policy =
-            resolve_active_policy_for_repo(&*self.policy_projections, artifact.repository_id)
-                .await?;
+            resolve_active_policy_for_repo(&*self.policy_projections, repository_id).await?;
         let mode = policy
             .as_ref()
             .map(|p| p.provenance_mode)
             .unwrap_or_default();
+
+        // The latest provenance outcome and append version come from the
+        // same read. A later append makes this verdict commit conflict.
+        let current_hold = if mode == ProvenanceMode::Required {
+            paired
+                .evidence()?
+                .iter()
+                .rev()
+                .find_map(|stored| match &stored.event {
+                    DomainEvent::ProvenanceHeld(e) => Some(Some(e.reason)),
+                    DomainEvent::ProvenanceVerified(_) | DomainEvent::ProvenanceRejected(_) => {
+                        Some(None)
+                    }
+                    _ => None,
+                })
+                .flatten()
+        } else {
+            None
+        };
+        let hold_at_version = HoldAtVersion {
+            expected_version,
+            current_reason: current_hold,
+        };
+        let artifact = paired.into_artifact();
 
         // Constituent classification — REPORTING ONLY, never a gate. A
         // `NoAttestation` verdict under `Required` holds unconditionally
@@ -667,7 +707,7 @@ impl ProvenanceOrchestrationUseCase {
                         mode,
                         "bundle fetch",
                         e,
-                        expected_version,
+                        hold_at_version,
                     )
                     .await;
             }
@@ -708,7 +748,7 @@ impl ProvenanceOrchestrationUseCase {
                                         mode,
                                         "post-proxy bundle re-read",
                                         e,
-                                        expected_version,
+                                        hold_at_version,
                                     )
                                     .await;
                             }
@@ -722,7 +762,7 @@ impl ProvenanceOrchestrationUseCase {
                                 mode,
                                 "upstream referrer fetch",
                                 e,
-                                expected_version,
+                                hold_at_version,
                             )
                             .await;
                     }
@@ -743,7 +783,7 @@ impl ProvenanceOrchestrationUseCase {
                         mode,
                         "CAS preimage read",
                         e,
-                        expected_version,
+                        hold_at_version,
                     )
                     .await;
             }
@@ -882,7 +922,7 @@ impl ProvenanceOrchestrationUseCase {
                 verdict,
                 mode,
                 is_constituent,
-                expected_version,
+                hold_at_version,
             )
             .await?;
 
@@ -1420,7 +1460,7 @@ impl ProvenanceOrchestrationUseCase {
         verdict: ProvenanceVerdict,
         mode: ProvenanceMode,
         is_constituent: bool,
-        expected_version: ExpectedVersion,
+        hold_at_version: HoldAtVersion,
     ) -> AppResult<ProvenanceRunOutcome> {
         // Defense-in-depth bounded requeue (issue #90). A `NoAttestation`
         // verdict under `Required` with a `None` `quarantine_window_start`
@@ -1539,11 +1579,11 @@ impl ProvenanceOrchestrationUseCase {
         // `result_summary` — the per-artifact forensic trail — names it
         // too.
         let unreadable_skipped = verdict.unreadable_skipped;
-        let events = artifact.complete_provenance(verdict, backend)?;
+        let mut events = artifact.complete_provenance(verdict, backend)?;
 
         if events.is_empty() {
-            // No event, status unchanged — held under `Required`, allowed
-            // under `VerifyIfPresent` / `Off`. Each of the four readings
+            // No domain transition, status unchanged — held under `Required`,
+            // allowed under `VerifyIfPresent` / `Off`. Each of the four readings
             // ticks its own result value, so a hold is never reported as a
             // pass and a check we could not run is never reported as an
             // artifact nobody signed. Single emission layer — the
@@ -1563,11 +1603,26 @@ impl ProvenanceOrchestrationUseCase {
                 );
             }
             crate::metrics::emit_provenance_verify(backend, mode, no_event_report.metric_result());
-            return Ok(ProvenanceRunOutcome::Applied {
-                event_appended: false,
-                verdict: no_event_report.verdict_summary(),
-                unreadable_skipped,
-            });
+            if let NoEventReport::Held(reason) = no_event_report {
+                let reason = hort_domain::ports::provenance::ProvenanceHoldReason::from(reason);
+                if hold_at_version.current_reason != Some(reason) {
+                    events.push(DomainEvent::ProvenanceHeld(
+                        hort_domain::events::ProvenanceHeld {
+                            artifact_id: artifact.id,
+                            content_hash: artifact.sha256_checksum.clone(),
+                            backend: backend.to_owned(),
+                            reason,
+                        },
+                    ));
+                }
+            }
+            if events.is_empty() {
+                return Ok(ProvenanceRunOutcome::Applied {
+                    event_appended: false,
+                    verdict: no_event_report.verdict_summary(),
+                    unreadable_skipped,
+                });
+            }
         }
 
         // Tracing: info! on the supply-chain decision — audit signal, not
@@ -1576,8 +1631,8 @@ impl ProvenanceOrchestrationUseCase {
         // `hort_provenance_verify_total{backend, mode, result}` always, +
         // `hort_provenance_reject_total{backend, reason}` on a rejection.
         // The coarse verdict bucket surfaced to the task handler's
-        // `result_summary`. Derived from the batch's AXIS event — the
-        // `Verified` / `Rejected` arm; the `ArtifactRejected` companion the
+        // `result_summary`. Derived from the batch's axis event — the
+        // `Verified` / `Rejected` / `Held` arm; the `ArtifactRejected` companion the
         // rejection arm appends alongside carries no provenance-specific
         // information, so it is skipped here rather than matched. A batch
         // with no axis event is unreachable (a non-empty batch always leads
@@ -1613,6 +1668,7 @@ impl ProvenanceOrchestrationUseCase {
                     crate::metrics::emit_provenance_reject(backend, e.reason);
                     ProvenanceVerdictSummary::Rejected(e.reason)
                 }
+                DomainEvent::ProvenanceHeld(_) => no_event_report.verdict_summary(),
                 _ => acc,
             },
         );
@@ -1639,7 +1695,7 @@ impl ProvenanceOrchestrationUseCase {
                 &artifact,
                 AppendEvents {
                     stream_id,
-                    expected_version,
+                    expected_version: hold_at_version.expected_version,
                     events: events.into_iter().map(EventToAppend::new).collect(),
                     correlation_id,
                     causation_id: None,
@@ -1695,7 +1751,7 @@ impl ProvenanceOrchestrationUseCase {
         mode: ProvenanceMode,
         stage: &str,
         err: crate::error::AppError,
-        expected_version: ExpectedVersion,
+        hold_at_version: HoldAtVersion,
     ) -> AppResult<ProvenanceRunOutcome> {
         tracing::warn!(
             artifact_id = %artifact.id,
@@ -1707,7 +1763,7 @@ impl ProvenanceOrchestrationUseCase {
              terminal, because nothing about the artifact was established)",
         );
         let verdict = ProvenanceVerdict::indeterminate(IndeterminateReason::AttestationFetchFailed);
-        self.apply_verdict(artifact, backend, verdict, mode, false, expected_version)
+        self.apply_verdict(artifact, backend, verdict, mode, false, hold_at_version)
             .await
     }
 }

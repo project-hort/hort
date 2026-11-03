@@ -2240,7 +2240,7 @@ pub enum ProvenanceVerifyResult {
     NoAttestation,
     /// A `Required`-mode artifact was found unsigned while its quarantine
     /// observation window is still open (issue #13): `complete_provenance`
-    /// returns `Ok(None)` and the artifact is HELD `Quarantined` (read as
+    /// returns an empty domain batch and the artifact is HELD `Quarantined` (read as
     /// `Pending` / fail-closed by the release gate) so it can still be
     /// signed. Separable from `no_attestation` so operators can see images
     /// *waiting to be signed* distinctly from *allowed unsigned*.

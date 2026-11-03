@@ -4205,7 +4205,7 @@ below). `hort_admin_tasks_enqueued_total` is the HTTP invoke handler's.
 |--------|------|--------|------|--------------|
 | `hort_admin_tasks_enqueued_total` | counter | `kind`, `result` | — | emitted by the HTTP handler (`hort-http-admin-tasks`) on every terminal path of `POST /api/v1/admin/tasks/{kind}`; not emitted by the dispatcher itself |
 | `hort_admin_tasks_completed_total` | counter | `kind`, `result` | — | `result ∈ {completed, failed_retry, failed_terminal}` |
-| `hort_admin_tasks_duration_seconds` | histogram | `kind` | seconds | wall-clock time from claim to outcome recording, wrapping `TaskHandler::run` |
+| `hort_admin_tasks_duration_seconds` | histogram | `kind` | seconds | elapsed time inside `TaskHandler::run`, and nothing else; the wait for a concurrency permit is not timed anywhere. `hort_admin_tasks_class_awaiting_capacity` counts waiting rows, and `hort_admin_tasks_class_unserved` shows whether the class has been served inside its threshold |
 | `hort_admin_tasks_in_flight` | gauge | `kind` | tasks | incremented before `TaskHandler::run`, decremented after; 0 when idle |
 | `hort_admin_tasks_pending_eligible` | gauge | `kind` | jobs | claim-eligible pending rows per kind (`status='pending'` and the lock free/expired), set once per starvation audit (every 60 s). Covers **every** kind present in `jobs`, including kinds this worker does not claim |
 | `hort_admin_tasks_starved_total` | counter | `kind`, `reason` | — | `reason ∈ {unregistered, not_claimed, oldest_row_stalled}` — one increment per audit at which the kind's eligible backlog has gone unserved for > 600 s |

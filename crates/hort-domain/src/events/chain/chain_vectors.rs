@@ -134,6 +134,7 @@ fn reproduces_frozen_bytes(event: &DomainEvent) -> bool {
         | DomainEvent::ScanIndeterminate(_)
         | DomainEvent::ProvenanceVerified(_)
         | DomainEvent::ProvenanceRejected(_)
+        | DomainEvent::ProvenanceHeld(_)
         | DomainEvent::PromotionRequested(_)
         | DomainEvent::PolicyEvaluated(_)
         | DomainEvent::ApprovalRequested(_)
@@ -509,8 +510,8 @@ fn frozen_canonical_bytes_reproduce_except_the_recorded_divergences() {
     // divergences were measured on, and all of them were verified above.
     assert_eq!(
         vectors.len(),
-        84,
-        "the frozen corpus is 84 vectors — 71 current shapes (one per \
+        85,
+        "the frozen corpus is 85 vectors — 72 current shapes (one per \
          `all_test_variants()` instance) plus 13 older stored shapes. A \
          shrinking corpus makes this test pass by measuring less"
     );

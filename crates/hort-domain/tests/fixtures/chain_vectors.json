@@ -751,6 +751,34 @@
       "actor_id": null,
       "actor_source_file": null,
       "actor_spec_digest": null,
+      "actor_type": "system",
+      "causation_id": "ca000000-0000-0000-0000-000000004000",
+      "correlation_id": "c0000000-0000-0000-0000-000000004000",
+      "event_id": "e0000000-0000-0000-0000-000000004000",
+      "event_version": 1,
+      "prev_event_hash": "5bb08be373afcb7ecf3119463fc3e6843718051a7b037bdd1d32f30e626d1c06",
+      "stream_category": "artifact",
+      "stream_id": "artifact-57000000-0000-0000-0000-000000004000",
+      "stream_position": 0
+    },
+    "event_hash": "0b5bc72dbb6f365291a75874060f6e164e49b3d7aa6caa490a07fe56cc7f6776",
+    "event_type": "ProvenanceHeld",
+    "name": "ProvenanceHeld",
+    "stored_envelope": {
+      "data": {
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "backend": "cosign",
+        "content_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "reason": "PendingSignature"
+      },
+      "type": "ProvenanceHeld"
+    }
+  },
+  {
+    "columns": {
+      "actor_id": null,
+      "actor_source_file": null,
+      "actor_spec_digest": null,
       "actor_type": "timer",
       "causation_id": null,
       "correlation_id": "c0000000-0000-0000-0000-00000000000c",
