@@ -6431,12 +6431,11 @@ mod tests {
                 ],
                 "the follower's own row claims its bytes and its child's, in one call"
             );
-            // `register_by_hash_inner` commits twice for this row — the
-            // genesis commit that mints it, then the quarantine gate's
-            // follow-on commit, which carries enqueues and no edges. Exactly
-            // ONE of the two carries edges, and it carries all of them: the
-            // row and its claims are a single atomic unit, not a mint
-            // followed by a top-up.
+            // `register_by_hash_inner` commits once for this row — the mint,
+            // the quarantine gate, the gate's enqueues and the whole edge set
+            // in one transaction. Exactly one transition carries edges and it
+            // carries all of them: the row and its claims are a single atomic
+            // unit, not a mint followed by a top-up.
             let edge_carrying: Vec<usize> = mocks
                 .lifecycle
                 .ingest_edges()
