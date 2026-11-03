@@ -1,11 +1,10 @@
 //! Client-supplied digest parsing — shared between blob and manifest
 //! pull.
 //!
-//! The OCI Distribution Spec only admits `sha256:<64-hex>`. Other
-//! well-formed algorithms (`sha512:…`) return `UNSUPPORTED`;
-//! everything else (missing `:`, wrong length, non-hex) returns
-//! `DIGEST_INVALID`. Keeping the classifier in one module means a
-//! future relaxation (e.g. sha512 support) only touches this file.
+//! This registry only addresses `sha256:<64-hex>`. Digests must first
+//! satisfy the OCI descriptor grammar; malformed values return
+//! `DIGEST_INVALID`. Other grammatical algorithms return `UNSUPPORTED`.
+//! The document classifier in `hort-domain::oci` must apply the same rule.
 
 use hort_domain::types::ContentHash;
 
@@ -13,12 +12,12 @@ use hort_domain::types::ContentHash;
 pub(super) enum DigestParse {
     /// Valid `sha256:<64-hex>`, wrapped in `ContentHash`.
     Ok(ContentHash),
-    /// Well-formed algorithm prefix but not SHA-256 (e.g.
-    /// `sha512:<hex>`). Spec: `UNSUPPORTED`. Carries no data — the
+    /// Grammatical digest with an algorithm other than SHA-256 (e.g.
+    /// `sha512:<128 hex>`). Spec: `UNSUPPORTED`. Carries no data — the
     /// requested algorithm is attacker-controlled and must not flow
     /// into a response body; `parse_digest` logs it server-side.
     Unsupported,
-    /// Anything else: missing `:`, wrong length, non-hex. Spec:
+    /// Anything else: missing `:`, invalid grammar, wrong length, non-hex. Spec:
     /// `DIGEST_INVALID`.
     Invalid { message: String },
 }
@@ -49,9 +48,25 @@ pub(super) fn parse_digest(raw: &str) -> DigestParse {
     let Some((algo, hex)) = raw.split_once(':') else {
         tracing::debug!(digest = %raw, "OCI digest missing `<algorithm>:` prefix");
         return DigestParse::Invalid {
-            message: "digest must be of the form <algorithm>:<hex>".to_string(),
+            message: "digest must be of the form <algorithm>:<encoded>".to_string(),
         };
     };
+    let algorithm_is_grammatical = algo.split(['+', '.', '_', '-']).all(|component| {
+        !component.is_empty()
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    });
+    let encoded_is_grammatical = !hex.is_empty()
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'=' | b'_' | b'-'));
+    if !algorithm_is_grammatical || !encoded_is_grammatical {
+        tracing::debug!(digest = %raw, "OCI digest violates descriptor grammar");
+        return DigestParse::Invalid {
+            message: "digest must match OCI descriptor grammar".to_string(),
+        };
+    }
     if algo != "sha256" {
         tracing::debug!(algorithm = %algo, "OCI digest algorithm unsupported");
         return DigestParse::Unsupported;
@@ -85,7 +100,7 @@ mod tests {
     #[test]
     fn rejects_sha512_as_unsupported() {
         assert!(matches!(
-            parse_digest(&format!("sha512:{SAMPLE_HEX}")),
+            parse_digest(&format!("sha512:{}", "a".repeat(128))),
             DigestParse::Unsupported
         ));
     }
@@ -161,7 +176,7 @@ mod tests {
         /// grammar" — so the document is valid and only unservable, which
         /// is a different wire code from an invalid one.
         WellFormedButUnsupported,
-        /// Matches no digest grammar hort recognises.
+        /// Invalid digest grammar or a malformed SHA-256 value.
         Invalid,
     }
 
@@ -223,7 +238,7 @@ mod tests {
     #[test]
     fn the_request_line_and_document_digest_classifiers_agree_arm_for_arm() {
         let other_algorithm = format!("sha512:{}", "a".repeat(128));
-        let rows: [(&str, &str, bool, Option<DescriptorProblem>); 4] = [
+        let rows: [(&str, &str, bool, Option<DescriptorProblem>); 11] = [
             // input, label, adapter-is-`Unsupported`, domain problem
             (
                 SAMPLE_HEX,
@@ -236,6 +251,48 @@ mod tests {
                 "a prefix naming an algorithm other than sha256",
                 true,
                 Some(DescriptorProblem::UnsupportedAlgorithm),
+            ),
+            (
+                "sha512:",
+                "an empty encoded portion",
+                false,
+                Some(DescriptorProblem::MalformedDigest),
+            ),
+            (
+                "sha512:!",
+                "a forbidden encoded character",
+                false,
+                Some(DescriptorProblem::MalformedDigest),
+            ),
+            (
+                "sha+512:Ab-_=",
+                "allowed algorithm separator and encoded characters",
+                true,
+                Some(DescriptorProblem::UnsupportedAlgorithm),
+            ),
+            (
+                "sha++512:abc",
+                "an empty algorithm component",
+                false,
+                Some(DescriptorProblem::MalformedDigest),
+            ),
+            (
+                ":abc",
+                "an empty algorithm",
+                false,
+                Some(DescriptorProblem::MalformedDigest),
+            ),
+            (
+                "SHA256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "an uppercase algorithm",
+                false,
+                Some(DescriptorProblem::MalformedDigest),
+            ),
+            (
+                "sha256:",
+                "an empty sha256 encoded portion",
+                false,
+                Some(DescriptorProblem::MalformedSha256),
             ),
             (
                 "sha256:deadbeef",

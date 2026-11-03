@@ -1938,7 +1938,7 @@ pub(crate) fn parse_manifest_blobs(
 ///
 /// Which refusal depends on the descriptor, and the spec draws the line:
 /// an unrecognised **algorithm** "SHOULD pass validation" if it matches the
-/// digest grammar, so `sha512:<hex>` is a *valid* index naming content
+/// digest grammar, so `sha512:<128 hex>` is a *valid* index naming content
 /// hort's CAS keyspace cannot address — [`OciError::Unsupported`]
 /// (`UNSUPPORTED`). A digest matching no grammar, or an absent one, is a
 /// malformed manifest — [`OciError::ManifestInvalid`] (`MANIFEST_INVALID`).
@@ -6514,7 +6514,7 @@ mod tests {
     // say. Admission refuses it. Which refusal depends on the descriptor, and
     // the image spec draws the line: a digest complying with the digest
     // grammar but naming an unrecognised algorithm "SHOULD pass validation",
-    // so `sha512:<hex>` is a VALID index hort cannot store (`UNSUPPORTED`),
+    // so `sha512:<128 hex>` is a VALID index hort cannot store (`UNSUPPORTED`),
     // while a digest matching no grammar, or an absent one, is a malformed
     // manifest (`MANIFEST_INVALID`).
     //
@@ -6770,6 +6770,28 @@ mod tests {
         );
         assert!(!out.index_minted);
         assert_eq!(out.member_edges, 0);
+    }
+
+    #[test]
+    fn put_index_with_an_ungrammatical_child_digest_is_manifest_invalid() {
+        for bad in [
+            "sha512:",
+            "sha512:!",
+            ":abc",
+            &format!("SHA256:{}", "a".repeat(64)),
+        ] {
+            let out = put_index_with_descriptors(|_| {
+                vec![serde_json::json!({ "digest": bad, "size": 7 })]
+            });
+            assert_eq!(out.status, StatusCode::BAD_REQUEST, "digest {bad}");
+            assert_eq!(envelope_code(&out.body), "MANIFEST_INVALID", "digest {bad}");
+            assert!(!out.index_minted, "digest {bad}");
+            assert_eq!(out.member_edges, 0, "digest {bad}");
+            assert!(
+                !String::from_utf8_lossy(&out.body).contains(bad),
+                "the invalid digest must not be echoed: {bad}"
+            );
+        }
     }
 
     #[test]
