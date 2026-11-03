@@ -167,6 +167,20 @@ bash "${root}/scripts/ci/base-image-preflight.sh" > "${tmp}/out" 2>&1
 grep -Fq "https://registry.example.invalid/v2/rust-proxy/manifests/${rust_ref##*@}" "${CURL_CALLS}"
 grep -Fq "https://registry.example.invalid/v2/dockerhub-proxy/library/debian/manifests/${debian_ref##*@}" "${CURL_CALLS}"
 
+cat > "${tmp}/050-override.conf" <<'CONF'
+[[registry]]
+prefix = "docker.io"
+location = "registry.example.invalid/dockerhub-override"
+CONF
+export BASE_IMAGE_REGISTRIES_CONF="${tmp}/registries.conf:${tmp}/000-shortnames.conf:${tmp}/050-override.conf"
+: > "${CURL_CALLS}"
+bash "${root}/scripts/ci/base-image-preflight.sh" > "${tmp}/out" 2>&1
+expected="https://registry.example.invalid/v2/dockerhub-override/library/rust/manifests/${rust_ref##*@}"
+actual="$(grep -F "/library/rust/manifests/${rust_ref##*@}" "${CURL_CALLS}" | cut -d ' ' -f 1)"
+printf 'duplicate-prefix resolved URL: %s\n' "${actual}"
+fixture_failed=0
+[[ "${actual}" == "${expected}" ]] || fixture_failed=1
+
 cat > "${tmp}/mirror.conf" <<'CONF'
 [[registry]]
 prefix = "docker.io"
@@ -182,6 +196,32 @@ bash "${root}/scripts/ci/base-image-preflight.sh" > "${tmp}/out" 2>&1
 grep -Fq "https://registry.example.invalid/v2/dockerhub-mirror/library/rust/manifests/${rust_ref##*@}" "${CURL_CALLS}"
 grep -Fq 'mirror docker.io -> registry.example.invalid/dockerhub-mirror' "${tmp}/out"
 
+cat > "${tmp}/050-mirror-override.conf" <<'CONF'
+[[registry]]
+prefix = "docker.io"
+location = "docker.io"
+[[registry.mirror]]
+location = "registry.example.invalid/mirror-override"
+pull-from-mirror = "digest-only"
+CONF
+export BASE_IMAGE_REGISTRIES_CONF="${tmp}/mirror.conf:${tmp}/000-shortnames.conf:${tmp}/050-mirror-override.conf"
+: > "${CURL_CALLS}"
+bash "${root}/scripts/ci/base-image-preflight.sh" > "${tmp}/out" 2>&1
+expected="https://registry.example.invalid/v2/mirror-override/library/rust/manifests/${rust_ref##*@}"
+actual="$(grep -F "/library/rust/manifests/${rust_ref##*@}" "${CURL_CALLS}" | cut -d ' ' -f 1)"
+printf 'duplicate-prefix mirror URL: %s\n' "${actual}"
+[[ "${actual}" == "${expected}" ]] || fixture_failed=1
+
+export BASE_IMAGE_REGISTRIES_CONF="${tmp}/mirror.conf:${tmp}/000-shortnames.conf:${tmp}/050-override.conf"
+: > "${CURL_CALLS}"
+bash "${root}/scripts/ci/base-image-preflight.sh" > "${tmp}/out" 2>&1
+expected="https://registry.example.invalid/v2/dockerhub-override/library/rust/manifests/${rust_ref##*@}"
+actual="$(grep -F "/library/rust/manifests/${rust_ref##*@}" "${CURL_CALLS}" | cut -d ' ' -f 1)"
+printf 'overridden mirror resolved URL: %s\n' "${actual}"
+[[ "${actual}" == "${expected}" ]] || fixture_failed=1
+[[ "${fixture_failed}" -eq 0 ]]
+
+export BASE_IMAGE_REGISTRIES_CONF="${tmp}/mirror.conf:${tmp}/000-shortnames.conf"
 sed -i 's/pull-from-mirror = "digest-only"/pull-from-mirror = "tag-only"/' "${tmp}/mirror.conf"
 : > "${CURL_CALLS}"
 rc=0
