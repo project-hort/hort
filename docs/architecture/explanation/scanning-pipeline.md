@@ -247,11 +247,12 @@ the merged finding list to the consumer boundary,
 (`crates/hort-app/src/use_cases/quarantine_use_case.rs`).
 
 That handoff is the pipeline's single most load-bearing property:
-**one Postgres transaction** commits the findings blob reference, the
+**one Postgres transaction** commits any changed findings blob reference, the
 per-finding `scan_findings` projection rows, the `sbom_components`
 projection replace, the artifact's state transition, the
-`repo_security_scores` delta, and the event batch. There is no state
-in which the event log says one thing and a projection says another.
+`repo_security_scores` delta, and the event batch. An unchanged finding
+verdict adds no event, while `last_scan_at` and the per-finding rows still
+record the latest scan. The event stream retains the last changed verdict.
 
 ### What the verdict does: `enforcement: reject | record`
 
@@ -263,7 +264,10 @@ verdict commits the reject triple (`ScanCompleted` +
 same evidence and the same audit event commit — the findings blob, the
 per-finding rows and `PolicyEvaluated(Fail, violations)` are all
 written identically — and the `ArtifactRejected` is withheld: the
-artifact's quarantine status is untouched by the verdict.
+artifact's quarantine status is untouched by the verdict. The
+`ScanCompleted` and its `PolicyEvaluated` companion are appended on the
+first scan and whenever the severity summary or findings blob hash changes;
+an unchanged rescan refreshes scan projections without adding that pair.
 
 That is deliberately the *only* difference. The enforcement branch
 lives at the last step of the evaluator, after every rule has run, so
@@ -293,7 +297,9 @@ the same `StoragePort::put` path as artifact content. The event's
 and only if `finding_count > 0`, and the severity counts must sum to
 the finding count. Clean scans never reference a blob; dashboards and
 CLIs render the inline summary and fetch the blob only when an
-operator drills into per-finding detail.
+operator drills into per-finding detail. The findings are ordered by their
+complete JSON values before the blob is written, so scanner arrival order
+does not change its content hash.
 
 ### Newly-vulnerable detection
 

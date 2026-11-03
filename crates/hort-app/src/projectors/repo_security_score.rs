@@ -5,7 +5,7 @@
 //! Computes [`ScoreDelta`] values for the `repo_security_scores`
 //! projection from artifact lifecycle transitions and bundles them
 //! through the lifecycle port so the projection upsert lands in the
-//! same Postgres transaction as the originating event append.
+//! same Postgres transaction as the scan or transition commit.
 //!
 //! All transition computations are pure functions of `(prior_status,
 //! new_status, severity_summary?, scan_completed_at?)`. The tests in

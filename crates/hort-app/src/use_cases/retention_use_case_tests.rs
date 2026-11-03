@@ -433,7 +433,7 @@ fn seed_stream_of_length(store: &MockEventStore, c: &RetentionCandidate, total: 
 }
 
 /// A stream sitting exactly ON the cap still reads completely — so the
-/// predicate matches — but the append that would take it to 201 events is
+/// predicate matches — but the append that would take it past the cap is
 /// refused. The pair is reported as an error (the sweep keeps going) and
 /// NOTHING is appended.
 #[tokio::test]
@@ -441,7 +441,7 @@ async fn expiry_append_refuses_a_stream_already_at_the_event_cap() {
     let (uc, store) = build(MockRetentionScanReader::new());
     let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
     let c = candidate(QuarantineStatus::Released, ts(0));
-    seed_stream_of_length(&store, &c, 200);
+    seed_stream_of_length(&store, &c, crate::use_cases::STREAM_EVENT_CAP);
 
     let report = uc
         .evaluate_policies_in_mode(
@@ -473,7 +473,7 @@ async fn expiry_append_still_lands_one_event_short_of_the_cap() {
     let (uc, store) = build(MockRetentionScanReader::new());
     let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
     let c = candidate(QuarantineStatus::Released, ts(0));
-    seed_stream_of_length(&store, &c, 199);
+    seed_stream_of_length(&store, &c, crate::use_cases::STREAM_EVENT_CAP - 1);
 
     let report = uc
         .evaluate_policies_in_mode(
@@ -510,14 +510,18 @@ async fn evaluation_refuses_a_stream_already_past_the_event_cap() {
     let (uc, store) = build(MockRetentionScanReader::new());
     let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
     let c = candidate(QuarantineStatus::Released, ts(0));
-    let stream_id = seed_stream_of_length(&store, &c, 201);
+    let stream_id = seed_stream_of_length(&store, &c, crate::use_cases::STREAM_EVENT_CAP + 1);
     let mut stream = store
-        .read_stream(&stream_id, ReadFrom::Start, 1_000)
+        .read_stream(
+            &stream_id,
+            ReadFrom::Start,
+            crate::use_cases::STREAM_EVENT_CAP + 2,
+        )
         .await
         .unwrap();
     stream.push(persisted(
         &stream_id,
-        201,
+        crate::use_cases::STREAM_EVENT_CAP + 1,
         c.artifact.created_at,
         DomainEvent::ArtifactExpired(hort_domain::events::ArtifactExpired {
             artifact_id: c.artifact.id,
@@ -530,7 +534,7 @@ async fn evaluation_refuses_a_stream_already_past_the_event_cap() {
             eligible_at: ts(900),
         }),
     ));
-    assert_eq!(stream.len(), 202);
+    assert_eq!(stream.len() as u64, crate::use_cases::STREAM_EVENT_CAP + 2);
     store.set_stream(&stream_id, stream);
 
     let report = uc
@@ -553,7 +557,7 @@ async fn evaluation_refuses_a_stream_already_past_the_event_cap() {
     assert!(
         report.matches.is_empty(),
         "a stream that cannot be read completely yields no decision at all, not a \
-         decision derived from its oldest 200 events — which here would be a second \
+         decision derived from its oldest capped prefix — which here would be a second \
          ArtifactExpired for a policy that already expired this artifact"
     );
 }

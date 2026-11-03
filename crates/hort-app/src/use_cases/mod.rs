@@ -272,8 +272,10 @@ use crate::error::{AppError, AppResult};
 /// sides:
 ///
 /// - **Write side.** [`read_unpaired_append_version`] refuses to derive an
-///   append version for a stream that already exceeds the cap, so every
-///   `ExpectedVersion::Exact` writer is bounded by it. An
+///   append version for a stream that already exceeds the cap. The
+///   repeatable scan writer also checks that its complete batch fits
+///   before append. Other `ExpectedVersion::Exact` writers can still
+///   cross the boundary when starting at the cap. An
 ///   `ExpectedVersion::Any` append gets no version check from the
 ///   adapter at all, so such a writer must refuse for itself:
 ///   `RetentionUseCase::append_expired` is the only *repeatable* one and
@@ -289,15 +291,11 @@ use crate::error::{AppError, AppResult};
 ///   provably seen the entire stream, and one that comes back with more
 ///   refuses to answer rather than hand its caller the oldest prefix.
 ///
-/// An artifact's realistic lifecycle is a few dozen events at most
-/// (ingest → quarantine → scan(s) → release/reject → maybe expire →
-/// purge), so the bound leaves roughly an order of magnitude of
-/// headroom. A stream that reaches it is a bug or abuse, and the
-/// resulting freeze — no further event accepted, no decision derived
-/// from a read that cannot prove completeness — is the intended
-/// fail-closed outcome, not a degradation to work around. Raising the
-/// number would only move the point at which the same failure appears.
-const STREAM_EVENT_CAP: u64 = 200;
+/// An unchanged scan still refreshes the scan projections without adding
+/// a verdict event, so ordinary rescan cadence does not consume this
+/// lifetime budget. A stream past the cap cannot prove that a capped
+/// read reached the tail; readers refuse to derive a decision from it.
+const STREAM_EVENT_CAP: u64 = 1000;
 
 /// One capped `ReadFrom::Start` read of a bounded artifact stream, plus
 /// the one fact a capped read cannot do without: whether its budget was
@@ -954,7 +952,7 @@ mod read_unpaired_append_version_tests {
         let artifact_id = Uuid::new_v4();
         let stream_id = StreamId::artifact(artifact_id);
 
-        let dummy: Vec<_> = (0..201)
+        let dummy: Vec<_> = (0..STREAM_EVENT_CAP + 1)
             .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
             .collect();
         events.set_stream(&stream_id, dummy);
@@ -963,7 +961,9 @@ mod read_unpaired_append_version_tests {
             read_unpaired_append_version(&*events, &stream_id, true, UnpairedAppend::GenesisAppend)
                 .await
                 .unwrap_err();
-        assert!(err.to_string().contains("200-event cap"));
+        assert!(err
+            .to_string()
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")));
     }
 
     #[tokio::test]
@@ -972,9 +972,9 @@ mod read_unpaired_append_version_tests {
         let artifact_id = Uuid::new_v4();
         let stream_id = StreamId::artifact(artifact_id);
 
-        // MockEventStore returns up to max_count events, so 201 events
-        // with read limit 201 returns all 201 — last position is 200.
-        let dummy: Vec<_> = (0..201)
+        // MockEventStore returns up to max_count events, so a stream one past
+        // the cap is read through its true tail at position STREAM_EVENT_CAP.
+        let dummy: Vec<_> = (0..STREAM_EVENT_CAP + 1)
             .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
             .collect();
         events.set_stream(&stream_id, dummy);
@@ -987,16 +987,16 @@ mod read_unpaired_append_version_tests {
         )
         .await
         .unwrap();
-        assert_eq!(version, ExpectedVersion::Exact(200));
+        assert_eq!(version, ExpectedVersion::Exact(STREAM_EVENT_CAP));
     }
 
     #[tokio::test]
-    async fn cap_at_exactly_200_is_allowed() {
+    async fn cap_at_exactly_the_limit_is_allowed() {
         let events = Arc::new(MockEventStore::new());
         let artifact_id = Uuid::new_v4();
         let stream_id = StreamId::artifact(artifact_id);
 
-        let dummy: Vec<_> = (0..200)
+        let dummy: Vec<_> = (0..STREAM_EVENT_CAP)
             .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
             .collect();
         events.set_stream(&stream_id, dummy);
@@ -1005,7 +1005,7 @@ mod read_unpaired_append_version_tests {
             read_unpaired_append_version(&*events, &stream_id, true, UnpairedAppend::GenesisAppend)
                 .await
                 .unwrap();
-        assert_eq!(version, ExpectedVersion::Exact(199));
+        assert_eq!(version, ExpectedVersion::Exact(STREAM_EVENT_CAP - 1));
     }
 
     /// Structural guard: `read_unpaired_append_version`'s capped
@@ -1106,7 +1106,8 @@ mod read_artifact_stream_tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("200-event cap"),
+            err.to_string()
+                .contains(&format!("{STREAM_EVENT_CAP}-event cap")),
             "the refusal must name the cap it is enforcing; got {err}"
         );
     }
@@ -1552,7 +1553,9 @@ mod artifact_at_version_tests {
             matches!(err, AppError::Domain(DomainError::Conflict(_))),
             "got {err}"
         );
-        assert!(err.to_string().contains("200-event cap"));
+        assert!(err
+            .to_string()
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")));
     }
 
     /// A stream at exactly the cap is not over it — the `+ 1` budget was
@@ -1602,7 +1605,9 @@ mod artifact_at_version_tests {
             matches!(err, AppError::Domain(DomainError::Invariant(_))),
             "got {err}"
         );
-        assert!(err.to_string().contains("200-event cap"));
+        assert!(err
+            .to_string()
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")));
     }
 
     /// The domain transitions mutate the entity as they produce their
@@ -1670,6 +1675,8 @@ mod artifact_at_version_tests {
             matches!(err, AppError::Domain(DomainError::Invariant(_))),
             "got {err}"
         );
-        assert!(err.to_string().contains("200-event cap"));
+        assert!(err
+            .to_string()
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")));
     }
 }

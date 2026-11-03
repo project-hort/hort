@@ -3,19 +3,18 @@
 //!
 //! The `repo_security_scores` table is a denormalised projection
 //! maintained by `RepoSecurityScoreProjector` (in `hort-app`) on every
-//! `ScanCompleted`, `ArtifactReleased`, `ArtifactRejected` and
+//! scan commit and on `ArtifactReleased`, `ArtifactRejected` and
 //! `ArtifactQuarantined` event. The row carries:
 //!
 //! - `quarantined_count` / `rejected_count` / `released_count` — the
 //!   per-status artifact counts in the repository.
 //! - `critical_count` / `high_count` / `medium_count` / `low_count` —
-//!   the cumulative finding-tier counts across every `ScanCompleted`
-//!   event.
-//! - `last_scan_at` — the most recent `ScanCompleted` event in the
+//!   cumulative finding-tier counts across scan commits.
+//! - `last_scan_at` — the most recent scan commit in the
 //!   repository (per-repo aggregate, NOT per-artifact).
 //!
 //! Atomicity contract: the row is updated **inside the same Postgres
-//! transaction** as the originating event append. This is enforced by
+//! transaction** as the scan or transition commit, including any event append. This is enforced by
 //! threading a [`ScoreDelta`] through
 //! [`crate::ports::artifact_lifecycle::ArtifactLifecyclePort`]'s
 //! `commit_transition_with_score` / `commit_scan_result_with_score`

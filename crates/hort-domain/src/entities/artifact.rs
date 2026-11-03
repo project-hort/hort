@@ -773,8 +773,7 @@ impl TerminalRejectionRecord {
     /// **historical** tombstones that carry `ArtifactCorrupted` alone.
     pub fn from_events<'a>(events: impl IntoIterator<Item = &'a DomainEvent>) -> Self {
         // Borrowed once so the shared D6 predicate can be CALLED rather
-        // than re-implemented here; a per-artifact stream is capped at
-        // 200 events, so the vector of references is negligible.
+        // than re-implemented here; a per-artifact stream is bounded by an enforced event cap, so the vector of references is negligible.
         let events: Vec<&DomainEvent> = events.into_iter().collect();
         if has_terminal_rejection_event(events.iter().copied()) {
             return Self::Present;

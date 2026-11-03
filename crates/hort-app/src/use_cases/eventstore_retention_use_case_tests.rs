@@ -59,6 +59,7 @@ use crate::event_store_publisher::wrap_for_test;
 use crate::use_cases::eventstore_retention_use_case::{
     CategoryRetentionRule, EventStoreRetentionUseCase, SealMode, StreamRetentionModeRef,
 };
+use crate::use_cases::STREAM_EVENT_CAP;
 
 const HASH_A: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -554,20 +555,22 @@ async fn non_terminal_tail_is_skipped_not_sealed() {
 /// Sealing DELETES a stream, so "the tail is the terminal" must be an
 /// answer about the real tail. A stream past `STREAM_EVENT_CAP` cannot be
 /// read to its tail, so the proof reports a read error and the stream is
-/// left alone — rather than being sealed because the 200th event of a
+/// left alone — rather than being sealed because the cap-boundary event of a
 /// longer stream happened to be an `ArtifactPurged`.
 #[tokio::test]
 async fn over_cap_stream_is_not_sealed_and_counts_as_an_error() {
     let aid = Uuid::new_v4();
     let sid = artifact_stream(aid);
-    // 201 events with an `ArtifactPurged` at BOTH the 200th position and
+    // One event past the cap with an `ArtifactPurged` at BOTH the cap-boundary position and
     // the true tail: the read is refused on length alone, so neither the
     // tail that a truncated read would have found nor the real one can
     // authorise a seal.
-    let mut stream: Vec<PersistedEvent> = (0..199).map(|p| ingested_persisted(aid, p)).collect();
-    stream.push(purged_persisted(aid, 199));
-    stream.push(purged_persisted(aid, 200));
-    assert_eq!(stream.len(), 201);
+    let mut stream: Vec<PersistedEvent> = (0..STREAM_EVENT_CAP - 1)
+        .map(|p| ingested_persisted(aid, p))
+        .collect();
+    stream.push(purged_persisted(aid, STREAM_EVENT_CAP - 1));
+    stream.push(purged_persisted(aid, STREAM_EVENT_CAP));
+    assert_eq!(stream.len() as u64, STREAM_EVENT_CAP + 1);
 
     let h = build(
         MockReader::new().with(vec![candidate(
