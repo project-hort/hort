@@ -368,7 +368,11 @@ cargo clippy --workspace --all-targets -- -D warnings      # linting
 cargo test --workspace                                     # full suite: lib + ALL tests/ integration targets (DB-gated tests self-skip w/o DATABASE_URL)
 cargo audit --deny warnings                                # advisories (ALWAYS — see note)
 cargo deny check                                           # advisories+bans+licenses+sources (ALWAYS — see note)
+bash scripts/run-shell-guards.sh                           # shell invariant guards
 ```
+
+The shell guard command exits 0 only when every guard passes, 2 when a guard
+cannot run here, and 1 when a guard fails or its CI/namespace inventory drifts.
 
 **`cargo test --workspace` is the default pre-push test command — NOT `--lib`.**
 It runs the full local suite — every crate's `--lib` unit tests AND every
