@@ -56,16 +56,18 @@ use tracing::info;
 use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::types::task_tier::queue_priority;
 
 use crate::config::MinimalConfig;
 use crate::{pg_identity, telemetry};
 
-/// `trigger_source` literal — must match the SQL CHECK constraint on
-/// `jobs.trigger_source` (`'manual' | 'cron' | 'advisory' | 'ingest'`).
-/// The scheduled CronJob is the `'cron'` trigger source.
-const CRON_TRIGGER_SOURCE: &str = "cron";
+/// `trigger_source` literal for this scheduled CronJob enqueue, taken
+/// from the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]) rather than
+/// re-typed beside it — so CHECK membership is a property of the value
+/// and this comment does not have to carry a copy of the list.
+const CRON_TRIGGER_SOURCE: &str = TriggerSource::Cron.as_str();
 
 /// `jobs.kind` of the row this subcommand enqueues. The ordinal it
 /// carries is not named here: it is decided from `(kind,

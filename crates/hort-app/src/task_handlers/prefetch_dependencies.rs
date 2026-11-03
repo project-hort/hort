@@ -75,7 +75,7 @@ use hort_domain::entities::repository::Repository;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::format_handler::{DependencySpec, FormatHandler};
-use hort_domain::ports::jobs_repository::{JobsRepository, PrefetchEnqueueRow};
+use hort_domain::ports::jobs_repository::{JobsRepository, PrefetchEnqueueRow, TriggerSource};
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
 use hort_domain::ports::storage::StoragePort;
@@ -89,12 +89,13 @@ use hort_domain::types::PageRequest;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// `trigger_source` literal on every cascade-enqueued row. Mirrors
-/// the migration-009 CHECK addition. The dedicated literal
-/// distinguishes cascade-spawned rows from cron / advisory / ingest
-/// / manual / seed-import in audit + metric labels
+/// `trigger_source` literal on every cascade-enqueued row, taken from
+/// the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]). The
+/// dedicated literal distinguishes cascade-spawned rows from every other
+/// trigger source in audit + metric labels
 /// (`hort_prefetch_enqueued_total{trigger}`).
-const PREFETCH_TRIGGER_SOURCE: &str = "prefetch";
+const PREFETCH_TRIGGER_SOURCE: &str = TriggerSource::Prefetch.as_str();
 
 /// `kind` literal for the ingest-leaf row. Must match
 /// `ADMIN_INVOKABLE_TASK_KINDS`.

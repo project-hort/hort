@@ -46,7 +46,7 @@ use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::advisory::AdvisoryPort;
 use hort_domain::ports::advisory_sync_state::AdvisorySyncStateRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::sbom_component_repository::SbomComponentRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
@@ -59,16 +59,17 @@ use crate::metrics::{emit_scan_jobs_enqueued, TriggerSourceLabel};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// `trigger_source` literal — must match the SQL CHECK constraint on
-/// `jobs.trigger_source` (`'manual' | 'cron' | 'advisory' | 'ingest'`).
-/// Mirrors [`hort_domain::ports::jobs_repository::TriggerSource::Advisory`].
+/// `trigger_source` literal for the advisory-watch sweep, taken from the
+/// one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]) rather than
+/// re-typed beside it.
 ///
-/// The literal is `"advisory"` NOT `"advisory_watch"` — this is the
-/// exact wire form the `TriggerSource::as_str` pin and the
-/// SQL CHECK accept. A drift here would either fail the INSERT loudly
-/// or, if the CHECK were ever loosened, end up filed under the wrong
-/// observability bucket silently.
-const ADVISORY_TRIGGER_SOURCE: &str = "advisory";
+/// The literal is `"advisory"` NOT `"advisory_watch"` — this handler's
+/// `kind` is `"advisory-watch-tick"` and its trigger source is not, and
+/// taking the value from the enum is what makes the two impossible to
+/// confuse. A drift here would either fail the INSERT loudly or file the
+/// row under the wrong observability bucket silently.
+const ADVISORY_TRIGGER_SOURCE: &str = TriggerSource::Advisory.as_str();
 
 /// `feed` PRIMARY-KEY literal in `advisory_sync_state`. v1 only carries
 /// the OSV feed; future feeds (GitHub Advisory) add their own row

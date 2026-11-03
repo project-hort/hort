@@ -42,7 +42,7 @@ use chrono::Utc;
 use serde_json::json;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::ports::rescan_candidates::{RescanCandidate, RescanCandidatesRepository};
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
@@ -66,10 +66,12 @@ use crate::metrics::{
 /// enormous queue burst, and ENV-tuning is deliberately not offered.
 const BATCH_SIZE: u32 = 1000;
 
-/// `trigger_source` literal — must match the SQL CHECK constraint on
-/// `jobs.trigger_source` (`'manual' | 'cron' | 'advisory' | 'ingest'`).
-/// Mirrors [`hort_domain::ports::jobs_repository::TriggerSource::Cron`].
-const CRON_TRIGGER_SOURCE: &str = "cron";
+/// `trigger_source` literal for the scheduled rescan tick, taken from
+/// the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]) rather than
+/// re-typed beside it — so a literal the `jobs.trigger_source` CHECK does
+/// not admit cannot be written here at all.
+const CRON_TRIGGER_SOURCE: &str = TriggerSource::Cron.as_str();
 
 // ---------------------------------------------------------------------------
 // Handler

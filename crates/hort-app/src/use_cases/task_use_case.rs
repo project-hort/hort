@@ -77,6 +77,7 @@ use hort_domain::events::{
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
     CompensatingDelete, EnqueueOutcome, JobRow, JobsRepository, ListJobsFilter, ListJobsPage,
+    TriggerSource,
 };
 use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::IdempotencyKey;
@@ -100,11 +101,12 @@ const TASK_AUDIT_APPEND_RETRY_ATTEMPTS: u32 = 5;
 /// `jobs.trigger_source` every admin task invoke carries.
 ///
 /// The POST is operator-initiated even when the operator is a chart
-/// CronJob, and `'manual'` is the only migration-009 CHECK literal that
-/// fits "an outside caller asked us to enqueue this". An earlier draft
-/// passed `"api"`, which is not in the CHECK and surfaced as a 23514
-/// constraint violation → 500 to the caller.
-const ADMIN_INVOKE_TRIGGER_SOURCE: &str = "manual";
+/// CronJob, and [`TriggerSource::Manual`] is the only member of the set
+/// that fits "an outside caller asked us to enqueue this". An earlier
+/// draft passed `"api"`, which is in no version of the set and surfaced
+/// as a 23514 constraint violation → 500 to the caller; taking the value
+/// from the enum is what makes that spelling impossible.
+const ADMIN_INVOKE_TRIGGER_SOURCE: &str = TriggerSource::Manual.as_str();
 
 /// Application use case for admin-task enqueue operations.
 pub struct TaskUseCase {

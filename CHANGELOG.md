@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The OCI cross-repository blob mount
+  (`POST /v2/<name>/blobs/uploads/?mount=…&from=…`, used by `skopeo copy` and
+  cross-repository re-tagging) answered `500` whenever the target repository's
+  scan policy requested a scan for the mounted blob, leaving the artifact
+  registered but never scanned. It now answers `201` and the scan runs (#402).
+- A scan job enqueued by `hort-server seed-import` could not be claimed, so a
+  seed-imported artifact never received its first scan verdict and stayed held
+  at the release gate (#402).
 - A pull-through upstream answering `410 Gone` for an artifact, blob or
   manifest is now a miss (404) rather than a bad gateway (502/503), so a client
   stops retrying and a virtual repository walks on to the next member (#395).

@@ -22,7 +22,7 @@
 //! ADR 0028 (destructive-task idempotency).
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -173,48 +173,193 @@ impl JobStatus {
     }
 }
 
-/// Why a `kind='scan'` (or other-kind) row exists.
+/// Generates `TriggerSource::ALL` and `TriggerSource::as_str` from one
+/// list of `Variant => "wire literal"` pairs.
 ///
-/// Mirrors the SQL CHECK constraint
-/// `trigger_source IN ('manual', 'cron', 'advisory', 'ingest')`
-/// in migration 009. Each source maps to a fixed priority ranking:
+/// The point is that there is no edit which puts a variant in one and
+/// not the other. `ALL` is built from the list's variants and `as_str`
+/// is a wildcard-free match over the same tokens, so:
 ///
-/// | `TriggerSource` | priority | Set by | Rationale |
-/// |---|---|---|---|
-/// | `Manual`   | 20 | `ManualRescanUseCase` | Operator clicked "rescan now"; jump the queue. |
-/// | `Cron`     | 10 | `CronRescanTickHandler` | Routine background drain. |
-/// | `Advisory` | 5  | `AdvisoryWatchTickHandler` | Targeted; below cron (the safety-net path). |
-/// | `Ingest`   | 0  | `IngestUseCase` | First-scan happens at ingest; FIFO is fine. |
+/// - a variant added to the enum and left out of the list makes the
+///   generated match non-exhaustive — `E0004`, a compile error, not a
+///   `23514` check_violation at the first producer that stamps it;
+/// - a variant the list names is in `ALL` by construction, so `FromStr`
+///   accepts exactly what the producers can spell;
+/// - the list's length is `ALL`'s length, so the count cannot be
+///   out of step with the membership either.
 ///
-/// **Wire literals must match the SQL CHECK exactly.** The watch
-/// tick's source is `"advisory"`, NOT `"advisory_watch"` —
-/// [`FromStr`] rejects the underscored form to prevent silent
-/// observability mis-categorisation (a label drifted from the SQL
-/// CHECK would either get rejected at INSERT time or, worse, get
-/// silently filed under the wrong bucket if a future migration
-/// loosened the CHECK without updating this enum).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// What the macro deliberately does NOT generate is the enum itself:
+/// each variant carries its own rationale as a doc comment, and those
+/// stay in the hand-written declaration where rustfmt and rustdoc reach
+/// them. The compiler's exhaustiveness check is what binds the two.
+macro_rules! trigger_source_wire {
+    ( $( $variant:ident => $literal:literal ),+ $(,)? ) => {
+        impl TriggerSource {
+            /// Every value `jobs.trigger_source` may hold, in the order
+            /// the migration lists them.
+            ///
+            /// This is what [`FromStr`] searches, what serde round-trips
+            /// through, and what the SQL CHECK is compared against. See
+            /// the type's own docs for the two-edit obligation when the
+            /// set grows.
+            pub const ALL: [Self; [$($literal),+].len()] = [$(Self::$variant),+];
+
+            /// Wire shape — the SQL CHECK literal for this variant.
+            ///
+            /// `const` so a writer's named constant can be *defined*
+            /// from it (`const CRON_TRIGGER_SOURCE: &str =
+            /// TriggerSource::Cron.as_str();`) instead of re-typing the
+            /// literal beside it. That is what makes a writer producing
+            /// a value outside the set a compile error at the definition
+            /// rather than a `23514` check_violation in production.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $literal,)+
+                }
+            }
+        }
+    };
+}
+
+/// Why a `kind='scan'` (or other-kind) `jobs` row exists — **the one
+/// definition of the value set `jobs.trigger_source` may hold.**
+///
+/// # One set, one statement
+///
+/// The set used to be written down three times and no two copies agreed:
+/// the SQL CHECK admitted eight literals, this type named four while its
+/// doc claimed to mirror the CHECK, and the writers produced a ninth
+/// (`'register-by-hash'`) that was in neither. The consequence was
+/// reachable: the OCI cross-repository blob mount answered `500` whenever
+/// the target repository's gate requested a scan, because the enqueue it
+/// stamps violated the CHECK and aborted the ingest transition.
+///
+/// So this enum is now the set, and everything else follows from it:
+///
+/// - [`Self::ALL`] and [`Self::as_str`] are generated from ONE list of
+///   `Variant => "literal"` pairs by the `trigger_source_wire!` macro
+///   declared just above this type, so the set and the wire shape
+///   cannot be edited apart: the generated `as_str` is a wildcard-free
+///   match over that list, so a variant the list does not name does not
+///   compile, and anything the list names is in `ALL` because `ALL` is
+///   built from the same tokens;
+/// - [`FromStr`] / [`Serialize`] / [`Deserialize`] are all derived from
+///   [`Self::ALL`] rather than re-spelling the literals;
+/// - the SQL side is checked against [`Self::ALL`] by the DB-free
+///   lock-step guard
+///   `crates/hort-adapters-postgres/tests/jobs_trigger_source_check_lockstep_guard.rs`,
+///   which parses the **effective** CHECK — the one defined by the newest
+///   migration that defines it, i.e. the list a migrated database
+///   actually enforces. Sibling of `task_kind_check_lockstep_guard`,
+///   which does the same job for `jobs.kind` ↔
+///   [`EVENT_TASK_KINDS`](crate::events::EVENT_TASK_KINDS).
+///
+/// **Adding a literal is therefore two edits, in this order:** add the
+/// variant here and its `Variant => "literal"` pair to the
+/// `trigger_source_wire!` list (which is where its [`Self::ALL`] entry
+/// and its `as_str` literal both come from), then append a new numbered
+/// migration redefining `jobs_trigger_source_check` over the full list. Never edit an applied migration in place — that
+/// changes its checksum and makes `sqlx::migrate!` reject every
+/// already-migrated database. The guard fails until both sides agree.
+///
+/// A variant that never reaches [`Self::ALL`] used to be the escape this
+/// arrangement could not see: give it an `as_str` literal, a tier and an
+/// ordinal, write it at one producer, and leave it out of `ALL` and the
+/// migration — `ALL.len()`, every test iterating `ALL` and the SQL
+/// lock-step guard all stayed green while [`FromStr`] rejected the very
+/// literal the producer stamped and its `INSERT` died on a `23514`
+/// check_violation. That is now a compile error: the single
+/// `trigger_source_wire!` list is where both `ALL` and `as_str` come
+/// from, and a variant missing from it makes the generated match
+/// non-exhaustive (`E0004`).
+///
+/// # Wire literals are exact
+///
+/// The watch tick's source is `"advisory"`, NOT `"advisory_watch"`; the
+/// prefetch root is `"self_service"` with an underscore while the seed
+/// import is `"seed-import"` with a hyphen. [`FromStr`] rejects every
+/// near-miss, because a label drifted from the SQL CHECK either fails the
+/// INSERT (loud) or files the row under the wrong observability bucket
+/// (silent).
+///
+/// # Ordinals live elsewhere
+///
+/// The `jobs.priority` a fresh row carries is decided by
+/// [`queue_priority`](crate::types::queue_priority) from `(kind,
+/// trigger_source)`, and who is waiting on the row by
+/// [`TaskTier::classify`](crate::types::TaskTier::classify). Both match
+/// over this type without a wildcard, so a new variant has to be given a
+/// tier and an ordinal before the build passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TriggerSource {
-    /// First-scan at ingest. Default priority 0.
+    /// `'ingest'` — an ingest, a pull-through, or a hook on one: the
+    /// first scan, the ingest-time provenance verify, the
+    /// prefetch-dependencies cascade root, the OCI index child rows.
     Ingest,
-    /// Cron rescan tick handler. Default priority 10.
+    /// `'cron'` — the rescan tick and the `hort-server enqueue-*`
+    /// CronJob subcommands.
     Cron,
-    /// Advisory watch tick handler. Default priority 5.
+    /// `'advisory'` — the advisory-watch sweep.
     Advisory,
-    /// Operator-triggered manual rescan. Default priority 20.
+    /// `'manual'` — an admin task invoke, an operator rescan, a
+    /// gitops-driven policy re-evaluation.
     Manual,
+    /// `'seed-import'` — the `hort-server seed-import` subcommand's own
+    /// row, and the scans and verifies that import enqueues through
+    /// `register_by_hash` with a backdated quarantine anchor. Separate
+    /// from `'manual'` so an import's enqueues are distinguishable in
+    /// the audit trail.
+    SeedImport,
+    /// `'prefetch'` — a row the transitive prefetch cascade spawned for
+    /// itself. Separate from [`Self::SelfService`] so an unexpectedly
+    /// high rate reads as a runaway cascade rather than a runaway
+    /// operator.
+    Prefetch,
+    /// `'self_service'` — the operator-initiated `hort-cli prefetch`
+    /// ROOT enqueue. Note the underscore: this literal is not
+    /// hyphenated.
+    SelfService,
+    /// `'scheduled'` — the `prefetch-tick` root enqueues, and the
+    /// `verify-event-chain` liveness breadcrumb the CronJob writes.
+    Scheduled,
+    /// `'register-by-hash'` — a per-repository row minted over content
+    /// already in CAS with no backdated anchor: the OCI cross-repository
+    /// blob mount, and the cross-repository pull-dedup followers.
+    ///
+    /// Admitted rather than folded into [`Self::Ingest`] because it has
+    /// a consumer: `register_by_hash`'s caller-class distinction is what
+    /// separates a mount or a coalesced follower from an ordinary ingest
+    /// in the audit trail, and `ingest_use_case`'s own tests assert on
+    /// the literal.
+    RegisterByHash,
+}
+
+// The set, spoken once. Order is the migration's order, so a diff
+// against the newest defining migration's IN-list reads line for line.
+// Per-variant rationale lives on the enum variants above.
+trigger_source_wire! {
+    Manual => "manual",
+    Cron => "cron",
+    Advisory => "advisory",
+    Ingest => "ingest",
+    SeedImport => "seed-import",
+    Prefetch => "prefetch",
+    SelfService => "self_service",
+    Scheduled => "scheduled",
+    RegisterByHash => "register-by-hash",
 }
 
 impl TriggerSource {
-    /// Wire shape — must match the SQL CHECK literals exactly.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Ingest => "ingest",
-            Self::Cron => "cron",
-            Self::Advisory => "advisory",
-            Self::Manual => "manual",
-        }
+    /// `'a' | 'b' | …` over [`Self::ALL`] — the "expected one of" half of
+    /// [`FromStr`]'s error, assembled from the set rather than re-typed
+    /// (the old hand-written list named four literals while the CHECK
+    /// admitted eight, so the error itself was misinformation).
+    fn wire_alternatives() -> String {
+        Self::ALL
+            .iter()
+            .map(|v| format!("'{}'", v.as_str()))
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 }
 
@@ -228,16 +373,40 @@ impl FromStr for TriggerSource {
     type Err = DomainError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "ingest" => Ok(Self::Ingest),
-            "cron" => Ok(Self::Cron),
-            "advisory" => Ok(Self::Advisory),
-            "manual" => Ok(Self::Manual),
-            other => Err(DomainError::Validation(format!(
-                "unknown trigger_source {other:?} (expected one of \
-                 'ingest' | 'cron' | 'advisory' | 'manual')"
-            ))),
-        }
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|v| v.as_str() == s)
+            .ok_or_else(|| {
+                DomainError::Validation(format!(
+                    "unknown trigger_source {s:?} (expected one of {})",
+                    Self::wire_alternatives()
+                ))
+            })
+    }
+}
+
+/// Serialized as its wire literal, so a `params` JSONB blob that embeds a
+/// `trigger_source` field stays coherent with the column.
+///
+/// Hand-written rather than `#[derive(Serialize)]` with a `rename_all`:
+/// no case convention produces both `seed-import` and `self_service`, so a
+/// derive would need a per-variant `rename` — which is the literals
+/// spelled a second time, which is what this type exists to stop.
+impl Serialize for TriggerSource {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TriggerSource {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // `String` rather than `&str`: a borrowed deserialize fails on
+        // any input the deserializer cannot hand back a borrow of (an
+        // escaped JSON string, a reader-backed source), and the wire
+        // literals are short enough that the allocation is noise.
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -1458,7 +1627,7 @@ pub struct PrefetchEnqueueRow {
     /// Priority ranking (see [`TriggerSource`]). Cascade rows carry priority 0
     /// (the schema default) so manual / cron / advisory drain first.
     pub priority: i16,
-    /// One of the `trigger_source` CHECK literals (migration 009).
+    /// One of the wire literals in [`TriggerSource::ALL`].
     /// Cascade-spawned rows carry `"prefetch"` to distinguish from
     /// cron / advisory / ingest / manual / seed-import.
     pub trigger_source: String,
@@ -1488,7 +1657,7 @@ pub struct IdempotentEnqueueRow {
     pub params: serde_json::Value,
     /// Priority ranking (see [`TriggerSource`]).
     pub priority: i16,
-    /// One of the `trigger_source` CHECK literals (migration 009).
+    /// One of the wire literals in [`TriggerSource::ALL`].
     pub trigger_source: String,
     /// Dedup key on the unscoped `jobs_idempotency_key_uq` partial
     /// unique index. Non-optional: a row with no key has nothing to
@@ -1891,24 +2060,66 @@ mod tests {
     /// each variant. Drift here would silently break adapter-side
     /// `WHERE trigger_source = $1` filters and let mis-categorised
     /// observability emissions through.
+    ///
+    /// Spelled out per variant on purpose: this is the one place in the
+    /// workspace where the literals are *asserted* rather than derived,
+    /// so an accidental edit to `as_str` has something to fail against.
+    /// Everything downstream — `FromStr`, serde, the writers' named
+    /// constants, the SQL lock-step guard — reads `as_str` instead of
+    /// re-typing it.
     #[test]
     fn trigger_source_as_str_matches_sql_literals() {
-        assert_eq!(TriggerSource::Ingest.as_str(), "ingest");
+        assert_eq!(TriggerSource::Manual.as_str(), "manual");
         assert_eq!(TriggerSource::Cron.as_str(), "cron");
         assert_eq!(TriggerSource::Advisory.as_str(), "advisory");
-        assert_eq!(TriggerSource::Manual.as_str(), "manual");
+        assert_eq!(TriggerSource::Ingest.as_str(), "ingest");
+        assert_eq!(TriggerSource::SeedImport.as_str(), "seed-import");
+        assert_eq!(TriggerSource::Prefetch.as_str(), "prefetch");
+        assert_eq!(TriggerSource::SelfService.as_str(), "self_service");
+        assert_eq!(TriggerSource::Scheduled.as_str(), "scheduled");
+        assert_eq!(TriggerSource::RegisterByHash.as_str(), "register-by-hash");
+    }
+
+    /// `ALL` is the set: nine entries, no duplicate wire literal, and
+    /// every entry round-trips through `as_str` → `FromStr`.
+    ///
+    /// Membership is no longer this test's job — `ALL` and `as_str` come
+    /// out of the one `trigger_source_wire!` list, so a variant the list
+    /// does not name is `E0004` and a variant it does name is in `ALL`.
+    /// What is left for a test is the arithmetic the compiler has no
+    /// opinion about: the count, which is the number a reviewer checks
+    /// the migration's IN-list against, and wire-literal uniqueness —
+    /// two variants given the same literal would make `FromStr`
+    /// single-valued on it and silently file one variant's rows under
+    /// the other.
+    #[test]
+    fn trigger_source_all_is_the_set() {
+        assert_eq!(
+            TriggerSource::ALL.len(),
+            9,
+            "the `trigger_source_wire!` list grew or shrank; bump this count \
+             together with the redefining migration's IN-list"
+        );
+        let mut wire: Vec<&str> = TriggerSource::ALL.iter().map(|v| v.as_str()).collect();
+        let before = wire.len();
+        wire.sort_unstable();
+        wire.dedup();
+        assert_eq!(
+            before,
+            wire.len(),
+            "two variants share a wire literal: {wire:?}"
+        );
+        for v in TriggerSource::ALL {
+            let parsed: TriggerSource = v.as_str().parse().expect("each ALL entry parses");
+            assert_eq!(parsed, v);
+        }
     }
 
     /// `Display` matches `as_str` for every variant — used by `tracing`
     /// fields and metric labels.
     #[test]
     fn trigger_source_display_matches_as_str() {
-        for v in [
-            TriggerSource::Ingest,
-            TriggerSource::Cron,
-            TriggerSource::Advisory,
-            TriggerSource::Manual,
-        ] {
+        for v in TriggerSource::ALL {
             assert_eq!(format!("{v}"), v.as_str());
         }
     }
@@ -1918,14 +2129,51 @@ mod tests {
     /// adapter row-mapper depends on.
     #[test]
     fn trigger_source_from_str_round_trips_each_variant() {
-        for v in [
-            TriggerSource::Ingest,
-            TriggerSource::Cron,
-            TriggerSource::Advisory,
-            TriggerSource::Manual,
-        ] {
+        for v in TriggerSource::ALL {
             let parsed: TriggerSource = v.as_str().parse().expect("each variant parses");
             assert_eq!(parsed, v);
+        }
+    }
+
+    /// The two literals the four-variant type used to reject, which are
+    /// the two a `kind='scan'` row can actually carry beyond the four:
+    /// `'seed-import'` (written by the seed import's own
+    /// `register_by_hash` enqueues) and `'register-by-hash'` (written by
+    /// the OCI cross-repository mount and the pull-dedup followers).
+    ///
+    /// Both are read back through this `FromStr` by
+    /// `ScanTaskHandler::run` and by `claim_scan_jobs`' row mapper, which
+    /// turned a miss into `DomainError::Invariant` — so a seed-imported
+    /// artifact's first scan could not be claimed at all.
+    #[test]
+    fn trigger_source_from_str_accepts_the_scan_row_literals() {
+        assert_eq!(
+            "seed-import"
+                .parse::<TriggerSource>()
+                .expect("seed-import parses"),
+            TriggerSource::SeedImport
+        );
+        assert_eq!(
+            "register-by-hash"
+                .parse::<TriggerSource>()
+                .expect("register-by-hash parses"),
+            TriggerSource::RegisterByHash
+        );
+    }
+
+    /// The error names the whole set rather than a stale subset. The
+    /// hand-written message used to list four literals while the CHECK
+    /// admitted eight, so the error misinformed whoever read it.
+    #[test]
+    fn trigger_source_from_str_error_names_every_literal() {
+        let err = TriggerSource::from_str("nope").expect_err("unknown literal must fail");
+        let text = err.to_string();
+        for v in TriggerSource::ALL {
+            assert!(
+                text.contains(v.as_str()),
+                "error must name {:?}: {text}",
+                v.as_str()
+            );
         }
     }
 
@@ -1952,7 +2200,14 @@ mod tests {
     /// happy-path-vs-sad-path discriminator the adapter relies on.
     #[test]
     fn trigger_source_from_str_rejects_unknown_literal() {
-        for bad in ["", "INGEST", " cron", "scheduled", "operator"] {
+        for bad in [
+            "",
+            "INGEST",
+            " cron",
+            "self-service", // the literal is `self_service`
+            "seedimport",   // the literal is `seed-import`
+            "operator",
+        ] {
             let err = TriggerSource::from_str(bad)
                 .unwrap_err_or_else_panic("expected unknown literal to fail");
             assert!(
@@ -1977,15 +2232,35 @@ mod tests {
         }
     }
 
-    /// `serde` round-trips through the `lowercase` rename — the column
-    /// literal is also the JSON literal, so `params` JSONB blobs that
-    /// embed a `trigger_source` field stay coherent with the column.
+    /// `serde` round-trips through the wire literal — the column literal
+    /// is also the JSON literal, so `params` JSONB blobs that embed a
+    /// `trigger_source` field stay coherent with the column.
+    ///
+    /// Covers every variant, not just a lowercase one: the hyphenated
+    /// (`seed-import`, `register-by-hash`) and underscored
+    /// (`self_service`) literals are exactly the ones a `rename_all`
+    /// derive would have got wrong.
     #[test]
-    fn trigger_source_serde_round_trips_lowercase() {
-        let json = serde_json::to_string(&TriggerSource::Advisory).expect("serialize");
-        assert_eq!(json, "\"advisory\"");
-        let back: TriggerSource = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, TriggerSource::Advisory);
+    fn trigger_source_serde_round_trips_the_wire_literal() {
+        for v in TriggerSource::ALL {
+            let json = serde_json::to_string(&v).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", v.as_str()));
+            let back: TriggerSource = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, v);
+        }
+    }
+
+    /// An unknown literal is a deserialize *error*, not a silent
+    /// default. The manual `Deserialize` routes through `FromStr`, so
+    /// this is the same rejection the row mapper gets.
+    #[test]
+    fn trigger_source_deserialize_rejects_an_unknown_literal() {
+        let err = serde_json::from_str::<TriggerSource>("\"api\"")
+            .expect_err("an unknown literal must not deserialize");
+        assert!(
+            err.to_string().contains("api"),
+            "error must quote the offending literal: {err}"
+        );
     }
 
     /// `ListJobsFilter::default()` produces an all-None filter

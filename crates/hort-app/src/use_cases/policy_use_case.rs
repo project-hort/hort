@@ -75,7 +75,7 @@ use hort_domain::ports::event_store::{
     AppendEvents, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
 };
 use hort_domain::ports::format_handler::FormatHandler;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::task_tier::queue_priority;
@@ -299,9 +299,10 @@ const POLICY_APPEND_ATTEMPTS: u8 = 2;
 const POLICY_REEVALUATION_KIND: &str = "policy-reevaluation";
 
 /// `jobs.trigger_source` the re-evaluation enqueue carries. The mutation
-/// that triggers it is operator- or gitops-driven, and no dedicated CHECK
-/// literal exists for the gitops path — that surface is out of scope here.
-const REEVALUATION_TRIGGER_SOURCE: &str = "manual";
+/// that triggers it is operator- or gitops-driven, and
+/// [`TriggerSource`] has no dedicated literal for the gitops path — that
+/// surface is out of scope here.
+const REEVALUATION_TRIGGER_SOURCE: &str = TriggerSource::Manual.as_str();
 
 /// What a policy mutation wants, re-decided against a given state
 /// (ADR 0060 step (b)).

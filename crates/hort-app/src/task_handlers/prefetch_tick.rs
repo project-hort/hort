@@ -171,7 +171,7 @@ use hort_domain::entities::repository::{PrefetchTrigger, Repository};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::format_handler::FormatHandler;
-use hort_domain::ports::jobs_repository::{JobsRepository, PrefetchEnqueueRow};
+use hort_domain::ports::jobs_repository::{JobsRepository, PrefetchEnqueueRow, TriggerSource};
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
@@ -225,12 +225,16 @@ const MAX_PREFETCHES_PER_TICK: usize = 5000;
 /// `PrefetchIngestHandler` (the same kind the cascade + self-service use).
 const PREFETCH_INGEST_KIND: &str = "prefetch";
 
-/// `trigger_source` for scheduled enqueues. Deliberately NOT `"prefetch"`
-/// (the cascade-internal marker): a `"scheduled"` leaf is a SEED, so its
-/// ingest re-fires the transitive cascade (`is_cascade_internal_leaf` is
-/// `trigger_source == "prefetch"`). Must be present in the
-/// `jobs.trigger_source` CHECK (migration 009).
-const SCHEDULED_TRIGGER_SOURCE: &str = "scheduled";
+/// `trigger_source` for scheduled enqueues. Deliberately NOT
+/// [`TriggerSource::Prefetch`] (the cascade-internal marker): a
+/// `"scheduled"` leaf is a SEED, so its ingest re-fires the transitive
+/// cascade (`is_cascade_internal_leaf` tests for the cascade literal).
+///
+/// Taken from the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]), so CHECK
+/// membership is a property of the value rather than something this
+/// comment has to promise.
+const SCHEDULED_TRIGGER_SOURCE: &str = TriggerSource::Scheduled.as_str();
 
 // ---------------------------------------------------------------------------
 // Handler
