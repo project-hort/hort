@@ -29,6 +29,7 @@
 # Exit codes:
 #   0 — all assertions passed
 #   1 — one or more assertions failed
+#   2 — required fail2ban-regex tool unavailable
 
 set -euo pipefail
 
@@ -44,7 +45,7 @@ if ! command -v fail2ban-regex &>/dev/null; then
     echo "" >&2
     echo "This test is CI/host-gated: it requires fail2ban to be installed." >&2
     echo "See the CI/host-gating note in this script for integration options." >&2
-    exit 1
+    exit 2
 fi
 
 # ── Sample log lines ──────────────────────────────────────────────────────────
