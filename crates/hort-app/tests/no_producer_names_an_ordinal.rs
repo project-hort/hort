@@ -61,11 +61,25 @@
 //! file's own claim false by a technicality:
 //!
 //! * [`JobsRepository::enqueue_task`] / [`JobsRepository::enqueue_scan`]
-//!   — the direct enqueues. The argument position is **derived from the
-//!   port's own signature** rather than hard-coded, so a parameter
-//!   inserted ahead of `priority` cannot leave this guard reading the
-//!   wrong argument (see
-//!   [`the_scan_reads_the_priority_argument_the_port_declares`]).
+//!   — the direct enqueues, in **both call forms**:
+//!   `self.jobs.enqueue_task(…)` and the path-qualified
+//!   `JobsRepository::enqueue_task(&*self.jobs, …)`. The second is the
+//!   same call, compiles identically, and is what a compiler suggestion
+//!   or a refactoring tool writes when the receiver needs a coercion —
+//!   so a scan keyed on the method-call spelling alone is blind on a
+//!   syntax nobody had to choose, which is worse than no scan: the next
+//!   author reads its green as an answer.
+//!
+//!   The argument position is **derived from the port's own signature**
+//!   rather than hard-coded, and derived **per form**: a UFCS call
+//!   writes the receiver as its first argument, so every later position
+//!   shifts behind it. A parameter inserted ahead of `priority` cannot
+//!   leave this guard reading the wrong argument, and neither can the
+//!   form a call was written in (see
+//!   [`the_scan_reads_the_priority_argument_the_port_declares`] and
+//!   [`the_scan_catches_an_ordinal_named_in_a_ufcs_call`], whose
+//!   fixture puts a table call at the unshifted position so that a
+//!   matcher widened without re-deriving would be green on it).
 //! * `IngestEnqueue::Scan` / `IngestEnqueue::ProvenanceVerify` — the
 //!   ingest-time gates, whose ordinal rides a struct into
 //!   `ArtifactLifecyclePort::commit_transition_with_enqueues` and is
@@ -87,8 +101,13 @@
 //! Blind spots, the ones every source scan has: a call assembled through
 //! a macro; a `priority` local initialised through a helper this scan
 //! cannot follow (it reads the `let` in the same file); and an ordinal
-//! laundered through a function parameter of some other name. The review
-//! check survives alongside it.
+//! laundered through a function parameter of some other name. A call
+//! spelled in neither form — neither `.enqueue_task(` nor a
+//! `::enqueue_task(` path — is deliberately **not** a blind spot: it
+//! panics, because the ordinal's position depends on the form and a
+//! scan that skipped what it could not classify would report compliance
+//! over a producer it never read. The review check survives alongside
+//! it.
 //!
 //! DB-free and sub-second, so `cargo test --workspace` runs it with no
 //! database — same family as `jobs_row_has_one_owner` and
@@ -195,26 +214,163 @@ fn split_top_level(text: &str) -> Vec<String> {
     out
 }
 
-/// The zero-based position of the `priority` parameter in `fn <method>`'s
-/// declaration in `port_source`, as the port declares it today.
+/// How a call site spells an enqueue entry point — and therefore where
+/// the ordinal sits in the argument list it writes.
+///
+/// Both forms compile to the same call, and a compiler suggestion or a
+/// refactoring tool produces the second one by itself, so a guard that
+/// reads only the first is blind on a syntax nobody had to choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallForm {
+    /// `self.jobs.enqueue_task(…)` — the receiver is the receiver, so
+    /// the call writes the port's parameters *without* `self`.
+    Method,
+    /// `JobsRepository::enqueue_task(&*self.jobs, …)` — path-qualified,
+    /// where `self` is the first **argument** and every later one shifts
+    /// behind it.
+    Ufcs,
+}
+
+impl CallForm {
+    /// How the form is spelled in a failure message, so a hit says which
+    /// argument list was read.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Method => "method call",
+            Self::Ufcs => "path-qualified (UFCS) call",
+        }
+    }
+}
+
+/// Is `param` the receiver rather than an argument a method call writes?
+fn is_receiver(param: &str) -> bool {
+    param.trim_end().ends_with("self")
+}
+
+/// `fn <method>`'s parameter list in `port_source`, receiver included,
+/// in declaration order.
+fn enqueue_parameters(port_source: &str, method: &str) -> Option<Vec<String>> {
+    let header = format!("fn {method}<'a>(");
+    let at = port_source.find(&header)?;
+    let open = at + header.len() - 1;
+    let close = balanced_end(port_source, open, b'(', b')')?;
+    Some(split_top_level(&port_source[open + 1..close]))
+}
+
+/// The zero-based position of the `priority` parameter in the argument
+/// list a `form` call to `method` writes, as the port declares it today.
 ///
 /// Read rather than written down so that inserting a parameter ahead of
 /// the ordinal cannot leave this guard checking the argument next door —
 /// which would be the quiet failure, not the loud one: the neighbouring
 /// argument at both entry points is a `&str`, so the guard would start
 /// rejecting every compliant call site and get "fixed" by relaxing it.
-fn ordinal_arg_index(port_source: &str, method: &str) -> Option<usize> {
-    let header = format!("fn {method}<'a>(");
-    let at = port_source.find(&header)?;
-    let open = at + header.len() - 1;
-    let close = balanced_end(port_source, open, b'(', b')')?;
-    let params = split_top_level(&port_source[open + 1..close]);
+///
+/// **The per-form difference is derived, not an increment.** A UFCS call
+/// writes the receiver as its first argument, so the position is the one
+/// the port declares *counting `self`*; a method call's is the same
+/// position with the receiver filtered out. Widening the matcher without
+/// re-deriving the position would read the argument next door at every
+/// UFCS site and still be green — the neighbour at that position is
+/// `actor_id: Option<Uuid>` on `enqueue_task` and `format: &str` on
+/// `enqueue_scan`, neither of which looks like an ordinal a producer
+/// named.
+fn ordinal_arg_index(port_source: &str, method: &str, form: CallForm) -> Option<usize> {
+    let params = enqueue_parameters(port_source, method)?;
     params
         .iter()
-        // `&'a self` is the receiver, not an argument the call site
-        // supplies.
-        .filter(|p| !p.ends_with("self"))
+        // `&'a self` is the receiver. A method call does not supply it;
+        // a UFCS call does, in first position.
+        .filter(|p| form == CallForm::Ufcs || !is_receiver(p))
         .position(|p| p.split(':').next().map(str::trim) == Some(ORDINAL_PARAM))
+}
+
+/// One enqueue entry point, with the ordinal's position in each call
+/// form the scan reads.
+struct EnqueueEntry {
+    method: &'static str,
+    method_form: usize,
+    ufcs_form: usize,
+}
+
+impl EnqueueEntry {
+    /// The ordinal's position in the argument list a `form` call writes.
+    fn ordinal_index(&self, form: CallForm) -> usize {
+        match form {
+            CallForm::Method => self.method_form,
+            CallForm::Ufcs => self.ufcs_form,
+        }
+    }
+}
+
+/// Both entry points' ordinal positions, read out of [`PORT_SOURCE`].
+fn enqueue_entries(port_source: &str) -> Vec<EnqueueEntry> {
+    ENQUEUE_METHODS
+        .iter()
+        .map(|method| {
+            let index = |form: CallForm| {
+                ordinal_arg_index(port_source, method, form).unwrap_or_else(|| {
+                    panic!(
+                        "no `{ORDINAL_PARAM}` parameter on `fn {method}` in {PORT_SOURCE} — the \
+                         port changed shape under this guard, and a guessed argument position \
+                         would check the wrong argument"
+                    )
+                })
+            };
+            EnqueueEntry {
+                method,
+                method_form: index(CallForm::Method),
+                ufcs_form: index(CallForm::Ufcs),
+            }
+        })
+        .collect()
+}
+
+/// Every call to `method` in `text`, as `(form, offset of the name,
+/// offset of the opening paren)`.
+///
+/// The form is read off the characters in front of the name rather than
+/// assumed, because it decides which argument is the ordinal. A spelling
+/// this cannot classify panics: a guard that silently skipped a call it
+/// did not recognise would report compliance over a producer it never
+/// read.
+fn enqueue_calls(text: &str, rel: &str, method: &str) -> Vec<(CallForm, usize, usize)> {
+    let marker = format!("{method}(");
+    let mut out = Vec::new();
+    let mut search = 0usize;
+    while let Some(found) = text[search..].find(&marker) {
+        let at = search + found;
+        let open = at + marker.len() - 1;
+        search = open + 1;
+        let before = &text[..at];
+        // A name that is the tail of a longer identifier is a different
+        // function, and reading its arguments as these would be the
+        // quiet failure.
+        if before
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        if before.ends_with("::") {
+            out.push((CallForm::Ufcs, at, open));
+        } else if before.ends_with('.') {
+            out.push((CallForm::Method, at, open));
+        } else if before.split_whitespace().next_back() != Some("fn") {
+            // `fn <method>(` is the port's own declaration — or an
+            // implementation of it — and declares no ordinal. Anything
+            // else is a call shape this scan cannot resolve a position
+            // for.
+            panic!(
+                "{rel}:{} — `{method}(` is written in a form this guard does not read (neither \
+                 `.{method}(` nor a path-qualified `::{method}(`); the ordinal's argument \
+                 position depends on the form, so this guard will not guess at it",
+                line_of(text, at)
+            );
+        }
+    }
+    out
 }
 
 /// How an ordinal expression reaches the column — the three accepted
@@ -305,8 +461,87 @@ fn in_a_port_implementation(text: &str, offset: usize) -> bool {
 struct Site {
     location: String,
     shape: &'static str,
+    /// How the enqueue was spelled, for an enqueue site; `None` for an
+    /// `IngestEnqueue` construction, which has no argument list.
+    form: Option<CallForm>,
     ordinal: Ordinal,
     expr: String,
+}
+
+/// Every ordinal reaching `jobs.priority` from one file's production
+/// region.
+///
+/// Separated from the file walk so a fixture can be scanned the same way
+/// the tree is — the positions come from the real port either way, so a
+/// fixture cannot pass against a position production does not use.
+fn ordinal_sites_in(text: &str, rel: &str, entries: &[EnqueueEntry]) -> Vec<Site> {
+    let mut sites = Vec::new();
+
+    for entry in entries {
+        let method = entry.method;
+        for (form, at, open) in enqueue_calls(text, rel, method) {
+            let index = entry.ordinal_index(form);
+            let line = line_of(text, at);
+            let Some(close) = balanced_end(text, open, b'(', b')') else {
+                panic!(
+                    "{rel}:{line} — the argument list of this `{method}(` call does not close \
+                     inside the production region; this guard will not guess at which argument \
+                     is the ordinal"
+                );
+            };
+            let args = split_top_level(&text[open + 1..close]);
+            let Some(expr) = args.get(index) else {
+                panic!(
+                    "{rel}:{line} — this {} to `{method}` writes {} arguments; the port declares \
+                     `{ORDINAL_PARAM}` at position {index} in that form",
+                    form.as_str(),
+                    args.len()
+                );
+            };
+            sites.push(Site {
+                location: format!("{rel}:{line}"),
+                shape: "enqueue",
+                form: Some(form),
+                ordinal: classify_ordinal(text, at, expr),
+                expr: normalise(expr),
+            });
+        }
+    }
+
+    for variant in INGEST_ENQUEUE_VARIANTS {
+        let mut search = 0usize;
+        while let Some(found) = text[search..].find(variant) {
+            let at = search + found;
+            let open = at + variant.len() - 1;
+            search = open + 1;
+            let line = line_of(text, at);
+            let Some(close) = balanced_end(text, open, b'{', b'}') else {
+                // An `IngestEnqueue::Scan {` whose brace does not
+                // close inside the region is a match arm the region
+                // pass cut, not a construction.
+                continue;
+            };
+            let fields = split_top_level(&text[open + 1..close]);
+            // A pattern binds `priority` without a value; only a
+            // construction assigns one.
+            let Some(expr) = fields.iter().find_map(|f| {
+                f.split_once(':')
+                    .filter(|(name, _)| name.trim() == ORDINAL_PARAM)
+                    .map(|(_, value)| value)
+            }) else {
+                continue;
+            };
+            sites.push(Site {
+                location: format!("{rel}:{line}"),
+                shape: "ingest-enqueue",
+                form: None,
+                ordinal: classify_ordinal(text, at, expr),
+                expr: normalise(expr),
+            });
+        }
+    }
+
+    sites
 }
 
 /// Every ordinal reaching `jobs.priority` from production code under
@@ -314,19 +549,7 @@ struct Site {
 fn ordinal_sites(root: &Path) -> Vec<Site> {
     let port_source = fs::read_to_string(root.join(PORT_SOURCE))
         .unwrap_or_else(|e| panic!("read {PORT_SOURCE}: {e}"));
-    let arg_index: Vec<(&str, usize)> = ENQUEUE_METHODS
-        .iter()
-        .map(|method| {
-            let index = ordinal_arg_index(&port_source, method).unwrap_or_else(|| {
-                panic!(
-                    "no `{ORDINAL_PARAM}` parameter on `fn {method}` in {PORT_SOURCE} — the port \
-                     changed shape under this guard, and a guessed argument position would check \
-                     the wrong argument"
-                )
-            });
-            (*method, index)
-        })
-        .collect();
+    let entries = enqueue_entries(&port_source);
 
     let mut sites = Vec::new();
     for path in production_sources(root) {
@@ -342,70 +565,7 @@ fn ordinal_sites(root: &Path) -> Vec<Site> {
         }
         let source = fs::read_to_string(&path).expect("source file is readable UTF-8");
         let text = production_region(&source);
-
-        for (method, index) in &arg_index {
-            let marker = format!(".{method}(");
-            let mut search = 0usize;
-            while let Some(found) = text[search..].find(&marker) {
-                let at = search + found;
-                let open = at + marker.len() - 1;
-                search = open + 1;
-                let line = line_of(&text, at);
-                let Some(close) = balanced_end(&text, open, b'(', b')') else {
-                    panic!(
-                        "{rel}:{line} — the argument list of this `.{method}(` call does not \
-                         close inside the production region; this guard will not guess at which \
-                         argument is the ordinal"
-                    );
-                };
-                let args = split_top_level(&text[open + 1..close]);
-                let Some(expr) = args.get(*index) else {
-                    panic!(
-                        "{rel}:{line} — `.{method}(` called with {} arguments; the port declares \
-                         `{ORDINAL_PARAM}` at position {index}",
-                        args.len()
-                    );
-                };
-                sites.push(Site {
-                    location: format!("{rel}:{line}"),
-                    shape: "enqueue",
-                    ordinal: classify_ordinal(&text, at, expr),
-                    expr: normalise(expr),
-                });
-            }
-        }
-
-        for variant in INGEST_ENQUEUE_VARIANTS {
-            let mut search = 0usize;
-            while let Some(found) = text[search..].find(variant) {
-                let at = search + found;
-                let open = at + variant.len() - 1;
-                search = open + 1;
-                let line = line_of(&text, at);
-                let Some(close) = balanced_end(&text, open, b'{', b'}') else {
-                    // An `IngestEnqueue::Scan {` whose brace does not
-                    // close inside the region is a match arm the region
-                    // pass cut, not a construction.
-                    continue;
-                };
-                let fields = split_top_level(&text[open + 1..close]);
-                // A pattern binds `priority` without a value; only a
-                // construction assigns one.
-                let Some(expr) = fields.iter().find_map(|f| {
-                    f.split_once(':')
-                        .filter(|(name, _)| name.trim() == ORDINAL_PARAM)
-                        .map(|(_, value)| value)
-                }) else {
-                    continue;
-                };
-                sites.push(Site {
-                    location: format!("{rel}:{line}"),
-                    shape: "ingest-enqueue",
-                    ordinal: classify_ordinal(&text, at, expr),
-                    expr: normalise(expr),
-                });
-            }
-        }
+        sites.extend(ordinal_sites_in(&text, &rel, &entries));
     }
     sites
 }
@@ -420,14 +580,16 @@ fn no_producer_names_a_queue_ordinal() {
         .filter(|s| s.ordinal == Ordinal::Named)
         .map(|s| {
             format!(
-                "{} — this producer names the ordinal `{}` itself. The number a fresh `jobs` row \
-                 carries is decided in `{ORDINAL_TABLE}` from the `(kind, trigger_source)` the \
-                 row already carries (ADR 0066 D6: a producer names a class, never a number). If \
-                 no `(kind, trigger_source)` pair describes this work, that is the finding: give \
-                 it a `TriggerSource` literal and a migration widening \
+                "{} ({}) — this producer names the ordinal `{}` itself. The number a fresh `jobs` \
+                 row carries is decided in `{ORDINAL_TABLE}` from the `(kind, trigger_source)` \
+                 the row already carries (ADR 0066 D6: a producer names a class, never a \
+                 number). If no `(kind, trigger_source)` pair describes this work, that is the \
+                 finding: give it a `TriggerSource` literal and a migration widening \
                  `jobs_trigger_source_check`, then call `queue_priority(kind, trigger_source)` \
                  like every other producer",
-                s.location, s.expr
+                s.location,
+                s.form.map_or(s.shape, CallForm::as_str),
+                s.expr
             )
         })
         .collect();
@@ -448,11 +610,16 @@ fn no_producer_names_a_queue_ordinal() {
             .filter(|s| s.ordinal == want && s.shape == shape)
             .count()
     };
-    assert!(
-        count(Ordinal::Table, "enqueue") >= 4,
-        "the scan found {} in-place table calls at an enqueue entry point; the producers that \
-         call the table directly are at least the admin invoke, the policy re-evaluation, the \
-         self-service prefetch root and the two clearance verifies",
+    assert_eq!(
+        count(Ordinal::Table, "enqueue"),
+        10,
+        "the scan found {} in-place table calls at an enqueue entry point; an exact count rather \
+         than a floor, because a floor cannot tell a hit that vanished from one that was never \
+         there — a call site rewritten into a form the scan does not read would leave the \
+         remainder satisfying a lower bound. If one was legitimately added or removed, move this \
+         count deliberately. The count spans both call forms, so rewriting a site from \
+         `self.jobs.enqueue_task(…)` into `JobsRepository::enqueue_task(&*self.jobs, …)` must \
+         leave it unchanged",
         count(Ordinal::Table, "enqueue")
     );
     assert_eq!(
@@ -488,37 +655,82 @@ fn no_producer_names_a_queue_ordinal() {
     );
 }
 
-/// The argument position this guard reads is the one the port declares.
+/// The argument position this guard reads is the one the port declares
+/// — **per call form**, because the two forms do not agree.
 ///
 /// Both entry points carry a `&str` immediately beside `priority`
 /// (`trigger_source` after it, `format` before it on `enqueue_scan`), so
 /// a guard reading a hard-coded position after a parameter was inserted
 /// would reject every compliant call site at once — and the natural
 /// repair for a guard that fails everywhere is to relax it.
+///
+/// The UFCS half is the opposite failure and the quieter one: the
+/// receiver becomes the first argument, so every position shifts behind
+/// it, and a matcher widened to the second form without re-deriving the
+/// position reads the argument next door at every such call and stays
+/// green. The two indices below must therefore differ by exactly the
+/// receiver, and they are read — not computed from each other.
 #[test]
 fn the_scan_reads_the_priority_argument_the_port_declares() {
     let port_source = fs::read_to_string(workspace_root().join(PORT_SOURCE))
         .unwrap_or_else(|e| panic!("read {PORT_SOURCE}: {e}"));
     assert_eq!(
-        ordinal_arg_index(&port_source, "enqueue_task"),
+        ordinal_arg_index(&port_source, "enqueue_task", CallForm::Method),
         Some(3),
         "`enqueue_task(kind, params, actor_id, priority, trigger_source, idempotency_key)`"
     );
     assert_eq!(
-        ordinal_arg_index(&port_source, "enqueue_scan"),
+        ordinal_arg_index(&port_source, "enqueue_scan", CallForm::Method),
         Some(4),
         "`enqueue_scan(artifact_id, repository_id, content_hash, format, priority, \
          trigger_source)`"
     );
-    // And the resolution really is a read, not a constant dressed up as
-    // one: a signature without the parameter resolves to nothing.
     assert_eq!(
-        ordinal_arg_index(
-            "fn enqueue_task<'a>(&'a self, kind: &'a str) -> X;",
-            "enqueue_task"
-        ),
-        None
+        ordinal_arg_index(&port_source, "enqueue_task", CallForm::Ufcs),
+        Some(4),
+        "`JobsRepository::enqueue_task(self, kind, params, actor_id, priority, …)` — the \
+         receiver is an argument here, so `priority` is one further along"
     );
+    assert_eq!(
+        ordinal_arg_index(&port_source, "enqueue_scan", CallForm::Ufcs),
+        Some(5),
+        "`JobsRepository::enqueue_scan(self, artifact_id, repository_id, content_hash, format, \
+         priority, …)`"
+    );
+    // The shift is the receiver and nothing else, at both entry points —
+    // asserted over the two read positions rather than by deriving one
+    // from the other, which is the mistake being guarded against.
+    for method in ENQUEUE_METHODS {
+        let params = enqueue_parameters(&port_source, method)
+            .unwrap_or_else(|| panic!("`fn {method}` declares a parameter list"));
+        let receivers = params.iter().filter(|p| is_receiver(p)).count();
+        assert_eq!(
+            receivers, 1,
+            "`fn {method}` must declare exactly one receiver, or the per-form shift is not the \
+             receiver: {params:?}"
+        );
+        assert_eq!(
+            ordinal_arg_index(&port_source, method, CallForm::Ufcs),
+            ordinal_arg_index(&port_source, method, CallForm::Method).map(|i| i + receivers),
+            "the UFCS position of `{method}`'s ordinal must exceed the method-call position by \
+             exactly the receiver"
+        );
+    }
+    // And the resolution really is a read, not a constant dressed up as
+    // one: a signature without the parameter resolves to nothing, in
+    // either form.
+    for form in [CallForm::Method, CallForm::Ufcs] {
+        assert_eq!(
+            ordinal_arg_index(
+                "fn enqueue_task<'a>(&'a self, kind: &'a str) -> X;",
+                "enqueue_task",
+                form
+            ),
+            None,
+            "{}",
+            form.as_str()
+        );
+    }
 }
 
 /// The classifier can still fail, and fails on the shape this unit
@@ -623,5 +835,117 @@ mod tests {
         !region.contains("4096"),
         "the enqueue inside the `#[cfg(test)] mod` must be blanked — a fixture chooses its own \
          ordinal and this guard has no business policing it:\n{region}"
+    );
+}
+
+/// A producer that names an ordinal in a **path-qualified (UFCS) call**
+/// is caught — and caught at the position that form writes the ordinal
+/// at.
+///
+/// `JobsRepository::enqueue_task(&*repo, …)` is the same call as
+/// `repo.enqueue_task(…)`, compiles identically, and is what a compiler
+/// suggestion or a refactoring tool produces when the receiver needs a
+/// coercion. It contains no `.enqueue_task(`, so a scan keyed on the
+/// method-call spelling alone sees nothing — and a guard that reports
+/// compliance over a producer it never read is worse than no guard,
+/// because the next author reads its green as an answer.
+///
+/// The fixture carries the trap with it. In the UFCS call below, the
+/// position a *method* call writes the ordinal at holds
+/// `queue_priority(KIND, SOURCE)` — the `actor_id` slot in this form —
+/// so a matcher widened to the second spelling without re-deriving the
+/// argument position classifies that as the table, reports the call
+/// compliant, and leaves the literal one argument further along
+/// unread. The last assertion pins that the trap is live rather than
+/// described.
+#[test]
+fn the_scan_catches_an_ordinal_named_in_a_ufcs_call() {
+    let port_source = fs::read_to_string(workspace_root().join(PORT_SOURCE))
+        .unwrap_or_else(|e| panic!("read {PORT_SOURCE}: {e}"));
+    let entries = enqueue_entries(&port_source);
+    let task = entries
+        .iter()
+        .find(|e| e.method == "enqueue_task")
+        .expect("the port declares `enqueue_task`");
+
+    let source = "\
+async fn compliant_method_call(&self) {
+    self.jobs
+        .enqueue_task(KIND, &params, None, queue_priority(KIND, SOURCE), SOURCE, None)
+        .await;
+}
+
+async fn compliant_ufcs_call(&self) {
+    JobsRepository::enqueue_task(
+        &*self.jobs, KIND, &params, None, queue_priority(KIND, SOURCE), SOURCE, None,
+    )
+    .await;
+}
+
+async fn ufcs_call_naming_a_number(&self) {
+    JobsRepository::enqueue_task(
+        &*self.jobs, KIND, &params, queue_priority(KIND, SOURCE), 7, SOURCE, None,
+    )
+    .await;
+}
+";
+    let region = production_region(source);
+    let sites = ordinal_sites_in(&region, "fixture.rs", &entries);
+
+    assert_eq!(
+        sites.len(),
+        3,
+        "both spellings are calls and all three must be read: {:?}",
+        sites
+            .iter()
+            .map(|s| (s.location.clone(), s.form, s.expr.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        sites.iter().map(|s| s.form).collect::<Vec<_>>(),
+        vec![
+            Some(CallForm::Method),
+            Some(CallForm::Ufcs),
+            Some(CallForm::Ufcs)
+        ],
+        "the form is read off each call, not assumed from the first one"
+    );
+    assert_eq!(
+        sites.iter().map(|s| &s.ordinal).collect::<Vec<_>>(),
+        vec![&Ordinal::Table, &Ordinal::Table, &Ordinal::Named],
+        "a compliant UFCS call must not become a false positive, and the one naming a number \
+         must be the hit: {:?}",
+        sites.iter().map(|s| s.expr.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        sites[2].expr, "7",
+        "the hit must be the ordinal the producer named, not the argument beside it"
+    );
+
+    // The trap is live: at the method-call position, the UFCS call that
+    // names `7` writes something this classifier accepts. A guard that
+    // read that position would be green on the fixture above — which is
+    // exactly the failure the per-form derivation exists to prevent.
+    let (_, at, open) = enqueue_calls(&region, "fixture.rs", "enqueue_task")
+        .into_iter()
+        .rfind(|(form, _, _)| *form == CallForm::Ufcs)
+        .expect("the fixture writes two UFCS calls");
+    let close =
+        balanced_end(&region, open, b'(', b')').expect("the fixture's argument list closes");
+    let args = split_top_level(&region[open + 1..close]);
+    assert_ne!(
+        task.method_form, task.ufcs_form,
+        "the two forms must disagree about the position, or this fixture proves nothing"
+    );
+    assert_eq!(
+        classify_ordinal(&region, at, &args[task.method_form]),
+        Ordinal::Table,
+        "the decoy at the method-call position must read as compliant, or the trap this test \
+         pins is not armed"
+    );
+    assert_eq!(
+        classify_ordinal(&region, at, &args[task.ufcs_form]),
+        Ordinal::Named,
+        "and the ordinal is one argument further along, behind the receiver"
     );
 }

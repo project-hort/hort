@@ -627,6 +627,55 @@ impl ClaimReservation {
             slots_per_band: 0,
         }
     }
+
+    /// The smallest claim batch this reservation can be served from
+    /// without removing a class from the allocation —
+    /// `bands × slots_per_band + 1`.
+    ///
+    /// # Why the batch and the share are not independent numbers
+    ///
+    /// [`JobsRepository::claim_pending_by_kinds`] spends the batch in
+    /// three passes and the reservation is the first of them. The
+    /// reserved pass takes up to `slots_per_band` rows for **each** band
+    /// and is then capped at the batch as a whole, dropping the
+    /// lowest-class reservations first; what the batch has left over is
+    /// what the one priority-blind oldest slot can take. So a batch of
+    /// `bands × slots_per_band` is spent entirely on the reserved bands
+    /// and the age slot gets nothing — and the age slot is the **only**
+    /// guarantee of service for a class with no reserved share (ADR 0066
+    /// D5: nobody waits on bulk work, so it gets none) and for an old
+    /// row of a flooded class, which sits in the flood's own band and is
+    /// therefore beyond any per-class reservation's reach. One more row
+    /// than the reservation can consume is what keeps that slot
+    /// reachable.
+    ///
+    /// The term is `+ 1` and not `+ bands`: the oldest pass claims one
+    /// row, priority-blind, and aging is a safety net beneath the
+    /// reservation rather than a second per-class allocation.
+    ///
+    /// The band **count** comes from the reservation itself rather than
+    /// from a literal, so a class gaining or losing a reserved share
+    /// moves this minimum with it (ADR 0066 D6: the vocabulary is
+    /// defined once). At `slots_per_band = 0` — the reservation turned
+    /// off — the minimum is `1`, which is still the honest answer: a
+    /// batch of zero claims nothing at all, so every class goes
+    /// unserved.
+    ///
+    /// `hort-worker` refuses to start below this (
+    /// `HORT_SCANNER_BATCH_SIZE` against
+    /// `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS`), rather than warning or
+    /// quietly raising the batch: overriding an operator's number
+    /// without saying so is how a class comes to be unserved invisibly.
+    #[must_use]
+    pub fn minimum_batch_size(&self) -> u32 {
+        // Saturating rather than wrapping: the share is operator input
+        // clamped only at `u16::MAX`, and a minimum that wrapped to a
+        // small number would read as satisfiable.
+        u32::try_from(self.bands.len())
+            .unwrap_or(u32::MAX)
+            .saturating_mul(u32::from(self.slots_per_band))
+            .saturating_add(1)
+    }
 }
 
 /// One kind's claim-eligible pending backlog, as observed by
@@ -1489,22 +1538,34 @@ pub trait JobsRepository: Send + Sync {
     /// claim set. Fenced on `locked_by = worker_id` and
     /// `status = 'running'` for the reason [`Self::renew_lease`] is: a
     /// worker whose row was swept and handed on must not write to the
-    /// row its successor now holds. `Ok(false)` means the fence
-    /// refused — the row moved on — and is not an error: the renewal's
-    /// own `lost` flag is what the dispatcher acts on.
+    /// row its successor now holds.
     ///
-    /// Idempotent and cheap to lose. If this write fails, the row keeps
-    /// a non-NULL `capacity_waiting_since` while its handler runs, so
-    /// the class reads as having one more row waiting for capacity than
-    /// it does — until the outcome write moves the row out of
-    /// `running`, which bounds the error by the handler's own runtime.
-    /// That direction is deliberate (ADR 0066: a false alarm is
-    /// recoverable, a silent stall is the failure being removed).
+    /// **`Ok(false)` is not an error and not a lost metric — it is the
+    /// fence answering, and the caller acts on it.** The dispatcher
+    /// calls this between the permit grant and the handler, so a
+    /// refusal here says the row stopped being this worker's while it
+    /// waited for capacity, and the dispatcher declines the dispatch
+    /// rather than running a second concurrent execution of work its
+    /// holder is already running. The lease renewal's own `lost` flag
+    /// does not cover that: it gates the *outcome write*, which happens
+    /// after the handler has run.
+    ///
+    /// An `Err` is the absence of an answer rather than a statement
+    /// about ownership, so the row keeps running: it then keeps a
+    /// non-NULL `capacity_waiting_since` while its handler runs, so the
+    /// class reads as having one more row waiting for capacity than it
+    /// does — until the outcome write moves the row out of `running`,
+    /// which bounds the error by the handler's own runtime. That
+    /// direction is deliberate (ADR 0066: a false alarm is recoverable,
+    /// a silent stall is the failure being removed).
     ///
     /// **Default implementation:** returns `Ok(true)`. A mock has no
     /// capacity wait recorded, so "the row is no longer waiting" is the
     /// honest answer — the additive-default pattern of
-    /// [`Self::renew_lease`].
+    /// [`Self::renew_lease`]. It has to stay `Ok(true)`: a default of
+    /// `Ok(false)` would now tell every caller its rows belong to
+    /// somebody else, so a repository that pre-dates this method would
+    /// dispatch nothing at all.
     fn clear_capacity_wait<'a>(
         &'a self,
         job_id: Uuid,
@@ -2559,6 +2620,86 @@ mod tests {
         assert!(
             matches!(err, DomainError::Invariant(_)),
             "expected Invariant for get_job default impl, got {err:?}"
+        );
+    }
+
+    /// The minimum batch is the reservation's own arithmetic: one row
+    /// beyond everything the reserved pass can consume.
+    ///
+    /// Asserted against the band list rather than against a literal,
+    /// because the whole point of deriving it is that a class gaining or
+    /// losing a reserved share moves the minimum with it. The spelled
+    /// numbers below are what today's two waited-on classes make of it,
+    /// and they are what an operator reads in the refusal.
+    #[test]
+    fn the_minimum_batch_is_one_row_past_the_whole_reservation() {
+        let bands = u32::try_from(crate::types::task_tier::waited_on_bands().len())
+            .expect("the band list is small");
+        for share in [0u16, 1, 2, 7] {
+            let reservation = ClaimReservation::waited_on(share);
+            assert_eq!(
+                reservation.minimum_batch_size(),
+                bands * u32::from(share) + 1,
+                "the minimum must be every reserved slot plus the one priority-blind oldest                  row, at share {share}"
+            );
+        }
+        // Today's numbers, as the refusal states them: two waited-on
+        // classes, so the shipped default share needs a batch of three
+        // and the shipped default batch of four clears it with a row to
+        // spare for the ranked remainder.
+        assert_eq!(bands, 2, "Interactive and Normal are the waited-on classes");
+        assert_eq!(
+            ClaimReservation::waited_on(crate::types::task_tier::DEFAULT_RESERVED_SLOTS_PER_CLASS)
+                .minimum_batch_size(),
+            3
+        );
+    }
+
+    /// A reservation that holds nothing still needs one row — a batch of
+    /// zero claims nothing at all.
+    ///
+    /// The `+ 1` is not a property of the reservation being non-empty:
+    /// with the reservation off, the claim is pure rank-then-age and the
+    /// batch is the only bound on it, so zero is still every class going
+    /// unserved. A minimum of zero here would make
+    /// `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0` the way to configure a
+    /// worker that claims nothing and starts anyway.
+    #[test]
+    fn a_reservation_that_holds_nothing_still_needs_one_row() {
+        assert_eq!(ClaimReservation::none().minimum_batch_size(), 1);
+        assert_eq!(ClaimReservation::waited_on(0).minimum_batch_size(), 1);
+    }
+
+    /// The minimum saturates rather than wrapping.
+    ///
+    /// The share is operator input and is only clamped at `u16::MAX`, so
+    /// the product is reachable from configuration. A wrapped minimum
+    /// would be a small number — i.e. a batch that satisfies a rule it
+    /// cannot satisfy — which is the one direction this check must not
+    /// fail in.
+    #[test]
+    fn an_absurd_share_saturates_rather_than_wrapping() {
+        let absurd = ClaimReservation {
+            bands: vec![PriorityBand {
+                lowest: 0,
+                highest: 100,
+            }],
+            slots_per_band: u16::MAX,
+        };
+        assert_eq!(absurd.minimum_batch_size(), u32::from(u16::MAX) + 1);
+        let saturating = ClaimReservation {
+            bands: vec![
+                PriorityBand {
+                    lowest: 0,
+                    highest: 100,
+                };
+                usize::from(u16::MAX)
+            ],
+            slots_per_band: u16::MAX,
+        };
+        assert!(
+            saturating.minimum_batch_size() > u32::from(u16::MAX),
+            "a minimum that wrapped would read as satisfiable by a small batch"
         );
     }
 

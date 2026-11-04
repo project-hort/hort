@@ -22,6 +22,11 @@ use std::time::Duration;
 // be the half every operator sees.
 use hort_app::retry_backoff::DEFAULT_MAX_ATTEMPTS;
 use hort_domain::policy::DEFAULT_CLASS_SERVICE_THRESHOLD_SECS;
+// The batch/share coherence rule is the claim's own arithmetic, so it is
+// asked of the reservation the claim takes rather than restated here: a
+// literal band count in this file would be a second answer to "which
+// classes get a share", and that number is the domain's.
+use hort_domain::ports::jobs_repository::ClaimReservation;
 use hort_domain::types::task_tier::DEFAULT_RESERVED_SLOTS_PER_CLASS;
 
 // -----------------------------------------------------------------
@@ -219,6 +224,29 @@ pub struct WorkerConfig {
     /// `/var/lib/hort/stateful-upload-staging` for S3.
     pub stateful_upload_staging_dir: PathBuf,
     pub poll_interval: Duration,
+    /// Rows the dispatcher claims per poll across every registered kind.
+    /// Parsed from `HORT_SCANNER_BATCH_SIZE`, **default `4`**.
+    ///
+    /// **Not independent of [`Self::reserved_slots_per_class`]**, and
+    /// the claim is what relates them. `claim_pending_by_kinds` spends
+    /// the batch in three passes: the reservation takes up to
+    /// `reserved_slots_per_class` rows for *each* waited-on band and is
+    /// then capped at the batch as a whole (dropping the lowest class's
+    /// reservation first), then one priority-blind oldest row, then the
+    /// remainder by rank. So a batch of
+    /// `bands × reserved_slots_per_class` is spent before the oldest
+    /// slot gets a row — and that slot is the only guarantee of service
+    /// for the class with no reserved share (ADR 0066 D5). The smallest
+    /// batch that serves every class is therefore
+    /// `bands × reserved_slots_per_class + 1`, which is
+    /// [`ClaimReservation::minimum_batch_size`] and, with the two
+    /// waited-on classes of today and the default share, `3`.
+    ///
+    /// A pair below that minimum **fails worker startup** rather than
+    /// being warned about or quietly raised: the lower batch an operator
+    /// reaches for against lock contention silently removed a class
+    /// from the allocation, and that is the defect the reservation
+    /// exists to remove.
     pub batch_size: u32,
     pub max_attempts: u32,
     /// Slots the dispatcher holds for each non-empty waited-on class at
@@ -235,6 +263,16 @@ pub struct WorkerConfig {
     /// Why it is configuration at all: ADR 0066 declines to fix the
     /// shares, because with a single worker replica the share is the
     /// whole control surface.
+    ///
+    /// **Bounded from above by [`Self::batch_size`]**, which has the
+    /// arithmetic: the claim batch must hold every reserved slot *and*
+    /// one row beyond them for the priority-blind oldest slot, so
+    /// `batch_size` must be at least
+    /// `bands × reserved_slots_per_class + 1`
+    /// ([`ClaimReservation::minimum_batch_size`]). Raising the share
+    /// without raising the batch removes a class from the allocation as
+    /// surely as lowering the batch does, so the same startup refusal
+    /// catches both directions.
     pub reserved_slots_per_class: u16,
     /// How long work of a class may wait with nothing of that class
     /// served before the dispatcher's per-class audit calls the class
@@ -624,6 +662,52 @@ impl WorkerConfig {
             u32::from(DEFAULT_RESERVED_SLOTS_PER_CLASS),
         )?)
         .unwrap_or(u16::MAX);
+        // The two numbers above are not independent, and the claim is
+        // what relates them: the reserved pass can spend
+        // `bands × share` of the batch before the one priority-blind
+        // oldest slot gets a row, and that slot is the only guarantee of
+        // service for the class with no reserved share (ADR 0066 D5).
+        // Below the minimum a class is simply never claimed.
+        //
+        // Refused rather than warned about or quietly raised. A worker
+        // whose batch cannot seat every class has the defect this
+        // reservation exists to remove, and overriding an operator's
+        // number without saying so is the same failure one level up —
+        // the house style here is to reject a value rather than
+        // interpret it (see `HORT_RETENTION_STREAM_MODE` below). The
+        // consequence is deliberate: a deployment running
+        // `HORT_SCANNER_BATCH_SIZE=2` stops starting, which is why the
+        // message carries both values, the arithmetic, the minimum and
+        // both repairs in one line.
+        //
+        // `var` is the batch rather than the share because the batch is
+        // the knob that has to clear the other one, and either repair
+        // ends the refusal — the reason names both.
+        let reservation = ClaimReservation::waited_on(reserved_slots_per_class);
+        let minimum_batch_size = reservation.minimum_batch_size();
+        if batch_size < minimum_batch_size {
+            return Err(ConfigError::InvalidValue {
+                var: "HORT_SCANNER_BATCH_SIZE",
+                reason: format!(
+                    "HORT_SCANNER_BATCH_SIZE={batch_size} cannot serve every work class at \
+                     HORT_SCANNER_RESERVED_SLOTS_PER_CLASS={reserved_slots_per_class}: the claim \
+                     holds {reserved_slots_per_class} {slot} for each of the {bands} waited-on \
+                     classes and needs one row beyond them for the priority-blind oldest slot, \
+                     which is the only guarantee of service for the class with no reserved share \
+                     — so the smallest batch that serves every class is {bands} × \
+                     {reserved_slots_per_class} + 1 = {minimum_batch_size}. Below it a class is \
+                     never claimed at all. Either raise HORT_SCANNER_BATCH_SIZE to at least \
+                     {minimum_batch_size}, or lower HORT_SCANNER_RESERVED_SLOTS_PER_CLASS \
+                     (`0` turns the reservation off entirely)",
+                    bands = reservation.bands.len(),
+                    slot = if reserved_slots_per_class == 1 {
+                        "slot"
+                    } else {
+                        "slots"
+                    },
+                ),
+            });
+        }
         // The per-class service threshold the dispatcher audits
         // against. `hort-server` reads the same variable for the gauge
         // an operator scrapes — see the field doc — and the default
@@ -1372,6 +1456,117 @@ mod tests {
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+    }
+
+    /// A batch too small to seat every class refuses to start, and says
+    /// both numbers, the minimum and the two repairs.
+    ///
+    /// `HORT_SCANNER_BATCH_SIZE=2` is the configuration an operator
+    /// reaches for against lock contention, and it silently removed a
+    /// class from the allocation: the reservation fills both waited-on
+    /// bands and the priority-blind oldest slot — the only guarantee of
+    /// service for the class with no reserved share — never gets one.
+    /// The refusal is the point, so the message is asserted rather than
+    /// merely the variant: an operator whose worker stopped starting
+    /// gets the arithmetic and the fix out of one line.
+    #[test]
+    fn a_batch_too_small_to_serve_every_class_refuses_to_start() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var("HORT_SCANNER_BATCH_SIZE", "2");
+
+        let err = WorkerConfig::from_env()
+            .expect_err("a batch that cannot seat every class must not start");
+        let ConfigError::InvalidValue { var, reason } = &err else {
+            panic!("expected InvalidValue, got {err:?}");
+        };
+        assert_eq!(*var, "HORT_SCANNER_BATCH_SIZE");
+        for fragment in [
+            "HORT_SCANNER_BATCH_SIZE=2",
+            "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=1",
+            "1 slot for each of the 2 waited-on classes",
+            "2 × 1 + 1 = 3",
+            "raise HORT_SCANNER_BATCH_SIZE to at least 3",
+            "lower HORT_SCANNER_RESERVED_SLOTS_PER_CLASS",
+        ] {
+            assert!(
+                reason.contains(fragment),
+                "the refusal must carry {fragment:?} — both values, the minimum and the fix in \
+                 one line: {reason}"
+            );
+        }
+    }
+
+    /// The same refusal from the other direction: raising the share
+    /// without raising the batch removes a class just as surely.
+    ///
+    /// Two slots for each of the two waited-on bands leaves nothing of a
+    /// four-row batch for the oldest slot, so the minimum is five and
+    /// the shipped default batch no longer suffices. The message names
+    /// the share's own variable, because that is the number this
+    /// operator changed.
+    #[test]
+    fn a_share_too_large_for_the_batch_refuses_to_start() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var("HORT_SCANNER_RESERVED_SLOTS_PER_CLASS", "2");
+
+        let err = WorkerConfig::from_env()
+            .expect_err("a share the batch cannot seat must not start either");
+        let ConfigError::InvalidValue { reason, .. } = &err else {
+            panic!("expected InvalidValue, got {err:?}");
+        };
+        for fragment in [
+            "HORT_SCANNER_BATCH_SIZE=4",
+            "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=2",
+            "2 slots for each of the 2 waited-on classes",
+            "2 × 2 + 1 = 5",
+            "raise HORT_SCANNER_BATCH_SIZE to at least 5",
+        ] {
+            assert!(
+                reason.contains(fragment),
+                "the refusal must carry {fragment:?}: {reason}"
+            );
+        }
+    }
+
+    /// The shipped pair starts — and so does every pair at or above the
+    /// minimum.
+    ///
+    /// The counter-assertion to the two refusals: a rule that rejected
+    /// the defaults would stop every deployment, and one that rejected
+    /// the minimum itself would be arithmetic nobody could satisfy. The
+    /// boundary is asserted on both sides, from the same derivation the
+    /// refusal uses, so a change to the band list moves the test with
+    /// the rule rather than against it.
+    #[test]
+    fn the_default_pair_starts_and_so_does_the_minimum() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+
+        let cfg = WorkerConfig::from_env().expect("the shipped default pair must start");
+        let minimum =
+            ClaimReservation::waited_on(DEFAULT_RESERVED_SLOTS_PER_CLASS).minimum_batch_size();
+        assert!(
+            cfg.batch_size >= minimum,
+            "the shipped default batch ({}) must seat the shipped default share ({}), whose \
+             minimum is {minimum}",
+            cfg.batch_size,
+            cfg.reserved_slots_per_class
+        );
+
+        // The boundary itself, from both sides.
+        std::env::set_var("HORT_SCANNER_BATCH_SIZE", minimum.to_string());
+        let at_minimum = WorkerConfig::from_env().expect("the minimum batch must start");
+        assert_eq!(at_minimum.batch_size, minimum);
+        std::env::set_var("HORT_SCANNER_BATCH_SIZE", (minimum - 1).to_string());
+        WorkerConfig::from_env().expect_err("one below the minimum must not start");
     }
 
     #[test]

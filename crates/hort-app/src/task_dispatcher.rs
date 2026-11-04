@@ -691,7 +691,18 @@ impl TaskDispatcher {
                     // reads the row as queued-for-capacity from here
                     // on — see `end_capacity_wait` for what the write
                     // is for and what a failed one costs.
-                    dispatcher_clone.end_capacity_wait(&job).await;
+                    //
+                    // It is also the last word on whether this worker
+                    // still holds the row: the write is fenced on
+                    // `locked_by` + `status`, so a refusal is the fence
+                    // answering, and a row handed on while this worker
+                    // waited for its permit must not be run here. The
+                    // renewal stops with the guard; nothing else of
+                    // this row's is ours to write.
+                    if !dispatcher_clone.end_capacity_wait(&job).await {
+                        drop(renewal);
+                        return;
+                    }
                     dispatcher_clone.dispatch_one(job, handler, renewal).await;
                 });
             }
@@ -893,7 +904,8 @@ impl TaskDispatcher {
     }
 
     /// Record that `job` is no longer waiting for capacity: its run
-    /// permit has been granted and its handler is next.
+    /// permit has been granted and its handler is next. Answers whether
+    /// this worker may still run the row.
     ///
     /// The other half of the claim's `capacity_waiting_since` write.
     /// Between the two, the row is the thing `locked_until` stopped
@@ -907,32 +919,60 @@ impl TaskDispatcher {
     /// passes through — the same totality argument
     /// [`Self::spawn_lease_renewal`] makes about its own start point.
     ///
-    /// Nothing here is fatal, and the direction of each failure is
-    /// deliberate:
+    /// # The two failures are not the same statement, and only one of
+    /// them is about ownership
     ///
-    /// - `Ok(false)` is the fence refusing: the row is no longer this
-    ///   worker's, so the successor's `capacity_waiting_since` must not
-    ///   be cleared by us. The renewal guard's `lost` flag is what the
-    ///   dispatcher acts on for that row, so this is a `debug!`.
-    /// - `Err` leaves the row reading as queued-for-capacity while its
-    ///   handler runs, so its class over-reports one waiter until the
-    ///   outcome write moves the row out of `running` — bounded by the
-    ///   handler's own runtime, and loud rather than silent, which is
-    ///   the direction ADR 0066 asks for.
-    async fn end_capacity_wait(&self, job: &JobRow) {
+    /// - **`Ok(false)` is the fence refusing**, and
+    ///   `JobsRepository::clear_capacity_wait` fences on
+    ///   `locked_by = worker_id AND status = 'running'` — so the answer
+    ///   is "this row is not yours any more", from the same predicate
+    ///   the lease renewal uses. This returns `false` and the caller
+    ///   does not dispatch: running the handler here would be a second
+    ///   concurrent execution of a row whose holder is already running
+    ///   it. The result write is fenced on `attempts`, so the row's
+    ///   *state* would survive that — but the work would double, a
+    ///   second scan would occupy scanner capacity, and both runs could
+    ///   append to the same stream.
+    ///
+    ///   This is not work dropped on the floor: the other worker holds
+    ///   the row. In the one shape where nobody does — the sweep
+    ///   requeued it and no sibling has re-claimed it — the row is
+    ///   `pending` and the next poll takes it, one poll interval later.
+    ///
+    ///   The renewal guard is **not** what covers this. Its `lost` flag
+    ///   gates the *outcome write* and nothing else:
+    ///   [`Self::stop_renewing_and_check_fence`] is read after
+    ///   `handler.run` has returned on the normal path, and on the
+    ///   refusal path the handler was never called — so on no path does
+    ///   it prevent an execution. A check whose answer arrives after
+    ///   the work is done cannot be the reason not to do the work.
+    ///
+    /// - **`Err` is the absence of an answer** and says nothing about
+    ///   ownership, so the row keeps running. It leaves the row reading
+    ///   as queued-for-capacity while its handler runs, so its class
+    ///   over-reports one waiter until the outcome write moves the row
+    ///   out of `running` — bounded by the handler's own runtime, and
+    ///   loud rather than silent, which is the direction ADR 0066 asks
+    ///   for. Declining the dispatch on a database flap would trade a
+    ///   metric for a stall.
+    async fn end_capacity_wait(&self, job: &JobRow) -> bool {
         match self
             .job_repo
             .clear_capacity_wait(job.id, &self.worker_id)
             .await
         {
-            Ok(true) => {}
+            Ok(true) => true,
             Ok(false) => {
-                tracing::debug!(
+                tracing::warn!(
                     job_id = %job.id,
                     kind = %job.kind,
-                    "TaskDispatcher: the capacity-wait clear found the row is no longer ours; \
-                     leaving it to whoever holds it now",
+                    "TaskDispatcher: the capacity-wait clear found the row is no longer ours — \
+                     it was closed out or an abandoned-lease sweep handed it on while this \
+                     worker waited for a run permit. Declining the dispatch and leaving the row \
+                     to whoever holds it now; running it would be a second concurrent execution \
+                     of work already in flight",
                 );
+                false
             }
             Err(e) => {
                 tracing::warn!(
@@ -941,8 +981,10 @@ impl TaskDispatcher {
                     kind = %job.kind,
                     "TaskDispatcher: could not clear the row's capacity wait; its class will \
                      report one more row waiting for capacity than it has until the outcome \
-                     write lands",
+                     write lands. Running the row anyway — a database that did not answer is no \
+                     statement about who holds it",
                 );
+                true
             }
         }
     }
@@ -5515,52 +5557,118 @@ mod tests {
         );
     }
 
-    /// Neither failure of the capacity-wait clear stops the row from
-    /// running.
+    /// A **fenced** capacity-wait clear declines the dispatch: no
+    /// handler runs and nothing is written.
     ///
-    /// `Ok(false)` is the fence refusing — the row is no longer this
-    /// worker's, and the renewal guard's `lost` flag is what the
-    /// dispatcher acts on for that row. `Err` is a database that did not
-    /// answer, which leaves the row reading as queued-for-capacity until
-    /// the outcome write moves it out of `running`. Both are a worse
-    /// *metric* for one handler's runtime and neither is a reason to
-    /// drop work on the floor, so the assertion that matters is that the
-    /// row still completes.
+    /// `clear_capacity_wait` fences on `locked_by = worker_id AND
+    /// status = 'running'`, so `Ok(false)` is that fence answering "this
+    /// row is not yours" — from the same predicate the lease renewal
+    /// uses, at the last point before the handler. Running it anyway is
+    /// a second concurrent execution of a row its holder is already
+    /// running: the result write is fenced on `attempts` so the row's
+    /// state survives, but the work doubles, a second scan occupies
+    /// scanner capacity, and both runs can append to the same stream.
+    ///
+    /// The renewal guard does **not** cover this, which is why this test
+    /// is about the dispatch and not about the write:
+    /// `stop_renewing_and_check_fence` is read after `handler.run` has
+    /// returned on the normal path and in place of it on the refusal
+    /// path, so on no path does it stop an execution — it only discards
+    /// a result the work has already produced.
+    ///
+    /// Nor is this work dropped on the floor, which is what the absent
+    /// `reschedule` below asserts: the other worker holds the row, and
+    /// returning it to `pending` from here would be this worker writing
+    /// to a row it has just been told is not its own. In the one shape
+    /// where nobody holds it — the sweep requeued it and no sibling
+    /// re-claimed it — the row is already `pending` and the next poll
+    /// takes it.
     #[tokio::test]
-    async fn a_failed_capacity_wait_clear_does_not_stop_the_row() {
-        for answer in [Some(false), None] {
-            let repo = Arc::new(DispatcherMockRepo::new());
-            let row = make_job_row("noop");
-            let job_id = row.id;
-            repo.seed_batch(vec![row]);
-            repo.set_capacity_wait_answer(answer);
-            let run_count = Arc::new(AtomicUsize::new(0));
-            let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
-            dispatcher.register(Arc::new(NoopHandler::new("noop", run_count.clone())), 1);
-            dispatcher.poll_interval_secs = 0;
+    async fn a_fenced_capacity_wait_clear_declines_the_dispatch() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let row = make_job_row("noop");
+        repo.seed_batch(vec![row]);
+        repo.set_capacity_wait_answer(Some(false));
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher.register(Arc::new(NoopHandler::new("noop", run_count.clone())), 1);
+        dispatcher.poll_interval_secs = 0;
 
-            let cancel = CancellationToken::new();
-            let cancel_clone = cancel.clone();
-            let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            cancel.cancel();
-            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 
-            assert_eq!(
-                repo.capacity_wait_clears().len(),
-                1,
-                "the clear is attempted exactly once per granted row (answer = {answer:?})"
-            );
-            assert!(
-                run_count.load(Ordering::SeqCst) >= 1,
-                "the handler must still run (answer = {answer:?})"
-            );
-            assert_eq!(
-                repo.mark_completed_calls(),
-                vec![job_id],
-                "and the row must still be closed out (answer = {answer:?})"
-            );
-        }
+        assert_eq!(
+            repo.capacity_wait_clears().len(),
+            1,
+            "the clear is attempted exactly once per granted row — it is the check, so it still \
+             runs"
+        );
+        assert_eq!(
+            run_count.load(Ordering::SeqCst),
+            0,
+            "no handler may run after the fence said the row is not ours"
+        );
+        assert!(
+            repo.mark_completed_calls().is_empty()
+                && repo.mark_failed_calls().is_empty()
+                && repo.reschedule_calls().is_empty(),
+            "and nothing of the row's is written — not the outcome, and not a return to \
+             `pending`, which would be a write to a row this worker was just told it does not \
+             hold: completed={:?} failed={:?} rescheduled={:?}",
+            repo.mark_completed_calls(),
+            repo.mark_failed_calls(),
+            repo.reschedule_calls(),
+        );
+    }
+
+    /// A capacity-wait clear that could not be *made* still runs the
+    /// row.
+    ///
+    /// The counterpart of the test above, and the distinction is the
+    /// whole point: `Err` is the absence of an answer, not a statement
+    /// about ownership, so declining here would trade a metric for a
+    /// stall. The row keeps a non-NULL `capacity_waiting_since` while
+    /// its handler runs, so its class over-reports one waiter until the
+    /// outcome write lands — bounded by the handler's own runtime, and
+    /// the direction ADR 0066 asks to err in.
+    #[tokio::test]
+    async fn a_capacity_wait_clear_that_did_not_answer_still_runs_the_row() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let row = make_job_row("noop");
+        let job_id = row.id;
+        repo.seed_batch(vec![row]);
+        repo.set_capacity_wait_answer(None);
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher.register(Arc::new(NoopHandler::new("noop", run_count.clone())), 1);
+        dispatcher.poll_interval_secs = 0;
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        assert_eq!(
+            repo.capacity_wait_clears().len(),
+            1,
+            "the clear is attempted exactly once per granted row"
+        );
+        assert!(
+            run_count.load(Ordering::SeqCst) >= 1,
+            "a database that did not answer is no statement about who holds the row, so the \
+             handler must still run"
+        );
+        assert_eq!(
+            repo.mark_completed_calls(),
+            vec![job_id],
+            "and the row must still be closed out"
+        );
     }
 
     // -----------------------------------------------------------------------
