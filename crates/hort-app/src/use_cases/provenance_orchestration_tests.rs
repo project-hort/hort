@@ -614,6 +614,57 @@ async fn verify_if_present_verified_signature_records_but_does_not_change_status
     ));
 }
 
+/// The verdict append refuses the event that would cross the cap, and the
+/// run surfaces that rather than freezing the artifact.
+///
+/// A `provenance-verify` is re-enqueued every time a signature referrer
+/// arrives for this subject and again by the window-expiry backstop, so
+/// an artifact held under `Required` accrues one verdict event per run for
+/// as long as it stays unsigned — the plainest repeatable writer on the
+/// provenance axis. The fixture is the one above, which commits exactly
+/// one `ProvenanceVerified`, with the stream filled to the cap.
+#[tokio::test]
+async fn a_verdict_is_refused_before_it_crosses_the_event_cap() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::verified(
+            sample_identity(),
+            Some("https://slsa.dev/provenance/v1".into()),
+        ),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::VerifyIfPresent),
+        vec![sample_pattern()],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_bundle(&f, b"valid-bundle-bytes");
+
+    let stream_id = StreamId::artifact(f.artifact_id);
+    let full: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP)
+        .map(|position| dummy_persisted_event(&stream_id, f.artifact_id, position))
+        .collect();
+    f.events.set_stream(&stream_id, full);
+
+    let err =
+        f.uc.verify_artifact(f.artifact_id)
+            .await
+            .expect_err("the verdict has nowhere to land");
+    assert!(
+        err.to_string()
+            .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)),
+        "the refusal must name the cap it is enforcing; got {err}"
+    );
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "no verdict is committed once the refusal fires"
+    );
+    assert_eq!(
+        f.events.stream_snapshot(&stream_id).len() as u64,
+        crate::use_cases::STREAM_EVENT_CAP,
+        "and the stream is left exactly on the cap"
+    );
+}
+
 // ===========================================================================
 // A bundle-fetch failure, once per mode.
 //

@@ -7,9 +7,11 @@
 //! `cas_reads_are_verified.rs` (a storage adapter whose `StoragePort::get`
 //! hands back an unverified stream),
 //! `condemning_rule_is_single_sourced.rs` (a second reader of a finding's
-//! component relation re-deriving the release-authority rule), and the
-//! two that read SQL out of string literals via [`mark_literals`]
-//! (`findings_reads_are_last_scan_scoped.rs`,
+//! component relation re-deriving the release-authority rule), the two
+//! halves of the artifact-stream event cap (`capped_stream_reads.rs` for
+//! a bounded read, `capped_stream_writes.rs` for an append that would
+//! cross the bound), and the two that read SQL out of string literals via
+//! [`mark_literals`] (`findings_reads_are_last_scan_scoped.rs`,
 //! `live_reads_exclude_deleted.rs`). All of them
 //! need the identical lexical
 //! discipline, and a second verbatim copy of it would be the exact
@@ -349,6 +351,64 @@ pub fn mark_literals(source: &str) -> (String, Vec<(usize, usize)>) {
     )
 }
 
+/// Split a call's argument text on top-level commas (ignoring commas
+/// nested in parens, brackets or angle brackets).
+///
+/// Lives here rather than in one guard because two of them now ask "which
+/// argument is this?" of a call they matched by name — `capped_stream_reads`
+/// about a `read_stream` budget, `capped_stream_writes` about which
+/// `AppendEvents` an append was handed — and a second verbatim copy is the
+/// duplication this module exists to avoid.
+pub fn split_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for ch in args.chars() {
+        match ch {
+            '(' | '[' | '<' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' | ']' | '>' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                out.push(current.trim().to_owned());
+                current = String::new();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current.trim().to_owned());
+    }
+    out
+}
+
+/// The argument text of the call whose opening paren is at `open`, or
+/// `None` when the parens do not balance inside the retained region.
+///
+/// Only sound on text [`blank_noncode`] has already been through: a paren
+/// inside a string literal or a doc comment is not a delimiter.
+pub fn call_args(text: &str, open: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[open + 1..i].to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The offset of the `}` closing the block whose `{` sits at `open`, or
 /// `None` when the braces do not balance before the end of the input.
 ///
@@ -388,6 +448,14 @@ pub struct FnItem {
     /// The item's body, braces included. Empty for a bodiless
     /// declaration (a trait method signature).
     pub body: String,
+    /// `(offset of the `fn` keyword, offset just past the body)` in the
+    /// text that was parsed. Both passes of [`production_region`]
+    /// preserve byte offsets, so this span also addresses the ORIGINAL
+    /// source — which is what a guard needs when the thing it must read
+    /// at a function is in a comment, and comments are blanked by the
+    /// time the structure is parseable. A bodiless declaration spans
+    /// nothing (`end == start`), so it contains no call site.
+    pub span: (usize, usize),
 }
 
 /// Match the opener that the `close` byte at `at` belongs to, returning
@@ -529,11 +597,19 @@ pub fn parse_fns(blanked: &str) -> Vec<FnItem> {
             .filter(|b| **b == b'\n')
             .count();
         counted_to = fn_at;
+        let span_end = if body.is_empty() {
+            fn_at
+        } else {
+            // `j` sits on the body's `{`; the body string runs to the
+            // matching `}` inclusive.
+            j + body.len()
+        };
         items.push(FnItem {
             name,
             line,
             attrs: preceding_attrs(blanked, fn_at),
             body,
+            span: (fn_at, span_end),
         });
         i = fn_at + 2;
     }

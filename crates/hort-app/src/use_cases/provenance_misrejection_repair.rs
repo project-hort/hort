@@ -154,7 +154,7 @@ use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::release_clearance::provenance_clearance_from;
-use crate::use_cases::{ArtifactAtVersion, OverCapStream};
+use crate::use_cases::{refuse_append_past_cap, ArtifactAtVersion, OverCapStream};
 
 /// Hard cap on how many `Rejected` rows one call examines. Mirrors the
 /// curation queue's own `MAX_QUEUE_LIMIT`, which is the listing this
@@ -447,6 +447,12 @@ impl ProvenanceMisrejectionRepairUseCase {
 
         let stream_id = paired.stream_id().clone();
         let expected_version = paired.expected_version();
+        // `ArtifactReEvaluated` plus the `ArtifactQuarantined` companion
+        // — two events. Repeatable: the repair returns the artifact to
+        // `Quarantined`, from where the illegal state it corrects is
+        // reachable again, and the admin verb driving it has no
+        // per-artifact bound.
+        refuse_append_past_cap(&stream_id, paired.stream_len(), 2)?;
         let previous_status = paired.artifact().quarantine_status;
         let quarantined = paired
             .artifact_mut()

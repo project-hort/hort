@@ -598,10 +598,28 @@ async fn emit_mismatch_event(
         category: StreamCategory::Artifact,
         entity_id: uuid_from_content_hash(content_hash),
     };
-    // We don't read-before-write here: the mismatch is an audit fact;
-    // concurrent appends from other sources would race, but
-    // `ExpectedVersion::Any` accepts any current position — there is
-    // no invariant we need to enforce across scrub-generated events.
+    // The append stays `ExpectedVersion::Any`: the mismatch is an audit
+    // fact and there is no invariant to enforce across scrub-generated
+    // events, so a concurrent appender's position is not this writer's
+    // business.
+    //
+    // What `Any` does not give is any bound — the adapter version-checks
+    // nothing on it — and this stream is the one `StreamCategory::
+    // Artifact` stream *designed* to accrete: repeat scrubs of a blob
+    // that stays tampered append to it on every pass (that is the point
+    // of deriving the entity id from the content hash). Past the cap the
+    // eventstore-retention sweep's terminal-proof read refuses the
+    // stream, so it can then neither be appended to usefully nor be
+    // sealed, and it grows for as long as the blob stays tampered. So the
+    // length is read and the refusal taken before the append.
+    //
+    // The read and the append are not atomic, and do not need to be: a
+    // concurrent mismatch landing in between puts the stream one event
+    // over the cap, and the next pass refuses.
+    let stream_len = crate::use_cases::read_artifact_stream(events, &stream_id)
+        .await?
+        .len() as u64;
+    crate::use_cases::refuse_append_past_cap(&stream_id, stream_len, 1)?;
     events
         .append(AppendEvents {
             stream_id,
@@ -697,6 +715,15 @@ async fn try_tombstone_artifact(
     };
 
     let stream_id = StreamId::artifact(artifact.id);
+    // ONCE-ONLY-APPEND: the corruption tombstone is the artifact's
+    // terminal pair. `tombstone_from_corruption` refuses every
+    // already-rejected source state, which is the branch above that
+    // returns `Ok(())` without appending, so a second scrub pass over the
+    // same blob reaches here and writes nothing. The events it does write
+    // are the last the stream ever takes — a tombstoned artifact is never
+    // released, re-scanned or promoted again — and they record
+    // destruction that has already happened to the bytes, so refusing
+    // them at the cap would suppress the only record of it.
     lifecycle
         .commit_transition(
             &artifact,
@@ -767,7 +794,7 @@ mod tests {
         MockStoragePort,
     };
     use hort_domain::entities::artifact::QuarantineStatus;
-    use hort_domain::events::RejectionReason;
+    use hort_domain::events::{PersistedEvent, RejectionReason};
 
     const HELLO_WORLD_SHA256: &str =
         "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
@@ -888,6 +915,111 @@ mod tests {
             }
             other => panic!("expected CasIntegrityMismatch, got {other:?}"),
         }
+    }
+
+    /// `len` prior `CasIntegrityMismatch` events on the per-hash stream —
+    /// the shape a blob that has stayed tampered across `len` scrub passes
+    /// leaves behind.
+    fn mismatch_history(
+        stream_id: &StreamId,
+        content_hash: &ContentHash,
+        len: u64,
+    ) -> Vec<PersistedEvent> {
+        (0..len)
+            .map(|position| PersistedEvent {
+                event_id: Uuid::new_v4(),
+                stream_id: stream_id.clone(),
+                stream_position: position,
+                global_position: position + 1,
+                event: DomainEvent::CasIntegrityMismatch(CasIntegrityMismatch {
+                    content_hash: content_hash.clone(),
+                    backend: "filesystem".to_string(),
+                    observed_hash: hash(EMPTY_SHA256),
+                }),
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: system_actor(),
+                event_version: 1,
+                stored_at: Utc::now(),
+            })
+            .collect()
+    }
+
+    /// The synthetic stream the scrub derives from a content hash.
+    fn mismatch_stream_for(content_hash: &ContentHash) -> StreamId {
+        StreamId {
+            category: StreamCategory::Artifact,
+            entity_id: uuid_from_content_hash(content_hash),
+        }
+    }
+
+    /// The per-hash mismatch stream is the one `StreamCategory::Artifact`
+    /// stream designed to accrete — one event per scrub pass over a blob
+    /// that stays tampered — so it is the repeatable `ExpectedVersion::
+    /// Any` writer the cap's write side has to bound. Once it reaches the
+    /// cap the event is withheld; the mismatch itself is still counted,
+    /// logged and metered, because the scrub's verdict was never the
+    /// event's to give.
+    #[tokio::test]
+    async fn the_mismatch_event_is_withheld_once_its_stream_reaches_the_cap() {
+        let (uc, storage, events) = make_case();
+        let tampered_hash = hash(HELLO_WORLD_SHA256);
+        storage.inject_tampered(tampered_hash.clone(), Vec::new());
+
+        let stream_id = mismatch_stream_for(&tampered_hash);
+        events.set_stream(
+            &stream_id,
+            mismatch_history(
+                &stream_id,
+                &tampered_hash,
+                crate::use_cases::STREAM_EVENT_CAP,
+            ),
+        );
+
+        let report = uc.run(opts_sequential()).await.unwrap();
+
+        assert_eq!(
+            report.mismatches, 1,
+            "the scrub still reports the mismatch — the refusal withholds the audit \
+             event, not the verdict"
+        );
+        assert!(
+            events.appended_batches().is_empty(),
+            "nothing is appended once the stream has no room"
+        );
+        assert_eq!(
+            events.stream_snapshot(&stream_id).len() as u64,
+            crate::use_cases::STREAM_EVENT_CAP,
+            "and the stream is left exactly on the cap"
+        );
+    }
+
+    /// One short of the cap there is room, so the same fixture records the
+    /// mismatch event as it always did.
+    #[tokio::test]
+    async fn the_mismatch_event_still_lands_one_short_of_the_cap() {
+        let (uc, storage, events) = make_case();
+        let tampered_hash = hash(HELLO_WORLD_SHA256);
+        storage.inject_tampered(tampered_hash.clone(), Vec::new());
+
+        let stream_id = mismatch_stream_for(&tampered_hash);
+        events.set_stream(
+            &stream_id,
+            mismatch_history(
+                &stream_id,
+                &tampered_hash,
+                crate::use_cases::STREAM_EVENT_CAP - 1,
+            ),
+        );
+
+        uc.run(opts_sequential()).await.unwrap();
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 1);
+        assert!(matches!(
+            batches[0].events[0].event,
+            DomainEvent::CasIntegrityMismatch(_)
+        ));
     }
 
     /// Corruption behind a `StoragePort` that does **not** verify on read

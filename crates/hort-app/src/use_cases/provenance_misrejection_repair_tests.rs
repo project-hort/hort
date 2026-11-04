@@ -960,6 +960,51 @@ async fn a_candidate_whose_stream_breached_the_event_cap_is_reported_as_failed()
     );
 }
 
+/// The repair's append is a PAIR — `ArtifactReEvaluated` plus the
+/// `ArtifactQuarantined` that returns the artifact to the ordinary sweep
+/// — so a stream one short of the cap has room for neither. The candidate
+/// is reported as failed rather than repaired, and nothing is committed.
+///
+/// Distinct from the over-cap test above, which is about a prefix the read
+/// cannot prove it finished. This one is about a stream the read saw
+/// entirely and that has no room left, which is the case the version check
+/// the append carries would have let through.
+#[tokio::test]
+async fn a_candidate_with_no_room_for_the_repair_pair_is_reported_as_failed() {
+    let f = build();
+    let (artifact, entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
+        let mut stream = vec![
+            quarantined(id, 0, anchor),
+            persisted_scan_completed(id, 0, 1),
+            verified(id, 2),
+        ];
+        // Filler up to one short of the cap, placed AFTER the three
+        // events the conjuncts read so every reverse scan still answers
+        // the same way.
+        stream.extend((3..STREAM_EVENT_CAP - 1).map(|i| quarantined(id, i, anchor)));
+        assert_eq!(stream.len() as u64, STREAM_EVENT_CAP - 1);
+        stream
+    });
+    f.queue.set_entries(vec![entry]);
+
+    let report = f.uc.run(repair_request(false), api_actor()).await.unwrap();
+
+    assert!(report.affected.is_empty());
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].0, artifact.id);
+    assert!(
+        report.failed[0]
+            .1
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")),
+        "the failure must name the cap it is enforcing; got {}",
+        report.failed[0].1
+    );
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "neither half of the repair pair lands"
+    );
+}
+
 /// Conjuncts 2 and 3 are decided from **one** observation of the stream,
 /// not two reads of it.
 ///

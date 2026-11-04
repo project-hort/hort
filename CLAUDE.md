@@ -597,9 +597,33 @@ from 2026-08-24 until the guard landed — a deleted artifact sat in the
 curator's worklist and spent rescan batch capacity. Carries a census counter-assertion per file, strips the
 predicate out of each corrected statement to prove the classifier can still
 fail, and asserts the column still exists; blind spots are a statement
-assembled from fragments or a predicate spelled around the column), and
+assembled from fragments or a predicate spelled around the column),
 `findings_reads_are_last_scan_scoped` (pins that a findings read is scoped to
-the artifact's last scan rather than every scan it ever had) are pure
+the artifact's last scan rather than every scan it ever had), and
+`capped_stream_writes` (ADR 0007's write side, the counterpart to
+`capped_stream_reads` — every production append to an artifact stream either
+calls the single cap predicate `refuse_append_past_cap` **in the function that
+appends**, or declares at the site why it cannot accumulate with an
+`ONCE-ONLY-APPEND: <reason>` comment. Repeatable is the whole criterion: a
+once-per-artifact writer cannot reach the cap, a sweep tick / rescan / API verb
+with no idempotency of its own can, and past the cap every capped reader
+refuses the stream, so the artifact can never be released, re-scanned or
+re-evaluated again and no operator instrument shortens a stream. The adapter's
+version check is not a bound — an `ExpectedVersion::Exact` writer paired
+exactly at the cap crosses it and succeeds, an `ExpectedVersion::Any` append is
+not version-checked at all — and convention held the rule at two of the thirty
+sites the census found. The corpus is **derived, not listed**: every method
+declared on `ArtifactLifecyclePort` is an artifact-stream append by
+`require_paired_artifact_stream`, and every other `AppendEvents`-taking entry
+point is classified from the batch literal the appending function built, so a
+call handed a batch it did not build is forwarding and out of scope. **No
+allow-list.** Three counter-assertions — a per-file census, the refusal's
+definition plus its call-site census (which is what pins
+`retention_use_case::append_expired`, whose `StreamId` arrives as a parameter
+the classifier cannot follow), and a mutation check that strips the refusal and
+the declaration out of real on-disk source and watches the scan go red. Blind
+spots: a macro-assembled call, a `stream_id` built from fragments, and a
+refusal delegated to a helper, which reads as a violation on purpose) are pure
 source-/fixture-scan guards — no database, sub-second — enforcing structural invariants that a
 rename or a stray `use` silently breaks. (A stale keyspace registry once shipped
 undetected because the gate then ran only `--lib`.) Because `cargo test --workspace`
