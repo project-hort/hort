@@ -1428,7 +1428,8 @@ mod tests {
         // the membership pins below would read an empty index and an armed
         // insert failure could not abort the ingest.
         let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone()).with_content_references(refs.clone()),
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+                .with_content_references(refs.clone()),
         );
         let storage = Arc::new(MockStoragePort::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());

@@ -358,10 +358,9 @@ fn build_inner(
     // commits with its transition actually reach it — the mock's stand-in for
     // the Postgres adapter writing them in the same transaction.
     let lifecycle = Arc::new(
-        MockArtifactLifecycle::new(artifacts.clone())
+        MockArtifactLifecycle::new(artifacts.clone(), events.clone())
             .with_content_references(content_references.clone())
-            .with_commit_visible_events(events.clone())
-            .with_optimistic_concurrency(events.clone()),
+            .with_optimistic_concurrency(),
     );
     let upstream_proxy = Arc::new(MockUpstreamProxy::new());
     let upstream_resolver = Arc::new(MockUpstreamResolver::new());
@@ -1081,7 +1080,10 @@ async fn timer_release_is_granted_over(f: &Fixture, stream: Vec<PersistedEvent>)
     let quarantine_uc = QuarantineUseCase::new(
         f.artifacts.clone(),
         crate::event_store_publisher::wrap_for_test(f.events.clone()),
-        Arc::new(MockArtifactLifecycle::new(f.artifacts.clone())),
+        Arc::new(MockArtifactLifecycle::new(
+            f.artifacts.clone(),
+            f.events.clone(),
+        )),
         f.repositories.clone(),
         f.projections.clone(),
         f.content_references.clone(),
@@ -2327,7 +2329,7 @@ async fn verify_artifact_interleaved_with_concurrent_reject_does_not_resurrect_a
     // commits with its transition actually reach it — the mock's stand-in for
     // the Postgres adapter writing them in the same transaction.
     let lifecycle = Arc::new(
-        MockArtifactLifecycle::new(artifacts.clone())
+        MockArtifactLifecycle::new(artifacts.clone(), events.clone())
             .with_content_references(content_references.clone()),
     );
     let upstream_proxy = Arc::new(MockUpstreamProxy::new());
@@ -2467,7 +2469,10 @@ async fn verify_artifact_interleaved_with_concurrent_reject_does_not_resurrect_a
     let quarantine_uc = QuarantineUseCase::new(
         artifacts.clone(),
         crate::event_store_publisher::wrap_for_test(events.clone()),
-        Arc::new(MockArtifactLifecycle::new(artifacts.clone())),
+        Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        )),
         quarantine_repositories,
         projections,
         Arc::new(MockContentReferenceIndex::new()),

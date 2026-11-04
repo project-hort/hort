@@ -2586,8 +2586,8 @@ mod tests {
         let events = Arc::new(MockEventStore::new());
         let scan_findings = Arc::new(MockScanFindingsRepository::new());
         let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_scan_result_paired_mocks(events.clone(), scan_findings.clone()),
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+                .with_scan_findings_repo(scan_findings.clone()),
         );
         let repositories = Arc::new(MockRepositoryRepository::new());
         let projections = Arc::new(MockPolicyProjectionRepository::new());
@@ -2670,8 +2670,8 @@ mod tests {
         let events = Arc::new(MockEventStore::new());
         let scan_findings = Arc::new(MockScanFindingsRepository::new());
         let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_scan_result_paired_mocks(events.clone(), scan_findings.clone()),
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+                .with_scan_findings_repo(scan_findings.clone()),
         );
         let repositories = Arc::new(MockRepositoryRepository::new());
         let projections = Arc::new(MockPolicyProjectionRepository::new());
@@ -3255,7 +3255,16 @@ mod tests {
                 low: 0,
                 negligible: 0,
             },
-            findings_blob: None,
+            // A findings blob because the count is non-zero:
+            // `ScanCompleted::validate` requires the pair, so without it
+            // this is an event no scan path can produce and the commit
+            // would be refused before it ever reached the conditional
+            // status write this test is about.
+            findings_blob: Some(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .parse()
+                    .expect("static valid SHA-256 hex"),
+            ),
             assessment: ScanAssessment::Analysed,
         });
         let err = lifecycle
@@ -4017,7 +4026,6 @@ mod tests {
         .unwrap();
         let first = lifecycle.committed_transitions()[0].1.clone();
         assert_eq!(first.events.len(), 2);
-        events.fold_batch_into_stream(&first).unwrap();
         let before = events.stream_snapshot(&stream_id).len();
 
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -4076,7 +4084,6 @@ mod tests {
         .await
         .unwrap();
         let first = lifecycle.committed_transitions()[0].1.clone();
-        events.fold_batch_into_stream(&first).unwrap();
         assert_eq!(events.stream_snapshot(&stream_id).len(), 2);
         let DomainEvent::PolicyEvaluated(previous) = &first.events[1].event else {
             panic!("first scan must carry its policy verdict");
@@ -4112,7 +4119,6 @@ mod tests {
             second.events[2].event,
             DomainEvent::ArtifactRejected(_)
         ));
-        events.fold_batch_into_stream(&second).unwrap();
         assert_eq!(events.stream_snapshot(&stream_id).len(), 5);
     }
 
@@ -4140,8 +4146,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let first = lifecycle.committed_transitions()[0].1.clone();
-        events.fold_batch_into_stream(&first).unwrap();
 
         policy.archived = true;
         projections.insert(policy.clone());
@@ -4173,7 +4177,6 @@ mod tests {
         assert_eq!(verdict.policy_id, replacement_id);
         assert_eq!(verdict.result, PolicyResult::Pass);
         assert!(verdict.violations.is_empty());
-        events.fold_batch_into_stream(&second).unwrap();
         assert_eq!(events.stream_snapshot(&stream_id).len(), 4);
     }
 
@@ -4212,7 +4215,6 @@ mod tests {
             panic!("first scan must carry its policy verdict");
         };
         assert_eq!(previous.result, PolicyResult::Fail);
-        events.fold_batch_into_stream(&first).unwrap();
 
         policy.severity_threshold = SeverityThreshold::High;
         projections.insert(policy);
@@ -4239,7 +4241,6 @@ mod tests {
         assert_eq!(verdict.result, PolicyResult::Fail);
         assert_eq!(verdict.policy_id, previous.policy_id);
         assert_ne!(verdict.violations, previous.violations);
-        events.fold_batch_into_stream(&second).unwrap();
         assert_eq!(events.stream_snapshot(&stream_id).len(), 5);
     }
 
@@ -4275,7 +4276,6 @@ mod tests {
         .await
         .unwrap();
         let first = lifecycle.committed_transitions()[0].1.clone();
-        events.fold_batch_into_stream(&first).unwrap();
         let before = events.stream_snapshot(&stream_id).len();
         findings[0].vulnerability_id = "CVE-DIFFERENT".into();
 
@@ -4419,8 +4419,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let first = lifecycle.committed_transitions()[0].1.clone();
-        events.fold_batch_into_stream(&first).unwrap();
         let before = events.stream_snapshot(&stream_id).len();
 
         uc.record_scan_result(

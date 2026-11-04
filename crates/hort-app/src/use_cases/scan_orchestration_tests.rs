@@ -699,8 +699,8 @@ fn make_uc_with_upstream(
     let events = Arc::new(MockEventStore::new());
     let scan_findings_repo = Arc::new(MockScanFindingsRepository::new());
     let lifecycle = Arc::new(
-        MockArtifactLifecycle::new(artifacts.clone())
-            .with_scan_result_paired_mocks(events.clone(), scan_findings_repo.clone()),
+        MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+            .with_scan_findings_repo(scan_findings_repo.clone()),
     );
     let repositories = Arc::new(MockRepositoryRepository::new());
     let content_refs = Arc::new(MockContentReferenceIndex::new());
@@ -2379,8 +2379,8 @@ fn make_uc_with_lifecycle(
     let events = Arc::new(MockEventStore::new());
     let scan_findings_repo = Arc::new(MockScanFindingsRepository::new());
     let lifecycle = Arc::new(
-        MockArtifactLifecycle::new(artifacts.clone())
-            .with_scan_result_paired_mocks(events.clone(), scan_findings_repo.clone()),
+        MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+            .with_scan_findings_repo(scan_findings_repo.clone()),
     );
     let _ = scan_findings_repo;
     let repositories = Arc::new(MockRepositoryRepository::new());
@@ -4749,8 +4749,8 @@ mod metrics_emission_tests {
     ) -> ScanOrchestrationUseCase {
         let scan_findings_repo = Arc::new(MockScanFindingsRepository::new());
         let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_scan_result_paired_mocks(events.clone(), scan_findings_repo.clone()),
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+                .with_scan_findings_repo(scan_findings_repo.clone()),
         );
         let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
         policy_projections.insert(seed_global_policy(vec!["trivy".into()]));

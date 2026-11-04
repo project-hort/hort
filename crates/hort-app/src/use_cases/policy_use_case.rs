@@ -3000,7 +3000,7 @@ mod tests {
         }
     }
 
-    impl crate::use_cases::test_support::StreamTail for MockEventStore {
+    impl crate::use_cases::test_support::PairedEventStore for MockEventStore {
         fn current_expected_version(&self, stream_id: &StreamId) -> ExpectedVersion {
             match self
                 .seeded_streams
@@ -3011,6 +3011,35 @@ mod tests {
             {
                 Some(last) => ExpectedVersion::Exact(last.stream_position),
                 None => ExpectedVersion::NoStream,
+            }
+        }
+
+        /// Fold the committed batch onto the end of the stream
+        /// `read_stream` serves, so a transition the paired
+        /// `MockArtifactLifecycle` committed is one the re-evaluation
+        /// pass can read back — as it would from the adapter, which
+        /// appends inside the same transaction as the artifact row.
+        fn publish_committed(&self, batch: &AppendEvents) {
+            let mut streams = self.seeded_streams.lock().unwrap();
+            let stream = streams.entry(batch.stream_id.clone()).or_default();
+            let first_position = stream.last().map_or(0, |last| last.stream_position + 1);
+            for (offset, to_append) in batch.events.iter().enumerate() {
+                let position = first_position + offset as u64;
+                stream.push(PersistedEvent {
+                    event_id: to_append.event_id,
+                    stream_id: batch.stream_id.clone(),
+                    stream_position: position,
+                    // No cross-stream sequence in this mock; the
+                    // per-stream position is the only ordering its
+                    // readers consult.
+                    global_position: position,
+                    event: to_append.event.clone(),
+                    correlation_id: batch.correlation_id,
+                    causation_id: batch.causation_id,
+                    actor: batch.actor.clone(),
+                    event_version: 1,
+                    stored_at: Utc::now(),
+                });
             }
         }
     }
@@ -3424,6 +3453,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -3457,6 +3487,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -3497,6 +3528,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         // The storage mock is returned so `seed_rejected_with_scan` can
         // put the artifact's findings blob in CAS. It has to: an
@@ -3549,6 +3581,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -3601,6 +3634,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -3677,6 +3711,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -5142,6 +5177,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -9228,8 +9264,11 @@ mod tests {
         let projections = Arc::new(MockPolicyProjections::new());
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(
-            crate::use_cases::test_support::MockArtifactLifecycle::new(artifacts.clone())
-                .with_optimistic_concurrency(events.clone()),
+            crate::use_cases::test_support::MockArtifactLifecycle::new(
+                artifacts.clone(),
+                events.clone(),
+            )
+            .with_optimistic_concurrency(),
         );
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =

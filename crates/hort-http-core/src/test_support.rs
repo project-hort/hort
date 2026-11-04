@@ -1230,7 +1230,7 @@ pub fn build_mock_ctx_with_label_flag(
     // they land nowhere and the read paths see no row — the PEP 658
     // `.metadata` serve resolves its CAS hash from the `wheel_metadata` row.
     let lifecycle = Arc::new(
-        MockArtifactLifecycle::new(artifacts.clone())
+        MockArtifactLifecycle::new(artifacts.clone(), events.clone())
             .with_metadata_repo(artifact_metadata.clone())
             .with_content_references(content_references.clone()),
     );
