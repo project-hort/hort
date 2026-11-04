@@ -1691,6 +1691,7 @@ pub async fn build_app_context(
             upstream_proxy_for_index_child,
             caching_resolver.clone(),
             jobs.clone(),
+            storage.clone(),
             oci_handler_for_index_child,
             ingest_use_case_for_index_child,
         )),

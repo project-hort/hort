@@ -71,7 +71,7 @@
 //!    (`find_by_repo_and_checksum`): ADR 0054 keeps the anchor per row, so a row
 //!    in another repository is not this repository's row. A hit returns
 //!    `Completed` without touching the network — never re-mint, never re-anchor.
-//!    This is also what makes the row safe to run twice.
+//!    It reads the stored manifest to restore missing constituent claims.
 //! 4. Fetch by digest through [`UpstreamProxy::fetch_manifest`], with an
 //!    `accept` list covering both the OCI and the Docker manifest and index
 //!    media types.
@@ -99,6 +99,8 @@
 //!    what it references. A failed edge fails this unit; the job row is
 //!    retried, where a committed manifest with a missing claim was only
 //!    repairable by re-reading manifest bodies out of CAS.
+//!    By design, this handler holds no content-reference port: existing-row
+//!    repair also goes through [`IngestUseCase::reconcile_claimed_edges`].
 //! 8. Recurse when the child is itself an index: enqueue
 //!    one `oci-index-child-ingest` row per grandchild — the whole level in one
 //!    [`JobsRepository::enqueue_idempotent_batch`] statement, never a row at a
@@ -158,15 +160,15 @@
 //! [`child_ingest_params`] — the pull-through legs through
 //! [`crate::use_cases::oci_index_child_enqueue::OciIndexChildEnqueueUseCase`],
 //! this handler directly for a grandchild — so the producer→consumer shape has
-//! one definition. Step 3 makes a re-run of an already-ingested child a no-op
-//! regardless.
+//! one definition. Step 3 makes a re-run of an already-ingested child avoid
+//! an upstream fetch while reconciling any missing claims.
 //!
 //! **The jobs row is the second dedupe layer, not the only one**, which is what
 //! makes a terminal row of this kind safe to delete: `jobs.idempotency_key`
 //! suppresses a re-enqueue only for as long as the row exists, but step 3's
-//! target-repository presence check suppresses the *work* permanently. A swept
+//! target-repository presence check suppresses a repeat fetch. A swept
 //! row that is later re-enqueued therefore short-circuits before it touches the
-//! network — a cheap no-op, never a re-fetch and never a re-anchor. Terminal
+//! network, rechecking the stored manifest's claims without re-anchoring. Terminal
 //! rows of this kind are consequently swept by `prefetch-row-retention-sweep`
 //! along with the rest of the pull-through ingest cascade; nothing durable is
 //! kept in them.
@@ -175,6 +177,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use hort_domain::entities::repository::{Repository, RepositoryFormat};
@@ -189,6 +192,7 @@ use hort_domain::ports::content_reference_index::ContentReferenceClaim;
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::jobs_repository::{IdempotentEnqueueRow, JobsRepository, TriggerSource};
 use hort_domain::ports::repository_repository::RepositoryRepository;
+use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
@@ -495,15 +499,14 @@ impl ChildOutcome {
 /// "could not do it".
 ///
 /// The grandchild counters are best-effort follow-up to an ingest that has
-/// already committed and cannot fail the call. `membership_edges_written` is
-/// not follow-up at all any more: those edges ride the child's own minting
-/// transition, so the number is what that transition carried — on a failure
-/// the whole unit reports `hard_failure` and this stays `0`.
+/// already committed and cannot fail the call. `membership_edges_written`
+/// counts claims inserted by a mint or a repeat repair; an already-present
+/// row with every claim intact reports zero.
 #[derive(Debug, Default)]
 struct ChildSummary {
     /// `true` when the ingested child was itself an image index.
     is_index: bool,
-    /// `content_references` rows committed with this child (`oci_index_member`
+    /// `content_references` rows inserted for this child (`oci_index_member`
     /// for an index, `oci_config` + `oci_layer` for an image manifest).
     membership_edges_written: u64,
     /// Grandchild rows that inserted.
@@ -552,10 +555,10 @@ struct ChildClaims {
 /// target-repository presence short-circuit) and the jobs repository (the
 /// grandchild enqueue when the child is itself an index).
 ///
-/// It holds **no** content-reference port. The child's membership edges are
-/// claims on bytes, so they travel into the ingest's own transition as
-/// [`ContentReferenceClaim`]s rather than being written beside it; with no
-/// handle there is nothing here that could write one afterwards.
+/// It holds **no** content-reference port. A new child's membership claims
+/// travel into the ingest transition as [`ContentReferenceClaim`]s. When the
+/// child already exists, [`IngestUseCase::reconcile_claimed_edges`] inserts
+/// only claims recovered from its stored manifest that are still missing.
 pub struct OciIndexChildIngestHandler {
     repositories: Arc<dyn RepositoryRepository>,
     artifacts: Arc<dyn ArtifactRepository>,
@@ -564,6 +567,7 @@ pub struct OciIndexChildIngestHandler {
     /// through exactly the mapping a client pull of that child would.
     upstream_resolver: Arc<dyn UpstreamResolver>,
     jobs: Arc<dyn JobsRepository>,
+    storage: Arc<dyn StoragePort>,
     /// OCI handler. This kind is OCI-only by design; the composition root wires
     /// the OCI handler in directly rather than threading the full per-format
     /// registry, mirroring
@@ -584,6 +588,7 @@ impl OciIndexChildIngestHandler {
         upstream_proxy: Arc<dyn UpstreamProxy>,
         upstream_resolver: Arc<dyn UpstreamResolver>,
         jobs: Arc<dyn JobsRepository>,
+        storage: Arc<dyn StoragePort>,
         oci_handler: Arc<dyn FormatHandler>,
         ingest: Arc<IngestUseCase>,
     ) -> Self {
@@ -593,6 +598,7 @@ impl OciIndexChildIngestHandler {
             upstream_proxy,
             upstream_resolver,
             jobs,
+            storage,
             oci_handler,
             ingest,
         }
@@ -658,6 +664,51 @@ impl OciIndexChildIngestHandler {
             .await
         {
             Ok(Some(existing)) => {
+                // The original transition cannot be replayed. The stored
+                // manifest can still reassert any missing foreign-byte claims.
+                // A blob with the same checksum is not a manifest whose
+                // membership claims this task may derive.
+                if existing.path == child_manifest_coords(&parsed.requested_name, child_hash).path {
+                    match self.storage.get(&existing.sha256_checksum).await {
+                        Ok(mut stream) => {
+                            let mut body = Vec::new();
+                            if let Err(err) = stream.read_to_end(&mut body).await {
+                                return Err(TaskOutcome::fail(
+                                    format!(
+                                        "oci-index-child-ingest: stored child unreadable: {err}"
+                                    ),
+                                    true,
+                                ));
+                            }
+                            let claims = self.derive_claims(
+                                &repo,
+                                parsed,
+                                child_hash,
+                                &existing.content_type,
+                                &body,
+                                summary,
+                            );
+                            summary.membership_edges_written =
+                                self.ingest
+                                    .reconcile_claimed_edges(&existing, &claims.edges)
+                                    .await
+                                    .map_err(|err| {
+                                        TaskOutcome::fail(
+                                    format!("oci-index-child-ingest: claim repair failed: {err}"),
+                                    true,
+                                )
+                                    })?;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                repository = %repo.key,
+                                artifact_id = %existing.id,
+                                error = %err,
+                                "oci-index-child-ingest: stored child unavailable for claim repair",
+                            );
+                        }
+                    }
+                }
                 tracing::debug!(
                     repository = %repo.key,
                     artifact_id = %existing.id,
@@ -833,9 +884,7 @@ impl OciIndexChildIngestHandler {
             }
         };
 
-        // The transition committed, so every edge it carried is durable —
-        // there is no per-edge outcome left to count.
-        summary.membership_edges_written = claims.edges.len() as u64;
+        summary.membership_edges_written = ingested.claimed_edges_written;
         tracing::debug!(
             repository = %repo.key,
             artifact_id = %ingested.artifact.id,
@@ -1339,6 +1388,7 @@ mod tests {
         proxy: Arc<MockUpstreamProxy>,
         resolver: Arc<MockUpstreamResolver>,
         refs: Arc<MockContentReferenceIndex>,
+        storage: Arc<MockStoragePort>,
         lifecycle: Arc<MockArtifactLifecycle>,
         jobs: Arc<MockJobsRepository>,
         repo: Repository,
@@ -1388,7 +1438,7 @@ mod tests {
         let policies = Arc::new(MockPolicyProjectionRepository::new());
 
         let ingest = Arc::new(IngestUseCase::new(
-            storage,
+            storage.clone(),
             lifecycle.clone(),
             artifacts.clone(),
             repos.clone(),
@@ -1412,6 +1462,7 @@ mod tests {
             proxy.clone(),
             resolver.clone(),
             jobs.clone(),
+            storage.clone(),
             oci_handler,
             ingest,
         );
@@ -1422,6 +1473,7 @@ mod tests {
             proxy,
             resolver,
             refs,
+            storage,
             lifecycle,
             jobs,
             repo,
@@ -1890,6 +1942,31 @@ mod tests {
         assert_no_rows_enqueued(&f.jobs);
     }
 
+    #[tokio::test]
+    async fn same_checksum_blob_row_is_not_read_as_a_manifest_for_claim_repair() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_layer_refs(1),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let hash: ContentHash = sha256_hex(&body).parse().expect("sha");
+        let digest = format!("sha256:{}", hash.as_ref());
+        let mut existing = held_manifest(f.repo.id, &hash, &digest);
+        existing.path = format!("blobs/{digest}");
+        f.artifacts.insert(existing);
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("task outcome"),
+        );
+        assert_eq!(summary["outcome"], "already_present");
+        assert_eq!(summary["membership_edges_written"], 0);
+        assert_eq!(f.storage.get_call_count(), 0);
+        assert_eq!(f.refs.entry_count(), 0);
+    }
+
     /// The presence check is scoped to the TARGET repository: the same
     /// content held elsewhere is a different row with a different anchor
     /// (ADR 0054) and must not suppress the mint here.
@@ -2163,6 +2240,230 @@ mod tests {
             .await
             .expect("query")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn repeat_child_ingest_repairs_missing_claims_without_rewriting_existing_edges() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_layer_refs(1),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+        let child_hash: ContentHash = sha256_hex(&body).parse().expect("child hash");
+        let request = VerifiedIngestRequest::ProtocolNative {
+            repository_id: f.repo.id,
+            coords: child_manifest_coords("library/nginx", &child_hash),
+            content_type: IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            actor: ApiActor {
+                user_id: Uuid::nil(),
+            },
+            payload_metadata: serde_json::Value::Null,
+            upstream_digest: child_hash.clone(),
+            upstream_published_at: None,
+            trust_upstream_publish_time: false,
+        };
+        let first = f
+            .handler
+            .ingest
+            .ingest_verified(
+                request,
+                &[],
+                Box::new(std::io::Cursor::new(body)),
+                f.handler.oci_handler.as_ref(),
+            )
+            .await
+            .expect("initial ingest without constituent claims");
+        assert_eq!(f.refs.entry_count(), 1, "only primary_content exists");
+
+        let config_hash = deterministic_sha(0xC0FF_EE00);
+        assert!(
+            f.refs
+                .find_by_target(f.repo.id, &config_hash, Some(OCI_CONFIG_KIND))
+                .await
+                .expect("config claims before repeat")
+                .is_empty(),
+            "without a claim the config is eligible for storage GC"
+        );
+
+        f.storage
+            .fail_next_get_truncated(child_hash.clone(), Vec::new());
+        let unreadable = f
+            .handler
+            .run(&params(f.repo.id, &digest), make_context())
+            .await
+            .expect("task outcome");
+        assert!(matches!(
+            unreadable,
+            TaskOutcome::Failed { retry: true, .. }
+        ));
+        assert_eq!(f.refs.entry_count(), 1);
+
+        f.refs.fail_next_insert_for_kind(
+            OCI_LAYER_KIND,
+            DomainError::Invariant("simulated repair failure".into()),
+        );
+        let failed = f
+            .handler
+            .run(&params(f.repo.id, &digest), make_context())
+            .await
+            .expect("task outcome");
+        assert!(matches!(failed, TaskOutcome::Failed { retry: true, .. }));
+        assert_eq!(
+            f.refs.entry_count(),
+            1,
+            "a failed batch leaves no partial constituent claim"
+        );
+
+        let repaired = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("repeat succeeds"),
+        );
+        assert_eq!(repaired["outcome"], "already_present");
+        assert_eq!(repaired["membership_edges_written"], 2);
+        assert_eq!(f.refs.entry_count(), 3);
+        let config_rows = f
+            .refs
+            .find_by_target(f.repo.id, &config_hash, Some(OCI_CONFIG_KIND))
+            .await
+            .expect("config claims after repeat");
+        assert_eq!(config_rows.len(), 1, "the config is no longer GC eligible");
+        assert_eq!(config_rows[0].source_artifact_id, first.artifact.id);
+
+        let repeated = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("third ingest succeeds"),
+        );
+        assert_eq!(repeated["membership_edges_written"], 0);
+        assert_eq!(f.refs.entry_count(), 3);
+        assert_eq!(
+            f.refs
+                .find_by_target(f.repo.id, &config_hash, Some(OCI_CONFIG_KIND))
+                .await
+                .expect("config claims after third ingest")[0]
+                .recorded_at,
+            config_rows[0].recorded_at,
+            "an existing claim retains its original timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_dedup_inserts_only_missing_claims_and_reports_inserted_rows() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(Vec::new())).await;
+        let body = image_manifest_body();
+        let child_hash: ContentHash = sha256_hex(&body).parse().expect("child hash");
+        let request = || VerifiedIngestRequest::ProtocolNative {
+            repository_id: f.repo.id,
+            coords: child_manifest_coords("library/nginx", &child_hash),
+            content_type: IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            actor: ApiActor {
+                user_id: Uuid::nil(),
+            },
+            payload_metadata: serde_json::Value::Null,
+            upstream_digest: child_hash.clone(),
+            upstream_published_at: None,
+            trust_upstream_publish_time: false,
+        };
+        let first = f
+            .handler
+            .ingest
+            .ingest_verified(
+                request(),
+                &[],
+                Box::new(std::io::Cursor::new(body.clone())),
+                f.handler.oci_handler.as_ref(),
+            )
+            .await
+            .expect("first ingest");
+        let target = deterministic_sha(0xC0FF_EE00);
+        let claim = ContentReferenceClaim {
+            target_content_hash: target.clone(),
+            kind: OCI_CONFIG_KIND.to_string(),
+            metadata: json!({"digest": oci_digest_ref(&target)}),
+        };
+        let second = f
+            .handler
+            .ingest
+            .ingest_verified(
+                request(),
+                std::slice::from_ref(&claim),
+                Box::new(std::io::Cursor::new(body.clone())),
+                f.handler.oci_handler.as_ref(),
+            )
+            .await
+            .expect("dedup repairs claim");
+        assert_eq!(second.artifact.id, first.artifact.id);
+        assert_eq!(second.claimed_edges_written, 1);
+        assert_eq!(f.refs.entry_count(), 2);
+        let inserted = f
+            .refs
+            .find_by_target(f.repo.id, &target, Some(OCI_CONFIG_KIND))
+            .await
+            .expect("claim after dedup");
+        assert_eq!(inserted.len(), 1);
+
+        let third = f
+            .handler
+            .ingest
+            .ingest_verified(
+                request(),
+                &[claim],
+                Box::new(std::io::Cursor::new(body.clone())),
+                f.handler.oci_handler.as_ref(),
+            )
+            .await
+            .expect("repeated dedup");
+        assert_eq!(third.claimed_edges_written, 0);
+        assert_eq!(f.refs.entry_count(), 2);
+        assert_eq!(
+            f.refs
+                .find_by_target(f.repo.id, &target, Some(OCI_CONFIG_KIND))
+                .await
+                .expect("claim after repeated dedup")[0]
+                .recorded_at,
+            inserted[0].recorded_at,
+        );
+
+        use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
+        use sha2::{Digest, Sha512};
+        let sha512 = hex::encode(Sha512::digest(&body));
+        let checksum = UpstreamPublishedChecksum::new(HashAlgorithm::Sha512, sha512)
+            .expect("valid upstream checksum");
+        let post_put_request = VerifiedIngestRequest::UpstreamPublished {
+            repository_id: f.repo.id,
+            coords: child_manifest_coords("library/nginx", &child_hash),
+            content_type: IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            actor: ApiActor {
+                user_id: Uuid::nil(),
+            },
+            payload_metadata: serde_json::Value::Null,
+            upstream_checksum: checksum,
+            upstream_published_at: None,
+            trust_upstream_publish_time: false,
+        };
+        let layer = ContentReferenceClaim {
+            target_content_hash: deterministic_sha(0xDEC0_0001),
+            kind: OCI_LAYER_KIND.to_string(),
+            metadata: serde_json::Value::Null,
+        };
+        let post_put = f
+            .handler
+            .ingest
+            .ingest_verified(
+                post_put_request,
+                &[layer],
+                Box::new(std::io::Cursor::new(body)),
+                f.handler.oci_handler.as_ref(),
+            )
+            .await
+            .expect("post-put dedup repairs another claim");
+        assert_eq!(post_put.artifact.id, first.artifact.id);
+        assert_eq!(post_put.claimed_edges_written, 1);
+        assert_eq!(f.refs.entry_count(), 3);
     }
 
     /// Nothing in this handler computes or overrides a quarantine anchor —
