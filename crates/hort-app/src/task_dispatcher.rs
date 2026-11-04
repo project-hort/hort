@@ -96,7 +96,7 @@ use uuid::Uuid;
 use hort_domain::events::{
     Actor, DomainEvent, InternalActor, TaskFailed, ADMIN_INVOKABLE_TASK_KINDS,
 };
-use hort_domain::policy::{evaluate_class_service, ClassService};
+use hort_domain::policy::{evaluate_class_service, permit_service_interval, ClassService};
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
     ClaimReservation, JobRow, JobsRepository, PendingKindBacklog, PriorityBand, RequeueOutcome,
@@ -497,9 +497,10 @@ impl TaskDispatcher {
         self.handlers.insert(kind, handler);
         self.permits.insert(
             kind,
-            Arc::new(ClassFairPermits::new(
+            Arc::new(ClassFairPermits::new_with_interval(
                 max_concurrency,
                 usize::from(self.reserved_slots_per_class),
+                permit_service_interval(self.class_service_threshold),
             )),
         );
     }
@@ -5301,6 +5302,21 @@ mod tests {
                  threshold: {snapshot:?}"
             );
         }
+    }
+
+    #[test]
+    fn register_threads_the_configured_service_interval_to_the_allocator() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let mut dispatcher = make_dispatcher(repo as Arc<dyn JobsRepository>);
+        dispatcher.class_service_threshold = Duration::from_secs(90);
+        dispatcher.register(
+            Arc::new(NoopHandler::new("scan", Arc::new(AtomicUsize::new(0)))),
+            1,
+        );
+        assert_eq!(
+            dispatcher.permits["scan"].service_interval(),
+            permit_service_interval(Duration::from_secs(90))
+        );
     }
 
     /// A class being served is not reported, however deep and old its

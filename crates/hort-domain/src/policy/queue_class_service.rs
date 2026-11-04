@@ -82,6 +82,16 @@ use crate::ports::jobs_repository::BandQueueSample;
 /// only by coincidence.
 pub const DEFAULT_CLASS_SERVICE_THRESHOLD_SECS: u64 = 300;
 
+/// Grant a waiting class a permit within half the configured audit window.
+///
+/// The audit records completed work, while the permit floor records grants.
+/// Keeping the grant interval shorter leaves the granted run time to finish
+/// before an otherwise healthy class reaches the audit threshold. Dividing
+/// [`Duration`] directly also keeps zero and extreme thresholds from wrapping.
+pub fn permit_service_interval(audit_threshold: Duration) -> Duration {
+    audit_threshold / 2
+}
+
 /// Where a starved class's work is stuck — the `reason` label on the
 /// per-class starvation counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +299,23 @@ fn waiting_since(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn permit_service_interval_is_half_the_audit_threshold() {
+        assert_eq!(
+            permit_service_interval(Duration::from_secs(300)),
+            Duration::from_secs(150)
+        );
+        assert_eq!(permit_service_interval(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            permit_service_interval(Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            permit_service_interval(Duration::from_secs(u64::MAX)),
+            Duration::from_secs(u64::MAX) / 2
+        );
+    }
 
     const NOW: i64 = 2_000_000;
     const THRESHOLD: Duration = Duration::from_secs(300);
