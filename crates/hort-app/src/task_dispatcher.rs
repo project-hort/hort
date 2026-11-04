@@ -99,8 +99,8 @@ use hort_domain::events::{
 use hort_domain::policy::{evaluate_class_service, ClassService};
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
-    ClaimReservation, JobRow, JobsRepository, PendingKindBacklog, PriorityBand, RequeueOutcome,
-    REQUEUE_ON_LEASE_EXPIRY_KINDS,
+    ClaimReservation, JobRow, JobsRepository, KindQueueSample, PendingKindBacklog, PriorityBand,
+    QueueServiceSample, RequeueOutcome, REQUEUE_ON_LEASE_EXPIRY_KINDS,
 };
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::types::task_tier::{class_bands, TaskTier};
@@ -125,6 +125,17 @@ const METRIC_IN_FLIGHT: &str = "hort_admin_tasks_in_flight";
 const METRIC_PENDING_ELIGIBLE: &str = "hort_admin_tasks_pending_eligible";
 const METRIC_STARVED: &str = "hort_admin_tasks_starved_total";
 const METRIC_CLASS_STARVED: &str = "hort_admin_tasks_class_starved_total";
+/// The same finding as [`METRIC_CLASS_STARVED`] at the granularity the
+/// guarantee is enforced at — one series per `(class, kind, reason)`.
+///
+/// A separate name rather than a `kind` label on the counter above, so
+/// the class-wide question stays exactly as askable as it was: an
+/// operator alarming on the coarse counter keeps the series identity
+/// they have, and the coarse counter also stays the backstop for a kind
+/// outside `EVENT_TASK_KINDS` (which the `jobs_kind_check` CHECK makes
+/// unreachable, but which a fold still counts and a per-kind series
+/// would have no label for).
+const METRIC_CLASS_KIND_STARVED: &str = "hort_admin_tasks_class_kind_starved_total";
 const METRIC_LEASE_REQUEUED: &str = "hort_admin_tasks_lease_requeued_total";
 const METRIC_LEASE_RENEW_FAILED: &str = "hort_admin_tasks_lease_renew_failed_total";
 
@@ -864,43 +875,125 @@ impl TaskDispatcher {
         // in the order the bands were passed, and a mock's additive
         // default answers for none at all — which makes this pass inert
         // rather than mislabelling a class.
-        for ((tier, _), sample) in bands.iter().zip(&samples) {
-            let verdict = evaluate_class_service(sample, now, self.class_service_threshold);
-            let ClassService::Starved {
-                waiting,
-                awaiting_capacity,
-                unserved_for_secs,
-                threshold_secs,
-                reason,
-            } = verdict
-            else {
-                continue;
-            };
-            tracing::error!(
-                class = tier.as_str(),
-                waiting,
-                awaiting_capacity,
-                pending_eligible = sample.pending_eligible,
-                unserved_for_secs,
-                threshold_secs,
-                reason = reason.as_str(),
-                "TaskDispatcher: a work class has work waiting that nothing of that class has \
-                 been served ahead of — every class is guaranteed service (ADR 0066 D5) and \
-                 this one is not getting it. reason 'not_claimed' means the waiting rows are \
-                 pending and are not being taken up, so the claim is where the class is \
-                 losing; reason 'awaiting_capacity' means rows of the class hold a claim and \
-                 have been queued behind a run permit past the threshold, which is the \
-                 allocation point no read of the pending backlog can see. Check \
-                 HORT_SCANNER_RESERVED_SLOTS_PER_CLASS (is a share reserved at all?) and \
-                 whether one class is flooding the kind",
-            );
-            metrics::counter!(
-                METRIC_CLASS_STARVED,
-                "class" => tier.as_str(),
-                "reason" => reason.as_str(),
-            )
-            .increment(1);
+        for ((tier, _), observation) in bands.iter().zip(&samples) {
+            self.report_class_service(*tier, &observation.class_wide(), now);
+            // The same verdict per `(class, kind)`, which is the
+            // granularity the guarantee is enforced at: the run permits
+            // come from one allocator per registered kind, so the class
+            // -wide answer above can be re-armed by a sibling kind's
+            // completion while this kind's own permit queue is stalled
+            // (ADR 0066 D5). The rows come out of the same statement as
+            // the fold, so the two verdicts describe one instant.
+            for KindQueueSample { kind, sample } in &observation.kinds {
+                self.report_kind_service(*tier, kind, sample, now);
+            }
         }
+    }
+
+    /// Log and count a class-wide service finding, or return silently
+    /// when the class is being served.
+    ///
+    /// Split out of [`Self::audit_class_service`] so the coarse and the
+    /// fine pass cannot drift on what counts as a finding: both
+    /// destructure the same `Starved` variant out of the same predicate
+    /// and differ only in the labels they carry.
+    fn report_class_service(
+        &self,
+        tier: TaskTier,
+        sample: &QueueServiceSample,
+        now: DateTime<Utc>,
+    ) {
+        let ClassService::Starved {
+            waiting,
+            awaiting_capacity,
+            unserved_for_secs,
+            threshold_secs,
+            reason,
+        } = evaluate_class_service(sample, now, self.class_service_threshold)
+        else {
+            return;
+        };
+        tracing::error!(
+            class = tier.as_str(),
+            waiting,
+            awaiting_capacity,
+            pending_eligible = sample.pending_eligible,
+            unserved_for_secs,
+            threshold_secs,
+            reason = reason.as_str(),
+            "TaskDispatcher: a work class has work waiting that nothing of that class has \
+             been served ahead of — every class is guaranteed service (ADR 0066 D5) and \
+             this one is not getting it. reason 'not_claimed' means the waiting rows are \
+             pending and are not being taken up, so the claim is where the class is \
+             losing; reason 'awaiting_capacity' means rows of the class hold a claim and \
+             have been queued behind a run permit past the threshold, which is the \
+             allocation point no read of the pending backlog can see. Check \
+             HORT_SCANNER_RESERVED_SLOTS_PER_CLASS (is a share reserved at all?) and \
+             whether one class is flooding the kind",
+        );
+        metrics::counter!(
+            METRIC_CLASS_STARVED,
+            "class" => tier.as_str(),
+            "reason" => reason.as_str(),
+        )
+        .increment(1);
+    }
+
+    /// The same finding for one `(class, kind)` pair — the granularity
+    /// the permits are allocated at.
+    ///
+    /// Fires independently of the class-wide pass, and the two are not
+    /// redundant in either direction. A class-wide finding implies at
+    /// least one kind finding, so the pair reads as a diagnosis rather
+    /// than a repetition: the coarse line says the class is losing and
+    /// the fine line says at which kind's allocator. The reverse does
+    /// not hold, and that is the defect this exists for — a kind whose
+    /// permit queue is stalled while a sibling kind of the same class
+    /// keeps completing is reported here and nowhere else.
+    fn report_kind_service(
+        &self,
+        tier: TaskTier,
+        kind: &str,
+        sample: &QueueServiceSample,
+        now: DateTime<Utc>,
+    ) {
+        let ClassService::Starved {
+            waiting,
+            awaiting_capacity,
+            unserved_for_secs,
+            threshold_secs,
+            reason,
+        } = evaluate_class_service(sample, now, self.class_service_threshold)
+        else {
+            return;
+        };
+        tracing::error!(
+            class = tier.as_str(),
+            kind,
+            waiting,
+            awaiting_capacity,
+            pending_eligible = sample.pending_eligible,
+            unserved_for_secs,
+            threshold_secs,
+            reason = reason.as_str(),
+            "TaskDispatcher: one kind of a work class has work waiting that nothing of that \
+             kind and class has been served ahead of. This is the granularity the guarantee \
+             is enforced at — the run permits for each kind are allocated by that kind's own \
+             allocator — so this finding can stand while the class as a whole reads as \
+             served because a different kind of it just completed. reason 'not_claimed' \
+             means the rows are pending and are not being taken up (if nothing in the fleet \
+             registers a handler for this kind, that is the cause and \
+             hort_admin_tasks_starved_total carries reason 'unregistered' beside it); \
+             reason 'awaiting_capacity' means rows of this kind and class hold a claim and \
+             have been queued behind this kind's run permit past the threshold",
+        );
+        metrics::counter!(
+            METRIC_CLASS_KIND_STARVED,
+            "class" => tier.as_str(),
+            "kind" => kind.to_string(),
+            "reason" => reason.as_str(),
+        )
+        .increment(1);
     }
 
     /// Record that `job` is no longer waiting for capacity: its run
@@ -5021,16 +5114,46 @@ mod tests {
     // Per-class service audit (ADR 0066 D5)
     // -----------------------------------------------------------------------
 
-    /// A per-class sample with nothing in it — each test below sets only
-    /// the facts its scenario rests on.
-    fn empty_sample() -> BandQueueSample {
-        BandQueueSample {
+    /// A slice sample with nothing in it — each test below sets only the
+    /// facts its scenario rests on.
+    fn empty_sample() -> QueueServiceSample {
+        QueueServiceSample {
             pending_eligible: 0,
             oldest_pending_at: None,
             awaiting_capacity: 0,
             oldest_capacity_wait_at: None,
             last_served_at: None,
         }
+    }
+
+    /// One band's observation, built from its kinds.
+    ///
+    /// Every fixture below has to name the kinds its rows belong to,
+    /// because a band is made of kinds and "two rows waiting in the
+    /// Normal band" is not a complete statement of a queue: the
+    /// guarantee is enforced per kind as well as per class, so which
+    /// kind the rows are is part of the scenario rather than detail.
+    fn band(kinds: Vec<(&str, QueueServiceSample)>) -> BandQueueSample {
+        BandQueueSample {
+            kinds: kinds
+                .into_iter()
+                .map(|(kind, sample)| KindQueueSample {
+                    kind: kind.to_string(),
+                    sample,
+                })
+                .collect(),
+        }
+    }
+
+    /// A band with no rows at all — the class is completely quiet.
+    fn empty_band() -> BandQueueSample {
+        band(Vec::new())
+    }
+
+    /// The common single-kind band: one kind's facts, and nothing else
+    /// of that class in the queue.
+    fn one_kind_band(kind: &str, sample: QueueServiceSample) -> BandQueueSample {
+        band(vec![(kind, sample)])
     }
 
     fn secs_ago(secs: i64) -> DateTime<Utc> {
@@ -5100,21 +5223,27 @@ mod tests {
         // The per-class view, in `class_bands()` order.
         repo.seed_band_samples(vec![
             // Interactive: flowing. Claimed and completed seconds ago.
-            BandQueueSample {
-                pending_eligible: 5,
-                oldest_pending_at: Some(secs_ago(30)),
-                last_served_at: Some(secs_ago(2)),
-                ..empty_sample()
-            },
+            one_kind_band(
+                "scan",
+                QueueServiceSample {
+                    pending_eligible: 5,
+                    oldest_pending_at: Some(secs_ago(30)),
+                    last_served_at: Some(secs_ago(2)),
+                    ..empty_sample()
+                },
+            ),
             // Normal: two operator rescans waiting 400 s, and nothing
             // of this class has ever been served.
-            BandQueueSample {
-                pending_eligible: 2,
-                oldest_pending_at: Some(secs_ago(400)),
-                ..empty_sample()
-            },
+            one_kind_band(
+                "scan",
+                QueueServiceSample {
+                    pending_eligible: 2,
+                    oldest_pending_at: Some(secs_ago(400)),
+                    ..empty_sample()
+                },
+            ),
             // Bulk: nothing waiting.
-            empty_sample(),
+            empty_band(),
         ]);
         // The kind was claimed two seconds ago, and the worker has been
         // up for two hours — so the per-kind audit has no grace window
@@ -5199,22 +5328,28 @@ mod tests {
         // are NOT here — they are `running`.
         repo.seed_backlog(vec![backlog("scan", 1, secs_ago(10))]);
         repo.seed_band_samples(vec![
-            BandQueueSample {
-                pending_eligible: 1,
-                oldest_pending_at: Some(secs_ago(10)),
-                last_served_at: Some(secs_ago(1)),
-                ..empty_sample()
-            },
+            one_kind_band(
+                "scan",
+                QueueServiceSample {
+                    pending_eligible: 1,
+                    oldest_pending_at: Some(secs_ago(10)),
+                    last_served_at: Some(secs_ago(1)),
+                    ..empty_sample()
+                },
+            ),
             // Normal: nothing pending at all, three rows holding claims
             // and queued behind a run permit for 700 s, nothing of the
             // class served in two hours.
-            BandQueueSample {
-                awaiting_capacity: 3,
-                oldest_capacity_wait_at: Some(secs_ago(700)),
-                last_served_at: Some(secs_ago(7_200)),
-                ..empty_sample()
-            },
-            empty_sample(),
+            one_kind_band(
+                "scan",
+                QueueServiceSample {
+                    awaiting_capacity: 3,
+                    oldest_capacity_wait_at: Some(secs_ago(700)),
+                    last_served_at: Some(secs_ago(7_200)),
+                    ..empty_sample()
+                },
+            ),
+            empty_band(),
         ]);
         let last_claimed: HashMap<String, DateTime<Utc>> =
             [("scan".to_string(), secs_ago(1))].into_iter().collect();
@@ -5264,6 +5399,133 @@ mod tests {
         );
     }
 
+    /// **Gap three.** A kind starving at its own permit point, inside a
+    /// class a *sibling kind* keeps re-arming.
+    ///
+    /// The permits are allocated per registered kind — the dispatcher
+    /// holds one allocator per kind, and the per-class time floor and
+    /// the class-blind age net live inside it — so the guarantee is
+    /// enforced per kind **and** per class. ADR 0066 D5: *"An
+    /// observation coarser than the enforcement is a statistic and not
+    /// an alarm — a guarantee enforced per kind and per class, and
+    /// watched per class alone, can be reported healthy by a sibling
+    /// kind's progress."*
+    ///
+    /// This is that constellation, and the class-wide verdict is
+    /// **right** about what it was asked: one `scan` row of the `Normal`
+    /// class has held a claim for 700 s behind that kind's permit, while
+    /// `prefetch` rows of the same class completed a second ago. The
+    /// class's newest completion is therefore a second old, the
+    /// class-wide reference instant is re-armed, and the class reads as
+    /// served — by a kind whose allocator is not the one that is stuck.
+    /// The finding lives at `(class, kind)` and nowhere coarser.
+    #[tokio::test]
+    async fn a_kind_starved_at_its_permit_is_reported_though_a_sibling_kind_just_completed() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.seed_band_samples(vec![
+            empty_band(),
+            band(vec![
+                // `scan`: one row claimed and queued behind this kind's
+                // run permit for 700 s, and nothing of this kind and
+                // class has ever completed.
+                (
+                    "scan",
+                    QueueServiceSample {
+                        awaiting_capacity: 1,
+                        oldest_capacity_wait_at: Some(secs_ago(700)),
+                        ..empty_sample()
+                    },
+                ),
+                // `prefetch`: nothing waiting, and a completion a second
+                // ago. A different kind, the same class.
+                (
+                    "prefetch",
+                    QueueServiceSample {
+                        last_served_at: Some(secs_ago(1)),
+                        ..empty_sample()
+                    },
+                ),
+            ]),
+            empty_band(),
+        ]);
+        let dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        dispatcher.audit_class_service().await;
+        drop(guard);
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        // The class-wide instrument says nothing, on either reason —
+        // that is the gap, and it is not a tuning failure: the sibling's
+        // completion is a real completion of that class.
+        for reason in [
+            ClassStarvationReason::NotClaimed.as_str(),
+            ClassStarvationReason::AwaitingCapacity.as_str(),
+        ] {
+            assert_eq!(
+                counter_value(
+                    &snapshot,
+                    METRIC_CLASS_STARVED,
+                    &[("class", TaskTier::Normal.as_str()), ("reason", reason)],
+                ),
+                0,
+                "the class-wide verdict is re-armed by the sibling kind — that is the \
+                 observation this granularity exists to replace: {snapshot:?}"
+            );
+        }
+        // And the per-kind instrument names the kind and the allocation
+        // point.
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_CLASS_KIND_STARVED,
+                &[
+                    ("class", TaskTier::Normal.as_str()),
+                    ("kind", "scan"),
+                    ("reason", ClassStarvationReason::AwaitingCapacity.as_str()),
+                ],
+            ),
+            1,
+            "the kind queued behind its own permit must be reported, with the permit named \
+             rather than the claim: {snapshot:?}"
+        );
+        // The sibling is not accused of anything: it has nothing
+        // waiting, so it is owed no service.
+        for reason in [
+            ClassStarvationReason::NotClaimed.as_str(),
+            ClassStarvationReason::AwaitingCapacity.as_str(),
+        ] {
+            assert_eq!(
+                counter_value(
+                    &snapshot,
+                    METRIC_CLASS_KIND_STARVED,
+                    &[
+                        ("class", TaskTier::Normal.as_str()),
+                        ("kind", "prefetch"),
+                        ("reason", reason),
+                    ],
+                ),
+                0,
+                "the kind that is flowing is idle, not starved: {snapshot:?}"
+            );
+        }
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_CLASS_KIND_STARVED,
+                &[
+                    ("class", TaskTier::Normal.as_str()),
+                    ("kind", "scan"),
+                    ("reason", ClassStarvationReason::NotClaimed.as_str()),
+                ],
+            ),
+            0,
+            "the claim is not where this kind is losing: {snapshot:?}"
+        );
+    }
+
     /// The observation covers **every** class, including the one with no
     /// reserved share.
     ///
@@ -5309,13 +5571,16 @@ mod tests {
         for (threshold_secs, expected) in [(900u64, 0u64), (300u64, 1u64)] {
             let repo = Arc::new(DispatcherMockRepo::new());
             repo.seed_band_samples(vec![
-                empty_sample(),
-                BandQueueSample {
-                    pending_eligible: 1,
-                    oldest_pending_at: Some(secs_ago(WAITED_SECS)),
-                    ..empty_sample()
-                },
-                empty_sample(),
+                empty_band(),
+                one_kind_band(
+                    "scan",
+                    QueueServiceSample {
+                        pending_eligible: 1,
+                        oldest_pending_at: Some(secs_ago(WAITED_SECS)),
+                        ..empty_sample()
+                    },
+                ),
+                empty_band(),
             ]);
             let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
             dispatcher.class_service_threshold = Duration::from_secs(threshold_secs);
@@ -5395,14 +5660,17 @@ mod tests {
     async fn a_deep_but_draining_class_is_not_reported() {
         let repo = Arc::new(DispatcherMockRepo::new());
         repo.seed_band_samples(vec![
-            empty_sample(),
-            empty_sample(),
-            BandQueueSample {
-                pending_eligible: 10_000,
-                oldest_pending_at: Some(secs_ago(7_200)),
-                last_served_at: Some(secs_ago(3)),
-                ..empty_sample()
-            },
+            empty_band(),
+            empty_band(),
+            one_kind_band(
+                "scan",
+                QueueServiceSample {
+                    pending_eligible: 10_000,
+                    oldest_pending_at: Some(secs_ago(7_200)),
+                    last_served_at: Some(secs_ago(3)),
+                    ..empty_sample()
+                },
+            ),
         ]);
         let dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
 

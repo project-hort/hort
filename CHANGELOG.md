@@ -44,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A work class starving at one kind's run permit is now reported even when a
+  different kind of the same class keeps completing: the service verdict is
+  emitted per kind as well as per class, on new
+  `hort_admin_tasks_class_kind_*` series (the existing
+  `hort_admin_tasks_class_*` series are unchanged). Alarm on
+  `hort_admin_tasks_class_kind_unserved` to get the kind named (#415).
 - Background work now runs on a worker whose client-waited queues never empty:
   past a bound derived from `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` the
   longest-waiting row takes the next run permit whatever its class. A worker

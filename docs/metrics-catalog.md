@@ -4194,18 +4194,28 @@ task kind registered with the dispatcher. In the initial v1
 deployment the only registered kind is `"scan"`.
 
 **Not every series in this family is the dispatcher's.** The per-process
-emitter is named in each row below, because three of them are not emitted
+emitter is named in each row below, because six of them are not emitted
 by a worker at all: the `hort_admin_tasks_class_*` **gauges** come from
-`hort-server`'s own sampler, which re-derives the per-class service verdict
+`hort-server`'s own sampler, which re-derives the service verdict
 from durable `jobs` rows on its own cadence so the verdict lands on a
 surface an operator scrapes (ADR 0066 D5; see *Per-class service semantics*
 below). `hort_admin_tasks_enqueued_total` is the HTTP invoke handler's.
+
+**Two granularities, two sets of names.** ADR 0066's service guarantee is
+enforced per `jobs.kind` *and* per class — the worker allocates run permits
+through one allocator per registered kind — and D5 requires it to be
+observed the same way, because *"an observation coarser than the enforcement
+is a statistic and not an alarm."* So the `class_*` series answer per class
+and the `class_kind_*` series answer per `(class, kind)`. The coarse set is
+not a compatibility shim: it is the fold of **every** kind row, including a
+kind outside the vocabulary the fine series are emitted over, and it is the
+always-present series an alarm is built on.
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
 | `hort_admin_tasks_enqueued_total` | counter | `kind`, `result` | — | emitted by the HTTP handler (`hort-http-admin-tasks`) on every terminal path of `POST /api/v1/admin/tasks/{kind}`; not emitted by the dispatcher itself |
 | `hort_admin_tasks_completed_total` | counter | `kind`, `result` | — | `result ∈ {completed, failed_retry, failed_terminal}` |
-| `hort_admin_tasks_duration_seconds` | histogram | `kind` | seconds | elapsed time inside `TaskHandler::run`, and nothing else; the wait for a concurrency permit is not timed anywhere. `hort_admin_tasks_class_awaiting_capacity` counts waiting rows, and `hort_admin_tasks_class_unserved` shows whether the class has been served inside its threshold |
+| `hort_admin_tasks_duration_seconds` | histogram | `kind` | seconds | elapsed time inside `TaskHandler::run`, and nothing else; the wait for a concurrency permit is not timed anywhere. `hort_admin_tasks_class_kind_awaiting_capacity` counts the rows of this kind waiting for one, and `hort_admin_tasks_class_kind_unserved` shows whether that kind and class has been served inside its threshold |
 | `hort_admin_tasks_in_flight` | gauge | `kind` | tasks | incremented before `TaskHandler::run`, decremented after; 0 when idle |
 | `hort_admin_tasks_pending_eligible` | gauge | `kind` | jobs | claim-eligible pending rows per kind (`status='pending'` and the lock free/expired), set once per starvation audit (every 60 s). Covers **every** kind present in `jobs`, including kinds this worker does not claim |
 | `hort_admin_tasks_starved_total` | counter | `kind`, `reason` | — | `reason ∈ {unregistered, not_claimed, oldest_row_stalled}` — one increment per audit at which the kind's eligible backlog has gone unserved for > 600 s |
@@ -4216,6 +4226,10 @@ below). `hort_admin_tasks_enqueued_total` is the HTTP invoke handler's.
 | `hort_admin_tasks_class_unserved` | gauge | `class` | — | **emitted by `hort-server`**, re-sampled every 60 s: `1` when that class has work waiting and nothing of the same class completed inside the threshold, `0` when the class completed something inside it or has nothing waiting. Same verdict (same pure predicate, same durable facts) as the worker counter above; this is the half on a surface a scrape reaches, since the worker's own `/metrics` listener is opt-in and off by default |
 | `hort_admin_tasks_class_pending_eligible` | gauge | `class` | jobs | **emitted by `hort-server`**, re-sampled every 60 s: claim-eligible pending rows (`status='pending'` and the lock free/expired) whose `jobs.priority` falls in that class's band |
 | `hort_admin_tasks_class_awaiting_capacity` | gauge | `class` | jobs | **emitted by `hort-server`**, re-sampled every 60 s: rows in that class's band that a **live** worker holds without having granted them capacity — `status='running'`, `locked_until > now()`, and `capacity_waiting_since IS NOT NULL`. Counts the rows no read of the pending backlog can see; includes the sub-second window between a claim and the grant that follows it, so a busy worker reads a small non-zero value as a matter of course |
+| `hort_admin_tasks_class_kind_starved_total` | counter | `class`, `kind`, `reason` | — | **emitted by the worker**, the row above at the granularity the guarantee is enforced at: one increment per audit pass at which that `(class, kind)` pair had work waiting and nothing of that pair had completed inside the threshold. Same `reason` values. Fires where the class-wide counter cannot — a kind stalled behind its own run permit while a sibling kind of the same class keeps completing |
+| `hort_admin_tasks_class_kind_unserved` | gauge | `class`, `kind` | — | **emitted by `hort-server`**, re-sampled every 60 s: `1` when that `(class, kind)` pair has work waiting and nothing of the pair completed inside the threshold. The alarm surface at the enforcement granularity; emitted for every kind in the vocabulary on every pass, so it reads `0` rather than vanishing when a kind has no rows |
+| `hort_admin_tasks_class_kind_pending_eligible` | gauge | `class`, `kind` | jobs | **emitted by `hort-server`**, re-sampled every 60 s: claim-eligible pending rows of that kind whose `jobs.priority` falls in that class's band. `sum by (class)` equals `hort_admin_tasks_class_pending_eligible` for every kind in the vocabulary |
+| `hort_admin_tasks_class_kind_awaiting_capacity` | gauge | `class`, `kind` | jobs | **emitted by `hort-server`**, re-sampled every 60 s: rows of that kind in that class's band holding a claim behind that kind's run permit. The series that matches the enforcement exactly — the permit allocator is per kind — and the one to read when `hort_admin_tasks_class_kind_unserved` is `1` with `reason="awaiting_capacity"` |
 
 **Starvation semantics** (issue #131). A `provenance-verify` backlog once
 grew to ~1450 rows over 33 minutes while the same dispatcher claimed and
@@ -4254,11 +4268,12 @@ Operators alarm on `increase(hort_admin_tasks_starved_total[15m]) > 0`.
 `hort_admin_tasks_pending_eligible` is the accompanying depth signal.
 
 **Per-class service semantics** (issue #399, ADR 0066 D5 — *"every class is
-guaranteed service; the guarantee is observable; and the observation reaches
-a human"*). The four `hort_admin_tasks_class_*` series answer a different
-question from the per-kind ones above, on the axis the guarantee is written
-on, and two of the three things they see are structural blind spots of the
-per-kind audit:
+guaranteed service; the guarantee is observable at the granularity it is
+enforced at; and the observation reaches a human"*). The eight
+`hort_admin_tasks_class_*` and `hort_admin_tasks_class_kind_*` series answer
+a different question from the per-kind ones above, on the axes the guarantee
+is written on, and two of the three things they see are structural blind
+spots of the per-kind audit:
 
 - **A kind carries several classes.** `scan` carries six trigger sources
   across all three classes. The per-kind audit's last-claimed clock is
@@ -4266,15 +4281,35 @@ per-kind audit:
   class never claimed reads as healthy there; its remaining axis
   (`oldest_row_stalled`) approximates service by the age of one row, which
   is the axis ADR 0066 removed from the capacity reservation.
+- **And a class carries several kinds**, which is the mirror image and why
+  the `class_kind_*` series exist. The permits are allocated per registered
+  kind, so a class whose `scan` rows are stalled behind `scan`'s permit is
+  re-armed, in the class-wide answer, by any `prefetch` row of the same
+  class completing. The class-wide verdict is *right* about what it was
+  asked and useless as an alarm for that state; the finding lives at
+  `(class, kind)` and nowhere coarser.
 - **A row waiting for a worker run permit is `running`.** It is outside the
   claim-eligible backlog by construction, so no per-kind read of `pending`
-  rows can see it at any threshold. `hort_admin_tasks_class_awaiting_capacity`
-  is the only place that wait is counted. The allocator's own two enforcement
-  times are derived from the same threshold and both sit below it (half of it
-  for the per-class time floor, three quarters for the class-blind age net), so
-  a `reason="awaiting_capacity"` verdict means the capacity itself is not
-  turning over — not that the class is being outranked, which the allocator
-  would have resolved before this window elapsed.
+  rows can see it at any threshold. The two
+  `*_awaiting_capacity` gauges are the only place that wait is counted. The
+  allocator's own two enforcement times are derived from the same threshold
+  and both sit below it (half of it for the per-class time floor, three
+  quarters for the class-blind age net), so a `reason="awaiting_capacity"`
+  verdict means the capacity itself is not turning over — not that the class
+  is being outranked, which the allocator would have resolved before this
+  window elapsed.
+
+  **Read that conclusion off the `class_kind_*` verdict, not the class-wide
+  one.** Those two times are counted inside *one kind's* allocator, so "the
+  allocator would have resolved it" is a statement about one kind. On
+  `hort_admin_tasks_class_kind_unserved` it holds as written: this kind's
+  allocator has not turned capacity over for this class in a window longer
+  than both of its own enforcement times. On
+  `hort_admin_tasks_class_unserved` the same `reason` means something
+  weaker — *no* kind of the class had its wait resolved — and it cannot name
+  which allocator is stuck, because several independent ones contributed to
+  the number. A class-wide `awaiting_capacity` verdict is therefore the cue
+  to read the per-kind series, which is the only place the answer is.
 - **The verdict is not a worker-process metric.** The worker's `/metrics`
   listener is `HORT_WORKER_METRICS_BIND` and is **off by default**, and a
   process-local counter is lost on restart — which is exactly when a stall
@@ -4302,10 +4337,27 @@ is therefore counted under `class="bulk"` whatever `TaskTier::classify`
 would say about its columns. That is ADR 0066 D7's accepted window and it
 drains with those rows.
 
-Operators alarm on `max_over_time(hort_admin_tasks_class_unserved[15m]) > 0`,
-with a `for:` comfortably above the 60 s sample interval.
-`hort_admin_tasks_class_pending_eligible` and
-`hort_admin_tasks_class_awaiting_capacity` are the accompanying depth
+**What to ask, and which series answers it.** The two granularities are
+separate names rather than one name with a `kind` label, so neither question
+is harder to ask than the other and the coarse expressions are unchanged:
+
+| Question | Query |
+|---|---|
+| Is this class starving? | `hort_admin_tasks_class_unserved{class="bulk"}` |
+| Which kind of it? | `hort_admin_tasks_class_kind_unserved{class="bulk"} == 1` |
+| Is anything starving at all? | `max_over_time(hort_admin_tasks_class_kind_unserved[15m]) > 0` |
+| How deep is the class? | `hort_admin_tasks_class_pending_eligible{class="bulk"}` |
+| How deep is one kind of it? | `hort_admin_tasks_class_kind_pending_eligible{class="bulk",kind="scan"}` |
+
+Operators alarm on the per-`(class, kind)` verdict —
+`max_over_time(hort_admin_tasks_class_kind_unserved[15m]) > 0`, with a `for:`
+comfortably above the 60 s sample interval — because that is the granularity
+the guarantee is enforced at and the alarm therefore names the kind to look
+at. The class-wide `max_over_time(hort_admin_tasks_class_unserved[15m]) > 0`
+stays valid and stays the backstop: it is the fold of every kind row, so it
+still fires for a row whose kind is outside the fine series' vocabulary.
+`hort_admin_tasks_class_kind_pending_eligible` and
+`hort_admin_tasks_class_kind_awaiting_capacity` are the accompanying depth
 signals, and the one that is non-zero says which allocation point to look
 at. The threshold errs loud by design: ADR 0066 states that *"a false alarm
 is recoverable, a silent stall is the failure being removed"*, so raise
@@ -4476,14 +4528,55 @@ integers; `scan` in particular is **not** an admin-invokable kind (see
   `hort_admin_tasks_class_awaiting_capacity`: 3 series each — one per class,
   all three emitted on every sampler pass including the healthy path, so a
   scrape never has to distinguish absence from zero.
+- `hort_admin_tasks_class_kind_starved_total`: 3 classes × 2 reasons × the
+  **26** kinds of `EVENT_TASK_KINDS` = **156 series max**, and only a
+  `(class, kind, reason)` triple that has actually been starved ever creates
+  one — in a steady deployment, none.
+- `hort_admin_tasks_class_kind_unserved`,
+  `hort_admin_tasks_class_kind_pending_eligible`,
+  `hort_admin_tasks_class_kind_awaiting_capacity`: **78 series each** (26
+  kinds × 3 classes), **234** for the three together, every one of them
+  emitted on every sampler pass. The figure is exact rather than a bound,
+  which is the point of the next paragraph.
+
+  **Which kinds get a series: all of them, every pass, allocator or not.**
+  The vocabulary is `EVENT_TASK_KINDS`, which is the complete set of values
+  `jobs.kind` can hold — the column's `jobs_kind_check` CHECK is held
+  against that list by `task_kind_check_lockstep_guard` — so the grid is
+  every kind a row can carry rather than a guess at the interesting ones.
+  Three reasons not to make the series set follow the rows instead:
+
+  - A **gauge that stops being emitted keeps its last value** (the recorder
+    is installed with no idle timeout), so a series that existed only while
+    a kind had rows would hold `1` after those rows drained — an alarm that
+    cannot clear.
+  - **Absence and `0` are not the same thing to a dashboard**, which is
+    already why every class is emitted on the healthy path.
+  - The alternative needs **process-local state** (remember last pass's
+    pairs, zero the departures), and that state is lost on restart — which
+    is exactly when a stall is being investigated.
+
+  **A kind with no registered allocator anywhere in the fleet gets its
+  series like any other**, and that is deliberate rather than incidental: it
+  is the case the observation most needs to report. A `provenance-verify`
+  backlog once reached ~1450 rows in 33 minutes with no handler registered
+  and no signal anywhere — the same reason `hort_admin_tasks_pending_eligible`
+  covers every kind present in `jobs`. Such a kind reads
+  `reason="not_claimed"`, since a kind nothing claims never reaches a permit
+  queue, and `hort_admin_tasks_starved_total{reason="unregistered"}` sits
+  beside it. `hort-server` could not filter by registration even if it
+  wanted to: registration is a worker-process fact.
 
 Source: `hort-http-admin-tasks::handlers::invoke` constants
 `METRIC_ENQUEUED`, `RESULT_OK`, `RESULT_RBAC_DENIED`, `RESULT_VALIDATION_ERROR`;
 `hort_app::task_dispatcher` constants `METRIC_COMPLETED`, `METRIC_DURATION`,
 `METRIC_IN_FLIGHT`, `METRIC_LEASE_REQUEUED`, `METRIC_LEASE_RENEW_FAILED`,
-`METRIC_CLASS_STARVED`; `hort_server::composition` constants
-`CLASS_UNSERVED_METRIC`, `CLASS_PENDING_ELIGIBLE_METRIC`,
-`CLASS_AWAITING_CAPACITY_METRIC` (the three server-emitted gauges) and
+`METRIC_CLASS_STARVED`, `METRIC_CLASS_KIND_STARVED`;
+`hort_server::composition` constants `CLASS_UNSERVED_METRIC`,
+`CLASS_PENDING_ELIGIBLE_METRIC`, `CLASS_AWAITING_CAPACITY_METRIC`,
+`CLASS_KIND_UNSERVED_METRIC`, `CLASS_KIND_PENDING_ELIGIBLE_METRIC`,
+`CLASS_KIND_AWAITING_CAPACITY_METRIC` (the six server-emitted gauges),
+`KIND_SERIES` (the kind vocabulary the fine series are emitted over) and
 `CLASS_SERVICE_SAMPLE_INTERVAL` (their cadence).
 
 ### Policy enforcement

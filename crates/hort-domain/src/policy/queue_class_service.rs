@@ -35,7 +35,7 @@
 //! - It sees the second allocation point. A row that has been claimed
 //!   and is waiting for a run permit is `status = 'running'`, so it is
 //!   outside the claim-eligible backlog by construction; it reaches this
-//!   predicate as [`BandQueueSample::awaiting_capacity`], which is what
+//!   predicate as [`QueueServiceSample::awaiting_capacity`], which is what
 //!   makes permit starvation observable rather than inferred from
 //!   end-to-end latency.
 //!
@@ -55,7 +55,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::ports::jobs_repository::BandQueueSample;
+use crate::ports::jobs_repository::QueueServiceSample;
 
 /// How long work of a class may be waiting with nothing of that class
 /// served before the class counts as unserved — the default of
@@ -281,7 +281,7 @@ impl ClassService {
 /// `not_claimed` has been checked for a capacity shortage and does not
 /// have one.
 pub fn evaluate_class_service(
-    sample: &BandQueueSample,
+    sample: &QueueServiceSample,
     now: DateTime<Utc>,
     threshold: Duration,
 ) -> ClassService {
@@ -479,8 +479,8 @@ mod tests {
 
     /// A sample with nothing in it — each test sets only the fields it
     /// is about, so a reader can see which facts a verdict rests on.
-    fn empty() -> BandQueueSample {
-        BandQueueSample {
+    fn empty() -> QueueServiceSample {
+        QueueServiceSample {
             pending_eligible: 0,
             oldest_pending_at: None,
             awaiting_capacity: 0,
@@ -503,7 +503,7 @@ mod tests {
         // The quiet-deployment shape: nothing of this class has
         // completed in a day, and nothing is waiting either. A class
         // nobody is asking anything of is not being starved.
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             last_served_at: Some(ts(NOW - 86_400)),
             ..empty()
         };
@@ -517,7 +517,7 @@ mod tests {
     fn negative_counts_are_treated_as_no_work() {
         // `count(*)` cannot return a negative, but the port's type is
         // signed; a negative must not become a positive `waiting`.
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: -5,
             awaiting_capacity: -1,
             ..empty()
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn work_waiting_inside_the_threshold_is_served() {
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 3,
             oldest_pending_at: Some(ts(NOW - 100)),
             ..empty()
@@ -552,7 +552,7 @@ mod tests {
         // hours old because the queue is deep, and the class is being
         // served every few seconds. This is exactly the state the
         // per-kind `oldest_row_stalled` axis reports as starvation.
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 10_000,
             oldest_pending_at: Some(ts(NOW - 7_200)),
             last_served_at: Some(ts(NOW - 5)),
@@ -572,7 +572,7 @@ mod tests {
         // The quiet deployment: nothing of this class has completed for
         // an hour, and a row arrives now. Without the arrival floor the
         // very first row would be reported as an hour of starvation.
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 1,
             oldest_pending_at: Some(ts(NOW - 2)),
             last_served_at: Some(ts(NOW - 3_600)),
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn a_wait_exactly_at_the_threshold_is_not_yet_starved() {
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 1,
             oldest_pending_at: Some(ts(NOW - 300)),
             ..empty()
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn a_future_timestamp_is_not_evidence_of_a_stall() {
         // Clock skew between the sampling process and the database.
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 2,
             oldest_pending_at: Some(ts(NOW + 50)),
             ..empty()
@@ -624,7 +624,7 @@ mod tests {
     fn a_positive_count_with_no_timestamp_is_not_starved() {
         // Unreachable from the adapter (count and timestamp come from
         // one FILTER); resolved toward "waiting since now".
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 4,
             awaiting_capacity: 2,
             ..empty()
@@ -642,7 +642,7 @@ mod tests {
 
     #[test]
     fn pending_work_waiting_past_the_threshold_with_no_service_is_starved() {
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 2,
             oldest_pending_at: Some(ts(NOW - 400)),
             ..empty()
@@ -663,7 +663,7 @@ mod tests {
     fn service_older_than_the_threshold_does_not_rescue_a_waiting_class() {
         // Served once, long ago, and the work has been waiting since
         // before that: the reference is the service, and it is stale.
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 7,
             oldest_pending_at: Some(ts(NOW - 5_000)),
             last_served_at: Some(ts(NOW - 900)),
@@ -690,7 +690,7 @@ mod tests {
         // Nothing of this class is in the pending backlog at all — the
         // rows have been claimed and are queued behind a run permit, so
         // no read of `status = 'pending'` can see them.
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             awaiting_capacity: 3,
             oldest_capacity_wait_at: Some(ts(NOW - 700)),
             last_served_at: Some(ts(NOW - 7_200)),
@@ -712,7 +712,7 @@ mod tests {
     fn the_permit_point_is_named_even_when_pending_work_is_older() {
         // Both points are blocked. The permit point is reported because
         // it is the one a pending-backlog read cannot see.
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 5,
             oldest_pending_at: Some(ts(NOW - 9_000)),
             awaiting_capacity: 1,
@@ -736,7 +736,7 @@ mod tests {
         // The permit is not the holdup: that row has been waiting
         // seconds. The label has to point at the claim, or a reader
         // cannot tell the two points apart.
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 5,
             oldest_pending_at: Some(ts(NOW - 9_000)),
             awaiting_capacity: 1,
@@ -761,7 +761,7 @@ mod tests {
         // One row has waited twenty minutes for a permit while the
         // class completed something two seconds ago — the capacity is
         // busy with this very class, which is service, not starvation.
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             awaiting_capacity: 1,
             oldest_capacity_wait_at: Some(ts(NOW - 1_200)),
             last_served_at: Some(ts(NOW - 2)),
@@ -780,7 +780,7 @@ mod tests {
 
     #[test]
     fn a_zero_threshold_over_alerts_rather_than_never_alerting() {
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 1,
             oldest_pending_at: Some(ts(NOW - 1)),
             ..empty()
@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn a_zero_wait_at_a_zero_threshold_is_served() {
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 1,
             oldest_pending_at: Some(now()),
             ..empty()
@@ -815,7 +815,7 @@ mod tests {
 
     #[test]
     fn an_absurd_threshold_saturates_without_panicking() {
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: 1,
             oldest_pending_at: Some(ts(0)),
             ..empty()
@@ -831,7 +831,7 @@ mod tests {
 
     #[test]
     fn a_saturating_waiting_count_does_not_wrap() {
-        let sample = BandQueueSample {
+        let sample = QueueServiceSample {
             pending_eligible: i64::MAX,
             oldest_pending_at: Some(ts(NOW - 10)),
             awaiting_capacity: 2,
