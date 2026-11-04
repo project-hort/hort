@@ -149,6 +149,27 @@ pub(crate) async fn enqueue_provenance_verify_in_tx(
 /// reservation would mean the replacement never takes effect at the one
 /// batch size where a single slot decides everything.
 ///
+/// # The batch a caller may ask for
+///
+/// The order above means the reserved pass can consume
+/// `bands × slots_per_band` of the batch before `oldest` is reached, and
+/// `oldest` is the only guarantee of service for a class with no
+/// reserved share (ADR 0066 D5). So a batch at or below that product
+/// serves one fewer class than the deployment has, and
+/// `hort-worker` **refuses to start** there rather than claiming that
+/// way: the minimum is
+/// [`ClaimReservation::minimum_batch_size`] —
+/// `bands × slots_per_band + 1`, three with today's two waited-on
+/// classes and the default share — so the paragraph above describes a
+/// batch size no worker now runs on.
+///
+/// This statement is deliberately not where that is enforced. It
+/// degrades correctly at every batch including zero (the
+/// `GREATEST`/`LEAST` wrappers below are what make that true), because
+/// a claim that locked rows the caller did not ask for would be a worse
+/// failure than an under-served class, and because the arithmetic
+/// belongs where the operator sets the number.
+///
 /// # The classification does not reach this SQL
 ///
 /// The reservation is expressed on `priority` against **bind
@@ -338,7 +359,10 @@ const RENEW_LEASE_SQL: &str = "UPDATE public.jobs SET\n\
 /// reason — a worker whose row was swept and handed on must not write
 /// to the row its successor now holds — so the two writes the
 /// dispatcher makes against a *running* row agree about who may make
-/// them. `rows_affected() == 0` is "the row moved on", not an error.
+/// them. `rows_affected() == 0` is "the row moved on", not an error —
+/// and it is the answer the dispatcher declines the dispatch on, since
+/// this write sits between the permit grant and the handler and is
+/// therefore the last statement about ownership before the work runs.
 const CLEAR_CAPACITY_WAIT_SQL: &str = "UPDATE public.jobs SET\n\
                      capacity_waiting_since = NULL,\n\
                      updated_at = now()\n\

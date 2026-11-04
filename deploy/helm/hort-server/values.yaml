@@ -1096,6 +1096,14 @@ worker:
     # HORT_SCANNER_POLL_INTERVAL_SECS — default 5.
     pollIntervalSecs: 5
     # HORT_SCANNER_BATCH_SIZE — default 4 (FOR UPDATE SKIP LOCKED batch).
+    #
+    # Must be at least
+    # `waited-on classes × HORT_SCANNER_RESERVED_SLOTS_PER_CLASS + 1`,
+    # which is 3 at that variable's default of 1: the claim fills the
+    # per-class reservation first and then one priority-blind oldest row,
+    # and that row is the only guarantee of service for bulk work, which
+    # has no reserved share. A smaller pair fails worker startup rather
+    # than silently dropping a class from the allocation.
     batchSize: 4
     # HORT_SCANNER_MAX_ATTEMPTS — default 6.
     maxAttempts: 6

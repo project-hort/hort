@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A worker whose `HORT_SCANNER_BATCH_SIZE` is too small to serve every work
+  class now refuses to start instead of silently never claiming one of them:
+  raise it to at least
+  `waited-on classes × HORT_SCANNER_RESERVED_SLOTS_PER_CLASS + 1` (`3` at the
+  default share, which the shipped default of `4` already clears). A row handed
+  to another worker while this one waited for capacity is also no longer run
+  twice (#409).
 - Repeated OCI manifest ingests now restore missing constituent claims, keeping their bytes protected from storage GC (#410).
 - Operator-requested work now runs on an instance with sustained client traffic (#405).
 - OCI digest request parameters that violate the descriptor grammar now return
