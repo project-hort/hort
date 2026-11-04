@@ -450,6 +450,12 @@ mod tests {
     /// propagates port errors without re-shaping them.
     struct FailingFindIndex;
     impl ContentReferenceIndex for FailingFindIndex {
+        fn insert_missing(
+            &self,
+            _rows: &[ContentReference],
+        ) -> BoxFuture<'_, hort_domain::error::DomainResult<u64>> {
+            Box::pin(async { Ok(0) })
+        }
         fn insert(
             &self,
             _row: ContentReference,
@@ -555,6 +561,12 @@ mod tests {
     /// Stub for testing port-error propagation on the delete side.
     struct FailingDeleteIndex;
     impl ContentReferenceIndex for FailingDeleteIndex {
+        fn insert_missing(
+            &self,
+            _rows: &[ContentReference],
+        ) -> BoxFuture<'_, hort_domain::error::DomainResult<u64>> {
+            Box::pin(async { Ok(0) })
+        }
         fn insert(
             &self,
             _row: ContentReference,

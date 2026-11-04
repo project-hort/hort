@@ -6484,6 +6484,41 @@ impl MockContentReferenceIndex {
 }
 
 impl ContentReferenceIndex for MockContentReferenceIndex {
+    fn insert_missing(&self, references: &[ContentReference]) -> BoxFuture<'_, DomainResult<u64>> {
+        let mut entries = self.entries.lock().unwrap();
+        let before = entries.clone();
+        let mut written = 0;
+        for reference in references {
+            let key = (
+                reference.repository_id,
+                reference.source_artifact_id,
+                reference.target_content_hash.as_ref().to_owned(),
+                reference.kind.clone(),
+            );
+            if entries.contains_key(&key) {
+                continue;
+            }
+            let error = self.next_insert_error.lock().unwrap().take().or_else(|| {
+                let mut targeted = self.next_insert_error_for_kind.lock().unwrap();
+                if targeted
+                    .as_ref()
+                    .is_some_and(|(kind, _)| kind == &reference.kind)
+                {
+                    targeted.take().map(|(_, err)| err)
+                } else {
+                    None
+                }
+            });
+            if let Some(err) = error {
+                *entries = before;
+                return Box::pin(async move { Err(err) });
+            }
+            entries.insert(key, reference.clone());
+            written += 1;
+        }
+        Box::pin(async move { Ok(written) })
+    }
+
     fn insert(&self, reference: ContentReference) -> BoxFuture<'_, DomainResult<()>> {
         // Upsert via `HashMap::insert` — the existing entry (if any) for
         // the SAME `(repo, source, target, kind)` key is replaced,

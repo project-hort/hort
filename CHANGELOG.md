@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Repeated OCI manifest ingests now restore missing constituent claims, keeping their bytes protected from storage GC (#410).
 - Operator-requested work now runs on an instance with sustained client traffic (#405).
 - OCI digest request parameters that violate the descriptor grammar now return
   `DIGEST_INVALID`; malformed image-index child digests return `MANIFEST_INVALID`

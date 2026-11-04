@@ -471,6 +471,11 @@ pub enum VerifiedIngestRequest {
 pub struct IngestOutcome {
     pub artifact: Artifact,
     pub ingested_event_id: Uuid,
+    /// Number of caller-supplied content claims written by this ingest.
+    /// A fresh transition commits the whole claim set atomically; a dedup
+    /// reports the insert-only port's affected-row count, which is zero
+    /// when all claims already exist.
+    pub claimed_edges_written: u64,
 }
 
 /// Map an error returned from the ingest pipeline to an `IngestResult`
@@ -1337,7 +1342,7 @@ impl IngestUseCase {
         let elapsed = started.elapsed().as_secs_f64();
         let (result_label, repository_label, size_emitted): (&'static str, String, Option<u64>) =
             match &result {
-                Ok((artifact, was_duplicate, repo_key, _)) => {
+                Ok(((artifact, was_duplicate, repo_key, _), _)) => {
                     let label = if *was_duplicate {
                         IngestResult::Duplicate.as_str()
                     } else {
@@ -1391,10 +1396,13 @@ impl IngestUseCase {
         }
 
         match result {
-            Ok((artifact, _duplicate, _repo_key, ingested_event_id)) => Ok(IngestOutcome {
-                artifact,
-                ingested_event_id,
-            }),
+            Ok(((artifact, _duplicate, _repo_key, ingested_event_id), claimed_edges_written)) => {
+                Ok(IngestOutcome {
+                    artifact,
+                    ingested_event_id,
+                    claimed_edges_written,
+                })
+            }
             Err((err, _repo_key, _preclassified)) => Err(err),
         }
     }
@@ -1837,6 +1845,7 @@ impl IngestUseCase {
         Ok(IngestOutcome {
             artifact,
             ingested_event_id,
+            claimed_edges_written: claimed_edges.len() as u64,
         })
     }
 
@@ -2278,7 +2287,7 @@ impl IngestUseCase {
         };
 
         match result {
-            Ok((artifact, was_duplicate, repo_key, ingested_event_id)) => {
+            Ok(((artifact, was_duplicate, repo_key, ingested_event_id), claimed_edges_written)) => {
                 let result_label = if was_duplicate {
                     IngestResult::Duplicate.as_str()
                 } else {
@@ -2291,6 +2300,7 @@ impl IngestUseCase {
                 Ok(IngestOutcome {
                     artifact,
                     ingested_event_id,
+                    claimed_edges_written,
                 })
             }
             Err((inner_err, repo_key, preclassified)) => {
@@ -3848,7 +3858,7 @@ impl IngestUseCase {
         // `false` (they ARE the seed). Derived from the verified request's
         // `payload_metadata.cascade_internal` in `ingest_with_verification`.
         suppress_cascade_seed: bool,
-    ) -> Result<IngestInnerOk, IngestInnerError> {
+    ) -> Result<(IngestInnerOk, u64), IngestInnerError> {
         let repo = self
             .verify_repository_and_format(repository_id, &coords)
             .await?;
@@ -3864,7 +3874,13 @@ impl IngestUseCase {
             )
             .await?
         {
-            ControlFlow::Break(early_ok) => return Ok(early_ok),
+            ControlFlow::Break(early_ok) => {
+                let written = self
+                    .reconcile_claimed_edges(&early_ok.0, claimed_edges)
+                    .await
+                    .map_err(|e| (InnerIngestError::Other(e), Some(repo_key.clone()), None))?;
+                return Ok((early_ok, written));
+            }
             ControlFlow::Continue(existing) => existing,
         };
 
@@ -3878,7 +3894,13 @@ impl IngestUseCase {
             )
             .await?
         {
-            ControlFlow::Break(early_ok) => return Ok(early_ok),
+            ControlFlow::Break(early_ok) => {
+                let written = self
+                    .reconcile_claimed_edges(&early_ok.0, claimed_edges)
+                    .await
+                    .map_err(|e| (InnerIngestError::Other(e), Some(repo_key.clone()), None))?;
+                return Ok((early_ok, written));
+            }
             ControlFlow::Continue(put_result) => put_result,
         };
 
@@ -4251,7 +4273,36 @@ impl IngestUseCase {
         )
         .await;
 
-        Ok((artifact, false, repo_key, artifact_ingested_event_id))
+        Ok((
+            (artifact, false, repo_key, artifact_ingested_event_id),
+            claimed_edges.len() as u64,
+        ))
+    }
+
+    /// Reassert foreign-byte claims on an existing artifact without a new
+    /// artifact transition. The storage GC lock and inserted-row count are
+    /// supplied by the index port; the row shape stays `ingest_edges`'s.
+    pub async fn reconcile_claimed_edges(
+        &self,
+        artifact: &Artifact,
+        claimed_edges: &[ContentReferenceClaim],
+    ) -> AppResult<u64> {
+        if claimed_edges.is_empty() {
+            return Ok(0);
+        }
+        let edges = Self::ingest_edges(
+            artifact,
+            artifact.repository_id,
+            None,
+            claimed_edges,
+            Utc::now(),
+        );
+        // `ingest_edges` emits `primary_content` first, and the existing row
+        // already owns that edge; only its foreign-byte claims can be missing.
+        self.content_references
+            .insert_missing(&edges[1..])
+            .await
+            .map_err(AppError::Domain)
     }
 
     /// Register a pre-existing CAS object into the target repository by
@@ -4288,7 +4339,9 @@ impl IngestUseCase {
     /// "duplicate"}`. Different hash at the same path returns
     /// `DomainError::Conflict`. Mirrors [`Self::ingest`]'s dedup
     /// semantics so retries on a lossy network do not corrupt the
-    /// aggregate.
+    /// aggregate. A duplicate also inserts any missing caller-supplied
+    /// foreign-byte claims without appending another artifact event; a
+    /// failed claim insert fails the call so another retry can repair it.
     ///
     /// **Dedup-path `ingested_event_id` caveat.** On the same-path-
     /// same-hash dedup return, the `ingested_event_id` is a freshly-
@@ -4337,6 +4390,7 @@ impl IngestUseCase {
         handler: &dyn FormatHandler,
     ) -> AppResult<IngestOutcome> {
         let format = req.coords.format.to_string();
+        let claimed_count = req.claimed_edges.len() as u64;
         let started = Instant::now();
 
         let result = self
@@ -4362,7 +4416,9 @@ impl IngestUseCase {
                     self.repo_label(Some(repo_key)),
                     Some(artifact.size_bytes),
                 ),
-                Ok(RegisterOutcome::Duplicate { artifact, repo_key }) => (
+                Ok(RegisterOutcome::Duplicate {
+                    artifact, repo_key, ..
+                }) => (
                     IngestResult::Duplicate.as_str(),
                     self.repo_label(Some(repo_key)),
                     Some(artifact.size_bytes),
@@ -4410,12 +4466,18 @@ impl IngestUseCase {
             }) => Ok(IngestOutcome {
                 artifact,
                 ingested_event_id,
+                claimed_edges_written: claimed_count,
             }),
-            Ok(RegisterOutcome::Duplicate { artifact, .. }) => Ok(IngestOutcome {
+            Ok(RegisterOutcome::Duplicate {
+                artifact,
+                claimed_edges_written,
+                ..
+            }) => Ok(IngestOutcome {
                 artifact,
                 // Dedup path: caller-visible id is a fresh uuid that
                 // points at no persisted event. See method docstring.
                 ingested_event_id: Uuid::new_v4(),
+                claimed_edges_written,
             }),
             Err(RegisterError::MetadataTooLarge { err, .. }) => Err(err),
             Err(RegisterError::Other { err, .. }) => Err(err),
@@ -4677,16 +4739,36 @@ impl IngestUseCase {
                 // success and changes nothing. The criterion for "no gate
                 // result" and why each of its three parts is load-bearing
                 // live on the method.
-                return Ok(self
+                // Unlike the gate catch-up below, a failed claim repair
+                // fails the call. The two heals sit one line apart and have
+                // opposite failure policies on purpose: a missing gate
+                // result leaves a servable row whose verdict the next
+                // repeat can still land, while a missing claim lets the
+                // storage GC collect the bytes this row serves. So the
+                // gate's "never turn a 201 into a 500" does not carry
+                // here — reporting success over an unclaimed blob is how
+                // the content goes away, not just the evidence.
+                let claimed_edges_written = self
+                    .reconcile_claimed_edges(&existing, &claimed_edges)
+                    .await
+                    .map_err(|err| RegisterError::Other {
+                        err,
+                        repo_key: Some(repo_key.clone()),
+                    })?;
+                let artifact = self
                     .dedup_or_catch_up_gate(
                         existing,
-                        repo_key,
                         quarantine_anchor_override,
                         trigger_source,
                         &scan_enqueue_format,
                         &actor,
                     )
-                    .await);
+                    .await;
+                return Ok(RegisterOutcome::Duplicate {
+                    artifact,
+                    repo_key,
+                    claimed_edges_written,
+                });
             }
             return Err(RegisterError::Other {
                 err: AppError::Domain(DomainError::Conflict(format!(
@@ -5528,20 +5610,16 @@ impl IngestUseCase {
     async fn dedup_or_catch_up_gate(
         &self,
         existing: Artifact,
-        repo_key: String,
         quarantine_anchor_override: Option<DateTime<Utc>>,
         trigger_source: &str,
         scan_enqueue_format: &str,
         actor: &ApiActor,
-    ) -> RegisterOutcome {
+    ) -> Artifact {
         // Conjunct 1, on the row the dedup already holds — free, and it
         // short-circuits every gated row in a quarantining repository
         // before any further I/O.
         if existing.quarantine_status != QuarantineStatus::None {
-            return RegisterOutcome::Duplicate {
-                artifact: existing,
-                repo_key,
-            };
+            return existing;
         }
 
         let artifact_id = existing.id;
@@ -5570,10 +5648,7 @@ impl IngestUseCase {
                      whether its gate ran is unknown; answering duplicate unchanged \
                      (the next repeat re-checks)"
                 );
-                return RegisterOutcome::Duplicate {
-                    artifact: existing,
-                    repo_key,
-                };
+                return existing;
             }
         };
 
@@ -5582,10 +5657,7 @@ impl IngestUseCase {
         // in the version, so this is the half of the fail-closed pair
         // `load` provides (the append losing is the other).
         if paired.artifact().quarantine_status != QuarantineStatus::None {
-            return RegisterOutcome::Duplicate {
-                artifact: paired.into_artifact(),
-                repo_key,
-            };
+            return paired.into_artifact();
         }
 
         // Conjunct 2.
@@ -5603,10 +5675,7 @@ impl IngestUseCase {
             }
         };
         if gate_output_present {
-            return RegisterOutcome::Duplicate {
-                artifact: paired.into_artifact(),
-                repo_key,
-            };
+            return paired.into_artifact();
         }
 
         // Conjunct 3.
@@ -5614,10 +5683,7 @@ impl IngestUseCase {
             .resolve_register_gate(repository_id, artifact_id, scan_enqueue_format)
             .await;
         if !gate.appends_a_durable_event() {
-            return RegisterOutcome::Duplicate {
-                artifact: paired.into_artifact(),
-                repo_key,
-            };
+            return paired.into_artifact();
         }
 
         // Applying the gate and committing it are ONE fallible step with
@@ -5644,10 +5710,7 @@ impl IngestUseCase {
                      concurrent repeat that landed the same gate first); answering \
                      duplicate unchanged"
                 );
-                return RegisterOutcome::Duplicate {
-                    artifact: paired.into_artifact(),
-                    repo_key,
-                };
+                return paired.into_artifact();
             }
         };
 
@@ -5678,7 +5741,7 @@ impl IngestUseCase {
         // post-coalesce cross-repo branch renders exactly this row into
         // its `503`, and the pre-catch-up row would advertise a
         // deadline-unknown constant over a window that now exists.
-        RegisterOutcome::Duplicate { artifact, repo_key }
+        artifact
     }
 
     /// The catch-up's whole write: apply `gate` to a clone of the paired
@@ -5831,6 +5894,7 @@ enum RegisterOutcome {
     Duplicate {
         artifact: Artifact,
         repo_key: String,
+        claimed_edges_written: u64,
     },
 }
 
@@ -9928,6 +9992,129 @@ mod tests {
         });
     }
 
+    /// A follower can find an existing manifest row whose foreign-byte
+    /// claims were absent at mint time. Its repeat has the manifest body
+    /// again, so it must restore those claims without minting another row.
+    #[tokio::test]
+    async fn register_existing_cas_blob_repeat_restores_missing_manifest_claims() {
+        let repo = oci_repo();
+        let repo_id = repo.id;
+        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
+        let layer: ContentHash = ZERO_HASH.parse().unwrap();
+        let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs, refs, _events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        seed_permissive_global_policy(&policies);
+        storage.insert_content(hash.clone(), b"manifest".to_vec());
+
+        let mut first_req = recb_req(repo_id, hash.clone());
+        first_req.coords = oci_coords();
+        let first = uc
+            .register_existing_cas_blob(first_req, &test_handler())
+            .await
+            .expect("initial follower registration succeeds");
+        assert!(
+            refs.find_by_target(repo_id, &layer, Some("oci_layer"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "the first registration has no foreign-byte claim"
+        );
+
+        let claimed_layer = ContentReferenceClaim {
+            target_content_hash: layer.clone(),
+            kind: "oci_layer".into(),
+            metadata: serde_json::json!({}),
+        };
+        let mut repeat_req = recb_req(repo_id, hash.clone());
+        repeat_req.coords = oci_coords();
+        repeat_req.claimed_edges = vec![claimed_layer.clone()];
+        let repeat = uc
+            .register_existing_cas_blob(repeat_req, &test_handler())
+            .await
+            .expect("repeat follower registration restores the missing claim");
+
+        assert_eq!(first.artifact.id, repeat.artifact.id);
+        assert_eq!(repeat.claimed_edges_written, 1);
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+        let claims = refs
+            .find_by_target(repo_id, &layer, Some("oci_layer"))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1, "the layer is no longer GC-eligible");
+        assert_eq!(claims[0].source_artifact_id, first.artifact.id);
+
+        let mut third_req = recb_req(repo_id, hash);
+        third_req.coords = oci_coords();
+        third_req.claimed_edges = vec![claimed_layer];
+        let third = uc
+            .register_existing_cas_blob(third_req, &test_handler())
+            .await
+            .expect("already-restored claim stays idempotent");
+        assert_eq!(third.claimed_edges_written, 0);
+    }
+
+    /// A failed repair cannot claim success: the missing edge is still
+    /// absent, and the next repeat must be able to write it.
+    #[tokio::test]
+    async fn register_existing_cas_blob_repeat_retries_failed_claim_repair() {
+        let repo = oci_repo();
+        let repo_id = repo.id;
+        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
+        let layer: ContentHash = ZERO_HASH.parse().unwrap();
+        let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs, refs, _events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        seed_permissive_global_policy(&policies);
+        storage.insert_content(hash.clone(), b"manifest".to_vec());
+
+        let claim = ContentReferenceClaim {
+            target_content_hash: layer.clone(),
+            kind: "oci_layer".into(),
+            metadata: serde_json::json!({}),
+        };
+        let request = |claimed_edges| {
+            let mut req = recb_req(repo_id, hash.clone());
+            req.coords = oci_coords();
+            req.claimed_edges = claimed_edges;
+            req
+        };
+        uc.register_existing_cas_blob(request(Vec::new()), &test_handler())
+            .await
+            .expect("initial registration succeeds");
+        refs.fail_next_insert_for_kind(
+            "oci_layer",
+            DomainError::Invariant("synthetic claim repair failure".into()),
+        );
+
+        let err = uc
+            .register_existing_cas_blob(request(vec![claim.clone()]), &test_handler())
+            .await
+            .expect_err("a failed repair must fail the duplicate call");
+        assert!(matches!(err, AppError::Domain(DomainError::Invariant(_))));
+        assert!(
+            refs.find_by_target(repo_id, &layer, Some("oci_layer"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failed repair leaves the foreign bytes GC-eligible"
+        );
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+
+        let retry = uc
+            .register_existing_cas_blob(request(vec![claim]), &test_handler())
+            .await
+            .expect("next repeat repairs the claim");
+        assert_eq!(retry.claimed_edges_written, 1);
+        assert_eq!(
+            refs.find_by_target(repo_id, &layer, Some("oci_layer"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     // ----- register_by_hash: the gate-aware dedup ------------------------
     //
     // A repeat of a mount whose gate never landed runs the gate instead of
@@ -10668,7 +10855,6 @@ mod tests {
     async fn a_repeat_whose_row_was_terminalised_since_the_dedup_read_does_not_re_gate_it() {
         let repo = pypi_repository();
         let repo_id = repo.id;
-        let repo_key = repo.key.clone();
         let hash: ContentHash = ZERO_HASH.parse().unwrap();
 
         let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, events) =
@@ -10684,21 +10870,16 @@ mod tests {
         rejected_since.quarantine_status = QuarantineStatus::Rejected;
         artifacts.insert(rejected_since);
 
-        let outcome = uc
+        let artifact = uc
             .dedup_or_catch_up_gate(
                 // The dedup's own, now-stale read.
                 existing.clone(),
-                repo_key,
                 None,
                 REGISTER_BY_HASH_TRIGGER_SOURCE,
                 "pypi",
                 &api_actor(),
             )
             .await;
-
-        let RegisterOutcome::Duplicate { artifact, .. } = outcome else {
-            panic!("a terminalised row must answer Duplicate, never Fresh");
-        };
         assert_eq!(
             artifact.quarantine_status,
             QuarantineStatus::Rejected,
