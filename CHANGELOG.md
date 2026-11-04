@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Background work now runs on a worker whose client-waited queues never empty:
+  past a bound derived from `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` the
+  longest-waiting row takes the next run permit whatever its class. A worker
+  started with `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0` now warns at startup
+  which guarantee that waives (#414).
 - A worker whose `HORT_SCANNER_BATCH_SIZE` is too small to serve every work
   class now refuses to start instead of silently never claiming one of them:
   raise it to at least

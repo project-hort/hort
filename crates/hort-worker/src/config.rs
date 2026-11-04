@@ -861,6 +861,28 @@ impl WorkerConfig {
             metrics_bind_addr,
         })
     }
+
+    /// What this worker's share of zero gives up, or `None` when the
+    /// reservation is on — the statement the binary makes at startup.
+    ///
+    /// ADR 0066 permits `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0` on
+    /// one condition: the deployment says which guarantee it waived.
+    /// The zero is also the only share the batch rule above cannot
+    /// complain about — the minimum batch at a share of zero is
+    /// `0 × bands + 1 = 1`, so every batch clears it while every
+    /// mechanism the rule protects is off — so without this statement
+    /// the one configuration that removes the guarantee is the one
+    /// configuration that boots silently.
+    ///
+    /// The text is the domain's
+    /// ([`hort_domain::policy::class_reservation_waiver`]), beside the
+    /// enforcement times it names; this reads it off the share **this
+    /// worker was configured with**, so the statement cannot be about a
+    /// number the worker is not running.
+    #[must_use]
+    pub fn class_reservation_waiver(&self) -> Option<&'static str> {
+        hort_domain::policy::class_reservation_waiver(self.reserved_slots_per_class)
+    }
 }
 
 /// Resolve `HORT_WORKER_METRICS_BIND`.
@@ -1532,6 +1554,47 @@ mod tests {
                 "the refusal must carry {fragment:?}: {reason}"
             );
         }
+    }
+
+    /// The zero is permitted, so it starts — and it does not start
+    /// quietly.
+    ///
+    /// ADR 0066's condition on the waiver is that it is never silent,
+    /// and this share is the one the batch rule above cannot refuse: at
+    /// zero the minimum batch is one, so the check passes exactly when
+    /// the reservation, its time floor and the age net beneath them are
+    /// all off. The counter-assertion is the shipped share, which has
+    /// nothing to state.
+    #[test]
+    fn a_zero_share_starts_and_states_what_it_waived() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var("HORT_SCANNER_RESERVED_SLOTS_PER_CLASS", "0");
+
+        let cfg = WorkerConfig::from_env().expect("a share of zero is a permitted waiver");
+        assert_eq!(cfg.reserved_slots_per_class, 0);
+        let waiver = cfg
+            .class_reservation_waiver()
+            .expect("a worker that gave the guarantee up must say so at startup");
+        for fragment in [
+            "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0",
+            "no class is guaranteed service",
+        ] {
+            assert!(
+                waiver.contains(fragment),
+                "the startup statement must carry {fragment:?}: {waiver}"
+            );
+        }
+
+        std::env::set_var("HORT_SCANNER_RESERVED_SLOTS_PER_CLASS", "1");
+        let reserved = WorkerConfig::from_env().expect("the shipped share must start");
+        assert_eq!(
+            reserved.class_reservation_waiver(),
+            None,
+            "a worker holding the guarantee has no waiver to state"
+        );
     }
 
     /// The shipped pair starts — and so does every pair at or above the

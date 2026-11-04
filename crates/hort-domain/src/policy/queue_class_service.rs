@@ -92,6 +92,70 @@ pub fn permit_service_interval(audit_threshold: Duration) -> Duration {
     audit_threshold / 2
 }
 
+/// Serve the longest-waiting row of **any** class past three quarters
+/// of the configured audit window — the bound of the class-blind age
+/// net beneath the per-class reservation (ADR 0066 D5).
+///
+/// # The one sentence for the factor
+///
+/// Three quarters is the midpoint of the only interval the two numbers
+/// already in play leave open: strictly above
+/// [`permit_service_interval`] (half the threshold), so a below-share
+/// waited-on class still reaches its own time floor first and that
+/// pass keeps deciding; and strictly below the audit threshold itself,
+/// so the net resolves a wait *before* the audit reports it rather than
+/// at the instant it fires — which is the same "enforcement below
+/// observation" rule the time floor is placed by.
+///
+/// # Why it is derived and not configured
+///
+/// The guarantee, its two enforcement times and its observation are
+/// one operator number (`HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS`). A
+/// second variable for the net would let a deployment order the three
+/// any way it liked, including the two orderings that make a pass dead:
+/// a bound at or below the service interval retires the service pass,
+/// and a bound at or above the threshold makes the audit report a state
+/// the scheduler had already decided to leave.
+///
+/// Dividing before multiplying, so an absurd threshold saturates
+/// instead of overflowing [`Duration`]'s multiplication — the reason
+/// [`permit_service_interval`] divides directly. At a threshold of
+/// zero all three collapse to zero and every pass fires on the first
+/// sample, which is the direction [`evaluate_class_service`] errs in
+/// too: over-alerting rather than never alerting.
+pub fn permit_age_net_bound(audit_threshold: Duration) -> Duration {
+    audit_threshold / 4 * 3
+}
+
+/// What a `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS` of zero gives up —
+/// the statement a worker configured that way makes at startup — or
+/// `None` when the reservation is on.
+///
+/// ADR 0066 permits the zero and attaches one condition: *"A deployment
+/// configured this way states at startup which guarantee it has given
+/// up"*, because a decision switched off without saying so is
+/// indistinguishable from one that failed. The zero is also the one
+/// configuration the worker's batch-size check cannot complain about —
+/// at a share of zero the minimum batch is `0 × bands + 1 = 1`, so
+/// every batch clears it while every mechanism the check exists to
+/// protect is off.
+///
+/// The text lives here, beside the two enforcement times it names
+/// ([`permit_service_interval`] and [`permit_age_net_bound`]), so the
+/// statement and the mechanisms it is about cannot drift apart; the
+/// worker emits it as a `warn!`, not a `debug!`.
+pub fn class_reservation_waiver(reserved_slots_per_class: u16) -> Option<&'static str> {
+    (reserved_slots_per_class == 0).then_some(
+        "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0 waives ADR 0066's service guarantee: no \
+         per-class reservation at either point this worker allocates capacity (the claim \
+         batch and the per-kind run permits), no per-class time floor and no class-blind \
+         age net beneath them. Work is claimed and run in arrival order, so no class is \
+         guaranteed service and a sustained flood of one class can shut the others out of \
+         both points. This is a permitted configuration; set the share to 1 or more to \
+         restore the guarantee.",
+    )
+}
+
 /// Where a starved class's work is stuck — the `reason` label on the
 /// per-class starvation counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +379,91 @@ mod tests {
             permit_service_interval(Duration::from_secs(u64::MAX)),
             Duration::from_secs(u64::MAX) / 2
         );
+    }
+
+    #[test]
+    fn permit_age_net_bound_is_three_quarters_of_the_audit_threshold() {
+        assert_eq!(
+            permit_age_net_bound(Duration::from_secs(300)),
+            Duration::from_secs(225)
+        );
+        assert_eq!(permit_age_net_bound(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            permit_age_net_bound(Duration::from_secs(1)),
+            Duration::from_millis(750)
+        );
+        // Dividing before multiplying: `Duration`'s multiplication
+        // panics on overflow, and the threshold is operator input with
+        // no upper clamp.
+        assert_eq!(
+            permit_age_net_bound(Duration::from_secs(u64::MAX)),
+            Duration::from_secs(u64::MAX) / 4 * 3
+        );
+    }
+
+    /// The bound sits strictly between the two numbers that were
+    /// already derived from the same threshold, at every threshold an
+    /// operator can set.
+    ///
+    /// Both inequalities are load-bearing and in opposite directions. A
+    /// bound at or below the service interval would retire the service
+    /// pass — that pass asks whether a *class* has been served lately
+    /// (`max(last grant, arrival)`) and the net asks whether a *row* has
+    /// waited too long (arrival alone), so for a never-served class the
+    /// two coincide and the earlier one decides everything. A bound at
+    /// or above the threshold would make the audit report a wait the
+    /// scheduler was already resolving.
+    #[test]
+    fn the_age_net_bound_is_strictly_between_the_service_interval_and_the_threshold() {
+        for secs in [1u64, 2, 7, 60, 300, 301, 3_600, 86_400, u64::MAX / 8] {
+            let threshold = Duration::from_secs(secs);
+            let interval = permit_service_interval(threshold);
+            let bound = permit_age_net_bound(threshold);
+            assert!(
+                interval < bound,
+                "at {secs} s the net must not swallow the service pass: \
+                 interval {interval:?}, bound {bound:?}"
+            );
+            assert!(
+                bound < threshold,
+                "at {secs} s the net must act before the audit reports: \
+                 bound {bound:?}, threshold {threshold:?}"
+            );
+        }
+        // The one degenerate threshold, and the direction it degenerates
+        // in: everything fires at once rather than nothing firing.
+        assert_eq!(permit_service_interval(Duration::ZERO), Duration::ZERO);
+        assert_eq!(permit_age_net_bound(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// The zero is permitted, and ADR 0066's condition is that it is
+    /// never silent — so the message has to name each mechanism it
+    /// switches off, not merely that something is off.
+    #[test]
+    fn a_share_of_zero_states_the_waiver_and_any_other_share_does_not() {
+        let waiver = class_reservation_waiver(0).expect("a share of zero must state the waiver");
+        for named in [
+            "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0",
+            "ADR 0066",
+            "claim",
+            "run permits",
+            "time floor",
+            "age net",
+            "arrival order",
+            "no class is guaranteed service",
+        ] {
+            assert!(
+                waiver.contains(named),
+                "the waiver must name `{named}`, or it does not say what was given up: {waiver}"
+            );
+        }
+        for share in [1u16, 2, 3, u16::MAX] {
+            assert_eq!(
+                class_reservation_waiver(share),
+                None,
+                "a share of {share} keeps the guarantee, so there is nothing to waive"
+            );
+        }
     }
 
     const NOW: i64 = 2_000_000;

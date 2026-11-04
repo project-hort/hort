@@ -97,8 +97,18 @@ async fn run_dispatcher() -> anyhow::Result<()> {
         batch_size = cfg.batch_size,
         max_attempts = cfg.max_attempts,
         lock_duration_secs = cfg.lock_duration.as_secs(),
+        reserved_slots_per_class = cfg.reserved_slots_per_class,
         "hort-worker starting",
     );
+    // A share of zero is a permitted waiver of ADR 0066's service
+    // guarantee, on the single condition that the deployment states
+    // which guarantee it gave up. `warn!` rather than `debug!`: a
+    // decision switched off without saying so is indistinguishable
+    // from one that failed, and this is the only share the batch
+    // coherence check cannot complain about.
+    if let Some(waiver) = cfg.class_reservation_waiver() {
+        tracing::warn!("{waiver}");
+    }
 
     // 2. Read HORT_EXTRA_CA_BUNDLE — propagate to spawned scanner
     //    subprocesses via SSL_CERT_FILE + capture parsed anchors for

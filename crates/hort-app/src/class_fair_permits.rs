@@ -20,25 +20,34 @@
 //!
 //! # The rule
 //!
-//! A free permit is granted in three passes. The first two consider the
+//! A free permit is granted in four passes. The middle two consider the
 //! same classes: waited-on classes ([`TaskTier::is_waited_on`]) with a
 //! queued row and fewer held permits than their
 //! [`ClassFairPermits::reserved_per_class`] share.
 //!
-//! 1. among those past half the class-service audit threshold, to the
-//!    class that has gone unserved longest;
-//! 2. otherwise to the highest class among them in [`TaskTier::ALL`] order;
-//! 3. otherwise to the **longest-waiting** row of any class.
+//! 1. to the **longest-waiting** row of any class, when it has waited
+//!    past [`hort_domain::policy::permit_age_net_bound`] and the net
+//!    has not already fired inside that bound;
+//! 2. otherwise, among the below-share waited-on classes past half the
+//!    class-service audit threshold, to the class that has gone
+//!    unserved longest;
+//! 3. otherwise to the highest class among them in [`TaskTier::ALL`] order;
+//! 4. otherwise to the **longest-waiting** row of any class.
+//!
+//! Passes one and four choose the same row from the same selection —
+//! one is the other brought forward — and differ only in what has to be
+//! true to reach them: pass four needs every waited-on class to have no
+//! eligible waiter, pass one needs a row to have waited past the bound.
 //!
 //! The share is a floor, not a priority order, and the difference is the
-//! whole design. The first two passes guarantee a waited-on class its
-//! share and nothing beyond it: once the class holds its share, a further
-//! row cannot overtake another class below its share and otherwise
-//! competes in arrival order. A waited-on flood cannot use an old grant
-//! record to take a permit owed to a class still below its share. Pass
-//! three is what makes
+//! whole design. The two waited-on passes guarantee a waited-on class
+//! its share and nothing beyond it: once the class holds its share, a
+//! further row cannot overtake another class below its share and
+//! otherwise competes in arrival order. A waited-on flood cannot use an
+//! old grant record to take a permit owed to a class still below its
+//! share. Passes one and four are what make
 //! [`TaskTier::Bulk`] — which has no reserved share, because nobody is
-//! waiting on it — served at all, and it is the same age-ordered
+//! waiting on it — served at all, and they are the same age-ordered
 //! fallback the claim's priority-blind oldest slot is.
 //!
 //! **It is not preemption** (ADR 0066, "What this decision does not
@@ -48,21 +57,81 @@
 //! guarantee is that it takes the *next* permit to come free, not that
 //! it starts now.
 //!
-//! # What this does not bound
+//! # What bounds the lowest class's wait
 //!
 //! At a capacity of one — the production setting for `scan` — the share
-//! is the whole capacity, so pass three is reached only when no
-//! waited-on class has a waiter. A worker whose waited-on arrivals
-//! sustainedly exceed its capacity therefore runs no bulk work while
-//! that lasts. That is ADR 0066's stated trade ("bulk work drains
-//! measurably slower, by construction... that is the trade being made,
-//! not a side effect") rather than an accident of this code, and the
-//! two things that bound it are separate decisions by design: the
-//! per-class service observation (D5) is what makes the state visible,
-//! and aging is the safety net ADR 0066 places *beneath* D4 — "worth
-//! having, not as a substitute". Neither is this module's, and a
-//! deployment that needs arrival order back has
-//! `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0`.
+//! is the whole capacity, so the two waited-on passes match whenever
+//! any waited-on class has a waiter and the arrival-order fallback is
+//! reached only when none does. A worker whose waited-on arrivals
+//! sustainedly exceed its capacity therefore never reaches pass four,
+//! and before the age net above it that worker ran no bulk work at all
+//! for as long as the stream lasted.
+//!
+//! "No bulk work while the stream lasts" is **not** the trade ADR 0066
+//! makes. Its consequence is that bulk work "drains measurably slower,
+//! by construction", and D5 guarantees service to every class
+//! *including* the one with no reserved share — resting there "not on a
+//! share but on a priority-blind age fallback beneath the reservation,
+//! present at every point the reservation is". The other allocation
+//! point already had one: the claim query's class-blind `oldest` CTE,
+//! one row by `created_at ASC` per batch. Pass one is this point's
+//! counterpart, and it sits *before* the waited-on passes because at a
+//! capacity of one a waited-on pass always matches — after them the net
+//! would be unreachable exactly where it is needed.
+//!
+//! **The bound is derived, not configured**
+//! ([`hort_domain::policy::permit_age_net_bound`]): three quarters of
+//! the class-service audit threshold, strictly above the time floor
+//! below it and strictly below the window the audit reports on. One
+//! operator number keeps ordering the three, and a second variable
+//! could only reorder them into a state where one of them is dead.
+//!
+//! **The net fires at most once per bound, and never twice in a row**,
+//! and that rate is what keeps it a net rather than a second ordering.
+//! A permit queue holds rows that have already been claimed, and a
+//! batch is claimed whether or not a permit is free, so a flood reaches
+//! this point as a pile of waiters that age *together*. A net with no
+//! rate would then match on every release for as long as the pile
+//! lasted and hand it the whole capacity in age order — the
+//! head-of-line blocking the reservation exists to remove, re-entered
+//! through the floor beneath it. The claim's `oldest` slot is one row
+//! of a batch for the same reason: aging is "a safety net beneath the
+//! reservation rather than a second per-class allocation".
+//!
+//! The two halves of that rate are not redundant. The bound is
+//! measured from the net's own last grant, so a single run **longer
+//! than the bound** satisfies it again the moment that run releases —
+//! and a `scan` run longer than three quarters of the audit threshold
+//! is ordinary. "Never twice in a row" is what bounds the pile in that
+//! regime: between two net grants some other pass is served, so the
+//! net's reach degrades to every second permit rather than to all of
+//! them. The net re-arms on its **own** grants and on nothing else, so
+//! a run of ordinary grants cannot hold it shut; and when no waited-on
+//! class is waiting, pass four still serves bulk work at full speed, so
+//! the rate binds only under contention — the only state it is about.
+//!
+//! **It is not a share for [`TaskTier::Bulk`]** and not a second
+//! per-class allocation: it is class-blind, so past the bound it may
+//! serve a bulk row ahead of a younger `Normal` waiter. That is what
+//! priority-blind means, and the claim point has done it since before
+//! this module existed. Inside the bound it reorders nothing, so D1's
+//! class order is untouched.
+//!
+//! What it buys is a **bound** where there was none, and the bound is
+//! worth stating precisely: a row is served after the rows already
+//! queued ahead of it, so its wait is the net's bound plus their run
+//! time, and no later arrival — of any class, for any length of
+//! stream — adds to it. It is *not* a function of the bound and the
+//! class count alone: a deeper queue ahead of a row is a longer wait,
+//! exactly as it is at the claim.
+//!
+//! `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0` switches off all three
+//! mechanisms together — the share, the time floor and this net — and
+//! leaves the arrival order that predates ADR 0066. That is a
+//! **permitted waiver** of the decision and not the off-switch of a
+//! feature, and ADR 0066 attaches one condition to it: the deployment
+//! states at startup which guarantee it has given up. The worker says
+//! it from [`hort_domain::policy::class_reservation_waiver`].
 //!
 //! # Why the floor is also a time
 //!
@@ -109,6 +178,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
+use hort_domain::policy::{permit_age_net_bound, permit_service_interval};
 use hort_domain::types::task_tier::TaskTier;
 
 /// How many classes there are, and therefore how many queues.
@@ -155,6 +225,21 @@ struct State {
     held: [usize; CLASS_COUNT],
     /// Last delivered grant per class. An undelivered grant is rolled back.
     last_granted_at: [Option<Instant>; CLASS_COUNT],
+    /// Last delivered grant the **age net** decided, and nothing else —
+    /// the net's rate is one permit per [`Inner::age_net_bound`], so a
+    /// grant any other pass made must not re-arm it. `None` until the
+    /// net has fired, which is what lets a first aged waiter be served
+    /// as soon as it crosses the bound.
+    last_age_net_grant_at: Option<Instant>,
+    /// Whether the last delivered grant was the net's.
+    ///
+    /// The second half of the net's rate, and not redundant with the
+    /// first: the time rate is measured from the net's own last grant,
+    /// so a run **longer than the bound** satisfies it again the moment
+    /// that run releases, and a pile of aged rows would take every
+    /// permit at a capacity of one. A `scan` run longer than three
+    /// quarters of the audit threshold is ordinary, not exotic.
+    age_net_took_the_last_grant: bool,
     /// Waiters per class, each in arrival order.
     queues: [VecDeque<Waiting>; CLASS_COUNT],
     next_seq: u64,
@@ -164,8 +249,25 @@ struct State {
 struct Inner {
     reserved_per_class: usize,
     service_interval: Duration,
+    age_net_bound: Duration,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     state: Mutex<State>,
+}
+
+/// Which pass decided a grant.
+///
+/// Only the age net needs naming: it is the one pass with a rate of its
+/// own, so [`Inner::pump`] re-arms it on its own grants and on no
+/// others. Returning it from [`Inner::take_next`] rather than
+/// re-deriving it afterwards is what keeps "did the net decide this?"
+/// from being a second, separately-wrong answer to a question the
+/// decision already had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decider {
+    /// Pass one — the class-blind age net.
+    AgeNet,
+    /// One of the other three passes, none of which has a rate.
+    Other,
 }
 
 impl Inner {
@@ -181,7 +283,12 @@ impl Inner {
     /// Pops rather than reporting an index, so there is no second
     /// "and is the queue still non-empty?" question for a caller to get
     /// wrong or for a reader to wonder about.
-    fn take_next(&self, state: &mut State, now: Instant) -> Option<(usize, Waiting)> {
+    fn take_next(&self, state: &mut State, now: Instant) -> Option<(usize, Waiting, Decider)> {
+        if let Some(index) = self.age_net(state, now) {
+            return state.queues[index]
+                .pop_front()
+                .map(|w| (index, w, Decider::AgeNet));
+        }
         let starved = (self.reserved_per_class > 0)
             .then(|| {
                 TaskTier::ALL
@@ -212,16 +319,75 @@ impl Inner {
                     })
                     .map(|(index, _)| index)
             })
-            .or_else(|| {
-                (0..CLASS_COUNT)
-                    .filter(|index| !state.queues[*index].is_empty())
-                    .min_by_key(|index| {
-                        state.queues[*index]
-                            .front()
-                            .map_or(u64::MAX, |waiting| waiting.seq)
-                    })
-            })?;
-        state.queues[index].pop_front().map(|w| (index, w))
+            .or_else(|| Self::oldest_waiter(state))?;
+        state.queues[index]
+            .pop_front()
+            .map(|w| (index, w, Decider::Other))
+    }
+
+    /// The longest-waiting row of any class — the arrival-order
+    /// fallback's choice, and the age net's.
+    ///
+    /// Ordered by `seq` rather than by `arrived_at`: the sequence is
+    /// assigned under the same lock that reads the clock, so the
+    /// smallest `seq` among the queue fronts *is* the earliest arrival,
+    /// with two arrivals inside one clock tick broken by the order they
+    /// joined in. One selection shared by both passes is what makes the
+    /// net the fallback brought forward rather than a second ordering
+    /// that could answer differently.
+    ///
+    /// A queue's front is its own oldest row (`push_back` on arrival,
+    /// `pop_front` on grant), so the fronts are the only candidates the
+    /// global minimum can be among.
+    fn oldest_waiter(state: &State) -> Option<usize> {
+        (0..CLASS_COUNT)
+            .filter(|index| !state.queues[*index].is_empty())
+            .min_by_key(|index| {
+                state.queues[*index]
+                    .front()
+                    .map_or(u64::MAX, |waiting| waiting.seq)
+            })
+    }
+
+    /// Whether the net's one class-blind slot is open: not twice in a
+    /// row, and not twice inside one bound.
+    ///
+    /// Both halves are needed and neither implies the other. The time
+    /// rate is what keeps a pile of rows that aged together from being
+    /// served all at once while runs are short; "not twice in a row" is
+    /// what keeps the same pile bounded when a single run outlasts the
+    /// bound, which satisfies the time rate at every release. Together
+    /// they make the net one slot per bound *and* never more than every
+    /// second grant — the claim's `oldest` slot is one row of a batch
+    /// for the same reason.
+    fn net_slot_is_open(&self, state: &State, now: Instant) -> bool {
+        !state.age_net_took_the_last_grant
+            && state
+                .last_age_net_grant_at
+                .is_none_or(|last| now.saturating_duration_since(last) > self.age_net_bound)
+    }
+
+    /// Pass one: the oldest waiter of any class once it has waited past
+    /// [`Self::age_net_bound`], while the net's slot is open.
+    ///
+    /// Three conditions, each load-bearing:
+    ///
+    /// - **The share is on.** At `reserved_per_class == 0` the operator
+    ///   has waived ADR 0066 and asked for arrival order, which is what
+    ///   the fallback already is — so the net has nothing to add and is
+    ///   switched off with the rest of the decision rather than left
+    ///   running where the startup statement says it is gone.
+    /// - **The slot is open** ([`Self::net_slot_is_open`]).
+    /// - **The oldest waiter is past the bound**, strictly — the same
+    ///   boundary the time floor uses, so "exactly at the bound" is not
+    ///   yet late anywhere in this module.
+    fn age_net(&self, state: &State, now: Instant) -> Option<usize> {
+        if self.reserved_per_class == 0 || !self.net_slot_is_open(state, now) {
+            return None;
+        }
+        let index = Self::oldest_waiter(state)?;
+        let arrived_at = state.queues[index].front()?.arrived_at;
+        (now.saturating_duration_since(arrived_at) > self.age_net_bound).then_some(index)
     }
 
     /// Hand out free permits until nothing is free or nobody is
@@ -233,12 +399,23 @@ impl Inner {
     fn pump(self: &Arc<Self>, state: &mut State) {
         let now = (self.clock)();
         while state.free > 0 {
-            let Some((index, waiting)) = self.take_next(state, now) else {
+            let Some((index, waiting, decider)) = self.take_next(state, now) else {
                 break;
             };
             state.free -= 1;
             state.held[index] += 1;
             let previous_grant = state.last_granted_at[index].replace(now);
+            // The net re-arms on its own grants and on nothing else,
+            // while "took the last grant" is set by every pass — a
+            // grant the reservation made is precisely what re-opens the
+            // net's slot. Both captured unconditionally so the rollback
+            // below restores values rather than deciding again which to.
+            let previous_age_net = state.last_age_net_grant_at;
+            let previous_took_last = state.age_net_took_the_last_grant;
+            state.age_net_took_the_last_grant = decider == Decider::AgeNet;
+            if decider == Decider::AgeNet {
+                state.last_age_net_grant_at = Some(now);
+            }
             let permit = Permit {
                 inner: Some(self.clone()),
                 index,
@@ -251,6 +428,8 @@ impl Inner {
                 state.free += 1;
                 state.held[index] -= 1;
                 state.last_granted_at[index] = previous_grant;
+                state.last_age_net_grant_at = previous_age_net;
+                state.age_net_took_the_last_grant = previous_took_last;
             }
         }
     }
@@ -301,35 +480,47 @@ impl ClassFairPermits {
     /// which is a coherent thing to ask for and is what a capacity of
     /// one already means at the default.
     ///
-    /// `reserved_per_class == 0` disables both waited-on passes, leaving
-    /// the arrival order that predates ADR 0066.
-    /// `service_interval` is derived from the configured class-service
-    /// audit threshold by [`hort_domain::policy::permit_service_interval`].
-    pub(crate) fn new_with_interval(
+    /// `reserved_per_class == 0` waives ADR 0066 at this point: both
+    /// waited-on passes and the age net above them are off, leaving the
+    /// arrival order that predates the decision.
+    ///
+    /// `audit_threshold` is the **configured class-service audit
+    /// threshold** (`HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS`) and not
+    /// either of the times derived from it. Both derivations happen
+    /// here, through the domain
+    /// ([`permit_service_interval`] and [`permit_age_net_bound`]), so
+    /// the two enforcement times cannot be threaded independently of
+    /// each other or of the window the audit reports on — an ordering
+    /// that retires a pass is not expressible rather than merely
+    /// avoided.
+    pub(crate) fn new_with_threshold(
         capacity: usize,
         reserved_per_class: usize,
-        service_interval: Duration,
+        audit_threshold: Duration,
     ) -> Self {
         let clock: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(Instant::now);
-        Self::build(capacity, reserved_per_class, service_interval, clock)
+        Self::build(capacity, reserved_per_class, audit_threshold, clock)
     }
 
     fn build(
         capacity: usize,
         reserved_per_class: usize,
-        service_interval: Duration,
+        audit_threshold: Duration,
         clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     ) -> Self {
         let capacity = capacity.max(1);
         Self {
             inner: Arc::new(Inner {
                 reserved_per_class,
-                service_interval,
+                service_interval: permit_service_interval(audit_threshold),
+                age_net_bound: permit_age_net_bound(audit_threshold),
                 clock,
                 state: Mutex::new(State {
                     free: capacity,
                     held: [0; CLASS_COUNT],
                     last_granted_at: [None; CLASS_COUNT],
+                    last_age_net_grant_at: None,
+                    age_net_took_the_last_grant: false,
                     queues: std::array::from_fn(|_| VecDeque::new()),
                     next_seq: 0,
                 }),
@@ -339,13 +530,12 @@ impl ClassFairPermits {
 
     #[cfg(test)]
     fn new(capacity: usize, reserved_per_class: usize) -> Self {
-        use hort_domain::policy::{permit_service_interval, DEFAULT_CLASS_SERVICE_THRESHOLD_SECS};
+        use hort_domain::policy::DEFAULT_CLASS_SERVICE_THRESHOLD_SECS;
 
-        let threshold = Duration::from_secs(DEFAULT_CLASS_SERVICE_THRESHOLD_SECS);
-        Self::new_with_interval(
+        Self::new_with_threshold(
             capacity,
             reserved_per_class,
-            permit_service_interval(threshold),
+            Duration::from_secs(DEFAULT_CLASS_SERVICE_THRESHOLD_SECS),
         )
     }
 
@@ -353,15 +543,24 @@ impl ClassFairPermits {
     fn with_clock(
         capacity: usize,
         reserved_per_class: usize,
-        service_interval: Duration,
+        audit_threshold: Duration,
         clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     ) -> Self {
-        Self::build(capacity, reserved_per_class, service_interval, clock)
+        Self::build(capacity, reserved_per_class, audit_threshold, clock)
     }
 
     #[cfg(test)]
     pub(crate) fn service_interval(&self) -> Duration {
         self.inner.service_interval
+    }
+
+    /// The age net's bound, for the composition-side assertion that the
+    /// configured threshold reached it — the reason
+    /// [`Self::service_interval`] is exposed, for the second number
+    /// derived from the same knob.
+    #[cfg(test)]
+    pub(crate) fn age_net_bound(&self) -> Duration {
+        self.inner.age_net_bound
     }
 
     /// Join the queue for `tier` **now**, and get back the handle to
@@ -486,6 +685,14 @@ mod tests {
     const NORMAL: Option<TaskTier> = Some(TaskTier::Normal);
     const BULK: Option<TaskTier> = Some(TaskTier::Bulk);
 
+    /// A driven-clock allocation at the shipped audit threshold.
+    ///
+    /// The argument is the threshold and not either time derived from
+    /// it, because the allocation derives both: at the 300 s default
+    /// that is a **150 s** service interval (half) and a **225 s** age
+    /// net bound (three quarters), which are the numbers the second
+    /// arguments below are chosen against. Nothing here sleeps — the
+    /// clock is the `AtomicU64` the caller stores seconds into.
     fn clocked_permits(
         capacity: usize,
         reserved_per_class: usize,
@@ -498,7 +705,7 @@ mod tests {
             ClassFairPermits::with_clock(
                 capacity,
                 reserved_per_class,
-                Duration::from_secs(150),
+                Duration::from_secs(300),
                 clock,
             ),
             seconds,
@@ -595,6 +802,294 @@ mod tests {
         assert!(still_waiting(&mut normal));
     }
 
+    // ---- The class-blind age net ------------------------------------------
+
+    /// The case the net exists for: a sustained client-waited stream at
+    /// a capacity of one, and the bulk row queued behind it is still
+    /// served.
+    ///
+    /// The loop is the sustained stream — one row joins for every row
+    /// served, so the waited-on queue never empties and the
+    /// arrival-order fallback is never reached. Before the net this
+    /// test could not be written: it would hand every permit to the
+    /// stream for as many iterations as it was given.
+    #[tokio::test]
+    async fn a_sustained_waited_on_stream_still_serves_bulk() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        // The stream holds the permit from the start, so the bulk row
+        // is a waiter rather than a holder by luck of arrival.
+        let mut held = granted_now(permits.acquire(INTERACTIVE)).await;
+        // `None` once it has been granted: a receiver that has already
+        // yielded its permit is closed, and reading it again would
+        // report the close rather than the grant.
+        let mut bulk = Some(permits.acquire(BULK));
+        let mut stream: VecDeque<PermitHandle> = VecDeque::new();
+        stream.push_back(permits.acquire(INTERACTIVE));
+
+        let mut granted = vec!["interactive"];
+        for step in 1..=6u64 {
+            seconds.store(step * 50, Ordering::SeqCst);
+            drop(held);
+            held = if let Some(permit) = bulk.as_mut().and_then(try_take) {
+                bulk = None;
+                granted.push("bulk");
+                permit
+            } else {
+                let next = stream
+                    .pop_front()
+                    .expect("the stream keeps a waiter for every row it has served");
+                granted.push("interactive");
+                granted_now(next).await
+            };
+            stream.push_back(permits.acquire(INTERACTIVE));
+        }
+        drop(held);
+
+        assert_eq!(
+            granted,
+            vec![
+                "interactive",
+                "interactive",
+                "interactive",
+                "interactive",
+                "interactive",
+                "bulk",
+                "interactive",
+            ],
+            "the bulk row waits out the 225 s bound and then takes the first permit to \
+             come free, and the stream has the capacity back on the next release"
+        );
+    }
+
+    /// Past the bound the older waiter wins even when it is bulk work
+    /// and the younger waiter belongs to a class with a reserved share.
+    ///
+    /// This is what priority-blind means, and the claim point's oldest
+    /// slot has done it since before this module existed.
+    #[tokio::test]
+    async fn past_the_bound_the_older_bulk_row_beats_a_younger_normal_waiter() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        let running = granted_now(permits.acquire(INTERACTIVE)).await;
+        let mut bulk = permits.acquire(BULK);
+        seconds.store(100, Ordering::SeqCst);
+        let normal = permits.acquire(NORMAL);
+
+        seconds.store(226, Ordering::SeqCst);
+        drop(running);
+        let bulk_run = try_take(&mut bulk).expect(
+            "past the bound the oldest waiter is served whatever its class — Normal's \
+             reserved share would otherwise have taken this permit",
+        );
+
+        // And the net yields immediately afterwards: it has fired
+        // inside the bound, so the reservation decides the next one.
+        drop(bulk_run);
+        let _normal_run = granted_now(normal).await;
+    }
+
+    /// Exactly at the bound is not yet past it — the same boundary the
+    /// time floor uses.
+    #[tokio::test]
+    async fn exactly_at_the_age_net_bound_the_reservation_still_decides() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        let running = granted_now(permits.acquire(INTERACTIVE)).await;
+        let mut bulk = permits.acquire(BULK);
+        seconds.store(100, Ordering::SeqCst);
+        let normal = permits.acquire(NORMAL);
+
+        seconds.store(225, Ordering::SeqCst);
+        drop(running);
+        let _normal_run = granted_now(normal).await;
+        assert!(
+            still_waiting(&mut bulk),
+            "a wait of exactly the bound has not passed it"
+        );
+    }
+
+    /// The service pass still decides something: here it picks a class
+    /// that neither of its neighbours would have.
+    ///
+    /// The three passes above the fallback would each answer
+    /// differently at this instant — the net would serve the oldest row
+    /// (`Bulk`), class order would serve the highest waiting class
+    /// (`Interactive`), and the service pass serves the class that has
+    /// gone unserved longest among those below their share (`Normal`,
+    /// whose waiter is older than Interactive's). That the answer is
+    /// `Normal` is the only observation that separates the three.
+    #[tokio::test]
+    async fn inside_the_bound_the_service_pass_decides_against_both_neighbours() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        let running = granted_now(permits.acquire(BULK)).await;
+        let mut oldest_bulk = permits.acquire(BULK);
+        let mut normal = permits.acquire(NORMAL);
+        seconds.store(100, Ordering::SeqCst);
+        let interactive = permits.acquire(INTERACTIVE);
+
+        seconds.store(200, Ordering::SeqCst);
+        drop(running);
+        let normal_run = try_take(&mut normal).expect(
+            "the service pass must decide: 200 s is past the 150 s floor for Normal and \
+             inside both the floor for Interactive and the 225 s age net bound",
+        );
+        assert!(
+            still_waiting(&mut oldest_bulk),
+            "inside the bound the net reorders nothing"
+        );
+
+        drop(normal_run);
+        let _interactive_run = granted_now(interactive).await;
+        assert!(
+            still_waiting(&mut oldest_bulk),
+            "and the reservation keeps deciding while the bound holds"
+        );
+    }
+
+    /// The net fires once per bound and not once per release: a pile of
+    /// rows that aged together does not take the capacity in age order.
+    ///
+    /// A claim batch is taken whether or not a permit is free, so this
+    /// pile is the shape a flood actually arrives in. A net with no
+    /// rate would match on every release until the pile cleared, which
+    /// is the head-of-line blocking the reservation exists to remove.
+    #[tokio::test]
+    async fn the_net_serves_one_aged_row_per_bound() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        let running = granted_now(permits.acquire(INTERACTIVE)).await;
+        let mut first_bulk = permits.acquire(BULK);
+        let mut second_bulk = permits.acquire(BULK);
+        let mut stream: VecDeque<PermitHandle> = VecDeque::new();
+        stream.push_back(permits.acquire(INTERACTIVE));
+        stream.push_back(permits.acquire(INTERACTIVE));
+
+        seconds.store(226, Ordering::SeqCst);
+        drop(running);
+        let first = try_take(&mut first_bulk).expect("the oldest aged row is served first");
+
+        drop(first);
+        assert!(
+            still_waiting(&mut second_bulk),
+            "the second aged row must not take the next permit too — the net has fired \
+             inside its bound, so the waited-on stream gets it"
+        );
+        let stream_run = granted_now(
+            stream
+                .pop_front()
+                .expect("the stream still has the waiter the net overtook"),
+        )
+        .await;
+
+        // One bound after the net's own grant, the slot is open again.
+        seconds.store(452, Ordering::SeqCst);
+        drop(stream_run);
+        let _second = try_take(&mut second_bulk)
+            .expect("a bound after its last grant the net serves the next aged row");
+    }
+
+    /// A run longer than the bound does not let the net take every
+    /// permit: it never fires twice in a row.
+    ///
+    /// The time rate alone would be satisfied again the instant such a
+    /// run releases, so without this half an aged pile would hold a
+    /// capacity of one for as long as it lasted — and a `scan` run
+    /// longer than three quarters of the audit threshold is ordinary.
+    #[tokio::test]
+    async fn the_net_does_not_fire_twice_in_a_row() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        let running = granted_now(permits.acquire(INTERACTIVE)).await;
+        let mut first_bulk = permits.acquire(BULK);
+        let mut second_bulk = permits.acquire(BULK);
+        let interactive = permits.acquire(INTERACTIVE);
+
+        seconds.store(226, Ordering::SeqCst);
+        drop(running);
+        let bulk_run = try_take(&mut first_bulk).expect("the oldest aged row is served first");
+
+        // The run outlasts the bound, so the net's time rate is clear
+        // again the moment it releases.
+        seconds.store(600, Ordering::SeqCst);
+        drop(bulk_run);
+        assert!(
+            still_waiting(&mut second_bulk),
+            "the net must not take a second permit with no other grant between them, \
+             however long its own run held the capacity"
+        );
+        let stream_run = granted_now(interactive).await;
+
+        // With a grant in between and the bound long past, the slot is
+        // open again — the rate bounds the pile without stranding it.
+        seconds.store(900, Ordering::SeqCst);
+        drop(stream_run);
+        let _second = try_take(&mut second_bulk)
+            .expect("one grant and one bound later, the next aged row is served");
+    }
+
+    /// A grant the net could not deliver leaves its slot open.
+    ///
+    /// Rolling the net's clock forward on an undelivered grant would
+    /// cost the next aged row a whole bound for a permit nobody
+    /// received — the same reason the per-class grant record is rolled
+    /// back, and at shutdown an abandoned waiter is the normal case.
+    #[tokio::test]
+    async fn an_undelivered_net_grant_does_not_rearm_the_net() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        let running = granted_now(permits.acquire(INTERACTIVE)).await;
+        let abandoned = permits.acquire(BULK);
+        let mut live_bulk = permits.acquire(BULK);
+        let mut interactive = permits.acquire(INTERACTIVE);
+        drop(abandoned);
+
+        seconds.store(226, Ordering::SeqCst);
+        drop(running);
+        let _live = try_take(&mut live_bulk).expect(
+            "the net's first pick went to an abandoned waiter, so its slot must still be \
+             open for the next aged row",
+        );
+        assert!(
+            still_waiting(&mut interactive),
+            "the reservation would have taken this permit had the net been re-armed by a \
+             grant nobody received"
+        );
+    }
+
+    /// The waiver switches the net off with the rest of the decision:
+    /// at a share of zero, past the bound is still the arrival order
+    /// that predates ADR 0066.
+    ///
+    /// The net can only ever answer what the fallback answers — both
+    /// pick the longest-waiting row from the same selection — so the
+    /// observable promise of the waiver is this one: with the share at
+    /// zero, no time and no class changes who is next.
+    #[tokio::test]
+    async fn a_zero_share_keeps_arrival_order_past_the_age_net_bound() {
+        let (permits, seconds) = clocked_permits(1, 0);
+        let running = granted_now(permits.acquire(BULK)).await;
+        let earlier_bulk = permits.acquire(BULK);
+        let mut waited_on = permits.acquire(INTERACTIVE);
+
+        seconds.store(400, Ordering::SeqCst);
+        drop(running);
+        assert!(
+            still_waiting(&mut waited_on),
+            "with no reserved share the permit must go to the earliest waiter, however \
+             long either of them has waited"
+        );
+        let _bulk = granted_now(earlier_bulk).await;
+    }
+
+    /// Both enforcement times come from the one configured threshold.
+    #[test]
+    fn both_enforcement_times_are_derived_from_the_audit_threshold() {
+        use hort_domain::policy::{permit_age_net_bound, permit_service_interval};
+
+        let threshold = Duration::from_secs(90);
+        let permits = ClassFairPermits::new_with_threshold(1, 1, threshold);
+        assert_eq!(
+            permits.service_interval(),
+            permit_service_interval(threshold)
+        );
+        assert_eq!(permits.age_net_bound(), permit_age_net_bound(threshold));
+    }
+
     #[tokio::test]
     async fn a_zero_share_skips_the_time_floor_even_after_it_expires() {
         let (permits, seconds) = clocked_permits(1, 0);
@@ -627,6 +1122,16 @@ mod tests {
 
     /// An old grant does not make a class starved while it still holds
     /// its share and another waited-on class holds none.
+    ///
+    /// The times are 150 s and 200 s so that both halves of the
+    /// assertion are live at once: Interactive's grant is older than
+    /// the 150 s service interval, so the time floor would consider it
+    /// were the share check not excluding it, while its queued row is
+    /// younger than the 225 s age net bound, so the net is not what
+    /// decides here. Past that bound the net serves the oldest row
+    /// whatever its share, which is
+    /// `past_the_bound_the_older_bulk_row_beats_a_younger_normal_waiter`'s
+    /// subject rather than this test's.
     #[tokio::test]
     async fn an_old_grant_cannot_overtake_a_class_below_its_share() {
         let (permits, seconds) = clocked_permits(2, 1);
@@ -634,10 +1139,10 @@ mod tests {
         let _second_interactive = granted_now(permits.acquire(INTERACTIVE)).await;
         let mut third_interactive = permits.acquire(INTERACTIVE);
 
-        seconds.store(300, Ordering::SeqCst);
+        seconds.store(150, Ordering::SeqCst);
         let mut normal = permits.acquire(NORMAL);
 
-        seconds.store(400, Ordering::SeqCst);
+        seconds.store(200, Ordering::SeqCst);
         drop(first_interactive);
         let normal_run = try_take(&mut normal)
             .expect("Normal is still waiting despite holding none of its reserved share");

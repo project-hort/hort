@@ -58,7 +58,8 @@ pub use quarantine_anchor::{
     derive_quarantine_anchor, AnchorEvidence, AnchorSource, DerivedAnchor,
 };
 pub use queue_class_service::{
-    evaluate_class_service, permit_service_interval, ClassService, ClassStarvationReason,
+    class_reservation_waiver, evaluate_class_service, permit_age_net_bound,
+    permit_service_interval, ClassService, ClassStarvationReason,
     DEFAULT_CLASS_SERVICE_THRESHOLD_SECS,
 };
 pub use re_evaluation::{decide_rejected_transition, ReEvaluationOutcome};

@@ -96,7 +96,7 @@ use uuid::Uuid;
 use hort_domain::events::{
     Actor, DomainEvent, InternalActor, TaskFailed, ADMIN_INVOKABLE_TASK_KINDS,
 };
-use hort_domain::policy::{evaluate_class_service, permit_service_interval, ClassService};
+use hort_domain::policy::{evaluate_class_service, ClassService};
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
     ClaimReservation, JobRow, JobsRepository, PendingKindBacklog, PriorityBand, RequeueOutcome,
@@ -497,10 +497,10 @@ impl TaskDispatcher {
         self.handlers.insert(kind, handler);
         self.permits.insert(
             kind,
-            Arc::new(ClassFairPermits::new_with_interval(
+            Arc::new(ClassFairPermits::new_with_threshold(
                 max_concurrency,
                 usize::from(self.reserved_slots_per_class),
-                permit_service_interval(self.class_service_threshold),
+                self.class_service_threshold,
             )),
         );
     }
@@ -1766,7 +1766,10 @@ mod tests {
     use crate::use_cases::test_support::{
         MockPermissionGrantRepository, MockUserRepository, ResultWriteLog,
     };
-    use hort_domain::policy::{ClassStarvationReason, DEFAULT_CLASS_SERVICE_THRESHOLD_SECS};
+    use hort_domain::policy::{
+        permit_age_net_bound, permit_service_interval, ClassStarvationReason,
+        DEFAULT_CLASS_SERVICE_THRESHOLD_SECS,
+    };
     use hort_domain::ports::jobs_repository::TriggerSource;
     use hort_domain::types::task_tier::{TaskTier, DEFAULT_RESERVED_SLOTS_PER_CLASS};
 
@@ -5358,6 +5361,30 @@ mod tests {
         assert_eq!(
             dispatcher.permits["scan"].service_interval(),
             permit_service_interval(Duration::from_secs(90))
+        );
+    }
+
+    /// The **second** number derived from the same threshold reaches
+    /// the allocator too.
+    ///
+    /// The age net's bound is not an independent knob: there is one
+    /// operator variable and the allocation derives both enforcement
+    /// times from it, so this asserts the threading rather than the
+    /// arithmetic (which is the domain's own test). A bound that
+    /// arrived as a constant would agree with the derivation only at
+    /// the default — the shape the two attempt caps had.
+    #[test]
+    fn register_threads_the_configured_threshold_to_the_age_net() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let mut dispatcher = make_dispatcher(repo as Arc<dyn JobsRepository>);
+        dispatcher.class_service_threshold = Duration::from_secs(90);
+        dispatcher.register(
+            Arc::new(NoopHandler::new("scan", Arc::new(AtomicUsize::new(0)))),
+            1,
+        );
+        assert_eq!(
+            dispatcher.permits["scan"].age_net_bound(),
+            permit_age_net_bound(Duration::from_secs(90))
         );
     }
 
