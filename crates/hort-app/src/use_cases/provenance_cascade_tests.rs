@@ -60,7 +60,10 @@ impl Fixture {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let storage = Arc::new(MockStoragePort::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let refs = Arc::new(MockContentReferenceIndex::new());
         let cascade = ProvenanceCascade::new(
             artifacts.clone(),

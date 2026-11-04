@@ -633,7 +633,10 @@ mod tests {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let repositories = Arc::new(MockRepositoryRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
         let uc = PromotionUseCase::new(
             artifacts.clone(),

@@ -178,8 +178,11 @@ mod tests {
         };
 
         let artifacts = Arc::new(MockArtifactRepository::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
         let events = Arc::new(MockEventStore::new());
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let projections = Arc::new(MockPolicyProjectionRepository::new());
         let storage = Arc::new(MockStoragePort::new());
         let curation_rules = Arc::new(MockCurationRuleRepository::new());

@@ -2821,14 +2821,20 @@ mod tests {
 
         // ---- Large payload: split path -------------------------------
         //
-        // Push a per-version block past the 256 KB threshold by
-        // stuffing a long `dependencies` map. The dispatch hashes the
-        // full block to CAS and the committed row carries only the
-        // 7-key summary — proof that both the upload site AND the
-        // summary filter work end-to-end.
+        // Push a per-version block past the 256 KB threshold with a long
+        // `readme` — a key `extract_metadata_summary` strips. The bulk has
+        // to ride a non-summary key: the summary is what stays on the
+        // `ArtifactIngested` event, and the event store refuses an event
+        // whose serialised form exceeds the 64 KB cap
+        // (`hort_domain::events::MAX_EVENT_JSON_BYTES`), so a block whose
+        // *summary* keys are themselves over that cap cannot be published
+        // at all. That is a property of the split worth knowing and not
+        // what this test is about: the dispatch hashes the full block to
+        // CAS and the committed row carries only the 7-key summary —
+        // proof that both the upload site AND the summary filter work
+        // end-to-end.
         let mut big_deps = serde_json::Map::new();
-        for i in 0..20_000 {
-            // ~30 bytes per entry * 20k ≈ 600 KB, comfortably over 256 KB.
+        for i in 0..20 {
             big_deps.insert(format!("dep-{i:05}"), serde_json::json!("^1.0.0"));
         }
         let big_tarball = hort_formats::test_support::build_npm_tarball("bigpkg", "9.9.9");
@@ -2842,7 +2848,8 @@ mod tests {
                     "dist":         { "tarball": "u", "shasum": "s" },
                     "dependencies": big_deps,
                     "engines":      { "node": ">=14" },
-                    "readme":       "must be stripped in the summary",
+                    // 300 KB, comfortably over the 256 KB split threshold.
+                    "readme":       "r".repeat(300 * 1024),
                 }
             },
             "_attachments": {

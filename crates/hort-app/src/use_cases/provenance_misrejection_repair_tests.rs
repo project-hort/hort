@@ -51,7 +51,10 @@ struct Fixture {
 fn build() -> Fixture {
     let events = Arc::new(MockEventStore::new());
     let artifacts = Arc::new(MockArtifactRepository::new());
-    let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+    let lifecycle = Arc::new(MockArtifactLifecycle::new(
+        artifacts.clone(),
+        events.clone(),
+    ));
     let queue = Arc::new(MockCurationQueueRepository::new());
     let uc = ProvenanceMisrejectionRepairUseCase::new(
         crate::event_store_publisher::wrap_for_test(events.clone()),
@@ -343,7 +346,10 @@ async fn repairs_the_stranded_state_by_event_and_the_ordinary_sweep_then_release
     let quarantine_uc = QuarantineUseCase::new(
         f.artifacts.clone(),
         crate::event_store_publisher::wrap_for_test(f.events.clone()),
-        Arc::new(MockArtifactLifecycle::new(f.artifacts.clone())),
+        Arc::new(MockArtifactLifecycle::new(
+            f.artifacts.clone(),
+            f.events.clone(),
+        )),
         Arc::new(MockRepositoryRepository::new()),
         required_provenance_projections(artifact.repository_id),
         Arc::new(MockContentReferenceIndex::new()),
@@ -1103,7 +1109,10 @@ async fn repairs_a_never_terminal_rejection_and_the_ordinary_sweep_then_holds_it
     let quarantine_uc = QuarantineUseCase::new(
         f.artifacts.clone(),
         crate::event_store_publisher::wrap_for_test(f.events.clone()),
-        Arc::new(MockArtifactLifecycle::new(f.artifacts.clone())),
+        Arc::new(MockArtifactLifecycle::new(
+            f.artifacts.clone(),
+            f.events.clone(),
+        )),
         Arc::new(MockRepositoryRepository::new()),
         required_provenance_projections(artifact.repository_id),
         Arc::new(MockContentReferenceIndex::new()),

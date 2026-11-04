@@ -473,9 +473,15 @@ The operator-facing how-to is at
   `hort-http-<format>` crate can construct one from a request body.
 - **Correlation IDs are server-generated.** Use cases call
   `Uuid::new_v4()`; client idempotency keys never enter the event log.
-- **Payload size cap: 64 KB per event**, enforced by a `CHECK` on the
-  `event_data` column (`migrations/004_events.sql`) and mirrored in
-  `hort-adapters-postgres::event_store::MAX_EVENT_JSON_BYTES`. A separate,
+- **Payload size cap: 64 KB per event**, defined once as
+  `hort_domain::events::MAX_EVENT_JSON_BYTES` and refused by
+  `DomainEvent::validate_serialized` — the call the Postgres append path and
+  the `hort-app` event-store double both make, so an event one accepts is an
+  event the other accepts. The `event_data` column carries an independent
+  `CHECK` (`migrations/004_events.sql`) as the database's own backstop; it
+  measures the stored jsonb datum (`pg_column_size`) rather than the
+  serialised text, so it is a second measurement of the same policy and not a
+  mirror of the constant. A separate,
   larger 1 MB cap exists on the unrelated `artifact_metadata.metadata`
   projection column (`migrations/003_artifacts_cas.sql`) — do not conflate
   the two. Per-format sanity caps below the 64 KB event-log ceiling are

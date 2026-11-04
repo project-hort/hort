@@ -423,7 +423,10 @@ mod tests {
         ) {
             let events = Arc::new(MockEventStore::new());
             let artifacts = Arc::new(MockArtifactRepository::new());
-            let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+            let lifecycle = Arc::new(MockArtifactLifecycle::new(
+                artifacts.clone(),
+                events.clone(),
+            ));
 
             let mut artifact = sample_artifact(QuarantineStatus::Released);
             artifact.sha256_checksum = hash.clone();

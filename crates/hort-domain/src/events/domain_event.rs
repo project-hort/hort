@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::error::DomainResult;
+use crate::error::{DomainError, DomainResult};
 
 use super::api_token_events::{
     ApiTokenIssuanceDenied, ApiTokenIssued, ApiTokenRevoked, ApiTokenUsed,
@@ -752,7 +752,76 @@ impl DomainEvent {
             Self::RetentionPolicyChanged(e) => e.validate(),
         }
     }
+
+    /// Everything an event must satisfy before **any** store may hold
+    /// it: [`Self::validate`]'s per-field invariants, then the
+    /// [`MAX_EVENT_JSON_BYTES`] cap on its serialised
+    /// [`stored_payload_envelope`](super::stored_payload_envelope).
+    ///
+    /// Returns the envelope, so an append path that has to persist it
+    /// serialises once and the bytes the cap measured are the bytes the
+    /// store writes. A caller that has already produced the envelope
+    /// uses [`Self::validate_serialized`] instead.
+    ///
+    /// The two conditions are one rule and live behind one call on
+    /// purpose. They used to be a pair of statements inside the Postgres
+    /// adapter's `validate_and_serialize`, which made the cap
+    /// unreachable from `hort-app` (ADR 0008: nothing depends on an
+    /// adapter) — so the `hort-app` event-store test double,
+    /// documenting itself as refusing what that function refuses, could
+    /// only take the first half, and a test could stand on an event no
+    /// producer in the system can write.
+    pub fn validate_for_storage(&self) -> DomainResult<serde_json::Value> {
+        let envelope = super::stored_payload_envelope(self);
+        self.validate_serialized(&envelope)?;
+        Ok(envelope)
+    }
+
+    /// [`Self::validate_for_storage`] for a caller that has already
+    /// serialised: `stored_envelope` must be **this** event's
+    /// [`stored_payload_envelope`](super::stored_payload_envelope) —
+    /// the value the store is about to hold, so that the cap bounds
+    /// what is written rather than a second derivation of it.
+    pub fn validate_serialized(&self, stored_envelope: &serde_json::Value) -> DomainResult<()> {
+        self.validate()?;
+        let size = stored_envelope.to_string().len();
+        if size > MAX_EVENT_JSON_BYTES {
+            return Err(DomainError::Validation(format!(
+                // The KB figure is derived from the cap rather than
+                // typed beside it: a hand-written "64 KB" is a second
+                // statement of the number that goes stale the moment
+                // the cap moves. `max_event_json_cap_is_whole_kilobytes`
+                // pins the division's exactness.
+                "serialized event {} exceeds {} KB limit ({size} bytes)",
+                self.event_type(),
+                MAX_EVENT_JSON_BYTES / BYTES_PER_KB,
+            )));
+        }
+        Ok(())
+    }
 }
+
+/// Maximum serialised size of one event's stored payload envelope
+/// (64 KB), and the **only** definition of that bound in the workspace's
+/// Rust: both the Postgres adapter's append path and the `hort-app` test
+/// doubles that round-trip events refuse an event through
+/// [`DomainEvent::validate_serialized`] /
+/// [`DomainEvent::validate_for_storage`], so an event one accepts is an
+/// event the other accepts.
+///
+/// It is a validation policy about events rather than a storage limit —
+/// a `jsonb` column has no 64 KB bound — which is why it lives beside
+/// [`DomainEvent::validate`] and not in the adapter that first enforced
+/// it. `migrations/004_events.sql` carries an independent
+/// `pg_column_size(event_data) <= 65536` `CHECK` as the database's own
+/// backstop; that one measures the stored (possibly compressed) jsonb
+/// datum rather than the serialised text, so it is a different
+/// measurement of the same policy and not a mirror of this constant.
+pub const MAX_EVENT_JSON_BYTES: usize = 65_536;
+
+/// Bytes per kilobyte, for rendering [`MAX_EVENT_JSON_BYTES`] in the
+/// refusal message.
+const BYTES_PER_KB: usize = 1024;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -762,8 +831,9 @@ pub(crate) mod tests {
     };
     use super::super::artifact_events::{
         ApprovalDecision, ArtifactCorrupted, ArtifactDeleted, ArtifactExpired, ArtifactPurged,
-        IngestSource, PolicyResult, ProvenanceHeld, ProvenanceRejected, ProvenanceVerified,
-        ReEvaluationTrigger, RejectionReason, ReleaseReason, ScanAssessment, SeveritySummary,
+        IngestSource, PolicyResult, PolicyViolation, ProvenanceHeld, ProvenanceRejected,
+        ProvenanceVerified, ReEvaluationTrigger, RejectionReason, ReleaseReason, ScanAssessment,
+        SeveritySummary,
     };
     use super::super::artifact_group_events::{
         ArtifactGroupInitiated, ArtifactGroupMemberAdded, ArtifactGroupMemberRemoved,
@@ -1421,7 +1491,7 @@ pub(crate) mod tests {
         });
         let err = bad.validate().unwrap_err();
         assert!(
-            matches!(err, crate::error::DomainError::Validation(_)),
+            matches!(err, DomainError::Validation(_)),
             "expected the inner predicate validator to reject a 0s TTL through the wrapper, got {err:?}"
         );
     }
@@ -1629,5 +1699,130 @@ pub(crate) mod tests {
             // match statements covered together.
             let _name = e.event_type();
         }
+    }
+
+    // -- validate_for_storage / validate_serialized ---------------------
+    //
+    // The cap used to be a private `const` in the Postgres adapter
+    // alongside the per-field `validate()` call, which is why these
+    // tests live here now: `hort-app`'s event-store double must refuse
+    // what the adapter refuses, and it cannot depend on an adapter to
+    // learn the rule (ADR 0008).
+
+    /// An over-cap `PolicyEvaluated`: 20 violations whose own fields are
+    /// each under their per-field cap (`rule` 256 = `MAX_RULE_LEN`,
+    /// `message` 4000 < `MAX_MESSAGE_LEN`, `details` null) aggregate to
+    /// ~85 KB of JSON. This is the defence-in-depth case — the shape the
+    /// per-field validators cannot see, because every field is legal.
+    fn over_cap_event() -> DomainEvent {
+        let violations: Vec<PolicyViolation> = (0..20)
+            .map(|i| PolicyViolation {
+                rule: format!("rule-{i:03}-{}", "r".repeat(247)),
+                severity: SeverityThreshold::Critical,
+                message: "d".repeat(4000),
+                details: serde_json::Value::Null,
+            })
+            .collect();
+        DomainEvent::PolicyEvaluated(PolicyEvaluated {
+            artifact_id: Uuid::new_v4(),
+            policy_id: Uuid::new_v4(),
+            result: PolicyResult::Fail,
+            violations,
+        })
+    }
+
+    /// The happy path hands back the envelope the store is to hold, so
+    /// an append path serialises once and the bytes the cap measured are
+    /// the bytes written.
+    #[test]
+    fn validate_for_storage_returns_the_stored_envelope() {
+        let event = DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
+            artifact_id: Uuid::new_v4(),
+            quarantine_window_start: Utc::now(),
+        });
+        let envelope = event
+            .validate_for_storage()
+            .expect("a minimal valid event is storable");
+        assert_eq!(envelope, crate::events::stored_payload_envelope(&event));
+    }
+
+    /// Half one: a per-field failure comes through unchanged, naming the
+    /// field rather than the size — an attacker must not learn which of
+    /// the two refused.
+    #[test]
+    fn validate_for_storage_refuses_what_validate_refuses() {
+        let event = DomainEvent::ArtifactRejected(ArtifactRejected {
+            artifact_id: Uuid::new_v4(),
+            rejected_by: RejectionReason::Admin,
+            reason: "x".repeat(70_000),
+        });
+        let err = event
+            .validate_for_storage()
+            .expect_err("an oversize `reason` is not storable");
+        assert!(matches!(err, DomainError::Validation(_)), "{err:?}");
+        assert!(err.to_string().contains("reason"), "{err}");
+    }
+
+    /// Half two, and the half the test double could not reach while the
+    /// cap lived in the adapter: every field legal, the aggregate over
+    /// the cap.
+    #[test]
+    fn validate_for_storage_refuses_an_over_cap_event() {
+        let event = over_cap_event();
+        event.validate().expect("every field is individually legal");
+        let size = crate::events::stored_payload_envelope(&event)
+            .to_string()
+            .len();
+        let err = event
+            .validate_for_storage()
+            .expect_err("the serialised aggregate is over the cap");
+        let DomainError::Validation(msg) = &err else {
+            panic!("expected a validation error, got: {err:?}")
+        };
+        // The operator-facing message, byte for byte — the text the
+        // Postgres adapter produced before the rule moved here.
+        assert_eq!(
+            msg,
+            &format!("serialized event PolicyEvaluated exceeds 64 KB limit ({size} bytes)"),
+        );
+    }
+
+    /// The boundary is `>` and not `>=`: an envelope of exactly
+    /// `MAX_EVENT_JSON_BYTES` serialised bytes is accepted, one byte
+    /// more is refused. Measured on a stand-in value of a known exact
+    /// length — no real event lands on the boundary to the byte, and the
+    /// boundary is what an operator at the edge of the cap experiences.
+    #[test]
+    fn the_cap_boundary_is_exclusive() {
+        let event = DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
+            artifact_id: Uuid::new_v4(),
+            quarantine_window_start: Utc::now(),
+        });
+        // A JSON string serialises to its content plus two quotes.
+        let at_cap = serde_json::Value::String("a".repeat(MAX_EVENT_JSON_BYTES - 2));
+        assert_eq!(at_cap.to_string().len(), MAX_EVENT_JSON_BYTES);
+        assert!(event.validate_serialized(&at_cap).is_ok());
+
+        let over_cap = serde_json::Value::String("a".repeat(MAX_EVENT_JSON_BYTES - 1));
+        assert_eq!(over_cap.to_string().len(), MAX_EVENT_JSON_BYTES + 1);
+        let err = event
+            .validate_serialized(&over_cap)
+            .expect_err("one byte over the cap is refused");
+        assert!(
+            err.to_string()
+                .contains(&format!("({} bytes)", MAX_EVENT_JSON_BYTES + 1)),
+            "{err}"
+        );
+    }
+
+    /// The refusal message renders the cap as whole kilobytes
+    /// (`MAX_EVENT_JSON_BYTES / BYTES_PER_KB`) rather than carrying a
+    /// second hand-written copy of the number. That rendering is only
+    /// honest while the division is exact, so pin it: a cap of, say,
+    /// 100_000 would have the message claim "97 KB".
+    #[test]
+    fn max_event_json_cap_is_whole_kilobytes() {
+        assert_eq!(MAX_EVENT_JSON_BYTES % BYTES_PER_KB, 0);
+        assert_eq!(MAX_EVENT_JSON_BYTES / BYTES_PER_KB, 64);
     }
 }

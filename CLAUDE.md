@@ -184,17 +184,27 @@ Coverage % is necessary but **not sufficient**: a DB-backed test that is correct
 ### A test double that round-trips must refuse what production refuses
 
 `MockEventStore` (`crates/hort-app/src/use_cases/test_support.rs`) is used by
-nine crates, and it **round-trips**: `read_stream` serves what `append`
-accepted. So a test seeds events there, production code reads them back, and a
-decision is asserted over them — which makes the double's acceptance criteria
-part of every such test's premise.
+eight crates, and it **round-trips**: what reaches its streams — a direct
+`set_stream`, or a commit through the `MockArtifactLifecycle` it is paired with
+— is what `read_stream` serves. So a test seeds events there, production code
+reads them back, and a decision is asserted over them, which makes the double's
+acceptance criteria part of every such test's premise.
 
 The production adapter validates: every `EventStore::append` goes through
 `validate_and_serialize` (`crates/hort-adapters-postgres/src/event_store.rs`),
-which calls `DomainEvent::validate()` on every event in the batch and then
-enforces a 64 KB serialised cap. **An event the double accepts and the adapter
-would reject is an event no producer in the system can write**, and a test
-standing on one proves a behaviour production cannot show.
+which refuses an event on two counts — `DomainEvent::validate()`'s per-field
+invariants, and a 64 KB cap on the serialised event. **An event the double
+accepts and the adapter would reject is an event no producer in the system can
+write**, and a test standing on one proves a behaviour production cannot show.
+
+Both counts are one call, `DomainEvent::validate_for_storage`
+(`crates/hort-domain/src/events/domain_event.rs`, beside `validate()`), and
+both the adapter and the double consume it. The cap used to be a private
+`const` in the adapter, which `hort-app` must not depend on (ADR 0008) — so the
+double implemented the half it could reach while its comment claimed the
+function that held both, and an oversize event was one it accepted and no
+producer could write. A rule a double has to re-state in its own words is a
+rule it will state half of; give it one call to make.
 
 This is measured, not theoretical. The authority-derivation corpus for the
 release gate held `ScanCompleted` events whose `finding_count` disagreed with
@@ -207,10 +217,32 @@ production incident survived behind impossible events.
 The rule is therefore scoped by round-tripping, not by "every double": a double
 whose `append` discards the batch (several local ones error or ignore it, and
 their `read_stream` is `unreachable!`) cannot host a corpus, because nothing
-reads it back. **A double that serves `read_stream` from what it accepted calls
-`validate()` on append and returns the error.** When adding such a double, do
-the same; when a fixture starts failing because of it, the fixture was building
-an event the system cannot produce.
+reads it back. **A double that serves `read_stream` from what it accepted
+refuses, on append, everything `validate_for_storage` refuses, and returns its
+error.** When adding such a double, do the same; when a fixture starts failing
+because of it, the fixture was building an event the system cannot produce.
+
+**And the other direction: a double that accepts a paired production write
+serves both halves or refuses the call.** Validity is about what a double
+accepts; this is about what it then shows. `MockArtifactLifecycle` takes an
+artifact and its event batch and persists both — in the adapter, inside one
+transaction with no opt-out, so a reader arriving afterwards sees both or the
+commit did not happen. The double made the events half an **opt-in**
+(`with_commit_visible_events`) and by default accepted the batch and dropped
+it, so "after the commit, the reader sees nothing" and "so it appends again"
+were properties of the double rather than of the code under test — the mirror
+image of accepting an impossible event, and just as invisible in the test
+standing on it. Two independent units hit it within a day of each other, and an
+opt-in only ever reaches the tests that already know about it.
+
+So the paired store is a **constructor argument** (`MockArtifactLifecycle::new`
+takes `Arc<dyn PairedEventStore>`) and every commit method publishes into it:
+the compiler, not a reviewer, reaches every construction site, and a test that
+cannot name the store its own reads go through is a test whose premise was
+never checked. A double with a second fallible effect beside the publish
+(`content_references` edges) applies **neither** until every refusal has run —
+an effect that outlives a refused commit is state the adapter's rollback never
+leaves.
 
 **Enforcement: `crates/hort-app/tests/db_tests_are_serialized.rs`**, a DB-free sub-second source scan in the same family as `db_gate_not_silent` — so `cargo test --workspace` runs it automatically. It reports every test function (inline `#[cfg(test)]` *and* `crates/*/tests/`) that reaches `test_support::{isolated_db_from, shared_migrated_pool, connect_or_panic}` — directly or through a same-file helper, transitively — or opens a raw `PgPool::connect` / `PgConnection::connect*`, and carries no `#[serial(hort_pg_db)]`. **It has no allow-list, by design**: a site that genuinely should not carry the key is a review conversation, not an exemption entry. Its blind spot is the one every source scan has — a helper in *another* file, or a connection opened through a macro — so the review check survives alongside it (see the architect Implementation Review Checklist).
 

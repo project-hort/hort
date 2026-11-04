@@ -300,7 +300,10 @@ mod tests {
         let content_references = Arc::new(MockContentReferenceIndex::new());
         let storage = Arc::new(MockStoragePort::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let upstream_proxy = Arc::new(MockUpstreamProxy::new());
         let upstream_resolver = Arc::new(MockUpstreamResolver::new());
 
@@ -466,7 +469,10 @@ mod tests {
         let content_references = Arc::new(MockContentReferenceIndex::new());
         let storage = Arc::new(MockStoragePort::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let upstream_proxy = Arc::new(MockUpstreamProxy::new());
         let upstream_resolver = Arc::new(MockUpstreamResolver::new());
 

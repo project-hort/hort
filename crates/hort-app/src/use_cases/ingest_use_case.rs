@@ -6100,9 +6100,8 @@ mod tests {
         content_references: &Arc<MockContentReferenceIndex>,
     ) -> Arc<MockArtifactLifecycle> {
         Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_content_references(content_references.clone())
-                .with_commit_visible_events(events.clone()),
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+                .with_content_references(content_references.clone()),
         )
     }
 
@@ -7707,7 +7706,7 @@ mod tests {
                 let events = Arc::new(MockEventStore::new());
                 let content_references = Arc::new(MockContentReferenceIndex::new());
                 let lifecycle = Arc::new(
-                    MockArtifactLifecycle::new(artifacts.clone())
+                    MockArtifactLifecycle::new(artifacts.clone(), events.clone())
                         .with_content_references(content_references.clone()),
                 );
                 let storage: Arc<dyn StoragePort> = Arc::new(FailingStoragePort);
@@ -9035,7 +9034,7 @@ mod tests {
                 let events = Arc::new(MockEventStore::new());
                 let content_references = Arc::new(MockContentReferenceIndex::new());
                 let lifecycle = Arc::new(
-                    MockArtifactLifecycle::new(artifacts.clone())
+                    MockArtifactLifecycle::new(artifacts.clone(), events.clone())
                         .with_content_references(content_references.clone()),
                 );
                 let storage: Arc<dyn StoragePort> = Arc::new(FailingStoragePort);
@@ -10699,13 +10698,12 @@ mod tests {
         let events = Arc::new(MockEventStore::new());
         let content_references = Arc::new(MockContentReferenceIndex::new());
         let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
                 .with_content_references(content_references.clone())
-                .with_commit_visible_events(events.clone())
                 // The optimistic-concurrency check the Postgres adapter
                 // gets for free from the event-store append inside its
                 // transaction.
-                .with_optimistic_concurrency(events.clone()),
+                .with_optimistic_concurrency(),
         );
         let groups = Arc::new(MockArtifactGroupRepository::new());
         let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));

@@ -2785,6 +2785,30 @@ mod tests {
         }
     }
 
+    /// The lifecycle double this harness pairs commits an artifact and
+    /// its events in one call; this is where the events half lands.
+    /// `read_stream` replays `appended`, so pushing the batch there is
+    /// what makes a committed transition readable afterwards — the
+    /// adapter's own semantics, which has no opt-out.
+    impl crate::use_cases::test_support::PairedEventStore for MockPolicyEventStore {
+        fn current_expected_version(&self, stream_id: &StreamId) -> ExpectedVersion {
+            let appended = self.appended.lock().unwrap();
+            let count: u64 = appended
+                .iter()
+                .filter(|b| &b.stream_id == stream_id)
+                .map(|b| b.events.len() as u64)
+                .sum();
+            match count.checked_sub(1) {
+                Some(last) => ExpectedVersion::Exact(last),
+                None => ExpectedVersion::NoStream,
+            }
+        }
+
+        fn publish_committed(&self, batch: &AppendEvents) {
+            self.appended.lock().unwrap().push(batch.clone());
+        }
+    }
+
     impl EventStore for MockPolicyEventStore {
         fn append(&self, batch: AppendEvents) -> BoxFuture<'_, DomainResult<AppendResult>> {
             let outcome = self
@@ -3231,6 +3255,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let upstream = Arc::new(
             crate::use_cases::test_support::MockRepositoryUpstreamMappingRepository::new(),
@@ -3336,6 +3361,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let upstream = Arc::new(
             crate::use_cases::test_support::MockRepositoryUpstreamMappingRepository::new(),

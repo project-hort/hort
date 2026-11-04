@@ -1838,7 +1838,10 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let queue_repo = Arc::new(MockCurationQueueRepository::new());
         let decisions_repo = Arc::new(MockCurationDecisionsRepository::new());
@@ -1865,7 +1868,10 @@ mod tests {
     fn make_use_case_with_queue() -> (CurationUseCase, Arc<MockCurationQueueRepository>) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let queue_repo = Arc::new(MockCurationQueueRepository::new());
         let decisions_repo = Arc::new(MockCurationDecisionsRepository::new());
@@ -1892,7 +1898,10 @@ mod tests {
     fn make_use_case_with_decisions() -> (CurationUseCase, Arc<MockCurationDecisionsRepository>) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let queue_repo = Arc::new(MockCurationQueueRepository::new());
         let decisions_repo = Arc::new(MockCurationDecisionsRepository::new());
@@ -1919,7 +1928,10 @@ mod tests {
     fn make_use_case_with_exclusions() -> (CurationUseCase, Arc<MockCurationExclusionsRepository>) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let queue_repo = Arc::new(MockCurationQueueRepository::new());
         let decisions_repo = Arc::new(MockCurationDecisionsRepository::new());
@@ -3423,7 +3435,10 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let decisions_repo = Arc::new(CommittedDecisionsRepository {
             lifecycle: lifecycle.clone(),
         });
@@ -4247,7 +4262,10 @@ mod tests {
         ) {
             let artifacts = Arc::new(MockArtifactRepository::new());
             let events = Arc::new(MockEventStore::new());
-            let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+            let lifecycle = Arc::new(MockArtifactLifecycle::new(
+                artifacts.clone(),
+                events.clone(),
+            ));
             let policies = Arc::new(MockPolicyProjectionRepository::new());
             let queue_repo = Arc::new(MockCurationQueueRepository::new());
             let decisions_repo = Arc::new(MockCurationDecisionsRepository::new());

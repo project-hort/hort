@@ -818,7 +818,10 @@ mod tests {
         storage.set_backend_label("filesystem");
         let events = Arc::new(MockEventStore::new());
         let artifacts = Arc::new(MockArtifactRepository::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let uc = CasScrubUseCase::new(
             storage.clone() as Arc<dyn StoragePort>,
             crate::event_store_publisher::wrap_for_test(events.clone()),
