@@ -115,6 +115,14 @@ impl RepoSecurityScoreProjector {
     /// second-scan code path — the change should
     /// almost certainly take a new function signature that accepts
     /// the prior `severity_summary` (or a richer `ScanContext`).
+    ///
+    /// What is **not** open, and is settled here: a rescan whose verdict
+    /// did not change must not reach this function at all. It appends no
+    /// `ScanCompleted`, so a severity bump on that commit has no event
+    /// behind it — see [`Self::compute_unchanged_scan_delta`], which is
+    /// the delta for that case. The accumulation this section describes
+    /// is therefore bounded to distinct verdicts rather than to rescan
+    /// cadence; the arithmetic over those verdicts is what stays open.
     pub fn compute_scan_completed_delta(
         prior_status: QuarantineStatus,
         new_status: QuarantineStatus,
@@ -134,6 +142,42 @@ impl RepoSecurityScoreProjector {
         d.high_delta = i32::try_from(severity_summary.high).unwrap_or(i32::MAX);
         d.medium_delta = i32::try_from(severity_summary.medium).unwrap_or(i32::MAX);
         d.low_delta = i32::try_from(severity_summary.low).unwrap_or(i32::MAX);
+        d.last_scan_at = Some(scan_completed_at);
+        d
+    }
+
+    /// Pure delta for a rescan whose verdict did **not** change — the
+    /// status move, the scan timestamp, and no severity terms.
+    ///
+    /// The severity terms of [`Self::compute_scan_completed_delta`] are
+    /// full per-tier counts added unconditionally, so they are correct
+    /// exactly once per distinct verdict. An unchanged verdict is by
+    /// definition the same `severity_summary` (and the same findings
+    /// blob, and the same `PolicyEvaluated`) the last changed verdict
+    /// already contributed, so adding them again counts the same
+    /// findings a second time on every rescan tick.
+    ///
+    /// What makes the omission a rule rather than an optimisation is the
+    /// event log. An unchanged verdict appends **no** `ScanCompleted`,
+    /// so a severity bump taken on that commit has nothing behind it:
+    /// the `repo_security_scores` row stops being derivable from the
+    /// events it is a projection of, and the drift is invisible to a
+    /// rebuild and to the chain verifier, both of which read only the
+    /// log. Every severity contribution in the projection has to
+    /// correspond to a `ScanCompleted` on some artifact stream.
+    ///
+    /// The status half stays, and has an event behind it for the same
+    /// reason: the only status move an unchanged verdict can make is the
+    /// inline fast-path release, which appends its own
+    /// `ArtifactReleased`. `last_scan_at` stays too — it is a timestamp,
+    /// not a count, and refreshing the scan projections without a
+    /// verdict event is the deliberate behaviour of an unchanged rescan.
+    pub fn compute_unchanged_scan_delta(
+        prior_status: QuarantineStatus,
+        new_status: QuarantineStatus,
+        scan_completed_at: DateTime<Utc>,
+    ) -> ScoreDelta {
+        let mut d = Self::status_delta(prior_status, new_status);
         d.last_scan_at = Some(scan_completed_at);
         d
     }
@@ -367,6 +411,86 @@ mod tests {
     /// rescan-aware variant supersedes it. The test exists to force
     /// the rewrite at that moment rather than letting the additive
     /// behaviour silently double-count in production.
+    /// An unchanged verdict contributes the status move and the scan
+    /// timestamp and **no** severity terms.
+    ///
+    /// This is the half of the additive problem that is closed rather
+    /// than open: the tripwire below is about the arithmetic across
+    /// *distinct* verdicts, which still needs a replacement delta. This
+    /// is about a rescan that found exactly what the last one found,
+    /// appends no `ScanCompleted`, and must therefore not move a count
+    /// the log cannot explain.
+    #[test]
+    fn compute_unchanged_scan_delta_moves_the_status_and_no_severity_count() {
+        let delta = RepoSecurityScoreProjector::compute_unchanged_scan_delta(
+            QuarantineStatus::Quarantined,
+            QuarantineStatus::Released,
+            ts(100),
+        );
+        assert_eq!(delta.quarantined_delta, -1);
+        assert_eq!(delta.released_delta, 1);
+        assert_eq!(delta.critical_delta, 0);
+        assert_eq!(delta.high_delta, 0);
+        assert_eq!(delta.medium_delta, 0);
+        assert_eq!(delta.low_delta, 0);
+        assert_eq!(
+            delta.last_scan_at,
+            Some(ts(100)),
+            "a timestamp is not a count: the scan did complete, so the per-repo \
+             most-recent-scan time advances"
+        );
+
+        // A rescan that moves nothing is still not a no-op delta, because
+        // the timestamp advances — which is exactly what an unchanged
+        // rescan is for.
+        let standing = RepoSecurityScoreProjector::compute_unchanged_scan_delta(
+            QuarantineStatus::Quarantined,
+            QuarantineStatus::Quarantined,
+            ts(200),
+        );
+        assert_eq!(standing.quarantined_delta, 0);
+        assert!(!standing.is_noop());
+    }
+
+    /// Applied twice, the unchanged delta leaves the severity counts
+    /// where the changed verdict put them. The counter-factual to the
+    /// tripwire below: with the additive function this sequence reads
+    /// 3 → 6 → 9, and the drift is what the cadence of rescanning turns
+    /// into an unbounded number.
+    #[test]
+    fn repeated_unchanged_rescans_do_not_accumulate_severity_counts() {
+        let sev = summary(3, 0, 0, 0);
+        let changed = RepoSecurityScoreProjector::compute_scan_completed_delta(
+            QuarantineStatus::Quarantined,
+            QuarantineStatus::Quarantined,
+            &sev,
+            ts(100),
+        );
+        let unchanged = RepoSecurityScoreProjector::compute_unchanged_scan_delta(
+            QuarantineStatus::Quarantined,
+            QuarantineStatus::Quarantined,
+            ts(200),
+        );
+
+        let id = Uuid::new_v4();
+        let after_scan = apply_delta_to_zero(id, &changed, ts(0));
+        let after_rescan = apply_delta_to_row(&after_scan, &unchanged, ts(0));
+        let after_another = apply_delta_to_row(&after_rescan, &unchanged, ts(0));
+
+        assert_eq!(after_scan.critical_count, 3);
+        assert_eq!(
+            after_rescan.critical_count, 3,
+            "the rescan found the same three findings and appended no event; counting \
+             them again would be a projection the log cannot explain"
+        );
+        assert_eq!(after_another.critical_count, 3);
+        assert_eq!(
+            after_another.last_scan_at,
+            Some(ts(200)),
+            "and the scan timestamp still tracks the latest rescan"
+        );
+    }
+
     #[test]
     fn compute_scan_completed_delta_is_purely_additive_rescan_tripwire() {
         let sev = summary(3, 0, 0, 0);

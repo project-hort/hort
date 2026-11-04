@@ -931,6 +931,15 @@ impl ProvenanceCascade {
         event: hort_domain::events::ProvenanceVerified,
         expected_version: ExpectedVersion,
     ) -> hort_domain::error::DomainResult<()> {
+        // ONCE-ONLY-APPEND: idempotent on its own output.
+        // `cascade_one` reads the constituent's clearance state and
+        // returns without calling here whenever a `ProvenanceVerified`
+        // is already on the stream — including on the re-check it runs
+        // after a version conflict — and a `ProvenanceVerified` is the
+        // only event this appends. The cap refusal is deliberately NOT
+        // here for a second reason: the caller retries this call on
+        // `Conflict`, and the refusal is a `Conflict` that re-reading
+        // can never clear, so it would spend that retry budget.
         self.lifecycle
             .commit_provenance_verdict(
                 constituent,

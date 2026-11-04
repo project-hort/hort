@@ -91,7 +91,8 @@ use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::provenance_cascade::ProvenanceCascade;
 use crate::use_cases::{
-    read_unpaired_append_version, ArtifactAtVersion, OverCapStream, UnpairedAppend,
+    read_unpaired_append_version, refuse_append_past_cap_at_version, ArtifactAtVersion,
+    OverCapStream, UnpairedAppend,
 };
 
 /// The `kind` filter used to read cosign attestation bundles off the
@@ -1297,6 +1298,10 @@ impl ProvenanceOrchestrationUseCase {
             upstream_published_at: None,
         };
 
+        // ONCE-ONLY-APPEND: a genesis append. `artifact_id` is a
+        // `Uuid::new_v4()` minted at the top of this method for the
+        // referrer manifest being registered, so the stream does not
+        // exist yet and the `ArtifactIngested` below is its first event.
         let stream_id = hort_domain::events::StreamId::artifact(artifact_id);
         let expected_version = read_unpaired_append_version(
             &*self.events,
@@ -1675,6 +1680,20 @@ impl ProvenanceOrchestrationUseCase {
 
         let stream_id = hort_domain::events::StreamId::artifact(artifact.id);
         let correlation_id = Uuid::new_v4();
+
+        // The verdict batch is one or two events depending on the
+        // outcome, so the cap is asked about the batch that was actually
+        // folded. Repeatable: a `provenance-verify` is re-enqueued
+        // whenever a signature referrer arrives for this subject and
+        // again by the window-expiry backstop, so an artifact held under
+        // `Required` accumulates one verdict event per run for as long as
+        // it stays unsigned. `hold_at_version` is this site's only
+        // observation of the stream and states its length.
+        refuse_append_past_cap_at_version(
+            &stream_id,
+            hold_at_version.expected_version,
+            events.len() as u64,
+        )?;
 
         // Column-scoped, prior-status-guarded verdict commit.
         // `artifact` was loaded at the top of `verify_artifact`, before

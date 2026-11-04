@@ -89,7 +89,7 @@ use std::path::{Path, PathBuf};
 
 mod rust_scan;
 
-use rust_scan::{line_of, production_region, walk_rust, workspace_root};
+use rust_scan::{call_args, line_of, production_region, split_args, walk_rust, workspace_root};
 
 /// The one file allowed to spell a bounded artifact-stream read, and the one
 /// function in it that does: `capped_artifact_read`. Everything that asks a
@@ -124,55 +124,6 @@ fn production_sources(root: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
-}
-
-/// Split a call's argument text on top-level commas (ignoring commas nested
-/// in parens, brackets or angle brackets).
-fn split_args(args: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut current = String::new();
-    for ch in args.chars() {
-        match ch {
-            '(' | '[' | '<' => {
-                depth += 1;
-                current.push(ch);
-            }
-            ')' | ']' | '>' => {
-                depth -= 1;
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                out.push(current.trim().to_owned());
-                current = String::new();
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.trim().is_empty() {
-        out.push(current.trim().to_owned());
-    }
-    out
-}
-
-/// The argument text of the call whose opening paren is at `open`, or `None`
-/// when the parens do not balance inside the retained region.
-fn call_args(text: &str, open: usize) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut depth = 0i32;
-    for (i, &b) in bytes.iter().enumerate().skip(open) {
-        match b {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(text[open + 1..i].to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// The name of the nearest `fn <name>(` declaration before `offset`. Used to

@@ -50,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hort_admin_tasks_class_kind_*` series (the existing
   `hort_admin_tasks_class_*` series are unchanged). Alarm on
   `hort_admin_tasks_class_kind_unserved` to get the kind named (#415).
+- An artifact's event stream can no longer be grown past its bound: a repeatable
+  write now refuses with 409 instead of freezing the artifact for every later
+  release, scan or transition (#412).
+- A rescan with an unchanged verdict no longer re-adds its findings to the
+  per-repository security-score counts (#412).
 - Background work now runs on a worker whose client-waited queues never empty:
   past a bound derived from `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` the
   longest-waiting row takes the next run permit whatever its class. A worker

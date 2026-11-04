@@ -1729,6 +1729,12 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
+        // ONCE-ONLY-APPEND: a genesis append. `artifact_id` was minted
+        // in this call, so the stream does not exist yet and the batch
+        // below is its first event — a stream of length zero cannot be
+        // taken past the cap. The `enforce_cap` argument above stays
+        // `true` as the net for a mint that somehow collided with an
+        // existing stream.
         let expected_version = read_unpaired_append_version(
             &*self.events,
             &stream_id,
@@ -4039,6 +4045,13 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
+        // ONCE-ONLY-APPEND: a genesis append. `artifact_id` was minted
+        // in this call, so the stream does not exist yet and everything
+        // this ingest appends — `ArtifactIngested`, the optional
+        // `ChecksumVerified`, `ScanRequested`, the quarantine transition
+        // — is its first handful of events. The `enforce_cap` argument
+        // stays `true` as the net for a mint that somehow collided with
+        // an existing stream.
         let expected_version = read_unpaired_append_version(
             &*self.events,
             &stream_id,
@@ -4961,6 +4974,10 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
+        // ONCE-ONLY-APPEND: a genesis append. The register path reaches
+        // here only for a freshly minted `artifact_id` — a repeat
+        // registration of an existing row takes the dedup / catch-up-gate
+        // branch instead — so the stream does not exist yet.
         let expected_version = read_unpaired_append_version(
             &*self.events,
             &stream_id,
@@ -5775,6 +5792,13 @@ impl IngestUseCase {
         scan_enqueue_format: &str,
         actor: &ApiActor,
     ) -> DomainResult<(Artifact, AnchorSource)> {
+        // ONCE-ONLY-APPEND: the gate's own output is what gates it.
+        // `carries_register_gate_output` refuses this path for any stream
+        // that already holds an `ArtifactQuarantined` or a
+        // `ScanRequested`, and those are exactly the events the batch
+        // below appends — so the gate runs at most once per artifact, and
+        // the simultaneous-repeat case the paired version exists for
+        // lands one of them and conflicts the other.
         let mut artifact = paired.artifact().clone();
         let applied = self
             .apply_register_gate(

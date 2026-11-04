@@ -94,7 +94,9 @@ use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::release_clearance;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
 use crate::use_cases::scan_kind_resolution::scan_kind_of;
-use crate::use_cases::{rejected_reevaluation, scan_history, ArtifactAtVersion, OverCapStream};
+use crate::use_cases::{
+    refuse_append_past_cap, rejected_reevaluation, scan_history, ArtifactAtVersion, OverCapStream,
+};
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -1874,6 +1876,24 @@ impl PolicyUseCase {
     ) -> bool {
         let stream_id = paired.stream_id().clone();
         let expected_version = paired.expected_version();
+        // `ArtifactReEvaluated` plus the `ArtifactRejected` companion —
+        // two events. Repeatable: a re-evaluation pass runs on every
+        // policy and exclusion change, and the tighten/loosen pair can
+        // alternate on one artifact indefinitely. A refusal is the same
+        // best-effort skip every other failure on this path is, but it is
+        // logged as what it is rather than as a concurrent modification,
+        // which is what the `Conflict` arm below would have called it.
+        if let Err(e) = refuse_append_past_cap(&stream_id, paired.stream_len(), 2) {
+            tracing::warn!(
+                artifact_id = %paired.artifact().id,
+                policy_id = %policy_id,
+                trigger = ?trigger,
+                error = %e,
+                "re-evaluation (tighten): the artifact's stream has no room for the \
+                 re-evaluation pair this would append; skipping artifact",
+            );
+            return false;
+        }
         let artifact = paired.into_artifact();
         let artifact_id = artifact.id;
 
@@ -2317,6 +2337,20 @@ impl PolicyUseCase {
         let artifact_id = paired.artifact().id;
         let stream_id = paired.stream_id().clone();
         let expected_version = paired.expected_version();
+        // `ArtifactReEvaluated` plus the companion transition — two
+        // events, and repeatable for the same reason the tighten
+        // direction is. Same best-effort skip, named for itself.
+        if let Err(e) = refuse_append_past_cap(&stream_id, paired.stream_len(), 2) {
+            tracing::warn!(
+                artifact_id = %artifact_id,
+                policy_id = %policy_id,
+                trigger = ?trigger,
+                error = %e,
+                "re-evaluation: the artifact's stream has no room for the re-evaluation \
+                 pair this would append; skipping artifact",
+            );
+            return false;
+        }
 
         // The artifact entity's `re_evaluate(now)` mutates state and
         // returns the companion transition event (`ArtifactQuarantined`
@@ -2997,6 +3031,18 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(stream_id, events);
+        }
+
+        /// What a seeded stream currently holds — the read half of
+        /// [`Self::seed_stream`], for a fixture that extends a stream a
+        /// helper already planted.
+        fn seeded_stream(&self, stream_id: &StreamId) -> Vec<PersistedEvent> {
+            self.seeded_streams
+                .lock()
+                .unwrap()
+                .get(stream_id)
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
@@ -3817,6 +3863,84 @@ mod tests {
              re-rejected by a threshold change over the same stored \
              findings: {:?}",
             lifecycle.committed_transitions(),
+        );
+    }
+
+    /// Pad `artifact_id`'s stream to exactly `len` events, keeping
+    /// whatever it already carries as the **tail** so every reverse scan
+    /// over it still finds the same latest verdict. The filler is
+    /// `ArtifactQuarantined`, which no verdict derivation reads.
+    fn pad_stream_to(events: &Arc<MockEventStore>, artifact_id: Uuid, len: u64) {
+        let stream_id = StreamId::artifact(artifact_id);
+        let existing = events.seeded_stream(&stream_id);
+        let filler = len - existing.len() as u64;
+        let mut padded: Vec<PersistedEvent> = (0..filler)
+            .map(|pos| {
+                crate::use_cases::test_support::dummy_persisted_event(&stream_id, artifact_id, pos)
+            })
+            .collect();
+        for (offset, mut event) in existing.into_iter().enumerate() {
+            event.stream_position = filler + offset as u64;
+            event.global_position = event.stream_position + 1;
+            padded.push(event);
+        }
+        assert_eq!(
+            padded.len() as u64,
+            len,
+            "the padding arithmetic is the fixture"
+        );
+        events.seed_stream(stream_id, padded);
+    }
+
+    /// The tighten direction refuses the pair that would cross the cap,
+    /// and skips that artifact rather than aborting the pass.
+    ///
+    /// Same fixture as `run_pass_tighten_still_re_holds_an_unpromoted_constituent`
+    /// — which commits exactly one re-hold — with the artifact's stream
+    /// padded to one event short of the cap. The pair needs two, so the
+    /// re-hold is refused; without the refusal the re-hold lands and the
+    /// artifact is frozen at `Rejected` with no rescan that revisits it.
+    #[tokio::test]
+    async fn run_pass_tighten_refuses_the_pair_that_would_cross_the_cap() {
+        let repo_id = Uuid::new_v4();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_constituent_re_eval_harness(repo_id);
+        let policy_id = Uuid::new_v4();
+
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        p.composite_verdict_mode = CompositeVerdictMode::Observed;
+        projections.insert(p);
+
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+        let findings = vec![sample_filesystem_finding(
+            "CVE-2024-LAYER",
+            SeverityThreshold::Critical,
+        )];
+        let artifact_id = seed_active_with_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            &findings,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+        pad_stream_to(&events, artifact_id, crate::use_cases::STREAM_EVENT_CAP - 1);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "the re-hold pair does not fit, so the artifact is skipped and nothing \
+             commits: {:?}",
+            lifecycle.committed_transitions(),
+        );
+        assert_eq!(
+            events.seeded_stream(&StreamId::artifact(artifact_id)).len() as u64,
+            crate::use_cases::STREAM_EVENT_CAP - 1,
+            "and its stream is left exactly where it was"
         );
     }
 
@@ -5795,6 +5919,37 @@ mod tests {
             }
             other => panic!("expected ArtifactReleased, got {other:?}"),
         }
+    }
+
+    /// The loosen direction carries the same refusal: the
+    /// `ArtifactReEvaluated` + `ArtifactReleased` pair is two events, and
+    /// one short of the cap there is room for neither half alone.
+    ///
+    /// Same fixture as
+    /// `add_exclusion_re_eval_pass_resets_artifact_to_released_when_clean_and_window_elapsed`,
+    /// which commits exactly one such pair.
+    #[tokio::test]
+    async fn add_exclusion_re_eval_pass_refuses_the_pair_that_would_cross_the_cap() {
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_use_case_with_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        projections.insert(p);
+
+        let artifact_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
+        artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+        pad_stream_to(&events, artifact_id, crate::use_cases::STREAM_EVENT_CAP - 1);
+
+        add_exclusion_then_run_pass(&uc, policy_id).await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "the release pair does not fit, so the artifact stays Rejected and the pass \
+             keeps going: {:?}",
+            lifecycle.committed_transitions(),
+        );
     }
 
     /// Re-evaluation that resets a Rejected artifact
