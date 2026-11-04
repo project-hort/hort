@@ -16,8 +16,9 @@ use uuid::Uuid;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::jobs_repository::{
     BandQueueSample, ClaimReservation, CompensatingDelete, EnqueueOutcome, JobRow, JobStatus,
-    JobsRepository, KindFields, ListJobsFilter, ListJobsPage, PendingKindBacklog, PriorityBand,
-    RequeueOutcome, RequeuedJob, ResultWriteOutcome, ScanJob, ScanKindFields, TriggerSource,
+    JobsRepository, KindFields, KindQueueSample, ListJobsFilter, ListJobsPage, PendingKindBacklog,
+    PriorityBand, QueueServiceSample, RequeueOutcome, RequeuedJob, ResultWriteOutcome, ScanJob,
+    ScanKindFields, TriggerSource,
 };
 use hort_domain::types::{ContentHash, IdempotencyKey};
 use serde_json::Value as JsonValue;
@@ -370,21 +371,56 @@ const CLEAR_CAPACITY_WAIT_SQL: &str = "UPDATE public.jobs SET\n\
                    AND locked_by = $2\n\
                    AND status = 'running'";
 
-/// The per-band queue-service sample behind
+/// The per-band, per-kind queue-service sample behind
 /// [`JobsRepository::queue_sample_by_band`].
 ///
-/// One pass over `public.jobs` answering five questions per band, which
-/// is why it is one statement with `FILTER` aggregates rather than three
-/// reads: the three facts have to describe the same instant, or a class
-/// could read as "nothing waiting" and "never served" from two
+/// One pass over `public.jobs` answering five questions per group,
+/// which is why it is one statement with `FILTER` aggregates rather
+/// than three reads: the facts have to describe the same instant, or a
+/// class could read as "nothing waiting" and "never served" from two
 /// different moments and be reported as neither.
 ///
-/// `unnest(...) WITH ORDINALITY` + `LEFT JOIN` is what makes the result
-/// index-aligned with the caller's band list: a band with no rows at all
-/// still produces its row, with zero counts and NULL timestamps. The
-/// bounds arrive as two `smallint[]` binds — the band is two numbers
-/// here and nothing more, exactly as in [`CLAIM_PENDING_BY_KINDS_SQL`]
-/// (ADR 0066 D6: the class vocabulary does not travel to SQL).
+/// # Why the grouping carries `j.kind`
+///
+/// ADR 0066's service guarantee is enforced per kind **and** per class
+/// — the worker builds one run-permit allocator per registered kind,
+/// and the per-class time floor and the class-blind age net live inside
+/// it — and D5 requires the guarantee to be observable at the
+/// granularity it is enforced at: *"a guarantee enforced per kind and
+/// per class, and watched per class alone, can be reported healthy by a
+/// sibling kind's progress."* Grouping by the band alone made
+/// `last_served_at` the newest completion of **any** kind in the band,
+/// so a class starving at one kind's permit point read as served
+/// because a different kind of the same class had just finished.
+///
+/// **It stays one statement, and that is what fixes the grouping.** A
+/// loop issuing one query per kind would answer from a set of instants
+/// — the very failure the single statement exists to prevent — so the
+/// kind becomes a second `GROUP BY` key instead. The class-wide answer
+/// is then a fold over this statement's own rows
+/// (`BandQueueSample::class_wide`), which keeps both granularities on
+/// one instant and keeps the coarse answer from disagreeing with the
+/// fine ones.
+///
+/// Every kind present in the band gets a group, whether or not any
+/// worker has a handler registered for it. That is deliberate and is
+/// the same reason `eligible_pending_by_kind` is unfiltered: a kind
+/// nothing claims is the case the observation most needs to report.
+///
+/// # Shape
+///
+/// `unnest(...) WITH ORDINALITY` + `LEFT JOIN` is what keeps every band
+/// in the answer: a band with no rows at all still produces exactly one
+/// group, with a NULL `kind`, zero counts and NULL timestamps — and a
+/// NULL `kind` can only arise that way, because `jobs.kind` is `NOT
+/// NULL`, so it is the unambiguous marker of an empty band. `band.ord`
+/// is projected because the result is no longer one row per band and
+/// the caller's index has to come from the row rather than from its
+/// position. The bounds arrive as two `smallint[]` binds — the band is
+/// two numbers here and nothing more, exactly as in
+/// [`CLAIM_PENDING_BY_KINDS_SQL`] (ADR 0066 D6: the class vocabulary
+/// does not travel to SQL, and `j.kind` is grouped on, never compared
+/// against anything).
 ///
 /// The three predicates, each of which is a different question:
 ///
@@ -397,11 +433,15 @@ const CLEAR_CAPACITY_WAIT_SQL: &str = "UPDATE public.jobs SET\n\
 ///   `capacity_waiting_since` until the abandoned-lease sweep requeues
 ///   it, and a dead owner is not a capacity shortage.
 /// - **last served** is the newest `completed_at` of any row in the
-///   band, which is the durable "this class is being served" fact.
-///   Unbounded on purpose: `NULL` then means "no row of this class has
-///   ever completed" rather than "none completed inside some window a
-///   reader would also have to know about".
+///   group, which is the durable "this slice is being served" fact.
+///   Per kind it is the fact the whole change turns on: a sibling
+///   kind's completion lands in the sibling's own group and cannot
+///   re-arm this one. Unbounded on purpose: `NULL` then means "no row
+///   of this kind and class has ever completed" rather than "none
+///   completed inside some window a reader would also have to know
+///   about".
 const QUEUE_SAMPLE_BY_BAND_SQL: &str = "SELECT band.ord AS ord,\n\
+                     j.kind AS kind,\n\
                      count(j.id) FILTER (\n\
                          WHERE j.status = 'pending'\n\
                            AND (j.locked_until IS NULL OR j.locked_until < now())\n\
@@ -430,8 +470,8 @@ const QUEUE_SAMPLE_BY_BAND_SQL: &str = "SELECT band.ord AS ord,\n\
                  LEFT JOIN public.jobs j\n\
                       ON j.priority >= band.lowest\n\
                      AND j.priority <= band.highest\n\
-                 GROUP BY band.ord\n\
-                 ORDER BY band.ord";
+                 GROUP BY band.ord, j.kind\n\
+                 ORDER BY band.ord, j.kind";
 
 /// Build the statement behind one of the three result writes
 /// ([`JobsRepository::mark_completed`], [`JobsRepository::reschedule`],
@@ -1860,31 +1900,46 @@ impl JobsRepository for PgJobsRepository {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Job", "queue_sample_by_band"))?;
-            // `ORDER BY band.ord` makes the result index-aligned with
-            // the caller's list, and the caller labels each sample with
-            // the class whose band it passed at that index. A short or
-            // re-ordered result would therefore mislabel a class, so the
-            // length is checked rather than zipped over.
-            //
-            // Unreachable from the statement as written — `WITH
-            // ORDINALITY` + `LEFT JOIN` + `GROUP BY band.ord` answer
-            // once per band whether or not any row falls in it, which
-            // `queue_sample_by_band_sql_answers_once_per_band` pins —
-            // so this is the same kind of defence as the unmappable
-            // claimed row above: an invariant stated where it is
-            // produced, in a shape a future edit to the SQL would
-            // surface as an error instead of as a mislabelled class.
-            if rows.len() != lows.len() {
-                return Err(DomainError::Invariant(format!(
-                    "queue_sample_by_band returned {} rows for {} bands; the statement groups \
-                     by a WITH ORDINALITY band and must answer once per band",
-                    rows.len(),
-                    lows.len(),
-                )));
-            }
-            rows.iter()
-                .map(|row| {
-                    Ok(BandQueueSample {
+            // One group per (band, kind) now, so the caller's index
+            // comes off `band.ord` rather than off the row's position,
+            // and a band contributes as many rows as it has kinds in
+            // it. The answers are still collected into a vector the
+            // caller can zip against its band list — the caller labels
+            // index `n` with the class whose band it passed at index
+            // `n`, and a mislabelled class is the failure this shape
+            // exists to make impossible.
+            let mut observed: Vec<BandQueueSample> = vec![BandQueueSample::default(); lows.len()];
+            // Which bands the statement actually answered for. A band
+            // that produced no group at all would leave a class's
+            // observation indistinguishable from "this class is
+            // completely quiet", which is a different fact — see the
+            // invariant below.
+            let mut answered = vec![false; lows.len()];
+            for row in &rows {
+                let ord: i64 = row.try_get("ord").map_err(|e| invariant(&e))?;
+                let index = usize::try_from(ord - 1).ok().filter(|i| *i < lows.len());
+                let Some(index) = index else {
+                    return Err(DomainError::Invariant(format!(
+                        "queue_sample_by_band returned ordinality {ord} for {} bands; WITH \
+                         ORDINALITY numbers the band list from 1",
+                        lows.len(),
+                    )));
+                };
+                answered[index] = true;
+                // `jobs.kind` is NOT NULL (migration 009), so a NULL
+                // here is the `LEFT JOIN`'s own no-match row and means
+                // the band held no rows at all. It carries zero counts
+                // and NULL timestamps, so there is nothing to record —
+                // the band's empty observation is already in place.
+                let Some(kind) = row
+                    .try_get::<Option<String>, _>("kind")
+                    .map_err(|e| invariant(&e))?
+                else {
+                    continue;
+                };
+                observed[index].kinds.push(KindQueueSample {
+                    kind,
+                    sample: QueueServiceSample {
                         pending_eligible: row
                             .try_get("pending_eligible")
                             .map_err(|e| invariant(&e))?,
@@ -1898,9 +1953,28 @@ impl JobsRepository for PgJobsRepository {
                             .try_get("oldest_capacity_wait_at")
                             .map_err(|e| invariant(&e))?,
                         last_served_at: row.try_get("last_served_at").map_err(|e| invariant(&e))?,
-                    })
-                })
-                .collect()
+                    },
+                });
+            }
+            // Unreachable from the statement as written — `WITH
+            // ORDINALITY` + `LEFT JOIN` + `GROUP BY band.ord, j.kind`
+            // answer with at least one group per band whether or not
+            // any row falls in it, which
+            // `queue_sample_by_band_sql_answers_once_per_band` pins —
+            // so this is the same kind of defence as the unmappable
+            // claimed row above: an invariant stated where it is
+            // produced, in a shape a future edit to the SQL would
+            // surface as an error instead of as a class reported quiet
+            // because nobody asked about it.
+            if let Some(missing) = answered.iter().position(|seen| !seen) {
+                return Err(DomainError::Invariant(format!(
+                    "queue_sample_by_band returned no group for band {} of {}; the statement \
+                     LEFT JOINs a WITH ORDINALITY band list and must answer for every band",
+                    missing + 1,
+                    lows.len(),
+                )));
+            }
+            Ok(observed)
         })
     }
 
@@ -2439,8 +2513,9 @@ mod tests {
             "LEFT JOIN public.jobs j",
             "ON j.priority >= band.lowest",
             "AND j.priority <= band.highest",
-            "GROUP BY band.ord",
-            "ORDER BY band.ord",
+            "j.kind AS kind",
+            "GROUP BY band.ord, j.kind",
+            "ORDER BY band.ord, j.kind",
         ] {
             assert!(
                 sql.contains(token),
@@ -2471,11 +2546,37 @@ mod tests {
         );
         // The statement must not learn what a class is — the bands are
         // two numbers (ADR 0066 D6, `task_class_is_single_sourced`).
+        //
+        // `trigger_source` is the column a classification keys on, so it
+        // may not appear here at all. `kind` is a different case and the
+        // distinction is the one that guard draws itself: a literal may
+        // *project* a column and may not *decide* from it. Grouping by
+        // `j.kind` decides nothing — it splits the band's rows by a
+        // column whose values the statement never compares against
+        // anything — and it is what makes the sample answer at the
+        // granularity the permits are allocated at. So what is
+        // forbidden is a `kind`-valued **predicate**, which is the shape
+        // a copy of the class mapping would take.
         assert!(
-            !sql.contains("trigger_source") && !sql.contains("kind"),
-            "the sample keys on the priority band alone; a kind or trigger-source \
-             predicate here would be a second copy of the class mapping:\n{sql}"
+            !sql.contains("trigger_source"),
+            "the sample keys on the priority band alone; a trigger-source predicate here \
+             would be a second copy of the class mapping:\n{sql}"
         );
+        for predicate in [
+            "kind =",
+            "kind!=",
+            "kind <>",
+            "kind IN",
+            "kind NOT IN",
+            "kind LIKE",
+            "kind ANY",
+        ] {
+            assert!(
+                !sql.contains(predicate),
+                "`{predicate}` decides from `kind` rather than grouping by it — the sample \
+                 selects every kind present in the band and filters on none:\n{sql}"
+            );
+        }
         for pat in [
             "jobsWHERE",
             "'pending'AND",
@@ -3836,6 +3937,274 @@ mod tests {
         .expect("seed aged jobs row")
     }
 
+    // -- queue_sample_by_band against a real Postgres ---------------------
+    //
+    // The statement had no DB-backed coverage before the per-kind
+    // grouping landed: its shape was pinned by a source-text test and
+    // its projection by nothing at all. These three run it, and the
+    // bands they pass are bands of their own invention rather than the
+    // class layout's — the adapter is handed two numbers and never
+    // learns what a class is (ADR 0066 D6), so a test that imported the
+    // class vocabulary to talk to it would be asserting the wrong
+    // contract.
+
+    /// A band this test owns: the low half of the `priority` CHECK's
+    /// range.
+    const TEST_BAND_A: PriorityBand = PriorityBand {
+        lowest: 0,
+        highest: 9,
+    };
+
+    /// A second, disjoint band — so "answers for every band" and "does
+    /// not leak between bands" are both observable.
+    const TEST_BAND_B: PriorityBand = PriorityBand {
+        lowest: 10,
+        highest: 19,
+    };
+
+    /// A claim-eligible pending row: no lock, `created_at` in the past.
+    async fn seed_pending_row(pool: &PgPool, kind: &str, priority: i16, age_secs: i32) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO public.jobs \
+               (kind, params, priority, trigger_source, status, created_at, updated_at) \
+             VALUES ($1, '{}'::jsonb, $2, 'cron', 'pending', \
+                     now() - ($3::int || ' seconds')::interval, \
+                     now() - ($3::int || ' seconds')::interval) \
+             RETURNING id",
+        )
+        .bind(kind)
+        .bind(priority)
+        .bind(age_secs)
+        .fetch_one(pool)
+        .await
+        .expect("seed pending jobs row")
+    }
+
+    /// A row that holds a claim and is queued behind a run permit: a
+    /// **live** lease plus a non-NULL `capacity_waiting_since`, which is
+    /// the conjunction the sample's second predicate requires.
+    async fn seed_awaiting_capacity_row(
+        pool: &PgPool,
+        kind: &str,
+        priority: i16,
+        waiting_secs: i32,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO public.jobs \
+               (kind, params, priority, trigger_source, status, locked_by, locked_until, \
+                capacity_waiting_since, created_at, updated_at) \
+             VALUES ($1, '{}'::jsonb, $2, 'cron', 'running', 'worker-1', \
+                     now() + interval '10 minutes', \
+                     now() - ($3::int || ' seconds')::interval, \
+                     now() - ($3::int || ' seconds')::interval, \
+                     now()) \
+             RETURNING id",
+        )
+        .bind(kind)
+        .bind(priority)
+        .bind(waiting_secs)
+        .fetch_one(pool)
+        .await
+        .expect("seed capacity-waiting jobs row")
+    }
+
+    /// A completed row — the only kind of row the service fact reads.
+    async fn seed_completed_row(
+        pool: &PgPool,
+        kind: &str,
+        priority: i16,
+        completed_secs_ago: i32,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO public.jobs \
+               (kind, params, priority, trigger_source, status, created_at, updated_at, \
+                completed_at) \
+             VALUES ($1, '{}'::jsonb, $2, 'cron', 'completed', \
+                     now() - ($3::int || ' seconds')::interval, now(), \
+                     now() - ($3::int || ' seconds')::interval) \
+             RETURNING id",
+        )
+        .bind(kind)
+        .bind(priority)
+        .bind(completed_secs_ago)
+        .fetch_one(pool)
+        .await
+        .expect("seed completed jobs row")
+    }
+
+    /// **The constellation this grouping exists for.** One kind queued
+    /// behind a run permit for twelve minutes, a different kind of the
+    /// same band completed a second ago.
+    ///
+    /// Before the grouping carried `j.kind` the statement answered one
+    /// `last_served_at` per band — "the newest `completed_at` of any row
+    /// in the band" — so the sibling's completion arrived as *this*
+    /// kind's service and the verdict read `Served`. ADR 0066 D5: *"a
+    /// guarantee enforced per kind and per class, and watched per class
+    /// alone, can be reported healthy by a sibling kind's progress."*
+    ///
+    /// Both answers come out of the one statement, so the band-wide fold
+    /// and the per-kind rows describe the same instant — and the fold
+    /// still reports what it always did, which is why the coarse
+    /// verdict here is `Served` and the fine one is not.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn queue_sample_by_band_splits_a_band_by_kind_so_a_sibling_cannot_re_arm_it() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+        seed_awaiting_capacity_row(&pool, "scan", TEST_BAND_A.lowest, 700).await;
+        seed_completed_row(&pool, "prefetch", TEST_BAND_A.lowest, 1).await;
+
+        let bands = repo
+            .queue_sample_by_band(&[TEST_BAND_A])
+            .await
+            .expect("queue_sample_by_band");
+        assert_eq!(bands.len(), 1, "one band in, one observation out");
+        let observation = &bands[0];
+
+        let scan = observation.kind("scan").expect("the scan rows are grouped");
+        assert_eq!(scan.awaiting_capacity, 1);
+        assert!(
+            scan.oldest_capacity_wait_at.is_some(),
+            "the count and its timestamp come from the same FILTER"
+        );
+        assert_eq!(
+            scan.last_served_at, None,
+            "nothing of this kind in this band has ever completed — the sibling's \
+             completion must not reach this row"
+        );
+        let prefetch = observation
+            .kind("prefetch")
+            .expect("the prefetch rows are grouped");
+        assert!(prefetch.last_served_at.is_some());
+        assert_eq!(
+            prefetch.awaiting_capacity, 0,
+            "the kind that completed has nothing queued behind a permit"
+        );
+
+        // The band-wide fold is unchanged from what the pre-per-kind
+        // statement returned: the newest completion of any kind in the
+        // band.
+        let folded = observation.class_wide();
+        assert_eq!(folded.last_served_at, prefetch.last_served_at);
+        assert_eq!(folded.awaiting_capacity, 1);
+
+        // And the two verdicts the two granularities produce, from one
+        // clock, over one statement's facts.
+        use hort_domain::policy::evaluate_class_service;
+        let now = Utc::now();
+        let threshold = Duration::from_secs(300);
+        assert!(
+            !evaluate_class_service(&folded, now, threshold).is_starved(),
+            "the band-wide verdict is re-armed by the sibling kind, which is the \
+             observation the per-kind rows exist to replace"
+        );
+        assert!(
+            evaluate_class_service(scan, now, threshold).is_starved(),
+            "the kind queued behind its own permit past the threshold is starved"
+        );
+    }
+
+    /// Every band in the request gets an observation, in the request's
+    /// order, including one with no rows at all — and a row of one band
+    /// does not appear in the other.
+    ///
+    /// The `LEFT JOIN` is the load-bearing half: an inner join would
+    /// drop the empty band, the result would be shorter than the band
+    /// list, and every class after the empty one would be labelled with
+    /// its neighbour's facts. With the kind in the grouping the empty
+    /// band's row carries a NULL `kind`, which is the only way a NULL
+    /// can arise there (`jobs.kind` is `NOT NULL`), and the adapter
+    /// records it as "this band has no kinds" rather than as a kind.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn queue_sample_by_band_answers_for_every_band_including_an_empty_one() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+        seed_pending_row(&pool, "scan", TEST_BAND_B.lowest, 120).await;
+
+        let bands = repo
+            .queue_sample_by_band(&[TEST_BAND_A, TEST_BAND_B])
+            .await
+            .expect("queue_sample_by_band");
+        assert_eq!(
+            bands.len(),
+            2,
+            "two bands in, two observations out, in order"
+        );
+        assert!(
+            bands[0].kinds.is_empty(),
+            "the band with no rows has no kind rows: {:?}",
+            bands[0]
+        );
+        assert_eq!(
+            bands[0].class_wide(),
+            QueueServiceSample::default(),
+            "an empty band folds to the quiet sample rather than being omitted"
+        );
+        assert_eq!(
+            bands[1].kind("scan").map(|s| s.pending_eligible),
+            Some(1),
+            "the seeded row is in its own band and nowhere else: {:?}",
+            bands[1]
+        );
+    }
+
+    /// The fold is the band's own numbers: counts sum across kinds, the
+    /// two "oldest" facts are the earliest of the kinds that have one,
+    /// and the service fact is the newest completion in the band.
+    ///
+    /// This is what makes the class-wide answer safe to derive rather
+    /// than ask for separately — a second statement would be a second
+    /// instant, which is the failure the single statement exists to
+    /// prevent.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn queue_sample_by_band_folds_its_kinds_into_the_whole_bands_numbers() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+        seed_pending_row(&pool, "scan", TEST_BAND_A.lowest, 100).await;
+        seed_pending_row(&pool, "scan", TEST_BAND_A.highest, 50).await;
+        seed_pending_row(&pool, "noop", TEST_BAND_A.lowest, 900).await;
+        seed_awaiting_capacity_row(&pool, "noop", TEST_BAND_A.lowest, 400).await;
+        seed_completed_row(&pool, "scan", TEST_BAND_A.lowest, 30).await;
+        seed_completed_row(&pool, "noop", TEST_BAND_A.lowest, 5).await;
+
+        let bands = repo
+            .queue_sample_by_band(&[TEST_BAND_A])
+            .await
+            .expect("queue_sample_by_band");
+        let observation = &bands[0];
+        let scan = observation.kind("scan").expect("scan rows");
+        let noop = observation.kind("noop").expect("noop rows");
+        assert_eq!((scan.pending_eligible, noop.pending_eligible), (2, 1));
+
+        let folded = observation.class_wide();
+        assert_eq!(folded.pending_eligible, 3, "counts sum across the kinds");
+        assert_eq!(folded.awaiting_capacity, 1);
+        assert_eq!(
+            folded.oldest_pending_at, noop.oldest_pending_at,
+            "the band's oldest pending row is the 900 s-old noop row, and a kind with no \
+             pending row at all must not erase it"
+        );
+        assert_eq!(folded.oldest_capacity_wait_at, noop.oldest_capacity_wait_at);
+        assert_eq!(
+            folded.last_served_at, noop.last_served_at,
+            "the band's service fact is the newest completion in it, whatever kind that is"
+        );
+        assert!(
+            scan.last_served_at < noop.last_served_at,
+            "fixture precondition: the two kinds completed at different times, so the fold \
+             really had a choice to make"
+        );
+    }
+
     /// Whether a seeded row is still present.
     async fn row_present(pool: &PgPool, id: Uuid) -> bool {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM public.jobs WHERE id = $1")
@@ -4705,18 +5074,33 @@ mod tests {
             "one answer per band, or a caller would label a class with its neighbour's facts"
         );
         assert_eq!(
-            samples[band_index(TaskTier::Interactive)].pending_eligible,
+            samples[band_index(TaskTier::Interactive)]
+                .class_wide()
+                .pending_eligible,
             1
         );
-        assert_eq!(samples[band_index(TaskTier::Normal)].pending_eligible, 1);
-        assert_eq!(samples[band_index(TaskTier::Bulk)].pending_eligible, 2);
+        assert_eq!(
+            samples[band_index(TaskTier::Normal)]
+                .class_wide()
+                .pending_eligible,
+            1
+        );
+        assert_eq!(
+            samples[band_index(TaskTier::Bulk)]
+                .class_wide()
+                .pending_eligible,
+            2
+        );
         for tier in TaskTier::ALL {
             assert!(
-                samples[band_index(tier)].oldest_pending_at.is_some(),
+                samples[band_index(tier)]
+                    .class_wide()
+                    .oldest_pending_at
+                    .is_some(),
                 "{tier:?} has pending rows, so it must carry the oldest one's arrival"
             );
             assert_eq!(
-                samples[band_index(tier)].last_served_at,
+                samples[band_index(tier)].class_wide().last_served_at,
                 None,
                 "nothing has completed yet, so no class has been served"
             );
@@ -4733,17 +5117,30 @@ mod tests {
             .expect("queue_sample_by_band");
         assert!(
             samples[band_index(TaskTier::Interactive)]
+                .class_wide()
                 .last_served_at
                 .is_some(),
             "the completed row is this class's durable 'being served' fact"
         );
         assert_eq!(
-            samples[band_index(TaskTier::Interactive)].pending_eligible,
+            samples[band_index(TaskTier::Interactive)]
+                .class_wide()
+                .pending_eligible,
             0,
             "and it is no longer waiting"
         );
-        assert_eq!(samples[band_index(TaskTier::Normal)].last_served_at, None);
-        assert_eq!(samples[band_index(TaskTier::Bulk)].last_served_at, None);
+        assert_eq!(
+            samples[band_index(TaskTier::Normal)]
+                .class_wide()
+                .last_served_at,
+            None
+        );
+        assert_eq!(
+            samples[band_index(TaskTier::Bulk)]
+                .class_wide()
+                .last_served_at,
+            None
+        );
     }
 
     /// A row awaiting capacity is one a **live** worker holds.
@@ -4777,7 +5174,7 @@ mod tests {
             .queue_sample_by_band(&observed_bands())
             .await
             .expect("queue_sample_by_band");
-        let normal = &samples[band_index(TaskTier::Normal)];
+        let normal = samples[band_index(TaskTier::Normal)].class_wide();
         assert_eq!(
             normal.awaiting_capacity, 1,
             "a live worker holds this row and has not run it yet"
@@ -4797,7 +5194,7 @@ mod tests {
             .queue_sample_by_band(&observed_bands())
             .await
             .expect("queue_sample_by_band");
-        let normal = &samples[band_index(TaskTier::Normal)];
+        let normal = samples[band_index(TaskTier::Normal)].class_wide();
         assert_eq!(
             normal.awaiting_capacity, 0,
             "a row whose owner is presumed dead is the sweep's business, not a capacity \

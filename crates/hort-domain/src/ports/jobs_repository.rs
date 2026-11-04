@@ -700,32 +700,46 @@ pub struct PendingKindBacklog {
     pub oldest_created_at: DateTime<Utc>,
 }
 
-/// One `jobs.priority` band's queue-service facts, as observed by
-/// [`JobsRepository::queue_sample_by_band`].
+/// The queue-service facts about one **slice** of `public.jobs`, as
+/// [`JobsRepository::queue_sample_by_band`] observes them.
 ///
-/// The band is a class's ordinal footprint
-/// ([`TaskTier::priority_band`](crate::types::task_tier::TaskTier::priority_band)),
-/// so each of these is one class's picture of the two points at which
-/// the worker allocates capacity — but the band travels to the adapter
-/// as two numbers and comes back positionally, because the adapter does
-/// not learn what a class is (ADR 0066 D6). Pairing a sample back up
-/// with its class is the caller's, via
-/// [`class_bands`](crate::types::task_tier::class_bands).
+/// A slice is either a whole `jobs.priority` band — a class's ordinal
+/// footprint
+/// ([`TaskTier::priority_band`](crate::types::task_tier::TaskTier::priority_band))
+/// — or one `jobs.kind` inside such a band. Both granularities carry
+/// the same five facts and are judged by the same pure predicate
+/// ([`policy::evaluate_class_service`](crate::policy::evaluate_class_service)),
+/// because ADR 0066 D5 requires the guarantee to be observable *at the
+/// granularity it is enforced at* and the enforcement is per kind and
+/// per class at both allocation points: the worker allocates run
+/// permits through one allocator **per registered kind**, so a class's
+/// service at that point is a per-kind fact that no class-wide number
+/// can state.
+///
+/// The band travels to the adapter as two numbers and comes back
+/// positionally, because the adapter does not learn what a class is
+/// (ADR 0066 D6). Pairing a sample back up with its class is the
+/// caller's, via [`class_bands`](crate::types::task_tier::class_bands).
 ///
 /// Every field is a *sample*: one statement's view of the queue at one
 /// instant. The verdict over it is
 /// [`policy::evaluate_class_service`](crate::policy::evaluate_class_service),
 /// which is pure and takes the clock as an argument.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BandQueueSample {
-    /// Claim-eligible pending rows in this band — the same eligibility
+///
+/// [`Default`] is "nothing of this slice is in the queue" — the sample
+/// a kind with no row in a band has, and the one a reader of the
+/// per-kind series needs in order to emit a `0` rather than nothing at
+/// all.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QueueServiceSample {
+    /// Claim-eligible pending rows in this slice — the same eligibility
     /// [`PendingKindBacklog`] counts (`status = 'pending'` and the lock
-    /// free or expired), grouped by band instead of by kind.
+    /// free or expired).
     pub pending_eligible: i64,
     /// `created_at` of the oldest of those rows; `None` when there are
     /// none.
     pub oldest_pending_at: Option<DateTime<Utc>>,
-    /// Rows in this band that a **live worker holds without having
+    /// Rows in this slice that a **live worker holds without having
     /// granted them capacity** — claimed, `status = 'running'`, lease
     /// unexpired, and still queued behind a run permit
     /// (`jobs.capacity_waiting_since IS NOT NULL`, migration 038).
@@ -743,17 +757,151 @@ pub struct BandQueueSample {
     /// `capacity_waiting_since` of the oldest row awaiting capacity;
     /// `None` when there are none.
     pub oldest_capacity_wait_at: Option<DateTime<Utc>>,
-    /// Newest `completed_at` of any row in this band — the durable
-    /// "this class is being served" fact, and the one the verdict rests
+    /// Newest `completed_at` of any row in this slice — the durable
+    /// "this slice is being served" fact, and the one the verdict rests
     /// on.
     ///
     /// Durable rather than process-local on purpose: the worker's
     /// in-process last-claimed clock is lost on restart, which is
     /// exactly when a stall is being investigated, and it is per-kind
-    /// (re-armed by a row of any class) rather than per-class. `None`
-    /// means no row of this class has ever completed on this
-    /// deployment.
+    /// *across* classes (re-armed by a row of any class) rather than per
+    /// class.
+    ///
+    /// Unbounded on purpose: `None` means "no row of this slice has ever
+    /// completed on this deployment" rather than "none completed inside
+    /// some window a reader would also have to know about".
     pub last_served_at: Option<DateTime<Utc>>,
+}
+
+/// One `jobs.kind`'s share of a band: the kind, and its own
+/// [`QueueServiceSample`].
+///
+/// The kind is a plain `String` and is *not* interpreted here — it is
+/// read straight off the column. A class is never derived from it
+/// (ADR 0066 D6); the class is the band this row was grouped under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KindQueueSample {
+    /// The `jobs.kind` value, verbatim.
+    pub kind: String,
+    /// That kind's facts inside this band.
+    pub sample: QueueServiceSample,
+}
+
+/// One `jobs.priority` band's queue-service observation: the per-kind
+/// rows the sampling statement answered with.
+///
+/// # Why the per-kind rows are the stored half
+///
+/// ADR 0066's guarantee is enforced per kind *and* per class — the
+/// claim's reservation, the per-class time floor and the class-blind age
+/// net all sit inside a per-kind allocator — and D5 requires the
+/// observation to match: *"An observation coarser than the enforcement
+/// is a statistic and not an alarm — a guarantee enforced per kind and
+/// per class, and watched per class alone, can be reported healthy by a
+/// sibling kind's progress."* So the finer rows are what the statement
+/// returns, and the class-wide answer is [`Self::class_wide`], a fold
+/// over them.
+///
+/// That direction is the load-bearing one. The class-wide answer is
+/// still needed (an operator asking "is this class starving" must get
+/// one number), and deriving it means it has exactly **one** definition
+/// and cannot disagree with the sum of the series it is drilled into.
+/// Storing it beside the rows would be a second copy of an aggregate
+/// the rows already determine, and a fixture could then state a total
+/// its own rows contradict.
+///
+/// A band with nothing in it carries **no** kind rows, and folds to a
+/// [`QueueServiceSample::default`] — which is what makes a class that
+/// has gone completely quiet distinguishable from one the statement did
+/// not look at: the band still gets its (empty) observation, in the
+/// caller's own band order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BandQueueSample {
+    /// Every `jobs.kind` with at least one row in this band, with that
+    /// kind's own facts. A kind with no row in the band is absent
+    /// rather than present-and-zero, because the statement groups by
+    /// the column and cannot invent a row.
+    pub kinds: Vec<KindQueueSample>,
+}
+
+impl BandQueueSample {
+    /// The whole band's facts — the class-wide answer, folded from
+    /// [`Self::kinds`].
+    ///
+    /// Exactly the five numbers the pre-per-kind statement returned,
+    /// because the grouping partitions the band: a sum of per-kind
+    /// counts is the band's count, the earliest of the per-kind
+    /// earliests is the band's earliest, and the newest of the per-kind
+    /// newests is the band's newest. All five facts therefore still
+    /// describe the **same instant** — the one statement's — which is
+    /// the property a loop over kinds would have given up.
+    ///
+    /// It is also the backstop for a kind the reader does not know
+    /// about. The per-kind series are emitted over a closed kind
+    /// vocabulary; a row carrying a kind outside it (which
+    /// `jobs_kind_check` makes unreachable, and which the lock-step
+    /// guard holds against
+    /// [`EVENT_TASK_KINDS`](crate::events::EVENT_TASK_KINDS)) is still
+    /// inside this fold, so the coarse alarm sees work the fine series
+    /// would have no label for.
+    pub fn class_wide(&self) -> QueueServiceSample {
+        let mut folded = QueueServiceSample::default();
+        for KindQueueSample { sample, .. } in &self.kinds {
+            folded.pending_eligible = folded
+                .pending_eligible
+                .saturating_add(sample.pending_eligible);
+            folded.awaiting_capacity = folded
+                .awaiting_capacity
+                .saturating_add(sample.awaiting_capacity);
+            folded.oldest_pending_at = earliest(folded.oldest_pending_at, sample.oldest_pending_at);
+            folded.oldest_capacity_wait_at = earliest(
+                folded.oldest_capacity_wait_at,
+                sample.oldest_capacity_wait_at,
+            );
+            folded.last_served_at = latest(folded.last_served_at, sample.last_served_at);
+        }
+        folded
+    }
+
+    /// This band's facts for one kind, or `None` when that kind has no
+    /// row in the band.
+    ///
+    /// A caller emitting a per-kind series over a closed vocabulary
+    /// resolves a `None` to [`QueueServiceSample::default`] — "this kind
+    /// has nothing of this class waiting" — rather than skipping the
+    /// series, so a scrape never has to tell absence from zero.
+    pub fn kind(&self, kind: &str) -> Option<&QueueServiceSample> {
+        self.kinds
+            .iter()
+            .find(|row| row.kind == kind)
+            .map(|row| &row.sample)
+    }
+}
+
+/// The earlier of two optional instants, treating `None` as "no instant
+/// to offer" rather than as a minimum.
+///
+/// Spelled out rather than `Option::min`, whose [`Ord`] puts `None`
+/// *below* every `Some` — folding with it would answer `None` for a
+/// band where one kind has waiting work and another has none, which is
+/// the opposite of the fact being folded.
+fn earliest(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
+/// The later of two optional instants. `Option::max` would agree here,
+/// and this is written out anyway so the fold's two directions read as
+/// one pair rather than as one helper and one idiom.
+fn latest(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
 }
 
 /// Domain projection of a `kind='scan'` row in the `jobs` table.
@@ -1512,10 +1660,28 @@ pub trait JobsRepository: Send + Sync {
     /// numbers per band and the positional result is matched back to a
     /// class by the caller.
     ///
-    /// A band with nothing in it yields a sample of zeroes and `None`s
+    /// A band with nothing in it yields an observation with no kind rows
     /// rather than being omitted, so the result is always index-aligned
     /// with `bands` and a class that has gone completely quiet is
     /// distinguishable from one the statement did not look at.
+    ///
+    /// **Each observation is grouped by `jobs.kind`, and it is still one
+    /// statement.** The guarantee is enforced per kind and per class, so
+    /// D5 requires it to be observed that way; a loop issuing one query
+    /// per kind would answer from a set of instants, and a class could
+    /// then read "nothing waiting" and "never served" from two different
+    /// moments. The class-wide answer is
+    /// [`BandQueueSample::class_wide`], a fold over the rows of that
+    /// same statement, so both granularities describe one instant and
+    /// cannot disagree.
+    ///
+    /// **Every kind present in the band gets a row — registered or
+    /// not.** The grouping is driven by the rows in `jobs`, never by a
+    /// caller's handler registry, for the reason
+    /// [`Self::eligible_pending_by_kind`] is unfiltered too: a kind no
+    /// worker in the fleet claims is the case the observation most needs
+    /// to be able to report, and the sampling process cannot know what
+    /// any worker registered.
     ///
     /// **Default implementation:** returns `Ok(Vec::new())` — "this
     /// repository observes no bands", the same additive default
@@ -1971,6 +2137,8 @@ pub struct IdempotentEnqueueRow {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
+
     use super::*;
 
     /// A `JobsRepository` implementing **only** the trait's required
@@ -3042,6 +3210,185 @@ mod tests {
         assert_eq!(
             format!("{:?}", RequeueOutcome::RetriesExhausted),
             "RetriesExhausted"
+        );
+    }
+
+    // -- BandQueueSample: the class-wide answer is a fold -----------------
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + secs, 0)
+            .single()
+            .expect("valid timestamp")
+    }
+
+    fn kind_row(kind: &str, sample: QueueServiceSample) -> KindQueueSample {
+        KindQueueSample {
+            kind: kind.to_string(),
+            sample,
+        }
+    }
+
+    /// The fold is the five aggregates the one statement would have
+    /// produced over the whole band: counts sum, the two "oldest" facts
+    /// take the earliest of the kinds that have one, and the service
+    /// fact takes the newest.
+    #[test]
+    fn class_wide_folds_every_kind_row_into_the_band_answer() {
+        let band = BandQueueSample {
+            kinds: vec![
+                kind_row(
+                    "scan",
+                    QueueServiceSample {
+                        pending_eligible: 2,
+                        oldest_pending_at: Some(at(50)),
+                        awaiting_capacity: 1,
+                        oldest_capacity_wait_at: Some(at(80)),
+                        last_served_at: Some(at(10)),
+                    },
+                ),
+                kind_row(
+                    "prefetch",
+                    QueueServiceSample {
+                        pending_eligible: 3,
+                        oldest_pending_at: Some(at(20)),
+                        awaiting_capacity: 0,
+                        oldest_capacity_wait_at: None,
+                        last_served_at: Some(at(90)),
+                    },
+                ),
+            ],
+        };
+        assert_eq!(
+            band.class_wide(),
+            QueueServiceSample {
+                pending_eligible: 5,
+                oldest_pending_at: Some(at(20)),
+                awaiting_capacity: 1,
+                oldest_capacity_wait_at: Some(at(80)),
+                last_served_at: Some(at(90)),
+            }
+        );
+    }
+
+    /// A band with no rows folds to the quiet sample, which is what
+    /// keeps "this class has gone completely quiet" distinguishable from
+    /// "the statement did not look at this band" — the latter is a
+    /// missing observation, not an empty one.
+    #[test]
+    fn class_wide_of_an_empty_band_is_the_quiet_sample() {
+        assert_eq!(
+            BandQueueSample::default().class_wide(),
+            QueueServiceSample::default()
+        );
+        assert_eq!(
+            QueueServiceSample::default(),
+            QueueServiceSample {
+                pending_eligible: 0,
+                oldest_pending_at: None,
+                awaiting_capacity: 0,
+                oldest_capacity_wait_at: None,
+                last_served_at: None,
+            },
+            "the default has to be the honest 'nothing here' sample, because a per-kind \
+             series emits it for every kind absent from the band"
+        );
+    }
+
+    /// `None` is "no instant to offer", not a minimum.
+    ///
+    /// The regression this pins: `Option`'s own [`Ord`] puts `None`
+    /// below every `Some`, so folding the two "oldest" facts with
+    /// `Option::min` would answer `None` for a band where one kind has
+    /// waiting work and another has none — and a positive count beside a
+    /// missing timestamp is exactly the internally-inconsistent sample
+    /// `evaluate_class_service` resolves toward "not starved". The fold
+    /// would have invented the inconsistency that resolution exists to
+    /// survive.
+    #[test]
+    fn class_wide_does_not_let_a_quiet_kind_erase_another_kinds_oldest() {
+        let band = BandQueueSample {
+            kinds: vec![
+                kind_row("noop", QueueServiceSample::default()),
+                kind_row(
+                    "scan",
+                    QueueServiceSample {
+                        pending_eligible: 1,
+                        oldest_pending_at: Some(at(5)),
+                        awaiting_capacity: 2,
+                        oldest_capacity_wait_at: Some(at(7)),
+                        last_served_at: None,
+                    },
+                ),
+            ],
+        };
+        let folded = band.class_wide();
+        assert_eq!(folded.oldest_pending_at, Some(at(5)));
+        assert_eq!(folded.oldest_capacity_wait_at, Some(at(7)));
+        assert_eq!(folded.last_served_at, None);
+        assert_eq!(folded.pending_eligible, 1);
+        assert_eq!(folded.awaiting_capacity, 2);
+    }
+
+    /// A sibling kind's completion is the band's `last_served_at` and is
+    /// **not** the starved kind's — which is the whole of ADR 0066 D5's
+    /// "an observation coarser than the enforcement is a statistic and
+    /// not an alarm".
+    #[test]
+    fn a_sibling_kinds_completion_does_not_reach_the_starved_kinds_row() {
+        let band = BandQueueSample {
+            kinds: vec![
+                kind_row(
+                    "scan",
+                    QueueServiceSample {
+                        awaiting_capacity: 1,
+                        oldest_capacity_wait_at: Some(at(0)),
+                        ..QueueServiceSample::default()
+                    },
+                ),
+                kind_row(
+                    "prefetch",
+                    QueueServiceSample {
+                        last_served_at: Some(at(600)),
+                        ..QueueServiceSample::default()
+                    },
+                ),
+            ],
+        };
+        assert_eq!(
+            band.class_wide().last_served_at,
+            Some(at(600)),
+            "the class-wide answer is re-armed by the sibling, as it always was"
+        );
+        assert_eq!(
+            band.kind("scan").expect("scan has a row").last_served_at,
+            None,
+            "the starved kind's own row must carry no service at all"
+        );
+    }
+
+    /// `kind` finds a present kind and answers `None` for an absent one,
+    /// which is the lookup a per-kind series makes per kind in its
+    /// vocabulary.
+    #[test]
+    fn kind_lookup_distinguishes_present_from_absent() {
+        let band = BandQueueSample {
+            kinds: vec![kind_row(
+                "scan",
+                QueueServiceSample {
+                    pending_eligible: 4,
+                    ..QueueServiceSample::default()
+                },
+            )],
+        };
+        assert_eq!(
+            band.kind("scan").map(|s| s.pending_eligible),
+            Some(4),
+            "a kind with rows in the band answers with its own facts"
+        );
+        assert!(
+            band.kind("retention-purge").is_none(),
+            "a kind with no row in the band is absent rather than zero — the caller is the \
+             one that decides to emit a zero for it"
         );
     }
 }

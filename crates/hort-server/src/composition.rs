@@ -725,6 +725,78 @@ const CLASS_PENDING_ELIGIBLE_METRIC: &str = "hort_admin_tasks_class_pending_elig
 /// see.
 const CLASS_AWAITING_CAPACITY_METRIC: &str = "hort_admin_tasks_class_awaiting_capacity";
 
+/// The three series above at the granularity ADR 0066's guarantee is
+/// **enforced** at: `(class, kind)` rather than class alone.
+///
+/// D5 requires the guarantee to be observable at the granularity it is
+/// enforced at, and the enforcement is per kind as well as per class —
+/// the worker allocates run permits through one allocator per
+/// registered kind, so a class starving at one kind's permit point is
+/// re-armed, in the class-wide answer, by any sibling kind of the same
+/// class completing. *"An observation coarser than the enforcement is a
+/// statistic and not an alarm."*
+///
+/// **New names rather than a `kind` label on the three above**, which
+/// is what keeps the class-wide question exactly as askable as it was:
+/// `hort_admin_tasks_class_unserved{class="bulk"}` stays one series with
+/// one value and every existing alert expression keeps its meaning. The
+/// coarse series also stay load-bearing rather than merely compatible —
+/// they are the fold of *every* kind row, so a row carrying a kind
+/// outside [`KIND_SERIES`]'s vocabulary is still inside them, while the
+/// fine series would have no label for it.
+const CLASS_KIND_UNSERVED_METRIC: &str = "hort_admin_tasks_class_kind_unserved";
+
+/// Per-`(class, kind)` claim-eligible depth. See
+/// [`CLASS_KIND_UNSERVED_METRIC`].
+const CLASS_KIND_PENDING_ELIGIBLE_METRIC: &str = "hort_admin_tasks_class_kind_pending_eligible";
+
+/// Per-`(class, kind)` count of rows holding a claim and queued behind
+/// that kind's run permit — the allocation point the fine granularity
+/// exists for, since the allocator is per kind. See
+/// [`CLASS_KIND_UNSERVED_METRIC`].
+const CLASS_KIND_AWAITING_CAPACITY_METRIC: &str = "hort_admin_tasks_class_kind_awaiting_capacity";
+
+/// The kinds the per-`(class, kind)` series are emitted over, on every
+/// pass, whether or not the kind has a row in the band.
+///
+/// # Why a closed list and not the kinds the sample happened to see
+///
+/// Three properties, and the first two are the ones the sibling
+/// class-wide series already rest on:
+///
+/// - **A gauge that stops being emitted keeps its last value.** The
+///   recorder is installed without an idle timeout, so a series that
+///   appears only while a kind has rows would hold `1` after the kind's
+///   rows drained — an alarm that cannot clear. Emitting the whole grid
+///   every pass means every series is refreshed from durable facts on
+///   every pass.
+/// - **Absence and `0.0` are not the same thing to a dashboard**, which
+///   is the stated reason every class is emitted on the healthy path
+///   too.
+/// - **It needs no state.** The alternative — remember which pairs were
+///   emitted last pass and zero the departures — would put the
+///   correctness of the alarm in process-local memory, which is lost on
+///   restart, i.e. exactly when a stall is being investigated.
+///
+/// # Which kinds, and the one that has no allocator
+///
+/// [`EVENT_TASK_KINDS`](hort_domain::events::EVENT_TASK_KINDS) is the
+/// complete set of values `jobs.kind` can hold — the column's
+/// `jobs_kind_check` CHECK is held against this list by
+/// `task_kind_check_lockstep_guard` — so the grid is every kind a row
+/// can carry, not a guess at the interesting ones.
+///
+/// **A kind with no registered allocator anywhere in the fleet gets its
+/// series like any other**, and that is deliberate: it is the case the
+/// observation most needs to be able to report. A `provenance-verify`
+/// backlog once reached ~1450 rows in 33 minutes with no handler
+/// registered and no signal anywhere, which is why the per-kind
+/// `hort_admin_tasks_pending_eligible` gauge covers every kind present
+/// in `jobs` too. The sampling process could not filter by registration
+/// even if it wanted to — registration is a worker-process fact and
+/// this is `hort-server`.
+const KIND_SERIES: &[&str] = hort_domain::events::EVENT_TASK_KINDS;
+
 /// How often [`spawn_queue_class_service_sampler`] re-samples the queue.
 ///
 /// One minute, matching the worker audit's own spacing: the sample is a
@@ -815,7 +887,10 @@ pub(crate) fn class_service_threshold_from_env() -> std::time::Duration {
 /// Every class is emitted on every pass, including the `0.0` healthy
 /// path, so a fresh scrape always sees the full series set — absence
 /// versus `0.0` is ambiguous to a dashboard, matching the convention
-/// the sibling signals use.
+/// the sibling signals use. The per-`(class, kind)` series extend that
+/// convention to the kind axis for the reasons on [`KIND_SERIES`], one
+/// of which is sharper here than for the classes: these are an alarm
+/// surface, and a gauge that stops being emitted keeps its last value.
 pub(crate) fn emit_queue_class_service_signal(
     samples: &[(
         hort_domain::types::task_tier::TaskTier,
@@ -825,10 +900,16 @@ pub(crate) fn emit_queue_class_service_signal(
     threshold: std::time::Duration,
 ) {
     use hort_domain::policy::{evaluate_class_service, ClassService};
+    use hort_domain::ports::jobs_repository::QueueServiceSample;
 
-    for (tier, sample) in samples {
+    // What a kind with no row in a band is judged on: nothing waiting,
+    // so `ClassService::Idle` and a `0.0` on all three series.
+    let quiet = QueueServiceSample::default();
+
+    for (tier, observation) in samples {
         let class = tier.as_str();
-        let verdict = evaluate_class_service(sample, now, threshold);
+        let sample = observation.class_wide();
+        let verdict = evaluate_class_service(&sample, now, threshold);
         metrics::gauge!(CLASS_PENDING_ELIGIBLE_METRIC, "class" => class)
             .set(sample.pending_eligible as f64);
         metrics::gauge!(CLASS_AWAITING_CAPACITY_METRIC, "class" => class)
@@ -886,6 +967,50 @@ pub(crate) fn emit_queue_class_service_signal(
                 tracing::debug!(
                     class,
                     "work class has nothing waiting — no service is owed to it"
+                );
+            }
+        }
+        // The same three facts and the same predicate per
+        // `(class, kind)` — the granularity the permits are allocated
+        // at, and therefore the one D5 requires the guarantee to be
+        // watched at. A kind with no row in this band is emitted as the
+        // quiet sample rather than skipped, for the reasons on
+        // [`KIND_SERIES`].
+        for kind in KIND_SERIES {
+            let kind_sample = observation.kind(kind).unwrap_or(&quiet);
+            let kind_verdict = evaluate_class_service(kind_sample, now, threshold);
+            metrics::gauge!(CLASS_KIND_PENDING_ELIGIBLE_METRIC, "class" => class, "kind" => *kind)
+                .set(kind_sample.pending_eligible as f64);
+            metrics::gauge!(CLASS_KIND_AWAITING_CAPACITY_METRIC, "class" => class, "kind" => *kind)
+                .set(kind_sample.awaiting_capacity as f64);
+            metrics::gauge!(CLASS_KIND_UNSERVED_METRIC, "class" => class, "kind" => *kind)
+                .set(if kind_verdict.is_starved() { 1.0 } else { 0.0 });
+            if let ClassService::Starved {
+                waiting,
+                awaiting_capacity,
+                unserved_for_secs,
+                threshold_secs,
+                reason,
+            } = kind_verdict
+            {
+                tracing::warn!(
+                    class,
+                    kind = *kind,
+                    waiting,
+                    awaiting_capacity,
+                    unserved_for_secs,
+                    threshold_secs,
+                    reason = reason.as_str(),
+                    "one kind of a work class is NOT being served — it has work waiting \
+                     that nothing of the same kind and class has been served ahead of \
+                     (ADR 0066 D5). This is the granularity the guarantee is enforced at: \
+                     each kind's run permits come from that kind's own allocator, so this \
+                     stands even when the class as a whole reads as served because a \
+                     different kind of it just completed. reason 'not_claimed': the rows \
+                     are pending and are not being taken up — if no worker in the fleet \
+                     registers a handler for this kind, that is the cause. reason \
+                     'awaiting_capacity': rows of this kind and class hold a claim and \
+                     have been queued behind this kind's run permit past the threshold."
                 );
             }
         }
@@ -4746,15 +4871,68 @@ mod tests {
     // ambiguous), the verdict lands on the right class, and the
     // threshold the operator set is the one applied.
 
-    /// A sample with nothing in it — each test sets only the facts its
-    /// scenario rests on.
-    fn empty_band_sample() -> hort_domain::ports::jobs_repository::BandQueueSample {
-        hort_domain::ports::jobs_repository::BandQueueSample {
+    /// A slice sample with nothing in it — each test sets only the facts
+    /// its scenario rests on.
+    fn empty_sample() -> hort_domain::ports::jobs_repository::QueueServiceSample {
+        hort_domain::ports::jobs_repository::QueueServiceSample {
             pending_eligible: 0,
             oldest_pending_at: None,
             awaiting_capacity: 0,
             oldest_capacity_wait_at: None,
             last_served_at: None,
+        }
+    }
+
+    /// One band's observation, built from the kinds its rows belong to.
+    ///
+    /// A fixture has to name them: the guarantee is enforced per kind as
+    /// well as per class, so "two rows waiting in the Normal band" is
+    /// not a complete statement of a queue.
+    fn band(
+        kinds: Vec<(
+            &str,
+            hort_domain::ports::jobs_repository::QueueServiceSample,
+        )>,
+    ) -> hort_domain::ports::jobs_repository::BandQueueSample {
+        hort_domain::ports::jobs_repository::BandQueueSample {
+            kinds: kinds
+                .into_iter()
+                .map(
+                    |(kind, sample)| hort_domain::ports::jobs_repository::KindQueueSample {
+                        kind: kind.to_string(),
+                        sample,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    /// A band with no rows at all — the class is completely quiet.
+    fn empty_band_sample() -> hort_domain::ports::jobs_repository::BandQueueSample {
+        band(Vec::new())
+    }
+
+    /// The common single-kind band.
+    fn one_kind_band(
+        kind: &str,
+        sample: hort_domain::ports::jobs_repository::QueueServiceSample,
+    ) -> hort_domain::ports::jobs_repository::BandQueueSample {
+        band(vec![(kind, sample)])
+    }
+
+    fn kind_gauge_for(entries: &[MetricEntry], name: &str, class: &str, kind: &str) -> f64 {
+        let gauge = find_metric(
+            entries,
+            MetricKind::Gauge,
+            name,
+            &[("class", class), ("kind", kind)],
+        )
+        .unwrap_or_else(|| {
+            panic!("{name}{{class={class},kind={kind}}} must be emitted: {entries:?}")
+        });
+        match gauge {
+            DebugValue::Gauge(v) => f64::from(*v),
+            other => panic!("expected a gauge, got {other:?}"),
         }
     }
 
@@ -4809,22 +4987,28 @@ mod tests {
         let samples = vec![
             (
                 TaskTier::Interactive,
-                hort_domain::ports::jobs_repository::BandQueueSample {
-                    pending_eligible: 4,
-                    oldest_pending_at: Some(now - chrono::Duration::seconds(20)),
-                    last_served_at: Some(now - chrono::Duration::seconds(2)),
-                    ..empty_band_sample()
-                },
+                one_kind_band(
+                    "scan",
+                    hort_domain::ports::jobs_repository::QueueServiceSample {
+                        pending_eligible: 4,
+                        oldest_pending_at: Some(now - chrono::Duration::seconds(20)),
+                        last_served_at: Some(now - chrono::Duration::seconds(2)),
+                        ..empty_sample()
+                    },
+                ),
             ),
             (
                 TaskTier::Normal,
-                hort_domain::ports::jobs_repository::BandQueueSample {
-                    pending_eligible: 2,
-                    oldest_pending_at: Some(now - chrono::Duration::seconds(400)),
-                    awaiting_capacity: 1,
-                    oldest_capacity_wait_at: Some(now - chrono::Duration::seconds(380)),
-                    ..empty_band_sample()
-                },
+                one_kind_band(
+                    "scan",
+                    hort_domain::ports::jobs_repository::QueueServiceSample {
+                        pending_eligible: 2,
+                        oldest_pending_at: Some(now - chrono::Duration::seconds(400)),
+                        awaiting_capacity: 1,
+                        oldest_capacity_wait_at: Some(now - chrono::Duration::seconds(380)),
+                        ..empty_sample()
+                    },
+                ),
             ),
             (TaskTier::Bulk, empty_band_sample()),
         ];
@@ -4872,6 +5056,189 @@ mod tests {
         );
     }
 
+    /// A kind starving at its own permit point is reported even though a
+    /// sibling kind of the same class completed a second ago.
+    ///
+    /// ADR 0066 D5: *"An observation coarser than the enforcement is a
+    /// statistic and not an alarm — a guarantee enforced per kind and
+    /// per class, and watched per class alone, can be reported healthy
+    /// by a sibling kind's progress."* The run permits are allocated by
+    /// one allocator per registered kind, so this is the constellation
+    /// where the class-wide gauge is **right** about what it was asked
+    /// and useless as an alarm: the class's newest completion is a
+    /// second old because `prefetch` finished, and the `scan` rows of
+    /// the same class have been queued behind `scan`'s permit for 700 s.
+    #[test]
+    fn a_kind_starved_at_its_permit_reads_1_though_a_sibling_kind_just_completed() {
+        use hort_domain::ports::jobs_repository::QueueServiceSample;
+        use hort_domain::types::task_tier::TaskTier;
+        let now = chrono::Utc::now();
+        let samples = vec![(
+            TaskTier::Normal,
+            band(vec![
+                (
+                    "scan",
+                    QueueServiceSample {
+                        awaiting_capacity: 1,
+                        oldest_capacity_wait_at: Some(now - chrono::Duration::seconds(700)),
+                        ..empty_sample()
+                    },
+                ),
+                (
+                    "prefetch",
+                    QueueServiceSample {
+                        last_served_at: Some(now - chrono::Duration::seconds(1)),
+                        ..empty_sample()
+                    },
+                ),
+            ]),
+        )];
+        let entries = capture(|| {
+            emit_queue_class_service_signal(&samples, now, std::time::Duration::from_secs(300));
+        });
+        let class = TaskTier::Normal.as_str();
+        assert_eq!(
+            gauge_for(&entries, CLASS_UNSERVED_METRIC, class),
+            0.0,
+            "the class-wide verdict is re-armed by the sibling kind's completion — that is \
+             the observation this granularity exists to replace, not a bug in it: {entries:?}"
+        );
+        assert_eq!(
+            kind_gauge_for(&entries, CLASS_KIND_UNSERVED_METRIC, class, "scan"),
+            1.0,
+            "the kind queued behind its own permit must read 1: {entries:?}"
+        );
+        assert_eq!(
+            kind_gauge_for(&entries, CLASS_KIND_UNSERVED_METRIC, class, "prefetch"),
+            0.0,
+            "the kind that is flowing has nothing waiting and is owed no service: {entries:?}"
+        );
+        // The depths beside the verdict are the kind's own, so the
+        // series that is non-zero says which allocation point to look
+        // at — and for this constellation it is the permit, which no
+        // read of the pending backlog can see.
+        assert_eq!(
+            kind_gauge_for(&entries, CLASS_KIND_AWAITING_CAPACITY_METRIC, class, "scan"),
+            1.0
+        );
+        assert_eq!(
+            kind_gauge_for(&entries, CLASS_KIND_PENDING_ELIGIBLE_METRIC, class, "scan"),
+            0.0
+        );
+        // And the class-wide depth is still the fold, so an operator
+        // drilling from the coarse series into the fine ones finds the
+        // same rows.
+        assert_eq!(
+            gauge_for(&entries, CLASS_AWAITING_CAPACITY_METRIC, class),
+            1.0
+        );
+    }
+
+    /// Every kind in the series vocabulary gets all three per-kind
+    /// series on every pass, for every class, including the healthy
+    /// path — and that is the cardinality figure the catalog states.
+    ///
+    /// Two properties in one assertion, and both are about what a
+    /// dashboard can conclude from a missing series. The recorder is
+    /// installed with no idle timeout, so a gauge that stops being
+    /// emitted keeps its last value: a series that only existed while a
+    /// kind had rows would hold `1` after those rows drained, which is
+    /// an alarm that cannot clear. And absence is not `0.0` to a
+    /// dashboard, which is the reason every class is emitted on the
+    /// healthy path too.
+    #[test]
+    fn every_kind_and_class_gets_every_series_on_the_healthy_path() {
+        use hort_domain::types::task_tier::TaskTier;
+        let now = chrono::Utc::now();
+        let samples: Vec<_> = TaskTier::ALL
+            .into_iter()
+            .map(|tier| (tier, empty_band_sample()))
+            .collect();
+        let entries = capture(|| {
+            emit_queue_class_service_signal(&samples, now, std::time::Duration::from_secs(300));
+        });
+        for tier in TaskTier::ALL {
+            for kind in KIND_SERIES {
+                for name in [
+                    CLASS_KIND_UNSERVED_METRIC,
+                    CLASS_KIND_PENDING_ELIGIBLE_METRIC,
+                    CLASS_KIND_AWAITING_CAPACITY_METRIC,
+                ] {
+                    assert_eq!(
+                        kind_gauge_for(&entries, name, tier.as_str(), kind),
+                        0.0,
+                        "a kind with no row in the band reads 0, not nothing at all"
+                    );
+                }
+            }
+        }
+        // The figure itself, so a vocabulary that grows is a visible
+        // change here rather than only in the catalog.
+        assert_eq!(
+            KIND_SERIES.len() * TaskTier::ALL.len(),
+            26 * 3,
+            "the per-kind series are bounded by every value `jobs.kind` can hold \
+             (EVENT_TASK_KINDS, held against the column's CHECK by \
+             task_kind_check_lockstep_guard) times the three classes"
+        );
+        assert_eq!(
+            KIND_SERIES,
+            hort_domain::events::EVENT_TASK_KINDS,
+            "the vocabulary is the column's own, not a second list"
+        );
+    }
+
+    /// A kind with no registered allocator anywhere in the fleet is
+    /// reported like any other.
+    ///
+    /// This is the case the signal most needs to be able to report — a
+    /// `provenance-verify` backlog once reached ~1450 rows in 33 minutes
+    /// with no handler registered and no signal anywhere — and the
+    /// sampling process could not filter by registration even if it
+    /// wanted to, because registration is a worker-process fact and this
+    /// is `hort-server`. The verdict's reason is the claim, since a kind
+    /// nothing claims never reaches a permit queue.
+    #[test]
+    fn a_kind_with_no_allocator_is_reported_at_the_claim() {
+        use hort_domain::ports::jobs_repository::QueueServiceSample;
+        use hort_domain::types::task_tier::TaskTier;
+        let now = chrono::Utc::now();
+        let samples = vec![(
+            TaskTier::Interactive,
+            one_kind_band(
+                "provenance-verify",
+                QueueServiceSample {
+                    pending_eligible: 1_450,
+                    oldest_pending_at: Some(now - chrono::Duration::seconds(1_980)),
+                    ..empty_sample()
+                },
+            ),
+        )];
+        let entries = capture(|| {
+            emit_queue_class_service_signal(&samples, now, std::time::Duration::from_secs(300));
+        });
+        let class = TaskTier::Interactive.as_str();
+        assert_eq!(
+            kind_gauge_for(
+                &entries,
+                CLASS_KIND_UNSERVED_METRIC,
+                class,
+                "provenance-verify"
+            ),
+            1.0
+        );
+        assert_eq!(
+            kind_gauge_for(
+                &entries,
+                CLASS_KIND_PENDING_ELIGIBLE_METRIC,
+                class,
+                "provenance-verify"
+            ),
+            1_450.0,
+            "the depth beside the verdict is the kind's own backlog"
+        );
+    }
+
     /// The threshold is the caller's — a longer one turns the same
     /// sample healthy.
     ///
@@ -4884,11 +5251,14 @@ mod tests {
         let now = chrono::Utc::now();
         let samples = vec![(
             TaskTier::Bulk,
-            hort_domain::ports::jobs_repository::BandQueueSample {
-                pending_eligible: 1,
-                oldest_pending_at: Some(now - chrono::Duration::seconds(400)),
-                ..empty_band_sample()
-            },
+            one_kind_band(
+                "scan",
+                hort_domain::ports::jobs_repository::QueueServiceSample {
+                    pending_eligible: 1,
+                    oldest_pending_at: Some(now - chrono::Duration::seconds(400)),
+                    ..empty_sample()
+                },
+            ),
         )];
         let tight = capture(|| {
             emit_queue_class_service_signal(&samples, now, std::time::Duration::from_secs(300));
@@ -5012,11 +5382,14 @@ mod tests {
         let jobs = sampling_jobs(vec![
             empty_band_sample(),
             empty_band_sample(),
-            hort_domain::ports::jobs_repository::BandQueueSample {
-                pending_eligible: 9,
-                oldest_pending_at: Some(now - chrono::Duration::seconds(900)),
-                ..empty_band_sample()
-            },
+            one_kind_band(
+                "scan",
+                hort_domain::ports::jobs_repository::QueueServiceSample {
+                    pending_eligible: 9,
+                    oldest_pending_at: Some(now - chrono::Duration::seconds(900)),
+                    ..empty_sample()
+                },
+            ),
         ]);
         let entries = one_sampler_pass(
             jobs.clone() as Arc<dyn hort_domain::ports::jobs_repository::JobsRepository>,
