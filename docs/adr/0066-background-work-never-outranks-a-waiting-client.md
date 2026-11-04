@@ -86,12 +86,24 @@ displaces work someone waits on.**
    victims are different: at the first point, other kinds of work; at the
    second, other classes of the same kind. Both must be closed, and a design
    that closes one is incomplete rather than partial.
-5. **Every class is guaranteed service; the guarantee is observable; and the
-   observation reaches a human.** A class that is never served is a defect
-   whatever its share says, so the guarantee is part of the decision and not a
-   nicety. Both instances were found by a human noticing latency, which is the
-   evidence that an instrumented guarantee nobody is alerted on is
-   documentation rather than a guarantee.
+5. **Every class is guaranteed service; the guarantee is observable at the
+   granularity it is enforced at; and the observation reaches a human.** A
+   class that is never served is a defect whatever its share says, so the
+   guarantee is part of the decision and not a nicety. *Every* class includes
+   the one with no reserved share. Its guarantee rests not on a share but on a
+   **priority-blind age fallback beneath the reservation, present at every
+   point the reservation is**: past a bound the oldest waiting item is served
+   whatever its class. That fallback reorders nothing inside the bound, so the
+   class order of (1) is untouched, and it is not a second per-class
+   allocation — aging alone would be insufficient (see *Alternatives
+   considered*), and beneath the reservation it is what keeps the lowest class
+   from never running. "Served more slowly" is the trade this decision makes;
+   "never served" is not. An observation coarser than the
+   enforcement is a statistic and not an alarm — a guarantee enforced per kind
+   and per class, and watched per class alone, can be reported healthy by a
+   sibling kind's progress. Both instances were found by a human noticing
+   latency, which is the evidence that an instrumented guarantee nobody is
+   alerted on is documentation rather than a guarantee.
 6. **The vocabulary is defined once, in the domain layer.** A producer of work
    names a class. No producer names a number.
 
@@ -114,6 +126,18 @@ displaces work someone waits on.**
 - **It does not fix the shares, or the boundaries between classes.** With a
   single worker replica the share *is* the whole control surface, so it is a
   per-deployment concern rather than a constant.
+- **A share of zero is a waiver of this decision, and it is permitted on one
+  condition: that the deployment is told.** Zero turns off the reservation at
+  both allocation points and leaves arrival order, which is the behaviour the
+  two instances in *Context* came from — so it is not merely the bottom of the
+  range above. It stays available because a deployment recovering from a
+  scheduling regression needs a way back that is not a new binary under
+  incident, and because nothing an attacker controls reaches it: the cost is
+  latency, not authority. The condition is that the waiver is never silent.
+  A deployment configured this way states at startup which guarantee it has
+  given up; a decision switched off without saying so is indistinguishable
+  from one that failed, and neither this decision nor (5)'s observation can
+  tell a reader which they are looking at.
 - **It does not classify every kind of work.** Which class a given kind
   belongs to is a design question answered per kind, from how long it runs and
   what waits on it — not something this decision can enumerate correctly in
