@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Operator-requested work now runs on an instance with sustained client traffic (#405).
 - OCI digest request parameters that violate the descriptor grammar now return
   `DIGEST_INVALID`; malformed image-index child digests return `MANIFEST_INVALID`
   instead of `UNSUPPORTED` (#407).

@@ -20,19 +20,23 @@
 //!
 //! # The rule
 //!
-//! A free permit is granted in two passes:
+//! A free permit is granted in three passes. The first two consider the
+//! same classes: waited-on classes ([`TaskTier::is_waited_on`]) with a
+//! queued row and fewer held permits than their
+//! [`ClassFairPermits::reserved_per_class`] share.
 //!
-//! 1. to the highest **waited-on** class
-//!    ([`TaskTier::is_waited_on`]) that has a waiter and currently holds
-//!    fewer than [`ClassFairPermits::reserved_per_class`] permits;
-//! 2. otherwise to the **longest-waiting** row of any class.
+//! 1. among those past half the class-service audit threshold, to the
+//!    class that has gone unserved longest;
+//! 2. otherwise to the highest class among them in [`TaskTier::ALL`] order;
+//! 3. otherwise to the **longest-waiting** row of any class.
 //!
-//! That is a floor, not a priority order, and the difference is the
-//! whole design. Pass one guarantees a waited-on class its share and
-//! nothing beyond it: once the class holds its share, a further row of
-//! that class takes its chances in arrival order against every other
-//! waiter — so a waited-on flood cannot take capacity the arrival order
-//! would not already have given it. Pass two is what makes
+//! The share is a floor, not a priority order, and the difference is the
+//! whole design. The first two passes guarantee a waited-on class its
+//! share and nothing beyond it: once the class holds its share, a further
+//! row cannot overtake another class below its share and otherwise
+//! competes in arrival order. A waited-on flood cannot use an old grant
+//! record to take a permit owed to a class still below its share. Pass
+//! three is what makes
 //! [`TaskTier::Bulk`] — which has no reserved share, because nobody is
 //! waiting on it — served at all, and it is the same age-ordered
 //! fallback the claim's priority-blind oldest slot is.
@@ -47,7 +51,7 @@
 //! # What this does not bound
 //!
 //! At a capacity of one — the production setting for `scan` — the share
-//! is the whole capacity, so pass two is reached only when no
+//! is the whole capacity, so pass three is reached only when no
 //! waited-on class has a waiter. A worker whose waited-on arrivals
 //! sustainedly exceed its capacity therefore runs no bulk work while
 //! that lasts. That is ADR 0066's stated trade ("bulk work drains
@@ -60,18 +64,48 @@
 //! deployment that needs arrival order back has
 //! `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0`.
 //!
+//! # Why the floor is also a time
+//!
+//! The share answers "does this class hold fewer permits than its
+//! share *right now*", and at a capacity of one that question cannot
+//! express a floor: a permit cannot be a third of itself, so after
+//! every release **every** class holds fewer than any share and the
+//! share pass always fires — for the first waited-on class in
+//! [`TaskTier::ALL`], every time. The share pass alone is therefore
+//! indistinguishable from strict class priority exactly where the
+//! production configuration sits, and a lower waited-on class with a
+//! sustained higher one above it is never served at all. A share of a
+//! single server is a share of its **turns**, not of its seats.
+//!
+//! So the same below-share candidates need a second ordering by time.
+//! That ordering uses the number the class-service audit already has
+//! ([`hort_domain::policy::permit_service_interval`]): the guarantee,
+//! its enforcement and its observation are one configured value rather
+//! than three. Enforcement sits deliberately *below* the threshold the
+//! audit reports on — a scheduler that acted at the same moment the
+//! audit fired would make the alarm mean nothing, because the state it
+//! reports would be the state the scheduler was about to leave.
+//!
+//! Holding a full share means a class is being served even if its last
+//! grant is old; the time ordering cannot give it another permit ahead
+//! of a class below its share. What the time floor buys is a **bound,
+//! not a rate**: a below-share class that has been unserved longest
+//! past the floor takes the next permit to come free, and then its
+//! floor re-arms. It is not proportional fairness, which no decision
+//! here asks for.
+//!
 //! # Why not a semaphore per class
 //!
 //! Splitting the capacity into per-class sub-semaphores is the obvious
 //! shape and it cannot be built at a capacity of one: three classes
 //! cannot each hold a dedicated permit out of a single one. A guarantee
 //! at that capacity can only be about the *order* permits are granted
-//! in, which is what this is, and the same rule then also reads
-//! correctly at higher capacities — where holding a share and being
-//! granted one coincide.
+//! in, which is what this is. At higher capacities the same rule also
+//! keeps a class that holds its full share out of both waited-on passes.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
@@ -101,10 +135,11 @@ fn queue_index(tier: Option<TaskTier>) -> usize {
 
 /// One queued waiter: where to send its permit, and when it arrived.
 struct Waiting {
-    /// Arrival order across **all** classes — what pass two orders by.
+    /// Arrival order across **all** classes — what pass three orders by.
     /// Per-queue position is not enough: the fallback is global arrival
     /// order, and three independently-ordered queues cannot answer it.
     seq: u64,
+    arrived_at: Instant,
     tx: oneshot::Sender<Permit>,
 }
 
@@ -116,8 +151,10 @@ struct Waiting {
 struct State {
     /// Permits not currently held.
     free: usize,
-    /// Permits held per class — pass one's "has it got its share yet".
+    /// Permits held per class — both waited-on passes require a class below its share.
     held: [usize; CLASS_COUNT],
+    /// Last delivered grant per class. An undelivered grant is rolled back.
+    last_granted_at: [Option<Instant>; CLASS_COUNT],
     /// Waiters per class, each in arrival order.
     queues: [VecDeque<Waiting>; CLASS_COUNT],
     next_seq: u64,
@@ -126,6 +163,8 @@ struct State {
 /// Shared allocation state for one registered kind.
 struct Inner {
     reserved_per_class: usize,
+    service_interval: Duration,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     state: Mutex<State>,
 }
 
@@ -133,23 +172,46 @@ impl Inner {
     /// The waiter the next free permit goes to and its class, or `None`
     /// when nobody is waiting.
     ///
-    /// Pass one is wildcard-free over [`TaskTier::ALL`], so a class
-    /// added later has to be given an `is_waited_on` answer before it
-    /// can be skipped here.
+    /// Both waited-on passes consider only queued classes below their
+    /// reserved share. The first orders classes past the service time
+    /// floor by how long they have gone unserved; the second uses
+    /// [`TaskTier::ALL`] order. A class added later has to be given an
+    /// `is_waited_on` answer before either pass can skip it.
     ///
     /// Pops rather than reporting an index, so there is no second
     /// "and is the queue still non-empty?" question for a caller to get
     /// wrong or for a reader to wonder about.
-    fn take_next(&self, state: &mut State) -> Option<(usize, Waiting)> {
-        let index = TaskTier::ALL
-            .iter()
-            .enumerate()
-            .find(|(index, tier)| {
-                tier.is_waited_on()
-                    && !state.queues[*index].is_empty()
-                    && state.held[*index] < self.reserved_per_class
+    fn take_next(&self, state: &mut State, now: Instant) -> Option<(usize, Waiting)> {
+        let starved = (self.reserved_per_class > 0)
+            .then(|| {
+                TaskTier::ALL
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tier)| tier.is_waited_on())
+                    .filter(|(index, _)| state.held[*index] < self.reserved_per_class)
+                    .filter_map(|(index, _)| {
+                        let arrival = state.queues[index].front()?.arrived_at;
+                        let reference = state.last_granted_at[index]
+                            .map_or(arrival, |grant| grant.max(arrival));
+                        (now.saturating_duration_since(reference) > self.service_interval)
+                            .then_some((index, reference))
+                    })
+                    .min_by_key(|(index, reference)| (*reference, *index))
+                    .map(|(index, _)| index)
             })
-            .map(|(index, _)| index)
+            .flatten();
+        let index = starved
+            .or_else(|| {
+                TaskTier::ALL
+                    .iter()
+                    .enumerate()
+                    .find(|(index, tier)| {
+                        tier.is_waited_on()
+                            && !state.queues[*index].is_empty()
+                            && state.held[*index] < self.reserved_per_class
+                    })
+                    .map(|(index, _)| index)
+            })
             .or_else(|| {
                 (0..CLASS_COUNT)
                     .filter(|index| !state.queues[*index].is_empty())
@@ -169,12 +231,14 @@ impl Inner {
     /// "free permit and a waiter at the same time" an unreachable
     /// state rather than one something has to poll for.
     fn pump(self: &Arc<Self>, state: &mut State) {
+        let now = (self.clock)();
         while state.free > 0 {
-            let Some((index, waiting)) = self.take_next(state) else {
+            let Some((index, waiting)) = self.take_next(state, now) else {
                 break;
             };
             state.free -= 1;
             state.held[index] += 1;
+            let previous_grant = state.last_granted_at[index].replace(now);
             let permit = Permit {
                 inner: Some(self.clone()),
                 index,
@@ -186,6 +250,7 @@ impl Inner {
                 undelivered.inner = None;
                 state.free += 1;
                 state.held[index] -= 1;
+                state.last_granted_at[index] = previous_grant;
             }
         }
     }
@@ -236,21 +301,67 @@ impl ClassFairPermits {
     /// which is a coherent thing to ask for and is what a capacity of
     /// one already means at the default.
     ///
-    /// `reserved_per_class == 0` disables pass one entirely, leaving
+    /// `reserved_per_class == 0` disables both waited-on passes, leaving
     /// the arrival order that predates ADR 0066.
-    pub(crate) fn new(capacity: usize, reserved_per_class: usize) -> Self {
+    /// `service_interval` is derived from the configured class-service
+    /// audit threshold by [`hort_domain::policy::permit_service_interval`].
+    pub(crate) fn new_with_interval(
+        capacity: usize,
+        reserved_per_class: usize,
+        service_interval: Duration,
+    ) -> Self {
+        let clock: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(Instant::now);
+        Self::build(capacity, reserved_per_class, service_interval, clock)
+    }
+
+    fn build(
+        capacity: usize,
+        reserved_per_class: usize,
+        service_interval: Duration,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Self {
         let capacity = capacity.max(1);
         Self {
             inner: Arc::new(Inner {
                 reserved_per_class,
+                service_interval,
+                clock,
                 state: Mutex::new(State {
                     free: capacity,
                     held: [0; CLASS_COUNT],
+                    last_granted_at: [None; CLASS_COUNT],
                     queues: std::array::from_fn(|_| VecDeque::new()),
                     next_seq: 0,
                 }),
             }),
         }
+    }
+
+    #[cfg(test)]
+    fn new(capacity: usize, reserved_per_class: usize) -> Self {
+        use hort_domain::policy::{permit_service_interval, DEFAULT_CLASS_SERVICE_THRESHOLD_SECS};
+
+        let threshold = Duration::from_secs(DEFAULT_CLASS_SERVICE_THRESHOLD_SECS);
+        Self::new_with_interval(
+            capacity,
+            reserved_per_class,
+            permit_service_interval(threshold),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_clock(
+        capacity: usize,
+        reserved_per_class: usize,
+        service_interval: Duration,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Self {
+        Self::build(capacity, reserved_per_class, service_interval, clock)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn service_interval(&self) -> Duration {
+        self.inner.service_interval
     }
 
     /// Join the queue for `tier` **now**, and get back the handle to
@@ -261,7 +372,7 @@ impl ClassFairPermits {
     /// spawned task first gets polled. The batch's arrival order is
     /// then the order the claim returned it in, which is a fact about
     /// the queue; if the enqueue happened inside the spawned task it
-    /// would be a fact about the scheduler instead, and pass two's
+    /// would be a fact about the scheduler instead, and pass three's
     /// "longest-waiting" would mean something slightly different on
     /// every run.
     pub(crate) fn acquire(&self, tier: Option<TaskTier>) -> PermitHandle {
@@ -271,7 +382,12 @@ impl ClassFairPermits {
             let mut state = self.inner.lock();
             let seq = state.next_seq;
             state.next_seq = state.next_seq.wrapping_add(1);
-            state.queues[index].push_back(Waiting { seq, tx });
+            let arrived_at = (self.inner.clock)();
+            state.queues[index].push_back(Waiting {
+                seq,
+                arrived_at,
+                tx,
+            });
             self.inner.pump(&mut state);
         }
         PermitHandle {
@@ -329,6 +445,7 @@ impl Drop for Permit {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -368,6 +485,170 @@ mod tests {
     const INTERACTIVE: Option<TaskTier> = Some(TaskTier::Interactive);
     const NORMAL: Option<TaskTier> = Some(TaskTier::Normal);
     const BULK: Option<TaskTier> = Some(TaskTier::Bulk);
+
+    fn clocked_permits(
+        capacity: usize,
+        reserved_per_class: usize,
+    ) -> (ClassFairPermits, Arc<AtomicU64>) {
+        let seconds = Arc::new(AtomicU64::new(0));
+        let driven = seconds.clone();
+        let start = Instant::now();
+        let clock = Arc::new(move || start + Duration::from_secs(driven.load(Ordering::SeqCst)));
+        (
+            ClassFairPermits::with_clock(
+                capacity,
+                reserved_per_class,
+                Duration::from_secs(150),
+                clock,
+            ),
+            seconds,
+        )
+    }
+
+    #[tokio::test]
+    async fn sustained_interactive_stream_serves_normal_after_the_time_floor() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        let running = granted_now(permits.acquire(BULK)).await;
+        let mut normal = permits.acquire(NORMAL);
+        let first_interactive = permits.acquire(INTERACTIVE);
+        let second_interactive = permits.acquire(INTERACTIVE);
+        let third_interactive = permits.acquire(INTERACTIVE);
+
+        drop(running);
+        let first = granted_now(first_interactive).await;
+        assert!(still_waiting(&mut normal));
+
+        seconds.store(150, Ordering::SeqCst);
+        drop(first);
+        let second = granted_now(second_interactive).await;
+        assert!(
+            still_waiting(&mut normal),
+            "exactly at the floor is not starved"
+        );
+
+        seconds.store(151, Ordering::SeqCst);
+        drop(second);
+        let normal_run = try_take(&mut normal).expect("Normal must get the permit at 151 seconds");
+        let mut third_interactive = third_interactive;
+        assert!(still_waiting(&mut third_interactive));
+        let fourth_interactive = permits.acquire(INTERACTIVE);
+
+        drop(normal_run);
+        let third = granted_now(third_interactive).await;
+        drop(third);
+        let _fourth = granted_now(fourth_interactive).await;
+    }
+
+    #[tokio::test]
+    async fn the_longest_starved_class_wins_before_class_order() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        let running = granted_now(permits.acquire(BULK)).await;
+        let normal = permits.acquire(NORMAL);
+        seconds.store(50, Ordering::SeqCst);
+        let mut interactive = permits.acquire(INTERACTIVE);
+
+        seconds.store(201, Ordering::SeqCst);
+        drop(running);
+        let _normal_run = granted_now(normal).await;
+        assert!(still_waiting(&mut interactive));
+    }
+
+    #[tokio::test]
+    async fn equally_starved_classes_follow_class_order() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        let running = granted_now(permits.acquire(BULK)).await;
+        let mut normal = permits.acquire(NORMAL);
+        let interactive = permits.acquire(INTERACTIVE);
+
+        seconds.store(151, Ordering::SeqCst);
+        drop(running);
+        let _interactive_run = granted_now(interactive).await;
+        assert!(still_waiting(&mut normal));
+    }
+
+    #[tokio::test]
+    async fn an_old_grant_does_not_make_a_new_waiter_starved() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        drop(granted_now(permits.acquire(NORMAL)).await);
+        seconds.store(1_000, Ordering::SeqCst);
+        let running = granted_now(permits.acquire(BULK)).await;
+        let mut normal = permits.acquire(NORMAL);
+        let interactive = permits.acquire(INTERACTIVE);
+
+        seconds.store(1_100, Ordering::SeqCst);
+        drop(running);
+        let _interactive_run = granted_now(interactive).await;
+        assert!(still_waiting(&mut normal));
+    }
+
+    #[tokio::test]
+    async fn a_first_waiter_is_judged_from_arrival_without_a_grant() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        let running = granted_now(permits.acquire(BULK)).await;
+        seconds.store(1_000, Ordering::SeqCst);
+        let mut normal = permits.acquire(NORMAL);
+        let interactive = permits.acquire(INTERACTIVE);
+
+        seconds.store(1_100, Ordering::SeqCst);
+        drop(running);
+        let _interactive_run = granted_now(interactive).await;
+        assert!(still_waiting(&mut normal));
+    }
+
+    #[tokio::test]
+    async fn a_zero_share_skips_the_time_floor_even_after_it_expires() {
+        let (permits, seconds) = clocked_permits(1, 0);
+        let running = granted_now(permits.acquire(BULK)).await;
+        let earlier_bulk = permits.acquire(BULK);
+        let mut interactive = permits.acquire(INTERACTIVE);
+
+        seconds.store(151, Ordering::SeqCst);
+        drop(running);
+        let _bulk_run = granted_now(earlier_bulk).await;
+        assert!(still_waiting(&mut interactive));
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_grant_does_not_rearm_the_time_floor() {
+        let (permits, seconds) = clocked_permits(1, 1);
+        drop(granted_now(permits.acquire(NORMAL)).await);
+        let running = granted_now(permits.acquire(BULK)).await;
+        let abandoned = permits.acquire(NORMAL);
+        let live_normal = permits.acquire(NORMAL);
+        seconds.store(100, Ordering::SeqCst);
+        let mut interactive = permits.acquire(INTERACTIVE);
+        drop(abandoned);
+
+        seconds.store(151, Ordering::SeqCst);
+        drop(running);
+        let _normal_run = granted_now(live_normal).await;
+        assert!(still_waiting(&mut interactive));
+    }
+
+    /// An old grant does not make a class starved while it still holds
+    /// its share and another waited-on class holds none.
+    #[tokio::test]
+    async fn an_old_grant_cannot_overtake_a_class_below_its_share() {
+        let (permits, seconds) = clocked_permits(2, 1);
+        let first_interactive = granted_now(permits.acquire(INTERACTIVE)).await;
+        let _second_interactive = granted_now(permits.acquire(INTERACTIVE)).await;
+        let mut third_interactive = permits.acquire(INTERACTIVE);
+
+        seconds.store(300, Ordering::SeqCst);
+        let mut normal = permits.acquire(NORMAL);
+
+        seconds.store(400, Ordering::SeqCst);
+        drop(first_interactive);
+        let normal_run = try_take(&mut normal)
+            .expect("Normal is still waiting despite holding none of its reserved share");
+        assert!(
+            still_waiting(&mut third_interactive),
+            "Interactive already holds its reserved share"
+        );
+
+        drop(normal_run);
+        let _third_interactive = granted_now(third_interactive).await;
+    }
 
     /// The case the module exists for: a client-waited row queued
     /// behind a whole bulk batch takes the **first** permit to come
