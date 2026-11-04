@@ -4269,7 +4269,12 @@ per-kind audit:
 - **A row waiting for a worker run permit is `running`.** It is outside the
   claim-eligible backlog by construction, so no per-kind read of `pending`
   rows can see it at any threshold. `hort_admin_tasks_class_awaiting_capacity`
-  is the only place that wait is counted.
+  is the only place that wait is counted. The allocator's own two enforcement
+  times are derived from the same threshold and both sit below it (half of it
+  for the per-class time floor, three quarters for the class-blind age net), so
+  a `reason="awaiting_capacity"` verdict means the capacity itself is not
+  turning over — not that the class is being outranked, which the allocator
+  would have resolved before this window elapsed.
 - **The verdict is not a worker-process metric.** The worker's `/metrics`
   listener is `HORT_WORKER_METRICS_BIND` and is **off by default**, and a
   process-local counter is lost on restart — which is exactly when a stall
