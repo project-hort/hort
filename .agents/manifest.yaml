@@ -41,12 +41,8 @@ sidecars:
     # unrelated failures, and AWS_ENDPOINT_URL/AWS_REGION produced 2 more
     # (an http:// endpoint with no allow-http opt-in is rejected).
     #
-    # The two things that actually talk to this Garage bring their own
+    # The one thing that actually talks to this Garage brings its own
     # config, which is why removing the block costs nothing:
-    #   - crates/hort-adapters-storage/tests/s3_multipart.rs — opt-in via
-    #     HORT_TEST_S3=1 with its own HORT_TEST_S3_{ENDPOINT,ACCESS_KEY,
-    #     SECRET_KEY,BUCKET,REGION} namespace, chosen precisely to avoid
-    #     colliding with the server's own variables.
     #   - .agents/garage-smoke.bats — passes AWS_* explicitly with `-e`
     #     to its aws-cli container.
     # HORT_STORAGE_S3_* / AWS_* are hort-server and hort-worker *runtime*
