@@ -398,17 +398,28 @@ pub struct Artifact {
 /// [`Repository.format`](super::repository::Repository).
 ///
 /// `metadata` is the opaque JSON blob produced by the format handler at
-/// ingest (e.g., PyPI METADATA fields; npm packument entry). Under the
-/// [`HashReference`](crate::ports::format_handler::MetadataStrategy::HashReference)
-/// strategy it carries the handler-extracted summary (what index/listing
-/// rendering needs); under `Inline` it carries the full payload.
+/// ingest (e.g., PyPI METADATA fields; npm packument entry) — the full
+/// payload when it fit in the `ArtifactIngested` event, otherwise the
+/// handler-extracted summary (what index/listing rendering needs), or
+/// `Null` when the summary did not fit either.
 ///
-/// `metadata_blob` is `Some(hash)` iff the handler's
-/// [`MetadataStrategy`](crate::ports::format_handler::MetadataStrategy) is
-/// `HashReference` and the serialised payload exceeded the inline
-/// threshold — in which case the full payload lives at `hash` in CAS.
-/// `None` otherwise (all `Inline`-strategy rows, and `HashReference` rows
-/// whose payload fit under the threshold).
+/// `metadata_blob` is `Some(hash)` exactly when the full payload did
+/// not fit in the event and so lives at `hash` in CAS — whatever the
+/// handler's
+/// [`MetadataStrategy`](crate::ports::format_handler::MetadataStrategy),
+/// because every strategy's inline budget is bounded by what an event
+/// can carry
+/// ([`inline_event_budget_bytes`](crate::ports::format_handler::MetadataStrategy::inline_event_budget_bytes)).
+///
+/// **The two fields are read as a pair, never separately**: `metadata`
+/// alone cannot be told apart from the payload, and
+/// `ArtifactUseCase::load_full_metadata` is the one place that resolves
+/// them. That holds for a consumer wanting one field as much as for one
+/// wanting the document — `metadata` is not a summary by construction,
+/// because a format whose strategy is
+/// [`MetadataStrategy::Inline`](crate::ports::format_handler::MetadataStrategy::Inline)
+/// has no summary extractor, so a spill there leaves `Null` and a
+/// direct read answers with no field rather than a smaller one.
 ///
 /// `properties` is reserved for user-assigned key/values; v2 never writes it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

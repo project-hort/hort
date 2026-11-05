@@ -30,7 +30,7 @@ use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 
 use crate::event_store_publisher::EventStorePublisher;
-use hort_domain::ports::format_handler::{FormatHandler, MetadataStrategy};
+use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
@@ -556,13 +556,19 @@ fn classify_ingest_error(err: &AppError) -> IngestResult {
 /// `storage.put` until after dedup checks have cleared so a duplicate
 /// re-publish does not orphan a just-written blob in CAS.
 enum MetadataDecision {
-    /// Full payload stays inline. The `Value` goes into both
-    /// `ArtifactIngested.metadata` and `ArtifactMetadata.metadata`.
+    /// Full payload is within the strategy's inline budget. The `Value`
+    /// goes into both `ArtifactIngested.metadata` and
+    /// `ArtifactMetadata.metadata` — unless
+    /// [`IngestUseCase::resolve_metadata_decision`] finds the event
+    /// carrying it still over the cap once the event's own fields are
+    /// counted, in which case it spills after all. A budget bounds a
+    /// payload; only the event can answer for an envelope.
     Inline(serde_json::Value),
-    /// Blob write deferred until after dedup. `bytes` is the
-    /// serialised full payload; `summary` is the handler-extracted
-    /// subset that will ride inline alongside the `Some(hash)`
-    /// produced by the deferred `storage.put`.
+    /// Over the budget: blob write deferred until after dedup. `bytes`
+    /// is the serialised full payload; `summary` is the
+    /// handler-extracted subset that will ride inline alongside the
+    /// `Some(hash)` produced by the deferred `storage.put` — if it
+    /// fits, which is the same question asked of the same event.
     Pending {
         bytes: Vec<u8>,
         summary: serde_json::Value,
@@ -1169,20 +1175,24 @@ impl IngestUseCase {
         // Metadata strategy dispatch. The pre-dispatch metadata cap
         // check above has already rejected pathological payloads; the
         // decision here is purely about where the payload-bearing bytes
-        // live:
-        //   - Inline               → full payload in event + projection row.
-        //   - HashReference        → if serialised length ≤ threshold,
-        //                            behave like Inline (no CAS round-trip
-        //                            for small packuments). Otherwise
-        //                            defer the blob put until after the
-        //                            dedup checks in `ingest_inner` have
-        //                            cleared, so a duplicate re-publish
-        //                            does not orphan a just-written CAS
-        //                            object (post-review
-        //                            hardening — see `MetadataDecision`).
-        //                            On the split path, the event +
-        //                            projection row carry only the
-        //                            handler-extracted summary.
+        // live — full payload in the event + projection row, or full
+        // payload in CAS with the handler-extracted summary inline
+        // beside a `ContentHash` pointing at it.
+        //
+        // ONE decision, for every strategy: the strategy supplies the
+        // budget (`MetadataStrategy::inline_event_budget_bytes`, which
+        // is where a handler-declared threshold is related to the event
+        // cap) and nothing else. A branch per strategy is what let
+        // npm declare a 256 KB inline threshold against a 64 KB event
+        // cap and `MetadataStrategy::Inline` declare none at all: both
+        // produced `Inline` decisions for payloads no event could
+        // carry, and the publish failed at the append with the content
+        // already in CAS.
+        //
+        // Over the budget, the blob put is deferred until after the
+        // dedup checks in `ingest_inner` have cleared, so a duplicate
+        // re-publish does not orphan a just-written CAS object (see
+        // `MetadataDecision`).
         //
         // The blob-cap rejection reuses the `MetadataTooLarge` IngestResult
         // label — it is the same semantic failure at a different storage
@@ -1202,76 +1212,66 @@ impl IngestUseCase {
         // determines whether a split really happened is deferred.
         let had_payload_metadata = !payload_metadata.is_null();
         let strategy = handler.metadata_strategy();
-        let metadata_decision: MetadataDecision = match strategy {
-            MetadataStrategy::Inline => MetadataDecision::Inline(payload_metadata),
-            MetadataStrategy::HashReference {
-                inline_threshold_bytes,
-            } => {
-                // Reuse the already-serialised bytes from the cap check
-                // above. For `Value::Null` payloads the serialisation
-                // was skipped (0 bytes) — they always hit the inline
-                // fast path regardless of threshold.
-                match serialized_metadata {
-                    None => MetadataDecision::Inline(payload_metadata),
-                    Some(bytes) if bytes.len() <= inline_threshold_bytes => {
-                        // Small enough to inline — no CAS round-trip
-                        // needed. Labelled `inline` downstream because
-                        // no split happened — the counter answers "how
-                        // many ingests split" not "how many declared
-                        // HashReference".
-                        MetadataDecision::Inline(payload_metadata)
-                    }
-                    Some(bytes) => {
-                        // Blob safety cap. `0` is the documented "accept
-                        // anything" escape hatch used by tests; any
-                        // non-zero value rejects payloads exceeding it
-                        // with the same `metadata_too_large` counter
-                        // label as the pre-dispatch metadata cap.
-                        if self.metadata_blob_max_bytes > 0
-                            && bytes.len() > self.metadata_blob_max_bytes
-                        {
-                            let repo_key = self
-                                .repositories
-                                .find_by_id(repository_id)
-                                .await
-                                .ok()
-                                .map(|r| r.key);
-                            let elapsed = started.elapsed().as_secs_f64();
-                            metrics::counter!(
-                                "hort_ingest_total",
-                                labels::FORMAT => format.clone(),
-                                labels::REPOSITORY => self.repo_label(repo_key.as_deref()),
-                                labels::RESULT => IngestResult::MetadataTooLarge.as_str(),
-                            )
-                            .increment(1);
-                            metrics::histogram!(
-                                "hort_ingest_duration_seconds",
-                                labels::FORMAT => format,
-                            )
-                            .record(elapsed);
-                            // Public info: blob cap. Explicit `reason`
-                            // label distinguishes this from the
-                            // pre-dispatch `metadata-too-large` log
-                            // which shares the counter label but is a
-                            // different code path.
-                            tracing::info!(
-                                format = %handler.format_key(),
-                                blob_cap = self.metadata_blob_max_bytes,
-                                reason = "blob-too-large",
-                                "metadata-blob-too-large"
-                            );
-                            return Err(AppError::Domain(DomainError::Validation(
-                                "upload-payload metadata exceeds blob cap".into(),
-                            )));
-                        }
-                        // Defer the CAS write: compute the handler's
-                        // summary now (cheap, pure) and hand the
-                        // serialised bytes to `ingest_inner` alongside
-                        // it. The blob is only put AFTER dedup clears.
-                        let summary = handler.extract_metadata_summary(&payload_metadata);
-                        MetadataDecision::Pending { bytes, summary }
-                    }
+        let inline_budget = strategy.inline_event_budget_bytes();
+        // Reuse the already-serialised bytes from the cap check above.
+        // For `Value::Null` payloads the serialisation was skipped
+        // (0 bytes) — they always hit the inline fast path.
+        let metadata_decision: MetadataDecision = match serialized_metadata {
+            None => MetadataDecision::Inline(payload_metadata),
+            Some(bytes) if bytes.len() <= inline_budget => {
+                // Within the budget — no CAS round-trip needed.
+                // Labelled `inline` downstream because no split
+                // happened: the counter answers "how many ingests
+                // split" not "how many declared HashReference".
+                MetadataDecision::Inline(payload_metadata)
+            }
+            Some(bytes) => {
+                // Blob safety cap. `0` is the documented "accept
+                // anything" escape hatch used by tests; any
+                // non-zero value rejects payloads exceeding it
+                // with the same `metadata_too_large` counter
+                // label as the pre-dispatch metadata cap.
+                if self.metadata_blob_max_bytes > 0 && bytes.len() > self.metadata_blob_max_bytes {
+                    let repo_key = self
+                        .repositories
+                        .find_by_id(repository_id)
+                        .await
+                        .ok()
+                        .map(|r| r.key);
+                    let elapsed = started.elapsed().as_secs_f64();
+                    metrics::counter!(
+                        "hort_ingest_total",
+                        labels::FORMAT => format.clone(),
+                        labels::REPOSITORY => self.repo_label(repo_key.as_deref()),
+                        labels::RESULT => IngestResult::MetadataTooLarge.as_str(),
+                    )
+                    .increment(1);
+                    metrics::histogram!(
+                        "hort_ingest_duration_seconds",
+                        labels::FORMAT => format,
+                    )
+                    .record(elapsed);
+                    // Public info: blob cap. Explicit `reason`
+                    // label distinguishes this from the
+                    // pre-dispatch `metadata-too-large` log
+                    // which shares the counter label but is a
+                    // different code path.
+                    tracing::info!(
+                        format = %handler.format_key(),
+                        blob_cap = self.metadata_blob_max_bytes,
+                        reason = "blob-too-large",
+                        "metadata-blob-too-large"
+                    );
+                    return Err(AppError::Domain(DomainError::Validation(
+                        "upload-payload metadata exceeds blob cap".into(),
+                    )));
                 }
+                // Defer the CAS write: compute the handler's
+                // summary now (cheap, pure) and hand the
+                // serialised bytes to `ingest_inner` alongside
+                // it. The blob is only put AFTER dedup clears.
+                let summary = handler.extract_metadata_summary(&payload_metadata);
+                MetadataDecision::Pending { bytes, summary }
             }
         };
 
@@ -2894,37 +2894,119 @@ impl IngestUseCase {
         ))
     }
 
-    /// Resolve the deferred metadata decision. The blob's `storage.put`
-    /// happens HERE — AFTER both dedup returns in
+    /// Resolve the deferred metadata decision into the `(inline
+    /// metadata, blob reference, strategy label)` triple the
+    /// `ArtifactIngested` event and its projection row carry. The
+    /// blob's `storage.put` happens HERE — AFTER both dedup returns in
     /// [`Self::find_existing_and_check_declared_dedup`] /
     /// [`Self::put_and_check_post_dedup`] — so a duplicate re-publish never
     /// orphans a fresh CAS object. See `MetadataDecision` docstring.
+    ///
+    /// `candidate` builds the event that *would* be appended for a
+    /// given `(metadata, metadata_blob)` pair, and the caller builds
+    /// the real one with the same closure — so the question asked here
+    /// ("does this fit in an event?") is asked of the event that is
+    /// actually committed, from one struct literal. That is what makes
+    /// an inline outcome *imply* "fits in an event": the budget the
+    /// outer dispatch applied bounds the payload, the cap bounds the
+    /// whole envelope, and the difference is the event's own fields —
+    /// which only the event knows.
+    ///
+    /// Whatever does not fit goes to CAS, and that is invisible to
+    /// every reader: `ArtifactUseCase::load_full_metadata` follows a
+    /// `metadata_blob` reference transparently, so this is a choice
+    /// about where bytes live and never about which fields a client
+    /// sees.
     async fn resolve_metadata_decision(
         &self,
         metadata_decision: MetadataDecision,
         repo_key: &str,
+        handler: &dyn FormatHandler,
+        candidate: &(dyn Fn(&serde_json::Value, Option<&ContentHash>) -> DomainEvent + Sync),
     ) -> Result<(serde_json::Value, Option<ContentHash>, &'static str), IngestInnerError> {
         match metadata_decision {
-            MetadataDecision::Inline(value) => Ok((value, None, values::STRATEGY_INLINE)),
-            MetadataDecision::Pending { bytes, summary } => {
-                let put_result = self
-                    .storage
-                    .put(Box::new(std::io::Cursor::new(bytes)))
+            // A `Value::Null` payload cannot be what pushes an envelope
+            // past the cap, and there would be nothing to spill if it
+            // were: the fit question only arises where there are
+            // payload bytes to answer it with.
+            MetadataDecision::Inline(value) if value.is_null() => {
+                Ok((value, None, values::STRATEGY_INLINE))
+            }
+            MetadataDecision::Inline(value) if candidate(&value, None).fits_storage_cap() => {
+                Ok((value, None, values::STRATEGY_INLINE))
+            }
+            MetadataDecision::Inline(value) => {
+                // Inside the handler's inline budget and still over the
+                // cap, so the event's own fields are what tip it. Spill
+                // rather than refuse — the alternative is a publish that
+                // fails after the content is already in CAS, which is
+                // what this path did for every payload in the band
+                // between the budget and the cap.
+                //
+                // Serialising here rather than carrying the bytes down
+                // from the outer dispatch keeps the cost on this arm
+                // alone: it is reached only when a payload lands within
+                // one event's worth of fields of the cap. `to_string`
+                // rather than `serde_json::to_vec` because a `Value`
+                // always renders — both emit the same compact JSON, and
+                // the infallible one leaves no error arm here that no
+                // input can reach.
+                let bytes = value.to_string().into_bytes();
+                let summary = handler.extract_metadata_summary(&value);
+                self.spill_metadata(bytes, summary, repo_key, candidate)
                     .await
-                    .map_err(|e| {
-                        (
-                            InnerIngestError::Other(AppError::Storage(e.to_string())),
-                            Some(repo_key.to_string()),
-                            None,
-                        )
-                    })?;
-                Ok((
-                    summary,
-                    Some(put_result.hash),
-                    values::STRATEGY_HASH_REFERENCE,
-                ))
+            }
+            MetadataDecision::Pending { bytes, summary } => {
+                self.spill_metadata(bytes, summary, repo_key, candidate)
+                    .await
             }
         }
+    }
+
+    /// Write the full payload to CAS and decide what rides the event
+    /// beside the reference.
+    ///
+    /// The summary is **not** a special case: it is another payload that
+    /// may not fit, decided by the same question against the same
+    /// candidate event. A summary over the cap used to make the whole
+    /// ingest fail — npm's summary is a per-version block's
+    /// `dependencies` / `devDependencies` / `peerDependencies` maps, and
+    /// a package with a few thousand entries exceeds 64 KB on its own —
+    /// and trimming it is not available: its key list is what an
+    /// installer needs to resolve a tree without the full packument, so
+    /// serving less makes every version look dependency-free to a
+    /// fresh, non-lockfile install.
+    ///
+    /// So when it does not fit, nothing but the reference rides the
+    /// event. That costs the read path one CAS round-trip and costs a
+    /// reader nothing at all: `load_full_metadata` returns the same
+    /// fields either way, and that is the only guarantee the summary
+    /// ever carried.
+    async fn spill_metadata(
+        &self,
+        bytes: Vec<u8>,
+        summary: serde_json::Value,
+        repo_key: &str,
+        candidate: &(dyn Fn(&serde_json::Value, Option<&ContentHash>) -> DomainEvent + Sync),
+    ) -> Result<(serde_json::Value, Option<ContentHash>, &'static str), IngestInnerError> {
+        let put_result = self
+            .storage
+            .put(Box::new(std::io::Cursor::new(bytes)))
+            .await
+            .map_err(|e| {
+                (
+                    InnerIngestError::Other(AppError::Storage(e.to_string())),
+                    Some(repo_key.to_string()),
+                    None,
+                )
+            })?;
+        let hash = put_result.hash;
+        let inline = if candidate(&summary, Some(&hash)).fits_storage_cap() {
+            summary
+        } else {
+            serde_json::Value::Null
+        };
+        Ok((inline, Some(hash), values::STRATEGY_HASH_REFERENCE))
     }
 
     /// Resolve the `ScanPolicy` governing this ingest and the decisions
@@ -3919,10 +4001,6 @@ impl IngestUseCase {
             .verify_sha1_upstream(verification.as_ref(), &put_result.hash, &repo_key)
             .await?;
 
-        let (final_metadata, final_blob, strategy_label) = self
-            .resolve_metadata_decision(metadata_decision, &repo_key)
-            .await?;
-
         // 4. Build Artifact entity.
         //
         // Retain `coords` by cloning into the
@@ -3978,38 +4056,63 @@ impl IngestUseCase {
         // to thread the same caller identity into `ArtifactGroupMemberAdded`.
         let actor_for_group = actor.clone();
 
+        // THE construction of this ingest's `ArtifactIngested` — used
+        // twice, for the same reason it is a closure rather than a
+        // struct literal. `resolve_metadata_decision` below asks a
+        // candidate `(metadata, metadata_blob)` pair whether the event
+        // carrying it fits inside `MAX_EVENT_JSON_BYTES`, and the event
+        // that is actually appended is built from this same closure
+        // with the pair it chose. So the fit question is asked of the
+        // event that gets committed, not of a second description of
+        // one: a field added to `ArtifactIngested` enters the decision
+        // automatically, with no shape to keep in step.
+        let make_ingested_event =
+            |metadata: &serde_json::Value, metadata_blob: Option<&ContentHash>| ArtifactIngested {
+                artifact_id,
+                repository_id,
+                name: artifact.name.clone(),
+                version: artifact.version.clone(),
+                // The CAS hash the content was stored under —
+                // `artifact.sha256_checksum` is `put_result.hash`, written
+                // onto the row a few lines above.
+                sha256: artifact.sha256_checksum.clone(),
+                size_bytes: artifact.size_bytes,
+                source: IngestSource::Direct,
+                metadata: metadata.clone(),
+                metadata_blob: metadata_blob.cloned(),
+                // Record the upstream-asserted
+                // publish hint on the *event* alongside the projection
+                // (it is written onto `Artifact.upstream_published_at`
+                // too; the event is the rebuild source of truth, so
+                // both must carry the same value). The opt-in path makes
+                // this
+                // value load-bearing for `quarantine_window_start`; a
+                // projection rebuild that lost the hint would silently
+                // shift release authority on every replay.
+                upstream_published_at,
+            };
+
+        // Resolve where the payload metadata lives. The blob put (if
+        // any) happens here, AFTER both dedup returns above, so a
+        // duplicate re-publish never orphans a fresh CAS object.
+        let (final_metadata, final_blob, strategy_label) = self
+            .resolve_metadata_decision(metadata_decision, &repo_key, handler, &|metadata, blob| {
+                DomainEvent::ArtifactIngested(make_ingested_event(metadata, blob))
+            })
+            .await?;
+
         // Snapshot the metadata-blob hash before it's moved
         // into the projection row below. Used to build the
         // `kind = "metadata_blob"` refcount edge (Some) or omit it from the
         // transition's edge set (None).
         let metadata_blob_for_refcount = final_blob.clone();
 
-        let ingested_event = ArtifactIngested {
-            artifact_id,
-            repository_id,
-            name: artifact.name.clone(),
-            version: artifact.version.clone(),
-            sha256: put_result.hash,
-            size_bytes: artifact.size_bytes,
-            source: IngestSource::Direct,
-            // `final_metadata` is the outer strategy dispatch's output:
-            // full payload for Inline, summary for a split HashReference,
-            // full payload for HashReference under its inline threshold.
-            metadata: final_metadata.clone(),
-            // `final_blob` is `Some(hash)` iff the outer dispatch put
-            // the full payload to CAS.
-            metadata_blob: final_blob.clone(),
-            // Record the upstream-asserted
-            // publish hint on the *event* alongside the projection
-            // (it is written onto `Artifact.upstream_published_at`
-            // too; the event is the rebuild source of truth, so
-            // both must carry the same value). The opt-in path makes
-            // this
-            // value load-bearing for `quarantine_window_start`; a
-            // projection rebuild that lost the hint would silently
-            // shift release authority on every replay.
-            upstream_published_at,
-        };
+        // `final_metadata` is the resolver's output: the full payload
+        // when it fits in an event, the handler summary when the
+        // payload spilled and the summary fits, and `Null` when
+        // neither does — in which case `final_blob` is the only route
+        // to the metadata, which is what `load_full_metadata` is for.
+        let ingested_event = make_ingested_event(&final_metadata, final_blob.as_ref());
 
         // 1:1 projection row sharing the event's metadata verbatim. The
         // repository's `format` is the authority here — coords.format has
@@ -5957,8 +6060,8 @@ mod tests {
 
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
-    use hort_domain::events::DomainEvent;
-    use hort_domain::ports::format_handler::GroupMembership;
+    use hort_domain::events::{DomainEvent, MAX_EVENT_JSON_BYTES};
+    use hort_domain::ports::format_handler::{GroupMembership, MetadataStrategy};
 
     use super::*;
     use crate::metrics::capture_metrics;
@@ -8517,6 +8620,261 @@ mod tests {
             let md = transitions[0].2.as_ref().expect("metadata row present");
             assert_eq!(md.metadata, summary);
             assert_eq!(md.metadata_blob, Some(expected_hash));
+        });
+    }
+
+    // -- "what stays inline fits in an event" --------------------------------
+    //
+    // The decision's budget (`MetadataStrategy::inline_event_budget_bytes`)
+    // bounds the PAYLOAD; `MAX_EVENT_JSON_BYTES` bounds the whole
+    // ENVELOPE. The three tests below cover the implication the ingest
+    // path owes the event store across that gap, the summary that used
+    // to collapse it, and the strategy that declared no threshold at
+    // all.
+
+    /// The boundary from both sides, at the level that decides whether a
+    /// package can be published: not which variant the dispatch chose
+    /// but what the committed event holds.
+    ///
+    /// A payload's serialised length is not its envelope's — the
+    /// event's own fields (ids, name, version, checksum) sit beside it —
+    /// so the exact byte at which inlining stops being possible is a
+    /// property of the event and not a number this test can name. It
+    /// sweeps across it instead and asserts the implication directly:
+    /// every size publishes, and every size that stayed inline produced
+    /// an event the store accepts.
+    #[test]
+    fn an_inline_decision_implies_the_event_fits() {
+        let mut inlined = 0_usize;
+        let mut spilled = 0_usize;
+
+        for target in [
+            MAX_EVENT_JSON_BYTES - 1024,
+            MAX_EVENT_JSON_BYTES - 512,
+            MAX_EVENT_JSON_BYTES - 64,
+            MAX_EVENT_JSON_BYTES - 1,
+            MAX_EVENT_JSON_BYTES,
+            MAX_EVENT_JSON_BYTES + 1,
+            MAX_EVENT_JSON_BYTES + 512,
+        ] {
+            let repo = pypi_repository();
+            let repo_id = repo.id;
+
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let (uc, _artifacts, _events, lifecycle, _storage, repos) = make_use_case();
+                repos.insert(repo);
+
+                // A threshold far above the cap — the shape npm
+                // shipped, and the one the clamp exists to answer.
+                let handler = StubFormatHandler::new("pypi")
+                    .with_max_bytes(10 * 1024 * 1024)
+                    .with_strategy(MetadataStrategy::HashReference {
+                        inline_threshold_bytes: 4 * MAX_EVENT_JSON_BYTES,
+                    });
+
+                uc.ingest_direct(
+                    req_with_metadata_bytes(repo_id, target),
+                    content_stream(b"payload"),
+                    &handler,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("a {target}-byte payload must publish, got {e:?}"));
+
+                let transitions = lifecycle.committed_transitions();
+                assert_eq!(transitions.len(), 1);
+                let event = &transitions[0].1.events[0].event;
+                let DomainEvent::ArtifactIngested(ingested) = event else {
+                    panic!("expected ArtifactIngested, got: {event:?}")
+                };
+                if ingested.metadata_blob.is_none() {
+                    inlined += 1;
+                    assert!(
+                        event.fits_storage_cap(),
+                        "a {target}-byte payload stayed inline in an event no store                          will hold — the decision did not see the cap"
+                    );
+                } else {
+                    spilled += 1;
+                }
+            });
+        }
+
+        // Counter-assertion: the sweep crossed the boundary. Entirely on
+        // one side of it, the assertion above would be about nothing.
+        assert!(
+            inlined > 0 && spilled > 0,
+            "the sweep must land on both sides of the boundary —              {inlined} inlined, {spilled} spilled"
+        );
+    }
+
+    /// A summary over the event cap is a successful ingest, not a
+    /// refusal. The summary is not a special case: it is another payload
+    /// that may not fit, and when it does not, the reference is all that
+    /// rides the event and `load_full_metadata` serves the full payload
+    /// from CAS.
+    ///
+    /// npm's summary is a per-version block's dependency maps, which a
+    /// package with a few thousand entries pushes over 64 KB on its
+    /// own, and its key list is not negotiable — serving less makes
+    /// every version look dependency-free to a fresh, non-lockfile
+    /// install.
+    #[test]
+    fn a_summary_over_the_event_cap_still_ingests() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        // Over the 128-byte threshold, so the payload spills; the
+        // stub's summary is then what would ride the event, and it does
+        // not fit either.
+        let payload = serde_json::json!({ "pad": "a".repeat(500) });
+        let serialised = serde_json::to_vec(&payload).unwrap();
+        let expected_hash: ContentHash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&serialised))
+                .parse()
+                .unwrap()
+        };
+        let oversize_summary = serde_json::json!({ "deps": "d".repeat(MAX_EVENT_JSON_BYTES) });
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            let handler = StubFormatHandler::new("pypi")
+                .with_max_bytes(10 * 1024 * 1024)
+                .with_strategy(MetadataStrategy::HashReference {
+                    inline_threshold_bytes: 128,
+                })
+                .with_summary(oversize_summary);
+
+            uc.ingest_direct(
+                DirectIngestRequest {
+                    payload_metadata: payload,
+                    ..req(repo_id)
+                },
+                content_stream(b"payload"),
+                &handler,
+            )
+            .await
+            .expect("an oversize summary must not refuse the ingest");
+
+            // Content and metadata blob — the full payload is in CAS.
+            assert_eq!(storage.put_call_count(), 2);
+            assert!(storage.stored_hashes().contains(&expected_hash));
+
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 1);
+            let event = &transitions[0].1.events[0].event;
+            let DomainEvent::ArtifactIngested(ingested) = event else {
+                panic!("expected ArtifactIngested, got: {event:?}")
+            };
+            assert_eq!(
+                ingested.metadata,
+                serde_json::Value::Null,
+                "a summary that does not fit does not ride the event"
+            );
+            assert_eq!(ingested.metadata_blob, Some(expected_hash.clone()));
+            assert!(event.fits_storage_cap());
+
+            // The projection row is the event's materialised view and
+            // must not diverge from it.
+            let md = transitions[0].2.as_ref().expect("metadata row present");
+            assert_eq!(md.metadata, serde_json::Value::Null);
+            assert_eq!(md.metadata_blob, Some(expected_hash));
+        });
+    }
+
+    /// `MetadataStrategy::Inline` declares no threshold, and two
+    /// compiled-in handlers declare a `metadata_expected_max_bytes`
+    /// above the event cap (pypi 128 KB, cargo 8 MB) — so the arm that
+    /// had no threshold to clamp is the one that could inline a payload
+    /// no event can carry. It spills instead of refusing, through the
+    /// same decision.
+    #[test]
+    fn an_inline_strategy_payload_over_the_cap_spills_rather_than_failing() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            // The trait default strategy, which is what every
+            // compiled-in handler but npm declares.
+            let handler = StubFormatHandler::new("pypi").with_max_bytes(10 * 1024 * 1024);
+            assert_eq!(handler.metadata_strategy(), MetadataStrategy::Inline);
+
+            uc.ingest_direct(
+                req_with_metadata_bytes(repo_id, 100 * 1024),
+                content_stream(b"payload"),
+                &handler,
+            )
+            .await
+            .expect("a payload over the cap must publish, not fail at the append");
+
+            assert_eq!(storage.put_call_count(), 2);
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 1);
+            let event = &transitions[0].1.events[0].event;
+            let DomainEvent::ArtifactIngested(ingested) = event else {
+                panic!("expected ArtifactIngested, got: {event:?}")
+            };
+            assert!(ingested.metadata_blob.is_some());
+            assert!(event.fits_storage_cap());
+        });
+    }
+
+    /// The metadata blob's CAS write is the one fallible step the spill
+    /// adds, and a failure there fails the ingest with nothing
+    /// committed — the same disposition as the wheel-METADATA blob
+    /// (`ingest_wheel_metadata_cas_put_failure_propagates_err`). It must
+    /// not commit an event carrying a reference to a blob that was never
+    /// written: `load_full_metadata` would then answer `AppError::Storage`
+    /// for every read of that artifact's metadata, for good.
+    ///
+    /// Targets the SECOND put via `fail_put_after_calls` — the first is
+    /// the artifact content, and failing that fails the ingest before the
+    /// spill is reached.
+    #[test]
+    fn a_metadata_blob_put_failure_commits_nothing() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            let handler = StubFormatHandler::new("pypi")
+                .with_max_bytes(10 * 1024 * 1024)
+                .with_strategy(MetadataStrategy::HashReference {
+                    inline_threshold_bytes: 128,
+                });
+
+            storage.fail_put_after_calls(
+                1,
+                DomainError::Invariant("synthetic CAS failure: metadata_blob put".into()),
+            );
+
+            let err = uc
+                .ingest_direct(
+                    DirectIngestRequest {
+                        payload_metadata: serde_json::json!({ "pad": "a".repeat(500) }),
+                        ..req(repo_id)
+                    },
+                    content_stream(b"payload"),
+                    &handler,
+                )
+                .await
+                .expect_err("a metadata-blob CAS failure must propagate");
+
+            assert!(
+                matches!(err, AppError::Storage(_)),
+                "expected AppError::Storage(_), got {err:?}"
+            );
+            assert_eq!(
+                lifecycle.committed_transitions().len(),
+                0,
+                "no event may reference a blob the spill failed to write"
+            );
         });
     }
 

@@ -456,6 +456,10 @@ pub struct FnItem {
     /// time the structure is parseable. A bodiless declaration spans
     /// nothing (`end == start`), so it contains no call site.
     pub span: (usize, usize),
+    /// The declaration from the `fn` keyword up to (not including) the
+    /// body's `{`, or the `;` of a bodiless one — so parameter and
+    /// return types are readable without re-parsing the file.
+    pub signature: String,
 }
 
 /// Match the opener that the `close` byte at `at` belongs to, returning
@@ -592,6 +596,7 @@ pub fn parse_fns(blanked: &str) -> Vec<FnItem> {
             }
             j += 1;
         }
+        let signature = blanked[fn_at..j.min(n)].to_string();
         line += bytes[counted_to..fn_at]
             .iter()
             .filter(|b| **b == b'\n')
@@ -610,6 +615,7 @@ pub fn parse_fns(blanked: &str) -> Vec<FnItem> {
             attrs: preceding_attrs(blanked, fn_at),
             body,
             span: (fn_at, span_end),
+            signature,
         });
         i = fn_at + 2;
     }

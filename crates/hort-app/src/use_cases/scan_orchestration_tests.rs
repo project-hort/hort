@@ -2896,6 +2896,126 @@ async fn subject_for_artifact_propagates_metadata_when_present() {
     );
 }
 
+/// Where the payload metadata lives is not observable in the component
+/// list a scan adjudicates.
+///
+/// Seeds the same npm per-version block twice — inline on the row, and
+/// spilled to CAS with the row's `metadata` left `Null` — and asserts
+/// `run_scan` hands `AdvisoryPort::query` the same component list both
+/// times. This is the consequence that matters here: the components are
+/// what an advisory backend matches a CVE against, so a dropped payload
+/// does not fail a scan, it passes one. Before this read path went
+/// through the accessor the spilled row produced
+/// `Sbom { components: vec![] }` — the npm handler's early return on
+/// `Value::Null` — indistinguishable from an artifact that genuinely
+/// declares no dependencies, and the artifact released with a clean
+/// verdict nothing had looked at.
+///
+/// The spilled row is seeded rather than published because this is a
+/// `hort-app` unit with no publish route in reach; the publish side of
+/// the same property is
+/// `hort-http-npm`'s
+/// `an_installer_sees_the_same_fields_whether_the_block_is_inline_or_in_cas`.
+/// The closing counter-assertion is read off the rows the orchestrator
+/// actually read, so a seeding mistake that put both cases on one side
+/// fails here rather than passing quietly.
+#[tokio::test]
+async fn a_scan_sees_the_same_components_whether_the_payload_is_inline_or_in_cas() {
+    use hort_domain::entities::artifact::ArtifactMetadata as DomainArtifactMetadata;
+    use hort_domain::entities::repository::RepositoryFormat;
+    use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
+
+    let payload = serde_json::json!({"dependencies": {"lodash": "^4.17.21"}});
+    let mut captured_components = Vec::new();
+    let mut blob_backed = Vec::new();
+
+    for spilled in [false, true] {
+        let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+        handlers.insert("npm".into(), Arc::new(NpmShapedSbomHandler));
+        let scanner: Arc<dyn ScannerPort> = Arc::new(MockScanner::new("trivy", Ok(vec![])));
+        let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+        scanners.insert("trivy".into(), scanner);
+        let advisory = Arc::new(RecordingAdvisory::new());
+        let advisory_port: Arc<dyn AdvisoryPort> = advisory.clone();
+
+        let (uc, _jobs, _events, storage, artifacts, repositories, _policy, metadata_repo) =
+            make_uc_full(vec!["trivy".into()], scanners, advisory_port, handlers);
+
+        // Seed the artifact and its repo with no metadata row, then
+        // write the row this iteration is about.
+        let artifact_id = seed_npm_artifact_with_metadata(
+            &artifacts,
+            &repositories,
+            &metadata_repo,
+            serde_json::Value::Null,
+        );
+        let row = if spilled {
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            let blob_hash: ContentHash = {
+                use sha2::Digest;
+                hex::encode(sha2::Sha256::digest(&bytes)).parse().unwrap()
+            };
+            storage.insert_content(blob_hash.clone(), bytes);
+            DomainArtifactMetadata {
+                artifact_id,
+                format: RepositoryFormat::Npm,
+                // What a spill leaves behind when the summary does not
+                // fit the event either.
+                metadata: serde_json::Value::Null,
+                metadata_blob: Some(blob_hash),
+                properties: serde_json::json!({}),
+            }
+        } else {
+            DomainArtifactMetadata {
+                artifact_id,
+                format: RepositoryFormat::Npm,
+                metadata: payload.clone(),
+                metadata_blob: None,
+                properties: serde_json::json!({}),
+            }
+        };
+        metadata_repo.insert(row);
+
+        let job = sample_scan_job(artifact_id, 1);
+        uc.run_scan(&job).await.expect("run_scan");
+
+        captured_components.push(
+            advisory
+                .last_components()
+                .expect("AdvisoryPort::query must have been invoked")
+                .iter()
+                .map(|c| c.purl.clone())
+                .collect::<Vec<_>>(),
+        );
+        blob_backed.push(
+            metadata_repo
+                .find_by_artifact_id(artifact_id)
+                .await
+                .unwrap()
+                .expect("the seeded metadata row must be there")
+                .metadata_blob
+                .is_some(),
+        );
+    }
+
+    assert_eq!(
+        captured_components,
+        vec![
+            vec!["pkg:npm/lodash@4.17.21".to_string()],
+            vec!["pkg:npm/lodash@4.17.21".to_string()],
+        ],
+        "a scan must adjudicate the same components either way — an empty list is not a \
+         failed scan, it is a passed one over nothing"
+    );
+    // Both sides: the two iterations really were the two row shapes.
+    assert_eq!(
+        blob_backed,
+        vec![false, true],
+        "the two rows must land on opposite sides of the spill — otherwise this test \
+         compares one read path with itself"
+    );
+}
+
 #[tokio::test]
 async fn run_scan_with_real_metadata_calls_advisory_with_non_empty_components() {
     // Integration-level: a full `run_scan` with real metadata results

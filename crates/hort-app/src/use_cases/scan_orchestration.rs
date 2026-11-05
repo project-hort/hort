@@ -75,6 +75,7 @@ use crate::metrics::{
 // the same reason.
 use crate::retry_backoff::{compute_backoff, DEFAULT_MAX_ATTEMPTS};
 use crate::scanning::any_scan_backend_applies_to;
+use crate::use_cases::artifact_use_case::load_full_metadata;
 use crate::use_cases::composite_scan::{
     CompositeDisposition, CompositeScan, CompositeVerdict, ShadowObservationSink,
     COMPOSITE_CONTRIBUTOR,
@@ -1739,12 +1740,31 @@ impl ScanOrchestrationUseCase {
         // absent (proxied fetch with no parsed body — a legitimate v1
         // case) the fallback is `Value::Null`, which the handlers'
         // early-returns interpret as "opaque payload, empty SBOM".
-        let metadata = self
+        //
+        // Through `load_full_metadata` rather than off `row.metadata`,
+        // because the row's own field is the full payload only when the
+        // payload fit in the `ArtifactIngested` event. Past the cap it
+        // holds the handler's summary, or `Null` where the format
+        // declares no summary extractor — and a `Null` here is
+        // indistinguishable from the absent-row case above, so the
+        // largest-payload artifacts would be the ones scanned with an
+        // empty SBOM and no dependency to match an advisory against.
+        // The free function takes the `StoragePort` this use case
+        // already holds; resolving the pair off that port here instead
+        // would be a second copy of the rule.
+        //
+        // A blob the row references but CAS cannot serve is an error
+        // and not a `Null`: it fails this scan, which retries and then
+        // quarantines fail-closed, where degrading would report a
+        // clean, dependency-free SBOM for an artifact nobody read.
+        let metadata = match self
             .artifact_metadata
             .find_by_artifact_id(artifact.id)
             .await?
-            .map(|row| row.metadata)
-            .unwrap_or(serde_json::Value::Null);
+        {
+            Some(row) => load_full_metadata(self.storage.as_ref(), &row).await?,
+            None => serde_json::Value::Null,
+        };
         Ok(ScanSubject {
             coords: ArtifactCoords {
                 name: artifact.name.clone(),

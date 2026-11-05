@@ -784,8 +784,7 @@ impl DomainEvent {
     /// what is written rather than a second derivation of it.
     pub fn validate_serialized(&self, stored_envelope: &serde_json::Value) -> DomainResult<()> {
         self.validate()?;
-        let size = stored_envelope.to_string().len();
-        if size > MAX_EVENT_JSON_BYTES {
+        if let Some(size) = Self::envelope_exceeds_cap(stored_envelope) {
             return Err(DomainError::Validation(format!(
                 // The KB figure is derived from the cap rather than
                 // typed beside it: a hand-written "64 KB" is a second
@@ -798,6 +797,42 @@ impl DomainEvent {
             )));
         }
         Ok(())
+    }
+
+    /// Whether this event's serialised
+    /// [`stored_payload_envelope`](super::stored_payload_envelope) is
+    /// within [`MAX_EVENT_JSON_BYTES`] — the size half of
+    /// [`Self::validate_serialized`], asked as a question instead of
+    /// enforced as a refusal.
+    ///
+    /// A producer that gets to choose *what* it puts in an event needs
+    /// the answer before it commits. The ingest path's inline-vs-spill
+    /// decision is the case: a per-format byte budget bounds the
+    /// **payload**, while the cap bounds the whole **envelope**, so the
+    /// two disagree by exactly the event's own fields and a payload
+    /// inside the budget can still be an event no store accepts.
+    /// Asking the event removes the disagreement — there is no
+    /// envelope-overhead allowance for a caller to estimate, and so
+    /// none to get wrong when a field is added here.
+    ///
+    /// Only the size half, deliberately: a producer choosing between
+    /// two payload shapes wants to know which fits, and a `validate()`
+    /// failure in some unrelated field is not an answer to that —
+    /// every append path runs the full
+    /// [`Self::validate_for_storage`] regardless.
+    #[must_use]
+    pub fn fits_storage_cap(&self) -> bool {
+        Self::envelope_exceeds_cap(&super::stored_payload_envelope(self)).is_none()
+    }
+
+    /// The cap comparison itself, stated once: `Some(size)` when
+    /// `stored_envelope` serialises past [`MAX_EVENT_JSON_BYTES`] (the
+    /// size the refusal message reports), `None` when it fits. Shared
+    /// by the refusal and the question above so the two can never
+    /// answer differently.
+    fn envelope_exceeds_cap(stored_envelope: &serde_json::Value) -> Option<usize> {
+        let size = stored_envelope.to_string().len();
+        (size > MAX_EVENT_JSON_BYTES).then_some(size)
     }
 }
 
@@ -1824,5 +1859,47 @@ pub(crate) mod tests {
     fn max_event_json_cap_is_whole_kilobytes() {
         assert_eq!(MAX_EVENT_JSON_BYTES % BYTES_PER_KB, 0);
         assert_eq!(MAX_EVENT_JSON_BYTES / BYTES_PER_KB, 64);
+    }
+
+    // -- fits_storage_cap -----------------------------------------------
+
+    /// The question and the refusal answer about the same envelope: an
+    /// event `validate_for_storage` accepts is one `fits_storage_cap`
+    /// reports as fitting, and the over-cap event is the same event
+    /// `validate_for_storage_refuses_an_over_cap_event` refuses.
+    #[test]
+    fn fits_storage_cap_agrees_with_the_refusal_on_both_sides() {
+        let fits = DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
+            artifact_id: Uuid::new_v4(),
+            quarantine_window_start: Utc::now(),
+        });
+        assert!(fits.validate_for_storage().is_ok());
+        assert!(fits.fits_storage_cap());
+
+        let over = over_cap_event();
+        assert!(over.validate_for_storage().is_err());
+        assert!(!over.fits_storage_cap());
+    }
+
+    /// Only the size half. An event whose per-field `validate()` refuses
+    /// it but whose envelope is small still *fits* — a producer choosing
+    /// between two payload shapes is asking which one an event can
+    /// carry, and a bad name is not an answer to that. The append path
+    /// still refuses it, through `validate_for_storage`.
+    #[test]
+    fn fits_storage_cap_is_the_size_half_only() {
+        let event = DomainEvent::ArtifactRejected(ArtifactRejected {
+            artifact_id: Uuid::new_v4(),
+            rejected_by: RejectionReason::Admin,
+            // Far under the cap, and refused by `validate()` — the
+            // reason field is empty.
+            reason: String::new(),
+        });
+        assert!(
+            event.validate().is_err(),
+            "fixture must be per-field invalid for this test to say anything"
+        );
+        assert!(event.fits_storage_cap());
+        assert!(event.validate_for_storage().is_err());
     }
 }

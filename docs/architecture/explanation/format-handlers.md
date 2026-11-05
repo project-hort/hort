@@ -33,12 +33,33 @@ pub enum MetadataStrategy {
 
 The last three methods carry the per-format size cap and the
 split-payload strategy. A handler that only overrides the
-first three inherits a conservative 64 KB cap and the `Inline` strategy
-— adequate for any format whose real-world metadata stays below a
-megabyte. Formats with long-tail outliers (npm) override
+first three inherits a conservative 64 KB cap and the `Inline` strategy.
+Formats with long-tail outliers (npm) override
 `metadata_strategy` to `HashReference` and raise the cap; see
 [domain-model.md](domain-model.md) for how the two
 strategies route the payload.
+
+**`metadata_expected_max_bytes` and `inline_threshold_bytes` answer
+different questions, and only the second is bounded by the event cap.**
+The former bounds the payload the pre-dispatch check will *accept* for
+this format, and is deliberately allowed above the 64 KB event ceiling
+(npm 5 MB, cargo 8 MB, PyPI 128 KB) — otherwise it would reject the
+very payloads `HashReference` exists to spill. The latter says how much
+of an accepted payload may stay **inline**, which means riding the
+`ArtifactIngested` event, so it is clamped to
+`hort_domain::events::MAX_EVENT_JSON_BYTES` by
+`MetadataStrategy::inline_event_budget_bytes` — one place, and the only
+statement of that relation. A handler declaring more gets the cap; a
+handler declaring less keeps its own value. `MetadataStrategy::Inline`
+declares no threshold, so the cap is the whole of its budget.
+
+Because the budget bounds the payload while the cap bounds the whole
+serialised envelope, the ingest path does not stop at the budget: it
+asks the candidate event itself (`DomainEvent::fits_storage_cap`)
+whether it fits, for the full payload and then for the handler summary.
+Whatever does not fit goes to CAS, and the choice is invisible to
+readers — `ArtifactUseCase::load_full_metadata` follows the reference
+transparently and is the one place that knows there is one.
 
 Upload parsing is **not** in the trait. Each ecosystem's upload shape
 (PyPI multipart, npm base64 JSON, Maven PUT) is tied to HTTP specifics

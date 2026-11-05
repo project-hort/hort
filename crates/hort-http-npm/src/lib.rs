@@ -2822,17 +2822,16 @@ mod tests {
         // ---- Large payload: split path -------------------------------
         //
         // Push a per-version block past the 256 KB threshold with a long
-        // `readme` — a key `extract_metadata_summary` strips. The bulk has
-        // to ride a non-summary key: the summary is what stays on the
-        // `ArtifactIngested` event, and the event store refuses an event
-        // whose serialised form exceeds the 64 KB cap
-        // (`hort_domain::events::MAX_EVENT_JSON_BYTES`), so a block whose
-        // *summary* keys are themselves over that cap cannot be published
-        // at all. That is a property of the split worth knowing and not
-        // what this test is about: the dispatch hashes the full block to
-        // CAS and the committed row carries only the 7-key summary —
-        // proof that both the upload site AND the summary filter work
-        // end-to-end.
+        // `readme` — a key `extract_metadata_summary` strips. The bulk
+        // rides a non-summary key so that the summary itself comfortably
+        // fits an event and the committed row carries it: that is what
+        // this test asserts, the upload site plus the summary filter
+        // working end-to-end. A block whose *summary* keys are
+        // themselves over the 64 KB event cap
+        // (`hort_domain::events::MAX_EVENT_JSON_BYTES`) publishes too —
+        // the reference is then all that rides the event — and
+        // `an_installer_sees_the_same_fields_whether_the_block_is_inline_or_in_cas`
+        // is where that case is covered.
         let mut big_deps = serde_json::Map::new();
         for i in 0..20 {
             big_deps.insert(format!("dep-{i:05}"), serde_json::json!("^1.0.0"));
@@ -2893,6 +2892,125 @@ mod tests {
         assert!(
             split_md.metadata_blob.is_some(),
             "over-threshold ingest must record a blob hash"
+        );
+    }
+
+    /// Where the payload metadata lives is not observable on the wire.
+    ///
+    /// Publishes the same per-version block shape twice, differing only
+    /// in how many `dependencies` entries it carries, and asserts the
+    /// installer's packument serves the published `dependencies` and
+    /// `engines` verbatim both times. The large case's dependency map
+    /// puts npm's summary over the 64 KB event cap — the summary is
+    /// `dependencies` plus six more keys, and its key list is not
+    /// negotiable, because serving less makes every version look
+    /// dependency-free to a fresh, non-lockfile install — so nothing but
+    /// the CAS reference rides the event and the read path recovers the
+    /// block through `ArtifactUseCase::load_full_metadata`. The small
+    /// case stays inline.
+    ///
+    /// The assertion is written once and run for both, and the only
+    /// thing the test states about which side of the threshold a publish
+    /// landed on is the closing counter-assertion — read off the
+    /// committed rows, not arranged. Before the spill decision could see
+    /// the cap, the large case did not publish at all.
+    #[tokio::test]
+    async fn an_installer_sees_the_same_fields_whether_the_block_is_inline_or_in_cas() {
+        let mut blob_backed = Vec::new();
+
+        for (pkg, dep_count) in [("smallpkg", 1_usize), ("bigpkg", 1800)] {
+            let h = harness();
+            insert_repo(&h, "npm-test");
+            let router = router(h.ctx.clone());
+
+            let mut deps = serde_json::Map::new();
+            for i in 0..dep_count {
+                deps.insert(
+                    format!("@scope/dependency-package-number-{i:04}"),
+                    serde_json::json!("^1.2.3"),
+                );
+            }
+            let tarball = hort_formats::test_support::build_npm_tarball(pkg, "1.0.0");
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&tarball);
+            let body = serde_json::json!({
+                "name": pkg,
+                "versions": {
+                    "1.0.0": {
+                        "name":         pkg,
+                        "version":      "1.0.0",
+                        "dist":         { "tarball": "u", "shasum": "s" },
+                        "dependencies": serde_json::Value::Object(deps.clone()),
+                        "engines":      { "node": ">=18" },
+                        // Out of the abbreviated contract, and stripped
+                        // by the summary — so its absence on the wire
+                        // says nothing about which side we are on.
+                        "readme":       "prose",
+                    }
+                },
+                "_attachments": {
+                    format!("{pkg}-1.0.0.tgz"): {
+                        "content_type": "application/octet-stream",
+                        "data":         b64,
+                        "length":       tarball.len(),
+                    }
+                },
+            });
+
+            let res = router
+                .clone()
+                .oneshot(
+                    Request::put(format!("/npm/npm-test/{pkg}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::OK,
+                "publishing {pkg} must succeed"
+            );
+
+            let md = h.lifecycle.committed_transitions()[0]
+                .2
+                .clone()
+                .expect("npm ingest must commit an ArtifactMetadata row");
+            blob_backed.push(md.metadata_blob.is_some());
+
+            let res = router
+                .oneshot(
+                    Request::get(format!("/npm/npm-test/{pkg}"))
+                        .header("host", "registry.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "serving {pkg} must succeed");
+            let served = to_bytes(res.into_body(), 4 * 1024 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&served).unwrap();
+            let version = &json["versions"]["1.0.0"];
+
+            assert_eq!(
+                version["dependencies"],
+                serde_json::Value::Object(deps),
+                "{pkg}: an installer must see every published dependency"
+            );
+            assert_eq!(version["engines"], serde_json::json!({ "node": ">=18" }));
+            assert!(
+                version.get("readme").is_none(),
+                "{pkg}: `readme` is out of the abbreviated-metadata contract"
+            );
+        }
+
+        // Counter-assertion: the two publishes landed on opposite sides
+        // of the threshold. Both on one side and the loop above compares
+        // a path with itself.
+        assert_eq!(
+            blob_backed,
+            vec![false, true],
+            "the small block must stay inline and the large one must spill —              otherwise this test is not comparing the two read paths"
         );
     }
 
