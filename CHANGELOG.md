@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A subscription edited, paused, resumed or disabled while it is delivering, or
+  running on more than one replica, no longer re-delivers events it had already
+  delivered the next time its process restarts (#311).
 - A scan policy written with a negative quarantine duration is now refused by
   name instead of being stored; already-stored negative values are untouched
   and are reported when a policy carrying one is next written (#253).

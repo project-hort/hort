@@ -27,6 +27,10 @@
 //! 10. `update_persists_state_and_disable_reason` — state transition
 //!     (Active → Disabled) flips the row's `state`, `disable_reason`,
 //!     `disabled_since` columns.
+//! 11. `a_late_writer_cannot_rewind_the_delivery_cursor` — the cursor has
+//!     one writer and only moves forward: a below-stored flush and a
+//!     whole-row `update` both leave it where it is, while the edits
+//!     those statements do own still land.
 //!
 //! Convention (mirrored from `api_token_repo.rs`): require
 //! `DATABASE_URL` to be set; when unset, every test early-returns
@@ -577,6 +581,114 @@ async fn update_last_delivered_persists_position_and_failure() {
     assert_eq!(
         held.last_failure.expect("failure recorded").reason,
         NotifyFailureReason::Dns
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance — the delivery cursor only moves forward, and `update` is not
+// one of its writers.
+// ---------------------------------------------------------------------------
+
+/// **A late writer cannot rewind the delivery cursor.**
+///
+/// The position is flushed from a cursor each dispatcher task holds in
+/// memory. There is one task per replica and no leader election, so the
+/// writers are concurrent and unordered: a slower replica's flush lands
+/// after a faster replica's, and a `pause` / `resume` / `disable` /
+/// `PATCH` writes back a whole row it read before either of them. Under
+/// a bare assignment the last writer won, and the stored cursor was
+/// whichever value happened to arrive last.
+///
+/// What a rewind costs is the point. A catch-up read resumes strictly
+/// *above* the stored position, so the column is not a statistic that is
+/// briefly stale — it is where the next process starts. Rewound, it
+/// re-delivers everything between, which the at-least-once guarantee
+/// permits but nobody asked for; and a column whose value depends on
+/// arrival order is one no reader can reason about.
+///
+/// Asserted as a property and not as an expression: each leg attempts the
+/// rewind through the real statement and reads the row back, so the
+/// `GREATEST` and the absent SET-list entry are both pinned by what they
+/// refuse rather than by their text.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn a_late_writer_cannot_rewind_the_delivery_cursor() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let owner = create_test_user(&pool).await;
+    let target = sample_webhook_target();
+    let filter = sample_filter(Uuid::new_v4());
+    let mut sub = build_subscription(owner, "monotonic", target, filter);
+
+    let repository = PgSubscriptionRepository::new(pool);
+    repository.create(&sub).await.expect("insert");
+
+    // The furthest writer so far.
+    repository
+        .update_last_delivered(sub.id, Some(9_000), None)
+        .await
+        .expect("the first advance lands");
+
+    // Leg 1: a slower task flushes a position it reached before the one
+    // above — and brings a failure with it, so the two halves of the
+    // write are separable. The failure is an audit signal an operator
+    // reads live and must land; the position is behind and must not.
+    let failure = SubscriptionFailure {
+        at: Utc::now(),
+        reason: NotifyFailureReason::Http5xx { status: 503 },
+        consecutive_failures: 3,
+    };
+    repository
+        .update_last_delivered(sub.id, Some(4_000), Some(&failure))
+        .await
+        .expect("a late flush is accepted, not rejected");
+    let after_late_flush = repository.find_by_id(sub.id).await.expect("find_by_id");
+    assert_eq!(
+        after_late_flush.last_delivered_position,
+        Some(9_000),
+        "a position below the stored one is not an advance"
+    );
+    assert_eq!(
+        after_late_flush
+            .last_failure
+            .expect("the failure is still recorded")
+            .consecutive_failures,
+        3,
+        "refusing the rewind must not also swallow the failure the same \
+         statement carried"
+    );
+
+    // Leg 2: the row-level write path. This is the value a `PATCH`,
+    // `pause`, `resume` or `disable` carries — read before the advance
+    // above, and written back after it. The edit it actually intends
+    // must land; the cursor it is only carrying must not.
+    sub.last_delivered_position = Some(1_000);
+    sub.description = Some("renamed after the cursor moved".to_string());
+    repository.update(&sub).await.expect("update");
+    let after_row_write = repository.find_by_id(sub.id).await.expect("find_by_id");
+    assert_eq!(
+        after_row_write.last_delivered_position,
+        Some(9_000),
+        "`update` is not a writer of the delivery cursor"
+    );
+    assert_eq!(
+        after_row_write.description.as_deref(),
+        Some("renamed after the cursor moved"),
+        "the fields `update` does own still persist"
+    );
+
+    // Leg 3: and forward still works, so none of the above was achieved
+    // by making the column read-only.
+    repository
+        .update_last_delivered(sub.id, Some(12_000), None)
+        .await
+        .expect("a real advance lands");
+    let advanced = repository.find_by_id(sub.id).await.expect("find_by_id");
+    assert_eq!(advanced.last_delivered_position, Some(12_000));
+    assert!(
+        advanced.last_failure.is_none(),
+        "the first success after a failure run still clears the failure"
     );
 }
 
