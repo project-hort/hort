@@ -338,3 +338,86 @@ does.
 
 The repair is idempotent — a second run finds nothing, because the first
 one moved the artifact out of `rejected`.
+
+---
+
+## 6. A third strand: artifacts held in a permissive (`quarantineDuration: 0`) repository
+
+The two strands above are about an artifact whose *verdict* never
+arrived. This one is about an artifact whose *window* no longer exists.
+
+`quarantineDuration: 0` — permissive mode — is a supported posture: it
+collapses [ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)'s
+time gate and leaves the fail-closed scan gate in place (see
+[the curator workflow guide](curator-workflow.md) §5). Under it ingest
+never quarantines at all, so in steady state a permissive repository
+holds nothing. Two things nevertheless put an artifact into the hold of
+a repository that is permissive *now*:
+
+- **The window was longer when the artifact was ingested** and an
+  operator has since shortened it to `0`. Changing `quarantineDuration`
+  re-judges nothing (it is not a re-evaluation trigger — see the curator
+  guide's §6) and nothing moves `quarantine_window_start` once it is
+  stamped, so the artifact keeps the anchor it was ingested under.
+- **A corrective path returned it to the hold.** The §5 repair is the
+  one that exists today, and it returns the artifact on its **original**
+  anchor — restored, not restarted.
+
+### Recognition shape
+
+Three facts together:
+
+1. `quarantine_status = 'quarantined'`;
+2. `release_attempt_at IS NULL`; and
+3. a **resolved** `quarantineDuration` of `0` for the artifact's
+   repository — `GET /api/v1/admin/repositories/:key/effective-config`
+   → `.scan_policy.quarantine_duration_secs`. Resolution is repo-scoped
+   policy → global policy → built-in default, so the repository's own
+   YAML is not the whole answer.
+
+(2) is the discriminating fact. The release sweep stamps
+`release_attempt_at` on **every** candidate it hands to the release gate,
+released and held alike, so a `NULL` means the sweep never *considered*
+the row — not that it considered it and the gates held it. The column is
+not on an API surface; read it from the row:
+
+```sql
+SELECT id, quarantine_status, quarantine_window_start, release_attempt_at
+  FROM artifacts
+ WHERE repository_id = '<repository-uuid>'
+   AND quarantine_status = 'quarantined'
+   AND deleted_at IS NULL;
+```
+
+Confirm the sweep is actually running before reading anything into a
+`NULL`: a deployment whose sweep CronJob is disabled shows `NULL` for
+every held artifact in every repository, which is a different problem
+with a different fix.
+
+### It self-heals, and there is no backfill to run
+
+Release-sweep candidacy selects by **deadline**, never by current policy.
+A zero window is a window of zero *length*, not an absent one: its cutoff
+is `now`, so every artifact a permissive repository still holds is past
+its deadline and is selected on the next tick. What happens to each one
+then is the ordinary per-artifact decision — the scan-axis release
+authority (ADR 0007) and the provenance clearance
+([ADR 0027](../../adr/0027-artifact-provenance-verification.md)) — exactly
+as for a candidate from any other repository. Permissive mode buys an
+artifact no authority it did not already have; it only makes it a
+candidate.
+
+Before 0.14.0 the sweep dropped a repository whose resolved window was
+`0` from candidacy altogether, which left its held artifacts with no exit
+at all — the anchor never moves, so the only recovery was a per-artifact
+curator waive. **0.14.0 and later selects by deadline, and the heal is a
+property of that query rather than of a migration**: a population that
+accumulated under an older release drains on the next sweep tick exactly
+like a freshly-arrived one. There is no backfill step to run and nothing
+to look for in `migrations/`.
+
+The tick is the `quarantine-release-sweep` CronJob
+(`scheduledTasks.quarantineReleaseSweep`, **default enabled**, default
+schedule `*/5 * * * *`). It has no admin-task HTTP route, so draining
+once off-schedule means running its own command against the runtime DSN:
+`hort-server enqueue-quarantine-release-sweep`.
