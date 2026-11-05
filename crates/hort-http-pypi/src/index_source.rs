@@ -236,12 +236,39 @@ impl IndexSource for HostedPypiSource {
             // Already a `ContentHash` on the stored row — carried across
             // typed rather than widened to `String` and re-parsed.
             let hash_sha256 = Some(artifact.sha256_checksum.clone());
-            let requires_python = metadata_map
-                .get(&artifact.id)
-                .and_then(|m| m.metadata.get("pkg_info"))
-                .and_then(|p| p.get("requires_python"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
+            // `load_full_metadata` and not `row.metadata`: the row's
+            // own field is the full `{"pkg_info": …}` object only when
+            // that object fit in the `ArtifactIngested` event. Past the
+            // cap the payload is in CAS and the row holds `Null` —
+            // PyPI's `MetadataStrategy::Inline` declares no summary
+            // extractor, so there is nothing smaller to fall back to —
+            // and the chain off `row.metadata` would yield `None`, which
+            // this builder renders by *omitting* `data-requires-python`
+            // from the simple index. A resolver reads that as "no Python
+            // requirement" rather than as "not stated", so the largest
+            // METADATA documents are exactly the ones that would install
+            // on an interpreter the release excludes.
+            //
+            // Batching answer: the one batched `batch_metadata` query
+            // above still serves the whole version set — this adds no
+            // query. The accessor is per-row, but its no-blob arm is a
+            // clone with no I/O, so the listing's CAS round-trips equal
+            // the number of *spilled* versions and are zero for a
+            // package whose releases all fit, which is the ordinary
+            // case. A batched variant would be new port surface sized
+            // for a set that is empty today; this mirrors the hosted
+            // cargo source, which resolves per row inside its own loop.
+            let requires_python = match metadata_map.get(&artifact.id) {
+                Some(row) => ctx
+                    .artifact_use_case
+                    .load_full_metadata(row)
+                    .await?
+                    .get("pkg_info")
+                    .and_then(|p| p.get("requires_python"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                None => None,
+            };
 
             // Populate `metadata_hash` from the batched
             // `wheel_metadata` ContentReference lookup (PEP 658).

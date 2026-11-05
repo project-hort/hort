@@ -65,14 +65,22 @@ pub struct ArtifactIngested {
     /// yield `None` on any `.get(key)` lookup).
     #[serde(default)]
     pub metadata: serde_json::Value,
-    /// Optional reference to the full payload stored in CAS, when the
+    /// Optional reference to the full payload stored in CAS, written
+    /// when the payload did not fit in this event — either past the
     /// format handler's
-    /// [`MetadataStrategy`](crate::ports::format_handler::MetadataStrategy)
-    /// is `HashReference` and the serialised payload exceeded the
-    /// handler's inline threshold. When `Some(hash)`, `metadata` carries
-    /// the handler-extracted summary and the full JSON payload lives at
-    /// `hash` in content-addressable storage. When `None`, `metadata`
-    /// carries the full payload inline.
+    /// [`inline_event_budget_bytes`](crate::ports::format_handler::MetadataStrategy::inline_event_budget_bytes)
+    /// or past [`MAX_EVENT_JSON_BYTES`](crate::events::MAX_EVENT_JSON_BYTES)
+    /// once this event's own fields are counted.
+    ///
+    /// When `None`, `metadata` carries the full payload inline. When
+    /// `Some(hash)`, the full JSON payload lives at `hash` in
+    /// content-addressable storage and `metadata` carries the
+    /// handler-extracted summary — or `Null`, when the summary did not
+    /// fit either, which is an ordinary outcome for a format whose
+    /// summary is itself unbounded (npm's is three dependency maps).
+    /// **A reader must therefore not treat an inline `metadata` as the
+    /// payload without first consulting `metadata_blob`**, which is
+    /// what `ArtifactUseCase::load_full_metadata` exists to do.
     ///
     /// `#[serde(default)]` so older persisted events — which
     /// never wrote this key — deserialise as `None` under the current

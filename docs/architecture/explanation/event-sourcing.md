@@ -484,8 +484,21 @@ The operator-facing how-to is at
   mirror of the constant. A separate,
   larger 1 MB cap exists on the unrelated `artifact_metadata.metadata`
   projection column (`migrations/003_artifacts_cas.sql`) — do not conflate
-  the two. Per-format sanity caps below the 64 KB event-log ceiling are
-  applied at the application layer — see
+  the two.
+- **A format's own metadata cap is *not* below the event ceiling, and is not
+  meant to be.** `FormatHandler::metadata_expected_max_bytes` bounds the
+  upload payload a format will *accept* (npm 5 MB, cargo 8 MB, PyPI 128 KB),
+  which is deliberately above 64 KB so the pre-dispatch check does not
+  pre-empt the spill decision. What is bounded by the event ceiling is only
+  the payload that stays **inline**:
+  `MetadataStrategy::inline_event_budget_bytes` clamps a handler's declared
+  `inline_threshold_bytes` to `MAX_EVENT_JSON_BYTES`, and the ingest path
+  then asks the candidate `ArtifactIngested` itself
+  (`DomainEvent::fits_storage_cap`) rather than estimating what the event's
+  own fields cost. Anything that does not fit — the full payload, or, after
+  a spill, the handler summary — goes to CAS and is served back through
+  `ArtifactUseCase::load_full_metadata`, so where the metadata lives is
+  invisible to every reader. See
   [format-handlers.md](format-handlers.md).
 - **Stream length cap: `STREAM_EVENT_CAP` events** (`hort_app::use_cases`),
   enforced on **both** sides, because the cap is what makes a single capped

@@ -766,27 +766,16 @@ async fn resolve_tag_reference(
 // ---------------------------------------------------------------------------
 
 /// Fetch the manifest's stored media-type from the
-/// `artifact_metadata.metadata.oci_media_type` field. Falls back to
+/// `artifact_metadata` payload's `oci_media_type` field. Falls back to
 /// [`DEFAULT_MEDIA_TYPE`] when the
 /// metadata row is absent or the field is missing — legitimate for
 /// artifacts that pre-date the metadata write (migration path) and for
 /// the adapter returning an error (we degrade gracefully rather than
 /// 500 the pull).
 async fn resolve_media_type(ctx: &AppContext, artifact_id: Uuid) -> String {
-    // `batch_metadata` collapses the single-id lookup into the
-    // trusted-ids contract: the caller has already authz'd the artifact
-    // (the manifest serve handler resolved it via `find_visible_by_path` /
-    // `find_visible_by_id` upstream, ADR 0008).
-    match ctx.artifact_use_case.batch_metadata(&[artifact_id]).await {
-        Ok(map) => map
-            .get(&artifact_id)
-            .and_then(|m| {
-                m.metadata
-                    .get("oci_media_type")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| DEFAULT_MEDIA_TYPE.to_string()),
+    match stored_media_type(ctx, artifact_id).await {
+        Ok(Some(media_type)) => media_type,
+        Ok(None) => DEFAULT_MEDIA_TYPE.to_string(),
         Err(e) => {
             tracing::warn!(
                 %artifact_id,
@@ -796,6 +785,47 @@ async fn resolve_media_type(ctx: &AppContext, artifact_id: Uuid) -> String {
             DEFAULT_MEDIA_TYPE.to_string()
         }
     }
+}
+
+/// The stored `oci_media_type`, or `None` when no row / no field.
+///
+/// Split out so [`resolve_media_type`] keeps exactly one
+/// degrade-to-default arm: the row lookup and the payload read are both
+/// fallible and both degrade the same way, and a nested match would
+/// have given the second one its own silent arm.
+///
+/// Reads the payload through `load_full_metadata` rather than off the
+/// row's `metadata` field. An OCI manifest's payload is compact by
+/// construction — the push path writes `{"oci_media_type", …}` and the
+/// pull-through paths a handful of short strings beside it, none of
+/// which approaches what an event can carry — so this is not expected
+/// to cost a CAS round-trip, and the accessor's no-blob arm is a clone
+/// with no I/O, so it does not. But "compact by construction" is a
+/// property of today's four call sites rather than of the field, and
+/// the read that rests on it is the pull's `Content-Type`: a row that
+/// did spill would serve every client the default media type for a
+/// manifest pushed as something else, which an OCI client resolves by
+/// refusing the manifest it just pushed. Asking the accessor costs that
+/// read nothing and does not rest on the write sites staying small.
+async fn stored_media_type(
+    ctx: &AppContext,
+    artifact_id: Uuid,
+) -> Result<Option<String>, AppError> {
+    // `batch_metadata` collapses the single-id lookup into the
+    // trusted-ids contract: the caller has already authz'd the artifact
+    // (the manifest serve handler resolved it via `find_visible_by_path` /
+    // `find_visible_by_id` upstream, ADR 0008).
+    let map = ctx.artifact_use_case.batch_metadata(&[artifact_id]).await?;
+    let Some(row) = map.get(&artifact_id) else {
+        return Ok(None);
+    };
+    Ok(ctx
+        .artifact_use_case
+        .load_full_metadata(row)
+        .await?
+        .get("oci_media_type")
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
 }
 
 /// Returns `true` if `headers`'s `Accept` matches `media_type`.
@@ -2388,6 +2418,149 @@ mod tests {
     }
 
     // ---------------- Happy paths ----------------
+
+    /// Where the payload metadata lives is not observable on a pull.
+    ///
+    /// Serves the same manifest bytes twice from rows that differ only
+    /// in where the `oci_media_type` lives — inline on the row, and
+    /// spilled to CAS with the row's `metadata` left `Null` — and
+    /// asserts the pull's `Content-Type` is the pushed media type both
+    /// times. Before this read path went through the accessor the
+    /// spilled row resolved to [`DEFAULT_MEDIA_TYPE`] instead, and the
+    /// consequence is not a mislabelled 200: the resolved type is also
+    /// what `serve` runs the request's `Accept` against, so a client
+    /// asking for the Docker schema it pushed got **406 Not
+    /// Acceptable** — a manifest in the registry that the client that
+    /// pushed it cannot pull. Reverting the accessor call is how that
+    /// was measured.
+    ///
+    /// **The spilled row is arranged, not published, and that is the
+    /// point.** The OCI write paths build a payload of a handful of
+    /// short strings — `{"oci_media_type", "oci_subject_digest"}` on
+    /// push, those plus the upstream name/URL on a pull-through — so
+    /// none of them can produce a payload an `ArtifactIngested` event
+    /// cannot carry, and there is no "same input twice, differing only
+    /// in size" to publish. But compact-by-construction is a property
+    /// of today's four write sites rather than of the field, and the
+    /// read that rests on it is the pull's `Content-Type`; so the row
+    /// shape is seeded directly and the read path is asserted to be
+    /// indifferent to it.
+    #[test]
+    fn a_pull_sees_the_pushed_media_type_whether_the_payload_is_inline_or_in_cas() {
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        // A Docker-schema manifest, which is routinely pushed and is
+        // deliberately **not** [`DEFAULT_MEDIA_TYPE`]: the fallback is
+        // what a lost `oci_media_type` degrades to, so a test using the
+        // default cannot tell the two read paths apart. Asserted below
+        // rather than left to the reader.
+        let media = "application/vnd.docker.distribution.manifest.v2+json";
+        assert_ne!(
+            media, DEFAULT_MEDIA_TYPE,
+            "this test is vacuous unless the pushed media type differs from the fallback \
+             a dropped `oci_media_type` produces"
+        );
+        // Exactly what `manifests_write::ingest_manifest` writes.
+        let payload = serde_json::json!({
+            "oci_media_type": media,
+            "oci_subject_digest": serde_json::Value::Null,
+        });
+
+        for spilled in [false, true] {
+            let (status, headers, blob_backed) = run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                // `None`: this test writes the metadata row itself.
+                let (artifact_id, _) = seed_manifest(
+                    &h.artifacts,
+                    &h.storage,
+                    &h.metadata,
+                    repo_id,
+                    &hex,
+                    &content,
+                    None,
+                    QuarantineStatus::None,
+                );
+
+                let row = if spilled {
+                    let bytes = serde_json::to_vec(&payload).unwrap();
+                    let blob_hash: ContentHash = {
+                        use sha2::Digest;
+                        hex::encode(sha2::Sha256::digest(&bytes)).parse().unwrap()
+                    };
+                    h.storage.insert_content(blob_hash.clone(), bytes);
+                    ArtifactMetadata {
+                        artifact_id,
+                        format: RepositoryFormat::Oci,
+                        // What a spill leaves behind for a format whose
+                        // strategy is `Inline`: no summary extractor, so
+                        // the row carries nothing at all.
+                        metadata: serde_json::Value::Null,
+                        metadata_blob: Some(blob_hash),
+                        properties: serde_json::Value::Object(Default::default()),
+                    }
+                } else {
+                    ArtifactMetadata {
+                        artifact_id,
+                        format: RepositoryFormat::Oci,
+                        metadata: payload.clone(),
+                        metadata_blob: None,
+                        properties: serde_json::Value::Object(Default::default()),
+                    }
+                };
+                h.metadata.insert(row);
+
+                let router = manifest_router(h.ctx.clone());
+                let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{hex}");
+                let resp = router
+                    .oneshot(
+                        Request::get(&uri)
+                            .header(ACCEPT, media)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                // Counter-assertion input, read off the row the serve
+                // actually read rather than off the loop variable.
+                use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
+                let blob_backed = h
+                    .metadata
+                    .find_by_artifact_id(artifact_id)
+                    .await
+                    .unwrap()
+                    .expect("the seeded metadata row must be there")
+                    .metadata_blob
+                    .is_some();
+                (status, headers, blob_backed)
+            });
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "spilled={spilled}: pull must succeed"
+            );
+            assert_eq!(
+                headers.get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+                media,
+                "spilled={spilled}: a client must see the pushed media type, not the default"
+            );
+            // Both sides: the row under test really was the shape this
+            // iteration meant to exercise.
+            assert_eq!(
+                blob_backed, spilled,
+                "spilled={spilled}: the committed row's shape must match the case — \
+                 otherwise this loop compares one read path with itself"
+            );
+        }
+    }
 
     #[test]
     fn get_manifest_by_digest_served_with_stored_media_type() {

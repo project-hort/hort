@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Per-version metadata between 64 KB and 256 KB now publishes for npm, PyPI and
+  cargo, and clients read the same fields wherever it is stored (#416).
 - A work class starving at one kind's run permit is now reported even when a
   different kind of the same class keeps completing: the service verdict is
   emitted per kind as well as per class, on new

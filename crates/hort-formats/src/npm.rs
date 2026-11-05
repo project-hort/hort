@@ -415,6 +415,16 @@ impl NpmTarballIdentity {
 /// deliberately locked to what the resolver + `npm view` minimally need —
 /// everything else (readme, description, keywords, bin, scripts, …) stays
 /// in the CAS blob.
+///
+/// The summary is a **read-path optimisation, not a storage
+/// guarantee**: three of these keys are dependency maps, so a package
+/// with a few thousand entries produces a summary over the 64 KB event
+/// cap on its own. The ingest path then keeps nothing inline and serves
+/// the block from CAS instead (`ArtifactUseCase::load_full_metadata`),
+/// which costs a reader one round-trip and no fields. Trimming the list
+/// to make it fit is not the alternative — see
+/// [`NPM_INSTALL_V1_MANIFEST_KEYS`] for what serving less does to a
+/// fresh install.
 const NPM_SUMMARY_KEYS: &[&str] = &[
     "name",
     "version",
@@ -597,20 +607,30 @@ impl FormatHandler for NpmFormatHandler {
     /// Real-world measurements observed a 1.37 MB max
     /// (`@mui/icons-material`) against a p99 of ~141 KB; 5 MB keeps
     /// headroom for long-tail growth while staying well below the
-    /// global 10 MB blob safety cap. The 256 KB split threshold is
-    /// enforced separately via `metadata_strategy`.
+    /// global 10 MB blob safety cap. How much of an admitted payload
+    /// stays inline is a different number and lives on
+    /// `metadata_strategy` below.
     fn metadata_expected_max_bytes(&self) -> usize {
         5 * 1024 * 1024
     }
 
     /// npm persists payload metadata via
-    /// [`MetadataStrategy::HashReference`]: packuments under 256 KB
-    /// stay inline for read-path cheapness, anything larger spills the
+    /// [`MetadataStrategy::HashReference`]: a packument small enough
+    /// stays inline for read-path cheapness, anything larger spills the
     /// full payload to CAS and keeps a handler-extracted summary inline
-    /// on the event + projection row. The threshold was calibrated
-    /// against a real-world corpus (p99 ~141 KB, max 1.37 MB); 256 KB
-    /// leaves the overwhelming majority of real packages on the inline
-    /// path while still kicking the long-tail outliers to the blob path.
+    /// on the event + projection row.
+    ///
+    /// The 256 KB declared here is a **read-path** statement calibrated
+    /// against a real-world corpus (p99 ~141 KB, max 1.37 MB): it is
+    /// how far npm would go to avoid a CAS round-trip. It is **not**
+    /// what the ingest path inlines —
+    /// [`MetadataStrategy::inline_event_budget_bytes`] clamps it to the
+    /// 64 KB event cap, because the inline payload rides the
+    /// `ArtifactIngested` event. The two numbers disagreeing was a real
+    /// defect: a payload in the 64 KB – 256 KB band (the measured p99
+    /// of ~141 KB is inside it) was "small enough to inline" and "too
+    /// big for an event" at once, so the publish failed at the append
+    /// with the tarball already written to CAS.
     fn metadata_strategy(&self) -> MetadataStrategy {
         MetadataStrategy::HashReference {
             inline_threshold_bytes: 256 * 1024,
