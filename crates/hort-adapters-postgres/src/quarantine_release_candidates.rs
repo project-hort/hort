@@ -634,6 +634,48 @@ mod tests {
         .expect("seed repo-scoped policy_projections row");
     }
 
+    /// Seed a repository-scoped policy whose quarantine window is
+    /// negative, the way one that **predates**
+    /// `policy_projections_quarantine_duration_secs_nonnegative` exists.
+    ///
+    /// That constraint is `NOT VALID`: it refuses every write from its
+    /// migration onwards and leaves rows written before it exactly as
+    /// they stand. So a row already in the table is the only state a
+    /// negative window survives in — and it is the whole reason the
+    /// `.max(0)` clamp this module applies stays. Reproducing the state
+    /// means writing the row while the constraint is absent and then
+    /// restoring it as the migration left it, which is what the
+    /// before-and-after here does; the database is this test's own
+    /// (`isolated_db_from`), so no sibling can observe the gap.
+    ///
+    /// Seeding it any other way would be seeding a row the schema
+    /// refuses — a premise no installation can reach, which would make
+    /// the clamp below it answer about nothing.
+    async fn seed_legacy_negative_window_policy(pool: &PgPool, repo_id: Uuid, secs: i64) {
+        assert!(
+            secs < 0,
+            "the legacy shape this builds is a negative window"
+        );
+        sqlx::query(
+            "ALTER TABLE public.policy_projections
+                 DROP CONSTRAINT policy_projections_quarantine_duration_secs_nonnegative",
+        )
+        .execute(pool)
+        .await
+        .expect("the non-negativity constraint exists to be lifted");
+
+        seed_repo_scoped_policy(pool, repo_id, secs).await;
+
+        sqlx::query(
+            "ALTER TABLE public.policy_projections
+                 ADD CONSTRAINT policy_projections_quarantine_duration_secs_nonnegative
+                 CHECK (quarantine_duration_secs >= 0) NOT VALID",
+        )
+        .execute(pool)
+        .await
+        .expect("restoring it NOT VALID leaves the row just written alone");
+    }
+
     /// `select_expired` returns an empty `Vec` on an empty database —
     /// no policies, no artifacts, no quarantined repos to resolve a
     /// duration for in the first place, so the default-duration
@@ -843,10 +885,12 @@ mod tests {
         );
     }
 
-    /// A negative `quarantine_duration_secs` behaves exactly as zero. The
-    /// column is a plain `bigint NOT NULL` with no non-negativity CHECK,
-    /// so the adapter — which reads the projection, not the validated
-    /// YAML — can encounter one.
+    /// A negative `quarantine_duration_secs` behaves exactly as zero.
+    /// The column's non-negativity CHECK is `NOT VALID`, so a row
+    /// written before it still carries one and this adapter — which
+    /// reads the projection, not the validated YAML — can encounter it.
+    /// See [`seed_legacy_negative_window_policy`] for why that is the
+    /// only shape it arrives in, and why it is the shape seeded here.
     ///
     /// The clamp is what keeps the cutoff at `now` instead of
     /// `now + |secs|`: an unclamped negative duration would put the
@@ -861,7 +905,7 @@ mod tests {
         };
 
         let repo = seed_repo(&pool).await;
-        seed_repo_scoped_policy(&pool, repo, -3600).await;
+        seed_legacy_negative_window_policy(&pool, repo, -3600).await;
         let now = Utc::now();
         // Anchored in the past: past the clamped (zero) window.
         let elapsed =
