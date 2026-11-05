@@ -1,0 +1,42 @@
+-- Migration 039 — a quarantine observation window is a duration, and a
+-- duration is not negative.
+--
+-- `quarantine_duration_secs` is the sole source of truth for the length
+-- of the hold ADR 0007 places on a fresh ingest, and its consumers read
+-- it in shapes written for a non-negative value: `> 0` / `<= 0` for
+-- whether the hold applies at all, and `anchor + duration` for the
+-- deadline they report. A negative value is NOT uniformly the same
+-- answer as the explicit permissive zero those shapes were written for:
+--
+--   * `SeedImportUseCase::compute_backdated_anchor` *subtracts* the
+--     duration, so a value past `-BACKDATE_MARGIN_SECS` stamps a
+--     `quarantine_window_start` in the FUTURE where zero stamps one in
+--     the past;
+--   * the boot posture summary counts permissive policies with `== 0`
+--     and so does not see one;
+--   * the deadline the curation queue and a served index report moves
+--     before the window anchor.
+--
+-- One stored value, three readings — so the value is refused where it
+-- is written instead of each reader picking one. The application-side
+-- refusal that names the field and the value lives in
+-- `hort_app::use_cases::policy_use_case`
+-- (`require_nonnegative_quarantine_duration`, reached by both the create
+-- and the update path); this constraint is the same statement one level
+-- down, so a row inserted by raw SQL or restored from a dump cannot
+-- escape it either.
+--
+-- `NOT VALID` is deliberate: the constraint is enforced on every INSERT
+-- and UPDATE from here on, and existing rows are left as they stand.
+-- Converging a stored negative value to zero would change what the three
+-- consumers above do with that row — which anchor a seed import stamps,
+-- which log level boot reports, which instant a client is told to come
+-- back at. That is a policy change, and a policy change is an operator
+-- act through the policy write path, not something a schema migration
+-- decides on their behalf. A later `ALTER TABLE ... VALIDATE CONSTRAINT`
+-- is therefore owed by whatever change converges those rows, and belongs
+-- with it rather than here; it is one statement and takes no lock that
+-- blocks reads.
+ALTER TABLE public.policy_projections
+    ADD CONSTRAINT policy_projections_quarantine_duration_secs_nonnegative
+    CHECK (quarantine_duration_secs >= 0) NOT VALID;

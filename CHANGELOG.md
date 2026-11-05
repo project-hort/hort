@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A scan policy written with a negative quarantine duration is now refused by
+  name instead of being stored; already-stored negative values are untouched
+  and are reported when a policy carrying one is next written (#253).
 - Per-version metadata between 64 KB and 256 KB now publishes for npm, PyPI and
   cargo, and clients read the same fields wherever it is stored (#416).
 - A work class starving at one kind's run permit is now reported even when a
