@@ -109,7 +109,9 @@ use hort_domain::ports::scanner_registry_repository::{
     ScannerRegistryEntry, ScannerRegistryRepository,
 };
 use hort_domain::ports::storage::StoragePort;
-use hort_domain::ports::subscription_repository::SubscriptionRepository;
+use hort_domain::ports::subscription_repository::{
+    advance_delivered_position, retained_delivered_position, SubscriptionRepository,
+};
 use hort_domain::ports::upstream_proxy::{UpstreamProxy, UpstreamProxyByFormat};
 use hort_domain::ports::webhook_target_guard::WebhookTargetGuard;
 use hort_domain::ports::BoxFuture;
@@ -531,7 +533,12 @@ impl SubscriptionRepository for MockSubscriptionRepository {
     }
 
     fn update(&self, s: &Subscription) -> BoxFuture<'_, DomainResult<()>> {
-        self.items.lock().unwrap().insert(s.id, s.clone());
+        let mut s = s.clone();
+        let mut items = self.items.lock().unwrap();
+        s.last_delivered_position =
+            retained_delivered_position(items.get(&s.id), s.last_delivered_position);
+        items.insert(s.id, s);
+        drop(items);
         Box::pin(async { Ok(()) })
     }
 
@@ -549,10 +556,9 @@ impl SubscriptionRepository for MockSubscriptionRepository {
         let lf = last_failure.cloned();
         let mut items = self.items.lock().unwrap();
         if let Some(s) = items.get_mut(&id) {
-            // `None` = no advance to record; mirrors the adapter's COALESCE.
-            if let Some(position) = position {
-                s.last_delivered_position = Some(position);
-            }
+            // Mirrors the adapter's `GREATEST`.
+            s.last_delivered_position =
+                advance_delivered_position(s.last_delivered_position, position);
             s.last_failure = lf;
         }
         Box::pin(async { Ok(()) })
