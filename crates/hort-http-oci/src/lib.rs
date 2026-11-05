@@ -55,6 +55,10 @@ pub(crate) mod name;
 pub(crate) mod prefetch;
 pub(crate) mod quarantine;
 pub mod referrers;
+// The record a refused hosted read leaves. `pub(crate)`: the two pull
+// handlers call it from their own withholding gates and nothing outside
+// the crate emits an OCI refusal.
+pub(crate) mod refusal;
 pub(crate) mod tag;
 pub mod tags;
 pub(crate) mod tail;
