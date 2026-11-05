@@ -72,6 +72,16 @@ ignore = [
     # 0.7.6 instead of being covered here. See `.cargo/audit.toml` for the
     # full rationale and the re-evaluation trigger.
     "RUSTSEC-2026-0387",
+
+    # astral-tokio-tar 0.6.2 — unmaintained (RUSTSEC-2026-0440). Astral ended
+    # maintenance on 2026-11-03 and deprecated every published version, so no
+    # lockfile move clears it, and `testcontainers 0.28.0` — its only
+    # dependent, declared under `[dev-dependencies]` by hort-adapters-storage
+    # and hort-notifier-nats — is the newest published release. The crate
+    # therefore reaches no hort binary, image or published crate. Unmaintained
+    # is a maintenance signal, not a vulnerability. See `.cargo/audit.toml` for
+    # the full rationale and the re-evaluation trigger.
+    "RUSTSEC-2026-0440",
 ]
 
 # ===========================================================================
