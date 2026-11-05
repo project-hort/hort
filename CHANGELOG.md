@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A refused OCI manifest or blob pull is now reconstructable from
+  `hort-server`'s logs, with the repository, the reference, the resolved
+  digest, the status and the reason it was withheld (#258).
 - A held artifact now records whether the publisher must sign it, sign its
   parent, or wait for an operator to repair verification. Subscribers to
   provenance event types will begin receiving `ProvenanceHeld` events (#400).

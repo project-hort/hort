@@ -69,6 +69,7 @@ use super::coords::oci_blob_coords;
 use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
 use super::error::OciError;
 use super::quarantine;
+use super::refusal::{log_refused_read, ReadRoute, RefusalReason, RefusedRead};
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
 
@@ -643,19 +644,37 @@ pub(super) async fn serve(
     //    Rejected stays inline because the subject its refusal names
     //    is route-specific (a blob digest here, a client reference on
     //    the manifest route), so each handler builds its own envelope.
+    // Which read the arms below record when they refuse. Bound once
+    // rather than per arm: it is four borrows and a discriminant, every
+    // field is already resolved by here, and three copies of the literal
+    // would be three places for one of them to go stale.
+    let refused = RefusedRead {
+        route: ReadRoute::Blob,
+        repo_key,
+        name,
+        reference: digest_str,
+        digest: &hash,
+    };
     // Exhaustive match (issue #92) — no wildcard arm, so a future
     // `QuarantineStatus` variant is a compile error here, not a
     // fall-through 500/200. `None` / `Released` continue to the happy
     // path below; every other arm returns.
+    //
+    // Every arm that refuses records the refusal before returning it (see
+    // `crate::refusal`): the served read is audited as an
+    // `ArtifactDownloaded` event further down, so without this the only
+    // reads hort could account for were the ones it granted.
     match artifact.quarantine_status {
         QuarantineStatus::None | QuarantineStatus::Released => {}
         QuarantineStatus::Quarantined => {
             if !write_authorized_existence_probe {
-                return quarantine::check_quarantine(
+                let response = quarantine::check_quarantine(
                     &artifact,
                     repo_key,
                     ctx.quarantine_retry_after_floor_secs,
                 );
+                log_refused_read(&response, &refused, &RefusalReason::hold(&artifact));
+                return response;
             }
             // else: the write-authorized existence probe — fall
             // through, but ONLY the HEAD branch below actually serves it
@@ -713,11 +732,13 @@ pub(super) async fn serve(
                         "refusing a Rejected blob with no rejection axis to report"
                     );
                 }
-                return OciError::ArtifactRejected {
+                let response = OciError::ArtifactRejected {
                     subject: format!("sha256:{}", hash.as_ref()),
                     axis,
                 }
                 .into_response();
+                log_refused_read(&response, &refused, &RefusalReason::Rejected);
+                return response;
             }
             // else: the write-authorized existence probe answers
             // existence on a terminal verdict too (ADR 0055's 2026-10-21
@@ -739,7 +760,9 @@ pub(super) async fn serve(
         }
         QuarantineStatus::ScanIndeterminate => {
             if !write_authorized_existence_probe {
-                return quarantine::check_scan_indeterminate();
+                let response = quarantine::check_scan_indeterminate();
+                log_refused_read(&response, &refused, &RefusalReason::ScanIndeterminate);
+                return response;
             }
             // else: same probe, same bound as the `Rejected` arm above.
             // An indeterminate scan is a verdict already reached, so a
@@ -1517,7 +1540,7 @@ mod tests {
 
     use hort_app::use_cases::test_support::{
         persisted_artifact_rejected, sample_artifact, sample_repository, MockArtifactRepository,
-        MockEventStore, MockRepositoryRepository, MockStoragePort,
+        MockEventStore, MockPolicyProjectionRepository, MockRepositoryRepository, MockStoragePort,
     };
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
@@ -1557,6 +1580,12 @@ mod tests {
         /// `ArtifactRejected` here and the use-case hydration recovers
         /// it; setting the field on a fixture entity proves nothing.
         events: Arc<MockEventStore>,
+        /// Policy projections, for the tests whose subject is WHICH hold a
+        /// `Quarantined` artifact is in: the harness's global seed carries
+        /// `provenance_mode: Off`, so a repo-scoped `Required` seed is what
+        /// makes the read-path hydration derive
+        /// `Artifact::provenance_hold_indefinite`.
+        policy_projections: Arc<MockPolicyProjectionRepository>,
     }
 
     fn harness() -> Harness {
@@ -1568,6 +1597,7 @@ mod tests {
             repositories: mocks.repositories,
             storage: mocks.storage,
             events: mocks.events,
+            policy_projections: mocks.policy_projections,
         }
     }
 
@@ -5887,5 +5917,213 @@ mod tests {
              existence-probe exemption must be evaluated BEFORE the bounded-await, \
              never after"
         );
+    }
+
+    // -- The record a refused read leaves ----------------------------------
+    //
+    // A served blob read is audited as an `ArtifactDownloaded` event (the
+    // `oci blob pull emits exactly one ArtifactDownloaded` test above);
+    // these pin the other half, where the withholding gate returns before
+    // the download and the log line is the only record there is.
+
+    /// The bytes every refusal test below withholds, with their digest —
+    /// which is both the `reference` the client sends and the `digest` the
+    /// line must carry.
+    fn withheld_blob() -> (Vec<u8>, String) {
+        let content = b"withheld".to_vec();
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        (content, hex)
+    }
+
+    /// Drive one anonymous blob `GET` of a withheld artifact and return the
+    /// response status beside every `tracing` event the request emitted.
+    ///
+    /// `indefinite` seeds the `Required`-provenance policy with a
+    /// zero-length window and leaves the artifact's stream without a
+    /// `ProvenanceVerified`, which is the shape the read-path hydration
+    /// derives `Artifact::provenance_hold_indefinite` from. Deriving it is
+    /// the point: a flag set on the fixture entity would be cleared on read
+    /// (`MockArtifactRepository` mirrors the Postgres `row -> Artifact`
+    /// mapper) and would prove nothing about which hold production sees.
+    fn refused_blob_read(
+        status: QuarantineStatus,
+        indefinite: bool,
+    ) -> (StatusCode, Vec<CapturedEvent>) {
+        let (content, hex) = withheld_blob();
+        capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                if indefinite {
+                    h.policy_projections
+                        .insert(required_provenance_policy(repo_id));
+                }
+                let artifact_id =
+                    seed_blob(&h.artifacts, &h.storage, repo_id, &hex, &content, status);
+                if matches!(status, QuarantineStatus::Rejected) {
+                    h.events.set_stream(
+                        &hort_domain::events::StreamId::artifact(artifact_id),
+                        vec![persisted_artifact_rejected(
+                            artifact_id,
+                            RejectionReason::Scanner,
+                            1,
+                        )],
+                    );
+                }
+                // The hydration opt-in: without it the policy resolution
+                // and the artifact's own stream are unreachable, so the
+                // hold would read as time-bounded and the rejection axis
+                // would come back empty for a harness reason.
+                let ctx = with_provenance_hold_hydration(&h.ctx);
+                serve(
+                    ctx,
+                    "myrepo",
+                    "nginx",
+                    &format!("sha256:{hex}"),
+                    &HeaderMap::new(),
+                    /* head = */ false,
+                    /* actor = */ None,
+                )
+                .await
+                .status()
+            })
+        })
+    }
+
+    /// Assert the one refusal line for a refused read of
+    /// [`withheld_blob`]: every field is fixed by the request except the
+    /// level, the status and the reason, which are what each class differs
+    /// in. On this route the client's `reference` IS the digest, so both
+    /// are checked against the same seeded hash.
+    fn assert_blob_refusal(
+        events: &[CapturedEvent],
+        level: tracing::Level,
+        status: u16,
+        reason: &str,
+        hex: &str,
+    ) {
+        crate::refusal::assert_refusal_line(
+            events,
+            &crate::refusal::ExpectedRefusal {
+                level,
+                route: "blob",
+                repository: "myrepo",
+                name: "nginx",
+                reference: &format!("sha256:{hex}"),
+                digest: hex,
+                status,
+                reason,
+            },
+        );
+    }
+
+    /// A hold with a deadline is the registry working as designed: the
+    /// client is told to come back, and coming back succeeds. `info!`, so
+    /// that every cold pull in the fleet does not land in the warn stream.
+    #[test]
+    fn a_refused_quarantined_blob_read_records_the_hold_at_info() {
+        let (_, hex) = withheld_blob();
+        let (status, events) =
+            refused_blob_read(QuarantineStatus::Quarantined, /* indefinite = */ false);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_blob_refusal(&events, tracing::Level::INFO, 503, "quarantined", &hex);
+    }
+
+    /// Same status and the same opaque body, different answer: a hold
+    /// waiting on a signature advertises no deadline, so no retry ends it
+    /// and the line says which hold it is.
+    #[test]
+    fn a_refused_provenance_held_blob_read_records_the_indefinite_hold_at_warn() {
+        let (_, hex) = withheld_blob();
+        let (status, events) =
+            refused_blob_read(QuarantineStatus::Quarantined, /* indefinite = */ true);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_blob_refusal(&events, tracing::Level::WARN, 503, "provenance_hold", &hex);
+    }
+
+    #[test]
+    fn a_refused_rejected_blob_read_records_the_verdict_at_warn() {
+        let (_, hex) = withheld_blob();
+        let (status, events) =
+            refused_blob_read(QuarantineStatus::Rejected, /* indefinite = */ false);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_blob_refusal(&events, tracing::Level::WARN, 403, "rejected", &hex);
+    }
+
+    #[test]
+    fn a_refused_scan_indeterminate_blob_read_records_the_verdict_at_warn() {
+        let (_, hex) = withheld_blob();
+        let (status, events) = refused_blob_read(
+            QuarantineStatus::ScanIndeterminate,
+            /* indefinite = */ false,
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_blob_refusal(
+            &events,
+            tracing::Level::WARN,
+            503,
+            "scan_indeterminate",
+            &hex,
+        );
+    }
+
+    /// The converse, and the reason the four above mean anything: a served
+    /// read is not a refusal and records none. Without this a line emitted
+    /// unconditionally would satisfy every assertion above.
+    #[test]
+    fn a_served_blob_read_records_no_refusal() {
+        let (status, events) =
+            refused_blob_read(QuarantineStatus::Released, /* indefinite = */ false);
+        assert_eq!(status, StatusCode::OK);
+        crate::refusal::assert_no_refusal_line(&events);
+    }
+
+    /// The write-authorized existence probe LIFTS the refusal, so it must
+    /// not record one — a line here would read as the negation of the
+    /// exemption's own `info!` and would tell an operator a pusher was
+    /// refused on the request that served it.
+    #[test]
+    fn a_write_authorized_existence_probe_records_no_refusal() {
+        let (content, hex) = withheld_blob();
+        let (status, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                seed_blob(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    &hex,
+                    &content,
+                    QuarantineStatus::Quarantined,
+                );
+                let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+                let principal = principal_with_claim("ci-pusher");
+                serve(
+                    ctx,
+                    "myrepo",
+                    "nginx",
+                    &format!("sha256:{hex}"),
+                    &HeaderMap::new(),
+                    /* head = */ true,
+                    Some(&principal),
+                )
+                .await
+                .status()
+            })
+        });
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the premise of this test is an exempted probe, not a refusal"
+        );
+        crate::refusal::assert_no_refusal_line(&events);
     }
 }
