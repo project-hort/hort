@@ -1076,7 +1076,9 @@ impl QuarantineUseCase {
                     error = %e,
                     stage = "content_references_delete_on_reject",
                     "content_references delete failed on reject; refcount row not deleted \
-                     on reject — refcount eventual, operator reconcile is future work"
+                     on reject — refcount eventual; \
+                     RefcountReconcileUseCase::sweep_drift removes it \
+                     (RefcountRepair::DeleteRejectedSourceRows)"
                 );
             }
 
@@ -6604,7 +6606,8 @@ spec:
         assert_eq!(
             content_refs.entry_count(),
             1,
-            "warn-on-fail must leave the seeded row in place; reconcile is future work"
+            "warn-on-fail must leave the seeded row in place; the row is repaired by \
+             RefcountRepair::DeleteRejectedSourceRows, not by a retry here"
         );
         let rows = content_refs
             .find_by_target(repo_id, &primary_hash, Some("primary_content"))
