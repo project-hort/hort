@@ -6,8 +6,7 @@
 #
 # WHY THE ADMIN API, NOT THE `garage` CLI: `dxflrs/garage` ships as a
 # shell-free `scratch` image (no /bin/sh, no coreutils — only the `/garage`
-# binary). The historical bootstrap approach (see
-# crates/hort-adapters-storage/tests/s3_multipart.rs and the sbx sidecar's
+# binary). The historical bootstrap approach (see the sbx sidecar's
 # `.agents/manifest.yaml`) drives the CLI via an orchestrator that execs
 # `/garage <argv>` directly (no shell) and captures each step's stdout on the
 # HOST side to feed the next step (e.g. `garage node id -q` -> NODE_ID ->

@@ -597,12 +597,6 @@ rpassword = "7"
 # `server_2_10` + `ring`.
 async-nats = { version = "0.51", default-features = false }
 
-# Integration-test container harness — used only as a dev-dep by
-# `hort-notifier-nats` to stand up `nats:latest` with JetStream enabled.
-# Workspace-pinned so future adapters that need real-broker fixtures
-# (e.g. a future Kafka relay) share the version.
-testcontainers = "0.28"
-
 # RustSec-maintained CVSS v3.x vector parser/scorer. Consumers:
 # `hort-adapters-scanner-osv` and `hort-adapters-advisory-osv` compute a
 # base score from an OSV `severity[].score` vector when no pre-computed

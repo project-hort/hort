@@ -33,8 +33,7 @@
 # sidecar relies on its host orchestrator for exactly that capture step,
 # which docker-compose does not have).
 #
-# Garage config traps (learned the hard way in #53, see s3_multipart.rs and
-# .agents/manifest.yaml — do not rediscover):
+# Garage config traps (see .agents/manifest.yaml — do not rediscover):
 #   - rpc_secret must be 32 hex-encoded bytes (64 hex chars).
 #   - access-key id is "GK" + 12 hex-encoded bytes; secret key is 32
 #     hex-encoded bytes. Plain "dev..." placeholders are rejected at import.

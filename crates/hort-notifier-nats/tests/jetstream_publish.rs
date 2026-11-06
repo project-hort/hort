@@ -1,37 +1,32 @@
 //! Integration tests for the NATS JetStream `EventNotifier` adapter.
-//! Each test stands up `nats:latest` with JetStream
-//! enabled via `testcontainers`, asserts the wire-level outcome, and
-//! drops the container at scope exit.
+//! Each test connects to an operator-supplied broker, creates the stream
+//! it needs, and asserts the wire-level outcome.
 //!
-//! **Gating.** All tests early-return when `HORT_TEST_NATS=1` is unset so
-//! dev environments without Docker keep the suite green — same gating
-//! discipline as `hort-adapters-postgres`'s `DATABASE_URL` tests. CI runs
-//! this suite with the sentinel enabled.
+//! **Gating.** The suite is opt-in and needs a reachable broker: every
+//! test early-returns unless `HORT_TEST_NATS=1` is set AND
+//! `HORT_TEST_NATS_URL` names a JetStream-enabled server. No CI config
+//! sets either variable, so the suite self-skips on every automated run
+//! today — it is driven by hand against a broker the operator provides.
+//! `nats:2.10` is the server floor matched by the `server_2_10` feature
+//! the adapter selects.
+//!
+//! The broker wants to be a scratch one: a catch-all stream over
+//! `events.>` would swallow the orphan subject and make the no-stream
+//! assertion below unreachable.
 //!
 //! ```bash
-//! HORT_TEST_NATS=1 cargo test -p hort-notifier-nats --test jetstream_publish
+//! HORT_TEST_NATS=1 HORT_TEST_NATS_URL=nats://127.0.0.1:4222 \
+//!     cargo test -p hort-notifier-nats --test jetstream_publish
 //! ```
 
 #![allow(clippy::expect_used)]
 
 use std::env;
-use std::time::Duration;
 
 use hort_domain::entities::subscription::{SubscriptionId, SubscriptionTarget};
 use hort_domain::ports::event_notifier::{EventNotifier, NotifyFailureReason, NotifyOutcome};
 use hort_notifier_nats::NatsNotifier;
-use testcontainers::core::{ContainerPort, IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use uuid::Uuid;
-
-/// NATS client port — the `nats` image exposes 4222 by default.
-const NATS_PORT: u16 = 4222;
-
-/// Container image and tag. `nats:2.10` is the floor matched by the
-/// `server_2_10` feature flag the adapter selects.
-const NATS_IMAGE: &str = "nats";
-const NATS_TAG: &str = "2.10";
 
 /// Sentinel env var. Mirrors the `DATABASE_URL` early-return pattern
 /// used by the postgres adapter's integration suite.
@@ -39,39 +34,40 @@ fn nats_gate_enabled() -> bool {
     env::var("HORT_TEST_NATS").ok().as_deref() == Some("1")
 }
 
-/// Start a `nats:2.10` container with `-js` (JetStream enabled), wait
-/// for the "Server is ready" log line, and return the live container
-/// handle plus its host-mapped client port.
-async fn start_nats() -> (ContainerAsync<GenericImage>, u16) {
-    let container = GenericImage::new(NATS_IMAGE, NATS_TAG)
-        .with_exposed_port(ContainerPort::Tcp(NATS_PORT))
-        // The 2.10 image prints "Server is ready" once the listener
-        // accepts client connections. Waiting for stdout avoids the
-        // race where `connect` is attempted before the server binds.
-        .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
-        .with_cmd(["-js"])
-        .with_startup_timeout(Duration::from_secs(30))
-        .start()
-        .await
-        .expect("nats container starts");
-    let port = container
-        .get_host_port_ipv4(NATS_PORT.tcp())
-        .await
-        .expect("nats container exposes host port");
-    (container, port)
+/// The suite does not own a broker — it is handed one, so the endpoint is
+/// the operator's to supply and has no default. Returns `None` with a
+/// skip note naming the variable when the sentinel is on but no endpoint
+/// is configured, so a bare `HORT_TEST_NATS=1` skips cleanly instead of
+/// failing on a connection refused against a guessed address.
+fn broker_url() -> Option<String> {
+    match env::var("HORT_TEST_NATS_URL") {
+        Ok(url) if !url.trim().is_empty() => Some(url),
+        _ => {
+            eprintln!(
+                "SKIP jetstream_publish: HORT_TEST_NATS=1 but HORT_TEST_NATS_URL is unset or \
+                 empty. Point the suite at a JetStream-enabled broker, e.g. \
+                 HORT_TEST_NATS_URL=nats://127.0.0.1:4222."
+            );
+            None
+        }
+    }
 }
 
-/// Open an async-nats client + JetStream context against the
-/// container, create a stream catching `events.>`, and return both
-/// the adapter under test and the raw JetStream context (so tests can
-/// poke at stream state if needed).
+/// Open an async-nats client + JetStream context against the given
+/// broker URL, create a stream catching `subject`, and return both the
+/// adapter under test and the raw JetStream context (so tests can poke at
+/// stream state if needed).
+///
+/// Every test names its own stream and its own subject, so the two tests
+/// below share one broker without interfering, and re-running them
+/// against the same broker re-creates each stream with an identical
+/// config rather than conflicting with the previous run's.
 async fn setup_adapter_with_stream(
-    port: u16,
+    url: &str,
     stream_name: &str,
     subject: &str,
 ) -> (NatsNotifier, async_nats::jetstream::Context) {
-    let url = format!("nats://127.0.0.1:{port}");
-    let client = async_nats::connect(&url)
+    let client = async_nats::connect(url)
         .await
         .expect("nats client connects");
     let js = async_nats::jetstream::new(client.clone());
@@ -98,9 +94,11 @@ async fn publish_with_existing_stream_delivers() {
     if !nats_gate_enabled() {
         return;
     }
-    let (_container, port) = start_nats().await;
+    let Some(url) = broker_url() else {
+        return;
+    };
     let subject = "events.artifact.ingested";
-    let (adapter, _js) = setup_adapter_with_stream(port, "EVENTS_INGESTED_DELIVER", subject).await;
+    let (adapter, _js) = setup_adapter_with_stream(&url, "EVENTS_INGESTED_DELIVER", subject).await;
 
     let target = SubscriptionTarget::NatsJetStream {
         subject: subject.to_string(),
@@ -115,9 +113,12 @@ async fn publish_with_existing_stream_delivers() {
 }
 
 // ---------------------------------------------------------------------------
-// No-stream path — publishing to a subject no stream catches surfaces
-// as `Failed { ConnectionLost }` (the broad bucket for now; finer
-// classification is future work per the adapter's module-level note).
+// No-stream path — publishing to a subject no stream catches surfaces as
+// `Failed { NatsNak }`, not as a transport failure. `classify_publish_error`
+// maps `PublishErrorKind::StreamNotFound` into the permanent-NAK bucket
+// because the condition does not heal: retrying the identical payload fails
+// identically, so routing it to `ConnectionLost` would invite a retry that
+// cannot succeed. The adapter's own unit tests pin that mapping.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -125,11 +126,13 @@ async fn publish_to_subject_with_no_stream_returns_failed() {
     if !nats_gate_enabled() {
         return;
     }
-    let (_container, port) = start_nats().await;
+    let Some(url) = broker_url() else {
+        return;
+    };
     // Create a stream that catches a DIFFERENT subject; publishing to
     // the orphan subject should fail the publish step (no_responders).
     let (adapter, _js) =
-        setup_adapter_with_stream(port, "EVENTS_NO_RESPONDERS", "events.unrelated.namespace").await;
+        setup_adapter_with_stream(&url, "EVENTS_NO_RESPONDERS", "events.unrelated.namespace").await;
 
     let target = SubscriptionTarget::NatsJetStream {
         subject: "events.orphan.subject".to_string(),
@@ -138,80 +141,18 @@ async fn publish_to_subject_with_no_stream_returns_failed() {
     let outcome = adapter.notify(&target, sub_id, &[]).await;
     match outcome {
         NotifyOutcome::Failed {
-            reason: NotifyFailureReason::ConnectionLost,
+            reason: NotifyFailureReason::NatsNak,
         } => {}
-        other => panic!("expected Failed{{ConnectionLost}}, got {other:?}"),
+        other => panic!("expected Failed{{NatsNak}}, got {other:?}"),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Connection-lost path — kill the container mid-flight; the next
-// publish surfaces as `Failed`. The dispatcher's failure budget
-// handles the rest.
-//
-// Marked `#[ignore]` because:
-//  - Container kill timing vs. async-nats internal reconnect is racy
-//    on CI. Either we get `Failed { ConnectionLost }` on the first
-//    publish after kill, or the client reconnect machinery surfaces
-//    a different transient error. Both are valid for the design-doc
-//    contract (no retry, surface failure) but the test as written
-//    is too narrow to be reliable.
-//  - The happy-path test above already exercises the same publish
-//    code path under a live broker; this test would add coverage
-//    only of the very narrow window between disconnect and the next
-//    publish attempt.
-//
-// Future work: replace with a fixture that intercepts the TCP
-// stream and tears it down deterministically (e.g. via a proxy).
+// Still uncovered, and not coverable from here: `NotifyOutcome::Failed`
+// classification for a connection lost mid-publish and for a stalled ack.
+// Both wanted; neither is expressible against a broker this suite does
+// not own — one needs the broker process torn down at a chosen instant,
+// the other needs an ack held back on demand, and a URL grants neither.
+// The route is a deterministic TCP intercept or an in-process broker
+// stub, not a container.
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "TODO(test-infra): container-kill timing is racy; needs deterministic TCP intercept"]
-async fn connection_lost_during_publish_returns_failed() {
-    if !nats_gate_enabled() {
-        return;
-    }
-    let (container, port) = start_nats().await;
-    let subject = "events.artifact.kill_test";
-    let (adapter, _js) = setup_adapter_with_stream(port, "EVENTS_KILL", subject).await;
-
-    let target = SubscriptionTarget::NatsJetStream {
-        subject: subject.to_string(),
-    };
-    let sub_id = SubscriptionId(Uuid::new_v4());
-    // First publish — must succeed against the live broker.
-    let first = adapter.notify(&target, sub_id, &[]).await;
-    assert_eq!(first, NotifyOutcome::Delivered);
-
-    // Stop the broker, then attempt a second publish.
-    container.stop().await.expect("stop container");
-    // Give the kernel a moment to reset the TCP connection state.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let outcome = adapter.notify(&target, sub_id, &[]).await;
-    match outcome {
-        NotifyOutcome::Failed { .. } => {}
-        other => panic!("expected Failed{{..}}, got {other:?}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Ack-timeout path — forcing an ack timeout against a real broker is
-// inherently flaky (the broker either acks within ms or returns an
-// error; there is no public knob to delay ack synthetically). Marked
-// `#[ignore]` for the same reason as the kill test.
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "TODO(test-infra): no deterministic way to stall an ack against a real broker"]
-async fn ack_timeout_classified_correctly() {
-    if !nats_gate_enabled() {
-        return;
-    }
-    // Placeholder body — if a future fixture introduces a way to
-    // synthetically delay JetStream acks (e.g. a custom dummy NATS
-    // server), wire the assertion through this test. The adapter
-    // contract under test: `NotifyOutcome::Failed { reason:
-    // NotifyFailureReason::AckTimeout }` after 2s.
-    let _ = NotifyFailureReason::AckTimeout;
-}

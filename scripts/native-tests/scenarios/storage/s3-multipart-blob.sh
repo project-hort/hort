@@ -27,9 +27,8 @@
 #     call, i.e. NOT the genuinely divergent path.
 #   - > 5 MiB (this scenario uses 8 MiB): the interior flush uploads part 1
 #     (5 MiB) mid-loop, and the loop's remainder (3 MiB) is uploaded as part
-#     2 after the loop -- TWO `put_part` calls, a real multi-part sequence
-#     (matches crates/hort-adapters-storage/tests/s3_multipart.rs's own
-#     "at least 2 put_part calls plus a final partial part" framing).
+#     2 after the loop -- TWO `put_part` calls, a real multi-part sequence:
+#     at least 2 `put_part` calls plus a final partial part.
 # Any blob at or below 5 MiB silently reduces this scenario to exercising
 # the exact same single-`put_part` path every OTHER scenario's small
 # fixtures already cover on every backend — it would stop testing anything
