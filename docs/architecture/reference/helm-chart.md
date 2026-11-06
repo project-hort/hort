@@ -142,7 +142,7 @@ Seven templates carry `helm.sh/hook` annotations:
 | pre-pull DaemonSets (`<fullname>-prepull-server`, `<fullname>-prepull-worker`) | `pre-install,pre-upgrade` | `-10` | `before-hook-creation` |
 | pre-pull wait/cleanup (`<fullname>-prepull`) | `pre-install,pre-upgrade` | `-9` | `before-hook-creation,hook-succeeded` |
 | migrate (`<fullname>-migrate`) | `pre-install,pre-upgrade` | `-5` | `before-hook-creation,hook-succeeded` |
-| svc-token bootstrap (`<fullname>-svc-token-bootstrap`) | `post-install,post-upgrade` | `5` | `before-hook-creation` |
+| svc-token bootstrap (`<fullname>-svc-token-bootstrap`) | `post-install,post-upgrade` | `5` | `before-hook-creation,hook-succeeded` |
 | test-connection | `test` | — | `before-hook-creation,hook-succeeded` |
 
 **Ordering guarantee:** pre-pull RBAC (`pre-install`, w=-11) → pre-pull
