@@ -67,7 +67,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # freshly ingested artifact answers `503 artifact is quarantined`. See
 # RELEASING.md, "Base images: warm the pinned digests before tagging".
 # Digest-pinned (B10/INFRA-8).
-FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS runtime
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
 
 # Runtime deps: CA roots for outbound TLS (upstream fetch), nothing else.
 RUN apt-get update && \
