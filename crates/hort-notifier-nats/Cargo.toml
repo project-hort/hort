@@ -65,12 +65,6 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"
 # Webhook-target construction in the misrouted-target safety-net test
 # (the unit suite never speaks HTTP).
 url = { workspace = true }
-# `testcontainers` integration tests stand up `nats:latest` with
-# JetStream enabled. All tests in `tests/jetstream_publish.rs`
-# early-return when the `HORT_TEST_NATS=1` sentinel env var is unset so
-# dev environments without Docker keep the suite green — same gating
-# discipline as `hort-adapters-postgres`'s `DATABASE_URL` tests.
-testcontainers = { workspace = true }
 # Generate a fully-valid self-signed X.509 CA in-process so the
 # extra-CA root-store tests exercise a cert rustls actually accepts as a
 # trust anchor (a static truncated PEM parses but fails
