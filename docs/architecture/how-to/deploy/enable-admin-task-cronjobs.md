@@ -140,9 +140,11 @@ apply path, ADR 0012).
 apply it (and, if the SA row does not exist yet at all, the
 `PermissionGrant` beside it — apply both together per §2), then re-run
 `helm upgrade` (or `helm rollback` and retry) so the hook Job re-runs.
-The Job's `helm.sh/hook-delete-policy: before-hook-creation` means a
-retried install/upgrade cleans up the failed Job automatically — you do
-not need to delete it by hand first.
+The Job's `helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded`
+means the failed Job and its pod stay in the namespace until you retry, so
+the `kubectl logs` command above still works however long after the failure
+you reach for it — and the retried install/upgrade then cleans the failed
+Job up automatically, so you do not need to delete it by hand first.
 
 ### 4.2 Grant absent — previously silent, now caught at install
 

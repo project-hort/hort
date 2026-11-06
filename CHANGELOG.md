@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`hort_admin_tasks_class_unserved{class}`), at the window
   `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` sets (default `300`; set it on
   the server and the worker) (#399).
+- A failed service-account token bootstrap hook now keeps its log until the
+  next install or upgrade, so an operator can read it after the fact (#196).
 
 ### Fixed
 
