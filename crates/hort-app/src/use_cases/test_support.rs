@@ -189,6 +189,14 @@ pub struct MockArtifactRepository {
     /// non-servable here", so a source that substituted one would
     /// re-advertise every version hort is holding back.
     package_version_status_errors: Mutex<std::collections::VecDeque<DomainError>>,
+    /// FIFO of injected errors for
+    /// [`find_by_path`](ArtifactRepository::find_by_path). Each call pops the
+    /// front and returns it verbatim. The path-keyed sibling of
+    /// [`Self::find_by_repo_and_checksum_errors`], and it exists for the same
+    /// posture: a caller whose per-path presence check gates an upstream fetch
+    /// must not read a failed lookup as "not present" and re-fetch content the
+    /// repository may already hold.
+    find_by_path_errors: Mutex<std::collections::VecDeque<DomainError>>,
 }
 
 /// One recorded call to either backfill-candidacy query. See
@@ -216,6 +224,7 @@ impl MockArtifactRepository {
             pypi_calls: Mutex::new(Vec::new()),
             oci_calls: Mutex::new(Vec::new()),
             package_version_status_errors: Mutex::new(std::collections::VecDeque::new()),
+            find_by_path_errors: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -259,6 +268,13 @@ impl MockArtifactRepository {
             .lock()
             .unwrap()
             .push_back(err);
+    }
+
+    /// Arm the next [`find_by_path`](ArtifactRepository::find_by_path) call to
+    /// fail with `err`. Queued, so a test can arm several consecutive
+    /// failures.
+    pub fn fail_next_find_by_path(&self, err: DomainError) {
+        self.find_by_path_errors.lock().unwrap().push_back(err);
     }
 
     /// Pin the allowlist that
@@ -654,6 +670,9 @@ impl ArtifactRepository for MockArtifactRepository {
         repository_id: Uuid,
         path: &str,
     ) -> BoxFut<'_, DomainResult<Option<Artifact>>> {
+        if let Some(err) = self.find_by_path_errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
         let result = self
             .artifacts
             .lock()

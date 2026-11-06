@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Ingesting a child manifest of a multi-arch OCI index now fetches and ingests
+  that child's config and layer blobs, so a held index no longer leaves the
+  tree under it uncached. Not governed by `prefetchPolicy.enabled` (#312).
 - Artifact scan subscribers now receive `ScanCompleted` and its policy verdict
   only when findings or the policy decision change; the latest scan time and
   findings rows still refresh on every scan. The per-artifact event bound is
