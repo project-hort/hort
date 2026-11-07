@@ -1,0 +1,27 @@
+# ServiceAccount (e2e): the native-token-mode identity for
+# scripts/native-tests/scenarios/clients/oci-manifest-delete.sh.
+#
+# PAT-only SA (no federatedIdentities / fallbackRotation): under the
+# native-tokens compose overlay the scenario admin-mints an hort_svc_* token
+# for this SA and uses it both as skopeo's `--dest-creds` for the push and as
+# the Basic credential of the `/v2/auth` exchange that mints the
+# `pull,delete`-scoped capability JWT the DELETE rides. A native credential is
+# required because the `/v2/auth` mint validates the Basic password strictly as
+# a PAT — a claims-based Keycloak JWT can never complete it.
+#
+# Authority is the sibling serviceAccount-subject PermissionGrants in
+# auth/oci-delete-e2e-ci-{read,write,delete}.yaml. All three are consumed
+# TWICE on that path: `ApiTokenUseCase::run_issuance_gates` refuses to mint a
+# token declaring a permission its subject does not hold, and
+# `OciTokenExchangeUseCase::evaluate_scope` refuses to put an action in the
+# capability JWT the subject cannot back. A service account is strictly
+# non-admin (ADR 0038), so no role-name short-circuit can stand in for the
+# `delete` grant here.
+#
+# Inert in legacy (no-overlay) runs: the SA row exists, nothing mints for it —
+# the scenario's legacy-mode branch drives dev-user's OIDC token instead.
+apiVersion: project-hort.de/v1
+kind: ServiceAccount
+metadata:
+  name: oci-delete-e2e-ci
+spec: {}

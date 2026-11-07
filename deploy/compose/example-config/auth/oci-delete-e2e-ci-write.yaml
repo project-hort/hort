@@ -1,0 +1,18 @@
+# PermissionGrant: serviceAccount oci-delete-e2e-ci -> write oci-delete-e2e
+# (native-token-mode skopeo push in
+# scenarios/clients/oci-manifest-delete.sh — the push that creates the
+# manifest the scenario then deletes).
+#
+# Explicitly NOT what authorises the delete: see the sibling
+# oci-delete-e2e-ci-delete.yaml. Resolves at apply to the SA's backing user
+# (GrantSubject::User, ADR 0037).
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-delete-e2e-ci-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-delete-e2e-ci
+  permission: write
+  repository: oci-delete-e2e

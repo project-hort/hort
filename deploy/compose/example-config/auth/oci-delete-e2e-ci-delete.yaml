@@ -1,0 +1,29 @@
+# PermissionGrant: serviceAccount oci-delete-e2e-ci -> delete oci-delete-e2e
+# (the `DELETE /v2/<repo>/<name>/manifests/<digest>` in
+# scenarios/clients/oci-manifest-delete.sh).
+#
+# The grant the scenario exists to exercise, and the FIRST `delete` grant in
+# this tree. `DeleteRepoAccess` authorises `Permission::Delete`, never
+# `Permission::Write`: destroying a published manifest is a distinct authority
+# from publishing one, so the write grant beside this one does not cover it.
+# An operator who declared `write` grants for an OCI repository and wants
+# published manifests deletable must add a parallel `delete` grant exactly
+# like this one.
+#
+# Consumed twice on the native-token path, so a removal fails loudly at the
+# mint rather than silently at the request: `run_issuance_gates` refuses to
+# mint an hort_svc_* token declaring `delete` for a subject that does not hold
+# it, and `OciTokenExchangeUseCase::evaluate_scope` refuses to put the
+# `delete` action into the capability JWT. Resolves at apply to the SA's
+# backing user (GrantSubject::User, ADR 0037); a service account is strictly
+# non-admin (ADR 0038), so no role-name short-circuit can stand in for it.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-delete-e2e-ci-delete
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-delete-e2e-ci
+  permission: delete
+  repository: oci-delete-e2e
