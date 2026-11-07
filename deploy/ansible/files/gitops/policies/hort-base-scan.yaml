@@ -22,4 +22,15 @@ spec:
   requireApproval: false
   provenanceMode: off
   scanBackends: ["trivy"]
+  # The composed image decides release, not the layer (ADR 0064 D1/D2): the
+  # composition is where symlinks are resolved and the package database is
+  # readable, so a layer scanned in isolation cannot answer the question.
+  # Under `observed` a layer whose analyzers found nothing to claim is
+  # condemned terminally — a statement about hort's materialisation, not
+  # about the bytes — and ADR 0062 then withholds every image binding it.
+  # `promoted` moves the authority to the composition, which is what makes
+  # that loosening safe: ADR 0064 D6 permits it only under a promoted
+  # verdict, never ahead of one. A hosted push has every constituent in CAS
+  # by the time the manifest commits, so the composite scan fetches nothing.
+  compositeVerdictMode: promoted
   licensePolicy: {}
