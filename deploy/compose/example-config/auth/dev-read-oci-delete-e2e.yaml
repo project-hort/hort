@@ -1,0 +1,19 @@
+# PermissionGrant: [developer, ci-pusher] -> read oci-delete-e2e
+# (legacy-mode dev-user in scenarios/clients/oci-manifest-delete.sh: the
+# manifest-body GET that records a layer digest, the closing layer-blob GET,
+# and the Read the delete handler's own `find_visible_by_path` enforces).
+#
+# Stated explicitly rather than leaned on `isPublic: true`, so the identity's
+# authority is readable from this directory instead of from the repository's
+# visibility flag. Per-repo + two-claim subject passes the allowlist linter.
+# Rationale: see ci-pushers.yaml.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: dev-read-oci-delete-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: read
+  repository: oci-delete-e2e

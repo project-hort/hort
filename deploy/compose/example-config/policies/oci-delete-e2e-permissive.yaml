@@ -1,0 +1,23 @@
+# ScanPolicy for oci-delete-e2e — the permissive posture, mirroring
+# oci-e2e-permissive.yaml.
+#
+# `quarantineDuration: 0s` + `scanBackends: []` is load-bearing rather than
+# incidental: the scenario pushes an image and then immediately reads the
+# manifest body (to record a layer digest), deletes the manifest and reads a
+# layer blob back. Under an observation window the manifest GET would 503
+# and the layer-blob GET would 503 too, so the scenario's closing assertion —
+# the blob STILL resolves after the manifest is gone — could not tell a
+# surviving blob from a held one.
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: oci-delete-e2e-permissive
+spec:
+  scope:
+    repository: oci-delete-e2e
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

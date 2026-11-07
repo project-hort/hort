@@ -1,0 +1,15 @@
+# PermissionGrant: [developer, ci-pusher] -> write oci-delete-e2e
+# (legacy-mode dev-user skopeo push via --dest-creds,
+# scenarios/clients/oci-manifest-delete.sh). Mirror of dev-write-oci-e2e.yaml
+# — per-repo + two-claim subject passes the allowlist linter. Rationale: see
+# ci-pushers.yaml.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: dev-write-oci-delete-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: write
+  repository: oci-delete-e2e

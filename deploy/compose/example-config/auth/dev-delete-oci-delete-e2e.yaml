@@ -1,0 +1,23 @@
+# PermissionGrant: [developer, ci-pusher] -> delete oci-delete-e2e
+# (legacy-mode dev-user `DELETE /v2/<repo>/<name>/manifests/<digest>` in
+# scenarios/clients/oci-manifest-delete.sh).
+#
+# The sibling dev-write grant does NOT authorise that request:
+# `DeleteRepoAccess` runs against `Permission::Delete`. dev-user resolves to
+# claims [developer, ci-pusher] (keycloak group `test-developers` through the
+# developers + ci-pushers ClaimMappings) and carries no `admin` claim, so the
+# role-name short-circuit in `hort_app::rbac` cannot fire and this grant is
+# the only thing that can carry the delete.
+#
+# Per-repo + two-claim subject passes the allowlist linter. Rationale: see
+# ci-pushers.yaml.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: dev-delete-oci-delete-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: delete
+  repository: oci-delete-e2e
