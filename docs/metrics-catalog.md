@@ -2305,8 +2305,10 @@ event, one per `PomSkipReason` that occurred, emitted by
 `MavenFormatHandler::extract_dependency_specs`
 (`crates/hort-formats/src/maven/mod.rs`) once per stored POM it reads.
 Each event carries `reason` (the label below), `count` (how many
-declared dependencies fell to that reason on this POM), and `resolved`
-(how many dependencies this POM yielded). It is documented here per the
+declared edges fell to that reason on this POM), and `resolved` (how
+many edges this POM yielded). An "edge" is a `<dependencies>` entry or
+the POM's `<parent>` coordinate, which the reader emits first and counts
+under the same reasons. It is documented here per the
 catalog's convention for labelling skip/failure reasons even though
 Maven's dependency-extraction ceiling (below) is architectural, not a
 gap this catalog entry can close by itself — see
@@ -2323,7 +2325,7 @@ read differently**:
 | `version_from_parent_or_bom` | reader limit | No `<version>` in this POM or its own `<dependencyManagement>` — the version lives in a parent POM or an imported BOM, neither reachable from here. Dominant reason on a managed tree (Spring Boot, Quarkus); the one that most understates real coverage. |
 | `unresolved_property` | reader limit | A `${...}` placeholder did not resolve from this POM's own `<properties>` or the model built-ins. |
 | `unsupported_range` | reader limit | The version is a Maven range; per ADR 0053 D2 a range upstream cannot satisfy is skipped, never guessed at. |
-| `incomplete_coordinate` | reader limit | The `<dependency>` declares no `<groupId>` or `<artifactId>` — no identity to enqueue even in principle. |
+| `incomplete_coordinate` | reader limit | The `<dependency>` declares no `<groupId>` or `<artifactId>`, or the `<parent>` block is missing any of its three parts — no identity to enqueue even in principle, and no `<dependencyManagement>` entry can complete a `<parent>`. |
 
 **Operator reading.** A `scope_excluded`-dominated skip set is a
 healthy cascade — it explains why the warmed set is smaller than the

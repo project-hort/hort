@@ -1,16 +1,28 @@
-//! POM `<dependencies>` extraction — the Maven arm of the transitive
+//! POM dependency-edge extraction — the Maven arm of the transitive
 //! prefetch cascade's
 //! [`VersionDiscovery::extract_dependency_specs`](hort_domain::ports::format_handler::VersionDiscovery::extract_dependency_specs).
 //!
 //! # What this reader can see, and why that is the whole story
 //!
 //! `extract_dependency_specs` is a pure function over **one artifact's own
-//! bytes**. It holds no port, no HTTP client and no fetcher, so a POM's
-//! parent chain and its imported BOMs — which is where a Spring Boot tree
-//! keeps most of its versions — are structurally unreachable from here.
-//! This reader therefore resolves exactly what the POM in front of it
-//! declares:
+//! bytes**. It holds no port, no HTTP client and no fetcher, so the
+//! *contents* of a POM's parent chain and of its imported BOMs — which is
+//! where a Spring Boot tree keeps most of its versions — are structurally
+//! unreachable from here. The parent's *coordinate* is not: Maven requires
+//! a `<parent>` block to spell out groupId, artifactId and version in
+//! full, in this document. This reader therefore resolves exactly what the
+//! POM in front of it declares:
 //!
+//! - The `<parent>` coordinate, emitted **first**. A consumer cannot read
+//!   this POM's dependency list at all until it has the parent, so the
+//!   parent leads the emitted order and a consumer that truncates in that
+//!   order keeps it. Otherwise it is an edge like any other — it counts
+//!   against the cascade's descendant budget and depth bound rather than
+//!   being exempt from them, because parent chains nest and an exempt
+//!   edge would be the one that recurses deepest. It carries no
+//!   `<scope>`, so the scope filter below does not reach it. Warming the
+//!   parent *artifact* does not make the parent's `<dependencyManagement>`
+//!   readable; that stays a counted skip here.
 //! - `<dependencies>` entries whose effective scope is `compile` or
 //!   `runtime` — Maven's runtime declaration classes (ADR 0053 D5), both of
 //!   which Maven propagates transitively to consumers. An absent `<scope>`
@@ -28,18 +40,18 @@
 //! Everything else is a **counted skip**, never an error. The distinction
 //! is load-bearing: `Err` aborts the cascade for the whole artifact, so it
 //! is reserved for input that is not a POM at all. A POM whose versions
-//! all live in its parent is a *valid* POM and yields `Ok` with every
-//! dependency skipped — a partially warmed tree, which is the outcome this
-//! reader exists to produce.
+//! all live in its parent is a *valid* POM and yields `Ok` carrying the
+//! parent edge and every `<dependencies>` entry skipped — a partially
+//! warmed tree, which is the outcome this reader exists to produce.
 //!
 //! # The skip count is the contract
 //!
 //! An operator who enables the transitive-prefetch trigger on a Maven
 //! proxy believes their tree is being warmed. Because this reader cannot
-//! see parent POMs or imported BOMs, the count of what it skipped — and
-//! which of the reasons applied — is the only thing that tells them how
-//! much of the tree it actually reached. [`PomSkipReason`] is that signal,
-//! and the reasons are kept distinguishable per cause rather than
+//! see *into* parent POMs or imported BOMs, the count of what it skipped
+//! — and which of the reasons applied — is the only thing that tells them
+//! how much of the tree it actually reached. [`PomSkipReason`] is that
+//! signal, and the reasons are kept distinguishable per cause rather than
 //! collapsed into one "unresolved" bucket.
 //!
 //! # `<optional>` is not a filter here
@@ -108,13 +120,19 @@ const DEFAULT_SCOPE: &str = "compile";
 ///   warm at all.
 /// - `import` — only meaningful inside `<dependencyManagement>` as a BOM
 ///   import, which this reader deliberately does not resolve.
+///
+/// The `<parent>` edge does **not** pass through this check: a `<parent>`
+/// declares no `<scope>`, so testing it here would count it as
+/// `ScopeExcluded` and drop the one edge the POM cannot be interpolated
+/// without. See [`resolve_parent`].
 const EMITTED_SCOPES: [&str; 2] = ["compile", "runtime"];
 
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
 
-/// Why a declared `<dependency>` did not become a [`DependencySpec`].
+/// Why a declared edge — a `<dependency>`, or the `<parent>` coordinate —
+/// did not become a [`DependencySpec`].
 ///
 /// Every reason here is counted, including [`PomSkipReason::ScopeExcluded`]
 /// — an operator reading the skip counts needs the full accounting of a
@@ -144,8 +162,12 @@ pub enum PomSkipReason {
     /// at, so it is skipped and counted rather than pinned.
     UnsupportedRange,
     /// The `<dependency>` element declares no `<groupId>` or no
-    /// `<artifactId>`. Structurally incomplete rather than deferred — the
-    /// dependency has no identity to enqueue even in principle.
+    /// `<artifactId>`, or the `<parent>` block is missing any of its three
+    /// parts. Structurally incomplete rather than deferred — the edge has
+    /// no identity to enqueue even in principle. A `<parent>` has no
+    /// `<dependencyManagement>` entry that could supply a part later, so a
+    /// part that interpolates to nothing lands here too rather than on
+    /// [`PomSkipReason::VersionFromParentOrBom`].
     IncompleteCoordinate,
     /// The effective scope is not in [`EMITTED_SCOPES`]. Not a coverage
     /// gap — the dependency is outside the cascade's declared class
@@ -199,10 +221,12 @@ pub struct PomSkip {
 /// the ones that did not with the reason for each.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PomDependencies {
-    /// Compile-scope dependencies resolved to a concrete version, in
-    /// document order.
+    /// The edges that resolved to a concrete version: the `<parent>`
+    /// coordinate first when the POM declares one, then the emitted-scope
+    /// `<dependencies>` entries in document order.
     pub specs: Vec<DependencySpec>,
-    /// Dependencies this reader could not resolve, in document order.
+    /// Edges this reader could not resolve, same order as
+    /// [`Self::specs`] — the `<parent>` first, then document order.
     pub skipped: Vec<PomSkip>,
 }
 
@@ -400,10 +424,15 @@ struct RawPom {
     group_id: Option<String>,
     /// `<project><artifactId>`. Maven never inherits an artifactId from a
     /// `<parent>` — it is the one coordinate every POM must spell out
-    /// itself — so there is no parent counterpart to this field.
+    /// itself — so this field has no inheritance fallback, unlike
+    /// [`Self::group_id`] and [`Self::version`].
     artifact_id: Option<String>,
     version: Option<String>,
     parent_group_id: Option<String>,
+    /// `<project><parent><artifactId>`. Read for the parent's **own**
+    /// coordinate — the edge [`resolve_parent`] emits — and never as a
+    /// fallback for [`Self::artifact_id`], which Maven does not inherit.
+    parent_artifact_id: Option<String>,
     parent_version: Option<String>,
     properties: HashMap<String, String>,
     dependencies: Vec<RawDependency>,
@@ -420,6 +449,7 @@ enum Leaf {
     ProjectArtifactId,
     ProjectVersion,
     ParentGroupId,
+    ParentArtifactId,
     ParentVersion,
     Property,
     DependencyField,
@@ -441,6 +471,7 @@ fn leaf_at(path: &[String]) -> Option<Leaf> {
         [project, parent, field] if project == "project" && parent == "parent" => {
             match field.as_str() {
                 "groupId" => Some(Leaf::ParentGroupId),
+                "artifactId" => Some(Leaf::ParentArtifactId),
                 "version" => Some(Leaf::ParentVersion),
                 _ => None,
             }
@@ -612,6 +643,7 @@ fn record_leaf(path: &[String], text: &str, pom: &mut RawPom, current: Option<&m
         Leaf::ProjectArtifactId => pom.artifact_id = Some(value.to_string()),
         Leaf::ProjectVersion => pom.version = Some(value.to_string()),
         Leaf::ParentGroupId => pom.parent_group_id = Some(value.to_string()),
+        Leaf::ParentArtifactId => pom.parent_artifact_id = Some(value.to_string()),
         Leaf::ParentVersion => pom.parent_version = Some(value.to_string()),
         Leaf::Property => {
             if let Some(name) = path.last() {
@@ -746,14 +778,24 @@ fn resolve(pom: &RawPom) -> PomDependencies {
     }
 
     let mut out = PomDependencies::default();
+
+    // The parent goes first: it is the edge this POM cannot be
+    // interpolated without, so a consumer that truncates in emitted order
+    // keeps it. It is NOT exempt from the cascade's descendant budget or
+    // depth bound — ordering within the bound, never an exemption from it.
+    match resolve_parent(pom, &interpolator) {
+        Some(Ok(spec)) => out.specs.push(spec),
+        Some(Err(skip)) => out.skipped.push(skip),
+        None => {}
+    }
+
     for dependency in &pom.dependencies {
         // -- identity -----------------------------------------------------
-        let (Some(group), Some(artifact)) = (
-            present(&dependency.group_id),
-            present(&dependency.artifact_id),
-        ) else {
+        let declared_group = present(&dependency.group_id);
+        let declared_artifact = present(&dependency.artifact_id);
+        let (Some(group), Some(artifact)) = (declared_group, declared_artifact) else {
             out.skipped.push(PomSkip {
-                coordinate: raw_label(dependency),
+                coordinate: raw_label(declared_group, declared_artifact),
                 reason: PomSkipReason::IncompleteCoordinate,
             });
             continue;
@@ -763,7 +805,7 @@ fn resolve(pom: &RawPom) -> PomDependencies {
             interpolator.interpolate(artifact),
         ) else {
             out.skipped.push(PomSkip {
-                coordinate: raw_label(dependency),
+                coordinate: raw_label(declared_group, declared_artifact),
                 reason: PomSkipReason::UnresolvedProperty,
             });
             continue;
@@ -842,13 +884,94 @@ fn resolve(pom: &RawPom) -> PomDependencies {
     out
 }
 
-/// Best-effort label for a dependency whose coordinate did not resolve —
-/// the raw, uninterpolated text with a `?` standing in for an absent
-/// half, so a skip record still says which declaration it came from.
-fn raw_label(dependency: &RawDependency) -> String {
-    let group = present(&dependency.group_id).unwrap_or("?");
-    let artifact = present(&dependency.artifact_id).unwrap_or("?");
-    sanitize(&format!("{group}:{artifact}"))
+/// Resolve the POM's `<parent>` into the edge it names.
+///
+/// `None` when the POM declares no parent at all — not a spec, and not a
+/// coverage gap either, so nothing is counted. `Some(Err(skip))` when it
+/// names one this reader cannot turn into a coordinate. `Some(Ok(spec))`
+/// otherwise.
+///
+/// **Why this is reachable from a pure function.** A `<parent>` block
+/// spells out groupId, artifactId and version in the document in front of
+/// the reader, so emitting the edge needs no parent fetch. That is a
+/// property of the POM schema, not of inheritance: the parent's *contents*
+/// — its `<dependencyManagement>`, its `<properties>` — stay out of reach,
+/// and a dependency whose version lives there is still a counted
+/// [`PomSkipReason::VersionFromParentOrBom`].
+///
+/// **The scope filter must not see it.** A `<parent>` declares no
+/// `<scope>`, so routing it through [`EMITTED_SCOPES`] would count it as
+/// [`PomSkipReason::ScopeExcluded`] and reproduce the missing edge in a
+/// new place.
+fn resolve_parent(
+    pom: &RawPom,
+    interpolator: &Interpolator,
+) -> Option<Result<DependencySpec, PomSkip>> {
+    let declared_group = present(&pom.parent_group_id);
+    let declared_artifact = present(&pom.parent_artifact_id);
+    let declared_version = present(&pom.parent_version);
+
+    // A POM with no `<parent>` names nothing, and neither does one whose
+    // every part is blank: there is no coordinate an operator could have
+    // expected to be warmed, so there is nothing to count.
+    if declared_group.is_none() && declared_artifact.is_none() && declared_version.is_none() {
+        return None;
+    }
+    let skip =
+        |coordinate: String, reason: PomSkipReason| Some(Err(PomSkip { coordinate, reason }));
+
+    // Maven requires all three parts; a partial block has no identity to
+    // enqueue even in principle, and no managed entry can complete it.
+    let (Some(group), Some(artifact), Some(version)) =
+        (declared_group, declared_artifact, declared_version)
+    else {
+        return skip(
+            raw_label(declared_group, declared_artifact),
+            PomSkipReason::IncompleteCoordinate,
+        );
+    };
+    // A `<parent><version>${revision}</version>` is legal in principle;
+    // when it does not resolve from this POM's own bytes it is the same
+    // unresolved property a dependency's would be.
+    let (Some(group), Some(artifact), Some(version)) = (
+        interpolator.interpolate(group),
+        interpolator.interpolate(artifact),
+        interpolator.interpolate(version),
+    ) else {
+        return skip(
+            raw_label(declared_group, declared_artifact),
+            PomSkipReason::UnresolvedProperty,
+        );
+    };
+    let (group, artifact, version) = (group.trim(), artifact.trim(), version.trim());
+    let coordinate = format!("{group}:{artifact}");
+    // A placeholder that resolved to the empty string leaves the
+    // coordinate without that part — structurally incomplete, exactly as
+    // an absent element is.
+    if group.is_empty() || artifact.is_empty() || version.is_empty() {
+        return skip(sanitize(&coordinate), PomSkipReason::IncompleteCoordinate);
+    }
+    // ADR 0053 D2: a range needs the upstream version set this reader does
+    // not have, so it is skipped and counted, never guessed at.
+    if is_version_range(version) {
+        return skip(sanitize(&coordinate), PomSkipReason::UnsupportedRange);
+    }
+    Some(Ok(DependencySpec {
+        name: coordinate,
+        range: version.to_string(),
+    }))
+}
+
+/// Best-effort label for an edge whose coordinate did not resolve — the
+/// raw, uninterpolated text with a `?` standing in for an absent half, so
+/// a skip record still says which declaration it came from. Shared by the
+/// `<dependency>` loop and the `<parent>`, which fail the same two ways.
+fn raw_label(group: Option<&str>, artifact: Option<&str>) -> String {
+    sanitize(&format!(
+        "{}:{}",
+        group.unwrap_or("?"),
+        artifact.unwrap_or("?")
+    ))
 }
 
 #[cfg(test)]
@@ -1182,7 +1305,8 @@ mod tests {
     fn builtins_fall_back_to_the_parent_coordinates_when_inherited() {
         // The POM declares neither `<groupId>` nor `<version>` of its own;
         // Maven's effective values come from `<parent>`, which is written
-        // in these same bytes.
+        // in these same bytes. The parent is also an edge in its own
+        // right, so it leads the emitted order.
         let result = parse(
             r#"<project>
                  <parent>
@@ -1199,7 +1323,13 @@ mod tests {
                  </dependencies>
                </project>"#,
         );
-        assert_eq!(result.specs, [spec("com.example:sibling", "4.5.6")]);
+        assert_eq!(
+            result.specs,
+            [
+                spec("com.example:parent", "4.5.6"),
+                spec("com.example:sibling", "4.5.6"),
+            ]
+        );
     }
 
     #[test]
@@ -1216,7 +1346,16 @@ mod tests {
                  </dependencies>
                </project>"#,
         );
-        assert_eq!(result.specs, [spec("com.example:sibling", "9.9.9")]);
+        // `${project.version}` is the POM's own `9.9.9`; the parent EDGE
+        // still carries the parent's own `4.5.6`. The inheritance
+        // fallback and the edge are different reads of the same block.
+        assert_eq!(
+            result.specs,
+            [
+                spec("com.example:p", "4.5.6"),
+                spec("com.example:sibling", "9.9.9"),
+            ]
+        );
     }
 
     #[test]
@@ -1311,6 +1450,222 @@ mod tests {
         ));
         assert_eq!(result.specs, [spec("g:a", "1.0")]);
         assert!(result.skipped.is_empty());
+    }
+
+    // -- the parent is an edge -----------------------------------------------
+
+    /// A POM declaring a `<parent>` plus whatever `body` adds. The
+    /// project's own `<artifactId>` is spelled out because Maven never
+    /// inherits one.
+    fn pom_with_parent(parent: &str, body: &str) -> String {
+        format!(
+            r#"<project>
+  <parent>{parent}</parent>
+  <artifactId>child</artifactId>
+{body}
+</project>"#
+        )
+    }
+
+    /// The defect this edge closes: without it the cascade warms a tree
+    /// whose root is still cold, and a build advances exactly one link of
+    /// its parent chain per quarantine window. `<dependencies>` is empty,
+    /// so the parent edge is the only thing the assertion can be reading.
+    ///
+    /// The `<relativePath/>` is deliberate and not decoration: it is the
+    /// one other `<parent>` child a real POM routinely carries, it names
+    /// a local filesystem path with no upstream artifact behind it, and
+    /// this reader must ignore it rather than fold it into the
+    /// coordinate.
+    #[test]
+    fn the_parent_coordinate_is_emitted_as_a_spec() {
+        let result = parse(&pom_with_parent(
+            "<groupId>org.apache.maven.plugins</groupId>
+             <artifactId>maven-plugins</artifactId>
+             <version>49</version>
+             <relativePath/>",
+            "<dependencies/>",
+        ));
+        assert_eq!(
+            result.specs,
+            [spec("org.apache.maven.plugins:maven-plugins", "49")]
+        );
+        assert!(result.skipped.is_empty());
+    }
+
+    /// Ordering is part of the property, not a detail: the parent is the
+    /// edge the POM cannot be interpolated without, so a consumer that
+    /// truncates in emitted order must keep it. The dependency here sorts
+    /// BEFORE the parent by name, so "first" cannot be satisfied by
+    /// accident.
+    #[test]
+    fn the_parent_spec_is_emitted_first() {
+        let result = parse(&pom_with_parent(
+            "<groupId>zzz.example</groupId><artifactId>zzz-parent</artifactId>
+             <version>49</version>",
+            "<dependencies>
+               <dependency><groupId>aaa.example</groupId><artifactId>aaa-dep</artifactId>
+                 <version>1.0</version></dependency>
+               <dependency><groupId>mmm.example</groupId><artifactId>mmm-dep</artifactId>
+                 <version>2.0</version></dependency>
+             </dependencies>",
+        ));
+        assert_eq!(
+            result.specs,
+            [
+                spec("zzz.example:zzz-parent", "49"),
+                spec("aaa.example:aaa-dep", "1.0"),
+                spec("mmm.example:mmm-dep", "2.0"),
+            ],
+            "the parent leads, then the dependencies in document order"
+        );
+    }
+
+    /// A POM with no `<parent>` is unchanged — no spec, and no skip
+    /// record either, because there is no coordinate an operator could
+    /// have expected to be warmed.
+    #[test]
+    fn a_pom_with_no_parent_emits_no_parent_spec_and_no_skip() {
+        let result = parse(&pom_with(
+            "<dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId>
+             <version>1.0</version></dependency></dependencies>",
+        ));
+        assert_eq!(result.specs, [spec("g:a", "1.0")]);
+        assert!(result.skipped.is_empty());
+    }
+
+    /// Maven requires all three parts. A block missing one has no
+    /// identity to enqueue even in principle, and — unlike a
+    /// `<dependency>` — no `<dependencyManagement>` entry can complete
+    /// it, so it is `IncompleteCoordinate` rather than a deferred
+    /// version.
+    #[test]
+    fn a_parent_missing_any_part_is_an_incomplete_coordinate_skip() {
+        for (parent, label) in [
+            ("<artifactId>p</artifactId><version>1.0</version>", "?:p"),
+            ("<groupId>g</groupId><version>1.0</version>", "g:?"),
+            ("<groupId>g</groupId><artifactId>p</artifactId>", "g:p"),
+        ] {
+            let result = parse(&pom_with_parent(parent, "<dependencies/>"));
+            assert!(result.specs.is_empty(), "{parent}");
+            assert_eq!(
+                reasons(&result),
+                [PomSkipReason::IncompleteCoordinate],
+                "{parent}"
+            );
+            assert_eq!(result.skipped[0].coordinate, label);
+        }
+    }
+
+    /// A `<parent>` whose every part is blank names nothing at all, so it
+    /// reads exactly like an absent one.
+    #[test]
+    fn an_empty_parent_block_names_nothing() {
+        let result = parse(&pom_with_parent("", "<dependencies/>"));
+        assert!(result.specs.is_empty());
+        assert!(result.skipped.is_empty());
+    }
+
+    /// `<parent><version>${revision}</version>` is legal; when the POM's
+    /// own `<properties>` declares it, it resolves from these bytes alone.
+    #[test]
+    fn a_parent_version_from_this_poms_own_properties_resolves() {
+        let result = parse(&pom_with_parent(
+            "<groupId>g</groupId><artifactId>p</artifactId><version>${rev}</version>",
+            "<properties><rev>7.1</rev></properties><dependencies/>",
+        ));
+        assert_eq!(result.specs, [spec("g:p", "7.1")]);
+        assert!(result.skipped.is_empty());
+    }
+
+    /// A parent coordinate written through properties resolves the same
+    /// way the groupId of a `<dependency>` does.
+    #[test]
+    fn a_parent_coordinate_from_this_poms_own_properties_resolves() {
+        let result = parse(&pom_with_parent(
+            "<groupId>${pg}</groupId><artifactId>${pa}</artifactId><version>2.0</version>",
+            "<properties><pg>org.example</pg><pa>bom</pa></properties><dependencies/>",
+        ));
+        assert_eq!(result.specs, [spec("org.example:bom", "2.0")]);
+    }
+
+    /// A property only a grandparent declares does not resolve from these
+    /// bytes — the same counted skip a dependency's would be, and the
+    /// label keeps the raw text so the operator can see which block it was.
+    #[test]
+    fn an_unresolvable_parent_property_is_a_counted_skip() {
+        let result = parse(&pom_with_parent(
+            "<groupId>g</groupId><artifactId>p</artifactId>
+             <version>${from.grandparent}</version>",
+            "<dependencies/>",
+        ));
+        assert!(result.specs.is_empty());
+        assert_eq!(reasons(&result), [PomSkipReason::UnresolvedProperty]);
+        assert_eq!(result.skipped[0].coordinate, "g:p");
+    }
+
+    /// A placeholder that resolves to the empty string leaves the
+    /// coordinate without that part — structurally incomplete, exactly as
+    /// an absent element is, and never a deferred version (no parent of
+    /// the parent is reachable to supply one).
+    #[test]
+    fn a_parent_part_that_expands_to_nothing_is_incomplete() {
+        let result = parse(&pom_with_parent(
+            "<groupId>g</groupId><artifactId>p</artifactId><version>${empty}</version>",
+            "<properties><empty/></properties><dependencies/>",
+        ));
+        assert!(result.specs.is_empty());
+        assert_eq!(reasons(&result), [PomSkipReason::IncompleteCoordinate]);
+        assert_eq!(result.skipped[0].coordinate, "g:p");
+    }
+
+    /// ADR 0053 D2 reaches the parent too: a range needs the upstream
+    /// version set this reader does not have, so it is skipped and
+    /// counted rather than guessed at.
+    #[test]
+    fn a_parent_version_range_is_a_counted_skip() {
+        let result = parse(&pom_with_parent(
+            "<groupId>g</groupId><artifactId>p</artifactId><version>[1.0,2.0)</version>",
+            "<dependencies/>",
+        ));
+        assert!(result.specs.is_empty());
+        assert_eq!(reasons(&result), [PomSkipReason::UnsupportedRange]);
+        assert_eq!(result.skipped[0].coordinate, "g:p");
+    }
+
+    /// A `<parent>` declares no `<scope>`. Routing it through
+    /// `EMITTED_SCOPES` would count it as `ScopeExcluded` and reproduce
+    /// the missing edge in a new place, so the filter must not reach it —
+    /// while the `provided`/`test` dependencies beside it stay excluded.
+    #[test]
+    fn the_scope_filter_does_not_reach_the_parent() {
+        let result = parse(&pom_with_parent(
+            "<groupId>g</groupId><artifactId>p</artifactId><version>1.0</version>",
+            "<dependencies>
+               <dependency><groupId>g</groupId><artifactId>t</artifactId>
+                 <version>1.0</version><scope>test</scope></dependency>
+               <dependency><groupId>g</groupId><artifactId>v</artifactId>
+                 <version>1.0</version><scope>provided</scope></dependency>
+             </dependencies>",
+        ));
+        assert_eq!(result.specs, [spec("g:p", "1.0")]);
+        assert_eq!(result.skip_count(PomSkipReason::ScopeExcluded), 2);
+        assert_eq!(result.skip_count(PomSkipReason::IncompleteCoordinate), 0);
+    }
+
+    /// The parent's own `<dependencyManagement>` is still out of reach:
+    /// warming the parent artifact does not make a version it manages
+    /// readable here.
+    #[test]
+    fn the_parent_edge_does_not_resolve_versions_the_parent_manages() {
+        let result = parse(&pom_with_parent(
+            "<groupId>g</groupId><artifactId>p</artifactId><version>1.0</version>",
+            "<dependencies>
+               <dependency><groupId>g</groupId><artifactId>managed</artifactId></dependency>
+             </dependencies>",
+        ));
+        assert_eq!(result.specs, [spec("g:p", "1.0")]);
+        assert_eq!(reasons(&result), [PomSkipReason::VersionFromParentOrBom]);
     }
 
     // -- scope filter --------------------------------------------------------
@@ -1581,7 +1936,16 @@ mod tests {
                  </dependencies>
                </project>"#,
         );
-        assert!(result.specs.is_empty());
+        // The parent edge is what the partial warm reaches: without it
+        // the cascade warms nothing at all for this POM, and a consumer
+        // never gets far enough to read the dependency list.
+        assert_eq!(
+            result.specs,
+            [spec(
+                "org.springframework.boot:spring-boot-starter-parent",
+                "3.2.0"
+            )]
+        );
         assert_eq!(result.skip_count(PomSkipReason::VersionFromParentOrBom), 1);
         assert_eq!(result.skip_count(PomSkipReason::ScopeExcluded), 1);
     }
