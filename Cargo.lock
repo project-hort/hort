@@ -522,7 +522,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex 2.0.1",
- "syn 3.0.3",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2655,7 +2655,7 @@ dependencies = [
  "password-hash",
  "rand 0.10.3",
  "serde",
- "serde-saphyr 2.1.0",
+ "serde-saphyr 2.1.1",
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.1",
@@ -2717,7 +2717,7 @@ dependencies = [
  "humantime",
  "rustls-pki-types",
  "serde",
- "serde-saphyr 2.1.0",
+ "serde-saphyr 2.1.1",
  "serde_json",
  "sha2 0.11.1",
  "thiserror 2.0.21",
@@ -5938,12 +5938,12 @@ dependencies = [
 
 [[package]]
 name = "serde-saphyr"
-version = "2.1.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f4dc2714fc5632417a6e979602d7044bad8f2880c63fc7217087180acec31b6"
+checksum = "d43fb82d550b07e6f929a58d7d0935182602f48ddead875f5ee313c41c8f07fe"
 dependencies = [
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "granit-parser 2.1.0",
  "nohash-hasher",
