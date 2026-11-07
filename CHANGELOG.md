@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Maven transitive-prefetch cascade now warms a POM's `<parent>` as well
+  as its dependencies, so a parent chain is walked per cascade depth instead
+  of one link per quarantine window (#418).
 - A subscription edited, paused, resumed or disabled while it is delivering, or
   running on more than one replica, no longer re-delivers events it had already
   delivered the next time its process restarts (#311).

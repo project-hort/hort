@@ -331,6 +331,14 @@ manifest, stored as its own group member, so `extract_dependency_specs`
 (`crates/hort-formats/src/maven/pom.rs`, `parse_pom_dependencies`) reads
 it directly rather than reaching into a container. What it resolves:
 
+- The `<parent>` coordinate, when the POM declares one, emitted
+  **first**. Maven requires a `<parent>` block to spell out groupId,
+  artifactId and version in full, in this document, so the edge needs no
+  parent fetch. It is emitted ahead of the `<dependencies>` specs because
+  a consumer cannot read the dependency list at all until it has the
+  parent; otherwise it is an ordinary edge, spending the descendant
+  budget and the depth bound like any other rather than being exempt from
+  them.
 - `<dependencies>` entries whose effective scope is `compile` or
   `runtime` (an absent `<scope>` is Maven's own `compile` default) —
   the same runtime-declaration class boundary ADR 0053 D5 draws for
@@ -342,23 +350,28 @@ it directly rather than reaching into a container. What it resolves:
 - Versions supplied by this POM's **own** `<dependencyManagement>`
   block — local bytes, not a parent and not a BOM import.
 
-**What it cannot reach, stated plainly: parent POMs, and imported
-BOMs.** `extract_dependency_specs` is a pure function over one
-artifact's own bytes — it holds no port, no HTTP client, no fetcher —
-so a POM's parent chain and any BOM it pulls in through
-`<dependencyManagement>`'s `<import>` scope are structurally
-unreachable from here, and that is exactly where a Spring Boot or
-Quarkus tree keeps most of its versions. **A project that keeps its
-versions in a parent or a BOM will see a high skip count and a
-correspondingly cold tree** — the reason is architectural, not a bug in
-this cut: reaching beyond a single POM needs a change to the
+**What it cannot reach, stated plainly: the *contents* of a parent POM,
+and of an imported BOM.** `extract_dependency_specs` is a pure function
+over one artifact's own bytes — it holds no port, no HTTP client, no
+fetcher — so a parent's `<dependencyManagement>` and `<properties>`, and
+any BOM pulled in through `<dependencyManagement>`'s `<import>` scope,
+are structurally unreachable from here, and that is exactly where a
+Spring Boot or Quarkus tree keeps most of its versions. **A project that
+keeps its dependency versions in a parent or a BOM will still see a high
+skip count** — the reason is architectural, not a bug in this cut:
+resolving a version held beyond a single POM needs a change to the
 `VersionDiscovery` (ADR 0005) contract itself, not more effort spent
-against the current one.
+against the current one. The parent's own *coordinate* is the one thing
+that is not beyond a single POM, which is why warming the parent
+artifact is in reach while reading what it manages is not — and why the
+cascade walks the parent chain one level per cascade depth rather than
+one level per quarantine window.
 
 Everything this reader cannot resolve is a **counted skip, never an
-`Err`** — a POM whose every version lives in its parent is a *valid*
-POM and yields `Ok(vec![])` with every dependency skipped, so the
-cascade partially warms the tree instead of aborting the walk.
+`Err`** — a POM whose every dependency version lives in its parent is a
+*valid* POM and yields `Ok` carrying just the parent edge, with every
+`<dependencies>` entry skipped, so the cascade partially warms the tree
+instead of aborting the walk.
 `PomSkipReason` (`crates/hort-formats/src/maven/pom.rs`) names five
 reasons, and an operator must read them as **two different classes**:
 
@@ -374,7 +387,9 @@ reasons, and an operator must read them as **two different classes**:
   properties/built-ins could not resolve), `unsupported_range` (a
   Maven version range; per ADR 0053 D2 a range upstream cannot
   satisfy is skipped, never guessed at), and `incomplete_coordinate`
-  (no `<groupId>` or `<artifactId>` to enqueue).
+  (no `<groupId>` or `<artifactId>` to enqueue — on a `<dependency>`,
+  or a `<parent>` block missing any of its three parts, which no
+  `<dependencyManagement>` entry can complete).
 
 Presenting these five as one "skipped" number defeats the signal in
 both directions: a healthy cascade (mostly `scope_excluded`) reads as
