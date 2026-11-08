@@ -97,7 +97,7 @@ the result instead.
 | socket2 | 0.6.3 | MIT | https://github.com/rust-lang/socket2 |
 | mio | 1.2.0 | MIT | https://github.com/tokio-rs/mio |
 | errno | 0.3.14 | MIT | https://github.com/lambda-fairy/rust-errno |
-| mime | 0.3.17 | MIT | https://github.com/hyperium/mime |
+| mime | 0.3.18 | MIT | https://github.com/hyperium/mime |
 | base64ct | 1.8.3 | MIT | https://github.com/RustCrypto/formats |
 | base16ct | 0.2.0 | MIT | https://github.com/RustCrypto/formats/tree/master/base16ct |
 | base16ct | 1.0.0 | MIT | https://github.com/RustCrypto/formats |
@@ -6193,7 +6193,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### mime 0.3.17 — MIT
+### mime 0.3.18 — MIT
 
 Repository: https://github.com/hyperium/mime
 
