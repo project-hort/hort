@@ -330,15 +330,20 @@ which spends it on the *row's*. The dispatcher used to carry a
 compile-time `5` instead, so the two agreed at the default and nowhere
 else.
 Exhausting the budget does not abandon the artifact — it transitions
-it, before the job row is marked failed, to the terminal
+it, before the job row is marked failed, to the
 `scan_indeterminate` status via
 `QuarantineUseCase::record_scan_indeterminate`, recording a distinct
 `ScanIndeterminate` event (deliberately *not* a zero-finding
 `ScanCompleted`, which would be indistinguishable from a clean scan).
 A `scan_indeterminate` artifact is non-downloadable, non-promotable,
-and **not releasable by the quarantine timer** — only an admin
-override or a post-exclusion re-evaluation can move it
-([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)).
+and **not releasable by the quarantine timer**. It is a **hold, not a
+dead end**: the stranded-rescan sweep re-picks it, and a verdict that is
+reached supersedes the absent one — a non-blocking verdict returns the
+artifact to `quarantined`, where the ordinary release sweep decides, and
+a blocking one condemns it to `rejected`. The curator's manual release
+reaches it too
+([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md),
+"A reached verdict supersedes an absent one").
 The ordering is itself fail-closed, and now by construction rather than
 by convention: the artifact transition happens inside `record_outcome`
 and the row's terminal write happens after it has returned, so a crash
@@ -936,10 +941,15 @@ If no backend produced a verdict:
 - **Any backend errored** → the existing retryable `Failed` path. An error
   may be transient.
 - **Every backend abstained, at least one of them gating** → the artifact
-  transitions straight to the terminal `scan_indeterminate` status, with
+  transitions straight to the `scan_indeterminate` status, with
   no retry budget spent. The artifact's kind and the backend's analyzers
   are both fixed, so the next attempt reaches the same answer; retrying
-  would only delay the hold by the backoff schedule.
+  would only delay the hold by the backoff schedule. The sweep still
+  re-picks the artifact on later ticks, which is what heals it when the
+  cause of the abstention goes away — a `ScanPolicy` moving to
+  `compositeVerdictMode: promoted`, say, after which `no_analyzer_matched`
+  no longer gates an `OciBlob`. A deterministic abstention simply
+  re-answers the same way, once per tick, appending nothing.
 - **Every abstention was `not_applicable`** → a **completed assessment
   with nothing to assess.** The orchestrator records a `ScanCompleted`
   with no findings and `assessment = not_applicable`, so scan authority
@@ -1089,7 +1099,8 @@ enqueue rate has outrun drain rate, whatever the trigger source.
   `ScanPolicy` thresholds, `Exclusion` overrides, curation rules.
 - [ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)
   — the consumer-side release predicate, including the `ScanWaived`
-  authority and why `scan_indeterminate` is terminal.
+  authority and why `scan_indeterminate` is a hold rather than a dead
+  end.
 - [Format handlers](format-handlers.md) — the `FormatHandler` port
   `extract_sbom` lives on.
 - [Content-addressable storage](cas-storage.md) — where findings blobs

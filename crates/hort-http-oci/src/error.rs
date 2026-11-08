@@ -126,12 +126,16 @@ pub enum OciError {
     /// opaque to the client.
     Quarantined { retry_after_seconds: Option<i64> },
     /// 503 — the artifact's scan result is indeterminate (the scanner
-    /// exhausted its retries without a decision; ADR 0007's fail-closed
-    /// terminal state — issue #6). Unlike [`Self::Quarantined`], this
-    /// hold has no self-resolving deadline (exit is admin override or a
-    /// successful rescan, not the passage of time), so this variant
-    /// deliberately does NOT carry `retry_after_seconds` and emits no
-    /// `Retry-After` header. Fail-closed for every caller, including a
+    /// exhausted its retries without a decision, or every backend
+    /// abstained about the artifact; ADR 0007's fail-closed state).
+    /// Unlike [`Self::Quarantined`], this hold has no
+    /// self-resolving deadline: its exits are the one manual release (a
+    /// curator's waive, which an admin caller also satisfies) and a
+    /// rescan that reaches a verdict — a non-blocking one returns the
+    /// artifact to the time-bounded hold, a blocking one condemns it
+    /// (ADR 0007, "A reached verdict supersedes an absent one") — and
+    /// never the passage of time. So this variant deliberately does NOT
+    /// carry `retry_after_seconds` and emits no `Retry-After` header. Fail-closed for every caller, including a
     /// write-granted one — the ADR 0039 §10 push-then-sign / dedup
     /// hold-read exemptions that apply to `Quarantined` do NOT extend
     /// here (issue #92). Code is `UNAVAILABLE` — the same spec-extension

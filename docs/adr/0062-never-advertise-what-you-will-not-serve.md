@@ -136,8 +136,8 @@ reader already holds the bytes; neither answer implies the other.
 ### 3. The line runs between a verdict and a wait, and it is one line for every format
 
 - A **terminal** verdict — `Rejected` or `ScanIndeterminate`, the class
-  `QuarantineStatus::is_terminal` names, whose exit is a deliberate act and
-  never the passage of time — means **never**. It is never advertised, in
+  `QuarantineStatus::is_terminal` names, whose exit is never the passage of
+  time — means **never**. It is never advertised, in
   either shape, in any format.
 - A **hold** — `Quarantined`, including a hold with no self-resolving deadline
   — means **not yet**. The client is told to come back, and every format keeps

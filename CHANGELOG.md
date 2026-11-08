@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- An artifact held `scan_indeterminate` is no longer a dead end: the rescan
+  sweep re-picks it, and a later scan verdict releases or rejects it with no
+  curator waiver (#419).
 - Ingesting a child manifest of a multi-arch OCI index now fetches and ingests
   that child's config and layer blobs, so a held index no longer leaves the
   tree under it uncached. Not governed by `prefetchPolicy.enabled` (#312).

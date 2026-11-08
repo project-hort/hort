@@ -997,6 +997,79 @@ impl Artifact {
         }
     }
 
+    /// A reached verdict supersedes an absent one: a scan that reached a
+    /// **non-blocking** verdict for an artifact held in
+    /// [`QuarantineStatus::ScanIndeterminate`] returns it to the hold
+    /// (ADR 0007, "A reached verdict supersedes an absent one").
+    ///
+    /// Valid from `ScanIndeterminate` and nothing else, and it targets
+    /// `Quarantined` and nothing else. Both halves are the point:
+    ///
+    /// - **Why a separate method rather than widening
+    ///   [`Self::record_clean_scan`].** That method is the state guard
+    ///   for a scan observation that does *not* transition the artifact —
+    ///   a clean verdict on a held artifact, a `record`-mode blocking
+    ///   verdict — and it mutates nothing. This one transitions. One
+    ///   method carrying both meanings would leave a reader unable to
+    ///   tell which is being asserted at a call site, so
+    ///   `record_clean_scan` keeps refusing `ScanIndeterminate`.
+    /// - **Why `Quarantined` and never `Released`.** The verdict
+    ///   withdraws the *absence* that produced the hold; it does not
+    ///   decide whether the artifact may now be served. Returning it to
+    ///   the hold puts it back in front of the release gate, which
+    ///   applies the live scan, curation and provenance conjunction under
+    ///   the unchanged authority enumeration — no authority is added
+    ///   here. Same shape as
+    ///   [`Self::repair_provenance_misrejection`] and
+    ///   [`Self::re_evaluate`]'s re-quarantine arm.
+    /// - **Why `Rejected` is not a source state.** An absent verdict is a
+    ///   statement about hort's own coverage; a recorded rejection is a
+    ///   statement about the artifact. Only the first is being
+    ///   withdrawn.
+    ///
+    /// The blocking half of the same verdict is
+    /// [`Self::reject_from_scan`], whose `ScanIndeterminate` source state
+    /// the same amendment opened. Which half applies is the caller's
+    /// partition of the policy verdict, exactly as it already is between
+    /// `record_clean_scan` and `reject_from_scan`.
+    ///
+    /// The observation-window anchor is **restored, not restarted**: an
+    /// artifact that reached `ScanIndeterminate` from `Quarantined`
+    /// carries one and keeps it, so the window that was already running
+    /// is the window the release gate reads. `now` is the anchor for the
+    /// one population that has none — an artifact that reached the state
+    /// from `None` under `quarantineDuration: 0`, which never had a
+    /// window — because a `Quarantined` artifact with no anchor is one no
+    /// release-candidacy query can see, and the method must not produce a
+    /// hold that nothing can decide.
+    ///
+    /// Refuses with [`DomainError::Invariant`] **without mutating**, so a
+    /// caller can record the fresh scan evidence and withhold only the
+    /// transition.
+    pub fn supersede_absent_verdict(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> DomainResult<ArtifactQuarantined> {
+        if quarantine_transitions::allowed_targets(
+            QuarantineEvent::SupersedeAbsentVerdict,
+            self.quarantine_status,
+        )
+        .is_none()
+        {
+            let other = self.quarantine_status;
+            return Err(DomainError::Invariant(format!(
+                "cannot supersede an absent scan verdict for artifact in state {other}:                  only a scan_indeterminate artifact is held for want of a verdict"
+            )));
+        }
+        self.quarantine_status = QuarantineStatus::Quarantined;
+        let anchor = self.quarantine_window_start.unwrap_or(now);
+        self.quarantine_window_start = Some(anchor);
+        Ok(ArtifactQuarantined {
+            artifact_id: self.id,
+            quarantine_window_start: anchor,
+        })
+    }
+
     /// Record scan with findings. Transitions to `Rejected`.
     ///
     /// Accepts source states `Quarantined` (strict mode: the artifact
@@ -1006,11 +1079,15 @@ impl Artifact {
     /// downloadable; bad findings retroactively block downloads).
     ///
     /// Accepts `Released` **iff `prior_release.permits_scan_reblock()`** —
-    /// iff the artifact got there automatically. Rejects `Rejected`
-    /// (terminal — the artifact is already blocked) and
-    /// `ScanIndeterminate` (its own terminal scan-failure state, whose
-    /// only exit is an explicit manual release). (The
-    /// `quarantineDuration: 0` permissive-mode contract — see
+    /// iff the artifact got there automatically. Accepts
+    /// `ScanIndeterminate`: an artifact held because no scanner reached a
+    /// verdict accepts one that is reached, and a blocking verdict
+    /// condemns it exactly as it does a held artifact (ADR 0007, "A
+    /// reached verdict supersedes an absent one"; the non-blocking half
+    /// is [`Self::supersede_absent_verdict`]). Rejects `Rejected`
+    /// (terminal — a positive disproof is a statement about the artifact
+    /// and nothing here withdraws it). (The `quarantineDuration: 0`
+    /// permissive-mode contract — see
     /// `docs/architecture/explanation/scanning-pipeline.md`.)
     ///
     /// # Why `Released` is conditional rather than refused outright
@@ -2925,6 +3002,99 @@ mod tests {
         ));
     }
 
+    /// `record_clean_scan` keeps refusing `ScanIndeterminate` — the
+    /// reason [`Artifact::supersede_absent_verdict`] is a separate
+    /// method. This event is the guard for an observation that does not
+    /// transition the artifact; the `ScanIndeterminate` case does
+    /// transition it, and one event with both meanings is one a reader
+    /// cannot tell apart at a call site.
+    #[test]
+    fn record_clean_scan_from_scan_indeterminate_fails() {
+        let a = scan_indeterminate_artifact();
+        assert!(matches!(
+            a.record_clean_scan(),
+            Err(DomainError::Invariant(_))
+        ));
+    }
+
+    // -- State machine: supersede_absent_verdict ----------------------------
+    //
+    // ADR 0007, "A reached verdict supersedes an absent one": the
+    // non-blocking half. `ScanIndeterminate -> Quarantined`, the
+    // original anchor preserved, every other source state refused
+    // without mutating.
+
+    #[test]
+    fn supersede_absent_verdict_from_scan_indeterminate_returns_to_the_hold() {
+        let mut a = scan_indeterminate_artifact();
+        let anchor = Utc::now() - chrono::Duration::days(3);
+        a.quarantine_window_start = Some(anchor);
+
+        let event = a
+            .supersede_absent_verdict(Utc::now())
+            .expect("a reached verdict is admissible from scan_indeterminate");
+
+        assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+        assert_eq!(event.artifact_id, a.id);
+        // Restored, not restarted — the window was always running; only
+        // the verdict was missing. An already-elapsed window is what
+        // makes the artifact a release candidate on the very next sweep.
+        assert_eq!(event.quarantine_window_start, anchor);
+        assert_eq!(a.quarantine_window_start, Some(anchor));
+        // Never `Released`: the release decision stays with the gate.
+        assert!(!a.is_downloadable());
+    }
+
+    /// The one population with no anchor — it reached
+    /// `ScanIndeterminate` from `None` under `quarantineDuration: 0`, so
+    /// it never had a window. `now` becomes the anchor, on the entity as
+    /// well as on the event: a `Quarantined` artifact with a NULL anchor
+    /// is invisible to every release-candidacy query, so leaving the
+    /// field empty would trade one dead end for another.
+    #[test]
+    fn supersede_absent_verdict_anchors_an_artifact_that_never_had_a_window() {
+        let mut a = scan_indeterminate_artifact();
+        a.quarantine_window_start = None;
+        let now = Utc::now();
+
+        let event = a.supersede_absent_verdict(now).expect("admissible");
+
+        assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+        assert_eq!(event.quarantine_window_start, now);
+        assert_eq!(a.quarantine_window_start, Some(now));
+    }
+
+    #[test]
+    fn supersede_absent_verdict_refuses_every_other_source_state() {
+        // `Rejected` is the load-bearing refusal: an absent verdict is a
+        // statement about hort's own coverage, a recorded rejection is a
+        // statement about the artifact, and only the first is withdrawn
+        // here.
+        for mut a in [
+            sample_artifact(),
+            quarantined_artifact(),
+            released_artifact(),
+            rejected_artifact(),
+        ] {
+            let before = a.quarantine_status;
+            let before_anchor = a.quarantine_window_start;
+            let err = a
+                .supersede_absent_verdict(Utc::now())
+                .expect_err("only scan_indeterminate is admissible");
+            match err {
+                DomainError::Invariant(msg) => assert!(
+                    msg.contains(&before.to_string()),
+                    "the refusal must name the state it refused, got {msg:?}"
+                ),
+                other => panic!("expected Invariant, got {other:?}"),
+            }
+            // Refused without mutating — the caller still records the
+            // fresh scan evidence.
+            assert_eq!(a.quarantine_status, before);
+            assert_eq!(a.quarantine_window_start, before_anchor);
+        }
+    }
+
     // -- State machine: reject_from_scan ------------------------------------
 
     #[test]
@@ -3137,21 +3307,27 @@ mod tests {
         assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
     }
 
-    /// `ScanIndeterminate` keeps today's behaviour too: its own terminal
-    /// scan-failure state, exited only by an explicit manual release
-    /// (ADR 0007).
+    /// `ScanIndeterminate` is an admissible source state as of ADR
+    /// 0007's "A reached verdict supersedes an absent one": an artifact
+    /// held because no scanner reached a verdict accepts one that is
+    /// reached, and a blocking verdict condemns it exactly as it does a
+    /// held artifact. This test asserted the opposite until that
+    /// amendment — the state's only exit was the curator's manual
+    /// release, so a blocking rescan verdict landed nowhere.
     #[test]
-    fn reject_from_scan_from_scan_indeterminate_fails() {
+    fn reject_from_scan_from_scan_indeterminate_rejects() {
         let mut a = sample_artifact();
         a.quarantine_status = QuarantineStatus::ScanIndeterminate;
-        assert!(matches!(
-            a.reject_from_scan(
-                "reason".into(),
-                ReleaseOrigin::Released(ReleaseReason::Timer)
-            ),
-            Err(DomainError::Invariant(_))
-        ));
-        assert_eq!(a.quarantine_status, QuarantineStatus::ScanIndeterminate);
+        let event = a
+            .reject_from_scan(
+                "critical finding".into(),
+                ReleaseOrigin::Released(ReleaseReason::Timer),
+            )
+            .expect("a blocking verdict condemns a scan_indeterminate artifact");
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        assert_eq!(a.rejection_reason, Some(RejectionReason::Scanner));
+        assert_eq!(event.rejected_by, RejectionReason::Scanner);
+        assert_eq!(event.reason, "critical finding");
     }
 
     /// **The release origin is a parameter, not entity state.** Two

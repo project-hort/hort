@@ -21,12 +21,15 @@ reasons:
   errored (unreachable, crashed, timed out). This is a
   **scanner-execution / infrastructure failure**: transient, and
   recoverable once the scanner comes back.
-- **The scan ran but the result was ambiguous** — the scanner executed
-  and produced output hort could not parse or classify. This is a
-  **terminal** failure under ADR 0007: the artifact transitions to
-  `scan_indeterminate`, is never auto-rescanned, and only exits via
-  the curator's manual release or post-exclusion policy
-  re-evaluation.
+- **The scan ran but no verdict came out of it** — the scanner executed
+  and produced output hort could not parse or classify, or every backend
+  abstained about the artifact. The artifact transitions to
+  `scan_indeterminate`. Under ADR 0007 that is a **hold, not a dead
+  end**: the same sweep re-picks it, and a verdict that is reached
+  supersedes the absent one — a non-blocking verdict returns the
+  artifact to `quarantined` and the ordinary release sweep decides from
+  there, a blocking one condemns it. The curator's manual release and
+  post-exclusion policy re-evaluation reach it as well.
 
 Before issue #6, both failure modes collapsed onto the same outcome: on
 retry exhaustion (`HORT_SCANNER_MAX_ATTEMPTS`, default 6), the artifact
@@ -40,11 +43,11 @@ exhausts retries now leaves the artifact **exactly where it was**:
 still `quarantine_status='quarantined'`, downloads still blocked (the
 status is the gate — ADR 0007), but with a persisted "last scan
 errored" fact (`jobs.status='failed'` on its most recent `kind='scan'`
-row). **This is the "stranded" state this guide is about.** A
-genuinely-ambiguous scan result still goes to the unchanged, terminal
-`scan_indeterminate` path — that is not what this guide covers; see
-[the curator workflow guide](curator-workflow.md) for recovering an
-artifact in that state.
+row). **This is the "stranded" state this guide is about.** A scan that
+produced no verdict still goes to the `scan_indeterminate` path, and as
+of ADR 0007's "A reached verdict supersedes an absent one" the same
+sweep recovers that state too — the two differ in which status the
+artifact waits in, not in whether anything re-scans it.
 
 **No new release authority was added.** A recovered scan releases the
 artifact via the existing `ScanSucceeded` authority (or rejects it on
@@ -56,8 +59,10 @@ actually run. It does not release anything on a timer.
 The `cron-rescan-tick` task (the same k8s CronJob / admin-task that
 drives the routine interval-based rescan when it is scheduled, default
 schedule `*/5 * * * *`) also re-picks stranded artifacts every tick, via
-`RescanCandidatesRepository::select_stranded`: `quarantine_status='quarantined'`
-artifacts whose last scan errored and have no in-flight `kind='scan'`
+`RescanCandidatesRepository::select_stranded`: `quarantine_status IN
+('quarantined', 'scan_indeterminate')`
+artifacts whose last scan errored — or that have no `kind='scan'` job at
+all — and have no in-flight `kind='scan'`
 job. Once the scanner is back, the very next tick re-enqueues a fresh
 scan for every stranded artifact — no operator action required. The
 recovered scan releases the artifact normally (`ScanSucceeded`) or
@@ -152,16 +157,21 @@ a last resort if the HTTP surface itself is unreachable.
 
 ## 4. What does NOT recover a stranded artifact
 
-- **A genuinely `scan_indeterminate` artifact is not touched by any of
-  the above.** That status is terminal by design (ADR 0007) — recover
-  it with the curator's manual release
+- **Nothing, if the abstention is deterministic.** Everything above
+  gives the scan another chance to run; none of it changes what the scan
+  says. A `scan_indeterminate` artifact whose backends abstain about its
+  kind re-answers the same way on every tick, so the sweep alone will
+  not move it — what moves it is removing the cause (a `ScanPolicy`
+  change, a backend that can analyse the format), after which the next
+  tick's verdict lands and the release sweep decides. The curator's
+  manual release is the immediate exit
   (`hort-cli curation waive <artifact_id> --justification '…'`, or
   `POST /api/v1/admin/curation/quarantine/:artifact_id/waive`), which
   reaches `ScanIndeterminate` as well as `Quarantined`: one authority
   owns the manual release, and what it requires is the source state
   rather than a second permission tier. The gate is
   `Permission::Curate` OR `Permission::Admin`, so an admin credential
-  works too. Post-exclusion policy re-evaluation is the other exit. See
+  works too. Post-exclusion policy re-evaluation is another. See
   [the curator workflow guide](curator-workflow.md).
 - **Waiting past `quarantine_until` does nothing on its own.** The
   release predicate has no timer-only authority (ADR 0007); a stranded

@@ -16,8 +16,11 @@
 //! `docs/architecture/explanation/scanning-pipeline.md`.
 //!
 //! [`RescanCandidatesRepository::select_stranded`] is a companion
-//! eligibility query (issue #6 / ADR 0007; widened by issue #115 defect
-//! (a) cure) for a *different* predicate: `quarantine_status='quarantined'`
+//! eligibility query (ADR 0007's retry-exhaustion split, its later
+//! widening to artifacts with no scan job at all, and its "A reached
+//! verdict supersedes an absent one" amendment) for a *different*
+//! predicate: `quarantine_status IN
+//! ('quarantined', 'scan_indeterminate')`
 //! artifacts whose scan either could not even **run** (every configured
 //! scanner backend failed and exhausted `HORT_SCANNER_MAX_ATTEMPTS`
 //! retries — the artifact's most recent `kind='scan'` job landed
@@ -32,8 +35,20 @@
 //! remediation for them, not an alternative to one). Both failure modes
 //! are transient/infrastructure or missed-enqueue, not a
 //! genuinely-ambiguous scan result, so neither transitions the artifact
-//! to the terminal `scan_indeterminate` status (ADR 0007 unchanged) —
-//! the artifact simply stays `quarantined`.
+//! to the `scan_indeterminate` status (ADR 0007 unchanged) — the
+//! artifact simply stays `quarantined`.
+//!
+//! **`scan_indeterminate` is in the predicate too.** An artifact held
+//! there is held for want of a verdict, and a verdict that is reached
+//! supersedes an absent one: a non-blocking one returns the artifact to
+//! the hold and a blocking one condemns it (ADR 0007, "A reached verdict
+//! supersedes an absent one"), so a rescan has somewhere to land. This
+//! query is the mechanism that delivers that healing rather than a
+//! consequence of it — there is no per-artifact operator rescan surface
+//! that bypasses it, so a state this query skips is terminal in practice
+//! whatever the transition table says. `rejected` stays excluded: a
+//! recorded rejection is a positive statement about the artifact, and
+//! its exit is `re_evaluate`, not a re-scan.
 //!
 //! A candidate under either failure mode is stranded ONLY when its
 //! resolved policy (repo-scoped-else-global-else-`DefaultPolicy`, the
@@ -114,12 +129,13 @@ pub trait RescanCandidatesRepository: Send + Sync {
     ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>>;
 
     /// Return up to `batch_size` **stranded** artifacts: `quarantine_status
-    /// = 'quarantined'` with a most-recent `kind='scan'` job in
-    /// `status='failed'` (a scanner-execution failure that exhausted
-    /// retries — see the module doc) and no in-flight `kind='scan'` job.
+    /// IN ('quarantined', 'scan_indeterminate')` with a most-recent
+    /// `kind='scan'` job in `status='failed'` (a scanner-execution
+    /// failure that exhausted retries — see the module doc) or no
+    /// `kind='scan'` job at all, and no in-flight `kind='scan'` job.
     ///
     /// Distinct query from [`Self::select_eligible`] — different source
-    /// status (`quarantined`, not `released`/`NULL`), no interval/`now`
+    /// statuses (the two holds, not `released`/`NULL`), no interval/`now`
     /// gating (a stranded artifact is eligible immediately, not after a
     /// policy-derived wait), and a different "was it scanned" signal (the
     /// most recent `jobs` row's status, not `artifacts.last_scan_at`).

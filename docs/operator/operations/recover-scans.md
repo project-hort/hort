@@ -28,4 +28,4 @@ Alternatively, an authorized client can call `POST /api/v1/artifacts/<artifact-i
 
 ## When a rescan is not enough
 
-A terminal `scan_indeterminate` result is **not** the same as scanner execution failure; refer it to an authorized curator and your documented review process. Check [Scanning & governance](scanning-governance.md) and [Monitoring & troubleshooting](monitoring.md).
+A `scan_indeterminate` result is **not** the same as scanner execution failure: no backend reached a verdict about the artifact, and a rescan that abstains the same way changes nothing. The hold is not permanent — the rescan sweep keeps re-picking the artifact, and once the cause is gone (a scan policy change, a backend that can analyse the format) the next verdict lifts it with no operator step. To release it sooner, refer it to an authorized curator and your documented review process. Check [Scanning & governance](scanning-governance.md) and [Monitoring & troubleshooting](monitoring.md).

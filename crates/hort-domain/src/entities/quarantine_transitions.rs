@@ -94,6 +94,19 @@ pub enum QuarantineEvent {
     /// handing the release decision back to the ordinary sweep rather
     /// than making it here.
     RepairProvenanceMisrejection,
+    /// `Artifact::supersede_absent_verdict` — a scan that reached a
+    /// non-blocking verdict for an artifact held because no scanner
+    /// reached one at all (ADR 0007, "A reached verdict supersedes an
+    /// absent one"). Same shape as [`Self::RepairProvenanceMisrejection`]
+    /// — single source state, single target, the hold rather than the
+    /// release — and distinct from [`Self::RecordCleanScan`] on purpose:
+    /// that event is the guard for a scan observation that does **not**
+    /// transition the artifact, and this one transitions it, so one event
+    /// carrying both meanings would leave a reader unable to tell which
+    /// is being asserted. The blocking half of the same verdict needs no
+    /// variant of its own — it is [`Self::RejectFromScan`], whose
+    /// `ScanIndeterminate` cell the same amendment opened.
+    SupersedeAbsentVerdict,
     /// `Artifact::complete_provenance`. **Not source-state-gated** — the
     /// method carries no `match self.quarantine_status` guard at all (its
     /// caller, the provenance orchestrator, only ever invokes it against a
@@ -123,6 +136,7 @@ impl QuarantineEvent {
         QuarantineEvent::ReEvaluate,
         QuarantineEvent::CompleteProvenance,
         QuarantineEvent::RepairProvenanceMisrejection,
+        QuarantineEvent::SupersedeAbsentVerdict,
     ];
 
     /// Stable, human-readable label — the DOT edge label and the name used
@@ -142,6 +156,7 @@ impl QuarantineEvent {
             Self::ReEvaluate => "re_evaluate",
             Self::CompleteProvenance => "complete_provenance",
             Self::RepairProvenanceMisrejection => "repair_provenance_misrejection",
+            Self::SupersedeAbsentVerdict => "supersede_absent_verdict",
         }
     }
 }
@@ -199,7 +214,8 @@ pub fn classify(event: QuarantineEvent, state: QuarantineStatus) -> Cell {
             NoneSt => Allowed(&[Rejected]),
             Quarantined => Allowed(&[Rejected]),
             Released => Allowed(&[Rejected]),
-            Rejected | ScanIndeterminate => Forbidden,
+            ScanIndeterminate => Allowed(&[Rejected]),
+            Rejected => Forbidden,
         },
         QuarantineEvent::RejectFromRetroactiveCuration => match state {
             Quarantined => Allowed(&[Rejected]),
@@ -271,6 +287,19 @@ pub fn classify(event: QuarantineEvent, state: QuarantineStatus) -> Cell {
             Rejected => Allowed(&[Quarantined]),
             NoneSt | Quarantined | Released | ScanIndeterminate => Forbidden,
         },
+        // Source-state guard only — the verdict's sign is the caller's
+        // partition (the blocking half is `RejectFromScan`), exactly as
+        // it is for `RecordCleanScan`. Targets `Quarantined` alone: the
+        // artifact returns to the hold and the ordinary release sweep
+        // decides under the live gate (ADR 0007, "A reached verdict
+        // supersedes an absent one", clause 1). `Rejected` stays
+        // `Forbidden` — a positive disproof is a statement about the
+        // artifact; an absent verdict is a statement about hort's own
+        // coverage, and only the second one is being withdrawn here.
+        QuarantineEvent::SupersedeAbsentVerdict => match state {
+            ScanIndeterminate => Allowed(&[Quarantined]),
+            NoneSt | Quarantined | Released | Rejected => Forbidden,
+        },
     }
 }
 
@@ -339,6 +368,12 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
              which no operator reviewed); an explicit Admin or Curator release outweighs \
              every later scan verdict and is refused without mutating",
         ],
+    },
+    QuarantineTransitionRow {
+        event: QuarantineEvent::RejectFromScan,
+        from: QuarantineStatus::ScanIndeterminate,
+        to: &[QuarantineStatus::Rejected],
+        required_triggers: &[],
     },
     QuarantineTransitionRow {
         event: QuarantineEvent::RejectFromRetroactiveCuration,
@@ -511,6 +546,12 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
              D1). A positive disproof, and a stream with no provenance verdict at all, \
              are refused",
         ],
+    },
+    QuarantineTransitionRow {
+        event: QuarantineEvent::SupersedeAbsentVerdict,
+        from: QuarantineStatus::ScanIndeterminate,
+        to: &[QuarantineStatus::Quarantined],
+        required_triggers: &[],
     },
 ];
 
@@ -715,6 +756,70 @@ mod tests {
         );
     }
 
+    /// The new arm, stated positively and negatively in one place:
+    /// `SupersedeAbsentVerdict` accepts exactly `ScanIndeterminate` and
+    /// reaches exactly `Quarantined` — never `Released`, which is what
+    /// keeps the release decision with the ordinary sweep's gate (ADR
+    /// 0007, "A reached verdict supersedes an absent one", clause 1).
+    /// Every other source state is `Forbidden`, `Rejected` included:
+    /// withdrawing an absent verdict must not withdraw a recorded one.
+    #[test]
+    fn supersede_absent_verdict_accepts_only_scan_indeterminate() {
+        assert_eq!(
+            allowed_targets(
+                QuarantineEvent::SupersedeAbsentVerdict,
+                QuarantineStatus::ScanIndeterminate
+            ),
+            Some(&[QuarantineStatus::Quarantined][..])
+        );
+        for from in [
+            QuarantineStatus::None,
+            QuarantineStatus::Quarantined,
+            QuarantineStatus::Released,
+            QuarantineStatus::Rejected,
+        ] {
+            assert_eq!(
+                allowed_targets(QuarantineEvent::SupersedeAbsentVerdict, from),
+                None,
+                "SupersedeAbsentVerdict must refuse {from}"
+            );
+        }
+    }
+
+    /// The blocking half of the same amendment: `RejectFromScan` now
+    /// reaches `Rejected` from `ScanIndeterminate`, and `Rejected` stays
+    /// `Forbidden` for it.
+    #[test]
+    fn reject_from_scan_reaches_rejected_from_scan_indeterminate() {
+        assert_eq!(
+            allowed_targets(
+                QuarantineEvent::RejectFromScan,
+                QuarantineStatus::ScanIndeterminate
+            ),
+            Some(&[QuarantineStatus::Rejected][..])
+        );
+        assert_eq!(
+            allowed_targets(QuarantineEvent::RejectFromScan, QuarantineStatus::Rejected),
+            None
+        );
+    }
+
+    /// The two events stay distinct, which is the reason the new one
+    /// exists: `RecordCleanScan` is the guard for a scan observation
+    /// that does **not** transition the artifact, so it must keep
+    /// refusing `ScanIndeterminate` rather than acquiring a second
+    /// meaning.
+    #[test]
+    fn record_clean_scan_still_refuses_scan_indeterminate() {
+        assert_eq!(
+            allowed_targets(
+                QuarantineEvent::RecordCleanScan,
+                QuarantineStatus::ScanIndeterminate
+            ),
+            None
+        );
+    }
+
     #[test]
     fn event_label_is_stable_and_non_empty() {
         for &event in QuarantineEvent::ALL {
@@ -740,6 +845,11 @@ mod tests {
         assert!(!dot.contains("record_clean_scan"));
         // reject_from_scan is a real Quarantined -> Rejected edge.
         assert!(dot.contains("\"quarantined\" -> \"rejected\" [label=\"reject_from_scan\"]"));
+        // The exit from `scan_indeterminate` the ADR 0007 amendment
+        // opened — a real edge, so the graph must carry it.
+        assert!(dot.contains(
+            "\"scan_indeterminate\" -> \"quarantined\" [label=\"supersede_absent_verdict\"]"
+        ));
         assert!(dot.ends_with("}\n"));
     }
 }
