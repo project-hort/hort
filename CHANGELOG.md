@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-11-08
+
 ### Added
 
 - A refused OCI manifest or blob pull is now reconstructable from
