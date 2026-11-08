@@ -454,7 +454,7 @@ the result instead.
 | rustversion | 1.0.22 | MIT | https://github.com/dtolnay/rustversion |
 | semver | 1.0.28 | MIT | https://github.com/dtolnay/semver |
 | serde-saphyr | 0.0.29 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
-| serde-saphyr | 2.1.0 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
+| serde-saphyr | 2.1.1 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
 | serde | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_core | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_derive | 1.0.229 | MIT | https://github.com/serde-rs/serde |
@@ -17145,7 +17145,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde-saphyr 2.1.0 — MIT
+### serde-saphyr 2.1.1 — MIT
 
 Repository: https://github.com/bourumir-wyngs/serde-saphyr
 
