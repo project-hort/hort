@@ -621,7 +621,7 @@ impl QuarantineUseCase {
     /// Released` inline when the computed deadline has already elapsed;
     /// the window-completes-last case still leaves the artifact
     /// `Quarantined` for the `release_expired` sweep. A clean re-scan of
-    /// an artifact ALREADY terminal (`Rejected` / `Released`) is a
+    /// an artifact this guard refuses (`Rejected` or `Released`) is a
     /// recoverable, idempotent re-scan: refresh the findings projection
     /// and record a `ScanCompleted` only if its findings or policy
     /// verdict changed,
@@ -630,6 +630,21 @@ impl QuarantineUseCase {
     /// rejects the terminal state for exactly that reason). Propagating
     /// the invariant instead fails the job and loops it forever — the
     /// same churn bug the reject branch already fixes.
+    ///
+    /// **`ScanIndeterminate` is the one state that does transition**
+    /// (ADR 0007, "A reached verdict supersedes an absent one"): the
+    /// artifact is held for want of a verdict, and this is one, so
+    /// [`Artifact::supersede_absent_verdict`] returns it to
+    /// `Quarantined` and its `ArtifactQuarantined` rides the same batch
+    /// — the status change gets its own event exactly as the reject and
+    /// the inline release do. It is a FRESH transition, not an
+    /// already-terminal skip, so the score re-count applies. From there
+    /// the ordinary release gate decides: the fast path below releases
+    /// the artifact in this same batch when its window has already
+    /// elapsed and a scan-axis authority is constructible, and otherwise
+    /// the `release_expired` sweep decides on a later tick. Which half
+    /// of the verdict applies is decided by the caller, exactly as it
+    /// already is between here and the reject branch.
     async fn handle_non_rejecting_verdict(
         &self,
         artifact: &mut Artifact,
@@ -637,6 +652,31 @@ impl QuarantineUseCase {
         violations: Vec<PolicyViolation>,
         new_findings: &[Finding],
     ) -> AppResult<bool> {
+        // The hold this verdict lifts, when there is one. An artifact in
+        // `ScanIndeterminate` is held because no scanner reached a
+        // verdict; this one did and does not block, so it goes back to
+        // `Quarantined` and the release gate decides from there (ADR
+        // 0007, "A reached verdict supersedes an absent one"). Taken
+        // before `record_clean_scan`, which refuses this state by
+        // design — the two events are deliberately distinct.
+        let returned_to_hold = if artifact.quarantine_status == QuarantineStatus::ScanIndeterminate
+        {
+            let quarantined = artifact.supersede_absent_verdict(ctx.now)?;
+            tracing::info!(
+                artifact_id = %ctx.artifact_id,
+                correlation_id = %ctx.correlation_id,
+                "a reached verdict superseded an absent one: artifact returned from \
+                 scan_indeterminate to the hold, where the ordinary release gate decides"
+            );
+            Some(quarantined)
+        } else {
+            None
+        };
+        // The state guard for an observation that does not transition the
+        // artifact. The transition above has already moved a superseded
+        // artifact to `Quarantined`, which this guard accepts, so one
+        // call answers for both paths and a superseding verdict is
+        // correctly NOT an already-terminal skip.
         let already_terminal = match artifact.record_clean_scan() {
             Ok(()) => false,
             Err(DomainError::Invariant(msg)) => {
@@ -696,6 +736,20 @@ impl QuarantineUseCase {
         if ctx.verdict_changed {
             events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
                 ctx.policy_event.clone(),
+            )));
+        }
+
+        // The `ScanIndeterminate -> Quarantined` transition's own event,
+        // after the verdict that justifies it and before any release
+        // that follows from it. A status change without an event on the
+        // stream is a silent UPDATE: the reject branch appends
+        // `ArtifactRejected` and the fast path below appends
+        // `ArtifactReleased` for exactly the same reason, and the
+        // provenance-misrejection repair appends this same
+        // `ArtifactQuarantined` for its own return to the hold.
+        if let Some(quarantined) = returned_to_hold {
+            events_vec.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(
+                quarantined,
             )));
         }
 
@@ -930,7 +984,10 @@ impl QuarantineUseCase {
     ///
     /// A `Timer`- or `PolicyReEvaluation`-released artifact is NOT in
     /// that set: the verdict re-blocks it on the ordinary
-    /// fresh-transition path.
+    /// fresh-transition path. Neither is a `ScanIndeterminate` one —
+    /// an artifact held because no scanner reached a verdict is
+    /// condemned by one that blocks, exactly as a held artifact is (ADR
+    /// 0007, "A reached verdict supersedes an absent one").
     async fn handle_reject_verdict(
         &self,
         artifact: &mut Artifact,
@@ -948,12 +1005,16 @@ impl QuarantineUseCase {
 
         // Transition to `Rejected`. The domain refuses two different
         // things here, and both are recoverable: an artifact already
-        // terminal for the scan axis (`Rejected` / `ScanIndeterminate`),
+        // `Rejected` (a recorded verdict this one does not duplicate),
         // and an artifact an operator explicitly released, whose
         // decision outweighs this verdict
-        // (`ReleaseOrigin::permits_scan_reblock`). In both cases we still
-        // refresh findings and record a changed `ScanCompleted` below,
-        // and skip only the `ArtifactRejected` event and the
+        // (`ReleaseOrigin::permits_scan_reblock`). A
+        // `ScanIndeterminate` artifact is NOT in that set as of ADR
+        // 0007's "A reached verdict supersedes an absent one": it is
+        // held for want of a verdict, so a blocking one condemns it on
+        // the ordinary fresh-transition path. In both refusal cases we
+        // still refresh findings and record a changed `ScanCompleted`
+        // below, and skip only the `ArtifactRejected` event and the
         // score re-count. Propagating the invariant instead would fail
         // the job and loop it forever (the original churn bug).
         //
@@ -10241,6 +10302,419 @@ spec:
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("artifact"));
         assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    // -- A reached verdict supersedes an absent one (ADR 0007) ---------------
+    //
+    // `scan_indeterminate` is a hold: a later verdict that blocks
+    // condemns the artifact, one that does not returns it to
+    // `quarantined`, and the ordinary release gate decides from there.
+
+    /// Seed an artifact held `scan_indeterminate` together with the
+    /// stream that put it there — the `ArtifactQuarantined` its hold was
+    /// taken on, then the `ScanIndeterminate` that ended its scan
+    /// without a verdict. `anchor` is the observation-window anchor, so
+    /// a caller decides whether the window is open or elapsed.
+    ///
+    /// The stream matters as much as the row: the release gate derives
+    /// its authority from the stream, and a `ScanIndeterminate` is not a
+    /// `ScanCompleted`, so before the rescan lands there is no
+    /// scan-axis authority to be had.
+    fn seed_scan_indeterminate_artifact(
+        artifacts: &Arc<MockArtifactRepository>,
+        repositories: &Arc<MockRepositoryRepository>,
+        events: &Arc<MockEventStore>,
+        anchor: DateTime<Utc>,
+    ) -> Uuid {
+        let mut artifact = sample_artifact(QuarantineStatus::ScanIndeterminate);
+        artifact.quarantine_window_start = Some(anchor);
+        let mut repo = sample_repository();
+        repo.id = artifact.repository_id;
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        repositories.insert(repo);
+
+        let stream_id = StreamId::artifact(artifact_id);
+        let mut quarantined = dummy_persisted_event(&stream_id, artifact_id, 0);
+        quarantined.event =
+            DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+                artifact_id,
+                quarantine_window_start: anchor,
+            });
+        let mut indeterminate = dummy_persisted_event(&stream_id, artifact_id, 1);
+        indeterminate.event =
+            DomainEvent::ScanIndeterminate(hort_domain::events::ScanIndeterminate {
+                artifact_id,
+                scanner: "trivy".into(),
+                reason: "trivy=no_analyzer_matched".into(),
+                attempts: 5,
+            });
+        events.set_stream(&stream_id, vec![quarantined, indeterminate]);
+        artifact_id
+    }
+
+    /// A repo-scoped policy with a real, non-zero observation window, so
+    /// a freshly-anchored artifact is genuinely mid-window and the
+    /// inline fast-path release cannot fire.
+    fn seed_windowed_policy(
+        projections: &Arc<MockPolicyProjectionRepository>,
+        repository_id: Uuid,
+    ) -> Uuid {
+        let mut policy = projection(
+            PolicyScope::Repository(repository_id),
+            SeverityThreshold::Critical,
+        );
+        policy.quarantine_duration_secs = 24 * 3600;
+        let policy_id = policy.policy_id;
+        projections.insert(policy);
+        policy_id
+    }
+
+    /// The non-blocking half: the artifact returns to the hold, and the
+    /// `ArtifactQuarantined` that records the move rides the same batch
+    /// as the verdict that justified it. The window is still open here,
+    /// so nothing is released — which is the point of targeting the
+    /// hold rather than `released`.
+    #[tokio::test]
+    async fn record_scan_result_non_blocking_verdict_returns_scan_indeterminate_to_the_hold() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let anchor = Utc::now();
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, anchor);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_windowed_policy(&projections, repo_id);
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::NotApplicable,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "a reached non-blocking verdict returns the artifact to the hold"
+        );
+        assert!(!saved.is_downloadable(), "a hold is not downloadable");
+        let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert_eq!(
+            kinds,
+            vec!["ScanCompleted", "PolicyEvaluated", "ArtifactQuarantined"],
+            "the status change gets its own event, after the verdict that justifies it"
+        );
+        let DomainEvent::ArtifactQuarantined(ev) = &batch.events[2].event else {
+            panic!("expected ArtifactQuarantined third");
+        };
+        assert_eq!(
+            ev.quarantine_window_start, anchor,
+            "the window is restored, not restarted"
+        );
+        // A fresh transition, not an already-terminal skip: the score
+        // projection is told the artifact became quarantined.
+        let deltas = lifecycle.score_deltas();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].1.quarantined_delta, 1);
+    }
+
+    /// The blocking half: a verdict that blocks condemns a
+    /// `scan_indeterminate` artifact exactly as it condemns a held one,
+    /// through the ordinary fresh-transition path.
+    #[tokio::test]
+    async fn record_scan_result_blocking_verdict_condemns_a_scan_indeterminate_artifact() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, Utc::now());
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_windowed_policy(&projections, repo_id);
+
+        let severity = SeveritySummary {
+            critical: 1,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        };
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings_from_summary(&severity),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Rejected);
+        assert_eq!(
+            saved.rejection_reason,
+            Some(hort_domain::events::RejectionReason::Scanner)
+        );
+        assert_eq!(
+            batch
+                .events
+                .iter()
+                .filter(|e| matches!(e.event, DomainEvent::ArtifactRejected(_)))
+                .count(),
+            1,
+            "the reject is a fresh transition, not an already-terminal skip"
+        );
+        assert!(
+            !batch
+                .events
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ArtifactQuarantined(_))),
+            "a blocking verdict never routes through the hold"
+        );
+    }
+
+    /// **Unattended healing, over the whole chain.** The exemplar: a
+    /// layer blob held `scan_indeterminate` because every backend
+    /// abstained about it, whose next sweep rescan returns
+    /// `Completed { assessment: NotApplicable }` once the cause of the
+    /// abstention goes away. The verdict lands, the artifact leaves the
+    /// state, and the release gate releases it — with no `waive` and no
+    /// operator step anywhere in the sequence.
+    ///
+    /// Three assertions, because the chain has three links and the
+    /// middle one is the only one this change adds:
+    ///
+    /// 1. **Before** the verdict the ordinary sweep releases nothing —
+    ///    the stream carries a `ScanIndeterminate` and no
+    ///    `ScanCompleted`, so no scan-axis authority is constructible.
+    ///    Without this the test would pass against an artifact that was
+    ///    releasable all along.
+    /// 2. The verdict moves the artifact out of the state and into the
+    ///    hold.
+    /// 3. The release follows from the gate, under
+    ///    `ReleaseReason::Timer` and an enumerated scan-axis authority —
+    ///    not `CuratorWaiver`, which is the exit this change exists to
+    ///    stop being the only one. The artifact's window elapsed long
+    ///    ago, so the gate is applied inline in the same batch; where it
+    ///    has not, the `release_expired` sweep applies the identical
+    ///    ladder on a later tick (the sibling test below).
+    #[tokio::test]
+    async fn scan_indeterminate_heals_unattended_over_the_whole_chain() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        // The hold was taken three days ago under a one-day window, so
+        // the observation window is long over — only the missing verdict
+        // was holding the artifact.
+        let anchor = Utc::now() - chrono::Duration::days(3);
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, anchor);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_windowed_policy(&projections, repo_id);
+
+        // (1) The sweep has nothing to do with it yet.
+        let before = uc.release_expired(vec![artifact_id]).await.unwrap();
+        assert!(
+            before.released.is_empty(),
+            "an artifact held for want of a verdict is not releasable before one arrives"
+        );
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::ScanIndeterminate
+        );
+
+        // The rescan the ordinary sweep enqueues, landing its verdict.
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::NotApplicable,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // (2) + (3) — one commit, the two transitions in order.
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "ScanCompleted",
+                "PolicyEvaluated",
+                "ArtifactQuarantined",
+                "ArtifactReleased"
+            ],
+            "the artifact passes through the hold and is then released by the gate"
+        );
+        let DomainEvent::ArtifactReleased(release) = &batch.events[3].event else {
+            panic!("expected ArtifactReleased last");
+        };
+        assert_eq!(
+            release.released_by,
+            ReleaseReason::Timer,
+            "the release is the ordinary unattended one, not a curator's waiver"
+        );
+        assert!(release.released_by_user_id.is_none(), "no operator decided");
+        assert_eq!(batch.actor, system_actor());
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+        assert!(saved.is_downloadable());
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Released,
+            "the row a reader sees afterwards"
+        );
+
+        // And the sweep is idempotent over the healed artifact — the
+        // chain completed, so a later tick finds nothing to release.
+        let after = uc.release_expired(vec![artifact_id]).await.unwrap();
+        assert!(after.released.is_empty());
+    }
+
+    /// The one population that has no observation-window anchor: it
+    /// reached `scan_indeterminate` from `None` under
+    /// `quarantineDuration: 0`, so it was never time-held. It heals in
+    /// the same commit, because the hold it returns to is a window of
+    /// zero length rather than an absent one — the same "a zero window
+    /// is a window of zero length" property the provenance-misrejection
+    /// repair's permissive-strand test pins.
+    ///
+    /// The anchor is `now` and not the artifact's ingest time, which is
+    /// the fail-closed direction: an earlier anchor would be a default
+    /// substituted for missing evidence on the permissive side of a
+    /// release gate (ADR 0065 D2). Under a zero window the two agree,
+    /// and under a non-zero one the artifact serves a window instead of
+    /// skipping it.
+    #[tokio::test]
+    async fn scan_indeterminate_with_no_window_anchor_heals_in_a_permissive_repository() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let started = Utc::now();
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, started);
+        // The permissive posture these artifacts come from: no window,
+        // and a policy whose window is zero seconds long.
+        artifacts.insert({
+            let mut a = artifacts.get(artifact_id).unwrap();
+            a.quarantine_window_start = None;
+            a
+        });
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // `projection()` carries `quarantine_duration_secs: 0`.
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::NotApplicable,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "ScanCompleted",
+                "PolicyEvaluated",
+                "ArtifactQuarantined",
+                "ArtifactReleased"
+            ]
+        );
+        let DomainEvent::ArtifactQuarantined(ev) = &batch.events[2].event else {
+            panic!("expected ArtifactQuarantined third");
+        };
+        assert!(
+            ev.quarantine_window_start >= started,
+            "an artifact that never had a window is anchored now, not earlier"
+        );
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+    }
+
+    /// The same chain where the window is still open: the verdict leaves
+    /// the artifact in the hold and the release decision with the
+    /// ordinary sweep's gate, which is what "returns the artifact to
+    /// `quarantined`, never directly to `released`" buys.
+    ///
+    /// What the verdict changed is asserted through the sweep's own
+    /// authority resolution: `None` before (a `ScanIndeterminate` is not
+    /// a `ScanCompleted`), `ScanSucceeded` after. The candidacy half is
+    /// asserted beside it through
+    /// [`QuarantineUseCase::is_window_elapsed`], the anchor +
+    /// resolved-duration computation the sweep's candidate query shares
+    /// — still `false` here, so the sweep correctly has not picked the
+    /// artifact up yet and will on the tick after its window ends.
+    #[tokio::test]
+    async fn scan_indeterminate_verdict_hands_the_release_decision_to_the_sweep() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, Utc::now());
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_windowed_policy(&projections, repo_id);
+        let stream_id = StreamId::artifact(artifact_id);
+        let policy = resolve_active_policy_for_repo(&*projections, repo_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            QuarantineUseCase::resolve_release_authority(
+                &events.stream_snapshot(&stream_id),
+                policy.as_ref()
+            ),
+            None,
+            "no scan-axis authority exists while the verdict is absent"
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::NotApplicable,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let healed = artifacts.get(artifact_id).unwrap();
+        assert_eq!(
+            healed.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "the window is still running, so the artifact stays held"
+        );
+        assert!(
+            !uc.is_window_elapsed(&healed).await.unwrap(),
+            "the sweep's candidacy filter has not reached this artifact yet"
+        );
+        assert!(!lifecycle.committed_transitions()[0]
+            .1
+            .events
+            .iter()
+            .any(|e| matches!(e.event, DomainEvent::ArtifactReleased(_))));
+
+        assert_eq!(
+            QuarantineUseCase::resolve_release_authority(
+                &events.stream_snapshot(&stream_id),
+                policy.as_ref()
+            ),
+            Some(ReleaseAuthorization::ScanSucceeded),
+            "what the verdict changed: the authority the sweep will release under"
+        );
     }
 
     /// Commit failure propagates (the atomic event+state append failed).

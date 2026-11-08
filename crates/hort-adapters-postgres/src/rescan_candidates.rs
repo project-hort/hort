@@ -25,15 +25,18 @@
 //! batch slot a real candidate then does not get, which is how a backlog
 //! of deleted rows can starve rescanning outright.
 //!
-//! Also implements `select_stranded` (issue #6; widened by issue #115
-//! defect (a) cure) — a companion eligibility query for
-//! `quarantine_status='quarantined'` artifacts whose scan either could
-//! not run at all (every backend errored, exhausted retries) OR was
-//! never even requested (no `kind='scan'` job row exists — the
-//! seed-import stranding gap item1 of #115 stops at the source; this
-//! sweep recovers artifacts already stranded that way before that fix),
-//! gated by the same resolved-policy-scans guard `select_eligible` uses
-//! so a `scan_backends: []` (ScanWaived) artifact is never treated as
+//! Also implements `select_stranded` (ADR 0007's retry-exhaustion split,
+//! its later widening to artifacts with no scan job at all, and its "A
+//! reached verdict supersedes an absent one" amendment) — a companion
+//! eligibility query for
+//! `quarantine_status IN ('quarantined', 'scan_indeterminate')`
+//! artifacts whose scan either could not run at all (every backend
+//! errored, exhausted retries) OR was never even requested (no
+//! `kind='scan'` job row exists — the seed-import path no longer strands
+//! artifacts that way, and this sweep recovers the ones it stranded
+//! before that fix), gated by the same
+//! resolved-policy-scans guard `select_eligible` uses so a
+//! `scan_backends: []` (ScanWaived) artifact is never treated as
 //! stranded. See the port's module doc and this impl's `select_stranded`
 //! doc comment.
 //!
@@ -229,10 +232,34 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
             // tick off (`scheduledTasks.cronRescanTick.enabled:
             // false`).
             //
-            // `quarantine_status = 'quarantined'` (NOT `'released'`/`NULL`
-            // — that's `select_eligible`'s predicate, and NOT
-            // `'scan_indeterminate'`/`'rejected'` — those are terminal,
-            // ADR 0007, never auto-rescanned). The
+            // `quarantine_status IN ('quarantined', 'scan_indeterminate')`
+            // — NOT `'released'`/`NULL`, that's `select_eligible`'s
+            // predicate, and NOT `'rejected'`.
+            //
+            // `scan_indeterminate` is in scope because an artifact held
+            // for want of a scan verdict accepts one that is reached
+            // (ADR 0007, "A reached verdict supersedes an absent one"):
+            // a non-blocking verdict returns it to the hold and a
+            // blocking one condemns it, so a rescan has somewhere to
+            // land. A state nothing re-picks is terminal in practice
+            // whatever the transition table says, which is why the two
+            // halves are one decision — this query IS the mechanism that
+            // delivers the healing, since there is no per-artifact
+            // operator rescan surface that bypasses it. Soft-deleted
+            // rows stay excluded for both statuses (`a.deleted_at IS
+            // NULL`, which `live_reads_exclude_deleted` governs).
+            //
+            // `rejected` stays excluded, and the asymmetry is the point:
+            // a recorded rejection is a positive statement about the
+            // artifact and stays terminal, while an absent verdict is a
+            // statement about hort's own coverage. `re_evaluate` is the
+            // exit from the former and this sweep is not.
+            //
+            // The resolved-policy-scans guard below keeps a
+            // `scan_backends: []` scope out of both statuses, and a
+            // deterministic abstention re-answers the same way: the
+            // artifact's job row goes `failed` again and it is re-picked
+            // on the NEXT tick, never in a loop inside one. The
             // in-flight exclusion reuses the same shape as
             // `select_eligible` and is covered by the existing
             // `jobs_scan_unique` partial unique index (migration 009).
@@ -269,7 +296,7 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                     ORDER BY (pp.scope ? 'Repository') DESC
                     LIMIT 1
                 ) p ON TRUE
-                WHERE a.quarantine_status = 'quarantined'
+                WHERE a.quarantine_status IN ('quarantined', 'scan_indeterminate')
                   AND a.deleted_at IS NULL
                   AND (last_job.status = 'failed' OR last_job.status IS NULL)
                   AND COALESCE(cardinality(p.scan_backends), $2) > 0

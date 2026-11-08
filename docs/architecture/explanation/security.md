@@ -460,9 +460,10 @@ pattern and the optimistic-concurrency guarantee.
 > (repo-scoped or global) policy via `PolicyProjectionRepository`.
 > Release is fail-closed in `hort-domain`
 > ([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)):
-> `Artifact::release()` is deny-by-default and the terminal
+> `Artifact::release()` is deny-by-default and the
 > `ScanIndeterminate` state holds artifacts whose scan never
-> succeeded. The timer sweep derives its release authority from the
+> succeeded — a hold a later reached verdict lifts, in either
+> direction, and never a timer. The timer sweep derives its release authority from the
 > artifact's own stream and resolved policy (a successful
 > `ScanCompleted` → `ScanSucceeded`, a `scan_backends: []` policy
 > → `ScanWaived`, or a scanned artifact under an

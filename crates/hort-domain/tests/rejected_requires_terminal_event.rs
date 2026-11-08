@@ -153,6 +153,16 @@ fn classify(event: QuarantineEvent) -> RejectedArmVerdict {
         // `Artifact::repair_provenance_misrejection` (which asks the same
         // `has_terminal_rejection_event` predicate this file does).
         QuarantineEvent::RepairProvenanceMisrejection => Unreachable,
+        // ADR 0007's "A reached verdict supersedes an absent one": the
+        // non-blocking half of a verdict reached for an artifact held
+        // for want of one. Leaves `ScanIndeterminate` for `Quarantined`
+        // and reaches no other state, so it can never create the
+        // condition this guard polices. The BLOCKING half of the same
+        // verdict is `RejectFromScan`, which does reach `Rejected` —
+        // from `ScanIndeterminate` as of the same amendment — and is
+        // classified `Compliant` below, so the new source state is
+        // covered by the entity method this file already exercises.
+        QuarantineEvent::SupersedeAbsentVerdict => Unreachable,
 
         // ── reach Rejected, and append ArtifactRejected ──────────────────
         // The scan axis (`QuarantineUseCase`).
@@ -283,7 +293,8 @@ fn exercise(event: QuarantineEvent) -> Vec<DomainEvent> {
         | QuarantineEvent::CascadeProvenanceClearance
         | QuarantineEvent::FailScanIndeterminate
         | QuarantineEvent::ReEvaluate
-        | QuarantineEvent::RepairProvenanceMisrejection => {
+        | QuarantineEvent::RepairProvenanceMisrejection
+        | QuarantineEvent::SupersedeAbsentVerdict => {
             unreachable!(
                 "exercise({event:?}) called for an event classified Unreachable — \
                  the main test only calls exercise() for the other two verdicts"
