@@ -28,7 +28,6 @@ use hort_domain::events::{
     ScanCompleted, SeveritySummary, StreamId,
 };
 use hort_domain::ports::event_store::{EventStore, ReadFrom};
-use hort_domain::ports::repo_security_score_repository::RepoSecurityScore;
 use hort_domain::ports::retention_scan_reader::{FirstObservations, RetentionScanReader};
 use hort_domain::ports::BoxFuture;
 use hort_domain::retention::{
@@ -53,8 +52,6 @@ fn ts(secs: i64) -> DateTime<Utc> {
 struct MockRetentionScanReader {
     findings: Mutex<Vec<Finding>>,
     findings_err: Mutex<bool>,
-    score: Mutex<Option<RepoSecurityScore>>,
-    score_err: Mutex<bool>,
     /// Our own first observation of each vulnerability, as the Postgres
     /// reader's `MIN(scan_findings.detected_at)` per pair would answer:
     /// lowercased id → date, and **absent means never observed**.
@@ -74,16 +71,8 @@ impl MockRetentionScanReader {
         *self.findings.lock().unwrap() = f;
         self
     }
-    fn with_score(self, s: RepoSecurityScore) -> Self {
-        *self.score.lock().unwrap() = Some(s);
-        self
-    }
     fn with_findings_err(self) -> Self {
         *self.findings_err.lock().unwrap() = true;
-        self
-    }
-    fn with_score_err(self) -> Self {
-        *self.score_err.lock().unwrap() = true;
         self
     }
     fn with_first_observed(self, observed: Vec<(&str, DateTime<Utc>)>) -> Self {
@@ -114,20 +103,6 @@ impl RetentionScanReader for MockRetentionScanReader {
                 Err(DomainError::Invariant("findings read failed".into()))
             } else {
                 Ok(f)
-            }
-        })
-    }
-    fn repo_security_score(
-        &self,
-        _repo_id: Uuid,
-    ) -> BoxFuture<'_, DomainResult<Option<RepoSecurityScore>>> {
-        let err = *self.score_err.lock().unwrap();
-        let s = self.score.lock().unwrap().clone();
-        Box::pin(async move {
-            if err {
-                Err(DomainError::Invariant("score read failed".into()))
-            } else {
-                Ok(s)
             }
         })
     }
@@ -181,21 +156,6 @@ fn finding(sev: SeverityThreshold, cvss: Option<f32>, fixed: Vec<&str>) -> Findi
         component_relation: ComponentRelation::NotEstablished,
         statement: hort_domain::types::FindingStatement::Unstated,
         advisory_published_at: None,
-    }
-}
-
-fn score(repo_id: Uuid, last_scan_at: Option<DateTime<Utc>>) -> RepoSecurityScore {
-    RepoSecurityScore {
-        repository_id: repo_id,
-        quarantined_count: 0,
-        rejected_count: 0,
-        released_count: 1,
-        critical_count: 0,
-        high_count: 1,
-        medium_count: 0,
-        low_count: 0,
-        last_scan_at,
-        updated_at: Utc::now(),
     }
 }
 
@@ -473,7 +433,7 @@ fn seed_stream_of_length(store: &MockEventStore, c: &RetentionCandidate, total: 
 }
 
 /// A stream sitting exactly ON the cap still reads completely — so the
-/// predicate matches — but the append that would take it to 201 events is
+/// predicate matches — but the append that would take it past the cap is
 /// refused. The pair is reported as an error (the sweep keeps going) and
 /// NOTHING is appended.
 #[tokio::test]
@@ -481,7 +441,7 @@ async fn expiry_append_refuses_a_stream_already_at_the_event_cap() {
     let (uc, store) = build(MockRetentionScanReader::new());
     let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
     let c = candidate(QuarantineStatus::Released, ts(0));
-    seed_stream_of_length(&store, &c, 200);
+    seed_stream_of_length(&store, &c, crate::use_cases::STREAM_EVENT_CAP);
 
     let report = uc
         .evaluate_policies_in_mode(
@@ -513,7 +473,7 @@ async fn expiry_append_still_lands_one_event_short_of_the_cap() {
     let (uc, store) = build(MockRetentionScanReader::new());
     let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
     let c = candidate(QuarantineStatus::Released, ts(0));
-    seed_stream_of_length(&store, &c, 199);
+    seed_stream_of_length(&store, &c, crate::use_cases::STREAM_EVENT_CAP - 1);
 
     let report = uc
         .evaluate_policies_in_mode(
@@ -550,14 +510,18 @@ async fn evaluation_refuses_a_stream_already_past_the_event_cap() {
     let (uc, store) = build(MockRetentionScanReader::new());
     let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
     let c = candidate(QuarantineStatus::Released, ts(0));
-    let stream_id = seed_stream_of_length(&store, &c, 201);
+    let stream_id = seed_stream_of_length(&store, &c, crate::use_cases::STREAM_EVENT_CAP + 1);
     let mut stream = store
-        .read_stream(&stream_id, ReadFrom::Start, 1_000)
+        .read_stream(
+            &stream_id,
+            ReadFrom::Start,
+            crate::use_cases::STREAM_EVENT_CAP + 2,
+        )
         .await
         .unwrap();
     stream.push(persisted(
         &stream_id,
-        201,
+        crate::use_cases::STREAM_EVENT_CAP + 1,
         c.artifact.created_at,
         DomainEvent::ArtifactExpired(hort_domain::events::ArtifactExpired {
             artifact_id: c.artifact.id,
@@ -570,7 +534,7 @@ async fn evaluation_refuses_a_stream_already_past_the_event_cap() {
             eligible_at: ts(900),
         }),
     ));
-    assert_eq!(stream.len(), 202);
+    assert_eq!(stream.len() as u64, crate::use_cases::STREAM_EVENT_CAP + 2);
     store.set_stream(&stream_id, stream);
 
     let report = uc
@@ -593,7 +557,7 @@ async fn evaluation_refuses_a_stream_already_past_the_event_cap() {
     assert!(
         report.matches.is_empty(),
         "a stream that cannot be read completely yields no decision at all, not a \
-         decision derived from its oldest 200 events — which here would be a second \
+         decision derived from its oldest capped prefix — which here would be a second \
          ArtifactExpired for a policy that already expired this artifact"
     );
 }
@@ -722,14 +686,13 @@ async fn inv7_fresh_scan_allows_security_predicate() {
 #[tokio::test]
 async fn inv7_stale_scan_skips_security_predicate_not_an_error() {
     let repo_id = Uuid::new_v4();
-    // last_scan 100h ago, 24h interval → 48h window → STALE.
-    let reader = MockRetentionScanReader::new()
-        .with_findings(vec![finding(
-            SeverityThreshold::Critical,
-            Some(9.8),
-            vec![],
-        )])
-        .with_score(score(repo_id, Some(ts(1_000_000) - Duration::hours(100))));
+    // Genesis only on the stream — no ScanCompleted to prove freshness
+    // against, so the gate trips and the security predicate is skipped.
+    let reader = MockRetentionScanReader::new().with_findings(vec![finding(
+        SeverityThreshold::Critical,
+        Some(9.8),
+        vec![],
+    )]);
     let (uc, store) = build(reader);
     let mut c = candidate(QuarantineStatus::Released, ts(0));
     c.artifact.repository_id = repo_id;
@@ -749,7 +712,7 @@ async fn inv7_stale_scan_skips_security_predicate_not_an_error() {
 }
 
 #[tokio::test]
-async fn inv7_no_score_row_treats_security_predicate_as_stale() {
+async fn inv7_unscanned_artifact_treats_security_predicate_as_stale() {
     let reader = MockRetentionScanReader::new().with_findings(vec![finding(
         SeverityThreshold::Critical,
         Some(9.8),
@@ -771,15 +734,13 @@ async fn inv7_no_score_row_treats_security_predicate_as_stale() {
 }
 
 #[tokio::test]
-async fn inv7_score_row_without_last_scan_is_stale() {
+async fn inv7_unscanned_artifact_is_stale_for_fix_available() {
     let repo_id = Uuid::new_v4();
-    let reader = MockRetentionScanReader::new()
-        .with_findings(vec![finding(
-            SeverityThreshold::Critical,
-            Some(9.8),
-            vec![],
-        )])
-        .with_score(score(repo_id, None));
+    let reader = MockRetentionScanReader::new().with_findings(vec![finding(
+        SeverityThreshold::Critical,
+        Some(9.8),
+        vec![],
+    )]);
     let (uc, store) = build(reader);
     let mut c = candidate(QuarantineStatus::Released, ts(0));
     c.artifact.repository_id = repo_id;
@@ -790,32 +751,6 @@ async fn inv7_score_row_without_last_scan_is_stale() {
         .await
         .unwrap();
     assert_eq!(s.skipped_stale_scan, 1);
-}
-
-#[tokio::test]
-async fn inv7_score_read_error_fails_safe_to_stale() {
-    let reader = MockRetentionScanReader::new()
-        .with_findings(vec![finding(
-            SeverityThreshold::Critical,
-            Some(9.8),
-            vec![],
-        )])
-        .with_score_err();
-    let (uc, store) = build(reader);
-    let c = candidate(QuarantineStatus::Released, ts(0));
-    seed_stream(&store, &c, IngestSource::Proxied, vec![]);
-    let p = policy(
-        PolicyPredicate::HasFindingAboveCvss(1.0),
-        RetentionScope::AllRepos,
-    );
-    let s = uc
-        .evaluate_policies(ts(1_000_000), &[p], &[c])
-        .await
-        .unwrap();
-    // Score-read failure → cannot prove freshness → treated as stale,
-    // NOT a hard error (the security predicate just does not run).
-    assert_eq!(s.skipped_stale_scan, 1);
-    assert_eq!(s.errors, 0);
 }
 
 #[tokio::test]
@@ -836,28 +771,25 @@ async fn inv7_does_not_gate_non_security_predicate() {
 }
 
 // ===========================================================================
-// The scan-data freshness gate is PER-ARTIFACT. The repo_security_score
-// .last_scan_at is a per-repo MAX — a fresh scan on a *different*
-// artifact in the same repo must NOT make THIS artifact look fresh.
-// The freshness signal is this artifact's most-recent ScanCompleted
-// on its own stream (`latest_scan_at`), tightened from the weaker
-// repo-score reading.
+// The scan-data freshness gate is PER-ARTIFACT. A per-repo
+// MAX(last_scan_at) — the shape the repo_security_scores projection
+// carries — would let a fresh scan on a *different* artifact in the same
+// repo make THIS artifact look fresh. So the freshness signal is this
+// artifact's own most-recent ScanCompleted on its own stream
+// (`latest_scan_at`), and the evaluator reads no per-repo aggregate.
 // ===========================================================================
 
 #[tokio::test]
-async fn inv7_per_artifact_stale_even_when_repo_score_is_fresh() {
+async fn inv7_stale_scan_on_own_stream_skips_predicate() {
     let repo_id = Uuid::new_v4();
-    // repo_security_score.last_scan_at is FRESH (1h ago) — a scan on
-    // some OTHER artifact in the same repo. The per-repo MAX must NOT
-    // rescue THIS artifact, whose own latest ScanCompleted is 200h old
-    // (>> 2×24h window) → stale → security predicate skipped.
-    let reader = MockRetentionScanReader::new()
-        .with_findings(vec![finding(
-            SeverityThreshold::Critical,
-            Some(9.8),
-            vec![],
-        )])
-        .with_score(score(repo_id, Some(ts(1_000_000) - Duration::hours(1))));
+    // This artifact's own latest ScanCompleted is 200h old (>> the
+    // 2×24h window) → stale → security predicate skipped. Activity on
+    // other artifacts in the same repo is not consulted at all.
+    let reader = MockRetentionScanReader::new().with_findings(vec![finding(
+        SeverityThreshold::Critical,
+        Some(9.8),
+        vec![],
+    )]);
     let (uc, store) = build(reader);
     let mut c = candidate(QuarantineStatus::Released, ts(0));
     c.artifact.repository_id = repo_id;
@@ -890,8 +822,8 @@ async fn inv7_per_artifact_stale_even_when_repo_score_is_fresh() {
         .unwrap();
     assert_eq!(
         s.skipped_stale_scan, 1,
-        "per-artifact freshness: a fresh repo-score MAX must not rescue \
-         an artifact whose own latest scan is stale"
+        "per-artifact freshness: an artifact whose own latest scan is \
+         stale is skipped, whatever its repository's other artifacts did"
     );
     assert_eq!(s.expired, 0, "stale artifact must NOT be expired");
     assert_eq!(s.errors, 0, "stale is NOT an error");
@@ -901,9 +833,9 @@ async fn inv7_per_artifact_stale_even_when_repo_score_is_fresh() {
 #[tokio::test]
 async fn inv7_per_artifact_fresh_scan_on_own_stream_allows_predicate() {
     let repo_id = Uuid::new_v4();
-    // No repo-score row at all (would have been STALE under the old
-    // per-repo reading) — but THIS artifact has a FRESH ScanCompleted
-    // on its own stream → per-artifact freshness allows the predicate.
+    // THIS artifact has a FRESH ScanCompleted on its own stream, which
+    // is the only thing the gate reads → the predicate is allowed to
+    // run.
     let reader = MockRetentionScanReader::new().with_findings(vec![finding(
         SeverityThreshold::Critical,
         Some(9.8),
@@ -945,16 +877,14 @@ async fn inv7_per_artifact_fresh_scan_on_own_stream_allows_predicate() {
 #[tokio::test]
 async fn inv7_per_artifact_no_scan_on_stream_is_stale_fail_safe() {
     let repo_id = Uuid::new_v4();
-    // Fresh repo-score MAX, but THIS artifact has NO ScanCompleted on
-    // its stream at all → cannot prove per-artifact freshness → stale
-    // (fail-safe: never expire on an unprovable security predicate).
-    let reader = MockRetentionScanReader::new()
-        .with_findings(vec![finding(
-            SeverityThreshold::Critical,
-            Some(9.8),
-            vec![],
-        )])
-        .with_score(score(repo_id, Some(ts(1_000_000) - Duration::hours(1))));
+    // THIS artifact has NO ScanCompleted on its stream at all → cannot
+    // prove per-artifact freshness → stale (fail-safe: never expire on
+    // an unprovable security predicate).
+    let reader = MockRetentionScanReader::new().with_findings(vec![finding(
+        SeverityThreshold::Critical,
+        Some(9.8),
+        vec![],
+    )]);
     let (uc, store) = build(reader);
     let mut c = candidate(QuarantineStatus::Released, ts(0));
     c.artifact.repository_id = repo_id;
@@ -1618,8 +1548,7 @@ async fn detected_for_never_scanned_artifact_is_skipped_per_inv7() {
     let repo_id = Uuid::new_v4();
     let reader = MockRetentionScanReader::new()
         .with_findings(vec![finding(SeverityThreshold::High, Some(7.0), vec![])])
-        .with_first_observed(vec![("cve-1", ts(0))])
-        .with_score(score(repo_id, Some(now - Duration::hours(1))));
+        .with_first_observed(vec![("cve-1", ts(0))]);
     let (uc, store) = build(reader);
     // Only the genesis on the stream — no scan event at all.
     let mut c = candidate(QuarantineStatus::Released, ts(0));
@@ -1632,8 +1561,7 @@ async fn detected_for_never_scanned_artifact_is_skipped_per_inv7() {
     let s = uc.evaluate_policies(now, &[p], &[c]).await.unwrap();
     assert_eq!(
         s.skipped_stale_scan, 1,
-        "never-scanned artifact: per-artifact freshness gate fail-safe skip \
-         (a fresh repo-score MAX must not rescue it)"
+        "never-scanned artifact: per-artifact freshness gate fail-safe skip"
     );
     assert_eq!(s.expired, 0, "never-scanned → must NOT expire");
     assert!(store.appended_batches().is_empty());
@@ -1872,9 +1800,7 @@ async fn archived_policy_is_not_evaluated() {
 #[tokio::test]
 async fn findings_read_error_is_recorded_and_sweep_continues() {
     let repo_id = Uuid::new_v4();
-    let reader = MockRetentionScanReader::new()
-        .with_findings_err()
-        .with_score(score(repo_id, Some(ts(1_000_000) - Duration::hours(1))));
+    let reader = MockRetentionScanReader::new().with_findings_err();
     let (uc, store) = build(reader);
     let mut c1 = candidate(QuarantineStatus::Released, ts(0));
     c1.artifact.repository_id = repo_id;
@@ -1962,13 +1888,11 @@ mod metrics {
         let pid = Uuid::new_v4();
         let snap = run(move || {
             Box::pin(async move {
-                let reader = MockRetentionScanReader::new()
-                    .with_findings(vec![finding(
-                        SeverityThreshold::Critical,
-                        Some(9.0),
-                        vec![],
-                    )])
-                    .with_score(score(repo_id, Some(ts(1_000_000) - Duration::hours(200))));
+                let reader = MockRetentionScanReader::new().with_findings(vec![finding(
+                    SeverityThreshold::Critical,
+                    Some(9.0),
+                    vec![],
+                )]);
                 let store = Arc::new(MockEventStore::new());
                 let uc = RetentionUseCase::new(wrap_for_test(store.clone()), Arc::new(reader));
                 let p = RetentionPolicy::project(&[RetentionPolicyEvent::Created {

@@ -152,11 +152,12 @@ use hort_domain::entities::rbac::Permission;
 use hort_domain::entities::repository::{Repository, RepositoryFormat, RepositoryType};
 use hort_domain::error::DomainError;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::{
     RepositoryUpstreamMapping, RepositoryUpstreamMappingRepository,
 };
+use hort_domain::types::task_tier::queue_priority;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
@@ -216,10 +217,12 @@ const TOKEN_KIND_DENIED_MESSAGE: &str =
 const PREFETCH_INGEST_KIND: &str = "prefetch";
 
 /// `trigger_source` value passed to [`JobsRepository::enqueue_task`]
-/// for self-service enqueues. Distinguishes operator-initiated
-/// prefetches from cascade-initiated ones (`"ingest"` from the
-/// register-by-hash cascade), supporting operator-side audit.
-const PREFETCH_TRIGGER_SOURCE: &str = "self_service";
+/// for self-service enqueues, taken from the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]).
+/// Distinguishes operator-initiated prefetches from cascade-initiated
+/// ones, supporting operator-side audit. Note the underscore: the wire
+/// literal is `self_service`, not `self-service`.
+const PREFETCH_TRIGGER_SOURCE: &str = TriggerSource::SelfService.as_str();
 
 /// Application use case for the repo-keyed self-service prefetch
 /// endpoint.
@@ -870,8 +873,7 @@ impl SelfServicePrefetchUseCase {
         // `IngestUseCase` on-ingest hook, gated on the repo's
         // `TransitiveDeps` trigger.
         //
-        // priority is `0i16` (operator-initiated prefetches are not
-        // high-priority); trigger_source is `"self_service"`, which the
+        // trigger_source is `"self_service"`, which the
         // migration-009 comment frames as the operator-initiated ROOT
         // enqueue — distinct from the cascade-spawned `"prefetch"`
         // children (an unexpectedly high `self_service` rate is a
@@ -888,7 +890,7 @@ impl SelfServicePrefetchUseCase {
                 PREFETCH_INGEST_KIND,
                 &params,
                 None,
-                0i16,
+                queue_priority(PREFETCH_INGEST_KIND, PREFETCH_TRIGGER_SOURCE),
                 PREFETCH_TRIGGER_SOURCE,
                 None, // non-destructive — no DB-side idempotency key (ADR 0028)
             )
@@ -1495,57 +1497,50 @@ mod tests {
     // H7 regression guard — code↔schema trigger_source drift
     // ============================================================
 
-    /// Extract the `trigger_source IN ( … )` allowed-value set from a
-    /// migration's SQL. Strips `--` comments first (the explanatory
-    /// comments inside the `IN(...)` block contain parens that would
-    /// otherwise truncate a naive close-paren scan), then collects the
-    /// single-quoted tokens.
-    fn parse_trigger_source_check(sql: &str) -> Vec<String> {
-        let start = sql
-            .find("trigger_source IN (")
-            .expect("migration must define `trigger_source IN (...)`");
-        let non_comment: String = sql[start..]
-            .lines()
-            .map(|l| match l.find("--") {
-                Some(i) => &l[..i],
-                None => l,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let close = non_comment
-            .find(')')
-            .expect("unterminated `trigger_source IN (...)`");
-        let block = &non_comment[..close];
-        let mut out = Vec::new();
-        let mut rest = block;
-        while let Some(open) = rest.find('\'') {
-            rest = &rest[open + 1..];
-            match rest.find('\'') {
-                Some(end) => {
-                    out.push(rest[..end].to_string());
-                    rest = &rest[end + 1..];
-                }
-                None => break,
-            }
-        }
-        out
-    }
-
+    /// H7: the `trigger_source` this use case writes must be a value the
+    /// `jobs.trigger_source` column accepts, or every enqueue 500s on a
+    /// `23514` constraint violation. rc.5 shipped the code fix
+    /// (`PREFETCH_TRIGGER_SOURCE = "self_service"`) but NOT the schema
+    /// value, and this guard is what catches that class of drift in the
+    /// DB-free `--lib` gate.
+    ///
+    /// It used to prove the point by parsing
+    /// `migrations/009_scan_jobs_and_findings.sql` with a local scanner.
+    /// Two things were wrong with that, and both are why it is gone:
+    ///
+    /// - **it read the wrong list.** 009's inline CHECK is what a *fresh*
+    ///   install starts from. The list a migrated database enforces is
+    ///   the one defined by the newest migration that defines it, so a
+    ///   later redefinition would have left this test asserting against
+    ///   a set no running database had.
+    /// - **it was a second parser of the same CHECK**, in a use case,
+    ///   which is one more place the set was spoken.
+    ///
+    /// So the assertion is now against
+    /// [`TriggerSource`](hort_domain::ports::jobs_repository::TriggerSource),
+    /// the one definition of the set — and the SQL side is bound to that
+    /// type, over the *effective* list, by
+    /// `crates/hort-adapters-postgres/tests/jobs_trigger_source_check_lockstep_guard.rs`.
+    /// Membership in the type therefore transitively proves CHECK
+    /// membership, without this file parsing any SQL.
     #[test]
-    fn prefetch_trigger_source_is_allowed_by_jobs_check_constraint() {
-        // H7: the `trigger_source` the self-service use case writes MUST
-        // be in migration 009's `jobs_trigger_source_check` IN-list, or
-        // every enqueue 500s on a constraint violation. rc.5 shipped the
-        // code fix (`PREFETCH_TRIGGER_SOURCE = "self_service"`) but NOT
-        // the schema value — this DB-free guard catches that code↔schema
-        // drift in the standard `--lib` gate, before it reaches a DB.
-        let migration = include_str!("../../../../migrations/009_scan_jobs_and_findings.sql");
-        let allowed = parse_trigger_source_check(migration);
-        assert!(
-            allowed.iter().any(|v| v == PREFETCH_TRIGGER_SOURCE),
-            "self-service trigger_source `{PREFETCH_TRIGGER_SOURCE}` is not in \
-             jobs_trigger_source_check {allowed:?} — extend migration 009"
+    fn prefetch_trigger_source_is_a_member_of_the_trigger_source_set() {
+        let parsed: TriggerSource = PREFETCH_TRIGGER_SOURCE.parse().unwrap_or_else(|e| {
+            panic!(
+                "self-service trigger_source `{PREFETCH_TRIGGER_SOURCE}` is not a \
+                 trigger-source literal: {e}"
+            )
+        });
+        assert_eq!(
+            parsed.as_str(),
+            PREFETCH_TRIGGER_SOURCE,
+            "the constant must be the variant's own wire literal"
         );
+        // The wire literal itself, pinned: `self_service` with an
+        // underscore. `self-service` is the near-miss the hyphenated
+        // siblings (`seed-import`, `register-by-hash`) invite, and it is
+        // not in the set.
+        assert_eq!(PREFETCH_TRIGGER_SOURCE, "self_service");
     }
 
     // ============================================================

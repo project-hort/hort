@@ -667,6 +667,15 @@ impl PurgeUseCase {
             })
             .collect();
         let event_count = purged_refs.len() as u64;
+        // ONCE-ONLY-APPEND: `ArtifactPurged` is the artifact's terminal
+        // event, one per content hash the worklist named, and
+        // `complete_artifact_purge` retires the projection row in the
+        // same transaction as the append — so the worklist that produced
+        // this batch is gone before anything can offer it again. The
+        // events record storage deletions that have already happened, and
+        // nothing reads an artifact's stream after its terminal event, so
+        // refusing them at the cap would drop the only record of the
+        // deletion while leaving the bytes deleted.
         let batch = AppendEvents {
             stream_id: StreamId::artifact(item.artifact_id),
             expected_version: ExpectedVersion::Any,

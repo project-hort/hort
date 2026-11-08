@@ -50,6 +50,82 @@ struct DownloadAuditGate {
     events: Arc<EventStorePublisher>,
 }
 
+// ---------------------------------------------------------------------------
+// Where an artifact's upload-payload metadata lives — the one answer
+// ---------------------------------------------------------------------------
+
+/// Resolve the full upload-payload metadata for an artifact row,
+/// transparently following a `metadata_blob` reference when present.
+///
+/// Two shapes:
+/// - `row.metadata_blob == None` — the row's `metadata` field IS the
+///   full payload (it fit in the `ArtifactIngested` event). Returned
+///   verbatim; no CAS round-trip.
+/// - `row.metadata_blob == Some(hash)` — the row's `metadata` holds at
+///   most the handler-extracted summary and the full payload lives in
+///   CAS. Stream the blob, collect, deserialise.
+///
+/// **This is the only place in production that reads either of those
+/// two fields**, enforced by
+/// `crates/hort-app/tests/payload_metadata_reads_use_the_accessor.rs`.
+/// Ask unconditionally: the `None` arm is a clone with no I/O, so a
+/// caller gains nothing by checking first and takes on a case
+/// distinction that keeps changing — which rows are blob-backed is not
+/// fixed, and a spilled row whose summary did not fit either leaves
+/// `metadata` as `Null`, so a hand-rolled `else` arm serves a reader
+/// nothing.
+///
+/// **There is no "summary fields are enough" shortcut.** A reader that
+/// wants one field (`requires_python` off PyPI's `pkg_info`, OCI's
+/// `oci_media_type`, the SBOM input for a Tier-A scan) still comes
+/// through here, because a row's `metadata` is not a summary by
+/// construction: for a format whose strategy is
+/// `MetadataStrategy::Inline` there is no summary extractor at all, so
+/// the spill leaves `Null` and a direct read yields no field rather
+/// than a smaller one. Those three readers each used to take the
+/// shortcut, and each answered a client with silence — an omitted
+/// `data-requires-python`, a default media type, an empty SBOM — in
+/// exactly the case where the payload was largest.
+///
+/// Takes the port rather than a use case so that a caller holding only
+/// outbound ports reaches it: `ScanOrchestrationUseCase` has a
+/// `StoragePort` and an `ArtifactMetadataRepository` and no
+/// `ArtifactUseCase`, and the alternative — letting it resolve the pair
+/// itself off its own `storage` — is the second answer this function
+/// exists to prevent. [`ArtifactUseCase::load_full_metadata`] is the
+/// method wrapper the HTTP format crates call, since `AppContext`'s
+/// `storage` is `pub(crate)` and off-limits to them (ADR 0008).
+///
+/// A malformed blob in CAS surfaces as [`AppError::Storage`] (not
+/// Domain) because the CAS write-time SHA-256 guarantee has held but
+/// the bytes no longer round-trip as JSON — that's an integrity
+/// failure of the blob store, not a business-logic error. The
+/// message is intentionally terse; the blob hash is in the row the
+/// caller already holds, and surfacing it in the error string would
+/// leak the addressable identifier into error-channel logs.
+#[tracing::instrument(skip(storage, row), fields(artifact_id = %row.artifact_id))]
+pub(crate) async fn load_full_metadata(
+    storage: &dyn StoragePort,
+    row: &ArtifactMetadata,
+) -> AppResult<serde_json::Value> {
+    match &row.metadata_blob {
+        None => Ok(row.metadata.clone()),
+        Some(hash) => {
+            let mut stream = storage
+                .get(hash)
+                .await
+                .map_err(|e| AppError::Storage(e.to_string()))?;
+            let mut buf = Vec::new();
+            stream
+                .read_to_end(&mut buf)
+                .await
+                .map_err(|e| AppError::Storage(format!("metadata blob read failed: {e}")))?;
+            serde_json::from_slice(&buf)
+                .map_err(|_| AppError::Storage("metadata blob deserialisation failed".into()))
+        }
+    }
+}
+
 /// Application use case for artifact read, download, and delete operations.
 pub struct ArtifactUseCase {
     artifacts: Arc<dyn ArtifactRepository>,
@@ -616,44 +692,14 @@ impl ArtifactUseCase {
     /// Resolve the full upload-payload metadata for an artifact row,
     /// transparently following a `metadata_blob` reference when present.
     ///
-    /// Two shapes:
-    /// - `row.metadata_blob == None` — the row's `metadata` field IS the
-    ///   full payload (Inline strategy, or HashReference under the inline
-    ///   threshold). Returned verbatim; no CAS round-trip.
-    /// - `row.metadata_blob == Some(hash)` — the row's `metadata` holds the
-    ///   handler-extracted summary and the full payload lives in CAS.
-    ///   Stream the blob, collect, deserialise.
-    ///
-    /// Callers that only need summary fields (index listings,
-    /// `data-requires-python`) read `row.metadata` directly and never call
-    /// this helper — summary sufficiency is a handler contract.
-    ///
-    /// A malformed blob in CAS surfaces as [`AppError::Storage`] (not
-    /// Domain) because the CAS write-time SHA-256 guarantee has held but
-    /// the bytes no longer round-trip as JSON — that's an integrity
-    /// failure of the blob store, not a business-logic error. The
-    /// message is intentionally terse; the blob hash is in the row the
-    /// caller already holds, and surfacing it in the error string would
-    /// leak the addressable identifier into error-channel logs.
-    #[tracing::instrument(skip(self, row), fields(artifact_id = %row.artifact_id))]
+    /// Thin wrapper over the module-level [`load_full_metadata`], which
+    /// is where the resolution actually lives so that a use case holding
+    /// only ports — `ScanOrchestrationUseCase` has a `StoragePort` and an
+    /// `ArtifactMetadataRepository` but no `ArtifactUseCase` — reaches
+    /// the same one answer instead of re-deriving it. See that function
+    /// for the contract.
     pub async fn load_full_metadata(&self, row: &ArtifactMetadata) -> AppResult<serde_json::Value> {
-        match &row.metadata_blob {
-            None => Ok(row.metadata.clone()),
-            Some(hash) => {
-                let mut stream = self
-                    .storage
-                    .get(hash)
-                    .await
-                    .map_err(|e| AppError::Storage(e.to_string()))?;
-                let mut buf = Vec::new();
-                stream
-                    .read_to_end(&mut buf)
-                    .await
-                    .map_err(|e| AppError::Storage(format!("metadata blob read failed: {e}")))?;
-                serde_json::from_slice(&buf)
-                    .map_err(|_| AppError::Storage("metadata blob deserialisation failed".into()))
-            }
-        }
+        load_full_metadata(self.storage.as_ref(), row).await
     }
 
     // -- visibility-aware extensions ----------------------------------------

@@ -13,6 +13,7 @@ pub mod checksum;
 pub mod finding;
 pub mod idempotency_key;
 pub mod sbom;
+pub mod task_tier;
 
 pub use alias_group::collapse_alias_groups;
 pub use artifact_kind::ArtifactKind;
@@ -24,6 +25,7 @@ pub use finding::{
 };
 pub use idempotency_key::IdempotencyKey;
 pub use sbom::{Ecosystem, PayloadAccess, Sbom, SbomComponent, SeekableRead};
+pub use task_tier::{queue_priority, scan_queue_priority, TaskTier};
 
 // ---------------------------------------------------------------------------
 // PageRequest

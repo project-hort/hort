@@ -23,6 +23,7 @@ stages:
   - test
   - security
   - quality
+  - base-images-ready
   - build-images
   - helm
   - release
@@ -1169,64 +1170,9 @@ warm:base-images:
         fi
       fi
 
-      # The pinned set is parsed out of the Dockerfiles a release-shaped
-      # build actually uses. This job must never carry a second,
-      # hand-maintained copy of the digests.
-      dockerfiles="docker/Dockerfile.hort-server docker/Dockerfile.worker deploy/compose/Dockerfile"
-
-      for f in ${dockerfiles}; do
-        [ -f "${f}" ] || echo "::warning::${f} not found — its base images are not being warmed (moved or renamed?)"
-      done
-
-      # Drift guard in the other direction: a digest-pinned FROM in a
-      # Dockerfile this job does not read is a base image nothing warms.
-      for f in $(grep -rlE '^[[:space:]]*FROM[[:space:]]+' --include='Dockerfile*' . 2>/dev/null | sed 's|^\./||'); do
-        grep -qE '^[[:space:]]*FROM[[:space:]].*@sha256:' "${f}" || continue
-        case " ${dockerfiles} " in
-          *" ${f} "*) ;;
-          *) echo "::warning::${f} pins a base-image digest but is not in this job's list — add it there or its base images stay cold until a build asks for them" ;;
-        esac
-      done
-
-      : > /tmp/from-refs.txt
-      for f in ${dockerfiles}; do
-        [ -f "${f}" ] || continue
-        grep -E '^[[:space:]]*FROM[[:space:]]' "${f}" \
-          | grep -oE '[^[:space:]@]+@sha256:[0-9a-f]{64}' >> /tmp/from-refs.txt || true
-      done
-
-      # `name[:tag]@sha256:<hex>` reduces to `name@sha256:<hex>`. Dropping
-      # the tag is lossless for a digest pull — the registry resolves the
-      # manifest by digest and ignores the tag, while the repository NAME is
-      # what selects the upstream and therefore the proxy path. It also
-      # removes the RUST_VERSION build-arg placeholder from the two pinned
-      # lines that carry it, without this job re-implementing Dockerfile ARG
-      # expansion and without the hazard of a CI variable of that name
-      # expanding into a reference. Deduplicating on (name, digest) then
-      # collapses the same image pinned under two different tags into the one
-      # pull it actually is.
-      refs=""
-      count=0
-      while read -r tok; do
-        [ -n "${tok}" ] || continue
-        nametag="${tok%@*}"
-        digest="${tok##*@}"
-        repo="${nametag}"
-        case "${nametag##*/}" in
-          *:*) repo="${nametag%:*}" ;;
-        esac
-        ref="${repo}@${digest}"
-        case " ${refs} " in
-          *" ${ref} "*) continue ;;
-        esac
-        refs="${refs} ${ref}"
-        count=$((count + 1))
-      done < /tmp/from-refs.txt
-
-      if [ "${count}" -eq 0 ]; then
-        echo "::warning::no digest-pinned FROM lines found — nothing warmed. The parse, not the pinning, is the first thing to check."
-        exit 0
-      fi
+      # Both warm and release precondition read the same Dockerfile digest set.
+      refs="$(bash scripts/ci/base-image-refs.sh)" || exit 1
+      count="$(printf '%s\n' "${refs}" | wc -l)"
 
       echo "Warming ${count} pinned base-image reference(s) through the proxy:"
       for ref in ${refs}; do echo "  ${ref}"; done
@@ -1387,17 +1333,48 @@ warm:base-images:
         echo "::warning::the base-image warm never reached its pull loop — the hort OIDC token exchange in before_script failed. Same candidate causes as prefetch:warm: the federation gitops is not applied, an audience or jti claim mismatch, or the switch is not actually 'true' in this pipeline context."
       fi
 
+# A release image cannot begin until every pinned base manifest answers HEAD.
+# Keep this in its own stage: build-images uses ordinary stage ordering, so
+# the precondition joins the existing test/security/quality gates instead of
+# making those jobs optional through a narrower needs list.
+base-images:preflight:
+  stage: base-images-ready
+  image: quay.io/buildah/stable:v1.43
+  tags:
+    - platform
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|beta)\.[0-9]+)?$/
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes: *code-changed-paths
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+      changes: *code-changed-paths
+  before_script:
+    - *platform-ca-rhel
+    - *resolve-registry-creds
+  script:
+    - bash scripts/ci/base-image-preflight.sh
+
 # Read-only readiness probe: reports the complete cold set ahead of a
 # release, without side effects (no prefetch POST — see
-# scripts/ci/vetted-index-preflight.sh). Scheduled only — this is a
-# pre-release signal an operator checks before cutting a release, not
-# something every develop push needs to re-run.
+# scripts/ci/vetted-index-preflight.sh).
+#
+# Reachable on develop as well as on a schedule, for the same reason its
+# three sibling warm jobs are: the project runs no pipeline schedules, so a
+# schedule-only rule is a job that cannot run. This is the readable report
+# of which locked deps the released_only index does not serve yet — the
+# difference between "still in quarantine, wait" and "rejected, intervene"
+# for a blocked publish — and the GitHub equivalent only exists inside
+# release.yml, whose job logs need admin rights. allow_failure: true keeps
+# a cold set from failing a develop pipeline; the job reports, it does not
+# gate.
 prefetch:verify:
   stage: test
   image: alpine:3.24
   needs: []
   allow_failure: true
   rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $HORT_PREFETCH_ENABLED == "true"'
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $HORT_PREFETCH_ENABLED == "true"'
   id_tokens: !reference [.hort-auth, id_tokens]
   before_script:
@@ -1482,7 +1459,7 @@ security:advisory-sync:
   needs: []
   <<: *rules-code-changed
   script:
-    - bash scripts/check-advisory-sync.sh
+    - bash scripts/run-shell-guards.sh scripts/check-advisory-sync.sh
 
 # Third-party attribution staleness + allowlist-parity gate. Regenerates
 # THIRD-PARTY-LICENSES.{md,json} via `cargo about generate` and diffs against
@@ -1531,7 +1508,7 @@ security:attribution-sync:
         exit 1
       }
   script:
-    - bash scripts/check-attribution.sh
+    - bash scripts/run-shell-guards.sh scripts/check-attribution.sh
 
 # No-plans gate (D7): `docs/plans/` is the branch-lifetime home for design docs
 # + backlogs, distilled into `docs/adr/` + `docs/architecture/` and removed
@@ -1753,9 +1730,9 @@ quality:chart-and-rust-pin-sync:
   before_script:
     - apk add --no-cache bash grep
   script:
-    - bash scripts/check-rust-version.sh
-    - bash scripts/check-values-comments.sh
-    - bash scripts/check-osv-scanner-version.sh
+    - bash scripts/run-shell-guards.sh scripts/check-rust-version.sh
+    - bash scripts/run-shell-guards.sh scripts/check-values-comments.sh
+    - bash scripts/run-shell-guards.sh scripts/check-osv-scanner-version.sh
 
 # Machine-readable G1 release-predicate gate. Fails unless the
 # event-chain-verify and advisory-ingest telemetry rows are catalogued in
@@ -1771,7 +1748,7 @@ quality:g1-attestation-gate:
   before_script:
     - apk add --no-cache bash grep findutils sed
   script:
-    - bash scripts/check-g1-attestation-gate.sh
+    - bash scripts/run-shell-guards.sh scripts/check-g1-attestation-gate.sh
 
 # Rejects an unannotated pipe into `grep -q`/`grep -Eq` under scripts/: that
 # shape misreports "no match" under `set -o pipefail` once the match lands
@@ -1787,7 +1764,29 @@ quality:pipe-grep-q-guard:
   before_script:
     - apk add --no-cache bash findutils
   script:
-    - bash scripts/check-pipe-grep-q.sh
+    - bash scripts/run-shell-guards.sh scripts/check-pipe-grep-q.sh
+
+# Exercise the release preflight resolver against local registry-rule fixtures.
+quality:base-image-preflight-test:
+  stage: quality
+  image: alpine:3.24
+  needs: []
+  <<: *rules-code-changed
+  before_script:
+    - apk add --no-cache bash grep findutils coreutils sed
+  script:
+    - bash scripts/run-shell-guards.sh scripts/test-base-image-preflight.sh
+
+# Keep the shell-guard runner's inventory and result semantics under test.
+quality:shell-guard-runner-test:
+  stage: quality
+  image: alpine:3.24
+  needs: []
+  <<: *rules-code-changed
+  before_script:
+    - apk add --no-cache bash git grep findutils coreutils sed
+  script:
+    - bash scripts/run-shell-guards.sh scripts/test-run-shell-guards.sh
 
 # Chart-template render test. Mirrors .github/workflows/ci.yml's
 # chart-template-tests job so the canonical GitLab pipeline gates chart
@@ -1815,7 +1814,7 @@ quality:helm-template-test:
   before_script:
     - apk add --no-cache bash grep findutils sed
   script:
-    - bash scripts/test-helm-templates.sh
+    - bash scripts/run-shell-guards.sh scripts/test-helm-templates.sh
 
 # Fail2ban regex regression test. Mirrors quality:helm-template-test: plain
 # bash, lightweight image, needs: [], runs on every pipeline (no rules).
@@ -1830,7 +1829,7 @@ quality:fail2ban-regex-test:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends fail2ban
   script:
-    - bash scripts/test-fail2ban-regex.sh
+    - bash scripts/run-shell-guards.sh scripts/test-fail2ban-regex.sh
 
 # capture_match regression test. Mirrors quality:fail2ban-regex-test: plain
 # bash, lightweight image, needs: [], runs on every pipeline (no rules).
@@ -1845,7 +1844,7 @@ quality:capture-match-test:
   before_script:
     - apk add --no-cache bash
   script:
-    - bash scripts/test-capture-match.sh
+    - bash scripts/run-shell-guards.sh scripts/test-capture-match.sh
 
 # Publish-time registry index check. Same shape as the two jobs above:
 # plain bash, lightweight image, no network. The check decides whether a
@@ -1863,7 +1862,7 @@ quality:crates-index-check-test:
     - apt-get update -qq
     - apt-get install -y -qq --no-install-recommends jq
   script:
-    - bash scripts/test-crate-version-in-index.sh
+    - bash scripts/run-shell-guards.sh scripts/test-crate-version-in-index.sh
 
 # project-hort.de static site (issue #78): builds site/dist/ and runs the
 # link-check that fails the build on any broken internal link or heading

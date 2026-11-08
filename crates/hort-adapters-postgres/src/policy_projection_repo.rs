@@ -682,6 +682,62 @@ mod tests {
         assert_eq!(fetched.scope, PolicyScope::Global);
     }
 
+    /// The column's own half of the quarantine-window invariant: a
+    /// duration is not negative, and the constraint says so where the
+    /// row is written, so a value that reaches the table by raw SQL or
+    /// a restored dump cannot escape it either. The application-side
+    /// refusal that names the field and the value is
+    /// `hort_app::use_cases::policy_use_case`'s
+    /// `require_nonnegative_quarantine_duration`; this is what stands
+    /// behind it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn upsert_refuses_a_negative_quarantine_duration() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgPolicyProjectionRepository::new(pool);
+
+        let id = Uuid::new_v4();
+        let mut p = sample_projection(id, &format!("neg-{}", id.simple()), 1);
+        p.quarantine_duration_secs = -1;
+
+        let err = repo.upsert(&p).await.expect_err("constraint refuses it");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("quarantine_duration_secs_nonnegative"),
+            "msg = {msg}"
+        );
+
+        assert!(
+            repo.find_by_id(id).await.expect("find_by_id").is_none(),
+            "a refused upsert leaves no row",
+        );
+    }
+
+    /// The boundary the constraint must not swallow: zero is the
+    /// explicit permissive window (ADR 0007), not a missing one.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn upsert_accepts_a_zero_quarantine_duration() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgPolicyProjectionRepository::new(pool);
+
+        let id = Uuid::new_v4();
+        let mut p = sample_projection(id, &format!("zero-{}", id.simple()), 1);
+        p.quarantine_duration_secs = 0;
+        repo.upsert(&p).await.expect("zero is permitted");
+
+        let fetched = repo
+            .find_by_id(id)
+            .await
+            .expect("find_by_id")
+            .expect("row exists");
+        assert_eq!(fetched.quarantine_duration_secs, 0);
+    }
+
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn upsert_updates_existing_row() {

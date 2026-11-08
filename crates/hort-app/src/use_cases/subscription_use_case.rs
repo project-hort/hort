@@ -1165,7 +1165,10 @@ impl SubscriptionUseCase {
     /// emission (high-frequency, not audit-relevant).
     ///
     /// `position = None` records the failure without moving the stored
-    /// cursor — see
+    /// cursor, and a `position` below the stored one is equally not an
+    /// advance: the write is monotonic, because the callers are one task
+    /// per replica flushing their own in-memory cursors with nothing
+    /// ordering them. See
     /// [`SubscriptionRepository::update_last_delivered`](hort_domain::ports::subscription_repository::SubscriptionRepository::update_last_delivered).
     #[tracing::instrument(skip(self, failure))]
     pub async fn record_delivery_progress(
@@ -1315,6 +1318,9 @@ fn domain_to_validation(e: DomainError) -> SubscriptionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hort_domain::ports::subscription_repository::{
+        advance_delivered_position, retained_delivered_position,
+    };
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1425,7 +1431,12 @@ mod tests {
             Box::pin(async move { Ok(items) })
         }
         fn update(&self, s: &Subscription) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
-            self.items.lock().unwrap().insert(s.id, s.clone());
+            let mut s = s.clone();
+            let mut items = self.items.lock().unwrap();
+            s.last_delivered_position =
+                retained_delivered_position(items.get(&s.id), s.last_delivered_position);
+            items.insert(s.id, s);
+            drop(items);
             Box::pin(async { Ok(()) })
         }
         fn delete(
@@ -1444,12 +1455,10 @@ mod tests {
             let lf = last_failure.cloned();
             let mut items = self.items.lock().unwrap();
             if let Some(s) = items.get_mut(&id) {
-                // `None` = no advance to record; mirrors the adapter's
-                // COALESCE so a test cannot see a rewind the real store
-                // would never produce.
-                if let Some(position) = position {
-                    s.last_delivered_position = Some(position);
-                }
+                // The adapter's `GREATEST`, so a test cannot see a rewind
+                // the real store would never produce.
+                s.last_delivered_position =
+                    advance_delivered_position(s.last_delivered_position, position);
                 s.last_failure = lf;
             }
             Box::pin(async { Ok(()) })

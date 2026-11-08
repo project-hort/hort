@@ -275,7 +275,7 @@ mod tests {
         // being dropped — the Postgres adapter commits them inside the
         // artifact's own transaction.
         let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
                 .with_content_references(content_refs.clone()),
         );
         let storage = Arc::new(MockStoragePort::new());

@@ -185,10 +185,10 @@ mod tests {
     use chrono::Utc;
     use hort_domain::error::{DomainError, DomainResult};
     use hort_domain::events::{
-        ArtifactQuarantined, PersistedEvent, ProvenanceVerified, StreamCategory,
+        ArtifactQuarantined, PersistedEvent, ProvenanceHeld, ProvenanceVerified, StreamCategory,
     };
     use hort_domain::ports::event_store::{AppendEvents, AppendResult, ReadFrom, SubscribeFrom};
-    use hort_domain::ports::provenance::SignerIdentity;
+    use hort_domain::ports::provenance::{ProvenanceHoldReason, SignerIdentity};
     use hort_domain::ports::BoxFuture;
     use hort_domain::types::ContentHash;
 
@@ -223,6 +223,48 @@ mod tests {
             predicate_type: None,
             cascaded_from: None,
         })
+    }
+
+    #[tokio::test]
+    async fn held_event_stays_pending_until_verified() {
+        let events = Arc::new(MockEventStore::new());
+        let artifact_id = Uuid::new_v4();
+        let sid = StreamId::artifact(artifact_id);
+        let held = DomainEvent::ProvenanceHeld(ProvenanceHeld {
+            artifact_id,
+            content_hash: VALID_SHA256.parse().unwrap(),
+            backend: "cosign".into(),
+            reason: ProvenanceHoldReason::PendingSignature,
+        });
+        events.set_stream(&sid, vec![persisted(sid.clone(), 0, held)]);
+        assert_eq!(
+            read_path_provenance_clearance(&*events, artifact_id, ProvenanceMode::Required)
+                .await
+                .unwrap(),
+            ProvenanceClearance::Pending
+        );
+        events.set_stream(
+            &sid,
+            vec![
+                persisted(
+                    sid.clone(),
+                    0,
+                    DomainEvent::ProvenanceHeld(ProvenanceHeld {
+                        artifact_id,
+                        content_hash: VALID_SHA256.parse().unwrap(),
+                        backend: "cosign".into(),
+                        reason: ProvenanceHoldReason::PendingSignature,
+                    }),
+                ),
+                persisted(sid.clone(), 1, verified_event(artifact_id)),
+            ],
+        );
+        assert_eq!(
+            read_path_provenance_clearance(&*events, artifact_id, ProvenanceMode::Required)
+                .await
+                .unwrap(),
+            ProvenanceClearance::Cleared
+        );
     }
 
     fn other_event(artifact_id: Uuid) -> DomainEvent {

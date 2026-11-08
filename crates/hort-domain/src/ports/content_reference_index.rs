@@ -284,6 +284,12 @@ pub trait ContentReferenceIndex: Send + Sync {
     /// shape.
     fn insert(&self, reference: ContentReference) -> BoxFuture<'_, DomainResult<()>>;
 
+    /// Insert only absent keys from a batch and return the number actually
+    /// inserted. Existing rows retain their metadata and timestamp. The
+    /// batch is atomic and takes the same target-hash locks as `insert`, so
+    /// storage GC cannot delete a target between the claim and its count.
+    fn insert_missing(&self, references: &[ContentReference]) -> BoxFuture<'_, DomainResult<u64>>;
+
     /// Look up every reference that points at `target` in this repo,
     /// optionally filtered by `kind`.
     ///

@@ -546,6 +546,7 @@ fn emit_state_gauge(active: &[Subscription]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hort_domain::ports::subscription_repository::retained_delivered_position;
 
     use std::collections::HashMap;
 
@@ -751,10 +752,12 @@ mod tests {
             })
         }
         fn update(&self, sub: &Subscription) -> BoxFuture<'_, DomainResult<()>> {
-            let sub = sub.clone();
+            let mut sub = sub.clone();
             Box::pin(async move {
                 let mut rows = self.active.lock().unwrap();
                 if let Some(row) = rows.iter_mut().find(|s| s.id == sub.id) {
+                    sub.last_delivered_position =
+                        retained_delivered_position(Some(row), sub.last_delivered_position);
                     *row = sub;
                 }
                 Ok(())

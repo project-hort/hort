@@ -22,7 +22,7 @@ Hort's architecture is the as-built, authoritative design described below — a 
 ### Target Architecture (summary)
 
 - **Hexagonal / onion layering**: Domain layer (pure Rust, zero I/O) → application layer → outbound port traits → adapters (Postgres, S3, scanner, WASM host)
-- **Event-sourced artifact lifecycle**: All artifact state transitions produce immutable domain events (`ArtifactIngested`, `ArtifactQuarantined`, `ScanCompleted`, `ArtifactReleased`, `ArtifactPromoted`, etc.). Repository config, users, and RBAC stay CRUD.
+- **Event-sourced artifact lifecycle**: All artifact state transitions produce immutable domain events (`ArtifactIngested`, `ArtifactQuarantined`, `ScanCompleted`, `ArtifactReleased`, `ArtifactPromoted`, etc.). Repository configuration proper stays CRUD; the authorization and identity **decisions** that change it are events, because an authorization change needs the same append-only authorship trail as `ArtifactReleased` (see the architect guide's "Everything else that is event-sourced" table).
 - **Enforced CAS**: `StoragePort::put(stream) → ContentHash`. Streaming — SHA-256 computed incrementally, no buffering. Callers never supply storage keys. Content hash is always SHA-256 of the raw bytes.
 - **Mandatory upstream verification**: every pull-through fetch verifies a checksum (protocol-native digest for OCI, parsed upstream metadata for Cargo / PyPI / npm). No operator opt-in; a format that cannot verify cannot proxy. See ADR 0006.
 - **WASM format modules**: Format handlers (npm, PyPI, Maven, OCI, etc.) are deploy-time WASM modules loaded from `$WASM_PLUGIN_DIR`. Each declares capability groups in a manifest. OCI/Git LFS (stateful upload) may stay compiled-in as Tier C.
@@ -125,9 +125,9 @@ Rust 1.97+ with the following project configuration:
 
 ### Test Coverage Tiers
 
-Coverage requirements vary by crate layer. Core crates contain the security-critical domain logic (artifact lifecycle, quarantine invariants, CAS guarantees, policy evaluation) and must be exhaustively tested.
+Coverage ambition varies by crate layer. Core crates contain the security-critical domain logic (artifact lifecycle, quarantine invariants, CAS guarantees, policy evaluation) and must be exhaustively tested.
 
-| Crate | Required coverage | Rationale |
+| Crate | Target coverage | Rationale |
 |---|---|---|
 | `hort-domain` | **100%** | Pure Rust, zero I/O — every branch is testable and must be tested. This is the security boundary. |
 | `hort-app` | **100%** | Orchestration logic that enforces invariants across ports. Mock all outbound ports. |
@@ -137,7 +137,21 @@ Coverage requirements vary by crate layer. Core crates contain the security-crit
 | `hort-http-<format>` | **>= 85%** | Per-format HTTP handler tests. |
 | `hort-formats` | **>= 85%** | WASM host tests. |
 
-**Enforcement:** `hort-domain` and `hort-app` coverage is checked by the `coverage` CI job. Any new public function or branch in these crates without a corresponding test is a blocking review finding. The 100% target means every match arm, every error path, and every boundary condition — not just happy paths.
+**These are targets, not acceptance criteria, and the two `100%` rows are not met today.** Measured on 2026-11-02 with the command the CI job itself runs — `cargo llvm-cov --workspace --lib --summary-only` with `DATABASE_URL` unset — `hort-domain` is at **97.89%** lines (707 of 33,464 uncovered) and `hort-app` at **94.18%** (7,588 of 130,284). Re-measure rather than quoting those: they move with every change, and aggregating the per-file summary per crate is
+
+```bash
+cargo llvm-cov --workspace --lib --summary-only | awk '
+  $1 ~ /^hort-[a-z-]+\// { split($1, p, "/"); l[p[1]] += $8; m[p[1]] += $9 }
+  END { for (c in l) printf "%-28s %.2f%%\n", c, 100*(l[c]-m[c])/l[c] }' | sort
+```
+
+**What CI actually gates** — there is **no per-crate threshold anywhere in the pipeline**, so reading the table as a pass/fail bar states a condition no job checks and no change can satisfy without closing pre-existing gaps that are not its business:
+
+- **Workspace-total floor.** GitHub `ci.yml` → `coverage` runs `cargo llvm-cov --workspace --lib --no-run --fail-under-lines 50`. Measured 2026-11-02: 88.24% lines workspace-wide.
+- **New/changed lines >= 70%.** The same job's *New code coverage gate* intersects the diff's added `.rs` line numbers with `lcov.info` and fails below 70%, skipping when too few lines changed.
+- **GitLab `test:coverage` enforces nothing.** It runs `cargo llvm-cov --workspace --lib` plus `report --summary-only` and uploads `lcov.info` / `coverage-sonar.xml`; the verdict on new-code coverage is Sonar's own server-side gate.
+
+**The per-change criterion, which is the one to carry into a directive and a review:** *a change adds no uncovered lines.* Measure it as the intersection of the diff's added line numbers with `cargo llvm-cov --show-missing-lines`, per touched file. It is stricter than any percentage threshold — a percentage hides a new uncovered branch behind pre-existing coverage — and, unlike the 100% rows above, it is satisfiable by the change under review. For `hort-domain` and `hort-app` specifically, a new public function or branch without a corresponding test stays a blocking review finding: every match arm, every error path, every boundary condition — not just happy paths.
 
 **DB-backed test isolation (parallel-safety contract).** The DB-backed suites have **three modes**, and a reviewer has to know which one a test is in:
 
@@ -170,17 +184,27 @@ Coverage % is necessary but **not sufficient**: a DB-backed test that is correct
 ### A test double that round-trips must refuse what production refuses
 
 `MockEventStore` (`crates/hort-app/src/use_cases/test_support.rs`) is used by
-nine crates, and it **round-trips**: `read_stream` serves what `append`
-accepted. So a test seeds events there, production code reads them back, and a
-decision is asserted over them — which makes the double's acceptance criteria
-part of every such test's premise.
+eight crates, and it **round-trips**: what reaches its streams — a direct
+`set_stream`, or a commit through the `MockArtifactLifecycle` it is paired with
+— is what `read_stream` serves. So a test seeds events there, production code
+reads them back, and a decision is asserted over them, which makes the double's
+acceptance criteria part of every such test's premise.
 
 The production adapter validates: every `EventStore::append` goes through
 `validate_and_serialize` (`crates/hort-adapters-postgres/src/event_store.rs`),
-which calls `DomainEvent::validate()` on every event in the batch and then
-enforces a 64 KB serialised cap. **An event the double accepts and the adapter
-would reject is an event no producer in the system can write**, and a test
-standing on one proves a behaviour production cannot show.
+which refuses an event on two counts — `DomainEvent::validate()`'s per-field
+invariants, and a 64 KB cap on the serialised event. **An event the double
+accepts and the adapter would reject is an event no producer in the system can
+write**, and a test standing on one proves a behaviour production cannot show.
+
+Both counts are one call, `DomainEvent::validate_for_storage`
+(`crates/hort-domain/src/events/domain_event.rs`, beside `validate()`), and
+both the adapter and the double consume it. The cap used to be a private
+`const` in the adapter, which `hort-app` must not depend on (ADR 0008) — so the
+double implemented the half it could reach while its comment claimed the
+function that held both, and an oversize event was one it accepted and no
+producer could write. A rule a double has to re-state in its own words is a
+rule it will state half of; give it one call to make.
 
 This is measured, not theoretical. The authority-derivation corpus for the
 release gate held `ScanCompleted` events whose `finding_count` disagreed with
@@ -193,10 +217,32 @@ production incident survived behind impossible events.
 The rule is therefore scoped by round-tripping, not by "every double": a double
 whose `append` discards the batch (several local ones error or ignore it, and
 their `read_stream` is `unreachable!`) cannot host a corpus, because nothing
-reads it back. **A double that serves `read_stream` from what it accepted calls
-`validate()` on append and returns the error.** When adding such a double, do
-the same; when a fixture starts failing because of it, the fixture was building
-an event the system cannot produce.
+reads it back. **A double that serves `read_stream` from what it accepted
+refuses, on append, everything `validate_for_storage` refuses, and returns its
+error.** When adding such a double, do the same; when a fixture starts failing
+because of it, the fixture was building an event the system cannot produce.
+
+**And the other direction: a double that accepts a paired production write
+serves both halves or refuses the call.** Validity is about what a double
+accepts; this is about what it then shows. `MockArtifactLifecycle` takes an
+artifact and its event batch and persists both — in the adapter, inside one
+transaction with no opt-out, so a reader arriving afterwards sees both or the
+commit did not happen. The double made the events half an **opt-in**
+(`with_commit_visible_events`) and by default accepted the batch and dropped
+it, so "after the commit, the reader sees nothing" and "so it appends again"
+were properties of the double rather than of the code under test — the mirror
+image of accepting an impossible event, and just as invisible in the test
+standing on it. Two independent units hit it within a day of each other, and an
+opt-in only ever reaches the tests that already know about it.
+
+So the paired store is a **constructor argument** (`MockArtifactLifecycle::new`
+takes `Arc<dyn PairedEventStore>`) and every commit method publishes into it:
+the compiler, not a reviewer, reaches every construction site, and a test that
+cannot name the store its own reads go through is a test whose premise was
+never checked. A double with a second fallible effect beside the publish
+(`content_references` edges) applies **neither** until every refusal has run —
+an effect that outlives a refused commit is state the adapter's rollback never
+leaves.
 
 **Enforcement: `crates/hort-app/tests/db_tests_are_serialized.rs`**, a DB-free sub-second source scan in the same family as `db_gate_not_silent` — so `cargo test --workspace` runs it automatically. It reports every test function (inline `#[cfg(test)]` *and* `crates/*/tests/`) that reaches `test_support::{isolated_db_from, shared_migrated_pool, connect_or_panic}` — directly or through a same-file helper, transitively — or opens a raw `PgPool::connect` / `PgConnection::connect*`, and carries no `#[serial(hort_pg_db)]`. **It has no allow-list, by design**: a site that genuinely should not carry the key is a review conversation, not an exemption entry. Its blind spot is the one every source scan has — a helper in *another* file, or a connection opened through a macro — so the review check survives alongside it (see the architect Implementation Review Checklist).
 
@@ -354,7 +400,11 @@ cargo clippy --workspace --all-targets -- -D warnings      # linting
 cargo test --workspace                                     # full suite: lib + ALL tests/ integration targets (DB-gated tests self-skip w/o DATABASE_URL)
 cargo audit --deny warnings                                # advisories (ALWAYS — see note)
 cargo deny check                                           # advisories+bans+licenses+sources (ALWAYS — see note)
+bash scripts/run-shell-guards.sh                           # shell invariant guards
 ```
+
+The shell guard command exits 0 only when every guard passes, 2 when a guard
+cannot run here, and 1 when a guard fails or its CI/namespace inventory drifts.
 
 **`cargo test --workspace` is the default pre-push test command — NOT `--lib`.**
 It runs the full local suite — every crate's `--lib` unit tests AND every
@@ -547,9 +597,33 @@ from 2026-08-24 until the guard landed — a deleted artifact sat in the
 curator's worklist and spent rescan batch capacity. Carries a census counter-assertion per file, strips the
 predicate out of each corrected statement to prove the classifier can still
 fail, and asserts the column still exists; blind spots are a statement
-assembled from fragments or a predicate spelled around the column), and
+assembled from fragments or a predicate spelled around the column),
 `findings_reads_are_last_scan_scoped` (pins that a findings read is scoped to
-the artifact's last scan rather than every scan it ever had) are pure
+the artifact's last scan rather than every scan it ever had), and
+`capped_stream_writes` (ADR 0007's write side, the counterpart to
+`capped_stream_reads` — every production append to an artifact stream either
+calls the single cap predicate `refuse_append_past_cap` **in the function that
+appends**, or declares at the site why it cannot accumulate with an
+`ONCE-ONLY-APPEND: <reason>` comment. Repeatable is the whole criterion: a
+once-per-artifact writer cannot reach the cap, a sweep tick / rescan / API verb
+with no idempotency of its own can, and past the cap every capped reader
+refuses the stream, so the artifact can never be released, re-scanned or
+re-evaluated again and no operator instrument shortens a stream. The adapter's
+version check is not a bound — an `ExpectedVersion::Exact` writer paired
+exactly at the cap crosses it and succeeds, an `ExpectedVersion::Any` append is
+not version-checked at all — and convention held the rule at two of the thirty
+sites the census found. The corpus is **derived, not listed**: every method
+declared on `ArtifactLifecyclePort` is an artifact-stream append by
+`require_paired_artifact_stream`, and every other `AppendEvents`-taking entry
+point is classified from the batch literal the appending function built, so a
+call handed a batch it did not build is forwarding and out of scope. **No
+allow-list.** Three counter-assertions — a per-file census, the refusal's
+definition plus its call-site census (which is what pins
+`retention_use_case::append_expired`, whose `StreamId` arrives as a parameter
+the classifier cannot follow), and a mutation check that strips the refusal and
+the declaration out of real on-disk source and watches the scan go red. Blind
+spots: a macro-assembled call, a `stream_id` built from fragments, and a
+refusal delegated to a helper, which reads as a violation on purpose) are pure
 source-/fixture-scan guards — no database, sub-second — enforcing structural invariants that a
 rename or a stray `use` silently breaks. (A stale keyspace registry once shipped
 undetected because the gate then ran only `--lib`.) Because `cargo test --workspace`
@@ -602,7 +676,7 @@ inherited rationale when the threat surface changes" rule.
 
 Additionally, before pushing:
 - Check for code duplication: if structurally similar blocks appear 3+ times in new code, refactor into a shared helper
-- Check test coverage: `hort-domain` and `hort-app` require 100% coverage; all other crates require 85%+ (see Test Coverage Tiers above)
+- Check test coverage: the change adds no uncovered lines (intersect the diff's added line numbers with `cargo llvm-cov --show-missing-lines`, per touched file). The per-crate percentages in *Test Coverage Tiers* above are targets, not gates — no CI job checks one; what CI gates is the workspace-total floor and >= 70% on new/changed lines.
 - Check migration numbering: verify the migration number is not already taken (`ls migrations/ | tail -5`)
 - **Regenerate third-party attribution on ANY dependency-graph change** — if the
   change adds/removes/re-versions a **non-workspace** crate in `Cargo.lock` (a dep

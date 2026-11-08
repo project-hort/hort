@@ -333,7 +333,7 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
     }
 
     /// Atomic provenance-verdict transition (`ProvenanceVerified` /
-    /// `ProvenanceRejected`). Column-scoped artifact write — see
+    /// `ProvenanceRejected` / `ProvenanceHeld`). Column-scoped artifact write — see
     /// [`ArtifactLifecyclePort::commit_provenance_verdict`] (issue #90):
     /// unlike [`Self::commit_transition`], this writes ONLY
     /// `quarantine_status` (+ `updated_at`), never the full row, so it

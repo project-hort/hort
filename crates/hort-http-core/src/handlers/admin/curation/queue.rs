@@ -130,10 +130,13 @@ pub struct CurationQueueEntryDto {
     pub format: String,
     pub package_name: String,
     pub version: Option<String>,
+    pub path: String,
     pub quarantine_status: String,
     pub quarantine_window_start: Option<DateTime<Utc>>,
     pub quarantine_deadline: Option<DateTime<Utc>>,
-    pub finding_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finding_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_severity: Option<String>,
     pub rejection_reason_kind: Option<String>,
 }
@@ -147,6 +150,7 @@ impl CurationQueueEntryDto {
             format: e.format.to_string(),
             package_name: e.package_name,
             version: e.version,
+            path: e.path,
             quarantine_status: e.quarantine_status.to_string(),
             quarantine_window_start: e.quarantine_window_start,
             quarantine_deadline: e.quarantine_deadline,
@@ -368,13 +372,34 @@ mod tests {
             format: RepositoryFormat::Npm,
             package_name: "evil-pkg".into(),
             version: Some("1.0.0".into()),
+            path: "evil-pkg/-/evil-pkg-1.0.0.tgz".into(),
             quarantine_status: QuarantineStatus::Quarantined,
             quarantine_window_start: Some(Utc::now()),
             quarantine_deadline: Some(Utc::now()),
-            finding_count: 3,
+            finding_count: Some(3),
             max_severity: None,
             rejection_reason_kind: None,
         }
+    }
+
+    #[test]
+    fn queue_wire_distinguishes_no_scan_from_clean_scan() {
+        let mut unscanned = sample_queue_entry();
+        unscanned.finding_count = None;
+        unscanned.max_severity = None;
+        let mut clean = sample_queue_entry();
+        clean.finding_count = Some(0);
+        clean.max_severity = None;
+
+        let unscanned_json = serde_json::to_value(CurationQueueEntryDto::from_domain(unscanned))
+            .expect("unscanned DTO serializes");
+        let clean_json = serde_json::to_value(CurationQueueEntryDto::from_domain(clean))
+            .expect("clean DTO serializes");
+        assert!(unscanned_json.get("finding_count").is_none());
+        assert!(unscanned_json.get("max_severity").is_none());
+        assert_eq!(clean_json["finding_count"], 0);
+        assert!(clean_json.get("max_severity").is_none());
+        assert_eq!(unscanned_json["path"], clean_json["path"]);
     }
 
     /// Happy path — curator + seeded entry → 200 with rendered DTO.

@@ -109,6 +109,11 @@ pub(crate) mod result_write_fence;
 // the task dispatcher and the scan orchestrator so one attempt budget
 // cannot mean two different windows depending on which one is asking.
 pub mod retry_backoff;
+// Per-kind run-permit allocation that no class can be shut out of —
+// the second of the two points ADR 0066 D4 requires non-displacement
+// at, and the one the claim cannot see (a row waiting here is already
+// `running`). Used by the task dispatcher.
+pub(crate) mod class_fair_permits;
 // The vulnerability-scanner backends compiled into this build — the single
 // source of truth the apply-time `scanBackends` validator checks against
 // (sibling of `crate::provenance`). Static, not the live worker registry:

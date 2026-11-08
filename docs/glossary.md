@@ -176,10 +176,13 @@ call failed. See [ADR 0039](adr/0039-keyed-provenance-verification.md)'s
 
 **It is not `ScanIndeterminate`, and the two must not be read as a pair.**
 Different axis (provenance vs. scan), different verdict: an indeterminate
-*provenance* verdict is a hold and is **never** terminal, while
-`ScanIndeterminate` is one of the two [terminal](#terminal-quarantine-status)
-quarantine statuses, whose exit is a deliberate act. Neither implies the
-other, and an artifact can be in one, both, or neither. The `held_` /
+*provenance* verdict writes no status at all — the artifact keeps whatever
+hold it was in — while `ScanIndeterminate` is one of the two
+[terminal](#terminal-quarantine-status) quarantine statuses, so an artifact
+in it is neither delivered nor advertised. Both are held rather than
+concluded, and both are lifted by the axis reaching a verdict rather than
+by a clock. Neither implies the other, and an artifact can be in one,
+both, or neither. The `held_` /
 `allowed_` prefixes on the provenance reporting values are what keep the
 two apart in an operator's dashboard; the shared word is an accident of
 English, not a shared concept.
@@ -346,11 +349,24 @@ merges, since `develop` publishes no image or chart. It is not gated on a
 
 ### Terminal (quarantine status)
 
-Said of an artifact whose lifecycle has concluded against delivery:
+Said of an artifact hort will not deliver and will not advertise:
 `Rejected` (a verdict was rendered against the bytes) and
-`ScanIndeterminate` (ADR 0007's fail-closed terminal scan failure). The
-exit from either is a deliberate act — an admin override, a policy loosen
-that re-judges the stored findings, a re-scan — never the passage of time.
+`ScanIndeterminate` (ADR 0007's fail-closed state for a scan that reached
+no verdict). Neither is exited by the passage of time — no timer releases
+either, and the predicate decides what a surface may say about the
+artifact, not that its case can never be reopened.
+
+The two differ in how they are exited, and the difference is the subject
+of the verdict. `Rejected` records a statement about the artifact, so its
+exit is a deliberate act: the curator's manual release, or a policy loosen
+that re-judges the stored findings. `ScanIndeterminate` records a
+statement about hort's own coverage, so it is a **hold**: the
+stranded-rescan sweep re-picks it unattended, and a verdict that is
+reached supersedes the absent one — a non-blocking verdict returns the
+artifact to `Quarantined` where the ordinary release sweep decides, a
+blocking one condemns it to `Rejected` (ADR 0007, "A reached verdict
+supersedes an absent one"). The curator's manual release reaches it too.
+
 `Quarantined` is the contrast and is **not** terminal, even when its hold
 has no self-resolving deadline (an artifact awaiting a signature, or one
 whose provenance check hort could not carry out — see

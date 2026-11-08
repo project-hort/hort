@@ -505,7 +505,10 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -659,18 +662,18 @@ mod tests {
         assert_eq!(summary.already_imported, 0);
         assert!(summary.errors.is_empty(), "{:?}", summary.errors);
 
-        // Two commits — ArtifactIngested + ArtifactQuarantined.
+        // ONE commit carrying ArtifactIngested + ArtifactQuarantined.
         let transitions = lifecycle.committed_transitions();
         assert_eq!(
             transitions.len(),
-            2,
-            "expected ArtifactIngested + ArtifactQuarantined transitions; got {transitions:?}"
+            1,
+            "expected ONE commit carrying both events; got {transitions:?}"
         );
         assert!(matches!(
             &transitions[0].1.events[0].event,
             DomainEvent::ArtifactIngested(_)
         ));
-        let q_event = match &transitions[1].1.events[0].event {
+        let q_event = match &transitions[0].1.events[1].event {
             DomainEvent::ArtifactQuarantined(q) => q,
             other => panic!("expected ArtifactQuarantined, got {other:?}"),
         };
@@ -953,40 +956,30 @@ mod tests {
         let summary = uc.run(vec![item], api_actor()).await.unwrap();
         assert_eq!(summary.registered, 1, "{:?}", summary.errors);
 
-        // Atomicity: still exactly 2 commits total (ArtifactIngested,
-        // then ONE quarantine+scan follow-on) — not 3.
+        // Atomicity: exactly ONE commit total — the mint, the quarantine
+        // transition and the scan request in one batch.
         let transitions = lifecycle.committed_transitions();
-        assert_eq!(transitions.len(), 2, "{transitions:?}");
-        let quarantine_commit = &transitions[1].1;
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        let commit = &transitions[0].1;
+        let kinds: Vec<&str> = commit.events.iter().map(|e| e.event.event_type()).collect();
         assert_eq!(
-            quarantine_commit.events.len(),
-            2,
-            "ArtifactQuarantined + ScanRequested must land in the SAME commit: {:?}",
-            quarantine_commit.events
+            kinds,
+            vec!["ArtifactIngested", "ArtifactQuarantined", "ScanRequested"],
+            "the mint, the quarantine and the scan request must land in the SAME commit: \
+             {kinds:?}"
         );
-        assert!(matches!(
-            quarantine_commit.events[0].event,
-            DomainEvent::ArtifactQuarantined(_)
-        ));
-        assert!(matches!(
-            quarantine_commit.events[1].event,
-            DomainEvent::ScanRequested(_)
-        ));
 
-        // Index 0 is the mint. `register_by_hash`'s genesis commit rides
-        // `commit_transition_with_enqueues` too — not for enqueues (it has
-        // none) but to carry the artifact's `primary_content` edge in its
-        // own transaction — so the gate's batch is index 1.
+        // The one commit carries the scan enqueue alongside the artifact's
+        // `primary_content` edge.
         let enqueues = lifecycle.ingest_enqueues();
-        assert_eq!(enqueues.len(), 2, "{enqueues:?}");
-        assert!(enqueues[0].1.is_empty(), "the mint enqueues nothing");
+        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
         assert!(
-            enqueues[1].1.iter().any(
+            enqueues[0].1.iter().any(
                 |e| matches!(e, IngestEnqueue::Scan { format, trigger_source, .. }
                     if format == "pypi" && trigger_source == "seed-import")
             ),
             "expected a seed-import Scan enqueue: {:?}",
-            enqueues[1].1
+            enqueues[0].1
         );
     }
 
@@ -1014,27 +1007,26 @@ mod tests {
         assert_eq!(summary.registered, 1, "{:?}", summary.errors);
 
         let transitions = lifecycle.committed_transitions();
-        assert_eq!(transitions.len(), 2, "{transitions:?}");
-        let quarantine_commit = &transitions[1].1;
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        let kinds: Vec<&str> = transitions[0]
+            .1
+            .events
+            .iter()
+            .map(|e| e.event.event_type())
+            .collect();
         assert_eq!(
-            quarantine_commit.events.len(),
-            1,
-            "ONLY ArtifactQuarantined — no ScanRequested under scan_backends:[]: {:?}",
-            quarantine_commit.events
+            kinds,
+            vec!["ArtifactIngested", "ArtifactQuarantined"],
+            "the mint and the quarantine, and no ScanRequested under \
+             scan_backends:[]: {kinds:?}"
         );
-        assert!(matches!(
-            quarantine_commit.events[0].event,
-            DomainEvent::ArtifactQuarantined(_)
-        ));
 
         // `commit_transition_with_enqueues` still runs (and the mock
         // still logs the call) — `enqueues` is the empty slice, not "no
-        // call happened". Assert each CALL's recorded enqueue Vec is
-        // empty, not that no call was logged. Two calls: the mint (which
-        // rides this method to carry its `primary_content` edge) and the
-        // gate's own commit.
+        // call happened". Assert the CALL's recorded enqueue Vec is
+        // empty, not that no call was logged.
         let enqueues = lifecycle.ingest_enqueues();
-        assert_eq!(enqueues.len(), 2, "{enqueues:?}");
+        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
         assert!(
             enqueues.iter().all(|(_, e)| e.is_empty()),
             "scan_backends:[] must enqueue nothing: {enqueues:?}"
@@ -1065,21 +1057,18 @@ mod tests {
         let summary = uc.run(vec![item], api_actor()).await.unwrap();
         assert_eq!(summary.registered, 1, "{:?}", summary.errors);
 
-        // Index 0 is the mint. `register_by_hash`'s genesis commit rides
-        // `commit_transition_with_enqueues` too — not for enqueues (it has
-        // none) but to carry the artifact's `primary_content` edge in its
-        // own transaction — so the gate's batch is index 1.
+        // One commit, carrying the mint, the gate's events and the gate's
+        // enqueues together.
         let enqueues = lifecycle.ingest_enqueues();
-        assert_eq!(enqueues.len(), 2, "{enqueues:?}");
-        assert!(enqueues[0].1.is_empty(), "the mint enqueues nothing");
+        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
         assert!(
-            enqueues[1].1.iter().any(|e| matches!(
+            enqueues[0].1.iter().any(|e| matches!(
                 e,
                 IngestEnqueue::ProvenanceVerify { trigger_source, .. }
                     if trigger_source == "seed-import"
             )),
             "expected a seed-import ProvenanceVerify enqueue: {:?}",
-            enqueues[1].1
+            enqueues[0].1
         );
     }
 
@@ -1104,10 +1093,9 @@ mod tests {
         let summary = uc.run(vec![item], api_actor()).await.unwrap();
         assert_eq!(summary.registered, 1, "{:?}", summary.errors);
 
-        // Two calls: the mint (riding this method for its
-        // `primary_content` edge) and the gate's quarantine commit.
+        // One call — the mint and the gate in one commit.
         let enqueues = lifecycle.ingest_enqueues();
-        assert_eq!(enqueues.len(), 2, "{enqueues:?}");
+        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
         assert!(
             enqueues.iter().all(|(_, e)| e.is_empty()),
             "provenance_mode: Off must never enqueue ProvenanceVerify: {:?}",
@@ -1137,10 +1125,9 @@ mod tests {
         let summary = uc.run(vec![item], api_actor()).await.unwrap();
         assert_eq!(summary.registered, 1, "{:?}", summary.errors);
 
-        // Two calls: the mint (riding this method for its
-        // `primary_content` edge) and the gate's quarantine commit.
+        // One call — the mint and the gate in one commit.
         let enqueues = lifecycle.ingest_enqueues();
-        assert_eq!(enqueues.len(), 2, "{enqueues:?}");
+        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
         assert!(
             enqueues.iter().all(|(_, e)| e.is_empty()),
             "pypi is not provenance-capable in this fixture — must enqueue nothing: {:?}",

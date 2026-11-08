@@ -171,12 +171,13 @@ use hort_domain::entities::repository::{PrefetchTrigger, Repository};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::format_handler::FormatHandler;
-use hort_domain::ports::jobs_repository::{JobsRepository, PrefetchEnqueueRow};
+use hort_domain::ports::jobs_repository::{JobsRepository, PrefetchEnqueueRow, TriggerSource};
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::BoxFuture;
+use hort_domain::types::task_tier::queue_priority;
 
 use crate::use_cases::index_serve_filter::{ordering_for_format, VersionOrdering};
 use crate::use_cases::prefetch_use_case::PrefetchUseCase;
@@ -224,12 +225,16 @@ const MAX_PREFETCHES_PER_TICK: usize = 5000;
 /// `PrefetchIngestHandler` (the same kind the cascade + self-service use).
 const PREFETCH_INGEST_KIND: &str = "prefetch";
 
-/// `trigger_source` for scheduled enqueues. Deliberately NOT `"prefetch"`
-/// (the cascade-internal marker): a `"scheduled"` leaf is a SEED, so its
-/// ingest re-fires the transitive cascade (`is_cascade_internal_leaf` is
-/// `trigger_source == "prefetch"`). Must be present in the
-/// `jobs.trigger_source` CHECK (migration 009).
-const SCHEDULED_TRIGGER_SOURCE: &str = "scheduled";
+/// `trigger_source` for scheduled enqueues. Deliberately NOT
+/// [`TriggerSource::Prefetch`] (the cascade-internal marker): a
+/// `"scheduled"` leaf is a SEED, so its ingest re-fires the transitive
+/// cascade (`is_cascade_internal_leaf` tests for the cascade literal).
+///
+/// Taken from the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]), so CHECK
+/// membership is a property of the value rather than something this
+/// comment has to promise.
+const SCHEDULED_TRIGGER_SOURCE: &str = TriggerSource::Scheduled.as_str();
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -809,6 +814,10 @@ impl TaskHandler for PrefetchTickHandler {
                     // scheduled row for the same coordinate.
                     let format_key = repo.format.to_string();
                     let normalised = handler.normalize_name(package);
+                    // Loop-invariant: every row in this batch is the same
+                    // `(kind, trigger_source)` pair, so the ordinal is
+                    // resolved once rather than per planned version.
+                    let priority = queue_priority(PREFETCH_INGEST_KIND, SCHEDULED_TRIGGER_SOURCE);
                     let rows: Vec<PrefetchEnqueueRow> = planned
                         .iter()
                         .map(|version| PrefetchEnqueueRow {
@@ -818,7 +827,7 @@ impl TaskHandler for PrefetchTickHandler {
                                 "package": normalised,
                                 "version": version,
                             }),
-                            priority: 0,
+                            priority,
                             trigger_source: SCHEDULED_TRIGGER_SOURCE.to_string(),
                             target_key: super::prefetch_target_key(
                                 repo.id,
@@ -2538,7 +2547,10 @@ mod tests {
                 row.trigger_source, "scheduled",
                 "SEED trigger source (not \"prefetch\") so the on-ingest cascade fires"
             );
-            assert_eq!(row.priority, 0);
+            assert_eq!(
+                row.priority,
+                queue_priority(PREFETCH_INGEST_KIND, SCHEDULED_TRIGGER_SOURCE)
+            );
             assert!(!row.target_key.is_empty(), "L3 dedup key must be populated");
             assert_eq!(row.params["repository_id"], serde_json::json!(repo_id));
             assert_eq!(row.params["package"], "express");

@@ -96,6 +96,7 @@ use hort_domain::ports::format_handler::{
     require_https_metadata_url, split_metadata_files_per_version, FormatHandler,
     MetadataUrlSubject, MAX_METADATA_FILES_PER_VERSION,
 };
+use hort_domain::ports::jobs_repository::TriggerSource;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
@@ -1568,7 +1569,7 @@ async fn pypi_per_distribution_fanout(
 /// verified-ingest request's `payload_metadata.cascade_internal`, which
 /// `IngestUseCase::ingest_with_verification` reads back.
 fn is_cascade_internal_leaf(trigger_source: &str) -> bool {
-    trigger_source == "prefetch"
+    trigger_source == TriggerSource::Prefetch.as_str()
 }
 
 /// Canonical projection path for a prefetch leaf artifact. The ONE place
@@ -2323,7 +2324,7 @@ mod tests {
         // being dropped — the Postgres adapter commits them inside the
         // artifact's own transaction.
         let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
                 .with_content_references(content_refs.clone()),
         );
         let storage = Arc::new(MockStoragePort::new());

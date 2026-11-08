@@ -367,8 +367,10 @@ block listing every version the served index is withholding, and why:
   not waiting for anything and carries no `available_after`; only an
   operator decision (see
   [`curator-workflow.md`](curator-workflow.md)) changes it.
-- `status: scan_indeterminate` — the scanner could not decide, and hort
-  fails closed. Also terminal, also no `available_after`.
+- `status: scan_indeterminate` — the scanner reached no verdict, and
+  hort fails closed. No `available_after`: the hold lifts when a scan
+  finally reaches a verdict, or on an operator decision, not on a
+  clock — so there is no instant to name.
 - `available_after` is the instant the hold lifts, computed from the
   same window the tarball route's `Retry-After` counts down to. It is
   **omitted** when hort cannot compute it (no recorded window anchor, or

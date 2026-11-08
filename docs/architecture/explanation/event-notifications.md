@@ -407,7 +407,12 @@ Loss and degradation stay observable:
   with a 5-minute debounce on success and immediately on failure
   (`subscription_task.rs`, `ProgressDebouncer`). It is both the operator
   signal and the cursor a restarting task resumes from — and because it
-  lags, it resumes *behind* rather than ahead. It is one scalar per
+  lags, it resumes *behind* rather than ahead. It only ever moves
+  forward, and `SubscriptionRepository::update_last_delivered` is its
+  only writer: the flushes come from one task per replica with no
+  leader election, so nothing orders them, and the row-level `update`
+  behind a `PATCH` / `pause` / `resume` / `disable` carries a copy of
+  the column it read before them. It is one scalar per
   subscription, and the merged `read_categories` walk is what makes that
   exact for a multi-category filter rather than a position in whichever
   category was read last.

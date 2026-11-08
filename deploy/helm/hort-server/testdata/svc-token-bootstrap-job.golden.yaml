@@ -15,12 +15,8 @@ metadata:
   annotations:
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "5"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
-  # Auto-clean 5 minutes after the Job completes (success or failure).
-  # The k8s audit log and operator tooling retain the run history;
-  # the Job object itself is just "did it finish".
-  ttlSecondsAfterFinished: 300
   backoffLimit: 1
   template:
     metadata:
@@ -40,8 +36,10 @@ spec:
           type: RuntimeDefault
       volumes:
         - name: bootstrap-token
-          # medium: Memory keeps the plaintext off-disk. The volume
-          # lifetime is the Pod lifetime — removed when the Job Pod completes.
+          # medium: Memory keeps the plaintext off-disk. Assume it is
+          # resident for as long as the Pod object exists — see the
+          # retention note in the docstring above, which is why a
+          # successful run is deleted at once.
           emptyDir:
             medium: Memory
         - name: tmp

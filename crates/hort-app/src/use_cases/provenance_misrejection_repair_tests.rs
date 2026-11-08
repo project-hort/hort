@@ -12,6 +12,7 @@
 //! decision does not lean on the listing.
 
 use super::*;
+use crate::use_cases::STREAM_EVENT_CAP;
 
 use chrono::{DateTime, Duration};
 use hort_domain::entities::artifact::Artifact;
@@ -25,6 +26,7 @@ use hort_domain::events::{
     ArtifactQuarantined, PersistedEvent, ProvenanceRejected, ProvenanceVerified, RejectionReason,
     StreamId,
 };
+use hort_domain::policy::DefaultPolicy;
 use hort_domain::ports::curation_queue_repository::CurationQueueEntry;
 use hort_domain::ports::provenance::{ProvenanceRejectReason, SignerIdentity};
 use hort_domain::types::ContentHash;
@@ -50,7 +52,10 @@ struct Fixture {
 fn build() -> Fixture {
     let events = Arc::new(MockEventStore::new());
     let artifacts = Arc::new(MockArtifactRepository::new());
-    let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+    let lifecycle = Arc::new(MockArtifactLifecycle::new(
+        artifacts.clone(),
+        events.clone(),
+    ));
     let queue = Arc::new(MockCurationQueueRepository::new());
     let uc = ProvenanceMisrejectionRepairUseCase::new(
         crate::event_store_publisher::wrap_for_test(events.clone()),
@@ -228,13 +233,23 @@ fn seed_never_terminal(f: &Fixture) -> (Artifact, CurationQueueEntry) {
 /// the two-hour-old anchor [`seed`] uses, so the candidate is past its
 /// deadline exactly as the real sweep's candidacy filter requires.
 fn required_provenance_projections(repository_id: Uuid) -> Arc<MockPolicyProjectionRepository> {
-    let projections = Arc::new(MockPolicyProjectionRepository::new());
-    projections.insert(ScanPolicyProjection {
+    required_provenance_projections_with_window(repository_id, 0).0
+}
+
+/// [`required_provenance_projections`] with the observation window named
+/// by the caller, and the projection handed back so a test can assert
+/// the premise it rests on instead of inheriting it from this file's
+/// choice of default.
+fn required_provenance_projections_with_window(
+    repository_id: Uuid,
+    quarantine_duration_secs: i64,
+) -> (Arc<MockPolicyProjectionRepository>, ScanPolicyProjection) {
+    let policy = ScanPolicyProjection {
         policy_id: Uuid::new_v4(),
         name: format!("required-provenance-{}", Uuid::new_v4()),
         scope: PolicyScope::Repository(repository_id),
         severity_threshold: SeverityThreshold::Critical,
-        quarantine_duration_secs: 0,
+        quarantine_duration_secs,
         require_approval: false,
         provenance_mode: ProvenanceMode::Required,
         provenance_backends: vec!["cosign".to_string()],
@@ -250,8 +265,34 @@ fn required_provenance_projections(repository_id: Uuid) -> Arc<MockPolicyProject
         stream_version: 0,
         created_at: Utc::now(),
         updated_at: Utc::now(),
-    });
-    projections
+    };
+    let projections = Arc::new(MockPolicyProjectionRepository::new());
+    projections.insert(policy.clone());
+    (projections, policy)
+}
+
+/// The ordinary release sweep over the fixture's own ports, with
+/// `projections` as the live policy. Its lifecycle writes back to the
+/// fixture's artifact repository and event store, so the sweep reads the
+/// real post-repair row and the real post-repair stream rather than a
+/// re-seeded copy of them.
+fn ordinary_sweep(
+    f: &Fixture,
+    projections: Arc<MockPolicyProjectionRepository>,
+) -> QuarantineUseCase {
+    QuarantineUseCase::new(
+        f.artifacts.clone(),
+        crate::event_store_publisher::wrap_for_test(f.events.clone()),
+        Arc::new(MockArtifactLifecycle::new(
+            f.artifacts.clone(),
+            f.events.clone(),
+        )),
+        Arc::new(MockRepositoryRepository::new()),
+        projections,
+        Arc::new(MockContentReferenceIndex::new()),
+        Arc::new(MockStoragePort::new()),
+        Arc::new(MockJobsRepository::new()),
+    )
 }
 
 fn repair_request(dry_run: bool) -> RepairRequest {
@@ -339,16 +380,7 @@ async fn repairs_the_stranded_state_by_event_and_the_ordinary_sweep_then_release
     // this assertion would hold with it deleted. It is also what makes
     // this the exact contrast to the never-terminal arm's hold: same
     // repository mode, different provenance evidence, opposite outcome.
-    let quarantine_uc = QuarantineUseCase::new(
-        f.artifacts.clone(),
-        crate::event_store_publisher::wrap_for_test(f.events.clone()),
-        Arc::new(MockArtifactLifecycle::new(f.artifacts.clone())),
-        Arc::new(MockRepositoryRepository::new()),
-        required_provenance_projections(artifact.repository_id),
-        Arc::new(MockContentReferenceIndex::new()),
-        Arc::new(MockStoragePort::new()),
-        Arc::new(MockJobsRepository::new()),
-    );
+    let quarantine_uc = ordinary_sweep(&f, required_provenance_projections(artifact.repository_id));
     let summary = quarantine_uc
         .release_expired(vec![artifact.id])
         .await
@@ -358,6 +390,120 @@ async fn repairs_the_stranded_state_by_event_and_the_ordinary_sweep_then_release
         vec![artifact.id],
         "the repaired artifact must be released by the ordinary sweep — that is what \
          makes the repair an exit rather than a state change to nowhere"
+    );
+}
+
+/// **The permissive strand.** A repaired artifact whose repository runs
+/// `quarantineDuration: 0` is actually released. Permissive mode is a
+/// supported posture — ADR 0007's time gate is collapsed, the
+/// fail-closed scan gate is not — and the repair's exit hands the
+/// artifact back to the ordinary sweep on its original anchor. For the
+/// exit to be an exit, the two have to meet: a zero window is a window
+/// of **zero length**, not an absent one, so the repaired artifact is
+/// past its deadline from the moment the repair commits.
+///
+/// # Why three assertions and not one
+///
+/// `release_expired` never reads the window — expiry is the sweep's
+/// *candidacy* signal and never a release authority (ADR 0007) — so
+/// handing it an artifact id proves only that the release gates clear.
+/// That assertion holds unchanged for an artifact the sweep could never
+/// reach, which is exactly the shape of the failure this pins: while a
+/// repository's resolved zero window was read as *no* window, such a
+/// repository contributed no candidates at all and the repair
+/// re-stranded the very artifacts it exists to un-strand, with nothing
+/// else able to move `quarantine_window_start` again.
+///
+/// So the candidacy half is asserted beside it, through
+/// [`QuarantineUseCase::is_window_elapsed`] — the anchor +
+/// resolved-policy-duration computation that method and the sweep's
+/// candidacy filter share — and asserted twice over the one repaired
+/// artifact, which is what makes it sensitive rather than merely true:
+///
+/// - under the repository's permissive window it reads **elapsed**;
+/// - under the ordinary window, with the *same* anchor, it reads **not
+///   elapsed**.
+///
+/// Neither answer is available to a resolution that does not consult the
+/// duration: one constant answers the first assertion, the other answers
+/// the second, and nothing answers both. The adapter's own
+/// deadline-grouping half of this claim is pinned against a real
+/// database in `hort-adapters-postgres`'s
+/// `quarantine_release_candidates` suite; this is the application
+/// layer's half, where the repair population lives.
+#[tokio::test]
+async fn repairs_into_a_permissive_repository_and_the_ordinary_sweep_releases_it() {
+    let f = build();
+    let (artifact, entry) = seed_stranded(&f);
+    let anchor = artifact.quarantine_window_start.unwrap();
+    f.queue.set_entries(vec![entry]);
+
+    f.uc.run(repair_request(false), api_actor())
+        .await
+        .expect("the repair must not itself error");
+
+    // The row the sweep will read: back in the hold, carrying the anchor
+    // it was ingested under. Restored, not restarted — the window the
+    // sweep resolves is the original one.
+    let repaired = f.artifacts.get(artifact.id).expect("the repaired row");
+    assert_eq!(repaired.quarantine_status, QuarantineStatus::Quarantined);
+    assert_eq!(repaired.quarantine_window_start, Some(anchor));
+
+    // (1) Candidacy under the repository's live permissive window.
+    let (permissive, permissive_policy) =
+        required_provenance_projections_with_window(artifact.repository_id, 0);
+    assert_eq!(
+        permissive_policy.quarantine_duration_secs, 0,
+        "premise: the repository's live window is the permissive zero"
+    );
+    assert!(
+        ordinary_sweep(&f, permissive.clone())
+            .is_window_elapsed(&repaired)
+            .await
+            .expect("is_window_elapsed must not error"),
+        "a zero-length window puts the deadline at the anchor, so the repaired artifact \
+         is past it and the sweep reaches it"
+    );
+
+    // (2) The same artifact and the same anchor under the ordinary
+    // window: its hold is still running. Without this, assertion (1)
+    // would hold for a resolution that never consulted the duration.
+    let (ordinary, ordinary_policy) = required_provenance_projections_with_window(
+        artifact.repository_id,
+        DefaultPolicy::quarantine_duration_secs(),
+    );
+    assert!(
+        Utc::now() - anchor < Duration::seconds(ordinary_policy.quarantine_duration_secs),
+        "premise: the ordinary window outlasts the seeded anchor's age, so the contrast \
+         below is about the duration and not about the anchor"
+    );
+    assert!(
+        !ordinary_sweep(&f, ordinary)
+            .is_window_elapsed(&repaired)
+            .await
+            .expect("is_window_elapsed must not error"),
+        "the repaired artifact is a candidate because its repository's window is zero, \
+         not because a repaired artifact is treated as expired"
+    );
+
+    // (3) …and the permissive repository's candidate is released, on the
+    // ordinary scan-axis authority with the provenance leg cleared by
+    // the `ProvenanceVerified` already on the stream. The repository is
+    // `provenance_mode: required`, so that clearance is doing real work
+    // rather than being waived by the default mode.
+    let summary = ordinary_sweep(&f, permissive)
+        .release_expired(vec![artifact.id])
+        .await
+        .expect("release_expired must not error");
+    assert_eq!(
+        summary.released,
+        vec![artifact.id],
+        "a repaired artifact in a permissive repository leaves the hold — a collapsed \
+         time gate is not a reason to withhold the sweep that is its only exit"
+    );
+    assert_eq!(
+        f.artifacts.get(artifact.id).unwrap().quarantine_status,
+        QuarantineStatus::Released,
     );
 }
 
@@ -934,7 +1080,7 @@ async fn a_candidate_whose_stream_breached_the_event_cap_is_reported_as_failed()
     let f = build();
     let (artifact, entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
         let mut stream = vec![quarantined(id, 0, anchor)];
-        stream.extend((1..201).map(|i| persisted_scan_completed(id, 0, i)));
+        stream.extend((1..STREAM_EVENT_CAP + 1).map(|i| persisted_scan_completed(id, 0, i)));
         stream
     });
     f.queue.set_entries(vec![entry]);
@@ -945,9 +1091,56 @@ async fn a_candidate_whose_stream_breached_the_event_cap_is_reported_as_failed()
     assert_eq!(report.failed.len(), 1);
     assert_eq!(report.failed[0].0, artifact.id);
     assert!(
-        report.failed[0].1.contains("200-event cap"),
+        report.failed[0]
+            .1
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")),
         "the failure must name the cap it is enforcing; got {}",
         report.failed[0].1
+    );
+}
+
+/// The repair's append is a PAIR — `ArtifactReEvaluated` plus the
+/// `ArtifactQuarantined` that returns the artifact to the ordinary sweep
+/// — so a stream one short of the cap has room for neither. The candidate
+/// is reported as failed rather than repaired, and nothing is committed.
+///
+/// Distinct from the over-cap test above, which is about a prefix the read
+/// cannot prove it finished. This one is about a stream the read saw
+/// entirely and that has no room left, which is the case the version check
+/// the append carries would have let through.
+#[tokio::test]
+async fn a_candidate_with_no_room_for_the_repair_pair_is_reported_as_failed() {
+    let f = build();
+    let (artifact, entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
+        let mut stream = vec![
+            quarantined(id, 0, anchor),
+            persisted_scan_completed(id, 0, 1),
+            verified(id, 2),
+        ];
+        // Filler up to one short of the cap, placed AFTER the three
+        // events the conjuncts read so every reverse scan still answers
+        // the same way.
+        stream.extend((3..STREAM_EVENT_CAP - 1).map(|i| quarantined(id, i, anchor)));
+        assert_eq!(stream.len() as u64, STREAM_EVENT_CAP - 1);
+        stream
+    });
+    f.queue.set_entries(vec![entry]);
+
+    let report = f.uc.run(repair_request(false), api_actor()).await.unwrap();
+
+    assert!(report.affected.is_empty());
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].0, artifact.id);
+    assert!(
+        report.failed[0]
+            .1
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")),
+        "the failure must name the cap it is enforcing; got {}",
+        report.failed[0].1
+    );
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "neither half of the repair pair lands"
     );
 }
 
@@ -1097,16 +1290,7 @@ async fn repairs_a_never_terminal_rejection_and_the_ordinary_sweep_then_holds_it
     }
 
     // --- and now the ordinary sweep takes over -------------------------
-    let quarantine_uc = QuarantineUseCase::new(
-        f.artifacts.clone(),
-        crate::event_store_publisher::wrap_for_test(f.events.clone()),
-        Arc::new(MockArtifactLifecycle::new(f.artifacts.clone())),
-        Arc::new(MockRepositoryRepository::new()),
-        required_provenance_projections(artifact.repository_id),
-        Arc::new(MockContentReferenceIndex::new()),
-        Arc::new(MockStoragePort::new()),
-        Arc::new(MockJobsRepository::new()),
-    );
+    let quarantine_uc = ordinary_sweep(&f, required_provenance_projections(artifact.repository_id));
     let summary = quarantine_uc
         .release_expired(vec![artifact.id])
         .await

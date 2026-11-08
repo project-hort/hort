@@ -164,8 +164,9 @@ to.
 
 ```sh
 hort-cli curation queue --status quarantined --repo npm-proxy
-# Identify the artifact_id. Then look at its finding count and scan
-# status. A waive is appropriate when finding_count = 0 (clean scan)
+# Identify the artifact_id and, for OCI, the path. Then look at its
+# finding count and scan status. A waive is appropriate when
+# finding_count = 0 (a completed clean scan)
 # or the findings are known false-positives you intend to follow up
 # with --exclude-finding.
 ```
@@ -174,9 +175,9 @@ hort-cli curation queue --status quarantined --repo npm-proxy
 which is the same scan the release verdict is derived from. A finding an
 earlier scan reported and a later one did not is not counted here — the
 row is in the queue because of what is true now, not because of what was
-ever true. Both read `0` / empty for an artifact that has never been
-scanned, which is a different situation: `scan_status` is what tells the
-two apart.
+ever true. An artifact that has never been scanned shows `unscanned` in
+both finding columns instead of `0` / empty. OCI rows also show their
+stored path, which distinguishes blobs and manifests of the same image.
 
 **Issue the waive:**
 
@@ -623,6 +624,17 @@ per-artifact one.
 ingest from a specific repo, the posture is wrong for that repo —
 encode the decision once in policy, not N times in the audit log.
 
+**Changing the duration re-judges nothing — the sweep tick is the way
+out.** `quarantineDuration` is deliberately not a re-evaluation trigger
+(§6): editing it re-derives no verdict and moves no artifact's
+`quarantine_window_start`, which is immutable once stamped. So setting
+`0` on a repository that is *already* holding artifacts releases nothing
+at apply time — those artifacts leave the hold when the release sweep's
+next tick reaches them and the live gates clear (default every five
+minutes), or, per artifact, on a curator waive. How to recognise one
+that has not moved is in
+[the stranded-artifact guide](recover-stranded-artifacts.md) §6.
+
 ---
 
 ## 6. Changing a `ScanPolicy` re-judges the existing population — in both directions
@@ -654,6 +666,12 @@ verdict under the new policy and transitions the artifact to match, in
   are re-`Quarantined` / re-`Rejected`. This is the direction that used
   to silently fail-open — an artifact you had just declared
   unacceptable stayed downloadable. It no longer does.
+
+**`quarantineDuration` is not on that list, and that is deliberate:**
+this pass re-derives the *verdict* from stored findings, never the
+*timer*. Editing the duration therefore re-judges nothing and moves no
+artifact's immutable `quarantine_window_start` — the release sweep's
+next tick is what acts on the new duration (§5).
 
 ### 6.1 What a tightening actually pulls — and what it cannot
 

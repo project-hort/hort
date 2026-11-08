@@ -21,6 +21,13 @@ use std::time::Duration;
 // sets nothing actually runs on — so the inert half of such a change would
 // be the half every operator sees.
 use hort_app::retry_backoff::DEFAULT_MAX_ATTEMPTS;
+use hort_domain::policy::DEFAULT_CLASS_SERVICE_THRESHOLD_SECS;
+// The batch/share coherence rule is the claim's own arithmetic, so it is
+// asked of the reservation the claim takes rather than restated here: a
+// literal band count in this file would be a second answer to "which
+// classes get a share", and that number is the domain's.
+use hort_domain::ports::jobs_repository::ClaimReservation;
+use hort_domain::types::task_tier::DEFAULT_RESERVED_SLOTS_PER_CLASS;
 
 // -----------------------------------------------------------------
 // Public types
@@ -217,8 +224,76 @@ pub struct WorkerConfig {
     /// `/var/lib/hort/stateful-upload-staging` for S3.
     pub stateful_upload_staging_dir: PathBuf,
     pub poll_interval: Duration,
+    /// Rows the dispatcher claims per poll across every registered kind.
+    /// Parsed from `HORT_SCANNER_BATCH_SIZE`, **default `4`**.
+    ///
+    /// **Not independent of [`Self::reserved_slots_per_class`]**, and
+    /// the claim is what relates them. `claim_pending_by_kinds` spends
+    /// the batch in three passes: the reservation takes up to
+    /// `reserved_slots_per_class` rows for *each* waited-on band and is
+    /// then capped at the batch as a whole (dropping the lowest class's
+    /// reservation first), then one priority-blind oldest row, then the
+    /// remainder by rank. So a batch of
+    /// `bands × reserved_slots_per_class` is spent before the oldest
+    /// slot gets a row — and that slot is the only guarantee of service
+    /// for the class with no reserved share (ADR 0066 D5). The smallest
+    /// batch that serves every class is therefore
+    /// `bands × reserved_slots_per_class + 1`, which is
+    /// [`ClaimReservation::minimum_batch_size`] and, with the two
+    /// waited-on classes of today and the default share, `3`.
+    ///
+    /// A pair below that minimum **fails worker startup** rather than
+    /// being warned about or quietly raised: the lower batch an operator
+    /// reaches for against lock contention silently removed a class
+    /// from the allocation, and that is the defect the reservation
+    /// exists to remove.
     pub batch_size: u32,
     pub max_attempts: u32,
+    /// Slots the dispatcher holds for each non-empty waited-on class at
+    /// both points where it allocates capacity — the claim batch and
+    /// the per-kind run permits (ADR 0066 D4). Parsed from
+    /// `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS`, **default
+    /// [`DEFAULT_RESERVED_SLOTS_PER_CLASS`]** (`1`).
+    ///
+    /// One number for both allocations deliberately: D4 says a design
+    /// that closes one point and not the other is incomplete rather
+    /// than partial, and two knobs would let a deployment be configured
+    /// into exactly that state. `0` turns the reservation off at both.
+    ///
+    /// Why it is configuration at all: ADR 0066 declines to fix the
+    /// shares, because with a single worker replica the share is the
+    /// whole control surface.
+    ///
+    /// **Bounded from above by [`Self::batch_size`]**, which has the
+    /// arithmetic: the claim batch must hold every reserved slot *and*
+    /// one row beyond them for the priority-blind oldest slot, so
+    /// `batch_size` must be at least
+    /// `bands × reserved_slots_per_class + 1`
+    /// ([`ClaimReservation::minimum_batch_size`]). Raising the share
+    /// without raising the batch removes a class from the allocation as
+    /// surely as lowering the batch does, so the same startup refusal
+    /// catches both directions.
+    pub reserved_slots_per_class: u16,
+    /// How long work of a class may wait with nothing of that class
+    /// served before the dispatcher's per-class audit calls the class
+    /// unserved (ADR 0066 D5). Parsed from
+    /// `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS`, **default
+    /// [`DEFAULT_CLASS_SERVICE_THRESHOLD_SECS`]** (300 s).
+    ///
+    /// **Shared with `hort-server`**, which reads the same variable to
+    /// decide the operator-facing `hort_admin_tasks_class_unserved`
+    /// gauge: the worker's ERROR log is the local trail and the
+    /// server's gauge is the surface a scrape reaches, and they are
+    /// verdicts of the same pure predicate over the same durable facts.
+    /// Set it on both deployments or on neither — set on one only, the
+    /// log and the gauge answer at different thresholds. The default is
+    /// the domain's so that "neither" is always consistent.
+    ///
+    /// `0` is a coherent setting that reports any waiting class as
+    /// unserved; the direction to err in is the loud one (ADR 0066: "a
+    /// false alarm is recoverable, a silent stall is the failure being
+    /// removed").
+    pub class_service_threshold: Duration,
     pub lock_duration: Duration,
     pub worker_id: String,
     /// Break-glass switch for the cross-backend finding merge's
@@ -363,6 +438,8 @@ impl std::fmt::Debug for WorkerConfig {
             poll_interval,
             batch_size,
             max_attempts,
+            reserved_slots_per_class,
+            class_service_threshold,
             lock_duration,
             worker_id,
             finding_merge_allow_informed_downgrade,
@@ -404,6 +481,8 @@ impl std::fmt::Debug for WorkerConfig {
             .field("poll_interval", poll_interval)
             .field("batch_size", batch_size)
             .field("max_attempts", max_attempts)
+            .field("reserved_slots_per_class", reserved_slots_per_class)
+            .field("class_service_threshold", class_service_threshold)
             .field("lock_duration", lock_duration)
             .field("worker_id", worker_id)
             .field(
@@ -572,6 +651,71 @@ impl WorkerConfig {
             Duration::from_secs(parse_u64_default("HORT_SCANNER_POLL_INTERVAL_SECS", 5)?);
         let batch_size = parse_u32_default("HORT_SCANNER_BATCH_SIZE", 4)?;
         let max_attempts = parse_u32_default("HORT_SCANNER_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)?;
+        // The per-class reserved share, for both the claim batch and
+        // the run permits. Clamped to `u16` the way `batch_size` is
+        // clamped at the dispatcher boundary: the knob is a count of
+        // slots inside a batch, and a value past `u16::MAX` is an
+        // operator typo rather than an intent the dispatcher could
+        // honour.
+        let reserved_slots_per_class = u16::try_from(parse_u32_default(
+            "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS",
+            u32::from(DEFAULT_RESERVED_SLOTS_PER_CLASS),
+        )?)
+        .unwrap_or(u16::MAX);
+        // The two numbers above are not independent, and the claim is
+        // what relates them: the reserved pass can spend
+        // `bands × share` of the batch before the one priority-blind
+        // oldest slot gets a row, and that slot is the only guarantee of
+        // service for the class with no reserved share (ADR 0066 D5).
+        // Below the minimum a class is simply never claimed.
+        //
+        // Refused rather than warned about or quietly raised. A worker
+        // whose batch cannot seat every class has the defect this
+        // reservation exists to remove, and overriding an operator's
+        // number without saying so is the same failure one level up —
+        // the house style here is to reject a value rather than
+        // interpret it (see `HORT_RETENTION_STREAM_MODE` below). The
+        // consequence is deliberate: a deployment running
+        // `HORT_SCANNER_BATCH_SIZE=2` stops starting, which is why the
+        // message carries both values, the arithmetic, the minimum and
+        // both repairs in one line.
+        //
+        // `var` is the batch rather than the share because the batch is
+        // the knob that has to clear the other one, and either repair
+        // ends the refusal — the reason names both.
+        let reservation = ClaimReservation::waited_on(reserved_slots_per_class);
+        let minimum_batch_size = reservation.minimum_batch_size();
+        if batch_size < minimum_batch_size {
+            return Err(ConfigError::InvalidValue {
+                var: "HORT_SCANNER_BATCH_SIZE",
+                reason: format!(
+                    "HORT_SCANNER_BATCH_SIZE={batch_size} cannot serve every work class at \
+                     HORT_SCANNER_RESERVED_SLOTS_PER_CLASS={reserved_slots_per_class}: the claim \
+                     holds {reserved_slots_per_class} {slot} for each of the {bands} waited-on \
+                     classes and needs one row beyond them for the priority-blind oldest slot, \
+                     which is the only guarantee of service for the class with no reserved share \
+                     — so the smallest batch that serves every class is {bands} × \
+                     {reserved_slots_per_class} + 1 = {minimum_batch_size}. Below it a class is \
+                     never claimed at all. Either raise HORT_SCANNER_BATCH_SIZE to at least \
+                     {minimum_batch_size}, or lower HORT_SCANNER_RESERVED_SLOTS_PER_CLASS \
+                     (`0` turns the reservation off entirely)",
+                    bands = reservation.bands.len(),
+                    slot = if reserved_slots_per_class == 1 {
+                        "slot"
+                    } else {
+                        "slots"
+                    },
+                ),
+            });
+        }
+        // The per-class service threshold the dispatcher audits
+        // against. `hort-server` reads the same variable for the gauge
+        // an operator scrapes — see the field doc — and the default
+        // comes from the domain so the two agree when neither is set.
+        let class_service_threshold = Duration::from_secs(parse_u64_default(
+            "HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS",
+            DEFAULT_CLASS_SERVICE_THRESHOLD_SECS,
+        )?);
         let lock_duration =
             Duration::from_secs(parse_u64_default("HORT_SCANNER_LOCK_DURATION_SECS", 900)?);
         let worker_id = parse_worker_id();
@@ -701,6 +845,8 @@ impl WorkerConfig {
             poll_interval,
             batch_size,
             max_attempts,
+            reserved_slots_per_class,
+            class_service_threshold,
             lock_duration,
             worker_id,
             finding_merge_allow_informed_downgrade,
@@ -714,6 +860,28 @@ impl WorkerConfig {
             lock_timeout_ms,
             metrics_bind_addr,
         })
+    }
+
+    /// What this worker's share of zero gives up, or `None` when the
+    /// reservation is on — the statement the binary makes at startup.
+    ///
+    /// ADR 0066 permits `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0` on
+    /// one condition: the deployment says which guarantee it waived.
+    /// The zero is also the only share the batch rule above cannot
+    /// complain about — the minimum batch at a share of zero is
+    /// `0 × bands + 1 = 1`, so every batch clears it while every
+    /// mechanism the rule protects is off — so without this statement
+    /// the one configuration that removes the guarantee is the one
+    /// configuration that boots silently.
+    ///
+    /// The text is the domain's
+    /// ([`hort_domain::policy::class_reservation_waiver`]), beside the
+    /// enforcement times it names; this reads it off the share **this
+    /// worker was configured with**, so the statement cannot be about a
+    /// number the worker is not running.
+    #[must_use]
+    pub fn class_reservation_waiver(&self) -> Option<&'static str> {
+        hort_domain::policy::class_reservation_waiver(self.reserved_slots_per_class)
     }
 }
 
@@ -1083,6 +1251,10 @@ mod tests {
         "HORT_SCANNER_POLL_INTERVAL_SECS",
         "HORT_SCANNER_BATCH_SIZE",
         "HORT_SCANNER_MAX_ATTEMPTS",
+        "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS",
+        // Per-class service threshold (ADR 0066 D5) — read by
+        // `hort-server` too.
+        "HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS",
         "HORT_SCANNER_LOCK_DURATION_SECS",
         "HORT_WORKER_ID",
         "POD_NAME",
@@ -1306,6 +1478,158 @@ mod tests {
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+    }
+
+    /// A batch too small to seat every class refuses to start, and says
+    /// both numbers, the minimum and the two repairs.
+    ///
+    /// `HORT_SCANNER_BATCH_SIZE=2` is the configuration an operator
+    /// reaches for against lock contention, and it silently removed a
+    /// class from the allocation: the reservation fills both waited-on
+    /// bands and the priority-blind oldest slot — the only guarantee of
+    /// service for the class with no reserved share — never gets one.
+    /// The refusal is the point, so the message is asserted rather than
+    /// merely the variant: an operator whose worker stopped starting
+    /// gets the arithmetic and the fix out of one line.
+    #[test]
+    fn a_batch_too_small_to_serve_every_class_refuses_to_start() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var("HORT_SCANNER_BATCH_SIZE", "2");
+
+        let err = WorkerConfig::from_env()
+            .expect_err("a batch that cannot seat every class must not start");
+        let ConfigError::InvalidValue { var, reason } = &err else {
+            panic!("expected InvalidValue, got {err:?}");
+        };
+        assert_eq!(*var, "HORT_SCANNER_BATCH_SIZE");
+        for fragment in [
+            "HORT_SCANNER_BATCH_SIZE=2",
+            "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=1",
+            "1 slot for each of the 2 waited-on classes",
+            "2 × 1 + 1 = 3",
+            "raise HORT_SCANNER_BATCH_SIZE to at least 3",
+            "lower HORT_SCANNER_RESERVED_SLOTS_PER_CLASS",
+        ] {
+            assert!(
+                reason.contains(fragment),
+                "the refusal must carry {fragment:?} — both values, the minimum and the fix in \
+                 one line: {reason}"
+            );
+        }
+    }
+
+    /// The same refusal from the other direction: raising the share
+    /// without raising the batch removes a class just as surely.
+    ///
+    /// Two slots for each of the two waited-on bands leaves nothing of a
+    /// four-row batch for the oldest slot, so the minimum is five and
+    /// the shipped default batch no longer suffices. The message names
+    /// the share's own variable, because that is the number this
+    /// operator changed.
+    #[test]
+    fn a_share_too_large_for_the_batch_refuses_to_start() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var("HORT_SCANNER_RESERVED_SLOTS_PER_CLASS", "2");
+
+        let err = WorkerConfig::from_env()
+            .expect_err("a share the batch cannot seat must not start either");
+        let ConfigError::InvalidValue { reason, .. } = &err else {
+            panic!("expected InvalidValue, got {err:?}");
+        };
+        for fragment in [
+            "HORT_SCANNER_BATCH_SIZE=4",
+            "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=2",
+            "2 slots for each of the 2 waited-on classes",
+            "2 × 2 + 1 = 5",
+            "raise HORT_SCANNER_BATCH_SIZE to at least 5",
+        ] {
+            assert!(
+                reason.contains(fragment),
+                "the refusal must carry {fragment:?}: {reason}"
+            );
+        }
+    }
+
+    /// The zero is permitted, so it starts — and it does not start
+    /// quietly.
+    ///
+    /// ADR 0066's condition on the waiver is that it is never silent,
+    /// and this share is the one the batch rule above cannot refuse: at
+    /// zero the minimum batch is one, so the check passes exactly when
+    /// the reservation, its time floor and the age net beneath them are
+    /// all off. The counter-assertion is the shipped share, which has
+    /// nothing to state.
+    #[test]
+    fn a_zero_share_starts_and_states_what_it_waived() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var("HORT_SCANNER_RESERVED_SLOTS_PER_CLASS", "0");
+
+        let cfg = WorkerConfig::from_env().expect("a share of zero is a permitted waiver");
+        assert_eq!(cfg.reserved_slots_per_class, 0);
+        let waiver = cfg
+            .class_reservation_waiver()
+            .expect("a worker that gave the guarantee up must say so at startup");
+        for fragment in [
+            "HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0",
+            "no class is guaranteed service",
+        ] {
+            assert!(
+                waiver.contains(fragment),
+                "the startup statement must carry {fragment:?}: {waiver}"
+            );
+        }
+
+        std::env::set_var("HORT_SCANNER_RESERVED_SLOTS_PER_CLASS", "1");
+        let reserved = WorkerConfig::from_env().expect("the shipped share must start");
+        assert_eq!(
+            reserved.class_reservation_waiver(),
+            None,
+            "a worker holding the guarantee has no waiver to state"
+        );
+    }
+
+    /// The shipped pair starts — and so does every pair at or above the
+    /// minimum.
+    ///
+    /// The counter-assertion to the two refusals: a rule that rejected
+    /// the defaults would stop every deployment, and one that rejected
+    /// the minimum itself would be arithmetic nobody could satisfy. The
+    /// boundary is asserted on both sides, from the same derivation the
+    /// refusal uses, so a change to the band list moves the test with
+    /// the rule rather than against it.
+    #[test]
+    fn the_default_pair_starts_and_so_does_the_minimum() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+
+        let cfg = WorkerConfig::from_env().expect("the shipped default pair must start");
+        let minimum =
+            ClaimReservation::waited_on(DEFAULT_RESERVED_SLOTS_PER_CLASS).minimum_batch_size();
+        assert!(
+            cfg.batch_size >= minimum,
+            "the shipped default batch ({}) must seat the shipped default share ({}), whose \
+             minimum is {minimum}",
+            cfg.batch_size,
+            cfg.reserved_slots_per_class
+        );
+
+        // The boundary itself, from both sides.
+        std::env::set_var("HORT_SCANNER_BATCH_SIZE", minimum.to_string());
+        let at_minimum = WorkerConfig::from_env().expect("the minimum batch must start");
+        assert_eq!(at_minimum.batch_size, minimum);
+        std::env::set_var("HORT_SCANNER_BATCH_SIZE", (minimum - 1).to_string());
+        WorkerConfig::from_env().expect_err("one below the minimum must not start");
     }
 
     #[test]
@@ -1636,6 +1960,38 @@ mod tests {
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+    }
+
+    // -- Per-class service threshold (ADR 0066 D5) ------------------------
+
+    /// Unset means the domain's number — the same one `hort-server`
+    /// falls back to, which is what makes the worker's log and the
+    /// operator's gauge agree on a deployment that configures neither.
+    #[test]
+    fn class_service_threshold_defaults_to_the_domain_number() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+
+        let cfg = WorkerConfig::from_env().expect("parses with required vars");
+        assert_eq!(
+            cfg.class_service_threshold,
+            Duration::from_secs(DEFAULT_CLASS_SERVICE_THRESHOLD_SECS),
+            "the default must come from the one domain definition, not from a local literal"
+        );
+    }
+
+    #[test]
+    fn class_service_threshold_override_is_parsed() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var("HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS", "90");
+
+        let cfg = WorkerConfig::from_env().expect("parses with the threshold override");
+        assert_eq!(cfg.class_service_threshold, Duration::from_secs(90));
     }
 
     // -- Worker /metrics listener bind (HORT_WORKER_METRICS_BIND) ---------

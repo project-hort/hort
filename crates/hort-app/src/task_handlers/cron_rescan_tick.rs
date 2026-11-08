@@ -42,10 +42,11 @@ use chrono::Utc;
 use serde_json::json;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::ports::rescan_candidates::{RescanCandidate, RescanCandidatesRepository};
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
+use hort_domain::types::task_tier::scan_queue_priority;
 
 use crate::metrics::{
     emit_scan_jobs_enqueued, set_cron_rescan_eligible_artifacts,
@@ -65,16 +66,12 @@ use crate::metrics::{
 /// enormous queue burst, and ENV-tuning is deliberately not offered.
 const BATCH_SIZE: u32 = 1000;
 
-/// Priority bucket for cron-enqueued scans.
-///
-/// Lower than manual (20), higher than advisory (5). The framework
-/// orders claims `priority DESC, created_at ASC`.
-const CRON_RESCAN_PRIORITY: i16 = 10;
-
-/// `trigger_source` literal — must match the SQL CHECK constraint on
-/// `jobs.trigger_source` (`'manual' | 'cron' | 'advisory' | 'ingest'`).
-/// Mirrors [`hort_domain::ports::jobs_repository::TriggerSource::Cron`].
-const CRON_TRIGGER_SOURCE: &str = "cron";
+/// `trigger_source` literal for the scheduled rescan tick, taken from
+/// the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]) rather than
+/// re-typed beside it — so a literal the `jobs.trigger_source` CHECK does
+/// not admit cannot be written here at all.
+const CRON_TRIGGER_SOURCE: &str = TriggerSource::Cron.as_str();
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -125,7 +122,7 @@ impl CronRescanTickHandler {
                     c.repository_id,
                     &c.content_hash,
                     &c.format,
-                    CRON_RESCAN_PRIORITY,
+                    scan_queue_priority(CRON_TRIGGER_SOURCE),
                     CRON_TRIGGER_SOURCE,
                 )
                 .await
@@ -600,8 +597,12 @@ mod tests {
             assert_eq!(call.artifact_id, c.artifact_id);
             assert_eq!(call.repository_id, c.repository_id);
             assert_eq!(call.format, c.format);
-            assert_eq!(call.priority, 10);
-            assert_eq!(call.priority, CRON_RESCAN_PRIORITY);
+            assert_eq!(call.priority, scan_queue_priority(CRON_TRIGGER_SOURCE));
+            assert!(
+                call.priority < scan_queue_priority(TriggerSource::Ingest.as_str()),
+                "a rescan nobody is waiting on must not outrank the ingest-time scan that \
+                 stands between a client's bytes and being served"
+            );
             assert_eq!(call.trigger_source, "cron");
             assert_eq!(call.trigger_source, CRON_TRIGGER_SOURCE);
         }
@@ -808,7 +809,7 @@ mod tests {
                 call.trigger_source, "cron",
                 "stranded re-enqueue still uses trigger_source=cron (same handler)"
             );
-            assert_eq!(call.priority, CRON_RESCAN_PRIORITY);
+            assert_eq!(call.priority, scan_queue_priority(CRON_TRIGGER_SOURCE));
         }
     }
 

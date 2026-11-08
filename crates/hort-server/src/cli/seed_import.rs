@@ -69,7 +69,8 @@ use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
 use hort_domain::entities::repository::RepositoryFormat;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::ContentHash;
 
 use crate::config::MinimalConfig;
@@ -83,19 +84,24 @@ use crate::{pg_identity, telemetry};
 /// per-row `actor_id` attribution (which stays a separate larger ask
 /// — see the module docstring).
 ///
-/// Constraint: the literal must match the `'seed-import'` arm in
-/// `009_scan_jobs_and_findings.sql`'s `trigger_source` CHECK. The
-/// `constants_match_init33_trigger_source_ranking` test below pins
-/// both the literal and the priority so a future rename has to
-/// touch the test in lock-step with the CHECK.
-const SEED_IMPORT_TRIGGER_SOURCE: &str = "seed-import";
+/// Constraint: the literal is taken from the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]), so it
+/// cannot be a value the `jobs.trigger_source` CHECK refuses — the SQL
+/// side is bound to that type over the *effective* list by
+/// `crates/hort-adapters-postgres/tests/jobs_trigger_source_check_lockstep_guard.rs`.
+/// The `constants_match_init33_trigger_source_ranking` test below still
+/// pins both the wire literal and the priority, so a rename of the
+/// variant has to touch that test too.
+const SEED_IMPORT_TRIGGER_SOURCE: &str = TriggerSource::SeedImport.as_str();
 
-/// `priority` for the enqueued row. The trigger-source
-/// ranking is `ingest=0 → advisory=5 → cron=10 → manual=20`. Manual
-/// invocation drains first; that matches the operator expectation
-/// for a one-shot cutover ("run the import, don't wait behind every
-/// scheduled cron tick").
-const MANUAL_PRIORITY: i16 = 20;
+/// `jobs.kind` of the row this subcommand enqueues. The ordinal it
+/// carries is not named here: it is decided from `(kind,
+/// trigger_source)` in `hort_domain::types::task_tier`. The pair
+/// `('seed-import', 'seed-import')` is what gives this row the
+/// operator tier while the scans and verifies the import itself goes on
+/// to enqueue — same trigger source, different kind — stay at the
+/// schema default.
+const KIND: &str = "seed-import";
 
 /// Arguments to `hort-server seed-import`.
 ///
@@ -149,12 +155,13 @@ async fn run_async(args: SeedImportArgs) -> anyhow::Result<()> {
     // The worker reads `params.items` — see `SeedImportHandler::run`.
     let params = serde_json::json!({ "items": items });
 
+    let priority = queue_priority(KIND, SEED_IMPORT_TRIGGER_SOURCE);
     let outcome = jobs
         .enqueue_task(
-            "seed-import",
+            KIND,
             &params,
             None, // actor_id — see module docstring; v1 attributes to system
-            MANUAL_PRIORITY,
+            priority,
             SEED_IMPORT_TRIGGER_SOURCE,
             None, // non-destructive task kind — no DB-side idempotency key (ADR 0028)
         )
@@ -173,8 +180,8 @@ async fn run_async(args: SeedImportArgs) -> anyhow::Result<()> {
 
     info!(
         job_id = %id,
-        kind = "seed-import",
-        priority = MANUAL_PRIORITY,
+        kind = KIND,
+        priority,
         trigger_source = SEED_IMPORT_TRIGGER_SOURCE,
         item_count = items.len(),
         "seed-import job enqueued"
@@ -338,10 +345,23 @@ mod tests {
         // when the worker's claim path inserts a row that fails the
         // CHECK.
         assert_eq!(SEED_IMPORT_TRIGGER_SOURCE, "seed-import");
-        // priority=20 matches the manual tier — seed-import
-        // is operator-driven so it inherits the manual-tier priority
-        // (drains first ahead of cron / advisory ticks).
-        assert_eq!(MANUAL_PRIORITY, 20);
+        // The subcommand's own row is operator-driven, so it ranks with
+        // the operator band and ahead of every cron / advisory tick.
+        // Asserted as relations rather than as a number: one row drives
+        // the import and the scans it enqueues are one per artifact in
+        // it, so this row has to sit in front of them or the operator
+        // waits for their backlog instead of for the import.
+        assert!(
+            queue_priority(KIND, SEED_IMPORT_TRIGGER_SOURCE)
+                > queue_priority("scan", SEED_IMPORT_TRIGGER_SOURCE),
+            "the import's own row must outrank the per-artifact scans it enqueues under the \
+             same trigger source"
+        );
+        assert!(
+            queue_priority(KIND, SEED_IMPORT_TRIGGER_SOURCE)
+                > queue_priority("scan", TriggerSource::Cron.as_str()),
+            "and must outrank the scheduled rescan ticks nobody is waiting on"
+        );
     }
 
     // ---- TSV parser tests --------------------------------------------------

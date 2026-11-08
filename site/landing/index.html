@@ -5,140 +5,8 @@
 <meta charset="utf-8"/><meta content="width=device-width,initial-scale=1" name="viewport"/>
 <meta content="hort is self-hosted, open-source artifact repository infrastructure with integrity built in." name="description"/>
 <title>hort — Artifact repositories with integrity built in</title>
-<style>
-:root{color-scheme:dark;--bg:#0b171c;--surface:#112a31;--surface2:#18353d;--text:#f4f8f7;--muted:#b3c7c9;--line:#35535a;--accent:#8be5cc;--accent-text:#102d35;--link:#a6f3df}
-html[data-theme=light]{color-scheme:light;--bg:#f4f8f7;--surface:#fff;--surface2:#e8f1ef;--text:#102d35;--muted:#4d6970;--line:#cbdedb;--accent:#246b72;--accent-text:#fff;--link:#126a72}
-*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 Inter,system-ui,-apple-system,sans-serif}a{color:var(--link)}a:focus-visible,button:focus-visible{outline:3px solid var(--accent);outline-offset:4px}.container{width:min(1160px,calc(100% - 44px));margin:auto}header{border-bottom:1px solid var(--line)}nav{display:flex;align-items:center;justify-content:space-between;gap:20px;min-height:82px}.brand{display:flex;align-items:center;gap:8px;text-decoration:none;color:var(--text);font-size:23px;font-weight:750;letter-spacing:-.04em}.brand img{width:57px;height:48px;object-fit:contain}.navlinks{display:flex;align-items:center;gap:24px}.navlinks a{text-decoration:none;color:var(--muted);font-size:14px}.navlinks a:hover{color:var(--text)}button{font:inherit;cursor:pointer}.theme{background:var(--surface);border:1px solid var(--line);color:var(--text);border-radius:9px;padding:7px 12px;font-size:13px}.hero{display:grid;grid-template-columns:.94fr 1.06fr;align-items:center;gap:52px;padding:94px 0 100px}.eyebrow{color:var(--accent);font-size:12px;font-weight:750;letter-spacing:.14em;text-transform:uppercase}.hero h1{font-size:clamp(40px,4.4vw,64px);line-height:1.08;letter-spacing:-.055em;margin:20px 0 25px}.lead{font-size:19px;line-height:1.6;color:var(--muted);max-width:550px}.buttons{display:flex;gap:12px;flex-wrap:wrap;margin-top:32px}.btn{display:inline-block;padding:11px 19px;border-radius:9px;text-decoration:none;font-size:14px;font-weight:700;border:1px solid var(--line);color:var(--text)}.btn.primary{background:var(--accent);color:var(--accent-text);border-color:var(--accent)}.status{font-size:13px;color:var(--muted);margin-top:26px}.diagram{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 18px 65px #00000013}.diagram .eyebrow{margin:0 0 8px}.diagram svg{display:block;width:100%;height:auto}.diagram .node{fill:var(--surface2);stroke:var(--line);stroke-width:1.5}.diagram .central{fill:#246b72;stroke:#8be5cc;stroke-width:2}.diagram .label{fill:var(--text);font-size:14px;font-weight:650}.diagram .small{fill:var(--muted);font-size:11px}.diagram .hort-label{fill:#fff;font-size:27px;font-weight:800}.diagram .hort-small{fill:#d8f9f0;font-size:12px}.diagram .path{stroke:var(--accent);stroke-width:2;fill:none;stroke-linecap:round;stroke-linejoin:round}.diagram .path-secondary{stroke:var(--muted);stroke-width:1.7;fill:none;stroke-dasharray:5 4}.diagram .arrow{fill:var(--accent)}.diagram .arrow-muted{fill:var(--muted)}.diagram-note{font-size:12px;color:var(--muted);margin:6px 0 0}.section{padding:70px 0;border-top:1px solid var(--line)}h2{font-size:clamp(28px,3vw,40px);letter-spacing:-.04em;line-height:1.2;margin:0 0 16px}h3{font-size:18px;margin:0 0 8px}.intro{max-width:760px;color:var(--muted);margin:0 0 34px}.features{display:grid;grid-template-columns:repeat(2,1fr);gap:15px}.feature{border:1px solid var(--line);background:var(--surface);border-radius:12px;padding:25px}.feature p{color:var(--muted);margin:0}.ecosystems{display:flex;gap:10px;flex-wrap:wrap}.ecosystems span{border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:9px 15px;font-weight:650;font-size:14px}.fine{color:var(--muted);font-size:14px;max-width:760px}.split{display:grid;grid-template-columns:1fr 1fr;gap:40px;align-items:start}pre{background:var(--surface);border:1px solid var(--line);padding:22px;border-radius:12px;overflow-x:auto;font:13px/1.7 'JetBrains Mono',ui-monospace,SFMono-Regular,monospace}code{font:inherit}footer{border-top:1px solid var(--line);padding:35px 0 50px;color:var(--muted);font-size:13px}footer .container{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}@media(max-width:900px){.hero{grid-template-columns:1fr;gap:30px;padding:55px 0}.hero h1{max-width:750px}.diagram{max-width:670px}.split{grid-template-columns:1fr}.navlinks{gap:12px}}@media(max-width:560px){.container{width:min(100% - 28px,1160px)}nav{min-height:68px}.navlinks a:not(:last-of-type){display:none}.navlinks{gap:10px}.brand img{width:45px;height:40px}.hero h1{font-size:41px}.features{grid-template-columns:1fr}.diagram{padding:10px}.section{padding:50px 0}}
-
-.scenario-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin:12px 0 16px}.scenario-tab{border:1px solid var(--line);border-radius:8px;background:var(--surface2);color:var(--muted);font-size:11px;font-weight:700;padding:9px 5px;line-height:1.3}.scenario-tab[aria-selected="true"]{background:var(--accent);border-color:var(--accent);color:var(--accent-text)}.scenario-panel[hidden]{display:none}.scenario-title{font-weight:750;font-size:17px;margin:2px 0 0}.scenario-description{font-size:12px;color:var(--muted);margin:2px 0 12px;min-height:36px}.zone{fill:var(--surface);stroke:var(--line);stroke-width:1.5;stroke-dasharray:5 4}.zone-label{fill:var(--muted);font-size:11px;font-weight:700;letter-spacing:.8px}.edge-label{fill:var(--muted);font-size:10px}.diagram svg{max-height:430px}.diagram .central{fill:#246b72;stroke:#8be5cc}@media(max-width:560px){.scenario-tab{font-size:10px;padding:8px 3px}.scenario-description{min-height:0}}
-
-/* Operational properties: theme-token driven, no hard-coded card palette */
-.ops-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:15px}
-.ops-card{border:1px solid var(--line);background:var(--surface);border-radius:12px;padding:25px}
-.ops-value{font-size:clamp(26px,3vw,38px);font-weight:750;letter-spacing:-.045em;line-height:1.2;margin:0 0 12px;color:var(--text)}
-.ops-card p{margin:0;color:var(--muted)}
-.ops-card h3{margin-bottom:8px}
-.ops-note{font-size:13px;color:var(--muted);margin-top:18px}
-@media(max-width:720px){.ops-grid{grid-template-columns:1fr}}
-
-/* Deployment and identity */
-.deploy-grid,.identity-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
-.deploy-card,.identity-card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:25px;min-width:0}
-.deploy-card h3,.identity-card h3{margin-top:8px}.deploy-card p,.identity-card p{color:var(--muted);font-size:14px}
-.deploy-card .tag{font-size:11px;letter-spacing:.1em;text-transform:uppercase;font-weight:750;color:var(--accent)}
-.deploy-card a,.identity-card a{font-size:14px}.identity-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
-.identity-flow{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px;margin:22px 0;overflow:hidden}
-.identity-flow svg{width:100%;height:auto;display:block;max-height:250px}
-.identity-flow .zone{fill:var(--surface2);stroke:var(--line);stroke-width:1.5}
-.identity-flow .txt{fill:var(--text);font-size:14px;font-weight:650}
-.identity-flow .sub{fill:var(--muted);font-size:11px}
-.identity-flow .line{fill:none;stroke:var(--accent);stroke-width:2}
-@media(max-width:800px){.deploy-grid,.identity-grid{grid-template-columns:1fr}}
-/* Configuration-as-code section */
-.config-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:stretch}
-.config-steps{display:grid;gap:12px}
-.config-step{display:flex;align-items:flex-start;gap:14px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px}
-.config-step .step-no{flex:0 0 32px;width:32px;height:32px;display:grid;place-items:center;border-radius:8px;background:var(--surface2);color:var(--accent);font-weight:800}
-.config-step strong{display:block;margin-bottom:2px}.config-step p{margin:0;color:var(--muted);font-size:14px}
-.config-code{border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:20px;display:flex;flex-direction:column;justify-content:center;min-width:0}
-.config-code .code-title{font:700 12px ui-monospace,monospace;color:var(--accent);letter-spacing:.04em}
-.config-code pre{margin:12px 0;border:0;padding:12px 0;background:transparent;font-size:13px}
-.config-code p{margin:0;color:var(--muted);font-size:13px}
-@media(max-width:800px){.config-grid{grid-template-columns:1fr}}
-
-/* Identity architecture, separate verified paths */
-.identity-steps{display:flex;flex-direction:column;gap:0;margin:16px 0 20px}.identity-steps span{position:relative;display:block;padding:12px 14px;margin-bottom:16px;background:var(--surface2);border:1px solid var(--line);border-radius:8px;font-size:13px;overflow-wrap:anywhere}.identity-steps span:not(:last-child)::after{content:"↓";position:absolute;top:100%;left:50%;transform:translateX(-50%);color:var(--accent);font-weight:700;line-height:16px}.identity-steps span:last-child{margin-bottom:0}.identity-details>.identity-card{min-width:0}.identity-gate{gap:10px}
-.identity-lanes{display:grid;gap:16px}.identity-lane{display:grid;grid-template-columns:minmax(0,1fr) 24px minmax(0,1fr) 24px minmax(0,1fr);align-items:center;gap:8px}.identity-source,.identity-destination{min-width:0;padding:17px 10px;border:1px solid var(--line);border-radius:10px;background:var(--surface2);display:flex;flex-direction:column;gap:6px;text-align:center}.identity-destination{background:var(--primary);color:white;border-color:var(--accent)}.identity-source strong,.identity-destination strong{font-size:14px}.identity-source span,.identity-destination span{font-size:11px;line-height:1.4}.identity-chevron{text-align:center;color:var(--accent);font-size:23px}.identity-gate{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:center;padding:18px;border:1px dashed var(--line);border-radius:10px;color:var(--text);font-size:13px}.identity-gate strong{color:var(--accent)}.identity-details{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin:24px 0}.identity-details p{color:var(--muted);font-size:14px}@media(max-width:700px){.identity-lane{grid-template-columns:1fr;gap:6px}.identity-chevron{transform:rotate(90deg)}.identity-details{grid-template-columns:1fr}.identity-gate{flex-direction:column}}
-
-/* v10 editorial consolidation */
-.task-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin-top:24px}.task-card{display:block;text-decoration:none;color:var(--text);padding:24px;background:var(--surface);border:1px solid var(--line);border-radius:14px;transition:border-color .15s,transform .15s}.task-card:hover,.task-card:focus-visible{border-color:var(--accent);transform:translateY(-2px)}.task-card h3{margin:12px 0 8px}.task-card p{font-size:14px;color:var(--muted);line-height:1.6}.task-link{font-size:13px;color:var(--accent);font-weight:700}.section-link{display:inline-block;margin-top:24px;color:var(--accent)}.task-section{padding-top:40px}.navlinks{gap:20px}@media(max-width:800px){.task-grid{grid-template-columns:1fr}.navlinks{gap:10px;flex-wrap:wrap}}
-</style>
-<style>
-/* v11: responsive polish and accessible navigation */
-:root { --content-width: 1160px; }
-body { overflow-wrap: break-word; -webkit-font-smoothing: antialiased; }
-.container { width: min(var(--content-width), calc(100% - 48px)); }
-section[id], main[id] { scroll-margin-top: 28px; }
-p, li { text-wrap: pretty; }
-h1, h2, h3 { text-wrap: balance; }
-.hero > *, .split > *, .config-grid > *, .deploy-grid > *,
-.identity-grid > *, .features > *, .ops-grid > * { min-width: 0; }
-.hero { gap: clamp(24px, 4vw, 58px); }
-.hero h1 { font-size: clamp(2.45rem, 4.5vw, 4.15rem); }
-.section { padding-block: clamp(52px, 6vw, 82px); }
-.btn, .theme, .scenario-tab, .menu-toggle { min-height: 42px; }
-.btn, .theme, .scenario-tab { transition: background-color .16s ease, border-color .16s ease; }
-.btn:hover, .theme:hover { border-color: var(--accent); }
-.diagram { min-width: 0; }
-.diagram svg { max-width: 100%; }
-.config-model { scrollbar-width: thin; scrollbar-color: var(--muted) transparent; }
-pre { max-width: 100%; white-space: pre; tab-size: 2; }
-.menu-toggle { display: none; border: 1px solid var(--line); border-radius: 9px;
-  background: var(--surface); color: var(--text); padding: 7px 14px; font-weight: 650; }
-@media (max-width: 900px) {
-  .hero { grid-template-columns: 1fr; padding-block: 60px 68px; }
-  .hero > .diagram { width: 100%; max-width: 740px; }
-}
-@media (max-width: 700px) {
-  .container { width: calc(100% - 32px); }
-  header nav { position: relative; min-height: 70px; }
-  .menu-toggle { display: inline-flex; align-items: center; justify-content: center; margin-left: auto; }
-  .navlinks { display: none; position: absolute; z-index: 20; top: calc(100% - 1px);
-    left: 0; right: 0; flex-direction: column; align-items: stretch; gap: 0;
-    padding: 10px; background: var(--surface); border: 1px solid var(--line);
-    border-radius: 0 0 12px 12px; box-shadow: 0 18px 35px #0003; }
-  .navlinks.is-open { display: flex; }
-  .navlinks a, .navlinks a:not(:last-of-type) { display: block; padding: 12px; font-size: 15px; }
-  .navlinks .theme { margin-top: 6px; width: 100%; }
-  .hero { padding-block: 45px 58px; }
-  .hero h1 { font-size: clamp(2.25rem, 9vw, 3.2rem); }
-  .lead { font-size: 17px; }
-  .features, .ops-grid, .deploy-grid, .identity-grid, .config-grid, .split { grid-template-columns: 1fr; }
-  .feature, .ops-card, .deploy-card, .identity-card { padding: 20px; }
-  .diagram { padding: 12px; }
-  .scenario-tabs { gap: 6px; }
-  .scenario-tab { font-size: 11px; padding: 9px 5px; }
-  .identity-lane { gap: 4px; }
-  .identity-source, .identity-destination { padding: 10px 5px; font-size: 11px; }
-}
-@media (max-width: 390px) {
-  .container { width: calc(100% - 24px); }
-  .scenario-tabs { grid-template-columns: 1fr; }
-  .scenario-tab { font-size: 12px; }
-  .buttons { flex-direction: column; align-items: stretch; }
-  .buttons .btn { text-align: center; }
-  .identity-lane { overflow-x: auto; }
-}
-@media (prefers-reduced-motion: reduce) {
-  html { scroll-behavior: auto; }
-  *, *::before, *::after { transition-duration: .01ms !important;
-    animation-duration: .01ms !important; }
-}
-</style><style>
-/* v12: four balanced operations cards */
-@media (min-width: 721px) { .ops-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-</style><style>
-/* v13: larger approved brandmark, preserving intrinsic SVG artwork */
-.brand { gap: 10px; flex-shrink: 0; }
-.brand img { width: 84px; height: 62px; display: block; object-fit: contain; }
-nav { min-height: 92px; }
-@media (max-width: 700px) {
-  nav { min-height: 78px; }
-  .brand img { width: 66px; height: 52px; }
-  .brand { font-size: 22px; gap: 7px; }
-}
-@media (max-width: 390px) {
-  .brand img { width: 60px; height: 48px; }
-}
-</style><link href="https://project-hort.de/" rel="canonical"/><meta content="website" property="og:type"/><meta content="hort" property="og:site_name"/><meta content="hort — Artifact repositories with integrity built in" property="og:title"/><meta content="Self-hosted artifact infrastructure for consuming, storing, and publishing software artifacts." property="og:description"/><meta content="https://project-hort.de/" property="og:url"/><meta content="https://project-hort.de/assets/social-preview.png" property="og:image"/><meta content="1200" property="og:image:width"/><meta content="630" property="og:image:height"/><meta content="summary_large_image" name="twitter:card"/><meta content="hort — Artifact repositories with integrity built in" name="twitter:title"/><meta content="Self-hosted artifact infrastructure for consuming, storing, and publishing software artifacts." name="twitter:description"/><meta content="https://project-hort.de/assets/social-preview.png" name="twitter:image"/><meta content="#0b171c" name="theme-color"/><link href="assets/hort-logo.svg" rel="icon" type="image/svg+xml"/><link href="assets/favicon-32.png" rel="icon" sizes="32x32" type="image/png"/><style>
-/* Publication stability and menu contrast. */
-html { scroll-padding-top: 16px; }
-@media (max-width: 700px) { .navlinks { background: var(--surface); } }
-@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
-</style><style>
-/* Operator use cases: five balanced cards at desktop widths */
-@media(min-width:721px){.ops-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-</style><script>(function(){try{var v=localStorage.getItem('hort-theme');if(v==='dark'||v==='light')document.documentElement.dataset.theme=v}catch(e){}})()</script></head>
+<link rel="stylesheet" href="assets/landing.css">
+<link href="https://project-hort.de/" rel="canonical"/><meta content="website" property="og:type"/><meta content="hort" property="og:site_name"/><meta content="hort — Artifact repositories with integrity built in" property="og:title"/><meta content="Self-hosted artifact infrastructure for consuming, storing, and publishing software artifacts." property="og:description"/><meta content="https://project-hort.de/" property="og:url"/><meta content="https://project-hort.de/assets/social-preview.png" property="og:image"/><meta content="1200" property="og:image:width"/><meta content="630" property="og:image:height"/><meta content="summary_large_image" name="twitter:card"/><meta content="hort — Artifact repositories with integrity built in" name="twitter:title"/><meta content="Self-hosted artifact infrastructure for consuming, storing, and publishing software artifacts." name="twitter:description"/><meta content="https://project-hort.de/assets/social-preview.png" name="twitter:image"/><meta content="#0b171c" name="theme-color"/><link href="assets/hort-logo.svg" rel="icon" type="image/svg+xml"/><link href="assets/favicon-32.png" rel="icon" sizes="32x32" type="image/png"/><script src="assets/landing-1.js"></script></head>
 <body>
 <header><nav aria-label="Main navigation" class="container"><a class="brand" href="#top"><img alt="hort logo" src="assets/hort-logo.svg"/>hort</a><button aria-controls="primary-navigation" aria-expanded="false" aria-label="Open navigation" class="menu-toggle" id="menu-toggle" type="button">Menu</button><div class="navlinks" id="primary-navigation"><a href="#top">Overview</a><a href="docs/index.html">Docs</a><a href="#architecture">Architecture</a><a href="https://github.com/project-hort/hort">GitHub</a><button aria-label="Switch color theme" class="theme" id="theme-toggle" type="button">Light mode</button></div></nav></header>
 <main id="top">
@@ -155,14 +23,14 @@ html { scroll-padding-top: 16px; }
 </div>
 <div class="identity-gate"><strong>Authentication ≠ authorization</strong><span>Repository operations are checked against the applicable permissions.</span></div>
 <p class="ops-note">Model checked against the project's authentication catalog and Rust configuration definitions. This diagram summarizes the documented behavior; it is not a full protocol trace or an independent security audit.</p><p><a href="https://github.com/project-hort/hort">Review source and documentation on GitHub</a></p><a class="section-link" href="https://github.com/project-hort/hort/blob/main/docs/auth-catalog.md">Read identity documentation</a></div></section><section aria-labelledby="config-heading" class="section" id="configuration"><div class="container"><div class="eyebrow">Configuration as code</div><h2 id="config-heading">Your artifact infrastructure, defined in files.</h2><p class="intro">Store repository and access configuration in version-controlled YAML. Run `hort-server validate-config --strict` before deployment; hort then applies the validated desired state at server startup. No continuous reconciliation is implied.</p>
-<div class="config-model" style="background:var(--surface, #142f36);border:1px solid var(--border,#42616a);border-radius:14px;padding:20px;margin:26px 0;overflow-x:auto"><svg aria-label="Configuration files feed startup validation and apply. Configuration resources are grouped into repositories and upstream mappings, governance policies and curation, identity and authorization." role="img" style="width:100%;min-width:610px;display:block" viewbox="0 0 850 292" xmlns="http://www.w3.org/2000/svg"><defs><marker id="config-arrow-v9" markerheight="7" markerwidth="7" orient="auto" refx="6" refy="3.5"><path d="M0 0 L7 3.5 L0 7" fill="none" stroke="#8BE5CC" stroke-width="1.4"></path></marker></defs>
+<div class="config-model"><svg aria-label="Configuration files feed startup validation and apply. Configuration resources are grouped into repositories and upstream mappings, governance policies and curation, identity and authorization." role="img" class="csp-diagram-svg" viewbox="0 0 850 292" xmlns="http://www.w3.org/2000/svg"><defs><marker id="config-arrow-v9" markerheight="7" markerwidth="7" orient="auto" refx="6" refy="3.5"><path d="M0 0 L7 3.5 L0 7" fill="none" stroke="#8BE5CC" stroke-width="1.4"></path></marker></defs>
 <rect fill="#18353D" height="48" rx="9" stroke="#60767D" width="346" x="252" y="8"></rect><text fill="#F4F8F7" font-size="15" font-weight="600" text-anchor="middle" x="425" y="27">Version-controlled YAML</text><text fill="#B3C7C9" font-size="11" text-anchor="middle" x="425" y="44">$HORT_CONFIG_DIR</text>
 <path d="M425 56 V77" marker-end="url(#config-arrow-v9)" stroke="#8BE5CC" stroke-width="2"></path><rect fill="#246B72" height="46" rx="9" stroke="#8BE5CC" width="346" x="252" y="80"></rect><text fill="white" font-size="14" font-weight="600" text-anchor="middle" x="425" y="99">Validate &amp; apply at startup</text><text fill="#D4F9EF" font-size="11" text-anchor="middle" x="425" y="115">Restart to apply file changes</text>
 <g fill="none" marker-end="url(#config-arrow-v9)" stroke="#8BE5CC" stroke-width="1.6"><path d="M425 126 V146 H143 V162"></path><path d="M425 126 V162"></path><path d="M425 146 H707 V162"></path></g>
 <g><rect fill="#18353D" height="106" rx="10" stroke="#42616A" width="268" x="8" y="166"></rect><text fill="#8BE5CC" font-size="14" font-weight="600" text-anchor="middle" x="142" y="189">Repositories &amp; upstreams</text><text fill="#F4F8F7" font-size="12" text-anchor="middle" x="142" y="211">ArtifactRepository</text><text fill="#F4F8F7" font-size="12" text-anchor="middle" x="142" y="231">UpstreamMapping</text><text fill="#B3C7C9" font-size="10" text-anchor="middle" x="142" y="253">Storage, endpoints, proxy sources</text>
 <rect fill="#18353D" height="106" rx="10" stroke="#42616A" width="268" x="291" y="166"></rect><text fill="#8BE5CC" font-size="14" font-weight="600" text-anchor="middle" x="425" y="189">Artifact governance</text><text fill="#F4F8F7" font-size="12" text-anchor="middle" x="425" y="211">ScanPolicy · RetentionPolicy</text><text fill="#F4F8F7" font-size="12" text-anchor="middle" x="425" y="231">CurationRule · Exclusion</text><text fill="#B3C7C9" font-size="10" text-anchor="middle" x="425" y="253">Policy scope depends on type</text>
 <rect fill="#18353D" height="106" rx="10" stroke="#42616A" width="268" x="574" y="166"></rect><text fill="#8BE5CC" font-size="14" font-weight="600" text-anchor="middle" x="708" y="189">Identity &amp; authorization</text><text fill="#F4F8F7" font-size="11.5" text-anchor="middle" x="708" y="211">OidcIssuer · ClaimMapping</text><text fill="#F4F8F7" font-size="11.5" text-anchor="middle" x="708" y="231">ServiceAccount · PermissionGrant</text><text fill="#B3C7C9" font-size="10" text-anchor="middle" x="708" y="253">Includes permission grant lint settings</text></g></svg></div>
-<h3 style="margin-top:32px">A real repository configuration</h3><p class="intro">Excerpt from <code>deploy/ansible/files/gitops/repositories/dockerhub-proxy.yaml</code>. This is an actual project example, shortened for readability.</p><div class="config-grid"><div class="config-code"><div class="code-title">ARTIFACT REPOSITORY · YAML</div><pre><code>apiVersion: project-hort.de/v1
+<h3 class="csp-spaced-h3">A real repository configuration</h3><p class="intro">Excerpt from <code>deploy/ansible/files/gitops/repositories/dockerhub-proxy.yaml</code>. This is an actual project example, shortened for readability.</p><div class="config-grid"><div class="config-code"><div class="code-title">ARTIFACT REPOSITORY · YAML</div><pre><code>apiVersion: project-hort.de/v1
 kind: ArtifactRepository
 metadata:
   name: dockerhub-proxy
@@ -178,28 +46,5 @@ spec:
   isPublic: false</code></pre><p><a href="https://github.com/project-hort/hort/blob/main/deploy/ansible/files/gitops/repositories/dockerhub-proxy.yaml">View full example in GitHub</a></p></div><div class="config-steps"><div class="config-step"><span class="step-no">01</span><div><strong>Version the YAML</strong><p>Keep configuration files in Git; protect secrets separately.</p></div></div><div class="config-step"><span class="step-no">02</span><div><strong>Review the change</strong><p>Use pull requests and code review for repository and access changes.</p></div></div><div class="config-step"><span class="step-no">03</span><div><strong>Deploy &amp; restart</strong><p>Deliver the approved configuration tree and restart hort to validate and apply it.</p></div></div></div></div><p class="ops-note">Configuration is applied on startup; this is not a continuously reconciling controller or an automatic live reload. The example omits description, comments and replicationPriority from the original file.</p><a class="section-link" href="https://github.com/project-hort/hort/tree/main/deploy/ansible/files/gitops">Explore configuration examples</a></div></section><section aria-labelledby="deploy-heading" class="section" id="deploy"><div class="container"><div class="eyebrow">Getting started</div><h2 id="deploy-heading">Your server or your cluster.</h2><p class="intro">Run hort as a native executable on a host or deploy it to Kubernetes. Choose the operational model that fits your infrastructure.</p><p class="intro">The hort CLI is an operator tool for managing and interacting with hort. It belongs alongside native and Kubernetes deployment workflows, not in a separate product category. <a href="https://github.com/project-hort/hort/releases">Get release binaries</a></p><div class="deploy-grid"><article class="deploy-card"><div class="tag">01 · Native</div><h3>Run the executable directly.</h3><p>Deploy hort on a Linux server or virtual machine without requiring Kubernetes. Manage the process and configuration using your existing host automation.</p><p>The repository includes an Ansible deployment example. Treat it as a starting point for your own environment, not a mandatory installer.</p><a href="https://github.com/project-hort/hort/tree/main/deploy/ansible">Explore the Ansible example</a></article><article class="deploy-card"><div class="tag">02 · Kubernetes</div><h3>Deploy with Helm.</h3><p>Use the documented Helm chart and an environment-specific values file for a Kubernetes deployment.</p><pre><code>helm install hort oci://registry.hort.rs/hort-charts/hort-server \
   -f my-values.yaml</code></pre><a href="https://github.com/project-hort/hort/tree/main/deploy/helm/hort-server">Read Helm chart documentation</a></article></div><p class="ops-note">Both paths require environment-specific configuration and prerequisites. Exact native startup commands, chart settings and health checks should be taken from the corresponding release documentation.</p></div></section><section class="section" id="architecture"><div class="container"><div class="eyebrow">Architecture</div><h2>Explore how hort fits.</h2><p class="intro">Inspect repository architecture, API boundaries and deployment examples in the source. The diagrams above illustrate workflows, not automatic replication or network policy guarantees.</p><p class="intro">Documentation direction: <strong>project-hort.de</strong> for operators, deployment, configuration and CLI; <strong>hort.rs</strong> is intended for developer-oriented resources such as Rust crates, APIs and contributor architecture. This is the planned information architecture, not a claim that both portals are already published.</p><a class="btn" href="https://github.com/project-hort/hort">Explore the architecture on GitHub</a></div></section><section class="section"><div class="container"><div class="eyebrow">Project status</div><h2>Version 1.0 is coming soon.</h2><p class="intro">hort is under active development and currently pre-1.0. Review current releases, known limitations, and deployment requirements when evaluating it for your infrastructure.</p><a href="https://github.com/project-hort/hort/releases">View releases</a></div></section></main>
 <footer><div class="container"><div>hort · Open-source artifact repository infrastructure</div><div><a href="docs/index.html">Documentation</a> · <a href="https://github.com/project-hort/hort">GitHub</a> · <a href="https://github.com/project-hort/hort/blob/main/LICENSE">License</a> · <a href="https://hort.rs/">hort.rs</a></div></div></footer>
-<script>const toggle=document.getElementById('theme-toggle');if(document.documentElement.dataset.theme==='light'){toggle.textContent='Dark mode';toggle.setAttribute('aria-label','Switch to dark theme')}toggle.addEventListener('click',()=>{const root=document.documentElement;const light=root.dataset.theme!=='light';root.dataset.theme=light?'light':'dark';try{localStorage.setItem('hort-theme',root.dataset.theme)}catch(e){}toggle.textContent=light?'Dark mode':'Light mode';toggle.setAttribute('aria-label',light?'Switch to dark theme':'Switch to light theme')});;const tabs=[...document.querySelectorAll('.scenario-tab')];function activateScenario(id,focus=false){tabs.forEach(t=>{const active=t.dataset.scenario===id;t.setAttribute('aria-selected',String(active));t.tabIndex=active?0:-1;if(active&&focus)t.focus()});document.querySelectorAll('.scenario-panel').forEach(p=>p.hidden=p.id!=='panel-'+id)}tabs.forEach((tab,i)=>{tab.addEventListener('click',()=>activateScenario(tab.dataset.scenario));tab.addEventListener('keydown',e=>{if(['ArrowLeft','ArrowRight','Home','End'].includes(e.key)){e.preventDefault();let next=e.key==='Home'?0:e.key==='End'?tabs.length-1:(i+(e.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;activateScenario(tabs[next].dataset.scenario,true)}})});</script>
-<script>document.querySelectorAll('[data-open-scenario]').forEach(link=>link.addEventListener('click',()=>{const target=document.querySelector('[data-scenario="'+link.dataset.openScenario+'"]');if(target)target.click();}));</script><script>
-(() => {
-  const button = document.getElementById('menu-toggle');
-  const links = document.getElementById('primary-navigation');
-  if (!button || !links) return;
-  function close() {
-    links.classList.remove('is-open');
-    button.setAttribute('aria-expanded', 'false');
-    button.setAttribute('aria-label', 'Open navigation');
-  }
-  button.addEventListener('click', () => {
-    const opened = links.classList.toggle('is-open');
-    button.setAttribute('aria-expanded', String(opened));
-    button.setAttribute('aria-label', opened ? 'Close navigation' : 'Open navigation');
-  });
-  links.addEventListener('click', event => {
-    if (event.target.closest('a')) close();
-  });
-  document.addEventListener('keydown', event => {
-    if (event.key === 'Escape') { close(); button.focus(); }
-  });
-  window.matchMedia('(min-width: 701px)').addEventListener('change', close);
-})();
-</script></body></html>
+<script src="assets/landing-2.js"></script>
+<script src="assets/landing-3.js"></script><script src="assets/landing-4.js"></script></body></html>

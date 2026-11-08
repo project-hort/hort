@@ -271,33 +271,151 @@ use crate::error::{AppError, AppResult};
 /// silently depends on, and the reason the number is enforced on both
 /// sides:
 ///
-/// - **Write side.** [`read_unpaired_append_version`] refuses to derive an
-///   append version for a stream that already exceeds the cap, so every
-///   `ExpectedVersion::Exact` writer is bounded by it. An
-///   `ExpectedVersion::Any` append gets no version check from the
-///   adapter at all, so such a writer must refuse for itself:
-///   `RetentionUseCase::append_expired` is the only *repeatable* one and
-///   does. The rest are terminal and single-shot (`ArtifactPurged`,
-///   `ArtifactDeleted`, the CAS-corruption tombstone pair) and
-///   deliberately do not refuse — they record destructive work that has
-///   already happened, they are the last events a stream ever takes, and
-///   no reader consults an artifact's stream after its terminal event.
-///   A NEW repeatable `Any` writer on [`StreamCategory::Artifact`]
-///   without a refusal of its own reopens the breach.
+/// - **Write side.** [`refuse_append_past_cap`] is the one definition of
+///   "this append would take the stream past the cap", and every
+///   *repeatable* append path on an artifact stream calls it before it
+///   commits. Repeatable is the whole criterion: a path the system can
+///   run again on the same artifact — a sweep tick, a rescan, an API
+///   verb with no idempotency of its own — is the only kind that can
+///   accumulate 1 000 events, and it is the kind that freezes the
+///   artifact permanently by crossing. The adapter's own version check
+///   does not stand in for the refusal: an `ExpectedVersion::Exact`
+///   writer starting exactly at the cap crosses it and succeeds, and an
+///   `ExpectedVersion::Any` append is not version-checked at all.
+///
+///   The paths that do **not** call it declare why at the site, with an
+///   `ONCE-ONLY-APPEND:` line: a genesis append on a stream minted in
+///   the same call, an append gated by its own output already being on
+///   the stream, or a terminal event after which the stream takes
+///   nothing further (`ArtifactPurged`, `ArtifactDeleted`, the
+///   CAS-corruption tombstone pair) — those record destructive work
+///   that has already happened, and no reader consults an artifact's
+///   stream after its terminal event. The
+///   `capped_stream_writes` structural guard enforces the choice: a new
+///   append site carries the refusal, or states its once-only reason, or
+///   fails the suite.
 /// - **Read side.** [`read_artifact_stream`] reads `STREAM_EVENT_CAP + 1`
 ///   events: a read that comes back with at most `STREAM_EVENT_CAP` has
 ///   provably seen the entire stream, and one that comes back with more
 ///   refuses to answer rather than hand its caller the oldest prefix.
 ///
-/// An artifact's realistic lifecycle is a few dozen events at most
-/// (ingest → quarantine → scan(s) → release/reject → maybe expire →
-/// purge), so the bound leaves roughly an order of magnitude of
-/// headroom. A stream that reaches it is a bug or abuse, and the
-/// resulting freeze — no further event accepted, no decision derived
-/// from a read that cannot prove completeness — is the intended
-/// fail-closed outcome, not a degradation to work around. Raising the
-/// number would only move the point at which the same failure appears.
-const STREAM_EVENT_CAP: u64 = 200;
+/// An unchanged scan still refreshes the scan projections without adding
+/// a verdict event, so ordinary rescan cadence does not consume this
+/// lifetime budget. A stream past the cap cannot prove that a capped
+/// read reached the tail; readers refuse to derive a decision from it.
+const STREAM_EVENT_CAP: u64 = 1000;
+
+/// Refuse the append that would take an artifact stream **across**
+/// [`STREAM_EVENT_CAP`] — **the one definition of the cap's write
+/// side**.
+///
+/// `stream_len` is the stream's length as the caller's own observation of
+/// it saw it, and `appended` is the number of events the batch about to
+/// be committed carries. The predicate is `stream_len <= cap &&
+/// stream_len + appended > cap`: a stream may reach the cap exactly, and
+/// the append that would take it past is refused. Counting the batch
+/// rather than one event matters for every multi-event commit — a
+/// verdict pair, a re-evaluation plus its companion transition — because
+/// a stream two short of the cap has room for one of them and not for
+/// both.
+///
+/// # Why a refusal here and not the adapter's version check
+///
+/// The version check is not a bound. An `ExpectedVersion::Exact` writer
+/// paired at exactly the cap carries the stream's true tail, so its
+/// append succeeds and the stream lands at `STREAM_EVENT_CAP + 1`; from
+/// there every capped read refuses and the artifact is frozen — no
+/// release, no verdict, no further transition, for an operator who has
+/// no instrument to shrink a stream. An `ExpectedVersion::Any` append
+/// gets no version check at all. The refusal, at the boundary and before
+/// the commit, is what turns that freeze into a refused call on a
+/// still-working artifact.
+///
+/// # Why a stream ALREADY past the cap is not refused here
+///
+/// Crossing and having-crossed are different questions and only the
+/// first one is this function's. "This stream is already past the cap" is
+/// a statement about a *read* that cannot prove it reached the tail, and
+/// each site answers it deliberately through
+/// [`OverCapStream`] / [`ArtifactAtVersion::evidence`] /
+/// [`read_artifact_stream`] — every site that derives anything from the
+/// stream refuses, and the few that derive nothing (the ordinary curator
+/// waive releases a `Quarantined` artifact without reading its history)
+/// deliberately do not, because that is the one instrument an operator
+/// has left on a frozen artifact. Refusing here as well would take it
+/// away through the back door, and it would not even buy a bound: a
+/// `Tolerate` pairing on an over-cap stream derives its version from the
+/// prefix's tail, so the adapter's own check refuses every such append
+/// except on a stream exactly one past the cap. The growth that remains
+/// is one event, once.
+///
+/// An `ExpectedVersion::Any` writer — the one shape with no version
+/// check behind it — cannot reach this function with an over-cap length
+/// at all: both of them take their length from
+/// [`read_artifact_stream`], which refuses a past-cap stream before any
+/// length is handed back.
+///
+/// # The error kind
+///
+/// [`DomainError::Conflict`], matching the three refusals that predate
+/// this helper, so a caller-reachable append answers 409 rather than
+/// 500: "this artifact's stream is full" is a state the caller can see
+/// and act on, not an internal contradiction. One consequence is
+/// load-bearing for anyone adding a call: re-reading never changes the
+/// answer, so the refusal must run **outside** any
+/// [`append_any_with_conflict_retry`] or hand-rolled conflict-retry
+/// loop, which would otherwise spend its whole budget waiting for a
+/// stream to get shorter.
+pub(crate) fn refuse_append_past_cap(
+    stream_id: &StreamId,
+    stream_len: u64,
+    appended: u64,
+) -> AppResult<()> {
+    if stream_len <= STREAM_EVENT_CAP && stream_len.saturating_add(appended) > STREAM_EVENT_CAP {
+        return Err(DomainError::Conflict(format!(
+            "stream {stream_id} holds {stream_len} events; appending {appended} more \
+             would exceed the {STREAM_EVENT_CAP}-event cap"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// [`refuse_append_past_cap`] for a site whose only observation of the
+/// stream is the [`ExpectedVersion`] a capped read derived for it.
+///
+/// A version from such a read states the length: `Exact(p)` is a stream
+/// of `p + 1` events and `NoStream` an empty one. So a caller holding
+/// one needs no second read of the stream to answer the cap question —
+/// and taking one would be the wrong shape anyway, since a length read
+/// after the version is a length the version does not describe.
+///
+/// `ExpectedVersion::Any` is the variant that opts out of the version
+/// check, and it states nothing about length. A caller holding one took
+/// it from nowhere, so it has to pass the length its own read observed
+/// to [`refuse_append_past_cap`] directly. Reaching here with `Any` is a
+/// wiring mistake in the calling use case rather than anything a caller
+/// did, which is why it is [`DomainError::Invariant`] and not refused as
+/// a cap breach it cannot prove.
+pub(crate) fn refuse_append_past_cap_at_version(
+    stream_id: &StreamId,
+    version: ExpectedVersion,
+    appended: u64,
+) -> AppResult<()> {
+    let stream_len = match version {
+        ExpectedVersion::NoStream => 0,
+        ExpectedVersion::Exact(tail) => tail.saturating_add(1),
+        ExpectedVersion::Any => {
+            return Err(DomainError::Invariant(format!(
+                "cap refusal for stream {stream_id} asked of ExpectedVersion::Any, which \
+                 states nothing about the stream's length — pass the length this caller's \
+                 own read observed"
+            ))
+            .into())
+        }
+    };
+    refuse_append_past_cap(stream_id, stream_len, appended)
+}
 
 /// One capped `ReadFrom::Start` read of a bounded artifact stream, plus
 /// the one fact a capped read cannot do without: whether its budget was
@@ -458,17 +576,22 @@ pub(crate) async fn read_artifact_stream(
 /// None of the variants is read at runtime. That is the point: it is a
 /// declaration by the call site, checked by review and by the reader,
 /// not a branch.
+///
+/// **"A second append inside the same call" is deliberately not a
+/// variant.** A mint and whatever that same call derives from resolved
+/// configuration belong in ONE
+/// [`commit_transition_with_enqueues`](hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort::commit_transition_with_enqueues)
+/// — both minting paths do that — because the first commit of the pair
+/// already publishes a servable artifact, so a failure of the second
+/// leaves a remainder nothing in the request path can repair. A new site
+/// that wants such a witness is asking for that split back, and the
+/// answer is to merge the appends, not to name the exception.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnpairedAppend {
     /// The artifact was minted in this call and its stream does not
     /// exist yet, so there is no stored evidence to pair with: the
     /// genesis event is the stream's first.
     GenesisAppend,
-    /// A follow-up append on a stream **this same call** created, whose
-    /// content is derived from resolved configuration rather than from
-    /// anything on the stream. Nothing a previous writer put there is
-    /// read, because there is no previous writer.
-    SameCallFollowUp,
     /// Every appended event's content comes from the caller's request.
     /// The stream is not consulted, so there is no decision for the
     /// version to protect beyond "this append is ordered after whatever
@@ -736,6 +859,25 @@ impl ArtifactAtVersion {
         &self.stream_id
     }
 
+    /// The stream's length as this pairing's one read observed it — the
+    /// left-hand side of [`refuse_append_past_cap`], for a site deciding
+    /// whether its batch still fits under [`STREAM_EVENT_CAP`].
+    ///
+    /// Read off the same observation as [`Self::expected_version`] and
+    /// [`Self::evidence`], which is the point: a length taken from a
+    /// second read would describe a different stream than the version
+    /// the append carries.
+    ///
+    /// On an [`OverCapStream::Tolerate`] pairing whose read overflowed,
+    /// this is the read's budget (`STREAM_EVENT_CAP + 1`) rather than the
+    /// stream's true length — which is all the refusal needs from it, and
+    /// is the exact value that tells [`refuse_append_past_cap`] the
+    /// stream has already crossed rather than is about to. See that
+    /// function for why those are different answers.
+    pub(crate) fn stream_len(&self) -> u64 {
+        self.read.events.len() as u64
+    }
+
     /// Take the artifact back out, dropping the pairing. For the commit
     /// step, which hands the mutated entity to the lifecycle port.
     pub(crate) fn into_artifact(self) -> Artifact {
@@ -896,6 +1038,109 @@ impl CallerPrivileges {
 }
 
 #[cfg(test)]
+mod refuse_append_past_cap_tests {
+    use hort_domain::events::StreamId;
+    use hort_domain::ports::event_store::ExpectedVersion;
+
+    use super::*;
+
+    fn stream() -> StreamId {
+        StreamId::artifact(Uuid::nil())
+    }
+
+    /// A batch that lands the stream exactly ON the cap is accepted: the
+    /// cap is the number of events a stream may hold, not the last one it
+    /// may reach.
+    #[test]
+    fn a_batch_that_lands_exactly_on_the_cap_is_accepted() {
+        refuse_append_past_cap(&stream(), STREAM_EVENT_CAP - 2, 2).expect("fits exactly");
+        refuse_append_past_cap(&stream(), 0, STREAM_EVENT_CAP).expect("fits exactly");
+        refuse_append_past_cap(&stream(), STREAM_EVENT_CAP, 0).expect("appends nothing");
+    }
+
+    /// The crossing refusal, and the reason the batch size is a parameter
+    /// rather than an assumed one: a stream one short of the cap has room
+    /// for a single event and not for a verdict pair.
+    #[test]
+    fn the_batch_that_crosses_the_cap_is_refused_and_names_the_stream() {
+        let stream = stream();
+        refuse_append_past_cap(&stream, STREAM_EVENT_CAP - 1, 1).expect("one more still fits");
+        let err = refuse_append_past_cap(&stream, STREAM_EVENT_CAP - 1, 2)
+            .expect_err("a pair does not fit one short of the cap");
+        assert!(
+            err.to_string().contains(&stream.to_string()),
+            "the refusal must name the stream it is about; got {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&format!("{STREAM_EVENT_CAP}-event cap")),
+            "the refusal must name the cap it is enforcing; got {err}"
+        );
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Conflict(_))),
+            "the refusal is a Conflict so a caller-reachable append answers 409; got {err:?}"
+        );
+    }
+
+    /// A stream already PAST the cap is not refused here. Crossing is
+    /// this predicate's question; "already crossed" is the read-side one
+    /// each site answers through `OverCapStream` / `evidence()`, and
+    /// refusing it here would take away the ordinary curator waive — the
+    /// one instrument left on a frozen artifact.
+    #[test]
+    fn a_stream_already_past_the_cap_is_not_a_crossing() {
+        refuse_append_past_cap(&stream(), STREAM_EVENT_CAP + 1, 1)
+            .expect("already past is not crossing");
+        refuse_append_past_cap(&stream(), STREAM_EVENT_CAP + 500, 3)
+            .expect("already past is not crossing");
+    }
+
+    /// A batch size large enough to overflow the addition must still read
+    /// as a crossing rather than wrapping into acceptance.
+    #[test]
+    fn an_overflowing_batch_size_still_refuses() {
+        refuse_append_past_cap(&stream(), 1, u64::MAX)
+            .expect_err("saturating addition keeps the crossing visible");
+    }
+
+    /// The version-shaped entry point states the same lengths:
+    /// `NoStream` is an empty stream and `Exact(p)` is `p + 1` events.
+    #[test]
+    fn a_version_states_the_length_it_was_derived_from() {
+        let stream = stream();
+        refuse_append_past_cap_at_version(&stream, ExpectedVersion::NoStream, STREAM_EVENT_CAP)
+            .expect("a genesis batch of exactly the cap fits");
+        refuse_append_past_cap_at_version(&stream, ExpectedVersion::NoStream, STREAM_EVENT_CAP + 1)
+            .expect_err("one more than the cap does not");
+        // Exact(cap - 1) is a stream of `cap` events: full.
+        refuse_append_past_cap_at_version(&stream, ExpectedVersion::Exact(STREAM_EVENT_CAP - 1), 1)
+            .expect_err("a stream sitting on the cap takes nothing more");
+        refuse_append_past_cap_at_version(&stream, ExpectedVersion::Exact(STREAM_EVENT_CAP - 2), 1)
+            .expect("one short of the cap takes one more");
+        refuse_append_past_cap_at_version(&stream, ExpectedVersion::Exact(STREAM_EVENT_CAP + 5), 1)
+            .expect("already past the cap is not a crossing");
+    }
+
+    /// `Any` is the variant that opts out of the version check, so it
+    /// states nothing about length. Reaching the version-shaped entry
+    /// point with one is a wiring mistake in the calling use case, and is
+    /// surfaced as an `Invariant` rather than answered with a guess.
+    #[test]
+    fn an_any_version_is_a_wiring_mistake_not_a_length() {
+        let err = refuse_append_past_cap_at_version(&stream(), ExpectedVersion::Any, 1)
+            .expect_err("Any states no length");
+        assert!(
+            matches!(err, AppError::Domain(DomainError::Invariant(_))),
+            "an unanswerable question is an Invariant, not a cap Conflict; got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("ExpectedVersion::Any"),
+            "the error must name what it was asked of; got {err}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod read_unpaired_append_version_tests {
     use std::sync::Arc;
 
@@ -949,7 +1194,7 @@ mod read_unpaired_append_version_tests {
         let artifact_id = Uuid::new_v4();
         let stream_id = StreamId::artifact(artifact_id);
 
-        let dummy: Vec<_> = (0..201)
+        let dummy: Vec<_> = (0..STREAM_EVENT_CAP + 1)
             .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
             .collect();
         events.set_stream(&stream_id, dummy);
@@ -958,7 +1203,9 @@ mod read_unpaired_append_version_tests {
             read_unpaired_append_version(&*events, &stream_id, true, UnpairedAppend::GenesisAppend)
                 .await
                 .unwrap_err();
-        assert!(err.to_string().contains("200-event cap"));
+        assert!(err
+            .to_string()
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")));
     }
 
     #[tokio::test]
@@ -967,9 +1214,9 @@ mod read_unpaired_append_version_tests {
         let artifact_id = Uuid::new_v4();
         let stream_id = StreamId::artifact(artifact_id);
 
-        // MockEventStore returns up to max_count events, so 201 events
-        // with read limit 201 returns all 201 — last position is 200.
-        let dummy: Vec<_> = (0..201)
+        // MockEventStore returns up to max_count events, so a stream one past
+        // the cap is read through its true tail at position STREAM_EVENT_CAP.
+        let dummy: Vec<_> = (0..STREAM_EVENT_CAP + 1)
             .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
             .collect();
         events.set_stream(&stream_id, dummy);
@@ -982,16 +1229,16 @@ mod read_unpaired_append_version_tests {
         )
         .await
         .unwrap();
-        assert_eq!(version, ExpectedVersion::Exact(200));
+        assert_eq!(version, ExpectedVersion::Exact(STREAM_EVENT_CAP));
     }
 
     #[tokio::test]
-    async fn cap_at_exactly_200_is_allowed() {
+    async fn cap_at_exactly_the_limit_is_allowed() {
         let events = Arc::new(MockEventStore::new());
         let artifact_id = Uuid::new_v4();
         let stream_id = StreamId::artifact(artifact_id);
 
-        let dummy: Vec<_> = (0..200)
+        let dummy: Vec<_> = (0..STREAM_EVENT_CAP)
             .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
             .collect();
         events.set_stream(&stream_id, dummy);
@@ -1000,7 +1247,7 @@ mod read_unpaired_append_version_tests {
             read_unpaired_append_version(&*events, &stream_id, true, UnpairedAppend::GenesisAppend)
                 .await
                 .unwrap();
-        assert_eq!(version, ExpectedVersion::Exact(199));
+        assert_eq!(version, ExpectedVersion::Exact(STREAM_EVENT_CAP - 1));
     }
 
     /// Structural guard: `read_unpaired_append_version`'s capped
@@ -1101,7 +1348,8 @@ mod read_artifact_stream_tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("200-event cap"),
+            err.to_string()
+                .contains(&format!("{STREAM_EVENT_CAP}-event cap")),
             "the refusal must name the cap it is enforcing; got {err}"
         );
     }
@@ -1547,7 +1795,9 @@ mod artifact_at_version_tests {
             matches!(err, AppError::Domain(DomainError::Conflict(_))),
             "got {err}"
         );
-        assert!(err.to_string().contains("200-event cap"));
+        assert!(err
+            .to_string()
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")));
     }
 
     /// A stream at exactly the cap is not over it — the `+ 1` budget was
@@ -1597,7 +1847,9 @@ mod artifact_at_version_tests {
             matches!(err, AppError::Domain(DomainError::Invariant(_))),
             "got {err}"
         );
-        assert!(err.to_string().contains("200-event cap"));
+        assert!(err
+            .to_string()
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")));
     }
 
     /// The domain transitions mutate the entity as they produce their
@@ -1665,6 +1917,8 @@ mod artifact_at_version_tests {
             matches!(err, AppError::Domain(DomainError::Invariant(_))),
             "got {err}"
         );
-        assert!(err.to_string().contains("200-event cap"));
+        assert!(err
+            .to_string()
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")));
     }
 }

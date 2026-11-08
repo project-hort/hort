@@ -68,24 +68,25 @@ use tracing::info;
 use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
+use hort_domain::types::task_tier::queue_priority;
 
 use crate::config::MinimalConfig;
 use crate::{pg_identity, telemetry};
 
-/// `trigger_source` literal — `'cron'` mirrors the other scheduled
-/// enqueue subcommands. Must match the SQL CHECK constraint on
-/// `jobs.trigger_source` (`'manual' | 'cron' | 'advisory' | 'ingest'
-/// | 'seed-import' | 'prefetch'`).
-const CRON_TRIGGER_SOURCE: &str = "cron";
+/// `trigger_source` literal for this scheduled CronJob enqueue, taken
+/// from the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]) rather than
+/// re-typed beside it — so CHECK membership is a property of the value
+/// and this comment does not have to carry a copy of the list.
+const CRON_TRIGGER_SOURCE: &str = TriggerSource::Cron.as_str();
 
-/// `priority` for the enqueued row. The trigger-source
-/// ranking is `ingest=0 → advisory=5 → cron=10 → manual=20`. Matches the
-/// release-sweep + prefetch-tick priority — backfill ticks are
-/// co-equal with quarantine release sweeps in the cron tier. The
-/// worker's claim query orders `priority DESC, created_at ASC`, so
-/// this slots into the same drain tier.
-const CRON_PRIORITY: i16 = 10;
+/// `jobs.kind` of the row this subcommand enqueues. The ordinal it
+/// carries is not named here: it is decided from `(kind,
+/// trigger_source)` in `hort_domain::types::task_tier`, so every
+/// cron-triggered row drains in the same tier by construction rather
+/// than by six constants agreeing.
+const KIND: &str = "wheel-metadata-backfill";
 
 /// Arguments to `hort-server enqueue-wheel-metadata-backfill`.
 ///
@@ -133,12 +134,13 @@ async fn run_async(args: EnqueueWheelMetadataBackfillArgs) -> anyhow::Result<()>
         None => serde_json::json!({}),
     };
 
+    let priority = queue_priority(KIND, CRON_TRIGGER_SOURCE);
     let outcome = jobs
         .enqueue_task(
-            "wheel-metadata-backfill",
+            KIND,
             &params,
             None, // actor_id — system-driven cron
-            CRON_PRIORITY,
+            priority,
             CRON_TRIGGER_SOURCE,
             None, // non-destructive task kind — no DB-side idempotency key (ADR 0028)
         )
@@ -153,8 +155,8 @@ async fn run_async(args: EnqueueWheelMetadataBackfillArgs) -> anyhow::Result<()>
 
     info!(
         job_id = %id,
-        kind = "wheel-metadata-backfill",
-        priority = CRON_PRIORITY,
+        kind = KIND,
+        priority,
         trigger_source = CRON_TRIGGER_SOURCE,
         batch_size = ?args.batch_size,
         "wheel-metadata-backfill job enqueued"
@@ -227,17 +229,18 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
-    /// Constants stay aligned with the release-sweep + prefetch-tick
-    /// precedent (trigger-source ranking; CHECK constraint
-    /// values). Same priority as the other cron-tier enqueue
-    /// subcommands so they drain in the same tier.
+    /// Constants stay aligned with the trigger-source ranking and the
+    /// CHECK constraint values. The CronJob template and the worker
+    /// dispatch table both reference them implicitly through the
+    /// inserted row; a silent drift here would break the claim
+    /// ordering.
+    ///
+    /// The ordinal is asserted as relations rather than as a number by
+    /// [`crate::cli::assert_scheduled_maintenance_ordinal`], which is
+    /// where the reasoning for both of them lives.
     #[test]
     fn constants_match_init33_trigger_source_ranking() {
         assert_eq!(CRON_TRIGGER_SOURCE, "cron");
-        assert_eq!(
-            CRON_PRIORITY, 10,
-            "wheel-metadata-backfill must share priority with quarantine-release-sweep + \
-             prefetch-tick (the cron tier); changing this skews the worker claim queue"
-        );
+        crate::cli::assert_scheduled_maintenance_ordinal(KIND);
     }
 }

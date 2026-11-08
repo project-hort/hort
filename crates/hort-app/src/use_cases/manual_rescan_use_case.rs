@@ -64,21 +64,17 @@ use uuid::Uuid;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::error::DomainError;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
+use hort_domain::types::task_tier::scan_queue_priority;
 
 use crate::error::{AppError, AppResult};
 use crate::metrics::{emit_scan_jobs_enqueued, TriggerSourceLabel};
 use crate::use_cases::repository_access::{AccessLevel, RepositoryAccessUseCase};
 
-/// Priority bucket for manual rescans.
-///
-/// Higher than cron (10) and advisory (5); manual operator action
-/// jumps the queue.
-const MANUAL_RESCAN_PRIORITY: i16 = 20;
-
-/// `trigger_source` literal for manual rescans
-/// ([`hort_domain::ports::jobs_repository::TriggerSource::Manual`]).
-const MANUAL_TRIGGER_SOURCE: &str = "manual";
+/// `trigger_source` literal for manual rescans, taken from the one
+/// definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]).
+const MANUAL_TRIGGER_SOURCE: &str = TriggerSource::Manual.as_str();
 
 /// Application use case for the manual rescan endpoint.
 pub struct ManualRescanUseCase {
@@ -170,7 +166,7 @@ impl ManualRescanUseCase {
                 artifact.repository_id,
                 &artifact.sha256_checksum,
                 &format,
-                MANUAL_RESCAN_PRIORITY,
+                scan_queue_priority(MANUAL_TRIGGER_SOURCE),
                 MANUAL_TRIGGER_SOURCE,
             )
             .await?;
@@ -184,7 +180,7 @@ impl ManualRescanUseCase {
         tracing::debug!(
             %artifact_id,
             %job_id,
-            priority = MANUAL_RESCAN_PRIORITY,
+            priority = scan_queue_priority(MANUAL_TRIGGER_SOURCE),
             trigger_source = MANUAL_TRIGGER_SOURCE,
             "manual rescan enqueued",
         );
@@ -207,6 +203,7 @@ mod tests {
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::caller::CallerPrincipal;
     use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+    use hort_domain::types::task_tier::queue_priority;
 
     use crate::rbac::RbacEvaluator;
     use crate::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
@@ -322,10 +319,15 @@ mod tests {
         let call = &calls[0];
         assert_eq!(call.artifact_id, artifact_id);
         assert_eq!(call.repository_id, repo_id);
-        assert_eq!(call.priority, MANUAL_RESCAN_PRIORITY);
         assert_eq!(
-            call.priority, 20,
-            "manual-rescan priority contract: manual = 20"
+            call.priority,
+            scan_queue_priority(MANUAL_TRIGGER_SOURCE),
+            "the rescan's ordinal is the one the table decides, never a number named here"
+        );
+        assert!(
+            call.priority > queue_priority("noop", MANUAL_TRIGGER_SOURCE),
+            "an operator is reading this answer, so it must outrank the admin task invokes \
+             that share the `'manual'` trigger source and are bookkeeping"
         );
         assert_eq!(call.trigger_source, MANUAL_TRIGGER_SOURCE);
         assert_eq!(call.trigger_source, "manual");

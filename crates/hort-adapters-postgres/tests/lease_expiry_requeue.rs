@@ -160,7 +160,13 @@ async fn an_artifact_with_an_abandoned_scan_row_is_scannable_again() {
 
     // And nothing claims it: the claim predicate is `status = 'pending'`.
     let pre = repo
-        .claim_pending_by_kinds(&["scan"], 10, "live-worker", Duration::from_secs(900))
+        .claim_pending_by_kinds(
+            &["scan"],
+            10,
+            "live-worker",
+            Duration::from_secs(900),
+            &hort_adapters_postgres::test_support::claim_reservation(),
+        )
         .await
         .expect("claim");
     assert!(
@@ -191,7 +197,13 @@ async fn an_artifact_with_an_abandoned_scan_row_is_scannable_again() {
         .expect("expire the requeue not-before");
 
     let claimed = repo
-        .claim_pending_by_kinds(&["scan"], 10, "live-worker", Duration::from_secs(900))
+        .claim_pending_by_kinds(
+            &["scan"],
+            10,
+            "live-worker",
+            Duration::from_secs(900),
+            &hort_adapters_postgres::test_support::claim_reservation(),
+        )
         .await
         .expect("claim");
     assert_eq!(
@@ -249,9 +261,15 @@ async fn a_requeue_leaves_attempts_alone_and_the_next_claim_charges_it() {
         .execute(&pool)
         .await
         .expect("expire the requeue not-before");
-    repo.claim_pending_by_kinds(&["scan"], 10, "live-worker", Duration::from_secs(900))
-        .await
-        .expect("claim");
+    repo.claim_pending_by_kinds(
+        &["scan"],
+        10,
+        "live-worker",
+        Duration::from_secs(900),
+        &hort_adapters_postgres::test_support::claim_reservation(),
+    )
+    .await
+    .expect("claim");
 
     let (_, attempts_after, _, _) = read_row(&pool, job_id).await;
     assert_eq!(

@@ -108,8 +108,22 @@ pub struct Subscription {
     pub snapshot_claims: Vec<String>,
     /// Active / paused / disabled.
     pub state: SubscriptionState,
-    /// Visibility aid — last successfully-delivered global position.
-    /// **Not** delivery semantics; the notifier is best-effort.
+    /// The delivery cursor: the `global_position` a restarting task
+    /// resumes **strictly above**.
+    ///
+    /// Not an operator statistic. A catch-up pass reads
+    /// `global_position > position`, so everything below the mark is
+    /// below every future read — which is what makes the field's two
+    /// directions asymmetric rather than merely approximate. Moved
+    /// forward past an undelivered event it is silent, unrecoverable
+    /// loss; moved backwards it is re-delivery of everything between,
+    /// which the at-least-once guarantee permits and the receiver drops
+    /// on `X-Hort-Delivery-Id`.
+    ///
+    /// Written only by `SubscriptionRepository::update_last_delivered`,
+    /// which never moves it backwards. It lags the owning task's
+    /// in-memory cursor by up to the progress debounce, deliberately:
+    /// resuming behind costs duplicates, resuming ahead costs events.
     pub last_delivered_position: Option<u64>,
     /// Most-recent failure observed. Overwritten on every new failure.
     pub last_failure: Option<SubscriptionFailure>,
@@ -259,6 +273,7 @@ pub enum EventTypeKind {
     /// Provenance check (ADR 0027) rejected the
     /// artifact. Same (no-)repository-association posture.
     ProvenanceRejected,
+    ProvenanceHeld,
     ArtifactReEvaluated,
     PromotionRequested,
     PolicyEvaluated,
@@ -401,6 +416,7 @@ impl EventTypeKind {
             DomainEvent::ScanIndeterminate(_) => EventTypeKind::ScanIndeterminate,
             DomainEvent::ProvenanceVerified(_) => EventTypeKind::ProvenanceVerified,
             DomainEvent::ProvenanceRejected(_) => EventTypeKind::ProvenanceRejected,
+            DomainEvent::ProvenanceHeld(_) => EventTypeKind::ProvenanceHeld,
             DomainEvent::ArtifactReEvaluated(_) => EventTypeKind::ArtifactReEvaluated,
             DomainEvent::PromotionRequested(_) => EventTypeKind::PromotionRequested,
             DomainEvent::PolicyEvaluated(_) => EventTypeKind::PolicyEvaluated,
@@ -541,6 +557,9 @@ impl EventTypeKind {
                 DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
             }
             DomainEvent::ProvenanceRejected(e) => {
+                DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
+            }
+            DomainEvent::ProvenanceHeld(e) => {
                 DisclosedRepositories::one(RepositoryRef::OfArtifact(e.artifact_id))
             }
             DomainEvent::ArtifactReEvaluated(e) => {

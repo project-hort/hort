@@ -76,7 +76,8 @@ use crate::use_cases::repository_access::RepositoryAccessUseCase;
 use crate::use_cases::scan_kind_resolution::scan_kind_of;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use crate::use_cases::{
-    rejected_reevaluation, scan_history, ArtifactAtVersion, CallerPrivileges, OverCapStream,
+    refuse_append_past_cap, rejected_reevaluation, scan_history, ArtifactAtVersion,
+    CallerPrivileges, OverCapStream,
 };
 
 /// Maximum justification length in BYTES.
@@ -688,6 +689,25 @@ impl CurationUseCase {
         // `waive` call).
         let repo_label = self.repository_access.metric_label(repository_id).await;
 
+        // One `ArtifactReleased`. Repeatable: a waived artifact is
+        // re-holdable by a rescan verdict or a retroactive curation rule
+        // and waivable again, so this verb runs an unbounded number of
+        // times over one artifact's life and carries the refusal rather
+        // than relying on the version check, which admits an append that
+        // starts exactly on the cap.
+        if let Err(e) = refuse_append_past_cap(paired.stream_id(), paired.stream_len(), 1) {
+            let result = classify_append_error(&e);
+            tracing::info!(
+                artifact_id = %artifact_id,
+                actor_id = %user_id,
+                outcome = result.as_str(),
+                "curation waive rejected: the artifact's stream has no room for the \
+                 ArtifactReleased this waiver would append"
+            );
+            emit_curation_decision(CurationDecisionLabel::Waive, Some(&repo_label), result);
+            return Err(e);
+        }
+
         // 3) Re-hydrate the rejection reason for a `Rejected` artifact —
         //    the axis `Artifact::release` decides the override on. The
         //    projection row does not carry the column (the Postgres
@@ -1144,6 +1164,25 @@ impl CurationUseCase {
         let stream_id = paired.stream_id().clone();
         let expected_version = paired.expected_version();
 
+        // `ArtifactReEvaluated` plus the companion transition — two
+        // events, which is why the batch size and not one is what the
+        // cap is asked about: a stream one short of the cap has room for
+        // the audit event and not for the transition it explains.
+        // Repeatable: the curator may re-evaluate the same artifact on
+        // every policy or exclusion change.
+        if let Err(e) = refuse_append_past_cap(&stream_id, paired.stream_len(), 2) {
+            let result = classify_append_error(&e);
+            tracing::info!(
+                artifact_id = %artifact_id,
+                actor_id = %actor.user_id,
+                outcome = result.as_str(),
+                "curator reevaluate rejected: the artifact's stream has no room for the \
+                 re-evaluation pair this would append"
+            );
+            emit_curation_decision(CurationDecisionLabel::Reevaluate, Some(&repo_label), result);
+            return Err(e);
+        }
+
         let previous_status = paired.artifact().quarantine_status;
         let companion_event = match paired.artifact_mut().re_evaluate(now, provenance, curation) {
             Ok(ev) => ev,
@@ -1547,6 +1586,16 @@ impl CurationUseCase {
             return;
         }
 
+        // One `ArtifactRejected`. Repeatable: a blocked artifact the
+        // curator later waives or re-evaluates is blockable again, so the
+        // verb has no per-artifact bound of its own.
+        if let Err(e) = refuse_append_past_cap(&stream_id, paired.stream_len(), 1) {
+            let result = classify_append_error(&e);
+            emit_curation_decision(CurationDecisionLabel::Block, Some(&repo_label), result);
+            outcome.failed.push((artifact_id, e));
+            return;
+        }
+
         let prior_status = paired.artifact().quarantine_status;
 
         let event_payload = match paired
@@ -1838,7 +1887,10 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let queue_repo = Arc::new(MockCurationQueueRepository::new());
         let decisions_repo = Arc::new(MockCurationDecisionsRepository::new());
@@ -1865,7 +1917,10 @@ mod tests {
     fn make_use_case_with_queue() -> (CurationUseCase, Arc<MockCurationQueueRepository>) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let queue_repo = Arc::new(MockCurationQueueRepository::new());
         let decisions_repo = Arc::new(MockCurationDecisionsRepository::new());
@@ -1892,7 +1947,10 @@ mod tests {
     fn make_use_case_with_decisions() -> (CurationUseCase, Arc<MockCurationDecisionsRepository>) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let queue_repo = Arc::new(MockCurationQueueRepository::new());
         let decisions_repo = Arc::new(MockCurationDecisionsRepository::new());
@@ -1919,7 +1977,10 @@ mod tests {
     fn make_use_case_with_exclusions() -> (CurationUseCase, Arc<MockCurationExclusionsRepository>) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let queue_repo = Arc::new(MockCurationQueueRepository::new());
         let decisions_repo = Arc::new(MockCurationDecisionsRepository::new());
@@ -2323,7 +2384,7 @@ mod tests {
         let artifact = sample_artifact(QuarantineStatus::Rejected);
         let artifact_id = artifact.id;
         let stream_id = StreamId::artifact(artifact_id);
-        let over_cap: Vec<_> = (0..201)
+        let over_cap: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP + 1)
             .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
             .collect();
         events.set_stream(&stream_id, over_cap);
@@ -2339,7 +2400,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("200-event cap"),
+            err.to_string()
+                .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)),
             "the refusal must name the cap it is enforcing; got {err}"
         );
         assert!(lifecycle.committed_transitions().is_empty());
@@ -2354,7 +2416,7 @@ mod tests {
         let artifact = sample_artifact(QuarantineStatus::Quarantined);
         let artifact_id = artifact.id;
         let stream_id = StreamId::artifact(artifact_id);
-        let over_cap: Vec<_> = (0..201)
+        let over_cap: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP + 1)
             .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
             .collect();
         events.set_stream(&stream_id, over_cap);
@@ -2369,6 +2431,101 @@ mod tests {
         .await
         .expect("the ordinary waive derives nothing from the stream");
         assert_eq!(lifecycle.committed_transitions().len(), 1);
+    }
+
+    /// The ordinary waive still refuses the append that would **cross**
+    /// the cap, which is the case `Tolerate` admits and the version check
+    /// lets through. Distinct from the two tests above: those are about
+    /// an unprovable *prefix*, this is about a stream with no room left.
+    #[tokio::test]
+    async fn waive_refuses_the_event_that_would_cross_the_cap() {
+        let (uc, artifacts, events, lifecycle) = make_use_case();
+        let artifact = sample_artifact(QuarantineStatus::Quarantined);
+        let artifact_id = artifact.id;
+        let stream_id = StreamId::artifact(artifact_id);
+        let full: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP)
+            .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
+            .collect();
+        events.set_stream(&stream_id, full);
+        artifacts.insert(artifact);
+
+        let err = uc
+            .waive(
+                artifact_id,
+                api_actor(),
+                curator_privileges(),
+                sample_justification(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)),
+            "the refusal must name the cap it is enforcing; got {err}"
+        );
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// One short of the cap there is room for the release, so the same
+    /// fixture waives normally.
+    #[tokio::test]
+    async fn waive_still_releases_one_event_short_of_the_cap() {
+        let (uc, artifacts, events, lifecycle) = make_use_case();
+        let artifact = sample_artifact(QuarantineStatus::Quarantined);
+        let artifact_id = artifact.id;
+        let stream_id = StreamId::artifact(artifact_id);
+        let nearly_full: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP - 1)
+            .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
+            .collect();
+        events.set_stream(&stream_id, nearly_full);
+        artifacts.insert(artifact);
+
+        uc.waive(
+            artifact_id,
+            api_actor(),
+            curator_privileges(),
+            sample_justification(),
+        )
+        .await
+        .expect("one more event still fits");
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+    }
+
+    /// The curator block carries the same refusal, and reports it as a
+    /// per-artifact failure rather than aborting the whole call — a
+    /// version-list block of a hundred artifacts must not lose the
+    /// ninety-nine with room because one has none.
+    #[tokio::test]
+    async fn block_reports_a_full_stream_as_a_per_artifact_failure() {
+        let (uc, artifacts, events, lifecycle) = make_use_case();
+        let artifact = sample_artifact(QuarantineStatus::Quarantined);
+        let artifact_id = artifact.id;
+        let stream_id = StreamId::artifact(artifact_id);
+        let full: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP)
+            .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
+            .collect();
+        events.set_stream(&stream_id, full);
+        artifacts.insert(artifact);
+
+        let outcome = uc
+            .block(
+                BlockTarget::Artifact(artifact_id),
+                api_actor(),
+                curator_privileges(),
+                sample_justification(),
+            )
+            .await
+            .expect("the call itself succeeds; the artifact is a per-item failure");
+
+        assert!(outcome.blocked_artifact_ids.is_empty());
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].0, artifact_id);
+        assert!(outcome.failed[0]
+            .1
+            .to_string()
+            .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)));
+        assert!(lifecycle.committed_transitions().is_empty());
     }
 
     /// The reverse scan the axis is derived from must see the stream's
@@ -3043,10 +3200,11 @@ mod tests {
             format: RepositoryFormat::Npm,
             package_name: "evil-pkg".into(),
             version: Some("1.0.0".into()),
+            path: "evil-pkg/-/evil-pkg-1.0.0.tgz".into(),
             quarantine_status: QuarantineStatus::Quarantined,
             quarantine_window_start: DateTime::<Utc>::from_timestamp(1_700_000_000, 0),
             quarantine_deadline: DateTime::<Utc>::from_timestamp(1_700_086_400, 0),
-            finding_count: 3,
+            finding_count: Some(3),
             max_severity: None,
             rejection_reason_kind: None,
         }
@@ -3421,7 +3579,10 @@ mod tests {
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let decisions_repo = Arc::new(CommittedDecisionsRepository {
             lifecycle: lifecycle.clone(),
         });
@@ -4245,7 +4406,10 @@ mod tests {
         ) {
             let artifacts = Arc::new(MockArtifactRepository::new());
             let events = Arc::new(MockEventStore::new());
-            let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+            let lifecycle = Arc::new(MockArtifactLifecycle::new(
+                artifacts.clone(),
+                events.clone(),
+            ));
             let policies = Arc::new(MockPolicyProjectionRepository::new());
             let queue_repo = Arc::new(MockCurationQueueRepository::new());
             let decisions_repo = Arc::new(MockCurationDecisionsRepository::new());
@@ -4361,7 +4525,7 @@ mod tests {
             let artifact = sample_artifact(QuarantineStatus::Rejected);
             let artifact_id = artifact.id;
             let stream_id = StreamId::artifact(artifact_id);
-            let over_cap: Vec<_> = (0..201)
+            let over_cap: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP + 1)
                 .map(|i| persisted_scan_completed(artifact_id, 0, i))
                 .collect();
             events.set_stream(&stream_id, over_cap);
@@ -4373,10 +4537,51 @@ mod tests {
                 .unwrap_err();
 
             assert!(
-                err.to_string().contains("200-event cap"),
+                err.to_string()
+                    .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)),
                 "the refusal must name the cap it is enforcing; got {err}"
             );
             assert!(lifecycle.committed_transitions().is_empty());
+        }
+
+        /// The re-evaluation appends a PAIR — `ArtifactReEvaluated` plus
+        /// the companion transition — so the refusal is asked about two
+        /// events. One short of the cap there is room for the audit event
+        /// and not for the transition it explains, and committing half a
+        /// pair is not an option: the refusal fires on both.
+        #[tokio::test]
+        async fn reevaluate_refuses_the_pair_that_would_cross_the_cap() {
+            let (uc, artifacts, events, lifecycle, _policies, _rules, storage) =
+                make_use_case_for_reevaluate();
+            // Clean scan + no policy is the `ResetToReleased` fixture
+            // `resets_to_released_when_no_policy_and_clean` uses, so the
+            // only thing standing between this call and a committed pair
+            // is the cap.
+            let artifact_id = seed_rejected_with_scan(&artifacts, &events, &storage, 0);
+            let stream_id = StreamId::artifact(artifact_id);
+            let mut stream = events.stream_snapshot(&stream_id);
+            let seeded = stream.len() as u64;
+            stream.extend(
+                (seeded..crate::use_cases::STREAM_EVENT_CAP - 1)
+                    .map(|i| persisted_scan_completed(artifact_id, 0, i)),
+            );
+            assert_eq!(stream.len() as u64, crate::use_cases::STREAM_EVENT_CAP - 1);
+            events.set_stream(&stream_id, stream);
+
+            let err = uc
+                .reevaluate(artifact_id, api_actor(), curator_privileges())
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)),
+                "the refusal must name the cap it is enforcing; got {err}"
+            );
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "neither half of the pair lands"
+            );
         }
 
         /// Caller lacking both `curate` and `admin` → `Forbidden`, no

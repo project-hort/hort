@@ -224,6 +224,14 @@ pub(crate) const STORE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// receiver's to drop (every delivery carries a fresh
 /// `X-Hort-Delivery-Id` and a stable `global_position`), a gap is
 /// recoverable by nobody.
+///
+/// This mark is monotonic because one task reads one stream in order
+/// ([`Self::observe`]); the *persisted* position is monotonic for a
+/// different reason, which is that it has many writers. One task per
+/// replica flushes its own copy of this mark with nothing ordering
+/// them, so the repository applies the greater of the two rather than
+/// the later — see
+/// [`hort_domain::ports::subscription_repository::SubscriptionRepository::update_last_delivered`].
 #[derive(Debug)]
 pub(crate) struct ReadCursor {
     /// `None` ⇒ nothing read and nothing ever delivered, so the walk
@@ -935,7 +943,9 @@ mod tests {
     };
     use hort_domain::ports::event_notifier::{EventNotifier, NotifyFailureReason, NotifyOutcome};
     use hort_domain::ports::repository_repository::RepositoryRepository;
-    use hort_domain::ports::subscription_repository::SubscriptionRepository;
+    use hort_domain::ports::subscription_repository::{
+        advance_delivered_position, retained_delivered_position, SubscriptionRepository,
+    };
     use hort_domain::ports::user_repository::UserRepository;
     use hort_domain::ports::webhook_target_guard::WebhookTargetGuard;
     use hort_domain::ports::BoxFuture;
@@ -998,15 +1008,31 @@ mod tests {
     /// standing in for the process dying immediately after a delivery has
     /// been persisted. Records what it was handed, like
     /// [`RecordingNotifier`].
-    pub(super) struct CancelAfterFirstDelivery {
+    ///
+    /// [`Self::first`] dies on the first delivery. [`Self::through`] dies
+    /// once it has delivered a named `global_position`, which is how a
+    /// test puts the restart boundary at a chosen point in the merged
+    /// stream rather than wherever the first event happens to sit.
+    pub(super) struct CancelAfterDelivery {
         cancel: CancellationToken,
+        /// `None` ⇒ cancel on the first delivery.
+        through: Option<u64>,
         calls: Mutex<Vec<u64>>,
     }
 
-    impl CancelAfterFirstDelivery {
-        fn new(cancel: CancellationToken) -> Self {
+    impl CancelAfterDelivery {
+        fn first(cancel: CancellationToken) -> Self {
             Self {
                 cancel,
+                through: None,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn through(cancel: CancellationToken, position: u64) -> Self {
+            Self {
+                cancel,
+                through: Some(position),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -1016,18 +1042,22 @@ mod tests {
         }
     }
 
-    impl EventNotifier for CancelAfterFirstDelivery {
+    impl EventNotifier for CancelAfterDelivery {
         fn notify<'a>(
             &'a self,
             _target: &'a SubscriptionTarget,
             _subscription_id: SubscriptionId,
             events: &'a [PersistedEvent],
         ) -> BoxFuture<'a, NotifyOutcome> {
-            self.calls
-                .lock()
-                .unwrap()
-                .extend(events.iter().map(|e| e.global_position));
-            self.cancel.cancel();
+            let positions: Vec<u64> = events.iter().map(|e| e.global_position).collect();
+            self.calls.lock().unwrap().extend(positions.iter().copied());
+            let die = match self.through {
+                None => true,
+                Some(through) => positions.iter().any(|&p| p >= through),
+            };
+            if die {
+                self.cancel.cancel();
+            }
             Box::pin(async { NotifyOutcome::Delivered })
         }
 
@@ -1270,9 +1300,12 @@ mod tests {
         }
 
         fn update(&self, sub: &Subscription) -> BoxFuture<'_, DomainResult<()>> {
-            let sub = sub.clone();
+            let mut sub = sub.clone();
             Box::pin(async move {
-                self.rows.lock().unwrap().insert(sub.id, sub);
+                let mut rows = self.rows.lock().unwrap();
+                sub.last_delivered_position =
+                    retained_delivered_position(rows.get(&sub.id), sub.last_delivered_position);
+                rows.insert(sub.id, sub);
                 Ok(())
             })
         }
@@ -1293,14 +1326,13 @@ mod tests {
                 .unwrap()
                 .push((id, position, last_failure.cloned()));
             // Also mirror into the row so subsequent reads see the
-            // updated state. `None` leaves the position alone, mirroring
-            // the adapter's COALESCE — a test must not be able to observe
-            // a rewind the real store would never write.
+            // updated state, through the adapter's `GREATEST` — a test
+            // must not be able to observe a rewind the real store would
+            // never write.
             let mut rows = self.rows.lock().unwrap();
             if let Some(row) = rows.get_mut(&id) {
-                if let Some(position) = position {
-                    row.last_delivered_position = Some(position);
-                }
+                row.last_delivered_position =
+                    advance_delivered_position(row.last_delivered_position, position);
                 row.last_failure = last_failure.cloned();
             }
             Box::pin(async { Ok(()) })
@@ -2644,7 +2676,7 @@ mod tests {
         // Life 1: the process dies right after its first delivery is
         // persisted.
         let life1_cancel = CancellationToken::new();
-        let life1_notifier = Arc::new(CancelAfterFirstDelivery::new(life1_cancel.clone()));
+        let life1_notifier = Arc::new(CancelAfterDelivery::first(life1_cancel.clone()));
         let deps = make_deps(
             &sub,
             rbac.clone(),
@@ -2720,6 +2752,186 @@ mod tests {
             vec![10, 11],
             "every event in the store must reach the subscriber across the restart; \
              a position missing here is a permanent gap"
+        );
+    }
+
+    /// **Two categories whose heads are far apart survive a restart
+    /// without either one's progress being bound to the other's.**
+    ///
+    /// The scenario is the one a multi-category subscriber actually
+    /// lives in: a busy category running hundreds of positions ahead of
+    /// a quiet one. The fear is that the busy category's advance becomes
+    /// the quiet category's floor across a restart — the quiet
+    /// category's backlog below the mark would then be below every
+    /// future read, and nothing recovers it.
+    ///
+    /// What makes that impossible is where the mark lives, not how many
+    /// marks there are. `global_position` is one sequence over the whole
+    /// store, the pass reads the filter's categories as one stream
+    /// ordered by it, and the cursor advances only over an event the pass
+    /// has finished with — so a mark at P asserts "everything up to P was
+    /// consumed, in every subscribed category", and a restart from P
+    /// resumes above exactly that. A per-category mark cannot assert more
+    /// than that, which is why the merged read closes this and a schema
+    /// change would not have.
+    ///
+    /// Driven through the **seed**, which is the junction the fear is
+    /// about: life 1 dies at a chosen point, life 2 is respawned from
+    /// nothing but the persisted scalar, and the assertions are about
+    /// what the receiver saw across both lives. Asserting the stored row
+    /// instead would test the write and not the restart.
+    #[tokio::test(start_paused = true)]
+    async fn two_categories_at_different_heads_survive_a_restart_independently() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let mut sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        sub.filter.categories = vec![StreamCategory::Artifact, StreamCategory::Ref];
+
+        // The busy category: twenty events, head at 200.
+        let busy: Vec<u64> = (1..=20).map(|n| n * 10).collect();
+        // The quiet category: three events, head at 95 — a hundred and
+        // five positions behind the busy category's, and interleaved
+        // through its range rather than clustered at the bottom.
+        let quiet: Vec<u64> = vec![15, 55, 95];
+
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(
+            StreamCategory::Artifact,
+            busy.iter().map(|&p| ingested_event(repo_id, p)).collect(),
+        );
+        mock_es.set_category(
+            StreamCategory::Ref,
+            quiet
+                .iter()
+                .map(|&p| {
+                    let mut e = ingested_event(repo_id, p);
+                    e.stream_id = StreamId {
+                        category: StreamCategory::Ref,
+                        entity_id: Uuid::new_v4(),
+                    };
+                    e
+                })
+                .collect(),
+        );
+
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+
+        // Life 1: the process dies once it has delivered position 30 —
+        // past the quiet category's first event and far short of either
+        // head, so both categories still have a backlog when the restart
+        // happens.
+        let life1_cancel = CancellationToken::new();
+        let life1_notifier = Arc::new(CancelAfterDelivery::through(life1_cancel.clone(), 30));
+        let deps = make_deps(
+            &sub,
+            rbac.clone(),
+            life1_notifier.clone(),
+            sub_repo.clone(),
+            mock_es.clone(),
+            principal.clone(),
+        );
+        let (sender1, receiver1) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        let sub_for_life1 = sub.clone();
+        let handle = tokio::spawn(async move {
+            run(sub_for_life1, deps, receiver1, life1_cancel).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("life 1 stops when its notifier cancels it")
+            .expect("task must not panic");
+        drop(sender1);
+
+        let life1_delivered = life1_notifier.delivered();
+        assert_eq!(
+            life1_delivered,
+            vec![10, 15, 20, 30],
+            "the merged walk delivers in global order across both categories"
+        );
+
+        let seed = sub_repo
+            .rows
+            .lock()
+            .unwrap()
+            .get(&sub.id)
+            .cloned()
+            .unwrap()
+            .last_delivered_position;
+        assert_eq!(seed, Some(30));
+        // The restart boundary is below BOTH heads. Without this the test
+        // would prove nothing: a seed above the quiet head would leave
+        // that category with no backlog to lose.
+        let quiet_head = *quiet.last().unwrap();
+        let busy_head = *busy.last().unwrap();
+        assert!(
+            seed < Some(quiet_head),
+            "the quiet category still has a backlog"
+        );
+        assert!(
+            seed < Some(busy_head),
+            "the busy category still has a backlog"
+        );
+
+        // Life 2: respawned from the persisted scalar and nothing else.
+        let mut sub2 = sub.clone();
+        sub2.last_delivered_position = seed;
+        let life2_notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let deps2 = make_deps(
+            &sub2,
+            rbac,
+            life2_notifier.clone(),
+            sub_repo.clone(),
+            mock_es,
+            principal,
+        );
+        let (sender2, receiver2) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        let cancel2 = CancellationToken::new();
+        let task_cancel = cancel2.clone();
+        let handle2 = tokio::spawn(async move { run(sub2, deps2, receiver2, task_cancel).await });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        cancel2.cancel();
+        drop(sender2);
+        tokio::time::timeout(Duration::from_secs(2), handle2)
+            .await
+            .expect("life 2 exits on cancel")
+            .expect("task must not panic");
+
+        let life2_delivered: Vec<u64> = life2_notifier
+            .calls()
+            .iter()
+            .flat_map(|(_, evts)| evts.iter().map(|e| e.global_position))
+            .collect();
+
+        // The claim under test, stated about the quiet category alone:
+        // its backlog above the restart boundary arrives after the
+        // restart, even though the boundary was set by a delivery in the
+        // busy category.
+        let quiet_after_restart: Vec<u64> = quiet.iter().copied().filter(|&p| p > 30).collect();
+        let quiet_delivered_in_life2: Vec<u64> = life2_delivered
+            .iter()
+            .copied()
+            .filter(|p| quiet.contains(p))
+            .collect();
+        assert_eq!(
+            quiet_delivered_in_life2, quiet_after_restart,
+            "the quiet category's remaining backlog is caught up after the restart; \
+             the busy category's advance is not its floor"
+        );
+
+        // And the whole store reaches the receiver across the two lives.
+        // A position missing here is a permanent gap — no later read
+        // starts below the cursor and the receiver never heard of it.
+        let mut seen: Vec<u64> = life1_delivered;
+        seen.extend(life2_delivered);
+        seen.sort_unstable();
+        seen.dedup();
+        let mut expected: Vec<u64> = busy.iter().chain(quiet.iter()).copied().collect();
+        expected.sort_unstable();
+        assert_eq!(
+            seen, expected,
+            "every event in both categories must reach the subscriber across the restart"
         );
     }
 

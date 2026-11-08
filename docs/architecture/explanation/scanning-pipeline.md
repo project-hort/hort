@@ -165,14 +165,22 @@ surfaces enqueue them, distinguishable forever after by
   artifact gets its first scan this way.
 - **Manual** — `POST /api/v1/artifacts/:id/rescan`
   (`crates/hort-http-admin-security/src/router.rs` →
-  `ManualRescanUseCase`), priority 20. Write-gated on the parent
-  repository with the standard anti-enumeration collapse, and
-  conflict-checked: an in-flight scan for the artifact returns the
-  existing job id as a conflict rather than stacking a duplicate.
-- **Cron rescan** — priority 10 (below).
-- **Advisory watch** — priority 5 (below). The deliberate ordering
-  puts the cron safety-net above the advisory fan-out and manual
-  operator intent above both.
+  `ManualRescanUseCase`). Write-gated on the parent repository with the
+  standard anti-enumeration collapse, and conflict-checked: an in-flight
+  scan for the artifact returns the existing job id as a conflict rather
+  than stacking a duplicate.
+- **Cron rescan** — the periodic safety net (below).
+- **Advisory watch** — the per-ecosystem fan-out (below).
+
+The ordinal each of those carries is **not** a per-trigger-source
+number any more: it is derived from *who is waiting* on the row
+(ADR 0066, `hort_domain::types::task_tier`). The ingest scan is the path
+a client is waiting on and ranks top; the manual rescan is an operator
+reading an answer and ranks in the middle, above the admin task invokes
+that share its `'manual'` trigger source; the cron and advisory rescans
+are work nobody waits on and share the bottom band, where the claim's
+`created_at ASC` tiebreak orders them. `queue_priority` is the one place
+the number is decided — no producer names one.
 
 A partial unique index on `(artifact_id) WHERE kind='scan'` over
 non-terminal rows makes "one in-flight scan per artifact" a database
@@ -239,11 +247,12 @@ the merged finding list to the consumer boundary,
 (`crates/hort-app/src/use_cases/quarantine_use_case.rs`).
 
 That handoff is the pipeline's single most load-bearing property:
-**one Postgres transaction** commits the findings blob reference, the
+**one Postgres transaction** commits any changed findings blob reference, the
 per-finding `scan_findings` projection rows, the `sbom_components`
 projection replace, the artifact's state transition, the
-`repo_security_scores` delta, and the event batch. There is no state
-in which the event log says one thing and a projection says another.
+`repo_security_scores` delta, and the event batch. An unchanged finding
+verdict adds no event, while `last_scan_at` and the per-finding rows still
+record the latest scan. The event stream retains the last changed verdict.
 
 ### What the verdict does: `enforcement: reject | record`
 
@@ -255,7 +264,10 @@ verdict commits the reject triple (`ScanCompleted` +
 same evidence and the same audit event commit — the findings blob, the
 per-finding rows and `PolicyEvaluated(Fail, violations)` are all
 written identically — and the `ArtifactRejected` is withheld: the
-artifact's quarantine status is untouched by the verdict.
+artifact's quarantine status is untouched by the verdict. The
+`ScanCompleted` and its `PolicyEvaluated` companion are appended on the
+first scan and whenever the severity summary or findings blob hash changes;
+an unchanged rescan refreshes scan projections without adding that pair.
 
 That is deliberately the *only* difference. The enforcement branch
 lives at the last step of the evaluator, after every rule has run, so
@@ -285,7 +297,9 @@ the same `StoragePort::put` path as artifact content. The event's
 and only if `finding_count > 0`, and the severity counts must sum to
 the finding count. Clean scans never reference a blob; dashboards and
 CLIs render the inline summary and fetch the blob only when an
-operator drills into per-finding detail.
+operator drills into per-finding detail. The findings are ordered by their
+complete JSON values before the blob is written, so scanner arrival order
+does not change its content hash.
 
 ### Newly-vulnerable detection
 
@@ -316,15 +330,20 @@ which spends it on the *row's*. The dispatcher used to carry a
 compile-time `5` instead, so the two agreed at the default and nowhere
 else.
 Exhausting the budget does not abandon the artifact — it transitions
-it, before the job row is marked failed, to the terminal
+it, before the job row is marked failed, to the
 `scan_indeterminate` status via
 `QuarantineUseCase::record_scan_indeterminate`, recording a distinct
 `ScanIndeterminate` event (deliberately *not* a zero-finding
 `ScanCompleted`, which would be indistinguishable from a clean scan).
 A `scan_indeterminate` artifact is non-downloadable, non-promotable,
-and **not releasable by the quarantine timer** — only an admin
-override or a post-exclusion re-evaluation can move it
-([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)).
+and **not releasable by the quarantine timer**. It is a **hold, not a
+dead end**: the stranded-rescan sweep re-picks it, and a verdict that is
+reached supersedes the absent one — a non-blocking verdict returns the
+artifact to `quarantined`, where the ordinary release sweep decides, and
+a blocking one condemns it to `rejected`. The curator's manual release
+reaches it too
+([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md),
+"A reached verdict supersedes an absent one").
 The ordering is itself fail-closed, and now by construction rather than
 by convention: the artifact transition happens inside `record_outcome`
 and the row's terminal write happens after it has returned, so a crash
@@ -922,10 +941,15 @@ If no backend produced a verdict:
 - **Any backend errored** → the existing retryable `Failed` path. An error
   may be transient.
 - **Every backend abstained, at least one of them gating** → the artifact
-  transitions straight to the terminal `scan_indeterminate` status, with
+  transitions straight to the `scan_indeterminate` status, with
   no retry budget spent. The artifact's kind and the backend's analyzers
   are both fixed, so the next attempt reaches the same answer; retrying
-  would only delay the hold by the backoff schedule.
+  would only delay the hold by the backoff schedule. The sweep still
+  re-picks the artifact on later ticks, which is what heals it when the
+  cause of the abstention goes away — a `ScanPolicy` moving to
+  `compositeVerdictMode: promoted`, say, after which `no_analyzer_matched`
+  no longer gates an `OciBlob`. A deterministic abstention simply
+  re-answers the same way, once per tick, appending nothing.
 - **Every abstention was `not_applicable`** → a **completed assessment
   with nothing to assess.** The orchestrator records a `ScanCompleted`
   with no findings and `assessment = not_applicable`, so scan authority
@@ -980,8 +1004,9 @@ never needs leader election to avoid double-firing.
 `CronRescanTickHandler`) is the safety net. Per tick it selects up to
 1000 released artifacts whose policy-derived rescan interval has
 elapsed (`ScanPolicy.rescanIntervalHours`, default 24, `0` disables)
-and that have no in-flight scan, and enqueues each at priority 10 with
-`trigger_source="cron"`. It is interval-driven and
+and that have no in-flight scan, and enqueues each with
+`trigger_source="cron"` at the ordinal that follows from it — the bottom
+band, because nobody is waiting on a scheduled rescan. It is interval-driven and
 advisory-independent: once the tick is scheduled, a released artifact
 gets re-adjudicated on its policy's cadence even if every feed went
 silent.
@@ -1074,7 +1099,8 @@ enqueue rate has outrun drain rate, whatever the trigger source.
   `ScanPolicy` thresholds, `Exclusion` overrides, curation rules.
 - [ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)
   — the consumer-side release predicate, including the `ScanWaived`
-  authority and why `scan_indeterminate` is terminal.
+  authority and why `scan_indeterminate` is a hold rather than a dead
+  end.
 - [Format handlers](format-handlers.md) — the `FormatHandler` port
   `extract_sbom` lives on.
 - [Content-addressable storage](cas-storage.md) — where findings blobs

@@ -75,9 +75,10 @@ use hort_domain::ports::event_store::{
     AppendEvents, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
 };
 use hort_domain::ports::format_handler::FormatHandler;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::storage::StoragePort;
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::{ArtifactCoords, PageRequest};
 
 use crate::append_conflict::{append_with_conflict_retry, ConflictCycleOutcome};
@@ -93,7 +94,9 @@ use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::release_clearance;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
 use crate::use_cases::scan_kind_resolution::scan_kind_of;
-use crate::use_cases::{rejected_reevaluation, scan_history, ArtifactAtVersion, OverCapStream};
+use crate::use_cases::{
+    refuse_append_past_cap, rejected_reevaluation, scan_history, ArtifactAtVersion, OverCapStream,
+};
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -294,6 +297,15 @@ pub struct RemoveExclusionCommand {
 /// and explicit rather than a loop.
 const POLICY_APPEND_ATTEMPTS: u8 = 2;
 
+/// `jobs.kind` of the async scan-policy re-evaluation pass (ADR 0041).
+const POLICY_REEVALUATION_KIND: &str = "policy-reevaluation";
+
+/// `jobs.trigger_source` the re-evaluation enqueue carries. The mutation
+/// that triggers it is operator- or gitops-driven, and
+/// [`TriggerSource`] has no dedicated literal for the gitops path — that
+/// surface is out of scope here.
+const REEVALUATION_TRIGGER_SOURCE: &str = TriggerSource::Manual.as_str();
+
 /// What a policy mutation wants, re-decided against a given state
 /// (ADR 0060 step (b)).
 ///
@@ -473,11 +485,11 @@ impl PolicyUseCase {
         match self
             .jobs
             .enqueue_task(
-                "policy-reevaluation",
+                POLICY_REEVALUATION_KIND,
                 &params,
                 None, // system/gitops-driven; no operator actor on the row
-                0i16, // default priority — a background population pass
-                "manual",
+                queue_priority(POLICY_REEVALUATION_KIND, REEVALUATION_TRIGGER_SOURCE),
+                REEVALUATION_TRIGGER_SOURCE,
                 None, // non-destructive kind → no DB-side idempotency key
             )
             .await
@@ -517,6 +529,17 @@ impl PolicyUseCase {
     /// mutation re-derives it rather than refusing forever on the stale
     /// version. One helper rather than a copy per site so the five
     /// mutations cannot describe the same failure five ways.
+    ///
+    /// **No non-negativity check belongs here**, even though the row this
+    /// funnel sends is exactly what the column's `CHECK` refuses. This
+    /// runs after the append: a refusal here would *describe* a split
+    /// brain — the stream states the mutation, the row does not — rather
+    /// than prevent one, which is strictly less useful than the SQLSTATE
+    /// 23514 it would replace. The obligation is therefore upstream of
+    /// this function, in the entry point that appended: every one of them
+    /// asks [`require_nonnegative_quarantine_duration`] before any
+    /// append, and `tests/policy_writes_check_the_window.rs` holds that
+    /// for the next writer rather than this doc comment.
     async fn write_projection(
         &self,
         policy_id: Uuid,
@@ -710,6 +733,11 @@ impl PolicyUseCase {
     /// 095). The check is performed before the append so a duplicate
     /// name cannot waste an event-stream position.
     ///
+    /// Fails with [`DomainError::Validation`] if the command's
+    /// quarantine window is negative
+    /// ([`require_nonnegative_quarantine_duration`]) — also before the
+    /// append, so a refused create leaves no stream behind.
+    ///
     /// # Why this one does not self-heal
     ///
     /// Every other mutation here re-derives the projection from the
@@ -780,6 +808,8 @@ impl PolicyUseCase {
             updated_at: now,
         };
 
+        require_nonnegative_quarantine_duration(&projection, NONNEGATIVE_WINDOW_WRITE_REMEDY)?;
+
         let event = PolicyCreated {
             policy_id,
             name: projection.name.clone(),
@@ -845,6 +875,12 @@ impl PolicyUseCase {
     ///   [`DomainError::Validation`] — re-checked against the
     ///   stream-derived state too, so a policy archived concurrently is
     ///   not updated on the retry.
+    /// - A negative quarantine window in the state the command asks for
+    ///   is rejected as [`DomainError::Validation`]
+    ///   ([`require_nonnegative_quarantine_duration`]), re-checked on the
+    ///   re-base for the same reason, and ahead of the same-value
+    ///   short-circuit: the column refuses that row whether or not this
+    ///   command is what made it negative.
     #[tracing::instrument(skip(self, cmd))]
     pub async fn update_policy(&self, cmd: UpdatePolicyCommand, actor: Actor) -> AppResult<()> {
         let policy_id = cmd.policy_id;
@@ -891,6 +927,7 @@ impl PolicyUseCase {
                 .into());
             }
             let desired = desired_projection(&cmd, &state.policy);
+            require_nonnegative_quarantine_duration(&desired, NONNEGATIVE_WINDOW_WRITE_REMEDY)?;
             let updates = diff_policy_fields(policy_id, &state.policy, &desired);
             if updates.is_empty() {
                 return Ok(PolicyIntent::Satisfied);
@@ -1018,6 +1055,14 @@ impl PolicyUseCase {
     /// archived, the intent is satisfied: the call succeeds and the stale
     /// row is repaired rather than being answered with a `Validation`
     /// error about a state the caller could not have seen.
+    ///
+    /// A projection carrying a negative quarantine window is refused as
+    /// [`DomainError::Validation`]
+    /// ([`require_nonnegative_quarantine_duration`]) before the append,
+    /// naming the field, the value and the way out. Unlike the write
+    /// path this call has no duration of its own to converge the row
+    /// with, and the value is deliberately left alone rather than
+    /// zeroed: see [`NONNEGATIVE_WINDOW_ARCHIVE_REMEDY`].
     #[tracing::instrument(skip(self))]
     pub async fn archive_policy(&self, policy_id: Uuid, actor: Actor) -> AppResult<()> {
         let projection = self
@@ -1041,6 +1086,26 @@ impl PolicyUseCase {
             ))
             .into());
         }
+
+        // Ahead of `mutate_policy_stream`, so a refusal appends no
+        // `PolicyArchived` and leaves the row exactly as it stands.
+        //
+        // This is the one asker with nothing to converge the value
+        // with: the write path's refusal is paired with a command that
+        // sets the field, while archival carries no duration at all and
+        // writes the projection back as it was read. So a stored
+        // negative window — only reachable in a row written before the
+        // column's `NOT VALID` CHECK — would reach that CHECK on the
+        // upsert and come back as SQLSTATE 23514 naming a constraint,
+        // through the gitops apply that is this method's only caller,
+        // failing a whole `ScanPolicy` apply pass. Asked here it names
+        // the field, the value and the two applies that fix it.
+        //
+        // Deliberately *not* converged to zero here: that would change
+        // what a seed import's backdated anchor, the boot posture
+        // summary and every rendered deadline do with this policy, and
+        // `PolicyArchived` is not authorship for a duration change.
+        require_nonnegative_quarantine_duration(&projection, NONNEGATIVE_WINDOW_ARCHIVE_REMEDY)?;
 
         let base = ScanPolicyReplay {
             policy: projection,
@@ -1091,6 +1156,12 @@ impl PolicyUseCase {
     ///   an idempotent success rather than that rejection — the caller
     ///   read an archived row and cannot be blamed for a state only the
     ///   stream knew.
+    /// - A projection carrying a negative quarantine window →
+    ///   [`DomainError::Validation`]
+    ///   ([`require_nonnegative_quarantine_duration`]) before the append.
+    ///   This is the one asker with no way out to offer, and the message
+    ///   says that rather than naming a route:
+    ///   [`NONNEGATIVE_WINDOW_REACTIVATE_REMEDY`].
     #[tracing::instrument(skip(self))]
     pub async fn reactivate_policy(&self, policy_id: Uuid, actor: Actor) -> AppResult<()> {
         let projection = self
@@ -1114,6 +1185,22 @@ impl PolicyUseCase {
             ))
             .into());
         }
+
+        // Ahead of `mutate_policy_stream`, so a refusal appends no
+        // `PolicyReactivated` and leaves the row exactly as it stands —
+        // and here that is the difference between a recoverable refusal
+        // and a state nothing converges. Past the append the stream says
+        // active while the row still says archived, and every retry
+        // re-reads that archived row, re-bases onto the stream, finds the
+        // intent already satisfied and fails the identical upsert: the
+        // only other write paths into this policy (`update_policy`,
+        // `archive_policy`) refuse an archived row first, so nothing else
+        // can move it either.
+        //
+        // The tail here is the one that names no route, because there is
+        // none to name — `NONNEGATIVE_WINDOW_REACTIVATE_REMEDY` carries
+        // the ordering trap instead.
+        require_nonnegative_quarantine_duration(&projection, NONNEGATIVE_WINDOW_REACTIVATE_REMEDY)?;
 
         let base = ScanPolicyReplay {
             policy: projection,
@@ -1178,6 +1265,13 @@ impl PolicyUseCase {
     ///   absence and archival as the same "policy is not editable"
     ///   class of failure).
     /// - Archived parent → [`DomainError::Validation`].
+    /// - A parent carrying a negative quarantine window →
+    ///   [`DomainError::Validation`]
+    ///   ([`require_nonnegative_quarantine_duration`]) before the append.
+    ///   Writing an exclusion re-writes the parent row, so the parent's
+    ///   own stored value has to be writable for this call to complete;
+    ///   the way out is one ordinary policy apply
+    ///   ([`NONNEGATIVE_WINDOW_EXCLUSION_REMEDY`]).
     /// - Stale `ExpectedVersion::Exact` → [`DomainError::Conflict`].
     #[tracing::instrument(skip(self, cmd))]
     pub async fn add_exclusion(&self, cmd: AddExclusionCommand, actor: Actor) -> AppResult<Uuid> {
@@ -1266,6 +1360,35 @@ impl PolicyUseCase {
             return Err(
                 DomainError::Validation(format!("policy '{}' is archived", parent.name)).into(),
             );
+        }
+
+        // Ahead of `mutate_policy_stream`, so a refusal appends no
+        // `ExclusionAdded`, writes no exclusion row and leaves the policy
+        // row untouched. The refusal is about the PARENT's stored window
+        // rather than anything the command carries: an upsert of the
+        // parent projection sends every column, so a legacy negative
+        // value this call never touches is still in the row that reaches
+        // the column's `CHECK`.
+        //
+        // Past the append the exclusion already suppresses its CVE, only
+        // the parent row's upsert fails, and the method returns before
+        // the loosen re-evaluation at its tail — so the artifacts the new
+        // exclusion should release stay held with no pass queued to
+        // release them, and the caller is told a constraint name.
+        if let Err(e) =
+            require_nonnegative_quarantine_duration(&parent, NONNEGATIVE_WINDOW_EXCLUSION_REMEDY)
+        {
+            tracing::info!(
+                policy_id = %policy_id,
+                name = %parent.name,
+                "add_exclusion rejected: the policy's stored quarantine window is negative",
+            );
+            emit_curation_decision(
+                CurationDecisionLabel::ExcludeFinding,
+                repo_label_ref,
+                CurationDecisionResult::Invalid,
+            );
+            return Err(e);
         }
 
         let exclusion_id = Uuid::new_v4();
@@ -1864,6 +1987,24 @@ impl PolicyUseCase {
     ) -> bool {
         let stream_id = paired.stream_id().clone();
         let expected_version = paired.expected_version();
+        // `ArtifactReEvaluated` plus the `ArtifactRejected` companion —
+        // two events. Repeatable: a re-evaluation pass runs on every
+        // policy and exclusion change, and the tighten/loosen pair can
+        // alternate on one artifact indefinitely. A refusal is the same
+        // best-effort skip every other failure on this path is, but it is
+        // logged as what it is rather than as a concurrent modification,
+        // which is what the `Conflict` arm below would have called it.
+        if let Err(e) = refuse_append_past_cap(&stream_id, paired.stream_len(), 2) {
+            tracing::warn!(
+                artifact_id = %paired.artifact().id,
+                policy_id = %policy_id,
+                trigger = ?trigger,
+                error = %e,
+                "re-evaluation (tighten): the artifact's stream has no room for the \
+                 re-evaluation pair this would append; skipping artifact",
+            );
+            return false;
+        }
         let artifact = paired.into_artifact();
         let artifact_id = artifact.id;
 
@@ -2307,6 +2448,20 @@ impl PolicyUseCase {
         let artifact_id = paired.artifact().id;
         let stream_id = paired.stream_id().clone();
         let expected_version = paired.expected_version();
+        // `ArtifactReEvaluated` plus the companion transition — two
+        // events, and repeatable for the same reason the tighten
+        // direction is. Same best-effort skip, named for itself.
+        if let Err(e) = refuse_append_past_cap(&stream_id, paired.stream_len(), 2) {
+            tracing::warn!(
+                artifact_id = %artifact_id,
+                policy_id = %policy_id,
+                trigger = ?trigger,
+                error = %e,
+                "re-evaluation: the artifact's stream has no room for the re-evaluation \
+                 pair this would append; skipping artifact",
+            );
+            return false;
+        }
 
         // The artifact entity's `re_evaluate(now)` mutates state and
         // returns the companion transition event (`ArtifactQuarantined`
@@ -2439,6 +2594,20 @@ impl PolicyUseCase {
     /// Validation:
     /// - Non-existent parent → [`DomainError::Validation`].
     /// - Archived parent → [`DomainError::Validation`].
+    /// - A parent carrying a negative quarantine window →
+    ///   [`DomainError::Validation`]
+    ///   ([`require_nonnegative_quarantine_duration`]) before the append.
+    ///   The stored-scope asymmetry below does **not** extend to this
+    ///   one, and the reason is that it withdraws nothing: dropping the
+    ///   exclusion re-writes the parent row, so the removal cannot
+    ///   complete over an invalid one either way. Refusing it pre-write
+    ///   names the field, the value and one apply that converges it
+    ///   ([`NONNEGATIVE_WINDOW_EXCLUSION_REMEDY`]), after which the
+    ///   removal runs AND enqueues its re-evaluation; letting it through
+    ///   appends, drops the row, fails the parent upsert on SQLSTATE
+    ///   23514 and skips that TIGHTEN pass — so the waiver's effect on
+    ///   the already-released population survives, permanently, with
+    ///   every retry failing the same way.
     /// - Unknown `exclusion_id` → [`DomainError::NotFound`].
     /// - Exclusion belongs to a different policy →
     ///   [`DomainError::Validation`] (defence-in-depth — the
@@ -2497,6 +2666,30 @@ impl PolicyUseCase {
             return Err(
                 DomainError::Validation(format!("policy '{}' is archived", parent.name)).into(),
             );
+        }
+
+        // Ahead of `mutate_policy_stream`, so a refusal appends no
+        // `ExclusionRemoved`, drops no row and leaves the policy row
+        // untouched — see the window bullet on this method's doc comment
+        // for why refusing a REMOVAL here withdraws nothing, unlike the
+        // stored-scope case. The repo label is `None` for the same reason
+        // as the two rejections above it: the exclusion whose scope
+        // resolves the label has not been read yet, and the parent's own
+        // row is what is being refused.
+        if let Err(e) =
+            require_nonnegative_quarantine_duration(&parent, NONNEGATIVE_WINDOW_EXCLUSION_REMEDY)
+        {
+            tracing::info!(
+                policy_id = %policy_id,
+                name = %parent.name,
+                "remove_exclusion rejected: the policy's stored quarantine window is negative",
+            );
+            emit_curation_decision(
+                CurationDecisionLabel::UnexcludeFinding,
+                None,
+                CurationDecisionResult::Invalid,
+            );
+            return Err(e);
         }
 
         let exclusions = self
@@ -2721,6 +2914,130 @@ fn curation_result_for(err: &AppError) -> CurationDecisionResult {
         _ => CurationDecisionResult::Error,
     }
 }
+
+/// Refuse a projection whose quarantine observation window is negative
+/// (ADR 0007).
+///
+/// **The one rule, over the projection about to be written**, rather than
+/// over the one field a command happened to set — which is what makes it
+/// reach the case no per-field check would: a legacy negative value a
+/// command leaves alone is still in the projection the upsert carries,
+/// and the column's own `CHECK` refuses that write whatever field the
+/// command was about. Asked here, the refusal names the field and the
+/// value; asked by the adapter, it names a constraint. Setting a
+/// non-negative duration in the same update is the way out, and that
+/// update passes.
+///
+/// A duration is not negative, and the consumers of
+/// `quarantine_duration_secs` do not agree on what a negative one would
+/// mean. The ingest gate reads `effective_duration_secs <= 0` and so
+/// treats it as the explicit permissive zero; `SeedImportUseCase`'s
+/// backdated anchor *subtracts* it, so a value past its margin stamps a
+/// `quarantine_window_start` in the future where zero stamps one in the
+/// past; the boot posture summary counts permissive policies with `== 0`
+/// and does not see it; and the deadline the curation queue and a served
+/// index report moves before the window anchor. The release sweep's
+/// `.max(0)` is one reader's answer to that, and the right posture for a
+/// reader that cannot trust a table it does not own — but one reader's
+/// answer is not the invariant.
+///
+/// Every writer asks before any event is appended — `create_policy` of
+/// the projection its `PolicyCreated` snapshot is encoded from,
+/// `update_policy`'s `decide` closure of the state its diff is taken
+/// against (on the first pass and on every re-base), and
+/// `archive_policy`, `reactivate_policy`, `add_exclusion` and
+/// `remove_exclusion` of the row they are about to write back — so a
+/// refusal leaves the stream and the row untouched. Those six are the
+/// whole census of projection writers, and
+/// `tests/policy_writes_check_the_window.rs` is what holds it: while
+/// this comment was the only statement of the rule the census was
+/// counted short twice, and the two writers it missed
+/// (`add_exclusion` / `remove_exclusion`) are the two reachable from a
+/// live admin route.
+///
+/// `remedy` is the tail each caller appends, because the way out is not
+/// the same at all six. At a write the command in hand carries a value,
+/// so the way out is one field
+/// ([`NONNEGATIVE_WINDOW_WRITE_REMEDY`]); at archival there is no value
+/// to converge with ([`NONNEGATIVE_WINDOW_ARCHIVE_REMEDY`]); an
+/// exclusion change is one ordinary policy apply away from a converged
+/// row ([`NONNEGATIVE_WINDOW_EXCLUSION_REMEDY`]); and reactivation has
+/// no route at all and says so
+/// ([`NONNEGATIVE_WINDOW_REACTIVATE_REMEDY`]). The predicate, the field
+/// name and the value stay here: one rule, six askers, four tails.
+fn require_nonnegative_quarantine_duration(
+    projection: &ScanPolicyProjection,
+    remedy: &str,
+) -> AppResult<()> {
+    if projection.quarantine_duration_secs < 0 {
+        return Err(DomainError::Validation(format!(
+            "quarantine_duration_secs must not be negative; policy '{}' carries {} \
+             (0 is the explicit permissive window); {remedy}",
+            projection.name, projection.quarantine_duration_secs
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// The way out of a negative quarantine window at a **write**: the
+/// command in hand sets the field, so one non-negative value in the
+/// same command converges the row.
+const NONNEGATIVE_WINDOW_WRITE_REMEDY: &str = "set a non-negative duration in the same write";
+
+/// The way out at **archival**, which is the one asker with no value to
+/// converge with: `archive_policy` writes the projection back as it
+/// stands, and `PolicyArchived` is not authorship for a duration change,
+/// so the value has to be fixed through the policy write path first.
+/// Every live caller of that path is gitops apply
+/// (`apply_config_use_case::scan_policies`), so the message names the
+/// two applies it takes rather than an API verb no installation has.
+const NONNEGATIVE_WINDOW_ARCHIVE_REMEDY: &str =
+    "the duration has to be set non-negative through the policy write path before the policy \
+     can be retired, because archiving writes the projection back as it stands; for a gitops \
+     installation: re-declare the policy with a non-negative quarantineDuration and apply, \
+     then remove it and apply again";
+
+/// The way out at **exclusion management**, the two askers reachable
+/// from a live admin route (`POST /api/v1/admin/policies/{policy_id}/
+/// exclusions` and `DELETE …/exclusions/{cve_id}`). Unlike archival this
+/// is one step, and the reason is the state the policy has to be in to
+/// get here: both methods refuse an archived parent, an active policy is
+/// one the desired tree still declares, and a declared `quarantineDuration`
+/// is parsed through `humantime` and so is never negative. So the next
+/// apply's diff finds the declared value and the stored one different
+/// and converges the row through `update_policy`, after which the
+/// exclusion change goes through — and carries its re-evaluation pass
+/// with it, which the post-append failure does not.
+const NONNEGATIVE_WINDOW_EXCLUSION_REMEDY: &str =
+    "the exclusion change cannot be written while the policy's own row carries that value, \
+     because writing an exclusion re-writes the parent policy row; declare a non-negative \
+     quarantineDuration for this policy and apply, which converges the row through the \
+     policy write path, then re-issue this request";
+
+/// The way out at **reactivation**, which is that there is not one — and
+/// saying so is the point.
+///
+/// `reactivate_policy`'s only caller is gitops apply re-declaring an
+/// archived policy, and that apply reactivates FIRST and applies the
+/// declared spec afterwards (`apply_config_use_case::scan_policies`,
+/// which propagates this refusal with `?`). So the re-declaration that
+/// would converge the row is exactly what triggers the refusal, and it
+/// never reaches the `update_policy` that carries the duration. An
+/// archived policy has no other write path at all — `update_policy`
+/// refuses an archived row.
+///
+/// Naming a route here would name one that does not exist, and an
+/// operator who sees only a failing apply retries it forever.
+/// Reordering the apply pipeline to manufacture a route would change the
+/// event order of every reactivation to serve a defect no installation
+/// is known to carry, so the honest message is the trap itself.
+const NONNEGATIVE_WINDOW_REACTIVATE_REMEDY: &str =
+    "there is no supported way out from here: an apply that re-declares an archived policy \
+     reactivates it before it applies the declared quarantineDuration, so the \
+     re-declaration that would converge this value is refused before it can apply, and an \
+     archived policy has no other write path that carries a duration; stop re-applying and \
+     escalate this row";
 
 /// Apply an [`UpdatePolicyCommand`]'s `Set` values to a projection,
 /// producing the state the caller is asking for.
@@ -2988,9 +3305,21 @@ mod tests {
                 .unwrap()
                 .insert(stream_id, events);
         }
+
+        /// What a seeded stream currently holds — the read half of
+        /// [`Self::seed_stream`], for a fixture that extends a stream a
+        /// helper already planted.
+        fn seeded_stream(&self, stream_id: &StreamId) -> Vec<PersistedEvent> {
+            self.seeded_streams
+                .lock()
+                .unwrap()
+                .get(stream_id)
+                .cloned()
+                .unwrap_or_default()
+        }
     }
 
-    impl crate::use_cases::test_support::StreamTail for MockEventStore {
+    impl crate::use_cases::test_support::PairedEventStore for MockEventStore {
         fn current_expected_version(&self, stream_id: &StreamId) -> ExpectedVersion {
             match self
                 .seeded_streams
@@ -3001,6 +3330,35 @@ mod tests {
             {
                 Some(last) => ExpectedVersion::Exact(last.stream_position),
                 None => ExpectedVersion::NoStream,
+            }
+        }
+
+        /// Fold the committed batch onto the end of the stream
+        /// `read_stream` serves, so a transition the paired
+        /// `MockArtifactLifecycle` committed is one the re-evaluation
+        /// pass can read back — as it would from the adapter, which
+        /// appends inside the same transaction as the artifact row.
+        fn publish_committed(&self, batch: &AppendEvents) {
+            let mut streams = self.seeded_streams.lock().unwrap();
+            let stream = streams.entry(batch.stream_id.clone()).or_default();
+            let first_position = stream.last().map_or(0, |last| last.stream_position + 1);
+            for (offset, to_append) in batch.events.iter().enumerate() {
+                let position = first_position + offset as u64;
+                stream.push(PersistedEvent {
+                    event_id: to_append.event_id,
+                    stream_id: batch.stream_id.clone(),
+                    stream_position: position,
+                    // No cross-stream sequence in this mock; the
+                    // per-stream position is the only ordering its
+                    // readers consult.
+                    global_position: position,
+                    event: to_append.event.clone(),
+                    correlation_id: batch.correlation_id,
+                    causation_id: batch.causation_id,
+                    actor: batch.actor.clone(),
+                    event_version: 1,
+                    stored_at: Utc::now(),
+                });
             }
         }
     }
@@ -3414,6 +3772,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -3447,6 +3806,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -3487,6 +3847,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         // The storage mock is returned so `seed_rejected_with_scan` can
         // put the artifact's findings blob in CAS. It has to: an
@@ -3539,6 +3900,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -3591,6 +3953,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -3667,6 +4030,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -3772,6 +4136,84 @@ mod tests {
              re-rejected by a threshold change over the same stored \
              findings: {:?}",
             lifecycle.committed_transitions(),
+        );
+    }
+
+    /// Pad `artifact_id`'s stream to exactly `len` events, keeping
+    /// whatever it already carries as the **tail** so every reverse scan
+    /// over it still finds the same latest verdict. The filler is
+    /// `ArtifactQuarantined`, which no verdict derivation reads.
+    fn pad_stream_to(events: &Arc<MockEventStore>, artifact_id: Uuid, len: u64) {
+        let stream_id = StreamId::artifact(artifact_id);
+        let existing = events.seeded_stream(&stream_id);
+        let filler = len - existing.len() as u64;
+        let mut padded: Vec<PersistedEvent> = (0..filler)
+            .map(|pos| {
+                crate::use_cases::test_support::dummy_persisted_event(&stream_id, artifact_id, pos)
+            })
+            .collect();
+        for (offset, mut event) in existing.into_iter().enumerate() {
+            event.stream_position = filler + offset as u64;
+            event.global_position = event.stream_position + 1;
+            padded.push(event);
+        }
+        assert_eq!(
+            padded.len() as u64,
+            len,
+            "the padding arithmetic is the fixture"
+        );
+        events.seed_stream(stream_id, padded);
+    }
+
+    /// The tighten direction refuses the pair that would cross the cap,
+    /// and skips that artifact rather than aborting the pass.
+    ///
+    /// Same fixture as `run_pass_tighten_still_re_holds_an_unpromoted_constituent`
+    /// — which commits exactly one re-hold — with the artifact's stream
+    /// padded to one event short of the cap. The pair needs two, so the
+    /// re-hold is refused; without the refusal the re-hold lands and the
+    /// artifact is frozen at `Rejected` with no rescan that revisits it.
+    #[tokio::test]
+    async fn run_pass_tighten_refuses_the_pair_that_would_cross_the_cap() {
+        let repo_id = Uuid::new_v4();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_constituent_re_eval_harness(repo_id);
+        let policy_id = Uuid::new_v4();
+
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        p.composite_verdict_mode = CompositeVerdictMode::Observed;
+        projections.insert(p);
+
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+        let findings = vec![sample_filesystem_finding(
+            "CVE-2024-LAYER",
+            SeverityThreshold::Critical,
+        )];
+        let artifact_id = seed_active_with_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            &findings,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+        pad_stream_to(&events, artifact_id, crate::use_cases::STREAM_EVENT_CAP - 1);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "the re-hold pair does not fit, so the artifact is skipped and nothing \
+             commits: {:?}",
+            lifecycle.committed_transitions(),
+        );
+        assert_eq!(
+            events.seeded_stream(&StreamId::artifact(artifact_id)).len() as u64,
+            crate::use_cases::STREAM_EVENT_CAP - 1,
+            "and its stream is left exactly where it was"
         );
     }
 
@@ -4205,6 +4647,124 @@ mod tests {
             projection.composite_verdict_mode,
             CompositeVerdictMode::Observed
         );
+    }
+
+    // -- the quarantine-window invariant, at both writers --------------------
+    //
+    // One rule (`require_nonnegative_quarantine_duration`) asked by
+    // `create_policy` and by `update_policy`'s `decide`, so the two
+    // writers cannot answer differently. The column carries the same
+    // statement for a row written by raw SQL; these tests pin the
+    // application half, which is the one that names the field and the
+    // value instead of a constraint.
+
+    #[tokio::test]
+    async fn create_policy_refuses_a_negative_quarantine_window() {
+        let (uc, events, projections) = make_use_case();
+        let mut cmd = sample_create_command("negative-window");
+        cmd.quarantine_duration_secs = -1;
+
+        let err = uc.create_policy(cmd, api_actor()).await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("validation"), "got: {msg}");
+        assert!(msg.contains("quarantine_duration_secs"), "got: {msg}");
+        assert!(msg.contains("-1"), "got: {msg}");
+        // Refused ahead of the append, so no stream and no row exist.
+        assert!(events.appended_batches().is_empty());
+        assert!(projections.upserts().is_empty());
+    }
+
+    /// Zero is the explicit permissive window (ADR 0007) and stays
+    /// accepted — the boundary the refusal must not swallow.
+    #[tokio::test]
+    async fn create_policy_accepts_the_explicit_permissive_zero() {
+        let (uc, events, projections) = make_use_case();
+        let mut cmd = sample_create_command("permissive-window");
+        cmd.quarantine_duration_secs = 0;
+
+        let policy_id = uc.create_policy(cmd, api_actor()).await.unwrap();
+
+        let projection = projections.find_by_id(policy_id).await.unwrap().unwrap();
+        assert_eq!(projection.quarantine_duration_secs, 0);
+        assert_eq!(events.appended_batches().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_policy_refuses_a_negative_quarantine_window() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        projections.insert(sample_projection(id, 4));
+        let baseline_upserts = projections.upserts().len();
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.quarantine_duration_secs = FieldChange::Set(-3600);
+
+        let err = uc.update_policy(cmd, api_actor()).await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("validation"), "got: {msg}");
+        assert!(msg.contains("quarantine_duration_secs"), "got: {msg}");
+        assert!(msg.contains("-3600"), "got: {msg}");
+        assert!(events.appended_batches().is_empty());
+        assert_eq!(projections.upserts().len(), baseline_upserts);
+    }
+
+    /// The rule is over the projection about to be written, not over the
+    /// field the command set — so a stored negative value the command
+    /// leaves alone is still refused, by name. That is not pedantry: the
+    /// upsert would carry that value and the column refuses it, so the
+    /// alternative is the same failure wearing a constraint's name.
+    ///
+    /// **No live caller takes this branch today**, and the test is here
+    /// for the decision rather than for a path: `update_policy`'s only
+    /// production callers build their command through
+    /// `apply_config_use_case::update_command_from_diff`, which sets
+    /// `quarantine_duration_secs` unconditionally from validated YAML —
+    /// so a real update always carries a non-negative value and
+    /// converges the row instead of being refused. The asker with no
+    /// such value is `archive_policy`.
+    #[tokio::test]
+    async fn update_policy_refuses_an_unrelated_change_over_a_stored_negative_window() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let mut stored = sample_projection(id, 4);
+        stored.quarantine_duration_secs = -5;
+        projections.insert(stored);
+        let baseline_upserts = projections.upserts().len();
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+
+        let err = uc.update_policy(cmd, api_actor()).await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("quarantine_duration_secs"), "got: {msg}");
+        assert!(msg.contains("-5"), "got: {msg}");
+        assert!(events.appended_batches().is_empty());
+        assert_eq!(projections.upserts().len(), baseline_upserts);
+    }
+
+    /// And the way out of that state: an update that sets a
+    /// non-negative window succeeds, whatever else it carries.
+    #[tokio::test]
+    async fn update_policy_setting_a_stored_negative_window_to_zero_succeeds() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let mut stored = sample_projection(id, 4);
+        stored.quarantine_duration_secs = -5;
+        projections.insert(stored);
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.name = FieldChange::Set("renamed".into());
+        cmd.quarantine_duration_secs = FieldChange::Set(0);
+
+        uc.update_policy(cmd, api_actor()).await.unwrap();
+
+        let projection = projections.find_by_id(id).await.unwrap().unwrap();
+        assert_eq!(projection.quarantine_duration_secs, 0);
+        assert_eq!(projection.name, "renamed");
+        assert_eq!(events.appended_batches().len(), 1);
     }
 
     // -- update_policy -------------------------------------------------------
@@ -4753,6 +5313,44 @@ mod tests {
         assert!(events.appended_batches().is_empty());
     }
 
+    /// Archival is the one asker of
+    /// `require_nonnegative_quarantine_duration` with no value to
+    /// converge the row with — it writes the projection back as it was
+    /// read — so a stored negative window is refused here by name
+    /// rather than reaching the column's `CHECK` and coming back as a
+    /// constraint name through a failing gitops apply.
+    ///
+    /// The refusal sits ahead of `mutate_policy_stream`, so the
+    /// assertions are what is *not* written: no `PolicyArchived`, and
+    /// the row untouched. The value is not converged to zero, which is
+    /// why the message has to carry the way out instead.
+    #[tokio::test]
+    async fn archive_policy_refuses_a_stored_negative_quarantine_window() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let mut stored = sample_projection(id, 4);
+        stored.quarantine_duration_secs = -5;
+        projections.insert(stored);
+        let baseline_upserts = projections.upserts().len();
+
+        let err = uc.archive_policy(id, api_actor()).await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("validation"), "got: {msg}");
+        // The field and the value.
+        assert!(msg.contains("quarantine_duration_secs"), "got: {msg}");
+        assert!(msg.contains("-5"), "got: {msg}");
+        // And the way out, which is this message's whole point: the
+        // policy write path, spelled as the YAML field an operator
+        // edits and the second apply that then retires the policy.
+        assert!(msg.contains("policy write path"), "got: {msg}");
+        assert!(msg.contains("quarantineDuration"), "got: {msg}");
+        assert!(msg.contains("remove it and apply again"), "got: {msg}");
+        // Refused ahead of the append: no event, and the row as it was.
+        assert!(events.appended_batches().is_empty());
+        assert_eq!(projections.upserts().len(), baseline_upserts);
+    }
+
     #[tokio::test]
     async fn archive_policy_happy_path_emits_event_and_marks_archived() {
         let (uc, events, projections) = make_use_case();
@@ -4967,6 +5565,49 @@ mod tests {
         assert!(events.appended_batches().is_empty());
     }
 
+    /// Reactivation is the asker with **no way out to name**, and the
+    /// message is what has to carry that.
+    ///
+    /// Its only production caller is a gitops apply re-declaring an
+    /// archived policy, and that apply reactivates first and applies the
+    /// declared spec afterwards — propagating this refusal with `?`, so
+    /// the `update_policy` that would converge the row never runs. The
+    /// row's value therefore cannot be fixed from here by any supported
+    /// route, and an operator who read a constraint name instead would
+    /// re-apply forever.
+    ///
+    /// Refused ahead of `mutate_policy_stream`, which is what keeps the
+    /// state recoverable: past the append the stream says active while
+    /// the row still says archived, and every retry fails the identical
+    /// upsert because the other write paths refuse an archived row.
+    #[tokio::test]
+    async fn reactivate_policy_refuses_a_stored_negative_quarantine_window() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let mut stored = sample_projection(id, 4);
+        stored.archived = true;
+        stored.quarantine_duration_secs = -7;
+        projections.insert(stored);
+        let baseline_upserts = projections.upserts().len();
+
+        let err = uc.reactivate_policy(id, api_actor()).await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("validation"), "got: {msg}");
+        // The field and the value, as at every other asker.
+        assert!(msg.contains("quarantine_duration_secs"), "got: {msg}");
+        assert!(msg.contains("-7"), "got: {msg}");
+        // And the tail that names the trap rather than a route: the
+        // re-declaration that would converge the row is refused before it
+        // can apply, so the operator escalates instead of retrying.
+        assert!(msg.contains("no supported way out"), "got: {msg}");
+        assert!(msg.contains("before it can apply"), "got: {msg}");
+        assert!(msg.contains("escalate"), "got: {msg}");
+        // Refused ahead of the append: no event, and the row as it was.
+        assert!(events.appended_batches().is_empty());
+        assert_eq!(projections.upserts().len(), baseline_upserts);
+    }
+
     /// The stale-projection repair at the `reactivate_policy` site — the
     /// seventh expected-version site on this stream, and the one the
     /// directive's census of six did not name. Its conflict handling was
@@ -5132,6 +5773,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -5230,6 +5872,51 @@ mod tests {
 
         assert!(events.appended_batches().is_empty());
         assert!(projections.exclusion_upserts().is_empty());
+    }
+
+    /// The parent's stored window, not the command's: adding an exclusion
+    /// re-writes the parent policy row, so a legacy negative value this
+    /// call never touches is still in the row the upsert carries.
+    ///
+    /// This asker is reachable from a live admin route, which is what
+    /// makes the tail one step rather than two: the parent is active, so
+    /// the desired tree declares it, and a declared `quarantineDuration`
+    /// is never negative — the next apply converges the row through
+    /// `update_policy`.
+    ///
+    /// Refused ahead of `mutate_policy_stream`, and the assertions are
+    /// what is *not* written. Past the append the CVE would already be
+    /// suppressed, the parent upsert alone would fail, and the method
+    /// would return before the loosen re-evaluation at its tail — so the
+    /// artifacts the exclusion should release would stay held with
+    /// nothing queued to release them.
+    #[tokio::test]
+    async fn add_exclusion_refuses_a_parents_stored_negative_quarantine_window() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let mut parent = sample_projection(policy_id, 3);
+        parent.quarantine_duration_secs = -9;
+        projections.insert(parent);
+        let baseline_upserts = projections.upserts().len();
+
+        let err = uc
+            .add_exclusion(sample_add_exclusion_command(policy_id), api_actor())
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("validation"), "got: {msg}");
+        assert!(msg.contains("quarantine_duration_secs"), "got: {msg}");
+        assert!(msg.contains("-9"), "got: {msg}");
+        // The one-step way out, spelled as the YAML field an operator
+        // edits and the apply that converges the row.
+        assert!(msg.contains("quarantineDuration"), "got: {msg}");
+        assert!(msg.contains("re-issue this request"), "got: {msg}");
+        // Nothing written anywhere: no event, no exclusion row, no
+        // parent row.
+        assert!(events.appended_batches().is_empty());
+        assert!(projections.exclusion_upserts().is_empty());
+        assert_eq!(projections.upserts().len(), baseline_upserts);
     }
 
     #[tokio::test]
@@ -5749,6 +6436,37 @@ mod tests {
             }
             other => panic!("expected ArtifactReleased, got {other:?}"),
         }
+    }
+
+    /// The loosen direction carries the same refusal: the
+    /// `ArtifactReEvaluated` + `ArtifactReleased` pair is two events, and
+    /// one short of the cap there is room for neither half alone.
+    ///
+    /// Same fixture as
+    /// `add_exclusion_re_eval_pass_resets_artifact_to_released_when_clean_and_window_elapsed`,
+    /// which commits exactly one such pair.
+    #[tokio::test]
+    async fn add_exclusion_re_eval_pass_refuses_the_pair_that_would_cross_the_cap() {
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_use_case_with_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        projections.insert(p);
+
+        let artifact_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
+        artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+        pad_stream_to(&events, artifact_id, crate::use_cases::STREAM_EVENT_CAP - 1);
+
+        add_exclusion_then_run_pass(&uc, policy_id).await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "the release pair does not fit, so the artifact stays Rejected and the pass \
+             keeps going: {:?}",
+            lifecycle.committed_transitions(),
+        );
     }
 
     /// Re-evaluation that resets a Rejected artifact
@@ -6670,6 +7388,49 @@ mod tests {
         assert!(events.appended_batches().is_empty());
     }
 
+    /// The removal half, which the stored-`PolicyScope` asymmetry does
+    /// **not** reach: refusing a removal here withdraws nothing, because
+    /// dropping an exclusion re-writes the parent policy row and so
+    /// cannot complete over an invalid one either way.
+    ///
+    /// What the refusal replaces is the worse half of that: an append, a
+    /// dropped exclusion row, a parent upsert failing on the column's
+    /// `CHECK`, and a return before the TIGHTEN re-evaluation — which is
+    /// the security-relevant half, since removing a waiver is what should
+    /// re-hold the artifacts it had released. Pre-write, the operator
+    /// gets one apply that converges the row, after which the removal
+    /// runs and enqueues that pass.
+    #[tokio::test]
+    async fn remove_exclusion_refuses_a_parents_stored_negative_quarantine_window() {
+        let (uc, events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let exclusion_id = Uuid::new_v4();
+        let mut parent = sample_projection(policy_id, 2);
+        parent.quarantine_duration_secs = -11;
+        projections.insert(parent);
+        projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
+        let baseline_upserts = projections.upserts().len();
+
+        let err = uc
+            .remove_exclusion(
+                sample_remove_exclusion_command(policy_id, exclusion_id),
+                api_actor(),
+            )
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("validation"), "got: {msg}");
+        assert!(msg.contains("quarantine_duration_secs"), "got: {msg}");
+        assert!(msg.contains("-11"), "got: {msg}");
+        assert!(msg.contains("quarantineDuration"), "got: {msg}");
+        assert!(msg.contains("re-issue this request"), "got: {msg}");
+        // The exclusion survives a refused removal, and so does the row.
+        assert!(events.appended_batches().is_empty());
+        assert!(projections.exclusion_deletes().is_empty());
+        assert_eq!(projections.upserts().len(), baseline_upserts);
+    }
+
     #[tokio::test]
     async fn remove_exclusion_unknown_exclusion_returns_not_found() {
         let (uc, events, projections) = make_use_case();
@@ -7316,6 +8077,42 @@ mod tests {
         assert_eq!(res, "invalid");
     }
 
+    /// A negative stored window is a *refused request*, not a failure:
+    /// the counter must say `invalid`. Worth pinning because the refusal
+    /// is a `DomainError::Validation` and the shared
+    /// `curation_result_for` maps everything that is not a
+    /// conflict to `error` — so letting this one propagate to the
+    /// generic arm would file an operator mistake in the bucket
+    /// operators alert on for broken infrastructure.
+    #[test]
+    fn add_exclusion_negative_window_emits_invalid_metric() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let (uc, _events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let mut parent = sample_projection(policy_id, 4);
+        parent.quarantine_duration_secs = -1;
+        projections.insert(parent);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(uc.add_exclusion(sample_add_exclusion_command(policy_id), api_actor()))
+                .expect_err("a negative stored window must be refused");
+        });
+
+        let hits = read_curation_decisions(snapshotter.snapshot());
+        assert_eq!(hits.len(), 1);
+        let (d, r, res, _) = &hits[0];
+        assert_eq!(d, "exclude_finding");
+        assert_eq!(r, "_all");
+        assert_eq!(res, "invalid");
+    }
+
     /// `add_exclusion` event-store conflict emits `result=conflict`.
     /// The 4xx-like signal operators alert on for contention.
     ///
@@ -7435,6 +8232,44 @@ mod tests {
         assert_eq!(d, "unexclude_finding");
         assert_eq!(r, "scoped-repo");
         assert_eq!(res, "ok");
+    }
+
+    /// The removal half of the same classification, with the `_all`
+    /// label its neighbours carry: the refusal happens before the
+    /// exclusion is read, so the scope that would resolve a repository
+    /// key is not known yet.
+    #[test]
+    fn remove_exclusion_negative_window_emits_invalid_metric() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let (uc, _events, projections) = make_use_case();
+        let policy_id = Uuid::new_v4();
+        let exclusion_id = Uuid::new_v4();
+        let mut parent = sample_projection(policy_id, 4);
+        parent.quarantine_duration_secs = -1;
+        projections.insert(parent);
+        projections.insert_exclusion(sample_exclusion(exclusion_id, policy_id));
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(uc.remove_exclusion(
+                    sample_remove_exclusion_command(policy_id, exclusion_id),
+                    api_actor(),
+                ))
+                .expect_err("a negative stored window must be refused");
+        });
+
+        let hits = read_curation_decisions(snapshotter.snapshot());
+        assert_eq!(hits.len(), 1);
+        let (d, r, res, _) = &hits[0];
+        assert_eq!(d, "unexclude_finding");
+        assert_eq!(r, "_all");
+        assert_eq!(res, "invalid");
     }
 
     /// `remove_exclusion` event-store conflict emits
@@ -9218,8 +10053,11 @@ mod tests {
         let projections = Arc::new(MockPolicyProjections::new());
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(
-            crate::use_cases::test_support::MockArtifactLifecycle::new(artifacts.clone())
-                .with_optimistic_concurrency(events.clone()),
+            crate::use_cases::test_support::MockArtifactLifecycle::new(
+                artifacts.clone(),
+                events.clone(),
+            )
+            .with_optimistic_concurrency(),
         );
         let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
         let curation_rules =
@@ -9269,7 +10107,10 @@ mod tests {
         // stays at position 0, inside any capped read.
         let stream_id = StreamId::artifact(artifact_id);
         let mut over_cap = vec![persisted_scan_completed(artifact_id, 1, 0)];
-        over_cap.extend((1..201).map(|i| persisted_scan_completed(artifact_id, 1, i)));
+        over_cap.extend(
+            (1..crate::use_cases::STREAM_EVENT_CAP + 1)
+                .map(|i| persisted_scan_completed(artifact_id, 1, i)),
+        );
         events.seed_stream(stream_id, over_cap);
         artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
 

@@ -690,6 +690,17 @@ pub async fn build_app_context(
         // scan budget got a row failed on one number and an artifact
         // held on another.
         cfg.max_attempts,
+        // The per-class reserved share, applied at both points where
+        // the dispatcher allocates capacity: the claim batch and the
+        // per-kind run permits (ADR 0066 D4).
+        cfg.reserved_slots_per_class,
+        // The threshold the per-class service audit answers at (ADR
+        // 0066 D5). `hort-server` reads the same operator variable for
+        // the gauge a scrape reaches; this is the worker-side trail's
+        // half of it, and passing the configured value rather than a
+        // local constant is what keeps the two from agreeing only at
+        // the default.
+        cfg.class_service_threshold,
     );
     dispatcher.register(
         Arc::new(ScanTaskHandler::new(orchestration.clone())),
@@ -1680,6 +1691,7 @@ pub async fn build_app_context(
             upstream_proxy_for_index_child,
             caching_resolver.clone(),
             jobs.clone(),
+            storage.clone(),
             oci_handler_for_index_child,
             ingest_use_case_for_index_child,
         )),

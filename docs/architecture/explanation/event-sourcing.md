@@ -473,21 +473,42 @@ The operator-facing how-to is at
   `hort-http-<format>` crate can construct one from a request body.
 - **Correlation IDs are server-generated.** Use cases call
   `Uuid::new_v4()`; client idempotency keys never enter the event log.
-- **Payload size cap: 64 KB per event**, enforced by a `CHECK` on the
-  `event_data` column (`migrations/004_events.sql`) and mirrored in
-  `hort-adapters-postgres::event_store::MAX_EVENT_JSON_BYTES`. A separate,
+- **Payload size cap: 64 KB per event**, defined once as
+  `hort_domain::events::MAX_EVENT_JSON_BYTES` and refused by
+  `DomainEvent::validate_serialized` — the call the Postgres append path and
+  the `hort-app` event-store double both make, so an event one accepts is an
+  event the other accepts. The `event_data` column carries an independent
+  `CHECK` (`migrations/004_events.sql`) as the database's own backstop; it
+  measures the stored jsonb datum (`pg_column_size`) rather than the
+  serialised text, so it is a second measurement of the same policy and not a
+  mirror of the constant. A separate,
   larger 1 MB cap exists on the unrelated `artifact_metadata.metadata`
   projection column (`migrations/003_artifacts_cas.sql`) — do not conflate
-  the two. Per-format sanity caps below the 64 KB event-log ceiling are
-  applied at the application layer — see
+  the two.
+- **A format's own metadata cap is *not* below the event ceiling, and is not
+  meant to be.** `FormatHandler::metadata_expected_max_bytes` bounds the
+  upload payload a format will *accept* (npm 5 MB, cargo 8 MB, PyPI 128 KB),
+  which is deliberately above 64 KB so the pre-dispatch check does not
+  pre-empt the spill decision. What is bounded by the event ceiling is only
+  the payload that stays **inline**:
+  `MetadataStrategy::inline_event_budget_bytes` clamps a handler's declared
+  `inline_threshold_bytes` to `MAX_EVENT_JSON_BYTES`, and the ingest path
+  then asks the candidate `ArtifactIngested` itself
+  (`DomainEvent::fits_storage_cap`) rather than estimating what the event's
+  own fields cost. Anything that does not fit — the full payload, or, after
+  a spill, the handler summary — goes to CAS and is served back through
+  `ArtifactUseCase::load_full_metadata`, so where the metadata lives is
+  invisible to every reader. See
   [format-handlers.md](format-handlers.md).
-- **Stream length cap: 200 events** (`hort_app::use_cases::STREAM_EVENT_CAP`),
+- **Stream length cap: `STREAM_EVENT_CAP` events** (`hort_app::use_cases`),
   enforced on **both** sides, because the cap is what makes a single capped
   `ReadFrom::Start` read of an artifact stream equal to reading the whole
   stream. An artifact that needs more events is a bug or abuse.
   - *Writing.* `read_expected_version` reads the current stream before
     appending and refuses to derive a version for one that already exceeds
-    the cap, which bounds every `ExpectedVersion::Exact` writer. An
+    the cap. The scan path also refuses before its complete event batch
+    would cross the cap. Other `ExpectedVersion::Exact` writers may still
+    cross the boundary when starting at the cap. An
     `ExpectedVersion::Any` append gets no version check from the adapter at
     all, so a repeatable `Any` writer on an artifact stream must refuse for
     itself — `RetentionUseCase::append_expired` (the daily expiry sweep) is
@@ -503,10 +524,10 @@ The operator-facing how-to is at
     so a read returning at most `cap` has provably reached the tail, and
     refuses one that has not. It never returns the oldest prefix: over a
     prefix, a reverse scan turns "the latest X" into "the latest X among the
-    oldest 200", and a superseded scan verdict would read as the current one.
+    oldest events read", and a superseded scan verdict would read as the current one.
     Raising the cap does not fix that; it only moves it.
-  - *Consequence.* A stream that reaches the cap is frozen in both
-    directions: no further event is accepted and no gate is decided from it.
-    That is the intended fail-closed outcome (see
+  - *Consequence.* A stream past the cap is unreadable for decisions;
+    repeatable scan and expiry appends refuse before crossing it. That is
+    the intended fail-closed outcome (see
     [ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)),
     not a state to engineer around.

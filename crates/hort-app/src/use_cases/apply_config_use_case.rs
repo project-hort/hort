@@ -1104,13 +1104,18 @@ impl ApplyConfigUseCase {
     /// apply can reach is reachable only from a write-capable stage**: the
     /// apply writes between its stages and ships no rollback, so a
     /// late-stage reject leaves a partial apply -- a refused tightening
-    /// beside a committed loosening of the same bundle. Two tests hold the
-    /// claim: `pre_write_validation_consumes_every_reject_row` (no lint row
-    /// may be omitted from the table) and
+    /// beside a committed loosening of the same bundle. Three tests hold
+    /// the claim, at three granularities:
+    /// `pre_write_validation_consumes_every_reject_row` (no lint row may
+    /// be omitted from the table -- derived from `LinterRule`),
+    /// `pre_write_pass_accepts_nothing_a_stage_refuses` (per spec *field*,
+    /// derived by mutating every string leaf of every kind's spec: if the
+    /// pass accepts a bundle the apply must accept it) and
     /// `every_rejecting_apply_stage_is_rejected_pre_write` (per-stage
-    /// corpus). The stages keep their own checks as defence-in-depth, where
-    /// a reject is then a `DomainError::Invariant`-grade contract violation
-    /// rather than operator error.
+    /// corpus, hand-written and specific). The stages keep their own
+    /// checks as defence-in-depth, where a reject is then a
+    /// `DomainError::Invariant`-grade contract violation rather than
+    /// operator error.
     ///
     /// This is the seam `gitops_boot` uses (via [`Self::preflight_validate`])
     /// to PARK not-ready on a pre-write config error instead of
@@ -2780,6 +2785,30 @@ mod tests {
         }
     }
 
+    /// The lifecycle double this harness pairs commits an artifact and
+    /// its events in one call; this is where the events half lands.
+    /// `read_stream` replays `appended`, so pushing the batch there is
+    /// what makes a committed transition readable afterwards — the
+    /// adapter's own semantics, which has no opt-out.
+    impl crate::use_cases::test_support::PairedEventStore for MockPolicyEventStore {
+        fn current_expected_version(&self, stream_id: &StreamId) -> ExpectedVersion {
+            let appended = self.appended.lock().unwrap();
+            let count: u64 = appended
+                .iter()
+                .filter(|b| &b.stream_id == stream_id)
+                .map(|b| b.events.len() as u64)
+                .sum();
+            match count.checked_sub(1) {
+                Some(last) => ExpectedVersion::Exact(last),
+                None => ExpectedVersion::NoStream,
+            }
+        }
+
+        fn publish_committed(&self, batch: &AppendEvents) {
+            self.appended.lock().unwrap().push(batch.clone());
+        }
+    }
+
     impl EventStore for MockPolicyEventStore {
         fn append(&self, batch: AppendEvents) -> BoxFuture<'_, DomainResult<AppendResult>> {
             let outcome = self
@@ -3226,6 +3255,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let upstream = Arc::new(
             crate::use_cases::test_support::MockRepositoryUpstreamMappingRepository::new(),
@@ -3331,6 +3361,7 @@ mod tests {
         let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
         let lifecycle = Arc::new(crate::use_cases::test_support::MockArtifactLifecycle::new(
             artifacts.clone(),
+            events.clone(),
         ));
         let upstream = Arc::new(
             crate::use_cases::test_support::MockRepositoryUpstreamMappingRepository::new(),
@@ -8487,22 +8518,29 @@ mod tests {
     ///
     /// # What the corpus is, and what it is not
     ///
-    /// The cases are **hand-written, one per rejecting stage**, and the
-    /// coverage claim is therefore only as complete as this list. The
-    /// companion test above (`pre_write_validation_consumes_every_reject_row`)
-    /// IS derived — its wildcard-free `match` over `LinterRule` fails to
-    /// compile until a new variant is classified — but that covers the
-    /// linter rows, not the stages: a stage can refuse through a domain
-    /// constructor, a port lookup or a `FromStr` with no lint row behind
-    /// it, which is exactly what the two newest cases below
-    /// (`apply_curation_rules`, `apply_virtual_members`) do. Those two
-    /// were absent for as long as the list was the only inventory, and
-    /// while both were covered by a preflight mirror throughout, losing
-    /// either mirror would have left this purported stage-completeness
-    /// test green. A new rejection arm added to a represented stage has
-    /// the same exposure. There is one stage function per apply pass, so
-    /// the list is checkable by reading `apply`; it is not checked by the
-    /// compiler.
+    /// The cases are **hand-written, one per rejecting stage**, so what
+    /// this test is, is the specific and readable evidence: each case
+    /// names the stage, the arm and the mirror, and asserts the
+    /// write-free abort as well. What it is *not* is the inventory. A
+    /// stage can refuse through a domain constructor, a port lookup or a
+    /// `FromStr` with no lint row behind it — which is what the two
+    /// newest cases below (`apply_curation_rules`,
+    /// `apply_virtual_members`) do, and both were absent for as long as
+    /// this list was the only inventory. Worse, a hand list per *stage*
+    /// cannot see an arm added to a stage it already covers:
+    /// `apply_permission_grants` was represented by four row-8 lint cases
+    /// while its `subject.userId` UUID parse was not.
+    ///
+    /// Both companion tests are derived, at the two granularities this
+    /// list is not: `pre_write_validation_consumes_every_reject_row`
+    /// (wildcard-free `match` over `LinterRule` — a new variant does not
+    /// compile until it is classified) covers the lint rows, and
+    /// `pre_write_pass_accepts_nothing_a_stage_refuses` covers the
+    /// rejection *arm* by mutating every string leaf of every kind's spec
+    /// and holding the apply to "whatever the pre-write pass accepts".
+    /// The residue those two leave — a non-string field, structure inside
+    /// a `serde_json::Value`-typed spec — is what keeps this corpus
+    /// worth reading rather than worth deleting.
     #[tokio::test]
     async fn every_rejecting_apply_stage_is_rejected_pre_write() {
         struct Case {
@@ -8761,6 +8799,533 @@ mod tests {
                 h2.events.appended().len(),
             );
         }
+    }
+
+    /// The same completeness claim as the corpus above, **derived** — the
+    /// inventory is the spec field space, read off `serde`, rather than a
+    /// list of stages someone remembered to extend.
+    ///
+    /// # Why the corpus above is not enough
+    ///
+    /// `every_rejecting_apply_stage_is_rejected_pre_write` is one case per
+    /// rejecting stage, and its own docs name the exposure that leaves: "a
+    /// new rejection arm added to a represented stage has the same
+    /// exposure". That exposure has now been paid three times.
+    /// `apply_curation_rules` and `apply_virtual_members` were missing for
+    /// as long as the list was the only inventory. The third is worse,
+    /// because it defeats the per-stage unit itself:
+    /// `apply_permission_grants` **was** represented — by four lint cases
+    /// of row 8 — while its non-lint arm, the `Uuid::parse_str` of
+    /// `subject.userId`, was not. The stage was on the list and the gap
+    /// went through anyway. A per-stage corpus cannot see that, because
+    /// the unit it checks is coarser than the unit that fails.
+    ///
+    /// # What is derived here, and how
+    ///
+    /// The unit is the **spec field**, which is finer than the stage and
+    /// is where an operator's mistake enters. For every declarable
+    /// [`Kind`], a bundle that applies cleanly is mutated one string leaf
+    /// at a time — the leaves walked out of `serde_json::to_value(spec)`,
+    /// so the inventory follows the type and a newly added spec field
+    /// joins the corpus without anyone deciding to add it — and each
+    /// mutant is held to:
+    ///
+    /// > if the pre-write pass **accepts** the bundle, the apply must
+    /// > accept it too.
+    ///
+    /// Its contrapositive is the claim `run_pre_write_validation` carries:
+    /// a bundle the apply refuses must already be refused before the
+    /// first write. A mutant that the preflight waves through and a stage
+    /// then rejects is exactly a refusal reachable only from a
+    /// write-capable stage — a partial apply with no rollback, a refused
+    /// tightening beside a committed loosening of the same bundle.
+    ///
+    /// Two replacement values, because validators split on them
+    /// differently: a nonsense token (parses as no enum, resolves to no
+    /// declared object, is no URL / duration / UUID) and the empty
+    /// string.
+    ///
+    /// # What it cannot see
+    ///
+    /// A field that is not a string leaf: a `bool` has no "nonsense"
+    /// value, an integer's out-of-range arm needs a bound this test does
+    /// not know, and `serde_json::Value`-typed specs (the retention
+    /// predicate) carry structure a flat leaf walk does not explore. A
+    /// new **kind** still needs a seed bundle here — but it cannot be
+    /// forgotten, because [`Kind`] is matched without a wildcard, so a
+    /// new variant does not compile until it is seeded. And a mutant that
+    /// is not representable (`kind`, `apiVersion` and other typed leaves
+    /// stop deserialising) is skipped deliberately: the YAML parse layer
+    /// refuses it before any `DesiredState` exists, which is before the
+    /// apply, which is the claim satisfied.
+    ///
+    /// The corpus above stays: it is the specific, readable evidence per
+    /// stage, and it asserts the write-free abort as well. This test is
+    /// the net under it.
+    #[tokio::test]
+    async fn pre_write_pass_accepts_nothing_a_stage_refuses() {
+        /// Parses as no enum, resolves to no declared object, and is
+        /// neither a URL, a duration nor a UUID.
+        const NONSENSE: &str = "hort-mutation-nonsense";
+
+        /// Rebuild a bundle with the target envelope's spec replaced by
+        /// `spec`, or `None` when `spec` is not a representable spec for
+        /// that kind.
+        type Rebuild = fn(&DesiredState, serde_json::Value) -> Option<DesiredState>;
+
+        struct Seed {
+            /// A bundle that applies cleanly, whose LAST envelope of the
+            /// kind under test is the mutation target (companions the
+            /// bundle needs to be valid come before it).
+            bundle: DesiredState,
+            /// That envelope's spec, as JSON.
+            spec: serde_json::Value,
+            rebuild: Rebuild,
+            /// The number of string leaves the spec carries. Pinned so a
+            /// new spec field lands in front of a reader: the count
+            /// changes, this test says so, and the question "is the new
+            /// field's rejection arm reachable before the first write?"
+            /// gets asked once, by the person adding it.
+            leaves: usize,
+        }
+
+        fn rebuild_repository(
+            base: &DesiredState,
+            spec: serde_json::Value,
+        ) -> Option<DesiredState> {
+            let mut out = base.clone();
+            out.repositories.last_mut()?.spec = serde_json::from_value(spec).ok()?;
+            Some(out)
+        }
+        fn rebuild_claim_mapping(
+            base: &DesiredState,
+            spec: serde_json::Value,
+        ) -> Option<DesiredState> {
+            let mut out = base.clone();
+            out.claim_mappings.last_mut()?.spec = serde_json::from_value(spec).ok()?;
+            Some(out)
+        }
+        fn rebuild_permission_grant(
+            base: &DesiredState,
+            spec: serde_json::Value,
+        ) -> Option<DesiredState> {
+            let mut out = base.clone();
+            out.permission_grants.last_mut()?.spec = serde_json::from_value(spec).ok()?;
+            Some(out)
+        }
+        fn rebuild_curation_rule(
+            base: &DesiredState,
+            spec: serde_json::Value,
+        ) -> Option<DesiredState> {
+            let mut out = base.clone();
+            out.curation_rules.last_mut()?.spec = serde_json::from_value(spec).ok()?;
+            Some(out)
+        }
+        fn rebuild_scan_policy(
+            base: &DesiredState,
+            spec: serde_json::Value,
+        ) -> Option<DesiredState> {
+            let mut out = base.clone();
+            out.scan_policies.last_mut()?.spec = serde_json::from_value(spec).ok()?;
+            Some(out)
+        }
+        fn rebuild_retention_policy(
+            base: &DesiredState,
+            spec: serde_json::Value,
+        ) -> Option<DesiredState> {
+            let mut out = base.clone();
+            out.retention_policies.last_mut()?.spec = serde_json::from_value(spec).ok()?;
+            Some(out)
+        }
+        fn rebuild_exclusion(base: &DesiredState, spec: serde_json::Value) -> Option<DesiredState> {
+            let mut out = base.clone();
+            out.exclusions.last_mut()?.spec = serde_json::from_value(spec).ok()?;
+            Some(out)
+        }
+        fn rebuild_upstream_mapping(
+            base: &DesiredState,
+            spec: serde_json::Value,
+        ) -> Option<DesiredState> {
+            let mut out = base.clone();
+            out.upstream_mappings.last_mut()?.spec = serde_json::from_value(spec).ok()?;
+            Some(out)
+        }
+        fn rebuild_oidc_issuer(
+            base: &DesiredState,
+            spec: serde_json::Value,
+        ) -> Option<DesiredState> {
+            let mut out = base.clone();
+            out.oidc_issuers.last_mut()?.spec = serde_json::from_value(spec).ok()?;
+            Some(out)
+        }
+        fn rebuild_service_account(
+            base: &DesiredState,
+            spec: serde_json::Value,
+        ) -> Option<DesiredState> {
+            let mut out = base.clone();
+            out.service_accounts.last_mut()?.spec = serde_json::from_value(spec).ok()?;
+            Some(out)
+        }
+        fn rebuild_lint_config(
+            base: &DesiredState,
+            spec: serde_json::Value,
+        ) -> Option<DesiredState> {
+            let mut out = base.clone();
+            out.lint_config.as_mut()?.spec = serde_json::from_value(spec).ok()?;
+            Some(out)
+        }
+
+        fn spec_of<S: serde::Serialize>(envelope: &Envelope<S>) -> serde_json::Value {
+            serde_json::to_value(&envelope.spec).expect("every gitops spec is Serialize")
+        }
+
+        // No `_` arm, on purpose: a new `Kind` does not COMPILE until it
+        // has a seed bundle here, which is what keeps the kind half of
+        // this inventory derived rather than remembered.
+        fn seed(kind: Kind) -> Seed {
+            match kind {
+                Kind::ArtifactRepository => {
+                    let env = repo_env("mutation-target", "hosted");
+                    Seed {
+                        spec: spec_of(&env),
+                        bundle: DesiredState {
+                            repositories: vec![env],
+                            ..Default::default()
+                        },
+                        rebuild: rebuild_repository,
+                        leaves: 6,
+                    }
+                }
+                Kind::ClaimMapping => {
+                    let env = cm_env("mutation-target", "team-alpha", "team");
+                    Seed {
+                        spec: spec_of(&env),
+                        bundle: DesiredState {
+                            claim_mappings: vec![env],
+                            ..Default::default()
+                        },
+                        rebuild: rebuild_claim_mapping,
+                        leaves: 2,
+                    }
+                }
+                Kind::PermissionGrant => {
+                    let env = grant_env(
+                        "mutation-target",
+                        &["team-alpha", "ops"],
+                        "read",
+                        Some("repo-x"),
+                    );
+                    Seed {
+                        spec: spec_of(&env),
+                        bundle: DesiredState {
+                            repositories: vec![repo_env("repo-x", "hosted")],
+                            permission_grants: vec![env],
+                            ..Default::default()
+                        },
+                        rebuild: rebuild_permission_grant,
+                        leaves: 5,
+                    }
+                }
+                Kind::CurationRule => {
+                    let env = rule_env("mutation-target", "block", "left-pad", "rationale");
+                    Seed {
+                        spec: spec_of(&env),
+                        bundle: DesiredState {
+                            curation_rules: vec![env],
+                            ..Default::default()
+                        },
+                        rebuild: rebuild_curation_rule,
+                        leaves: 4,
+                    }
+                }
+                Kind::ScanPolicy => {
+                    let env = scan_policy_env("mutation-target");
+                    Seed {
+                        spec: spec_of(&env),
+                        bundle: DesiredState {
+                            scan_policies: vec![env],
+                            ..Default::default()
+                        },
+                        rebuild: rebuild_scan_policy,
+                        leaves: 9,
+                    }
+                }
+                Kind::RetentionPolicy => {
+                    let env = retention_policy_env_for_apply(
+                        "mutation-target",
+                        serde_json::json!({ "AgeExceeds": 2_592_000u64 }),
+                    );
+                    Seed {
+                        spec: spec_of(&env),
+                        bundle: DesiredState {
+                            retention_policies: vec![env],
+                            ..Default::default()
+                        },
+                        rebuild: rebuild_retention_policy,
+                        leaves: 1,
+                    }
+                }
+                Kind::Exclusion => {
+                    let env = exclusion_env("mutation-target", "p-parent", "CVE-2026-0001");
+                    Seed {
+                        spec: spec_of(&env),
+                        bundle: DesiredState {
+                            scan_policies: vec![scan_policy_env("p-parent")],
+                            exclusions: vec![env],
+                            ..Default::default()
+                        },
+                        rebuild: rebuild_exclusion,
+                        leaves: 4,
+                    }
+                }
+                Kind::UpstreamMapping => {
+                    let env = upstream_mapping_env(
+                        "mutation-target",
+                        "oci-mirror",
+                        "dockerhub/",
+                        "https://registry-1.docker.io",
+                    );
+                    Seed {
+                        spec: spec_of(&env),
+                        bundle: DesiredState {
+                            repositories: vec![repo_env("oci-mirror", "proxy")],
+                            upstream_mappings: vec![env],
+                            ..Default::default()
+                        },
+                        rebuild: rebuild_upstream_mapping,
+                        leaves: 4,
+                    }
+                }
+                Kind::OidcIssuer => {
+                    let env = oidc_issuer_env_for_apply("mutation-target");
+                    Seed {
+                        spec: spec_of(&env),
+                        bundle: DesiredState {
+                            oidc_issuers: vec![env],
+                            ..Default::default()
+                        },
+                        rebuild: rebuild_oidc_issuer,
+                        leaves: 4,
+                    }
+                }
+                Kind::ServiceAccount => {
+                    let env = service_account_env_for_apply("mutation-target", Some("corp"));
+                    Seed {
+                        spec: spec_of(&env),
+                        bundle: DesiredState {
+                            oidc_issuers: vec![oidc_issuer_env_for_apply("corp")],
+                            service_accounts: vec![env],
+                            ..Default::default()
+                        },
+                        rebuild: rebuild_service_account,
+                        leaves: 2,
+                    }
+                }
+                Kind::PermissionGrantLintConfig => {
+                    let mut bundle = DesiredState::default();
+                    put_lint_config(
+                        &mut bundle,
+                        "mutation-target",
+                        &["team-alpha"],
+                        hort_config::lint_config::RuleOverridesSpec::default(),
+                    );
+                    Seed {
+                        spec: spec_of(
+                            bundle
+                                .lint_config
+                                .as_ref()
+                                .expect("put_lint_config sets the singleton slot"),
+                        ),
+                        bundle,
+                        rebuild: rebuild_lint_config,
+                        leaves: 1,
+                    }
+                }
+            }
+        }
+
+        /// Every `Kind` variant, once. The wildcard-free `match` above is
+        /// the compile-time guarantee that this list is complete; the
+        /// array is what lets the loop iterate it.
+        const ALL_KINDS: &[Kind] = &[
+            Kind::ArtifactRepository,
+            Kind::ClaimMapping,
+            Kind::PermissionGrant,
+            Kind::CurationRule,
+            Kind::ScanPolicy,
+            Kind::Exclusion,
+            Kind::UpstreamMapping,
+            Kind::OidcIssuer,
+            Kind::ServiceAccount,
+            Kind::RetentionPolicy,
+            Kind::PermissionGrantLintConfig,
+        ];
+
+        /// Every one-string-leaf mutation of `value`, as
+        /// `(field path, the whole mutated value)`. The walk is what
+        /// makes the field inventory derived: it follows the serialised
+        /// spec, so it cannot miss a field the type carries.
+        fn mutants(
+            value: &serde_json::Value,
+            label: &str,
+            replacement: &str,
+            out: &mut Vec<(String, serde_json::Value)>,
+        ) {
+            match value {
+                serde_json::Value::String(_) => out.push((
+                    label.to_owned(),
+                    serde_json::Value::String(replacement.to_owned()),
+                )),
+                serde_json::Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        let mut inner = Vec::new();
+                        mutants(item, &format!("{label}[{index}]"), replacement, &mut inner);
+                        for (path, mutated) in inner {
+                            let mut copy = items.clone();
+                            copy[index] = mutated;
+                            out.push((path, serde_json::Value::Array(copy)));
+                        }
+                    }
+                }
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        let child_label = if label.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{label}.{key}")
+                        };
+                        let mut inner = Vec::new();
+                        mutants(child, &child_label, replacement, &mut inner);
+                        for (path, mutated) in inner {
+                            let mut copy = map.clone();
+                            copy.insert(key.clone(), mutated);
+                            out.push((path, serde_json::Value::Object(copy)));
+                        }
+                    }
+                }
+                // A bool has no nonsense value, an integer's out-of-range
+                // arm needs a bound this test does not know, and `null`
+                // is the absent-field shape every spec already accepts.
+                _ => {}
+            }
+        }
+
+        let mut checked = 0usize;
+        let mut unrepresentable = 0usize;
+        let mut refused_pre_write = 0usize;
+
+        for &kind in ALL_KINDS {
+            let seed = seed(kind);
+
+            // Positive control. Without it every mutant below could be
+            // refused for a reason the mutation did not introduce, and
+            // the whole corpus would pass while proving nothing.
+            let control = build_harness_with_lint_config(crate::lint::LintConfig::default());
+            control
+                .uc
+                .apply(seed.bundle.clone(), env_oidc())
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "the seed bundle for {kind:?} must apply cleanly — every \
+                         mutant below is read against it — got {err:?}"
+                    )
+                });
+
+            let mut leaf_paths: Vec<String> = Vec::new();
+            {
+                let mut probe = Vec::new();
+                mutants(&seed.spec, "", NONSENSE, &mut probe);
+                leaf_paths.extend(probe.into_iter().map(|(path, _)| path));
+            }
+            assert_eq!(
+                leaf_paths.len(),
+                seed.leaves,
+                "{kind:?} carries {} string spec leaves, not {}: {leaf_paths:?}. A \
+                 field was added to or removed from the spec. Update the count — \
+                 and while you are here, answer the question this test exists to \
+                 ask: can the apply refuse that field from a write-capable stage \
+                 without the pre-write pass refusing it first?",
+                leaf_paths.len(),
+                seed.leaves
+            );
+
+            for replacement in [NONSENSE, ""] {
+                let mut generated = Vec::new();
+                mutants(&seed.spec, "", replacement, &mut generated);
+                for (path, spec) in generated {
+                    let Some(desired) = (seed.rebuild)(&seed.bundle, spec) else {
+                        // Not a representable spec: the YAML parse layer
+                        // refuses it before a `DesiredState` exists, so
+                        // the apply never sees it.
+                        unrepresentable += 1;
+                        continue;
+                    };
+                    checked += 1;
+
+                    let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
+                    let pre_write = h.uc.preflight_validate(&desired, &env_oidc()).await;
+                    if pre_write.is_err() {
+                        refused_pre_write += 1;
+                    }
+                    let applied = h.uc.apply(desired, env_oidc()).await;
+
+                    if pre_write.is_ok() {
+                        assert!(
+                            applied.is_ok(),
+                            "{kind:?} with `{path}` = {replacement:?}: the pre-write \
+                             pass ACCEPTED this bundle and the apply then REFUSED it \
+                             ({:?}). That refusal is reachable only from a \
+                             write-capable stage: the apply writes between its stages \
+                             and ships no rollback, so this bundle leaves a partial \
+                             apply behind — and `gitops_boot` crashloops on it \
+                             instead of parking not-ready. Mirror the arm in the \
+                             pre-write pass (a per-spec validation rule, or a row in \
+                             `PRE_WRITE_REJECT_ROWS`), then add the case to \
+                             `every_rejecting_apply_stage_is_rejected_pre_write`",
+                            applied.err()
+                        );
+                    } else {
+                        assert!(
+                            matches!(pre_write, Err(AppError::Domain(DomainError::Validation(_)))),
+                            "{kind:?} with `{path}` = {replacement:?}: the pre-write \
+                             refusal must be park-eligible \
+                             (`GitopsBootError::PreflightValidate` maps \
+                             `DomainError::Validation`), got {pre_write:?}"
+                        );
+                        assert!(
+                            applied.is_err(),
+                            "{kind:?} with `{path}` = {replacement:?}: the pre-write \
+                             pass refused this bundle but `apply` accepted it — the \
+                             write path must run the same pass"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Counter-assertions. The loop above is vacuous in two different
+        // ways, and both have to be closed: a corpus that generated no
+        // mutants would pass, and a corpus whose every mutant is waved
+        // through by both gates proves nothing about either.
+        assert_eq!(
+            (checked, unrepresentable),
+            (76, 8),
+            "the mutation corpus changed size (checked {checked}, \
+             unrepresentable {unrepresentable}; 42 string leaves x 2 \
+             replacements, less the typed leaves that stop deserialising). \
+             Expected when a spec field is added or removed — re-read the \
+             per-kind leaf counts above with it"
+        );
+        assert!(
+            refused_pre_write >= 40,
+            "only {refused_pre_write} of {checked} mutants were refused before \
+             the first write. The corpus is supposed to be mostly nonsense: a \
+             collapse here means the mutations stopped reaching the validators \
+             (a rebuild that silently targets the wrong envelope, a seed whose \
+             spec serialises to no string leaves), and the implication asserted \
+             above would then hold trivially"
+        );
     }
 
     /// The acceptance shape for the grant lint: a bundle carrying a grant

@@ -56,10 +56,24 @@
 //! Production code only. Test code legitimately reads with arbitrary budgets
 //! — a fixture asserting "the stream did not change" picks a number large
 //! enough for its own fixture, and a guard that argued with it would be
-//! arguing about test data. So the scan drops `*_tests.rs` files, the
-//! `test_support.rs` harnesses, and everything at or after a file's first
-//! column-0 `#[cfg(test)]` attribute (the convention in this workspace is that
-//! inline test modules come last in the file).
+//! arguing about test data. So the scan drops `*_tests.rs` files and the
+//! `test_support.rs` harnesses by filename, and reads the rest through
+//! [`rust_scan::production_region`] — comments and literals blanked, then
+//! every `#[cfg(test)]` item blanked **per item**.
+//!
+//! Per item, not "from the first `#[cfg(test)]` to the end of the file",
+//! and the difference is the whole reach of this guard. The truncating form
+//! shipped here from the day the guard landed, on the premise that an inline
+//! test module comes last in the file. That premise does not hold: a
+//! `#[cfg(test)] use std::sync::atomic::…` seam, a `#[cfg(test)]` struct
+//! field or a `#[cfg(test)]` interruption hook sits in the *middle* of a
+//! production file, and from the first one on the truncating rule read the
+//! rest of the file as test code. Measured over `crates/*/src` when this was
+//! corrected: **14 files, 3 635 lines of production code** the guard had
+//! never looked at — `purge_gc.rs` alone contributing 487 below its atomics
+//! `use`. No `.read_stream(` call was hiding in any of them, so the reach was
+//! the defect and not a find; a violation landing in one of those 3 635 lines
+//! would have been invisible while this test reported green.
 //!
 //! The blind spot every source scan has applies: a call assembled through a
 //! macro, or a `max_count` that is a parameter of some *other* function
@@ -72,6 +86,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+mod rust_scan;
+
+use rust_scan::{call_args, line_of, production_region, split_args, walk_rust, workspace_root};
 
 /// The one file allowed to spell a bounded artifact-stream read, and the one
 /// function in it that does: `capped_artifact_read`. Everything that asks a
@@ -92,14 +110,6 @@ const UNBOUNDED_BUDGET: &str = "u64::MAX";
 /// The `EventStore::read_stream` parameter name a decorator forwards.
 const FORWARDED_BUDGET: &str = "max_count";
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent() // crates/
-        .and_then(Path::parent) // workspace root
-        .expect("CARGO_MANIFEST_DIR resolves under crates/hort-app")
-        .to_path_buf()
-}
-
 /// Every `crates/<crate>/src/**/*.rs`, sorted so failures are stable.
 fn production_sources(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -109,110 +119,11 @@ fn production_sources(root: &Path) -> Vec<PathBuf> {
     for crate_dir in crates.flatten() {
         let src = crate_dir.path().join("src");
         if src.is_dir() {
-            walk_rs(&src, &mut out);
+            walk_rust(&src, &mut |path| out.push(path.to_path_buf()));
         }
     }
     out.sort();
     out
-}
-
-fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_rs(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-/// Drop everything a bounded-read rule must not police: the inline test
-/// module (and anything after it), plus whole-line comments so prose about
-/// `.read_stream(` stays readable.
-///
-/// Returns the retained text with each dropped line replaced by an empty one,
-/// so byte offsets still map back to the original line numbers.
-fn production_region(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut in_tests = false;
-    for line in source.lines() {
-        // A column-0 `#[cfg(test)]` attribute starts the inline test module;
-        // the workspace convention is that such modules come last, so
-        // everything from the first one on is test code.
-        //
-        // `#[cfg(any(test, feature = "test-support"))]` is deliberately NOT a
-        // marker: in this workspace it guards individual *items* — a
-        // `pub mod test_support;` declaration, a `wrap_for_test` constructor —
-        // in the middle of a production file, and treating it as one hid every
-        // production read in `use_cases/mod.rs` behind the `test_support`
-        // module declaration near the top. Whole test-support module files are
-        // dropped by filename instead.
-        if line.starts_with("#[cfg(test)]") {
-            in_tests = true;
-        }
-        let trimmed = line.trim_start();
-        let is_comment = trimmed.starts_with("//");
-        if in_tests || is_comment {
-            out.push('\n');
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Split a call's argument text on top-level commas (ignoring commas nested
-/// in parens, brackets or angle brackets).
-fn split_args(args: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut current = String::new();
-    for ch in args.chars() {
-        match ch {
-            '(' | '[' | '<' => {
-                depth += 1;
-                current.push(ch);
-            }
-            ')' | ']' | '>' => {
-                depth -= 1;
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                out.push(current.trim().to_owned());
-                current = String::new();
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.trim().is_empty() {
-        out.push(current.trim().to_owned());
-    }
-    out
-}
-
-/// The argument text of the call whose opening paren is at `open`, or `None`
-/// when the parens do not balance inside the retained region.
-fn call_args(text: &str, open: usize) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut depth = 0i32;
-    for (i, &b) in bytes.iter().enumerate().skip(open) {
-        match b {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(text[open + 1..i].to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// The name of the nearest `fn <name>(` declaration before `offset`. Used to
@@ -224,10 +135,6 @@ fn enclosing_fn_name(text: &str, offset: usize) -> Option<String> {
     let rest = &before[at + 3..];
     let end = rest.find('(')?;
     Some(rest[..end].trim().to_owned())
-}
-
-fn line_of(text: &str, offset: usize) -> usize {
-    text[..offset].bytes().filter(|&b| b == b'\n').count() + 1
 }
 
 /// Collapse whitespace so `STREAM_EVENT_CAP\n    + 1` compares equal to
@@ -353,5 +260,56 @@ fn bounded_stream_reads_live_only_in_the_audited_reader() {
          If a reader was legitimately added or removed there, update this \
          count deliberately — a drifting count means the scan stopped \
          seeing it"
+    );
+}
+
+/// The reach of the scan above, pinned: a violation below a mid-file
+/// `#[cfg(test)]` item is production code and must be seen.
+///
+/// This is the defect that shipped with the guard. The region rule used to
+/// treat the first column-0 `#[cfg(test)]` as the start of the inline test
+/// module and blank everything after it, so a `#[cfg(test)] use …` seam —
+/// the shape `hort-adapters-postgres/src/purge_gc.rs` carries at line 202,
+/// with 487 lines of production code below it — hid every read in the rest
+/// of the file. Seeding a `.read_stream(.., 200)` there left the guard
+/// green. The scan over the real tree cannot catch a regression to that
+/// rule on its own: with no violation in the tree, the truncating and the
+/// per-item rule agree on the verdict and disagree only on how much they
+/// read.
+///
+/// The second half is the opposite error, and it matters just as much: a
+/// read inside a `#[cfg(test)]` module is test data (a fixture picks a
+/// budget large enough for its own fixture), so a region rule that stopped
+/// blanking test code would turn this guard into an argument about
+/// fixtures.
+#[test]
+fn the_scan_reads_production_code_below_a_cfg_test_item() {
+    let source = "\
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+async fn production_reader(&self) {
+    self.event_store.read_stream(&id, ReadFrom::Start, 200).await;
+}
+
+#[cfg(test)]
+mod tests {
+    async fn fixture(&self) {
+        self.event_store.read_stream(&id, ReadFrom::Start, 4096).await;
+    }
+}
+";
+    let region = production_region(source);
+    assert!(
+        region.contains("read_stream(&id, ReadFrom::Start, 200)"),
+        "the production read below the `#[cfg(test)] use` seam must survive \
+         the region pass — blanking it is the blind spot this guard shipped \
+         with, and a violation there reads as green:\n{region}"
+    );
+    assert!(
+        !region.contains("4096"),
+        "the read inside the `#[cfg(test)] mod` must be blanked — a fixture \
+         chooses its own budget and this guard has no business policing \
+         it:\n{region}"
     );
 }

@@ -2368,8 +2368,20 @@ fn error_chain_contains(err: &dyn std::error::Error, needle: &str) -> bool {
 
 fn map_reqwest_status(status: StatusCode) -> UpstreamErrorKind {
     match status.as_u16() {
-        404 => UpstreamErrorKind::NotFound,
+        // `410 Gone` is a miss, not a broken upstream. RFC 9110 §15.5.11:
+        // the target resource "is no longer available at the origin server
+        // and that this condition is likely to be permanent". For a registry
+        // that is an inventory statement — the upstream is saying it does not
+        // have this — so it takes the same answer as a `404`. Folded into the
+        // generic `4xx` bucket it rendered as 502/503 at the format layers,
+        // i.e. "the upstream is broken", which is both wrong and retryable.
+        // `UpstreamExistence::from_http_status` has read `410` as `Absent`
+        // beside `404` since the probe leg was built; this is the content leg
+        // catching up to it.
+        404 | 410 => UpstreamErrorKind::NotFound,
         401 | 403 => UpstreamErrorKind::Unauthorized,
+        // Before the generic `4xx` arm on purpose: a `429` is the upstream
+        // asking for a retry, which is the opposite verdict.
         429 => UpstreamErrorKind::RateLimited,
         s if (400..500).contains(&s) => UpstreamErrorKind::Upstream4xx,
         s if (500..600).contains(&s) => UpstreamErrorKind::Upstream5xx,
@@ -7661,6 +7673,96 @@ mod tests {
             panic!("404 must error")
         };
         assert_eq!(classify_error(&err), Some(UpstreamErrorKind::NotFound));
+    }
+
+    /// **A `410 Gone` on the content leg is a miss, not a broken upstream.**
+    /// RFC 9110 §15.5.11: the resource "is no longer available at the origin
+    /// server and that this condition is likely to be permanent" — for a
+    /// registry that is an inventory statement, so it earns the same
+    /// `not_found` classification as a `404`. Folded into the generic `4xx`
+    /// bucket it rendered as a retryable 502/503 at the format layers.
+    #[tokio::test]
+    async fn fetch_artifact_410_maps_to_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gone.tar.gz"))
+            .respond_with(ResponseTemplate::new(410))
+            .mount(&server)
+            .await;
+        let proxy = proxy_for(&server);
+        let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+        let Err(err) = proxy.fetch_artifact(m, "/gone.tar.gz".into()).await else {
+            panic!("410 must error")
+        };
+        assert_eq!(classify_error(&err), Some(UpstreamErrorKind::NotFound));
+    }
+
+    /// The classifier table itself, so the arms that must NOT move are
+    /// pinned beside the one that did.
+    ///
+    /// `429` is the counter-case that matters: it is matched *before* the
+    /// generic `(400..500)` arm, and it is the one `4xx` whose verdict is the
+    /// opposite of a miss — the upstream asking for a retry. Reordering the
+    /// arms so `429` fell into the generic bucket, or widening the
+    /// `not_found` arm to a range, would turn a rate-limit into a permanent
+    /// answer; that is what these rows are here to catch.
+    #[test]
+    fn the_status_classifier_reads_404_and_410_as_not_found_and_nothing_else() {
+        for (status, expected) in [
+            (404, UpstreamErrorKind::NotFound),
+            // RFC 9110 §15.5.11 — permanently gone is an inventory
+            // statement, so it is a miss.
+            (410, UpstreamErrorKind::NotFound),
+            (401, UpstreamErrorKind::Unauthorized),
+            (403, UpstreamErrorKind::Unauthorized),
+            (429, UpstreamErrorKind::RateLimited),
+            // The `4xx` neighbours of `410` on both sides stay generic: the
+            // arm is the two codes that state an inventory fact, not a range.
+            (400, UpstreamErrorKind::Upstream4xx),
+            (409, UpstreamErrorKind::Upstream4xx),
+            (411, UpstreamErrorKind::Upstream4xx),
+            (451, UpstreamErrorKind::Upstream4xx),
+            (500, UpstreamErrorKind::Upstream5xx),
+            (503, UpstreamErrorKind::Upstream5xx),
+        ] {
+            assert_eq!(
+                map_reqwest_status(StatusCode::from_u16(status).unwrap()),
+                expected,
+                "status {status}"
+            );
+        }
+    }
+
+    /// The probe leg already read `410` as `Absent`
+    /// ([`UpstreamExistence::from_http_status`]) while the content leg read
+    /// it as a generic `4xx`. The two legs answer the same question about
+    /// the same upstream, so a reader has to be able to see that they now
+    /// agree — and that they still disagree about a `405`, which is an
+    /// upstream refusing to answer rather than making a statement.
+    #[test]
+    fn the_content_leg_and_the_probe_leg_agree_on_404_and_410() {
+        for status in [404u16, 410] {
+            assert_eq!(
+                map_reqwest_status(StatusCode::from_u16(status).unwrap()),
+                UpstreamErrorKind::NotFound,
+                "content leg, status {status}"
+            );
+            assert_eq!(
+                UpstreamExistence::from_http_status(status),
+                UpstreamExistence::Absent,
+                "probe leg, status {status}"
+            );
+        }
+        assert_eq!(
+            UpstreamExistence::from_http_status(405),
+            UpstreamExistence::Unknown,
+            "a HEAD refusal is not a statement about the artifact"
+        );
+        assert_eq!(
+            map_reqwest_status(StatusCode::from_u16(405).unwrap()),
+            UpstreamErrorKind::Upstream4xx,
+            "and on the content leg it is not a miss either"
+        );
     }
 
     /// Absolute URL pointing at loopback → SSRF refusal before the

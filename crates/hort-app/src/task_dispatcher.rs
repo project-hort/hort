@@ -6,8 +6,11 @@
 //! [`TaskHandler`] implementation, and persists the returned [`TaskOutcome`]
 //! to the jobs table via `mark_completed` / `reschedule` / `mark_failed`.
 //!
-//! Per-kind [`tokio::sync::Semaphore`]s enforce concurrency limits set at
-//! registration time. Graceful shutdown is driven by a
+//! Per-kind [`ClassFairPermits`] enforce the concurrency limits set at
+//! registration time, and allocate them so that no class of the same
+//! kind is shut out — the second of the two points ADR 0066 D4 requires
+//! non-displacement at, and the one the claim cannot see (a row waiting
+//! for a permit is already `running`). Graceful shutdown is driven by a
 //! [`tokio_util::sync::CancellationToken`].
 //!
 //! # Execution-time authority
@@ -21,21 +24,43 @@
 //! [`crate::destructive_task_reauthorization`] for the decision and why
 //! a refusal is terminal while an unreadable authority store is not.
 //!
+//! # Audit event emitted
+//!
+//! A failure the dispatcher wrote to the row also lands on the audit
+//! stream as `TaskFailed` — `final_attempt: false` from the
+//! `reschedule` path, `true` from `mark_failed`. It is the counterpart
+//! of the enqueue path's `TaskInvoked` and shares its stream routing, so
+//! a destructive kind's invocation and its failure are one trail on the
+//! never-deleted stream. [`TaskDispatcher::append_failure_audit`]
+//! carries the conditions: the write must have landed, and the kind must
+//! be one an operator can invoke.
+//!
 //! # Metrics emitted
 //!
 //! See metrics-catalog.md (`hort_admin_tasks_*`):
 //!
-//! - `hort_admin_tasks_enqueued_total{kind}` — currently unused by the
-//!   dispatcher itself; enqueued events are emitted by the HTTP handler.
-//!   Documented here for completeness.
+//! - `hort_admin_tasks_enqueued_total{kind, result}` — NOT emitted by the
+//!   dispatcher; the HTTP invoke handler
+//!   (`hort-http-admin-tasks::handlers::invoke`) owns it, and `result ∈
+//!   {ok, rbac_denied, validation_error}` describes the *acceptance* of an
+//!   operator request, not the fate of a claimed row. Listed here only so
+//!   the `hort_admin_tasks_*` family reads complete from one place; the
+//!   label set is the handler's, so change it there.
 //! - `hort_admin_tasks_completed_total{kind, result}` — one increment per
 //!   `record_outcome_for_row` call. `result ∈ {completed, failed_retry,
 //!   failed_terminal}`. A retryable failure on a row that has spent its
 //!   attempt budget ([`TaskDispatcher::attempt_cap`]) counts as
 //!   `failed_terminal`, because
 //!   that is what the dispatcher did to the row.
-//! - `hort_admin_tasks_duration_seconds{kind}` — elapsed time from claim to
-//!   `record_outcome_for_row`, wrapping `TaskHandler::run`.
+//! - `hort_admin_tasks_duration_seconds{kind}` — elapsed time inside
+//!   `TaskHandler::run`, and nothing else. In particular it does NOT
+//!   include the wait for a concurrency permit, which a claimed row may
+//!   spend arbitrarily long in. That wait is not *timed* anywhere; what
+//!   is observable is how many rows of a class are in it and how long
+//!   the oldest of them has waited — see
+//!   [`TaskDispatcher::audit_class_service`] and, for the
+//!   operator-facing gauges,
+//!   `hort_server::composition::emit_queue_class_service_signal`.
 //! - `hort_admin_tasks_in_flight{kind}` — gauge; incremented when a task
 //!   `run` starts, decremented when it finishes.
 //! - `hort_admin_tasks_pending_eligible{kind}` — gauge; claim-eligible
@@ -50,6 +75,14 @@
 //!   claimed constantly (a sustained high-priority stream of the same kind
 //!   can starve one old low-priority row indefinitely while claims of
 //!   fresher rows keep `not_claimed`/`unregistered` silent).
+//! - `hort_admin_tasks_class_starved_total{class, reason}` — counter;
+//!   one increment per audit at which a **class** has work waiting that
+//!   nothing of that class has been served ahead of (ADR 0066 D5).
+//!   `reason ∈ {not_claimed, awaiting_capacity}` — which of the two
+//!   allocation points the class is losing at. Per class rather than per
+//!   kind, and therefore the answer to a question the two series above
+//!   structurally cannot answer; see
+//!   [`TaskDispatcher::audit_class_service`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,16 +90,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use hort_domain::events::{Actor, InternalActor};
+use hort_domain::events::{
+    Actor, DomainEvent, InternalActor, TaskFailed, ADMIN_INVOKABLE_TASK_KINDS,
+};
+use hort_domain::policy::{evaluate_class_service, ClassService};
+use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
-    JobRow, JobsRepository, PendingKindBacklog, RequeueOutcome, REQUEUE_ON_LEASE_EXPIRY_KINDS,
+    ClaimReservation, JobRow, JobsRepository, KindQueueSample, PendingKindBacklog, PriorityBand,
+    QueueServiceSample, RequeueOutcome, REQUEUE_ON_LEASE_EXPIRY_KINDS,
 };
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
+use hort_domain::types::task_tier::{class_bands, TaskTier};
 
+use crate::class_fair_permits::ClassFairPermits;
 use crate::destructive_task_reauthorization::{
     DestructiveTaskReauthorizer, ReauthorizationVerdict,
 };
@@ -74,6 +113,7 @@ use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::result_write_fence::surface_attempted_result_write;
 use crate::retry_backoff::compute_backoff;
+use crate::use_cases::task_use_case::TaskUseCase;
 
 // ---------------------------------------------------------------------------
 // Metric name constants
@@ -84,6 +124,18 @@ const METRIC_DURATION: &str = "hort_admin_tasks_duration_seconds";
 const METRIC_IN_FLIGHT: &str = "hort_admin_tasks_in_flight";
 const METRIC_PENDING_ELIGIBLE: &str = "hort_admin_tasks_pending_eligible";
 const METRIC_STARVED: &str = "hort_admin_tasks_starved_total";
+const METRIC_CLASS_STARVED: &str = "hort_admin_tasks_class_starved_total";
+/// The same finding as [`METRIC_CLASS_STARVED`] at the granularity the
+/// guarantee is enforced at — one series per `(class, kind, reason)`.
+///
+/// A separate name rather than a `kind` label on the counter above, so
+/// the class-wide question stays exactly as askable as it was: an
+/// operator alarming on the coarse counter keeps the series identity
+/// they have, and the coarse counter also stays the backstop for a kind
+/// outside `EVENT_TASK_KINDS` (which the `jobs_kind_check` CHECK makes
+/// unreachable, but which a fold still counts and a per-kind series
+/// would have no label for).
+const METRIC_CLASS_KIND_STARVED: &str = "hort_admin_tasks_class_kind_starved_total";
 const METRIC_LEASE_REQUEUED: &str = "hort_admin_tasks_lease_requeued_total";
 const METRIC_LEASE_RENEW_FAILED: &str = "hort_admin_tasks_lease_renew_failed_total";
 
@@ -225,14 +277,22 @@ const _: () = assert!(
 pub struct TaskDispatcher {
     /// Registered handlers, keyed by `TaskHandler::kind()`.
     handlers: HashMap<&'static str, Arc<dyn TaskHandler>>,
-    /// Per-kind semaphore enforcing `max_concurrency`.
-    semaphores: HashMap<&'static str, Arc<Semaphore>>,
+    /// Per-kind run permits enforcing `max_concurrency`, allocated so
+    /// that no class of the same kind is shut out — see
+    /// [`ClassFairPermits`] and [`Self::reserved_slots_per_class`].
+    permits: HashMap<&'static str, Arc<ClassFairPermits>>,
     job_repo: Arc<dyn JobsRepository>,
-    /// `EventStore` is held for future use (e.g. emitting `TaskInvoked`
-    /// audit events). Currently unused by the dispatcher
-    /// itself — scan-kind outcome events are emitted inside
-    /// `ScanTaskHandler::run` via `ScanOrchestrationUseCase::record_outcome`.
-    #[allow(dead_code)]
+    /// Where the dispatcher appends the `TaskFailed` audit record for a
+    /// failure it closed a row out on — see
+    /// [`Self::append_failure_audit`] for the routing, the
+    /// kinds it skips and why the append can never change the row's
+    /// state.
+    ///
+    /// Nothing else in the dispatcher writes events: a scan's own
+    /// outcome vocabulary is emitted inside `ScanTaskHandler::run` via
+    /// `ScanOrchestrationUseCase::record_outcome`, and `TaskInvoked`
+    /// belongs to the enqueue path (`TaskUseCase::enqueue`), not to
+    /// execution.
     event_store: Arc<EventStorePublisher>,
     /// Re-checks a destructive invocation's requester against the live
     /// authority state before its handler is invoked.
@@ -307,6 +367,47 @@ pub struct TaskDispatcher {
     /// break produced the same permanent `failed` row as a genuinely
     /// broken dependency.
     attempt_cap: u32,
+    /// Slots held for each non-empty waited-on class at **both** points
+    /// where this dispatcher allocates capacity — ADR 0066 D4.
+    ///
+    /// One number for two allocations on purpose: the claim decides
+    /// *which work is taken up* and the permit decides *which work gets
+    /// the capacity to run*, and D4 is explicit that a design closing
+    /// one leaves the other's victim. Two knobs would let an operator
+    /// close one and leave the other, which is the state the decision
+    /// calls incomplete rather than partial.
+    ///
+    /// **Configured, not a constant**, because ADR 0066 declines to fix
+    /// the shares: with a single worker replica the share *is* the whole
+    /// control surface, so it is a per-deployment concern. The default
+    /// is the domain's — at least one slot per non-empty waited-on class
+    /// (`HORT_SCANNER_RESERVED_SLOTS_PER_CLASS`, default `1`), which
+    /// needs no measurement to justify: interactive work is bounded by
+    /// what clients do and bulk work is unbounded by construction, so a
+    /// share that can go to zero for a class someone is waiting on is
+    /// the defect itself.
+    ///
+    /// `0` turns the reservation off at both points, restoring the
+    /// pre-decision behaviour. It is reachable only by an operator
+    /// setting it deliberately.
+    reserved_slots_per_class: u16,
+    /// How long work of a class may wait with nothing of that class
+    /// served before [`Self::audit_class_service`] calls the class
+    /// unserved — ADR 0066 D5's threshold.
+    ///
+    /// **Configured, not a constant, and the same knob the server
+    /// reads.** `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` reaches this
+    /// field by way of `WorkerConfig::class_service_threshold` and
+    /// reaches `hort-server`'s gauge by way of its own composition
+    /// root; the default is
+    /// [`DEFAULT_CLASS_SERVICE_THRESHOLD_SECS`](hort_domain::policy::DEFAULT_CLASS_SERVICE_THRESHOLD_SECS),
+    /// defined once in the domain so the two processes cannot disagree
+    /// about it the way the attempt caps did while one of them was a
+    /// `const` (see [`Self::attempt_cap`]). An operator who sets the
+    /// variable on only one of the two deployments gets a worker log
+    /// and an operator gauge that answer at different thresholds, which
+    /// is why the metrics catalog names both readers.
+    class_service_threshold: Duration,
 }
 
 impl TaskDispatcher {
@@ -331,10 +432,12 @@ impl TaskDispatcher {
         poll_interval_secs: u64,
         batch_size: u16,
         attempt_cap: u32,
+        reserved_slots_per_class: u16,
+        class_service_threshold: Duration,
     ) -> Self {
         Self {
             handlers: HashMap::new(),
-            semaphores: HashMap::new(),
+            permits: HashMap::new(),
             job_repo,
             event_store,
             reauthorizer,
@@ -343,6 +446,8 @@ impl TaskDispatcher {
             poll_interval_secs,
             batch_size,
             attempt_cap,
+            reserved_slots_per_class,
+            class_service_threshold,
         }
     }
 
@@ -355,10 +460,42 @@ impl TaskDispatcher {
         self.attempt_cap
     }
 
+    /// The per-class reserved share this dispatcher allocates both its
+    /// claim batch and its run permits with.
+    ///
+    /// Exposed for the same reason [`Self::attempt_cap`] is: the
+    /// composition root is the only place the operator's number is
+    /// read, so a composition test is the only place the knob can be
+    /// seen to reach the dispatcher at all. ADR 0066 D4 makes that
+    /// worth asserting — one of the two allocation points is
+    /// unobservable from outside the process, so "the share was
+    /// configured but never threaded" would look exactly like "the
+    /// share is the default".
+    pub fn reserved_slots_per_class(&self) -> u16 {
+        self.reserved_slots_per_class
+    }
+
+    /// The per-class service threshold this dispatcher audits against.
+    ///
+    /// Exposed for the reason [`Self::reserved_slots_per_class`] is: the
+    /// composition root is the only place the operator's number is
+    /// read, and the verdict it feeds is emitted by a *different*
+    /// process, so a composition test is the only place "the knob
+    /// reached the audit" can be seen at all.
+    pub fn class_service_threshold(&self) -> Duration {
+        self.class_service_threshold
+    }
+
     /// Register a handler for its `kind()` with a per-kind concurrency cap.
     ///
     /// `max_concurrency` is the maximum number of concurrent invocations of
     /// this handler. A value of `1` serialises all executions of this kind.
+    ///
+    /// The cap is unchanged by [`Self::reserved_slots_per_class`]: the
+    /// reservation decides the *order* this kind's permits are handed
+    /// out in, never how many there are (ADR 0066 — "nothing here
+    /// interrupts running work or takes capacity away from it"). A
+    /// `scan` concurrency of one stays one.
     ///
     /// Panics if the same kind is registered twice (programming error).
     #[tracing::instrument(skip(self, handler))]
@@ -368,10 +505,15 @@ impl TaskDispatcher {
             !self.handlers.contains_key(kind),
             "TaskDispatcher: kind '{kind}' registered twice"
         );
-        let concurrency = max_concurrency.max(1);
         self.handlers.insert(kind, handler);
-        self.semaphores
-            .insert(kind, Arc::new(Semaphore::new(concurrency)));
+        self.permits.insert(
+            kind,
+            Arc::new(ClassFairPermits::new_with_threshold(
+                max_concurrency,
+                usize::from(self.reserved_slots_per_class),
+                self.class_service_threshold,
+            )),
+        );
     }
 
     /// Return the set of currently-registered handler kinds.
@@ -397,7 +539,7 @@ impl TaskDispatcher {
     /// 1. Waits for `poll_interval_secs` (or cancellation — whichever first).
     /// 2. Claims up to `batch_size` pending rows across all registered kinds.
     /// 3. Dispatches each row to its handler in a `tokio::spawn` task,
-    ///    gated by the kind's semaphore and — for the destructive
+    ///    gated by the kind's permit allocation and — for the destructive
     ///    invocations only — by a live re-check of the requester's
     ///    authority (see the module docs).
     /// 4. Each spawned task records the outcome via `record_outcome_for_row`.
@@ -412,6 +554,10 @@ impl TaskDispatcher {
     pub async fn run(self, cancel: CancellationToken) -> AppResult<()> {
         let kinds: Vec<&str> = self.handlers.keys().copied().collect();
         let registered: HashSet<&str> = kinds.iter().copied().collect();
+        // The bands the claim holds slots in — built once per run
+        // rather than per poll, because they are a property of the
+        // class vocabulary and not of the batch.
+        let reservation = ClaimReservation::waited_on(self.reserved_slots_per_class);
         // Wrap self in Arc so spawned tasks can share ownership without
         // cloning the entire struct.
         let dispatcher = Arc::new(self);
@@ -451,6 +597,7 @@ impl TaskDispatcher {
                     dispatcher.batch_size,
                     &dispatcher.worker_id,
                     dispatcher.lock_duration,
+                    &reservation,
                 )
                 .await
             {
@@ -478,6 +625,13 @@ impl TaskDispatcher {
                 dispatcher
                     .audit_starvation(&registered, &last_claimed, started_at)
                     .await;
+                // The per-class half, on the same clock and as a
+                // separate pass. It shares nothing with the per-kind
+                // audit above — not even `last_claimed`, which is
+                // per-kind and process-local — because the two answer
+                // different questions from different facts; see
+                // [`Self::audit_class_service`].
+                dispatcher.audit_class_service().await;
             }
 
             if last_lease_sweep.is_none_or(|t| t.elapsed() >= LEASE_SWEEP_INTERVAL) {
@@ -506,23 +660,61 @@ impl TaskDispatcher {
                         .await;
                     continue;
                 };
-                let Some(semaphore) = dispatcher.semaphores.get(kind_str.as_str()).cloned() else {
-                    // Invariant: semaphore always co-exists with handler.
-                    tracing::error!(kind = %kind_str, "TaskDispatcher: no semaphore for kind");
+                let Some(permits) = dispatcher.permits.get(kind_str.as_str()) else {
+                    // Invariant: the permit pool always co-exists with
+                    // the handler.
+                    tracing::error!(kind = %kind_str, "TaskDispatcher: no permits for kind");
                     dispatcher
-                        .return_to_pending(&job, "no semaphore registered for kind")
+                        .return_to_pending(&job, "no permit pool registered for kind")
                         .await;
                     continue;
                 };
+                // Join the kind's permit queue HERE, synchronously, and
+                // not inside the spawned task. Two reasons, both
+                // load-bearing. The queue position has to be decided by
+                // the claim's own order rather than by whenever the
+                // runtime first polls a spawned task — otherwise the
+                // allocation's "longest waiting" tiebreak is a fact
+                // about the scheduler. And the class has to be read off
+                // the row, which only this loop holds.
+                let pending_permit =
+                    permits.acquire(TaskTier::classify(&job.kind, &job.trigger_source));
+                // Start renewing the claim's lease HERE, at the claim,
+                // and not inside `dispatch_one` — for the same reason
+                // the permit queue is joined here, and one more.
+                // `locked_until` says *a live worker owns this row*, so
+                // it has to be held from the moment this worker owns
+                // one; the permit wait above can be arbitrarily long
+                // (the batch claims `batch_size` rows regardless of how
+                // many permits are free, and the shipped default claims
+                // four against a `scan` concurrency of one), and a lease
+                // left to lapse across it reports a death that did not
+                // happen — see `spawn_lease_renewal` for the meaning
+                // and what it costs.
+                let renewal = dispatcher.spawn_lease_renewal(job.id, kind_str.clone());
                 let dispatcher_clone = dispatcher.clone();
                 tokio::spawn(async move {
-                    // Acquire concurrency permit before calling the handler.
-                    let _permit = semaphore
-                        .acquire()
-                        .await
-                        .expect("semaphore never closed during run");
+                    // Hold the concurrency permit for the whole handler
+                    // call.
+                    let _permit = pending_permit.granted().await;
 
-                    dispatcher_clone.dispatch_one(job, handler).await;
+                    // The wait that began at the claim is over. Nothing
+                    // reads the row as queued-for-capacity from here
+                    // on — see `end_capacity_wait` for what the write
+                    // is for and what a failed one costs.
+                    //
+                    // It is also the last word on whether this worker
+                    // still holds the row: the write is fenced on
+                    // `locked_by` + `status`, so a refusal is the fence
+                    // answering, and a row handed on while this worker
+                    // waited for its permit must not be run here. The
+                    // renewal stops with the guard; nothing else of
+                    // this row's is ours to write.
+                    if !dispatcher_clone.end_capacity_wait(&job).await {
+                        drop(renewal);
+                        return;
+                    }
+                    dispatcher_clone.dispatch_one(job, handler, renewal).await;
                 });
             }
         }
@@ -626,8 +818,290 @@ impl TaskDispatcher {
         }
     }
 
+    /// Per-class service audit — ADR 0066 D5's guarantee, on the axis
+    /// the guarantee is stated on.
+    ///
+    /// # What this sees that [`Self::audit_starvation`] cannot
+    ///
+    /// That audit is per **kind**, and a kind carries several classes —
+    /// `scan` carries six trigger sources across all three. Its
+    /// last-claimed clock is re-armed by a row of *any* class, so a
+    /// kind claimed steadily with one class never claimed reads as
+    /// healthy there, and its remaining axis (`oldest_row_stalled`)
+    /// approximates service by the age of one row, which is the axis
+    /// ADR 0066 removed from the reservation. This pass asks the
+    /// question the decision is written in: per class, is work waiting,
+    /// and has anything of this class been served while it waited?
+    ///
+    /// It also sees the **second** allocation point. A row that has
+    /// been claimed and is queued behind a run permit is already
+    /// `status = 'running'`, so it is outside the claim-eligible
+    /// backlog by construction and no per-kind read of `pending` rows
+    /// can see it. It arrives here as
+    /// [`BandQueueSample::awaiting_capacity`](hort_domain::ports::jobs_repository::BandQueueSample::awaiting_capacity),
+    /// which is the surface the lease-renewal move owed: once renewal
+    /// starts at the claim, `locked_until` says a live worker owns the
+    /// row and no longer says whether a handler is running it (see
+    /// [`Self::spawn_lease_renewal`]).
+    ///
+    /// # Why it holds no state
+    ///
+    /// Every fact it reads is durable — the pending backlog, the
+    /// capacity waits, and the newest completion per class all come off
+    /// `jobs` in one statement. A process-local last-claimed map is
+    /// lost on restart, which is exactly when a stall is being
+    /// investigated, so the verdict rests on nothing this process
+    /// remembers. That is also what lets `hort-server` reach the same
+    /// verdict from the same facts on its own schedule — this log is
+    /// the worker-side trail, and the operator-facing gauge is the
+    /// server's, because the worker exposes no scraped surface by
+    /// default.
+    async fn audit_class_service(&self) {
+        let bands = class_bands();
+        let bounds: Vec<PriorityBand> = bands.iter().map(|(_, band)| *band).collect();
+        let samples = match self.job_repo.queue_sample_by_band(&bounds).await {
+            Ok(samples) => samples,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "TaskDispatcher: per-class service audit query failed; will retry on a \
+                     later tick",
+                );
+                return;
+            }
+        };
+        let now = Utc::now();
+        // `zip` rather than an index: the adapter answers once per band
+        // in the order the bands were passed, and a mock's additive
+        // default answers for none at all — which makes this pass inert
+        // rather than mislabelling a class.
+        for ((tier, _), observation) in bands.iter().zip(&samples) {
+            self.report_class_service(*tier, &observation.class_wide(), now);
+            // The same verdict per `(class, kind)`, which is the
+            // granularity the guarantee is enforced at: the run permits
+            // come from one allocator per registered kind, so the class
+            // -wide answer above can be re-armed by a sibling kind's
+            // completion while this kind's own permit queue is stalled
+            // (ADR 0066 D5). The rows come out of the same statement as
+            // the fold, so the two verdicts describe one instant.
+            for KindQueueSample { kind, sample } in &observation.kinds {
+                self.report_kind_service(*tier, kind, sample, now);
+            }
+        }
+    }
+
+    /// Log and count a class-wide service finding, or return silently
+    /// when the class is being served.
+    ///
+    /// Split out of [`Self::audit_class_service`] so the coarse and the
+    /// fine pass cannot drift on what counts as a finding: both
+    /// destructure the same `Starved` variant out of the same predicate
+    /// and differ only in the labels they carry.
+    fn report_class_service(
+        &self,
+        tier: TaskTier,
+        sample: &QueueServiceSample,
+        now: DateTime<Utc>,
+    ) {
+        let ClassService::Starved {
+            waiting,
+            awaiting_capacity,
+            unserved_for_secs,
+            threshold_secs,
+            reason,
+        } = evaluate_class_service(sample, now, self.class_service_threshold)
+        else {
+            return;
+        };
+        tracing::error!(
+            class = tier.as_str(),
+            waiting,
+            awaiting_capacity,
+            pending_eligible = sample.pending_eligible,
+            unserved_for_secs,
+            threshold_secs,
+            reason = reason.as_str(),
+            "TaskDispatcher: a work class has work waiting that nothing of that class has \
+             been served ahead of — every class is guaranteed service (ADR 0066 D5) and \
+             this one is not getting it. reason 'not_claimed' means the waiting rows are \
+             pending and are not being taken up, so the claim is where the class is \
+             losing; reason 'awaiting_capacity' means rows of the class hold a claim and \
+             have been queued behind a run permit past the threshold, which is the \
+             allocation point no read of the pending backlog can see. Check \
+             HORT_SCANNER_RESERVED_SLOTS_PER_CLASS (is a share reserved at all?) and \
+             whether one class is flooding the kind",
+        );
+        metrics::counter!(
+            METRIC_CLASS_STARVED,
+            "class" => tier.as_str(),
+            "reason" => reason.as_str(),
+        )
+        .increment(1);
+    }
+
+    /// The same finding for one `(class, kind)` pair — the granularity
+    /// the permits are allocated at.
+    ///
+    /// Fires independently of the class-wide pass, and the two are not
+    /// redundant in either direction. A class-wide finding implies at
+    /// least one kind finding, so the pair reads as a diagnosis rather
+    /// than a repetition: the coarse line says the class is losing and
+    /// the fine line says at which kind's allocator. The reverse does
+    /// not hold, and that is the defect this exists for — a kind whose
+    /// permit queue is stalled while a sibling kind of the same class
+    /// keeps completing is reported here and nowhere else.
+    fn report_kind_service(
+        &self,
+        tier: TaskTier,
+        kind: &str,
+        sample: &QueueServiceSample,
+        now: DateTime<Utc>,
+    ) {
+        let ClassService::Starved {
+            waiting,
+            awaiting_capacity,
+            unserved_for_secs,
+            threshold_secs,
+            reason,
+        } = evaluate_class_service(sample, now, self.class_service_threshold)
+        else {
+            return;
+        };
+        tracing::error!(
+            class = tier.as_str(),
+            kind,
+            waiting,
+            awaiting_capacity,
+            pending_eligible = sample.pending_eligible,
+            unserved_for_secs,
+            threshold_secs,
+            reason = reason.as_str(),
+            "TaskDispatcher: one kind of a work class has work waiting that nothing of that \
+             kind and class has been served ahead of. This is the granularity the guarantee \
+             is enforced at — the run permits for each kind are allocated by that kind's own \
+             allocator — so this finding can stand while the class as a whole reads as \
+             served because a different kind of it just completed. reason 'not_claimed' \
+             means the rows are pending and are not being taken up (if nothing in the fleet \
+             registers a handler for this kind, that is the cause and \
+             hort_admin_tasks_starved_total carries reason 'unregistered' beside it); \
+             reason 'awaiting_capacity' means rows of this kind and class hold a claim and \
+             have been queued behind this kind's run permit past the threshold",
+        );
+        metrics::counter!(
+            METRIC_CLASS_KIND_STARVED,
+            "class" => tier.as_str(),
+            "kind" => kind.to_string(),
+            "reason" => reason.as_str(),
+        )
+        .increment(1);
+    }
+
+    /// Record that `job` is no longer waiting for capacity: its run
+    /// permit has been granted and its handler is next. Answers whether
+    /// this worker may still run the row.
+    ///
+    /// The other half of the claim's `capacity_waiting_since` write.
+    /// Between the two, the row is the thing `locked_until` stopped
+    /// being able to express — claimed by a live worker and *not*
+    /// executing — which is what makes a permit wait countable at all
+    /// (ADR 0066 D5; see [`Self::audit_class_service`]).
+    ///
+    /// Called from the dispatch loop's spawned task, immediately after
+    /// the permit is granted and before the handler can run, which is
+    /// the single point every claimed row of every registered kind
+    /// passes through — the same totality argument
+    /// [`Self::spawn_lease_renewal`] makes about its own start point.
+    ///
+    /// # The two failures are not the same statement, and only one of
+    /// them is about ownership
+    ///
+    /// - **`Ok(false)` is the fence refusing**, and
+    ///   `JobsRepository::clear_capacity_wait` fences on
+    ///   `locked_by = worker_id AND status = 'running'` — so the answer
+    ///   is "this row is not yours any more", from the same predicate
+    ///   the lease renewal uses. This returns `false` and the caller
+    ///   does not dispatch: running the handler here would be a second
+    ///   concurrent execution of a row whose holder is already running
+    ///   it. The result write is fenced on `attempts`, so the row's
+    ///   *state* would survive that — but the work would double, a
+    ///   second scan would occupy scanner capacity, and both runs could
+    ///   append to the same stream.
+    ///
+    ///   This is not work dropped on the floor: the other worker holds
+    ///   the row. In the one shape where nobody does — the sweep
+    ///   requeued it and no sibling has re-claimed it — the row is
+    ///   `pending` and the next poll takes it, one poll interval later.
+    ///
+    ///   The renewal guard is **not** what covers this. Its `lost` flag
+    ///   gates the *outcome write* and nothing else:
+    ///   [`Self::stop_renewing_and_check_fence`] is read after
+    ///   `handler.run` has returned on the normal path, and on the
+    ///   refusal path the handler was never called — so on no path does
+    ///   it prevent an execution. A check whose answer arrives after
+    ///   the work is done cannot be the reason not to do the work.
+    ///
+    /// - **`Err` is the absence of an answer** and says nothing about
+    ///   ownership, so the row keeps running. It leaves the row reading
+    ///   as queued-for-capacity while its handler runs, so its class
+    ///   over-reports one waiter until the outcome write moves the row
+    ///   out of `running` — bounded by the handler's own runtime, and
+    ///   loud rather than silent, which is the direction ADR 0066 asks
+    ///   for. Declining the dispatch on a database flap would trade a
+    ///   metric for a stall.
+    async fn end_capacity_wait(&self, job: &JobRow) -> bool {
+        match self
+            .job_repo
+            .clear_capacity_wait(job.id, &self.worker_id)
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(
+                    job_id = %job.id,
+                    kind = %job.kind,
+                    "TaskDispatcher: the capacity-wait clear found the row is no longer ours — \
+                     it was closed out or an abandoned-lease sweep handed it on while this \
+                     worker waited for a run permit. Declining the dispatch and leaving the row \
+                     to whoever holds it now; running it would be a second concurrent execution \
+                     of work already in flight",
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    job_id = %job.id,
+                    kind = %job.kind,
+                    "TaskDispatcher: could not clear the row's capacity wait; its class will \
+                     report one more row waiting for capacity than it has until the outcome \
+                     write lands. Running the row anyway — a database that did not answer is no \
+                     statement about who holds it",
+                );
+                true
+            }
+        }
+    }
+
     /// Abandoned-lease sweep — the recovery path for a row whose worker
     /// died holding the claim.
+    ///
+    /// # What this reads `locked_until` as
+    ///
+    /// **"No live worker owns this row any more."** A lapsed lease plus
+    /// the grace is a statement about the *owner*, never about the
+    /// *work*: a live owner renews three times a lease however long its
+    /// handler runs, and it renews from the claim onward — so a row
+    /// still waiting for a concurrency permit is renewed too and is
+    /// correctly invisible here. See [`Self::spawn_lease_renewal`] for
+    /// the full meaning, including the queued-vs-executing distinction
+    /// `locked_until` deliberately no longer carries — that one is
+    /// `jobs.capacity_waiting_since`'s, which this predicate does not
+    /// read and must not start reading: a row waiting for capacity is
+    /// owned by a live worker, which is the only thing being asked
+    /// here.
+    ///
+    /// This is why the predicate needs no "but is it merely slow?"
+    /// term, and why it must not grow one.
     ///
     /// Runs on every replica with no leader election. The adapter's
     /// picking CTE takes its rows `FOR UPDATE SKIP LOCKED`, so
@@ -712,19 +1186,51 @@ impl TaskDispatcher {
     /// Hold the claim lease on `job_id` for as long as the returned
     /// guard lives.
     ///
-    /// This is the half of the design that gives the sweep's
-    /// discriminator a meaning. The spawned task extends `locked_until`
-    /// every `lock_duration / RENEWALS_PER_LEASE`; dropping the guard
-    /// aborts it. Placing it here rather than in the handlers is what
-    /// makes the mechanism total: `dispatch_one` is the single point
-    /// through which every registered kind runs, and
+    /// # What `locked_until` means
+    ///
+    /// **A live worker owns this row** — not "a handler is executing
+    /// it". That is the only thing the mechanism on the other end
+    /// tests: [`Self::sweep_abandoned_leases`] recovers a row whose
+    /// *worker died* holding the claim, and a lease is the worker
+    /// saying it is still there. So the renewal starts at the **claim**
+    /// (in [`Self::run`]'s dispatch loop, beside the permit
+    /// `acquire`), not when the handler starts: a claimed row waiting
+    /// for a concurrency permit is owned by a live worker that intends
+    /// to run it, and letting its lease lapse across that wait reports
+    /// a death that did not happen — and spends an attempt on a queue
+    /// position, which is the one thing an attempt budget must not buy.
+    ///
+    /// **What that costs, and where it is paid.** From `locked_until`
+    /// alone, *queued* and *executing* are no longer distinguishable.
+    /// That is an observability distinction and not a recovery one —
+    /// the sweep only ever needed "is the owner alive" — and the
+    /// distinction now lives in a column of its own:
+    /// `jobs.capacity_waiting_since` (migration 038) is set by the
+    /// claim and cleared by [`Self::end_capacity_wait`] when the permit
+    /// is granted, so a `running` row with a live lease says which of
+    /// the two it is. That is what makes a permit wait countable
+    /// ([`Self::audit_class_service`]) rather than inferred from
+    /// end-to-end latency: the row is invisible in the claim-eligible
+    /// backlog by construction, and the task-duration histogram times
+    /// `handler.run` only.
+    ///
+    /// # Where it is started from
+    ///
+    /// The spawned task extends `locked_until` every `lock_duration /
+    /// RENEWALS_PER_LEASE`; dropping the guard aborts it. The dispatch
+    /// loop is the single start point, which is what makes the
+    /// mechanism total: every claimed row of every registered kind
+    /// passes through it on its way to `dispatch_one`, and
     /// `claim_pending_by_kinds` is the only claim statement with a
     /// production caller, so one call site covers the whole kind
-    /// vocabulary and every kind added later.
+    /// vocabulary and every kind added later. The guard is then handed
+    /// to [`Self::dispatch_one`], which is where it has to die — see
+    /// [`Self::stop_renewing_and_check_fence`].
     ///
     /// A renewal that reports the row is no longer ours raises the
     /// guard's `lost` flag, and [`Self::dispatch_one`] reads it before
-    /// writing the outcome. That makes the flag a **fencing token**, not
+    /// **every** outcome write it makes. That makes the flag a
+    /// **fencing token**, not
     /// just a log line, and it has to be: the sweep only hands a row on
     /// after two full leases of silence, but once it has, a stale
     /// worker's `reschedule` would put a row a *live* worker is mid-way
@@ -848,24 +1354,86 @@ impl TaskDispatcher {
         }
     }
 
+    /// Stop renewing the claim's lease, and answer whether this
+    /// execution may still write the row's outcome.
+    ///
+    /// Both halves are one call because they have to happen together at
+    /// every outcome write, and each of them is a property:
+    ///
+    /// - **The renewal stops before the write.** The outcome write is
+    ///   what closes the row out; a renewal landing after it would be
+    ///   putting a lease on a row that is no longer running, and the
+    ///   very sweep that exists to recover a stuck row would then be
+    ///   unable to see it.
+    /// - **`lost_the_row()` is read before the write.** That is what
+    ///   makes the fenced result write total rather than a property of
+    ///   one code path. Since the renewal now starts at the claim
+    ///   rather than at the handler, the window in which this worker can
+    ///   lose the row covers the permit wait and the authority re-check
+    ///   as well as `run` — so the refusal path is fenced for exactly
+    ///   the same reason the handler path is.
+    ///
+    /// `false` means *do not write*: the row is now someone else's. The
+    /// worst shape is not a lost result but a `reschedule` returning a
+    /// row a live worker is mid-way through to `pending`, which invites
+    /// a third concurrent execution and charges an attempt to the wrong
+    /// run. The row's state is whatever its current holder makes it;
+    /// this execution's only correct move is to stop.
+    fn stop_renewing_and_check_fence(
+        &self,
+        renewal: LeaseRenewalGuard,
+        job: &JobRow,
+        kind: &str,
+    ) -> bool {
+        let lost = renewal.lost_the_row();
+        drop(renewal);
+        if lost {
+            tracing::error!(
+                job_id = %job.id,
+                kind,
+                "TaskDispatcher: discarding this execution's outcome — the row was handed to \
+                 another worker while this worker held the claim, so writing the outcome \
+                 would clobber an execution that is still in flight",
+            );
+        }
+        !lost
+    }
+
     /// Invoke the handler for a single job row and record the outcome.
-    async fn dispatch_one(self: &Arc<Self>, job: JobRow, handler: Arc<dyn TaskHandler>) {
+    ///
+    /// `renewal` is the claim's live lease, started by the dispatch
+    /// loop when the row was claimed and handed over here because this
+    /// is the only place that knows when the row stops being this
+    /// worker's concern. Every path out of this method therefore goes
+    /// through [`Self::stop_renewing_and_check_fence`] before it writes
+    /// an outcome, and none of them may return while the guard is still
+    /// alive.
+    async fn dispatch_one(
+        self: &Arc<Self>,
+        job: JobRow,
+        handler: Arc<dyn TaskHandler>,
+        renewal: LeaseRenewalGuard,
+    ) {
         let kind = handler.kind();
 
         let params = job.params.clone().unwrap_or(serde_json::Value::Null);
 
         // Authority must still hold when the job executes; acceptance
-        // does not confer it. This runs before the in-flight gauge, the
-        // duration timer and the lease renewal because none of them
-        // describe a refusal: a row whose handler was never called did
-        // not take time in that handler, and counting it would put a
-        // two-read authority check into the kind's execution-latency
-        // distribution.
+        // does not confer it. This runs before the in-flight gauge and
+        // the duration timer because neither describes a refusal: a row
+        // whose handler was never called did not take time in that
+        // handler, and counting it would put a two-read authority check
+        // into the kind's execution-latency distribution. The lease is
+        // the one thing that is already running by this point — it
+        // belongs to the claim, and this worker owns the row while it
+        // asks the question.
         if let Some(outcome) = self
             .refuse_unauthorized_execution(&job, kind, &params)
             .await
         {
-            self.record_outcome_for_row(&job, kind, outcome).await;
+            if self.stop_renewing_and_check_fence(renewal, &job, kind) {
+                self.record_outcome_for_row(&job, kind, outcome).await;
+            }
             return;
         }
 
@@ -880,18 +1448,15 @@ impl TaskDispatcher {
         // Emit in-flight gauge +1.
         metrics::gauge!(METRIC_IN_FLIGHT, "kind" => kind.to_string()).increment(1.0);
 
-        // Hold the lease for the whole of `run`, and stop holding it the
-        // instant `run` returns — the outcome write below is what closes
-        // the row out, and a renewal landing after it would be writing a
-        // lease onto a row that is no longer running.
-        let renewal = self.spawn_lease_renewal(job.id, kind.to_string());
-
         let started = Instant::now();
         let outcome = handler.run(&params, ctx).await;
         let elapsed = started.elapsed();
 
-        let lost_the_row = renewal.lost_the_row();
-        drop(renewal);
+        // Stop holding the lease the instant `run` returns — the outcome
+        // write below is what closes the row out, and a renewal landing
+        // after it would be writing a lease onto a row that is no longer
+        // running.
+        let may_write = self.stop_renewing_and_check_fence(renewal, &job, kind);
 
         // Emit in-flight gauge -1.
         metrics::gauge!(METRIC_IN_FLIGHT, "kind" => kind.to_string()).decrement(1.0);
@@ -900,21 +1465,7 @@ impl TaskDispatcher {
         metrics::histogram!(METRIC_DURATION, "kind" => kind.to_string())
             .record(elapsed.as_secs_f64());
 
-        if lost_the_row {
-            // The fence. Writing here would overwrite a row that is now
-            // someone else's — and the worst shape is not a lost result
-            // but a `reschedule` returning a row a live worker is
-            // mid-way through to `pending`, which invites a third
-            // concurrent execution and charges an attempt to the wrong
-            // run. The row's state is whatever its current holder makes
-            // it; this execution's only correct move is to stop.
-            tracing::error!(
-                job_id = %job.id,
-                kind,
-                "TaskDispatcher: discarding this handler's outcome — the row was handed to \
-                 another worker while the handler ran, so writing the outcome would clobber \
-                 an execution that is still in flight",
-            );
+        if !may_write {
             return;
         }
 
@@ -956,6 +1507,10 @@ impl TaskDispatcher {
     /// owns events and artifact state and reports what the row should
     /// become; `crates/hort-app/tests/jobs_row_has_one_owner.rs` is what
     /// keeps a second writer from reappearing in this layer.
+    ///
+    /// Both failure transitions also append the `TaskFailed` audit
+    /// record — see [`Self::append_failure_audit`], which is called only
+    /// when the write landed and only for a kind the event admits.
     async fn record_outcome_for_row(&self, job: &JobRow, kind: &str, outcome: TaskOutcome) {
         match outcome {
             TaskOutcome::Completed { result_summary } => {
@@ -995,7 +1550,7 @@ impl TaskDispatcher {
                         .job_repo
                         .reschedule(job.id, job.attempts, backoff, &reason)
                         .await;
-                    surface_attempted_result_write(
+                    let landed = surface_attempted_result_write(
                         written,
                         "reschedule",
                         job.id,
@@ -1008,6 +1563,9 @@ impl TaskDispatcher {
                         "result" => RESULT_FAILED_RETRY,
                     )
                     .increment(1);
+                    if landed {
+                        self.append_failure_audit(job, kind, &reason, false).await;
+                    }
                 } else {
                     if retry {
                         // A task that has failed its whole budget is an
@@ -1029,7 +1587,7 @@ impl TaskDispatcher {
                         .job_repo
                         .mark_failed(job.id, job.attempts, &reason)
                         .await;
-                    surface_attempted_result_write(
+                    let landed = surface_attempted_result_write(
                         written,
                         "mark_failed",
                         job.id,
@@ -1042,8 +1600,120 @@ impl TaskDispatcher {
                         "result" => RESULT_FAILED_TERMINAL,
                     )
                     .increment(1);
+                    if landed {
+                        self.append_failure_audit(job, kind, &reason, true).await;
+                    }
                 }
             }
+        }
+    }
+
+    /// Append the `TaskFailed` audit record for a failure this
+    /// execution wrote to the row.
+    ///
+    /// The `jobs` row records a failure for seven days and then the
+    /// retention sweep removes it; this is the durable half. It pairs
+    /// with the enqueue path's `TaskInvoked`, and the pairing is the
+    /// whole design — four conditions follow from it, and each one is
+    /// load-bearing.
+    ///
+    /// **Routed through [`TaskUseCase::task_audit_stream`], never
+    /// re-derived.** A destructive kind's `TaskInvoked` lands on
+    /// `StreamId::eventstore_retention()`, the stream
+    /// `EventStore::delete_stream` / `archive_stream` are forbidden to
+    /// touch. Its `TaskFailed` has to land there too, or an
+    /// `eventstore-archive` run could truncate the record of its own
+    /// failure while the record of its invocation survives — and the
+    /// refused or failed destructive run is the half an operator came
+    /// to read. A second copy of the routing rule here is how the two
+    /// halves would come to disagree.
+    ///
+    /// **Only when the result write landed** — the caller branches on
+    /// [`surface_attempted_result_write`]'s answer. The fenced write is
+    /// `AND attempts = $2`; a refusal means the abandoned-lease sweep
+    /// handed the row to a later execution while this handler ran, so
+    /// this execution's failure is not the row's state. An audit record
+    /// claiming otherwise is a false record about a row somebody else
+    /// owns.
+    ///
+    /// **Skipped for a kind outside [`ADMIN_INVOKABLE_TASK_KINDS`]**,
+    /// which the dispatcher does run: `TaskFailed::validate` rejects
+    /// such a kind and the production event store validates every event
+    /// it appends, so an unconditional append would produce a rejected
+    /// write for exactly those. That validation is the right shape and
+    /// this is the side that narrows — `TaskFailed` is the counterpart
+    /// of `TaskInvoked`, which can only ever carry an allowlisted kind,
+    /// so the pair is symmetric by construction. The two such kinds
+    /// have records of their own: a `scan` row's failure is the scan
+    /// vocabulary's business (`ScanCompleted` on a verdict,
+    /// `ScanIndeterminate` when the budget is spent — and a scan row is
+    /// only ever minted by `enqueue_scan`, never by an operator), and
+    /// an `oci-index-child-ingest` failure costs nothing but the
+    /// ergonomics win, because the child stays reachable through the
+    /// lazy pull path that re-derives it.
+    ///
+    /// **Never changes the task's outcome.** The row is the operational
+    /// record and this is the audit record, so the append comes after
+    /// the write and an event-store failure is logged and nothing else.
+    /// A store that is down must not be able to hold a row open.
+    async fn append_failure_audit(
+        &self,
+        job: &JobRow,
+        kind: &str,
+        reason: &str,
+        final_attempt: bool,
+    ) {
+        if !ADMIN_INVOKABLE_TASK_KINDS.contains(&kind) {
+            tracing::debug!(
+                job_id = %job.id,
+                kind,
+                final_attempt,
+                "TaskDispatcher: no TaskFailed audit event for this kind — it is not \
+                 operator-invokable, so it has no TaskInvoked to pair with and the event's \
+                 own validation rejects it; the row and the kind's own event vocabulary \
+                 are its record",
+            );
+            return;
+        }
+
+        // `reason` is already bounded: every production failure is built
+        // through `TaskOutcome::fail`, whose `REASON_MAX_BYTES` is the
+        // same number as this event's own cap, deliberately so the event
+        // and `jobs.last_error` cannot disagree about what was
+        // truncated. Re-truncating here would be a second copy of that
+        // bound; leaving it means a producer that ever bypassed the
+        // constructor shows up as a rejected append rather than as two
+        // silently different texts.
+        let append = AppendEvents {
+            stream_id: TaskUseCase::task_audit_stream(kind),
+            expected_version: ExpectedVersion::Any,
+            events: vec![EventToAppend::new(DomainEvent::TaskFailed(TaskFailed {
+                task_job_id: job.id,
+                kind: kind.to_string(),
+                reason: reason.to_string(),
+                final_attempt,
+            }))],
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            // The same actor this execution's `TaskContext` already
+            // carries, so one dispatched run is attributed one way
+            // rather than two. Deliberately not the row's `actor_id`:
+            // the requester asked for the task, the worker is what
+            // failed it, and attributing the failure to the requester
+            // would read as the operator having done something wrong.
+            actor: Actor::Internal(InternalActor::Timer),
+        };
+        if let Err(e) = self.event_store.append(append).await {
+            tracing::error!(
+                error = %e,
+                job_id = %job.id,
+                kind,
+                final_attempt,
+                "TaskDispatcher: the TaskFailed audit event did not reach the event store. \
+                 The row's state is already written and stands — the failure is \
+                 operator-visible there, but absent from the audit trail, so it is lost \
+                 once the row's retention horizon removes it",
+            );
         }
     }
 }
@@ -1171,9 +1841,10 @@ mod tests {
     use chrono::Utc;
     use hort_domain::error::DomainError;
     use hort_domain::error::DomainResult;
-    use hort_domain::events::DESTRUCTIVE_TASK_KINDS;
+    use hort_domain::events::{DESTRUCTIVE_TASK_KINDS, EVENT_TASK_KINDS};
     use hort_domain::ports::jobs_repository::{
-        JobRow, JobStatus, JobsRepository, RequeuedJob, ResultWriteOutcome, ScanJob,
+        BandQueueSample, JobRow, JobStatus, JobsRepository, RequeuedJob, ResultWriteOutcome,
+        ScanJob,
     };
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
     use hort_domain::ports::BoxFuture;
@@ -1188,6 +1859,12 @@ mod tests {
     use crate::use_cases::test_support::{
         MockPermissionGrantRepository, MockUserRepository, ResultWriteLog,
     };
+    use hort_domain::policy::{
+        permit_age_net_bound, permit_service_interval, ClassStarvationReason,
+        DEFAULT_CLASS_SERVICE_THRESHOLD_SECS,
+    };
+    use hort_domain::ports::jobs_repository::TriggerSource;
+    use hort_domain::types::task_tier::{TaskTier, DEFAULT_RESERVED_SLOTS_PER_CLASS};
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -1284,6 +1961,11 @@ mod tests {
     struct DispatcherMockRepo {
         /// Pre-seeded batches; each `claim` call pops the front.
         claim_batches: Mutex<Vec<Vec<JobRow>>>,
+        /// The reservation every `claim_pending_by_kinds` call arrived
+        /// with, in order. The claim is the half of ADR 0066 D4 that is
+        /// a *port argument*, so this is where a DB-free test can see
+        /// the configured share actually leave the dispatcher.
+        claim_reservations: Mutex<Vec<ClaimReservation>>,
         mark_completed_calls: Mutex<Vec<Uuid>>,
         mark_completed_summaries: Mutex<Vec<serde_json::Value>>,
         reschedule_calls: Mutex<Vec<(Uuid, String)>>,
@@ -1310,15 +1992,50 @@ mod tests {
         renew_calls: Mutex<Vec<(Uuid, String)>>,
         /// What `renew_lease` answers: `Some(b)` → `Ok(b)`, `None` → `Err`.
         renew_answer: Mutex<Option<bool>>,
+        /// The modelled `locked_until` of every row this repo handed
+        /// out, keyed by job id. Only written while
+        /// [`Self::model_leases`] is armed.
+        leases: Mutex<HashMap<Uuid, ModelledLease>>,
+        /// When armed, `requeue_abandoned` answers from [`Self::leases`]
+        /// rather than from `requeue_result`, and `claim_pending_by_kinds`
+        /// / `renew_lease` keep that model up to date.
+        ///
+        /// Opt-in because the question it answers is only ever asked by
+        /// the two tests about **where the renewal starts** — and for
+        /// those, a seeded `requeue_result` would assert the fixture. The
+        /// whole point is whether the lease the dispatcher actually wrote
+        /// stayed fresh, so the sweep has to read that lease.
+        model_leases: Mutex<bool>,
+        /// What the modelled sweep resolved, in order.
+        model_requeued: Mutex<Vec<RequeuedJob>>,
         /// The fence every result write arrived with, and what they
         /// answer. See [`ResultWriteLog`].
         write_log: ResultWriteLog,
+        /// What `queue_sample_by_band` reports, one entry per band in
+        /// the order the bands were passed (the per-class service
+        /// audit's input).
+        band_samples: Mutex<Vec<BandQueueSample>>,
+        /// When true, `queue_sample_by_band` returns `Err`.
+        band_samples_fail: Mutex<bool>,
+        /// The band bounds every `queue_sample_by_band` call arrived
+        /// with, in order — so a test can see that the observation asks
+        /// about every class rather than only the reserved ones.
+        band_queries: Mutex<Vec<Vec<PriorityBand>>>,
+        /// `(job_id, worker_id)` of every `clear_capacity_wait` call, in
+        /// order.
+        capacity_wait_clears: Mutex<Vec<(Uuid, String)>>,
+        /// What `clear_capacity_wait` answers: `Some(b)` → `Ok(b)`,
+        /// `None` → `Err`. Mirrors [`Self::renew_answer`], because the
+        /// two writes have the same two failure shapes — a fence that
+        /// refused, and a database that did not answer.
+        capacity_wait_answer: Mutex<Option<bool>>,
     }
 
     impl DispatcherMockRepo {
         fn new() -> Self {
             Self {
                 claim_batches: Mutex::new(Vec::new()),
+                claim_reservations: Mutex::new(Vec::new()),
                 mark_completed_calls: Mutex::new(Vec::new()),
                 mark_completed_summaries: Mutex::new(Vec::new()),
                 reschedule_calls: Mutex::new(Vec::new()),
@@ -1332,12 +2049,24 @@ mod tests {
                 requeue_fails: Mutex::new(false),
                 renew_calls: Mutex::new(Vec::new()),
                 renew_answer: Mutex::new(Some(true)),
+                leases: Mutex::new(HashMap::new()),
+                model_leases: Mutex::new(false),
+                model_requeued: Mutex::new(Vec::new()),
                 write_log: ResultWriteLog::default(),
+                band_samples: Mutex::new(Vec::new()),
+                band_samples_fail: Mutex::new(false),
+                band_queries: Mutex::new(Vec::new()),
+                capacity_wait_clears: Mutex::new(Vec::new()),
+                capacity_wait_answer: Mutex::new(Some(true)),
             }
         }
 
         fn seed_batch(&self, rows: Vec<JobRow>) {
             self.claim_batches.lock().unwrap().push(rows);
+        }
+
+        fn claim_reservations(&self) -> Vec<ClaimReservation> {
+            self.claim_reservations.lock().unwrap().clone()
         }
 
         fn seed_backlog(&self, rows: Vec<PendingKindBacklog>) {
@@ -1346,6 +2075,28 @@ mod tests {
 
         fn fail_backlog(&self) {
             *self.backlog_fails.lock().unwrap() = true;
+        }
+
+        /// Seed the per-class sample, one entry per band in
+        /// `class_bands()` order (Interactive, Normal, Bulk).
+        fn seed_band_samples(&self, samples: Vec<BandQueueSample>) {
+            *self.band_samples.lock().unwrap() = samples;
+        }
+
+        fn fail_band_samples(&self) {
+            *self.band_samples_fail.lock().unwrap() = true;
+        }
+
+        fn band_queries(&self) -> Vec<Vec<PriorityBand>> {
+            self.band_queries.lock().unwrap().clone()
+        }
+
+        fn capacity_wait_clears(&self) -> Vec<(Uuid, String)> {
+            self.capacity_wait_clears.lock().unwrap().clone()
+        }
+
+        fn set_capacity_wait_answer(&self, answer: Option<bool>) {
+            *self.capacity_wait_answer.lock().unwrap() = answer;
         }
 
         fn fail_reschedule(&self) {
@@ -1394,6 +2145,128 @@ mod tests {
         fn renew_calls(&self) -> Vec<(Uuid, String)> {
             self.renew_calls.lock().unwrap().clone()
         }
+
+        /// Arm the lease model — see [`Self::model_leases`] the field.
+        fn model_leases(&self) {
+            *self.model_leases.lock().unwrap() = true;
+        }
+
+        /// Write the modelled lease a claim hands out: `locked_until =
+        /// now() + lock_duration`, carrying the row's post-claim
+        /// `attempts` so the modelled sweep can spend the budget the way
+        /// the real `CASE` does.
+        fn model_claim(&self, row: &JobRow, lock_duration: Duration) {
+            if !*self.model_leases.lock().unwrap() {
+                return;
+            }
+            self.leases.lock().unwrap().insert(
+                row.id,
+                ModelledLease {
+                    kind: row.kind.clone(),
+                    attempts: row.attempts,
+                    until: tokio::time::Instant::now() + lock_duration,
+                },
+            );
+        }
+
+        /// Push a modelled lease forward, as a renewal that answered
+        /// "still yours" does. A renewal that errored or was refused
+        /// moves nothing — which is the whole observable a stalled or
+        /// dead worker leaves behind.
+        fn model_renewal(&self, job_id: Uuid, lock_duration: Duration) {
+            if !*self.model_leases.lock().unwrap() {
+                return;
+            }
+            if let Some(lease) = self.leases.lock().unwrap().get_mut(&job_id) {
+                lease.until = tokio::time::Instant::now() + lock_duration;
+            }
+        }
+
+        /// The modelled sweep: every row of an allow-listed kind whose
+        /// lease lapsed more than `grace` ago, oldest lapse first and
+        /// capped at the batch — `REQUEUE_ABANDONED_SQL`'s predicate,
+        /// in the one respect these tests turn on.
+        ///
+        /// Compared as `until + grace < now` rather than `until < now -
+        /// grace` so the arithmetic cannot underflow near the paused
+        /// clock's origin.
+        ///
+        /// The resolved rows leave the model, because the real statement
+        /// clears `locked_by`/`locked_until`; `attempts` is handed back
+        /// untouched, because the real statement leaves the column to
+        /// the next claim.
+        ///
+        /// The real `CASE`'s other arm — a row at the attempt cap goes
+        /// terminal instead of back to `pending` — is deliberately NOT
+        /// modelled, because nothing here asks about it and
+        /// `lease_expiry_requeue.rs` proves it against the statement
+        /// itself. A row at the cap therefore **panics** rather than
+        /// being answered `Requeued`: a double that cannot be faithful
+        /// about a state has to refuse it, not guess, or the test
+        /// standing on it proves a behaviour production does not have.
+        fn model_sweep(
+            &self,
+            kinds: &[&str],
+            grace: Duration,
+            attempt_cap: u32,
+            batch_size: u16,
+        ) -> Vec<RequeuedJob> {
+            let now = tokio::time::Instant::now();
+            let mut leases = self.leases.lock().unwrap();
+            let mut lapsed: Vec<(Uuid, ModelledLease)> = leases
+                .iter()
+                .filter(|(_, l)| kinds.contains(&l.kind.as_str()) && l.until + grace < now)
+                .map(|(id, l)| (*id, l.clone()))
+                .collect();
+            lapsed.sort_by_key(|(id, l)| (l.until, *id));
+            let resolved: Vec<RequeuedJob> = lapsed
+                .into_iter()
+                .take(batch_size as usize)
+                .map(|(id, l)| {
+                    assert!(
+                        l.attempts < attempt_cap,
+                        "the lease model does not model the attempt cap: row {id} is at \
+                         {}/{attempt_cap} and the real statement would fail it terminally",
+                        l.attempts,
+                    );
+                    leases.remove(&id);
+                    RequeuedJob {
+                        id,
+                        kind: l.kind,
+                        attempts: l.attempts,
+                        outcome: RequeueOutcome::Requeued,
+                    }
+                })
+                .collect();
+            self.model_requeued
+                .lock()
+                .unwrap()
+                .extend(resolved.iter().cloned());
+            resolved
+        }
+
+        /// What the modelled sweep has resolved so far.
+        fn model_requeued(&self) -> Vec<RequeuedJob> {
+            self.model_requeued.lock().unwrap().clone()
+        }
+
+        /// The `attempts` the model still holds for `job_id`, or `None`
+        /// once a sweep has resolved the row out of the model.
+        fn modelled_attempts(&self, job_id: Uuid) -> Option<u32> {
+            self.leases.lock().unwrap().get(&job_id).map(|l| l.attempts)
+        }
+    }
+
+    /// One row's modelled `locked_until`, plus what the sweep needs to
+    /// answer about it.
+    #[derive(Clone)]
+    struct ModelledLease {
+        kind: String,
+        /// `attempts` as the claim left it. Nothing in the model moves
+        /// it, which is the behaviour `lease_expiry_requeue.rs` proves
+        /// of the real statement.
+        attempts: u32,
+        until: tokio::time::Instant,
     }
 
     impl JobsRepository for DispatcherMockRepo {
@@ -1401,13 +2274,16 @@ mod tests {
             &'a self,
             job_id: Uuid,
             worker_id: &'a str,
-            _lock_duration: Duration,
+            lock_duration: Duration,
         ) -> BoxFuture<'a, DomainResult<bool>> {
             self.renew_calls
                 .lock()
                 .unwrap()
                 .push((job_id, worker_id.to_string()));
             let answer = *self.renew_answer.lock().unwrap();
+            if answer == Some(true) {
+                self.model_renewal(job_id, lock_duration);
+            }
             Box::pin(async move {
                 match answer {
                     Some(b) => Ok(b),
@@ -1430,7 +2306,11 @@ mod tests {
                 batch_size,
             });
             let fails = *self.requeue_fails.lock().unwrap();
-            let rows = self.requeue_result.lock().unwrap().clone();
+            let rows = if *self.model_leases.lock().unwrap() {
+                self.model_sweep(kinds, grace, attempt_cap, batch_size)
+            } else {
+                self.requeue_result.lock().unwrap().clone()
+            };
             Box::pin(async move {
                 if fails {
                     return Err(DomainError::Invariant("requeue boom".into()));
@@ -1517,8 +2397,13 @@ mod tests {
             _kinds: &'a [&'a str],
             _batch_size: u16,
             _worker_id: &'a str,
-            _lock_duration: Duration,
+            lock_duration: Duration,
+            reservation: &'a ClaimReservation,
         ) -> BoxFuture<'a, DomainResult<Vec<JobRow>>> {
+            self.claim_reservations
+                .lock()
+                .unwrap()
+                .push(reservation.clone());
             let batch = {
                 let mut q = self.claim_batches.lock().unwrap();
                 if q.is_empty() {
@@ -1527,6 +2412,11 @@ mod tests {
                     q.remove(0)
                 }
             };
+            // The claim is where `locked_until` is first written, so it
+            // is where the lease model starts.
+            for row in &batch {
+                self.model_claim(row, lock_duration);
+            }
             Box::pin(async move { Ok(batch) })
         }
 
@@ -1538,6 +2428,40 @@ mod tests {
                     Err(DomainError::Invariant("backlog boom".into()))
                 } else {
                     Ok(rows)
+                }
+            })
+        }
+
+        fn queue_sample_by_band<'a>(
+            &'a self,
+            bands: &'a [PriorityBand],
+        ) -> BoxFuture<'a, DomainResult<Vec<BandQueueSample>>> {
+            self.band_queries.lock().unwrap().push(bands.to_vec());
+            let fails = *self.band_samples_fail.lock().unwrap();
+            let rows = self.band_samples.lock().unwrap().clone();
+            Box::pin(async move {
+                if fails {
+                    Err(DomainError::Invariant("band sample boom".into()))
+                } else {
+                    Ok(rows)
+                }
+            })
+        }
+
+        fn clear_capacity_wait<'a>(
+            &'a self,
+            job_id: Uuid,
+            worker_id: &'a str,
+        ) -> BoxFuture<'a, DomainResult<bool>> {
+            self.capacity_wait_clears
+                .lock()
+                .unwrap()
+                .push((job_id, worker_id.to_string()));
+            let answer = *self.capacity_wait_answer.lock().unwrap();
+            Box::pin(async move {
+                match answer {
+                    Some(landed) => Ok(landed),
+                    None => Err(DomainError::Invariant("clear boom".into())),
                 }
             })
         }
@@ -1557,6 +2481,109 @@ mod tests {
                     stream_position: 0,
                     global_positions: Vec::new(),
                 })
+            })
+        }
+
+        fn read_stream(
+            &self,
+            _stream_id: &StreamId,
+            _from: ReadFrom,
+            _max_count: u64,
+        ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn read_category(
+            &self,
+            _category: hort_domain::events::StreamCategory,
+            _from: SubscribeFrom,
+            _max_count: u64,
+        ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
+            Box::pin(async { Ok(hort_domain::ports::event_store::SealOutcome::Sealed) })
+        }
+
+        fn archive_stream(
+            &self,
+            _stream_id: StreamId,
+            _target: &str,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
+            Box::pin(async { Ok(hort_domain::ports::event_store::SealOutcome::Sealed) })
+        }
+    }
+
+    /// An `EventStore` that records every batch it was handed, and can
+    /// be told to refuse them.
+    ///
+    /// It does **not** round-trip — `read_stream` serves nothing, and
+    /// no production code reads back what the dispatcher appends — so
+    /// the "a double that round-trips must refuse what production
+    /// refuses" rule does not reach it. What a test needs here is the
+    /// batch's stream id, its payload and the fact that an append was
+    /// attempted at all.
+    struct RecordingEventStore {
+        batches: Mutex<Vec<AppendEvents>>,
+        fails: bool,
+    }
+
+    impl RecordingEventStore {
+        fn new() -> Self {
+            Self {
+                batches: Mutex::new(Vec::new()),
+                fails: false,
+            }
+        }
+
+        /// Every append errors — the event store being down while the
+        /// row's own write already landed.
+        fn failing() -> Self {
+            Self {
+                batches: Mutex::new(Vec::new()),
+                fails: true,
+            }
+        }
+
+        fn batches(&self) -> Vec<AppendEvents> {
+            self.batches.lock().unwrap().clone()
+        }
+
+        /// The single `TaskFailed` payload this store was handed, with
+        /// the stream it was routed to. Panics unless exactly one batch
+        /// of exactly one `TaskFailed` was appended, because every
+        /// caller is asserting about one failure.
+        fn only_task_failed(&self) -> (StreamId, TaskFailed) {
+            let batches = self.batches();
+            assert_eq!(batches.len(), 1, "expected exactly one append: {batches:?}");
+            let batch = &batches[0];
+            assert_eq!(batch.events.len(), 1, "expected a single-event batch");
+            match &batch.events[0].event {
+                DomainEvent::TaskFailed(e) => (batch.stream_id.clone(), e.clone()),
+                other => panic!("expected TaskFailed, got {}", other.event_type()),
+            }
+        }
+    }
+
+    impl EventStore for RecordingEventStore {
+        fn append(&self, batch: AppendEvents) -> BoxFuture<'_, DomainResult<AppendResult>> {
+            self.batches.lock().unwrap().push(batch);
+            let fails = self.fails;
+            Box::pin(async move {
+                if fails {
+                    Err(DomainError::Invariant("event store down".into()))
+                } else {
+                    Ok(AppendResult {
+                        stream_position: 0,
+                        global_positions: vec![0],
+                    })
+                }
             })
         }
 
@@ -1629,6 +2656,52 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// Records the `trigger_source` of every row it is handed, in the
+    /// order it was handed them — which, under a per-kind concurrency of
+    /// one, is the order the kind's permits were granted in.
+    struct OrderRecordingHandler {
+        kind: &'static str,
+        order: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TaskHandler for OrderRecordingHandler {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+
+        fn run<'a>(
+            &'a self,
+            params: &'a serde_json::Value,
+            _ctx: TaskContext,
+        ) -> BoxFuture<'a, DomainResult<TaskOutcome>> {
+            let source = params
+                .get("trigger_source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<missing>")
+                .to_string();
+            self.order.lock().unwrap().push(source);
+            Box::pin(async {
+                Ok(TaskOutcome::Completed {
+                    result_summary: serde_json::Value::Null,
+                })
+            })
+        }
+    }
+
+    /// A claimed `kind='scan'` row carrying a real trigger source, so
+    /// `TaskTier::classify` has something to answer about.
+    ///
+    /// The trigger source is echoed into `params` as well, because the
+    /// handler only sees the params — and the order it records is the
+    /// evidence.
+    fn make_scan_row(trigger_source: &str) -> JobRow {
+        let mut row = make_job_row("scan");
+        row.trigger_source = trigger_source.to_string();
+        row.priority = hort_domain::types::task_tier::scan_queue_priority(trigger_source);
+        row.params = Some(serde_json::json!({ "trigger_source": trigger_source }));
+        row
     }
 
     /// A handler that returns Completed with a SPECIFIC non-null summary —
@@ -1722,7 +2795,42 @@ mod tests {
         }
     }
 
-    /// A slow handler that holds a semaphore long enough to observe concurrency.
+    /// A `kind='scan'` handler that occupies its permit for a
+    /// caller-chosen span, so the next row of the same batch is a
+    /// *claimed row waiting for a permit* for exactly that long.
+    ///
+    /// `scan` rather than a made-up kind because the tests it serves
+    /// turn on [`REQUEUE_ON_LEASE_EXPIRY_KINDS`]: that allow-list is
+    /// what decides whether an abandoned row is recoverable at all, and
+    /// a kind outside it would make a "not requeued" assertion pass for
+    /// a reason that has nothing to do with the lease.
+    struct OccupyingScanHandler {
+        hold: Duration,
+        started: Arc<AtomicUsize>,
+    }
+
+    impl TaskHandler for OccupyingScanHandler {
+        fn kind(&self) -> &'static str {
+            "scan"
+        }
+
+        fn run<'a>(
+            &'a self,
+            _params: &'a serde_json::Value,
+            _ctx: TaskContext,
+        ) -> BoxFuture<'a, DomainResult<TaskOutcome>> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let hold = self.hold;
+            Box::pin(async move {
+                tokio::time::sleep(hold).await;
+                Ok(TaskOutcome::Completed {
+                    result_summary: serde_json::Value::Null,
+                })
+            })
+        }
+    }
+
+    /// A slow handler that holds its permit long enough to observe concurrency.
     struct SlowHandler {
         max_concurrent: Arc<AtomicUsize>,
         current: Arc<AtomicUsize>,
@@ -1762,16 +2870,45 @@ mod tests {
         repo: Arc<dyn JobsRepository>,
         reauthorizer: Arc<DestructiveTaskReauthorizer>,
     ) -> TaskDispatcher {
+        make_dispatcher_with_events(repo, reauthorizer, Arc::new(NoopEventStore))
+    }
+
+    /// [`make_dispatcher_with`] for a test that reads back what the
+    /// dispatcher appended — see [`RecordingEventStore`].
+    fn make_dispatcher_with_events<S: EventStore + 'static>(
+        repo: Arc<dyn JobsRepository>,
+        reauthorizer: Arc<DestructiveTaskReauthorizer>,
+        events: Arc<S>,
+    ) -> TaskDispatcher {
         TaskDispatcher::new(
             repo,
-            crate::event_store_publisher::wrap_for_test(Arc::new(NoopEventStore)),
+            crate::event_store_publisher::wrap_for_test(events),
             reauthorizer,
             "test-worker",
             Duration::from_secs(60),
             999_999, // very long poll interval — we drive ticks manually via seeded batches
             16,
             TEST_ATTEMPT_CAP,
+            TEST_RESERVED_SLOTS_PER_CLASS,
+            TEST_CLASS_SERVICE_THRESHOLD,
         )
+    }
+
+    /// Call `dispatch_one` the way the dispatch loop does — with the
+    /// claim's lease renewal already running.
+    ///
+    /// The renewal starts at the claim, so a test that hands
+    /// `dispatch_one` a row with no live guard would be exercising a
+    /// state production cannot be in. Mirrors the loop exactly: the
+    /// guard is created from the row's id and the handler's kind, and
+    /// handed over by value.
+    async fn dispatch_one_with_lease(
+        dispatcher: &Arc<TaskDispatcher>,
+        row: JobRow,
+        handler: Arc<dyn TaskHandler>,
+    ) {
+        let renewal = dispatcher.spawn_lease_renewal(row.id, handler.kind().to_string());
+        dispatcher.dispatch_one(row, handler, renewal).await;
     }
 
     /// The attempt budget `make_dispatcher` builds its dispatchers with.
@@ -1785,6 +2922,20 @@ mod tests {
     /// with a different value — see
     /// [`the_cap_is_the_configured_one_not_the_default`].
     const TEST_ATTEMPT_CAP: u32 = DEFAULT_MAX_ATTEMPTS;
+
+    /// The per-class reserved share `make_dispatcher` builds its
+    /// dispatchers with — `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS`'s own
+    /// default, so the fairness a test observes is the one an
+    /// out-of-the-box deployment gets. A test about the share being
+    /// *configured* builds its own dispatcher with a different value.
+    const TEST_RESERVED_SLOTS_PER_CLASS: u16 = DEFAULT_RESERVED_SLOTS_PER_CLASS;
+
+    /// The per-class service threshold `make_dispatcher` builds its
+    /// dispatchers with — the domain default, so a test observes the
+    /// window an out-of-the-box deployment audits at. A test about the
+    /// threshold being *configured* passes its own.
+    const TEST_CLASS_SERVICE_THRESHOLD: Duration =
+        Duration::from_secs(DEFAULT_CLASS_SERVICE_THRESHOLD_SECS);
 
     // -----------------------------------------------------------------------
     // Helper to look up a counter value from a debugging snapshot
@@ -1912,6 +3063,185 @@ mod tests {
             run_count.load(Ordering::SeqCst),
             1,
             "handler ran exactly once"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-displacement at the permit (ADR 0066 D4, point two)
+    // -----------------------------------------------------------------------
+
+    /// **Point two of ADR 0066 D4.** A client-waited row that won the
+    /// claim does not wait behind the whole bulk batch of its own kind
+    /// for the capacity to run.
+    ///
+    /// This is the victim the claim cannot see: such a row is already
+    /// `running`, so the starvation audit and the claim's own
+    /// reservation are both blind to it. `scan` is the kind it happens
+    /// to — six trigger sources across all three classes, and a
+    /// production concurrency of one.
+    ///
+    /// The batch is deliberately ordered worst-case: the ingest scan is
+    /// claimed **last**, behind four scheduled rescans. Under an
+    /// arrival-ordered permit queue it therefore runs fifth. What it may
+    /// not do is wait for work that has not started — the first rescan
+    /// already holds the only permit and nothing here interrupts it (ADR
+    /// 0066: this is not preemption), so the guarantee is that the
+    /// ingest scan takes the **next** permit to come free, which is
+    /// second.
+    #[tokio::test]
+    async fn a_client_waited_row_does_not_wait_behind_the_bulk_batch_for_a_permit() {
+        let bulk = TriggerSource::Cron.as_str();
+        let interactive = TriggerSource::Ingest.as_str();
+        // The premise: these two really are different classes, and the
+        // kind really is one both reach.
+        assert_eq!(
+            TaskTier::classify("scan", bulk),
+            Some(TaskTier::Bulk),
+            "the fixture needs the flood to be the class nobody waits on"
+        );
+        assert_eq!(
+            TaskTier::classify("scan", interactive),
+            Some(TaskTier::Interactive),
+            "the fixture needs the victim to be client-waited"
+        );
+
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let mut batch: Vec<JobRow> = (0..4).map(|_| make_scan_row(bulk)).collect();
+        batch.push(make_scan_row(interactive));
+        repo.seed_batch(batch);
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher.poll_interval_secs = 0;
+        dispatcher.register(
+            Arc::new(OrderRecordingHandler {
+                kind: "scan",
+                order: order.clone(),
+            }),
+            // The production concurrency for `scan`: parallelism comes
+            // from replicas, not from intra-process concurrency. One
+            // permit is also the case a spatial reservation cannot
+            // serve, so it is the one worth pinning.
+            1,
+        );
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("dispatcher join timed out")
+            .expect("task did not panic")
+            .expect("run returned Err");
+
+        let order = order.lock().unwrap().clone();
+        assert_eq!(
+            order.len(),
+            5,
+            "every claimed row must still run — a reservation that dropped one \
+             would pass the assertion below for the wrong reason: {order:?}"
+        );
+        let at = order
+            .iter()
+            .position(|s| s == interactive)
+            .expect("the client-waited row must run");
+        assert_eq!(
+            at, 1,
+            "the client-waited row must take the first permit that comes free, not \
+             wait out the bulk batch it was claimed behind: {order:?}"
+        );
+    }
+
+    /// **The share is the operator's number, at both points.**
+    ///
+    /// Asserted together rather than twice, because that is the shape
+    /// of the mistake: ADR 0066 D4 calls a design that closes one point
+    /// and not the other *incomplete*, and a knob threaded into one of
+    /// them is exactly that. The claim's half is a port argument, so
+    /// the mock can read it; the permit's half is internal, so it is
+    /// read as behaviour.
+    ///
+    /// The configured value is the **off** position, which the default
+    /// is not — at the default this test would pass against a
+    /// compiled-in constant too.
+    #[tokio::test]
+    async fn the_reserved_share_is_the_configured_one_at_both_points() {
+        const CONFIGURED: u16 = 0;
+        const _: () = assert!(CONFIGURED != DEFAULT_RESERVED_SLOTS_PER_CLASS);
+
+        let bulk = TriggerSource::Cron.as_str();
+        let interactive = TriggerSource::Ingest.as_str();
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let mut batch: Vec<JobRow> = (0..4).map(|_| make_scan_row(bulk)).collect();
+        batch.push(make_scan_row(interactive));
+        repo.seed_batch(batch);
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut dispatcher = TaskDispatcher::new(
+            repo.clone() as Arc<dyn JobsRepository>,
+            crate::event_store_publisher::wrap_for_test(Arc::new(NoopEventStore)),
+            authorizing_reauthorizer(),
+            "test-worker",
+            Duration::from_secs(60),
+            0,
+            16,
+            TEST_ATTEMPT_CAP,
+            CONFIGURED,
+            TEST_CLASS_SERVICE_THRESHOLD,
+        );
+        assert_eq!(dispatcher.reserved_slots_per_class(), CONFIGURED);
+        dispatcher.register(
+            Arc::new(OrderRecordingHandler {
+                kind: "scan",
+                order: order.clone(),
+            }),
+            1,
+        );
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("dispatcher join timed out")
+            .expect("task did not panic")
+            .expect("run returned Err");
+
+        // Point one: the number reached the port, with the band list
+        // the domain decides rather than one the dispatcher invented.
+        let seen = repo.claim_reservations();
+        let first = seen
+            .first()
+            .expect("the dispatcher must have claimed at least once");
+        assert_eq!(
+            first.slots_per_band, CONFIGURED,
+            "the claim must be handed the configured share, not a default: {seen:?}"
+        );
+        assert_eq!(
+            first.bands,
+            hort_domain::types::task_tier::waited_on_bands(),
+            "the bands must be the domain's waited-on list"
+        );
+
+        // Point two: the number reached `register`. At the off position
+        // the permits are arrival-ordered, so the client-waited row
+        // claimed last runs last.
+        let order = order.lock().unwrap().clone();
+        assert_eq!(
+            order.len(),
+            5,
+            "every claimed row must still run: {order:?}"
+        );
+        assert_eq!(
+            order.iter().position(|s| s == interactive),
+            Some(4),
+            "with the share at zero the permits must be arrival-ordered, which is what \
+             shows the number reached the permit allocation and not only the accessor: \
+             {order:?}"
         );
     }
 
@@ -2209,7 +3539,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(dispatcher.dispatch_one(row, handler))
+                .block_on(dispatch_one_with_lease(&dispatcher, row, handler))
         });
 
         let snap = snapshotter.snapshot().into_vec();
@@ -2262,13 +3592,19 @@ mod tests {
                 999_999,
                 16,
                 CONFIGURED,
+                TEST_RESERVED_SLOTS_PER_CLASS,
+                TEST_CLASS_SERVICE_THRESHOLD,
             ));
 
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(dispatcher.dispatch_one(row, Arc::new(RetryHandler("retry-kind"))));
+                .block_on(dispatch_one_with_lease(
+                    &dispatcher,
+                    row,
+                    Arc::new(RetryHandler("retry-kind")),
+                ));
 
             if expect_terminal {
                 assert_eq!(
@@ -2313,6 +3649,8 @@ mod tests {
             999_999,
             16,
             CONFIGURED,
+            TEST_RESERVED_SLOTS_PER_CLASS,
+            TEST_CLASS_SERVICE_THRESHOLD,
         ));
         assert_eq!(dispatcher.attempt_cap(), CONFIGURED);
 
@@ -2511,7 +3849,11 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(dispatcher.dispatch_one(row, Arc::new(NoopHandler::new("noop", runs))));
+            .block_on(dispatch_one_with_lease(
+                &dispatcher,
+                row,
+                Arc::new(NoopHandler::new("noop", runs)),
+            ));
 
         assert_eq!(
             repo.mark_completed_calls(),
@@ -2523,6 +3865,321 @@ mod tests {
             repo.reschedule_calls().is_empty() && repo.mark_failed_calls().is_empty(),
             "a refusal must not be answered with a different write: the row belongs to \
              whoever holds it now"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The failure half of the audit pair — `TaskFailed`
+    // -----------------------------------------------------------------------
+
+    /// Drive one row through `dispatch_one` against a caller-supplied
+    /// repo and event store, so a test can read the row writes and the
+    /// appends together.
+    ///
+    /// No metrics recorder, unlike [`dispatch_one_row`]: these cases are
+    /// about the event, and the outcome counters have their own
+    /// coverage above.
+    fn dispatch_one_row_recording(
+        repo: &Arc<DispatcherMockRepo>,
+        events: &Arc<RecordingEventStore>,
+        kind: &'static str,
+        attempts: u32,
+        handler: Arc<dyn TaskHandler>,
+    ) -> Uuid {
+        assert_eq!(
+            handler.kind(),
+            kind,
+            "the audited kind is the HANDLER's, so the row's kind has to match it"
+        );
+        let mut row = make_job_row(kind);
+        row.attempts = attempts;
+        let row_id = row.id;
+        let dispatcher = Arc::new(make_dispatcher_with_events(
+            repo.clone() as Arc<dyn JobsRepository>,
+            authorizing_reauthorizer(),
+            events.clone(),
+        ));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(dispatch_one_with_lease(&dispatcher, row, handler));
+        row_id
+    }
+
+    /// The retryable path appends `final_attempt: false`.
+    ///
+    /// The row is going back to `pending`, so the failure is real but
+    /// not the last word — and the field exists to carry exactly that
+    /// distinction. An audit reader that could not tell a rescheduled
+    /// failure from a terminal one would read the attempt budget's
+    /// whole curve as repeated final failures.
+    #[test]
+    fn a_rescheduled_failure_appends_task_failed_as_not_final() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let events = Arc::new(RecordingEventStore::new());
+        let row_id = dispatch_one_row_recording(
+            &repo,
+            &events,
+            "noop",
+            TEST_ATTEMPT_CAP - 1,
+            Arc::new(RetryHandler("noop")),
+        );
+
+        assert_eq!(
+            repo.reschedule_calls(),
+            vec![(row_id, "transient error".to_string())],
+            "the row still goes back to pending — the event is additive"
+        );
+        let (stream, event) = events.only_task_failed();
+        assert_eq!(stream, StreamId::authorization());
+        assert_eq!(
+            event,
+            TaskFailed {
+                task_job_id: row_id,
+                kind: "noop".to_string(),
+                reason: "transient error".to_string(),
+                final_attempt: false,
+            }
+        );
+    }
+
+    /// The terminal path appends `final_attempt: true`, carrying the
+    /// same text the row's `last_error` got.
+    #[test]
+    fn a_terminal_failure_appends_task_failed_as_final() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let events = Arc::new(RecordingEventStore::new());
+        let row_id = dispatch_one_row_recording(
+            &repo,
+            &events,
+            "noop",
+            TEST_ATTEMPT_CAP,
+            Arc::new(RetryHandler("noop")),
+        );
+
+        assert_eq!(
+            repo.mark_failed_calls(),
+            vec![(row_id, "transient error".to_string())],
+            "at the cap the row is terminal"
+        );
+        assert!(repo.reschedule_calls().is_empty());
+        let (stream, event) = events.only_task_failed();
+        assert_eq!(stream, StreamId::authorization());
+        assert_eq!(
+            event,
+            TaskFailed {
+                task_job_id: row_id,
+                kind: "noop".to_string(),
+                reason: "transient error".to_string(),
+                final_attempt: true,
+            }
+        );
+    }
+
+    /// A destructive kind's `TaskFailed` lands on the same stream its
+    /// `TaskInvoked` did — the never-deleted one.
+    ///
+    /// This is the whole reason the routing is a call into
+    /// `TaskUseCase::task_audit_stream` rather than a second copy of the
+    /// rule. Split across two streams, an `eventstore-archive` could
+    /// truncate the record of its own failure while the record of its
+    /// invocation survived on the exempt stream — and the failed
+    /// destructive run is the half an operator came to read.
+    #[test]
+    fn a_destructive_kinds_task_failed_lands_beside_its_task_invoked() {
+        for kind in DESTRUCTIVE_TASK_KINDS {
+            let repo = Arc::new(DispatcherMockRepo::new());
+            let events = Arc::new(RecordingEventStore::new());
+            dispatch_one_row_recording(
+                &repo,
+                &events,
+                kind,
+                TEST_ATTEMPT_CAP,
+                Arc::new(RetryHandler(kind)),
+            );
+
+            let (stream, event) = events.only_task_failed();
+            assert_eq!(
+                stream,
+                TaskUseCase::task_audit_stream(kind),
+                "{kind}: the pair has to share the enqueue path's own routing"
+            );
+            assert_eq!(
+                stream,
+                StreamId::eventstore_retention(),
+                "{kind}: a destructive kind's audit trail is the exempt stream"
+            );
+            assert_ne!(stream, StreamId::authorization());
+            assert!(event.final_attempt);
+        }
+    }
+
+    /// A refused result write appends nothing, on both failure paths.
+    ///
+    /// The fence is `AND attempts = $2`: a refusal means the
+    /// abandoned-lease sweep handed the row to a later execution while
+    /// this handler ran, so this execution's failure is not the row's
+    /// state. An audit record saying it is would be a false record
+    /// about a row somebody else owns — and, unlike the row, the event
+    /// store has no fence of its own to catch it.
+    #[test]
+    fn a_refused_result_write_appends_no_audit_event() {
+        for (attempts, write) in [
+            (TEST_ATTEMPT_CAP - 1, "reschedule"),
+            (TEST_ATTEMPT_CAP, "mark_failed"),
+        ] {
+            let repo = Arc::new(DispatcherMockRepo::new());
+            repo.write_log
+                .refuse(ResultWriteOutcome::Superseded { current_attempt: 9 });
+            let events = Arc::new(RecordingEventStore::new());
+            dispatch_one_row_recording(
+                &repo,
+                &events,
+                "noop",
+                attempts,
+                Arc::new(RetryHandler("noop")),
+            );
+
+            assert_eq!(
+                repo.write_log.attempts(),
+                vec![attempts],
+                "{write} must still be attempted — the refusal is the repo's answer"
+            );
+            assert!(
+                events.batches().is_empty(),
+                "{write} was refused, so there is no failure of this execution's to audit; \
+                 got {:?}",
+                events.batches(),
+            );
+        }
+    }
+
+    /// An event-store failure changes neither the row nor the outcome.
+    ///
+    /// The row is the operational record and the event is the audit
+    /// record, in that order: the append happens after the write, and a
+    /// store that is down is logged and let go. A worker that failed a
+    /// task differently — or held the row open — because its audit
+    /// store was unreachable would turn an observability outage into a
+    /// queue outage.
+    #[test]
+    fn an_event_store_failure_leaves_the_row_and_the_outcome_unchanged() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let events = Arc::new(RecordingEventStore::failing());
+        let row_id = dispatch_one_row_recording(
+            &repo,
+            &events,
+            "noop",
+            TEST_ATTEMPT_CAP,
+            Arc::new(RetryHandler("noop")),
+        );
+
+        assert_eq!(
+            repo.mark_failed_calls(),
+            vec![(row_id, "transient error".to_string())],
+            "the row is closed out exactly as it would have been"
+        );
+        assert!(
+            repo.reschedule_calls().is_empty(),
+            "a failed append must not be answered with a different row write"
+        );
+        assert_eq!(
+            events.batches().len(),
+            1,
+            "the append is attempted once and not retried"
+        );
+    }
+
+    /// A kind outside `ADMIN_INVOKABLE_TASK_KINDS` closes its row out
+    /// and appends nothing.
+    ///
+    /// `TaskFailed::validate` rejects such a kind and the production
+    /// event store validates every event it appends, so an
+    /// unconditional append here would write nothing but rejections for
+    /// exactly the kinds the dispatcher runs and no operator can
+    /// invoke. `scan` is the documented example: its rows are minted
+    /// only by `enqueue_scan`, and its failures are the scan
+    /// vocabulary's business.
+    #[test]
+    fn a_kind_outside_the_admin_invoke_allowlist_appends_no_audit_event() {
+        for kind in ["scan", "oci-index-child-ingest"] {
+            assert!(
+                !ADMIN_INVOKABLE_TASK_KINDS.contains(&kind),
+                "{kind} is the premise of this test — it must stay off the allowlist"
+            );
+            let repo = Arc::new(DispatcherMockRepo::new());
+            let events = Arc::new(RecordingEventStore::new());
+            let row_id = dispatch_one_row_recording(
+                &repo,
+                &events,
+                kind,
+                TEST_ATTEMPT_CAP,
+                Arc::new(RetryHandler(kind)),
+            );
+
+            assert_eq!(
+                repo.mark_failed_calls(),
+                vec![(row_id, "transient error".to_string())],
+                "{kind}: the row is still closed out — only the event is skipped"
+            );
+            assert!(
+                events.batches().is_empty(),
+                "{kind}: an append the event store would reject must not be issued; got {:?}",
+                events.batches(),
+            );
+        }
+    }
+
+    /// A success appends nothing — the counter-assertion that the emit
+    /// is scoped to the two failure paths and not to every outcome.
+    #[test]
+    fn a_completed_outcome_appends_no_audit_event() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let events = Arc::new(RecordingEventStore::new());
+        let row_id = dispatch_one_row_recording(
+            &repo,
+            &events,
+            "noop",
+            1,
+            Arc::new(NoopHandler::new("noop", runs)),
+        );
+
+        assert_eq!(repo.mark_completed_calls(), vec![row_id]);
+        assert!(
+            events.batches().is_empty(),
+            "there is no TaskCompleted in the vocabulary and no reason to invent one here; \
+             got {:?}",
+            events.batches(),
+        );
+    }
+
+    /// The census behind the skip, pinned where the skip stands.
+    ///
+    /// Three `jobs.kind` values are valid rows the admin invoke path
+    /// cannot produce. Two of them have a `TaskHandler` and so reach
+    /// the dispatcher's failure paths — `scan` and
+    /// `oci-index-child-ingest`, both covered by
+    /// [`a_kind_outside_the_admin_invoke_allowlist_appends_no_audit_event`].
+    /// `verify-event-chain` has no handler at all: its rows are written
+    /// directly by the `hort-server verify-event-chain` subcommand as a
+    /// liveness breadcrumb, so no dispatcher ever closes one out.
+    ///
+    /// A fourth arrival widens the set of failures that go unaudited,
+    /// which is a decision rather than an oversight — this is what puts
+    /// it in front of whoever adds it.
+    #[test]
+    fn the_kinds_with_no_task_failed_record_are_the_three_outside_the_allowlist() {
+        let mut outside: Vec<&str> = EVENT_TASK_KINDS
+            .iter()
+            .copied()
+            .filter(|k| !ADMIN_INVOKABLE_TASK_KINDS.contains(k))
+            .collect();
+        outside.sort_unstable();
+        assert_eq!(
+            outside,
+            vec!["oci-index-child-ingest", "scan", "verify-event-chain"],
         );
     }
 
@@ -2867,7 +4524,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(Arc::new(dispatcher).dispatch_one(row, handler))
+                .block_on(dispatch_one_with_lease(&Arc::new(dispatcher), row, handler))
         });
 
         let snap = snapshotter.snapshot().into_vec();
@@ -2900,7 +4557,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(Arc::new(dispatcher).dispatch_one(row, handler))
+                .block_on(dispatch_one_with_lease(&Arc::new(dispatcher), row, handler))
         });
 
         let snap = snapshotter.snapshot().into_vec();
@@ -2937,7 +4594,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(Arc::new(dispatcher).dispatch_one(row, handler))
+                .block_on(dispatch_one_with_lease(&Arc::new(dispatcher), row, handler))
         });
 
         let snap = snapshotter.snapshot().into_vec();
@@ -3454,6 +5111,862 @@ mod tests {
         );
     }
     // -----------------------------------------------------------------------
+    // Per-class service audit (ADR 0066 D5)
+    // -----------------------------------------------------------------------
+
+    /// A slice sample with nothing in it — each test below sets only the
+    /// facts its scenario rests on.
+    fn empty_sample() -> QueueServiceSample {
+        QueueServiceSample {
+            pending_eligible: 0,
+            oldest_pending_at: None,
+            awaiting_capacity: 0,
+            oldest_capacity_wait_at: None,
+            last_served_at: None,
+        }
+    }
+
+    /// One band's observation, built from its kinds.
+    ///
+    /// Every fixture below has to name the kinds its rows belong to,
+    /// because a band is made of kinds and "two rows waiting in the
+    /// Normal band" is not a complete statement of a queue: the
+    /// guarantee is enforced per kind as well as per class, so which
+    /// kind the rows are is part of the scenario rather than detail.
+    fn band(kinds: Vec<(&str, QueueServiceSample)>) -> BandQueueSample {
+        BandQueueSample {
+            kinds: kinds
+                .into_iter()
+                .map(|(kind, sample)| KindQueueSample {
+                    kind: kind.to_string(),
+                    sample,
+                })
+                .collect(),
+        }
+    }
+
+    /// A band with no rows at all — the class is completely quiet.
+    fn empty_band() -> BandQueueSample {
+        band(Vec::new())
+    }
+
+    /// The common single-kind band: one kind's facts, and nothing else
+    /// of that class in the queue.
+    fn one_kind_band(kind: &str, sample: QueueServiceSample) -> BandQueueSample {
+        band(vec![(kind, sample)])
+    }
+
+    fn secs_ago(secs: i64) -> DateTime<Utc> {
+        Utc::now() - chrono::Duration::seconds(secs)
+    }
+
+    /// Run both instruments over one scenario and return the metric
+    /// snapshot: the pre-change per-kind audit with its own inputs, and
+    /// the per-class audit with the seeded band samples.
+    ///
+    /// Both in one recorder on purpose. The claim each gap test makes is
+    /// not "the new counter fires" but "the new counter fires **where
+    /// the old one does not**", and that is only an assertion if the old
+    /// one was given its own best shot at the same state in the same
+    /// snapshot.
+    async fn run_both_audits(
+        repo: &Arc<DispatcherMockRepo>,
+        last_claimed: &HashMap<String, DateTime<Utc>>,
+        started_at: DateTime<Utc>,
+    ) -> Vec<(
+        CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    )> {
+        let dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        let registered: HashSet<&str> = ["scan"].into_iter().collect();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        dispatcher
+            .audit_starvation(&registered, last_claimed, started_at)
+            .await;
+        dispatcher.audit_class_service().await;
+        drop(guard);
+        snapshotter.snapshot().into_vec()
+    }
+
+    /// **Gap one.** A kind that is claimed steadily while one of its
+    /// classes is not.
+    ///
+    /// `scan` carries all three classes. Here its `Interactive` rows are
+    /// claimed and completed constantly and its `Normal` rows — an
+    /// operator's rescans — have been sitting unclaimed for just under
+    /// seven minutes with nothing of that class ever served.
+    ///
+    /// **The per-kind audit is silent, and both of its axes are silent
+    /// for a structural reason, not a tuning one.** Its first axis asks
+    /// "is this kind being claimed", and the answer is yes — the clock
+    /// is re-armed by a row of *any* class, which is precisely the
+    /// blind spot. Its second axis asks "has the kind's oldest eligible
+    /// row aged past 600 s", and it has not: that threshold is sized
+    /// "well above any legitimate transient" because the axis fires on
+    /// states that are not defects (a deep queue draining normally
+    /// keeps an old oldest row), so it cannot also be the window a
+    /// control task's starvation is caught in. The per-class predicate
+    /// has no such false positives to tolerate — service re-arms its
+    /// reference — so it answers at 300 s, and that is the window this
+    /// scenario sits in.
+    #[tokio::test]
+    async fn a_class_that_is_never_served_is_invisible_to_the_per_kind_audit() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        // The per-kind view: one kind, seven eligible rows, the oldest
+        // of them 400 s old. This is the SAME queue the per-class view
+        // below describes — 5 Interactive rows plus 2 Normal ones.
+        repo.seed_backlog(vec![backlog("scan", 7, secs_ago(400))]);
+        // The per-class view, in `class_bands()` order.
+        repo.seed_band_samples(vec![
+            // Interactive: flowing. Claimed and completed seconds ago.
+            one_kind_band(
+                "scan",
+                QueueServiceSample {
+                    pending_eligible: 5,
+                    oldest_pending_at: Some(secs_ago(30)),
+                    last_served_at: Some(secs_ago(2)),
+                    ..empty_sample()
+                },
+            ),
+            // Normal: two operator rescans waiting 400 s, and nothing
+            // of this class has ever been served.
+            one_kind_band(
+                "scan",
+                QueueServiceSample {
+                    pending_eligible: 2,
+                    oldest_pending_at: Some(secs_ago(400)),
+                    ..empty_sample()
+                },
+            ),
+            // Bulk: nothing waiting.
+            empty_band(),
+        ]);
+        // The kind was claimed two seconds ago, and the worker has been
+        // up for two hours — so the per-kind audit has no grace window
+        // left to hide behind.
+        let last_claimed: HashMap<String, DateTime<Utc>> =
+            [("scan".to_string(), secs_ago(2))].into_iter().collect();
+
+        let snapshot = run_both_audits(&repo, &last_claimed, secs_ago(7_200)).await;
+
+        // The pre-change instrument says nothing at all — on either
+        // reason, for the one kind there is.
+        for reason in [
+            STARVED_UNREGISTERED,
+            STARVED_NOT_CLAIMED,
+            STARVED_OLDEST_ROW,
+        ] {
+            assert_eq!(
+                counter_value(
+                    &snapshot,
+                    METRIC_STARVED,
+                    &[("kind", "scan"), ("reason", reason)]
+                ),
+                0,
+                "the per-kind audit must read this queue as healthy — that is the gap: \
+                 {snapshot:?}"
+            );
+        }
+        // And the per-class audit names the class that is losing, and
+        // the allocation point it is losing at.
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_CLASS_STARVED,
+                &[
+                    ("class", TaskTier::Normal.as_str()),
+                    ("reason", ClassStarvationReason::NotClaimed.as_str()),
+                ],
+            ),
+            1,
+            "the class with work waiting and no service must be reported: {snapshot:?}"
+        );
+        // The class that IS being served is not reported, so the finding
+        // is a verdict rather than a restatement of "this kind has a
+        // backlog".
+        for class in [TaskTier::Interactive.as_str(), TaskTier::Bulk.as_str()] {
+            for reason in [
+                ClassStarvationReason::NotClaimed.as_str(),
+                ClassStarvationReason::AwaitingCapacity.as_str(),
+            ] {
+                assert_eq!(
+                    counter_value(
+                        &snapshot,
+                        METRIC_CLASS_STARVED,
+                        &[("class", class), ("reason", reason)],
+                    ),
+                    0,
+                    "{class} is being served or idle and must not be reported: {snapshot:?}"
+                );
+            }
+        }
+    }
+
+    /// **Gap two.** A class whose rows are waiting for permits.
+    ///
+    /// The rows have been claimed, so they are `running` and outside the
+    /// claim-eligible backlog **by construction**: no SQL read of
+    /// pending rows can see them, whatever its threshold. The per-kind
+    /// audit here sees a kind that is being claimed with one young
+    /// pending row — a perfectly healthy queue — while three rows of
+    /// the `Normal` class have held a claim for twelve minutes without
+    /// being given the capacity to run.
+    ///
+    /// This is also the debt the lease-renewal move took on: once
+    /// renewal starts at the claim, `locked_until` no longer separates
+    /// *queued* from *executing*, so this count is the only thing that
+    /// tells a row waiting for capacity from a row running a slow
+    /// handler.
+    #[tokio::test]
+    async fn rows_waiting_for_a_permit_are_invisible_to_the_per_kind_audit() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        // The per-kind view: one young pending row. The starved rows
+        // are NOT here — they are `running`.
+        repo.seed_backlog(vec![backlog("scan", 1, secs_ago(10))]);
+        repo.seed_band_samples(vec![
+            one_kind_band(
+                "scan",
+                QueueServiceSample {
+                    pending_eligible: 1,
+                    oldest_pending_at: Some(secs_ago(10)),
+                    last_served_at: Some(secs_ago(1)),
+                    ..empty_sample()
+                },
+            ),
+            // Normal: nothing pending at all, three rows holding claims
+            // and queued behind a run permit for 700 s, nothing of the
+            // class served in two hours.
+            one_kind_band(
+                "scan",
+                QueueServiceSample {
+                    awaiting_capacity: 3,
+                    oldest_capacity_wait_at: Some(secs_ago(700)),
+                    last_served_at: Some(secs_ago(7_200)),
+                    ..empty_sample()
+                },
+            ),
+            empty_band(),
+        ]);
+        let last_claimed: HashMap<String, DateTime<Utc>> =
+            [("scan".to_string(), secs_ago(1))].into_iter().collect();
+
+        let snapshot = run_both_audits(&repo, &last_claimed, secs_ago(7_200)).await;
+
+        for reason in [
+            STARVED_UNREGISTERED,
+            STARVED_NOT_CLAIMED,
+            STARVED_OLDEST_ROW,
+        ] {
+            assert_eq!(
+                counter_value(
+                    &snapshot,
+                    METRIC_STARVED,
+                    &[("kind", "scan"), ("reason", reason)]
+                ),
+                0,
+                "a permit waiter is `running`, so no per-kind read of the pending backlog \
+                 can report it at any threshold: {snapshot:?}"
+            );
+        }
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_CLASS_STARVED,
+                &[
+                    ("class", TaskTier::Normal.as_str()),
+                    ("reason", ClassStarvationReason::AwaitingCapacity.as_str()),
+                ],
+            ),
+            1,
+            "the class queued behind the permit must be reported, and the reason must name \
+             the permit rather than the claim: {snapshot:?}"
+        );
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_CLASS_STARVED,
+                &[
+                    ("class", TaskTier::Normal.as_str()),
+                    ("reason", ClassStarvationReason::NotClaimed.as_str()),
+                ],
+            ),
+            0,
+            "the claim is not where this class is losing: {snapshot:?}"
+        );
+    }
+
+    /// **Gap three.** A kind starving at its own permit point, inside a
+    /// class a *sibling kind* keeps re-arming.
+    ///
+    /// The permits are allocated per registered kind — the dispatcher
+    /// holds one allocator per kind, and the per-class time floor and
+    /// the class-blind age net live inside it — so the guarantee is
+    /// enforced per kind **and** per class. ADR 0066 D5: *"An
+    /// observation coarser than the enforcement is a statistic and not
+    /// an alarm — a guarantee enforced per kind and per class, and
+    /// watched per class alone, can be reported healthy by a sibling
+    /// kind's progress."*
+    ///
+    /// This is that constellation, and the class-wide verdict is
+    /// **right** about what it was asked: one `scan` row of the `Normal`
+    /// class has held a claim for 700 s behind that kind's permit, while
+    /// `prefetch` rows of the same class completed a second ago. The
+    /// class's newest completion is therefore a second old, the
+    /// class-wide reference instant is re-armed, and the class reads as
+    /// served — by a kind whose allocator is not the one that is stuck.
+    /// The finding lives at `(class, kind)` and nowhere coarser.
+    #[tokio::test]
+    async fn a_kind_starved_at_its_permit_is_reported_though_a_sibling_kind_just_completed() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.seed_band_samples(vec![
+            empty_band(),
+            band(vec![
+                // `scan`: one row claimed and queued behind this kind's
+                // run permit for 700 s, and nothing of this kind and
+                // class has ever completed.
+                (
+                    "scan",
+                    QueueServiceSample {
+                        awaiting_capacity: 1,
+                        oldest_capacity_wait_at: Some(secs_ago(700)),
+                        ..empty_sample()
+                    },
+                ),
+                // `prefetch`: nothing waiting, and a completion a second
+                // ago. A different kind, the same class.
+                (
+                    "prefetch",
+                    QueueServiceSample {
+                        last_served_at: Some(secs_ago(1)),
+                        ..empty_sample()
+                    },
+                ),
+            ]),
+            empty_band(),
+        ]);
+        let dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        dispatcher.audit_class_service().await;
+        drop(guard);
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        // The class-wide instrument says nothing, on either reason —
+        // that is the gap, and it is not a tuning failure: the sibling's
+        // completion is a real completion of that class.
+        for reason in [
+            ClassStarvationReason::NotClaimed.as_str(),
+            ClassStarvationReason::AwaitingCapacity.as_str(),
+        ] {
+            assert_eq!(
+                counter_value(
+                    &snapshot,
+                    METRIC_CLASS_STARVED,
+                    &[("class", TaskTier::Normal.as_str()), ("reason", reason)],
+                ),
+                0,
+                "the class-wide verdict is re-armed by the sibling kind — that is the \
+                 observation this granularity exists to replace: {snapshot:?}"
+            );
+        }
+        // And the per-kind instrument names the kind and the allocation
+        // point.
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_CLASS_KIND_STARVED,
+                &[
+                    ("class", TaskTier::Normal.as_str()),
+                    ("kind", "scan"),
+                    ("reason", ClassStarvationReason::AwaitingCapacity.as_str()),
+                ],
+            ),
+            1,
+            "the kind queued behind its own permit must be reported, with the permit named \
+             rather than the claim: {snapshot:?}"
+        );
+        // The sibling is not accused of anything: it has nothing
+        // waiting, so it is owed no service.
+        for reason in [
+            ClassStarvationReason::NotClaimed.as_str(),
+            ClassStarvationReason::AwaitingCapacity.as_str(),
+        ] {
+            assert_eq!(
+                counter_value(
+                    &snapshot,
+                    METRIC_CLASS_KIND_STARVED,
+                    &[
+                        ("class", TaskTier::Normal.as_str()),
+                        ("kind", "prefetch"),
+                        ("reason", reason),
+                    ],
+                ),
+                0,
+                "the kind that is flowing is idle, not starved: {snapshot:?}"
+            );
+        }
+        assert_eq!(
+            counter_value(
+                &snapshot,
+                METRIC_CLASS_KIND_STARVED,
+                &[
+                    ("class", TaskTier::Normal.as_str()),
+                    ("kind", "scan"),
+                    ("reason", ClassStarvationReason::NotClaimed.as_str()),
+                ],
+            ),
+            0,
+            "the claim is not where this kind is losing: {snapshot:?}"
+        );
+    }
+
+    /// The observation covers **every** class, including the one with no
+    /// reserved share.
+    ///
+    /// The bands it asks about are `class_bands()`, not the claim's
+    /// `waited_on_bands()`. Building the observation from the
+    /// reservation's list is the plausible mistake, and it would leave
+    /// `Bulk` — the class whose service nothing else holds, because
+    /// nobody is waiting on it — unobserved.
+    #[tokio::test]
+    async fn the_service_audit_observes_every_class_not_only_the_reserved_ones() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher.audit_class_service().await;
+
+        let queries = repo.band_queries();
+        assert_eq!(queries.len(), 1, "one audit, one observation");
+        let expected: Vec<PriorityBand> = class_bands().into_iter().map(|(_, band)| band).collect();
+        assert_eq!(
+            queries[0], expected,
+            "the audit must observe every class's band, in class order"
+        );
+        assert!(
+            queries[0].len() > hort_domain::types::task_tier::waited_on_bands().len(),
+            "an observation built from the reservation's band list would be blind to Bulk"
+        );
+    }
+
+    /// The audit answers at the **configured** threshold, not at the
+    /// domain default.
+    ///
+    /// The number is read in the worker's composition root and the
+    /// verdict it feeds is also emitted by `hort-server`, so "the knob
+    /// was configured but never threaded" would look exactly like "the
+    /// knob was never set" — the same shape the two attempt caps had
+    /// while one of them was a `const`. One sample, two thresholds, two
+    /// verdicts.
+    #[tokio::test]
+    async fn the_service_audit_answers_at_the_configured_threshold() {
+        /// The class has had work waiting this long with nothing of it
+        /// served — between the two thresholds below.
+        const WAITED_SECS: i64 = 400;
+
+        for (threshold_secs, expected) in [(900u64, 0u64), (300u64, 1u64)] {
+            let repo = Arc::new(DispatcherMockRepo::new());
+            repo.seed_band_samples(vec![
+                empty_band(),
+                one_kind_band(
+                    "scan",
+                    QueueServiceSample {
+                        pending_eligible: 1,
+                        oldest_pending_at: Some(secs_ago(WAITED_SECS)),
+                        ..empty_sample()
+                    },
+                ),
+                empty_band(),
+            ]);
+            let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+            dispatcher.class_service_threshold = Duration::from_secs(threshold_secs);
+            assert_eq!(
+                dispatcher.class_service_threshold(),
+                Duration::from_secs(threshold_secs),
+                "the accessor reports the number the dispatcher was built with — what a \
+                 composition test asserts against `WorkerConfig`"
+            );
+
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let guard = metrics::set_default_local_recorder(&recorder);
+            dispatcher.audit_class_service().await;
+            drop(guard);
+
+            let snapshot = snapshotter.snapshot().into_vec();
+            assert_eq!(
+                counter_value(
+                    &snapshot,
+                    METRIC_CLASS_STARVED,
+                    &[
+                        ("class", TaskTier::Normal.as_str()),
+                        ("reason", ClassStarvationReason::NotClaimed.as_str()),
+                    ],
+                ),
+                expected,
+                "{WAITED_SECS} s of unserved waiting against a {threshold_secs} s \
+                 threshold: {snapshot:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn register_threads_the_configured_service_interval_to_the_allocator() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let mut dispatcher = make_dispatcher(repo as Arc<dyn JobsRepository>);
+        dispatcher.class_service_threshold = Duration::from_secs(90);
+        dispatcher.register(
+            Arc::new(NoopHandler::new("scan", Arc::new(AtomicUsize::new(0)))),
+            1,
+        );
+        assert_eq!(
+            dispatcher.permits["scan"].service_interval(),
+            permit_service_interval(Duration::from_secs(90))
+        );
+    }
+
+    /// The **second** number derived from the same threshold reaches
+    /// the allocator too.
+    ///
+    /// The age net's bound is not an independent knob: there is one
+    /// operator variable and the allocation derives both enforcement
+    /// times from it, so this asserts the threading rather than the
+    /// arithmetic (which is the domain's own test). A bound that
+    /// arrived as a constant would agree with the derivation only at
+    /// the default — the shape the two attempt caps had.
+    #[test]
+    fn register_threads_the_configured_threshold_to_the_age_net() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let mut dispatcher = make_dispatcher(repo as Arc<dyn JobsRepository>);
+        dispatcher.class_service_threshold = Duration::from_secs(90);
+        dispatcher.register(
+            Arc::new(NoopHandler::new("scan", Arc::new(AtomicUsize::new(0)))),
+            1,
+        );
+        assert_eq!(
+            dispatcher.permits["scan"].age_net_bound(),
+            permit_age_net_bound(Duration::from_secs(90))
+        );
+    }
+
+    /// A class being served is not reported, however deep and old its
+    /// queue is — the false positive the per-kind age axis has and this
+    /// one must not acquire.
+    #[tokio::test]
+    async fn a_deep_but_draining_class_is_not_reported() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.seed_band_samples(vec![
+            empty_band(),
+            empty_band(),
+            one_kind_band(
+                "scan",
+                QueueServiceSample {
+                    pending_eligible: 10_000,
+                    oldest_pending_at: Some(secs_ago(7_200)),
+                    last_served_at: Some(secs_ago(3)),
+                    ..empty_sample()
+                },
+            ),
+        ]);
+        let dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        dispatcher.audit_class_service().await;
+        drop(guard);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        for reason in [
+            ClassStarvationReason::NotClaimed.as_str(),
+            ClassStarvationReason::AwaitingCapacity.as_str(),
+        ] {
+            assert_eq!(
+                counter_value(
+                    &snapshot,
+                    METRIC_CLASS_STARVED,
+                    &[("class", TaskTier::Bulk.as_str()), ("reason", reason)],
+                ),
+                0,
+                "a two-hour-old oldest row in a class that completed something three \
+                 seconds ago is a deep queue draining, not starvation: {snapshot:?}"
+            );
+        }
+    }
+
+    /// A failing sample is warn-and-continue, exactly like the per-kind
+    /// audit's own query failure: the poll loop must not die for a
+    /// diagnostic read.
+    #[tokio::test]
+    async fn the_service_audit_swallows_a_query_failure() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.fail_band_samples();
+        let dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        dispatcher.audit_class_service().await;
+        drop(guard);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        for class in TaskTier::ALL {
+            for reason in [
+                ClassStarvationReason::NotClaimed.as_str(),
+                ClassStarvationReason::AwaitingCapacity.as_str(),
+            ] {
+                assert_eq!(
+                    counter_value(
+                        &snapshot,
+                        METRIC_CLASS_STARVED,
+                        &[("class", class.as_str()), ("reason", reason)],
+                    ),
+                    0,
+                    "a failed sample must accuse nobody: {snapshot:?}"
+                );
+            }
+        }
+    }
+
+    /// A repository that answers for no bands at all makes the audit
+    /// inert rather than mislabelling a class.
+    ///
+    /// That is the shape every `JobsRepository` fixture in the tree
+    /// presents — `MockJobsRepository` seeds no samples unless a test
+    /// says otherwise, and the port's own additive default answers for
+    /// none either — so this is the audit's behaviour almost everywhere
+    /// it is reachable from a test. Pairing a short answer with the
+    /// band list positionally would label a class with another class's
+    /// facts.
+    #[tokio::test]
+    async fn an_unseeded_sample_leaves_the_audit_inert() {
+        let repo = Arc::new(crate::use_cases::test_support::MockJobsRepository::new());
+        let dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        dispatcher.audit_class_service().await;
+        drop(guard);
+
+        assert_eq!(
+            repo.band_sample_calls().len(),
+            1,
+            "the audit must still have asked"
+        );
+        let snapshot = snapshotter.snapshot().into_vec();
+        for class in TaskTier::ALL {
+            assert_eq!(
+                counter_value(
+                    &snapshot,
+                    METRIC_CLASS_STARVED,
+                    &[
+                        ("class", class.as_str()),
+                        ("reason", ClassStarvationReason::NotClaimed.as_str()),
+                    ],
+                ),
+                0,
+                "a repository that observes no bands must accuse nobody: {snapshot:?}"
+            );
+        }
+    }
+
+    /// The capacity wait that began at the claim ends when the permit is
+    /// granted — and before the handler runs.
+    ///
+    /// Both halves matter. Without the clear, every row a worker ever
+    /// claimed would read as queued-for-capacity for the whole of its
+    /// execution, so the count the per-class audit reads would be "rows
+    /// this worker holds" rather than "rows waiting for capacity" and
+    /// the verdict would fire on a perfectly healthy worker. The
+    /// ordering is what makes the count mean the wait and not the run.
+    #[tokio::test]
+    async fn the_dispatch_loop_ends_the_capacity_wait_at_the_grant() {
+        /// Records how many capacity-wait clears had landed by the time
+        /// the handler was entered.
+        struct ObservingHandler {
+            repo: Arc<DispatcherMockRepo>,
+            clears_seen_at_run: Arc<AtomicUsize>,
+        }
+        impl TaskHandler for ObservingHandler {
+            fn kind(&self) -> &'static str {
+                "noop"
+            }
+            fn run<'a>(
+                &'a self,
+                _params: &'a serde_json::Value,
+                _ctx: TaskContext,
+            ) -> BoxFuture<'a, DomainResult<TaskOutcome>> {
+                self.clears_seen_at_run
+                    .store(self.repo.capacity_wait_clears().len(), Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(TaskOutcome::Completed {
+                        result_summary: serde_json::Value::Null,
+                    })
+                })
+            }
+        }
+
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let row = make_job_row("noop");
+        let job_id = row.id;
+        repo.seed_batch(vec![row]);
+        let clears_seen_at_run = Arc::new(AtomicUsize::new(0));
+        let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher.register(
+            Arc::new(ObservingHandler {
+                repo: repo.clone(),
+                clears_seen_at_run: clears_seen_at_run.clone(),
+            }),
+            1,
+        );
+        dispatcher.poll_interval_secs = 0;
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        assert_eq!(
+            repo.capacity_wait_clears(),
+            vec![(job_id, "test-worker".to_string())],
+            "the granted row's capacity wait must be cleared, under this worker's own id — \
+             the write is fenced on `locked_by`, so a wrong id would clear nothing"
+        );
+        assert_eq!(
+            clears_seen_at_run.load(Ordering::SeqCst),
+            1,
+            "the clear must land BEFORE the handler runs, or the count means \
+             'rows this worker holds' instead of 'rows waiting for capacity'"
+        );
+        assert_eq!(
+            repo.mark_completed_calls(),
+            vec![job_id],
+            "and the row still runs to completion"
+        );
+    }
+
+    /// A **fenced** capacity-wait clear declines the dispatch: no
+    /// handler runs and nothing is written.
+    ///
+    /// `clear_capacity_wait` fences on `locked_by = worker_id AND
+    /// status = 'running'`, so `Ok(false)` is that fence answering "this
+    /// row is not yours" — from the same predicate the lease renewal
+    /// uses, at the last point before the handler. Running it anyway is
+    /// a second concurrent execution of a row its holder is already
+    /// running: the result write is fenced on `attempts` so the row's
+    /// state survives, but the work doubles, a second scan occupies
+    /// scanner capacity, and both runs can append to the same stream.
+    ///
+    /// The renewal guard does **not** cover this, which is why this test
+    /// is about the dispatch and not about the write:
+    /// `stop_renewing_and_check_fence` is read after `handler.run` has
+    /// returned on the normal path and in place of it on the refusal
+    /// path, so on no path does it stop an execution — it only discards
+    /// a result the work has already produced.
+    ///
+    /// Nor is this work dropped on the floor, which is what the absent
+    /// `reschedule` below asserts: the other worker holds the row, and
+    /// returning it to `pending` from here would be this worker writing
+    /// to a row it has just been told is not its own. In the one shape
+    /// where nobody holds it — the sweep requeued it and no sibling
+    /// re-claimed it — the row is already `pending` and the next poll
+    /// takes it.
+    #[tokio::test]
+    async fn a_fenced_capacity_wait_clear_declines_the_dispatch() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let row = make_job_row("noop");
+        repo.seed_batch(vec![row]);
+        repo.set_capacity_wait_answer(Some(false));
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher.register(Arc::new(NoopHandler::new("noop", run_count.clone())), 1);
+        dispatcher.poll_interval_secs = 0;
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        assert_eq!(
+            repo.capacity_wait_clears().len(),
+            1,
+            "the clear is attempted exactly once per granted row — it is the check, so it still \
+             runs"
+        );
+        assert_eq!(
+            run_count.load(Ordering::SeqCst),
+            0,
+            "no handler may run after the fence said the row is not ours"
+        );
+        assert!(
+            repo.mark_completed_calls().is_empty()
+                && repo.mark_failed_calls().is_empty()
+                && repo.reschedule_calls().is_empty(),
+            "and nothing of the row's is written — not the outcome, and not a return to \
+             `pending`, which would be a write to a row this worker was just told it does not \
+             hold: completed={:?} failed={:?} rescheduled={:?}",
+            repo.mark_completed_calls(),
+            repo.mark_failed_calls(),
+            repo.reschedule_calls(),
+        );
+    }
+
+    /// A capacity-wait clear that could not be *made* still runs the
+    /// row.
+    ///
+    /// The counterpart of the test above, and the distinction is the
+    /// whole point: `Err` is the absence of an answer, not a statement
+    /// about ownership, so declining here would trade a metric for a
+    /// stall. The row keeps a non-NULL `capacity_waiting_since` while
+    /// its handler runs, so its class over-reports one waiter until the
+    /// outcome write lands — bounded by the handler's own runtime, and
+    /// the direction ADR 0066 asks to err in.
+    #[tokio::test]
+    async fn a_capacity_wait_clear_that_did_not_answer_still_runs_the_row() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let row = make_job_row("noop");
+        let job_id = row.id;
+        repo.seed_batch(vec![row]);
+        repo.set_capacity_wait_answer(None);
+        let run_count = Arc::new(AtomicUsize::new(0));
+        let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        dispatcher.register(Arc::new(NoopHandler::new("noop", run_count.clone())), 1);
+        dispatcher.poll_interval_secs = 0;
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move { dispatcher.run(cancel_clone).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        assert_eq!(
+            repo.capacity_wait_clears().len(),
+            1,
+            "the clear is attempted exactly once per granted row"
+        );
+        assert!(
+            run_count.load(Ordering::SeqCst) >= 1,
+            "a database that did not answer is no statement about who holds the row, so the \
+             handler must still run"
+        );
+        assert_eq!(
+            repo.mark_completed_calls(),
+            vec![job_id],
+            "and the row must still be closed out"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Abandoned-lease sweep
     // -----------------------------------------------------------------------
 
@@ -3606,6 +6119,203 @@ mod tests {
     // -----------------------------------------------------------------------
     // Lease renewal
     // -----------------------------------------------------------------------
+
+    /// **A claimed row waiting for a permit keeps its lease.**
+    ///
+    /// `locked_until` says a live worker *owns* the row, not that a
+    /// handler is executing it. While the renewal started inside
+    /// `dispatch_one`, a row that won the claim and then waited for a
+    /// concurrency permit held a lease nobody renewed — so the sweep
+    /// recovered it after `lock_duration × (1 +
+    /// LEASE_EXPIRY_GRACE_MULTIPLE)`, reporting a death that had not
+    /// happened and spending one of the row's attempts on a queue
+    /// position. An attempt budget bounds *failing work*, and a permit
+    /// wait is not evidence about the job: nothing was attempted,
+    /// nothing failed.
+    ///
+    /// The wait is not a contrived state. The claim takes `batch_size`
+    /// rows per poll regardless of how many permits are free, and the
+    /// shipped compose default claims four against a `scan` concurrency
+    /// of one — so three of every four claimed rows begin by waiting.
+    ///
+    /// The sweep here is a **sibling replica's**: the sweep runs on
+    /// every replica with no leader election, and a replica that did not
+    /// claim the row is exactly who recovers a dead worker's. It answers
+    /// from the lease this dispatcher actually wrote — see
+    /// `DispatcherMockRepo::model_leases` — while *which arguments* the
+    /// dispatcher's own sweep passes is pinned separately by
+    /// [`sweep_passes_the_policy_allow_list_and_a_lease_derived_grace`].
+    #[tokio::test(start_paused = true)]
+    async fn a_claimed_row_waiting_for_a_permit_keeps_its_lease() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.model_leases();
+
+        // Two rows of one kind, one permit: the second is claimed,
+        // `running`, and then waits. Both `Bulk`, which is the class
+        // ADR 0066's floor makes wait under sustained waited-on load.
+        let waiting = make_scan_row(TriggerSource::Cron.as_str());
+        let waiting_id = waiting.id;
+        let waiting_attempts = waiting.attempts;
+        repo.seed_batch(vec![make_scan_row(TriggerSource::Cron.as_str()), waiting]);
+
+        let mut worker = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        // Read off the dispatcher rather than restated, so a change to
+        // either number cannot leave this test asserting about a window
+        // the sweep no longer uses.
+        let sweepable_after = worker.lock_duration * (1 + LEASE_EXPIRY_GRACE_MULTIPLE);
+        let started = Arc::new(AtomicUsize::new(0));
+        worker.register(
+            Arc::new(OccupyingScanHandler {
+                // Past the window, so the second row is still waiting
+                // when the sweep below runs.
+                hold: sweepable_after * 2,
+                started: started.clone(),
+            }),
+            // The production `scan` concurrency: parallelism comes from
+            // replicas, not from intra-process concurrency.
+            1,
+        );
+        // A one-second poll, because the paused clock only auto-advances
+        // while the runtime is idle: `make_dispatcher`'s 999_999 s would
+        // put the first claim past the window under test, and the 0 the
+        // real-clock fairness tests use would never let the loop idle.
+        worker.poll_interval_secs = 1;
+
+        let cancel = CancellationToken::new();
+        let worker_handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { worker.run(cancel).await }
+        });
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "the premise: the batch was claimed and only the first row got the one permit"
+        );
+
+        // Sit out the whole window an unrenewed lease lapses in.
+        tokio::time::sleep(sweepable_after + Duration::from_secs(5)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "the second row must still be waiting for its permit — a run in which it had \
+             started proves nothing about a lease held across a wait"
+        );
+
+        let sweeper = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        sweeper.sweep_abandoned_leases().await;
+
+        assert_eq!(
+            repo.model_requeued(),
+            Vec::new(),
+            "a claimed row waiting for a permit is owned by a live worker; the sweep must \
+             not call it abandoned"
+        );
+        assert_eq!(
+            repo.modelled_attempts(waiting_id),
+            Some(waiting_attempts),
+            "and its attempt budget must be untouched — a requeue spends one by making the \
+             row claimable again"
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), worker_handle)
+            .await
+            .expect("dispatcher join timed out")
+            .expect("task did not panic")
+            .expect("run returned Err");
+
+        // And it still runs when the permit comes free. Keeping a lease
+        // across the wait is only the right answer if the wait ends in
+        // the work being done — a row that held its lease and then never
+        // ran would be a worse outcome than the requeue, not a better one.
+        tokio::time::timeout(sweepable_after * 4, async {
+            while started.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .await
+        .expect("the row that waited must run once the permit is released");
+    }
+
+    /// **Worker death is still detected.**
+    ///
+    /// The lease must not become unconditional. A fix that passed the
+    /// test above by never letting a lease lapse would have disabled
+    /// the only recovery a row whose worker died has — and for
+    /// `kind='scan'` that is not clutter but a lost capability, because
+    /// `jobs_scan_unique` blocks any further scan job for the artifact
+    /// while the abandoned row sits in `running`.
+    ///
+    /// Same lease model and same sibling-replica sweep as the test
+    /// above, so the pair differs in exactly one fact: here the renewal
+    /// stops. The guard is dropped, which aborts the renewal task — and
+    /// from the database that is indistinguishable from the process
+    /// being gone, which is the whole discriminator.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_workers_claimed_row_is_still_swept() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.model_leases();
+        let row = make_scan_row(TriggerSource::Cron.as_str());
+        let row_id = row.id;
+        let row_attempts = row.attempts;
+        repo.seed_batch(vec![row]);
+
+        let worker = Arc::new(make_dispatcher(repo.clone() as Arc<dyn JobsRepository>));
+        let sweepable_after = worker.lock_duration * (1 + LEASE_EXPIRY_GRACE_MULTIPLE);
+
+        // Claim the row and start its lease where the dispatch loop now
+        // starts it — at the claim, before any permit or handler.
+        let claimed = worker
+            .job_repo
+            .claim_pending_by_kinds(
+                &["scan"],
+                worker.batch_size,
+                &worker.worker_id,
+                worker.lock_duration,
+                &ClaimReservation::waited_on(TEST_RESERVED_SLOTS_PER_CLASS),
+            )
+            .await
+            .expect("the mock claim cannot fail");
+        assert_eq!(claimed.len(), 1, "the premise: one row was claimed");
+        let renewal = worker.spawn_lease_renewal(row_id, "scan".to_string());
+
+        // While the worker is alive the row is not sweepable — which is
+        // also what keeps this test from passing against a renewal that
+        // never ran at all.
+        tokio::time::sleep(sweepable_after).await;
+        assert!(
+            !repo.renew_calls().is_empty(),
+            "the premise: the worker was holding the lease before it died"
+        );
+        let sweeper = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        sweeper.sweep_abandoned_leases().await;
+        assert_eq!(
+            repo.model_requeued(),
+            Vec::new(),
+            "a renewed lease is not sweepable"
+        );
+
+        // The worker dies here: the guard goes, and the renewal task
+        // with it. Nothing pushes `locked_until` forward again.
+        drop(renewal);
+
+        tokio::time::sleep(sweepable_after + Duration::from_secs(5)).await;
+        sweeper.sweep_abandoned_leases().await;
+
+        assert_eq!(
+            repo.model_requeued(),
+            vec![RequeuedJob {
+                id: row_id,
+                kind: "scan".to_string(),
+                attempts: row_attempts,
+                outcome: RequeueOutcome::Requeued,
+            }],
+            "a lease that stopped being renewed for a full lease plus the grace is a dead \
+             owner, and the row goes back to pending with its counter left for the next claim"
+        );
+    }
 
     /// A handler that outlives its lease keeps the lease alive.
     ///
@@ -3763,7 +6473,7 @@ mod tests {
         });
         let row = make_job_row("slow-kind");
 
-        dispatcher.dispatch_one(row, handler).await;
+        dispatch_one_with_lease(&dispatcher, row, handler).await;
 
         assert_eq!(repo.renew_calls().len(), 1, "renewal stopped at the fence");
         assert!(
@@ -3781,6 +6491,56 @@ mod tests {
         );
     }
 
+    /// The fence covers the **refusal** write too, not only the
+    /// handler's.
+    ///
+    /// This state is reachable only because the renewal starts at the
+    /// claim: the permit wait now sits between the claim and the
+    /// authority re-check, so a worker can have lost the row before it
+    /// ever asks the question. An unfenced refusal here would write a
+    /// terminal `failed` over a row another worker is already running —
+    /// the same clobber the handler path is fenced against, reached by
+    /// a path that writes without calling a handler at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_lost_its_row_discards_a_refusal_too() {
+        let kind = "retention-purge";
+        assert!(
+            DESTRUCTIVE_TASK_KINDS.contains(&kind),
+            "this test is only about what it claims while {kind:?} is destructive"
+        );
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.set_renew_answer(Some(false));
+        let dispatcher = Arc::new(make_dispatcher_with(
+            repo.clone() as Arc<dyn JobsRepository>,
+            refusing_reauthorizer(),
+        ));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<dyn TaskHandler> = Arc::new(NoopHandler::new(kind, runs.clone()));
+        let row = make_job_row(kind);
+
+        let renewal = dispatcher.spawn_lease_renewal(row.id, kind.to_string());
+        // The permit wait — one lease of it, so a renewal tick lands and
+        // reports the row is no longer ours before `dispatch_one` is
+        // entered at all.
+        tokio::time::sleep(dispatcher.lock_duration).await;
+        dispatcher.dispatch_one(row, handler, renewal).await;
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "the refusal still stops the handler — losing the row does not make it run"
+        );
+        assert!(
+            repo.mark_failed_calls().is_empty(),
+            "the refusal is an outcome write like any other, and a worker that no longer \
+             holds the row must not make it"
+        );
+        assert!(
+            repo.reschedule_calls().is_empty() && repo.mark_completed_calls().is_empty(),
+            "and it must not substitute a different write for the one the fence refused"
+        );
+    }
+
     /// The fence does not fire on the ordinary path — a handler that
     /// keeps its row writes its outcome as usual.
     #[tokio::test(start_paused = true)]
@@ -3795,7 +6555,7 @@ mod tests {
         let row = make_job_row("slow-kind");
         let row_id = row.id;
 
-        dispatcher.dispatch_one(row, handler).await;
+        dispatch_one_with_lease(&dispatcher, row, handler).await;
 
         assert_eq!(
             repo.mark_completed_calls(),
@@ -3822,6 +6582,8 @@ mod tests {
             999_999,
             16,
             TEST_ATTEMPT_CAP,
+            TEST_RESERVED_SLOTS_PER_CLASS,
+            TEST_CLASS_SERVICE_THRESHOLD,
         ));
 
         let guard = dispatcher.spawn_lease_renewal(Uuid::new_v4(), "scan".to_string());
@@ -3856,7 +6618,7 @@ mod tests {
         });
         let row = make_job_row("slow-kind");
 
-        dispatcher.dispatch_one(row, handler).await;
+        dispatch_one_with_lease(&dispatcher, row, handler).await;
 
         let during = repo.renew_calls().len();
         assert_eq!(

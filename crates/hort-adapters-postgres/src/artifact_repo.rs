@@ -321,6 +321,15 @@ impl ArtifactRepository for PgArtifactRepository {
             let deleted_at = Utc::now();
             let event = artifact.delete(deleted_at)?;
 
+            // ONCE-ONLY-APPEND: `ArtifactDeleted` is the artifact's
+            // terminal event. The read above and the UPDATE below both
+            // carry `deleted_at IS NULL`, and a zero-row UPDATE rolls
+            // this transaction back including the append — so an artifact
+            // takes exactly one of these, ever. It records a deletion
+            // that the same transaction performs, and nothing reads an
+            // artifact's stream after its terminal event, so refusing it
+            // at the event cap would leave a row soft-deleted with no
+            // event saying so.
             self.event_store
                 .append_in_tx(
                     &mut uow,

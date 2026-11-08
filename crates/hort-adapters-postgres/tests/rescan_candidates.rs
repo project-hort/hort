@@ -24,18 +24,24 @@
 //! - `select_eligible_returns_null_quarantine_artifact`
 //! - `select_eligible_returns_null_quarantine_no_policy_artifact`
 //!
-//! `select_stranded` coverage matrix (issue #6 — stranded-scan recovery;
-//! widened by issue #115 defect (a) cure — mirrors the predicate:
-//! `quarantine_status='quarantined'` + (most-recent `kind='scan'` job
-//! `status='failed'` OR no `kind='scan'` job at all) + resolved policy
-//! actually scans, no interval/`now` gating):
+//! `select_stranded` coverage matrix — the stranded-scan recovery ADR
+//! 0007's retry-exhaustion split introduced, its later widening to
+//! artifacts with no scan job at all, and its "A reached verdict
+//! supersedes an absent one" amendment. Mirrors the predicate:
+//! `quarantine_status IN ('quarantined', 'scan_indeterminate')` +
+//! (most-recent `kind='scan'` job `status='failed'` OR no `kind='scan'`
+//! job at all) + resolved policy actually scans, no interval/`now`
+//! gating):
 //!
 //! - `select_stranded_returns_quarantined_artifact_with_failed_last_scan`
 //! - `select_stranded_returns_quarantined_artifact_with_no_scan_job_under_scanning_policy` (#115)
 //! - `select_stranded_skips_quarantined_artifact_with_no_scan_job_under_scan_waived_policy` (#115)
 //! - `select_stranded_skips_quarantined_artifact_with_pending_last_scan`
 //! - `select_stranded_skips_released_artifact_even_with_failed_scan`
-//! - `select_stranded_skips_scan_indeterminate_artifact_even_with_failed_scan`
+//! - `select_stranded_returns_scan_indeterminate_artifact_with_failed_last_scan`
+//! - `select_stranded_returns_scan_indeterminate_artifact_with_no_scan_job_under_scanning_policy`
+//! - `select_stranded_skips_scan_indeterminate_artifact_under_scan_waived_policy`
+//! - `select_stranded_skips_soft_deleted_scan_indeterminate_artifact`
 //! - `select_stranded_skips_rejected_artifact_even_with_failed_scan`
 //! - `select_stranded_skips_artifact_with_newer_in_flight_job_despite_older_failed_job`
 //!
@@ -175,8 +181,9 @@ async fn seed_repo_scoped_policy(pool: &PgPool, repo_id: Uuid, rescan_interval_h
 /// Seed a non-archived repository-scoped policy with `scan_backends: []`
 /// — the operator's explicit ScanWaived opt-out. Used by the #115 item2
 /// `select_stranded` scan-policy-aware guard tests: a job-less (or
-/// failed-job) quarantined artifact under this policy must NOT be
-/// treated as stranded — see `crates/hort-adapters-postgres/src/rescan_candidates.rs`'s
+/// failed-job) artifact under this policy must NOT be treated as
+/// stranded, in either hold — see
+/// `crates/hort-adapters-postgres/src/rescan_candidates.rs`'s
 /// `select_stranded` doc comment.
 async fn seed_repo_scoped_scan_waived_policy(pool: &PgPool, repo_id: Uuid) -> Uuid {
     let policy_id = Uuid::new_v4();
@@ -797,14 +804,20 @@ async fn select_stranded_skips_released_artifact_even_with_failed_scan() {
 }
 
 // ---------------------------------------------------------------------
-// (e) scan_indeterminate artifact with a failed scan job → NOT returned
-//     — the critical ADR 0007 acceptance criterion: (b) must not
-//     re-pick the terminal fail-closed state.
+// (e) scan_indeterminate artifact with a failed scan job → RETURNED.
+//     The ADR 0007 "A reached verdict supersedes an absent one" half:
+//     the state is a hold, so a rescan has somewhere to land — a
+//     non-blocking verdict returns the artifact to `quarantined` and a
+//     blocking one condemns it. This assertion was the exact inverse
+//     until that amendment, and the exclusion was what made the state
+//     terminal in practice: this query is the only thing that re-picks
+//     an artifact for a scan, so nothing else could have delivered the
+//     verdict the transition table now admits.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
 #[serial(hort_pg_db)]
-async fn select_stranded_skips_scan_indeterminate_artifact_even_with_failed_scan() {
+async fn select_stranded_returns_scan_indeterminate_artifact_with_failed_last_scan() {
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -818,11 +831,109 @@ async fn select_stranded_skips_scan_indeterminate_artifact_even_with_failed_scan
         .await
         .expect("select_stranded Ok");
 
+    let matched = filter_to(&rows, &[artifact]);
+    assert_eq!(
+        matched.len(),
+        1,
+        "an artifact held for want of a verdict must be re-picked for a scan — \
+         it is the only mechanism that can deliver one"
+    );
+    assert_eq!(matched[0].repository_id, repo);
+    assert_eq!(matched[0].format, "pypi");
+}
+
+// ---------------------------------------------------------------------
+// (e2) scan_indeterminate with NO scan job at all → RETURNED. The
+//      job-absent arm reaches the new status too; a state is either in
+//      the predicate or it is not, and the two arms must not disagree
+//      about which.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_returns_scan_indeterminate_artifact_with_no_scan_job_under_scanning_policy(
+) {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let artifact = seed_artifact(&pool, repo, Some("scan_indeterminate"), None).await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert_eq!(
+        filter_to(&rows, &[artifact]).len(),
+        1,
+        "the job-absent arm admits scan_indeterminate exactly as the \
+         failed-job arm does"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (e3) scan_indeterminate under a `scan_backends: []` policy → NOT
+//      returned. The scan-policy guard is status-agnostic: enqueueing a
+//      scan for a scope the operator declared unscanned contradicts
+//      their own policy whichever hold the artifact sits in.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_scan_indeterminate_artifact_under_scan_waived_policy() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_scan_waived_policy(&pool, repo).await;
+    let artifact = seed_artifact(&pool, repo, Some("scan_indeterminate"), None).await;
+    let _job = seed_scan_job(&pool, repo, artifact, "failed").await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
     assert!(
         filter_to(&rows, &[artifact]).is_empty(),
-        "scan_indeterminate is terminal (ADR 0007) — select_stranded must \
-         NEVER re-pick it, even when its last scan job is 'failed'; only \
-         admin override / post-exclusion policy re-evaluation exit it"
+        "a scan_backends: [] scope is an explicit operator opt-out of \
+         scanning — widening the status set does not widen past it"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (e4) A soft-deleted scan_indeterminate artifact → NOT returned. The
+//      soft-delete exclusion is per-statement, so the status widening
+//      has to be asserted against it rather than inferred from the
+//      `quarantined` sibling below.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_soft_deleted_scan_indeterminate_artifact() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let artifact = seed_artifact(&pool, repo, Some("scan_indeterminate"), None).await;
+    let _job = seed_scan_job(&pool, repo, artifact, "failed").await;
+    hort_adapters_postgres::test_support::soft_delete_artifact(&pool, artifact).await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "deletion already took the artifact out of service — scanning it \
+         buys no serving decision, and its stream is terminal"
     );
 }
 

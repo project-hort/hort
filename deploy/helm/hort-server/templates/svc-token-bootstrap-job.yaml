@@ -37,8 +37,40 @@ Hook annotations:
     the database is already migrated (pre-install migrate Job ran at weight -5).
   - hook-weight 5              — after the Deployment (weight 0) so the
     service-account row is available.
-  - before-hook-creation       — clean up any prior failed run so the Job
-    name does not collide on retry.
+  - before-hook-creation,hook-succeeded — a failed run is KEPT, only a
+    successful one is cleaned up; see the retention note below. Same policy
+    as the chart's other hook Jobs (job-migrate.yaml, prepull-job.yaml).
+
+Retention: the `--require-authority` preflight below (ADR 0046) is worth
+exactly as much as the message it prints, and the failed pod's log is the
+only place that message survives — the one naming the missing service
+account or grant. The documented diagnosis for both failure modes is
+`kubectl logs job/<release>-svc-token-bootstrap -c issue-token`, which needs
+the Job to still be there, so a failed run is retained until someone has had
+a chance to read it. That stays bounded without a history limit: the Job
+name is fixed, so at most one exists at a time and the next install/upgrade
+reclaims it via before-hook-creation.
+
+Two things must therefore not come back here. `hook-failed` deletes
+precisely the evidence this policy keeps. And a TTL on this Job — the
+seconds-after-finished field in its `spec`, which this Job must not carry —
+is not a tidier spelling of the same thing but the same deletion by another
+route: the Job TTL controller removes a finished Job whatever the delete
+policy says, so a TTL beside this annotation erases a failed run on a timer
+while the annotation still reads as if it were retained.
+
+Deleting a successful run at once is also the stronger half for the
+bootstrap-token volume below: on every routine upgrade — the common path —
+the pod that held the plaintext goes away the moment the hook succeeds
+instead of lingering on a timer. Only the rare failure path is retained
+longer, and that path's token is headed for revocation anyway: the recovery
+for a mint-succeeded/write-failed run is `--rotate`, which revokes the row
+and mints afresh. How much plaintext outlives the containers is not fully
+answerable from the Kubernetes documentation — it ties an emptyDir's
+lifetime to its Pod's and names removal from the node as what destroys the
+data, but does not say whether kubelet reclaims a terminated Pod's emptyDir
+before the Pod object is deleted. That much is unverified, so the volume
+comment below assumes the conservative answer.
 
 Image note: the hort-server runtime image is distroless (no shell, no kubectl).
 The two-container pattern avoids polluting the main image with Kubernetes
@@ -61,12 +93,8 @@ metadata:
   annotations:
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "5"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
-  # Auto-clean 5 minutes after the Job completes (success or failure).
-  # The k8s audit log and operator tooling retain the run history;
-  # the Job object itself is just "did it finish".
-  ttlSecondsAfterFinished: 300
   backoffLimit: 1
   template:
     metadata:
@@ -84,8 +112,10 @@ spec:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       volumes:
         - name: bootstrap-token
-          # medium: Memory keeps the plaintext off-disk. The volume
-          # lifetime is the Pod lifetime — removed when the Job Pod completes.
+          # medium: Memory keeps the plaintext off-disk. Assume it is
+          # resident for as long as the Pod object exists — see the
+          # retention note in the docstring above, which is why a
+          # successful run is deleted at once.
           emptyDir:
             medium: Memory
         - name: tmp

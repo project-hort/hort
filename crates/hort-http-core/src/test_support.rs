@@ -109,7 +109,9 @@ use hort_domain::ports::scanner_registry_repository::{
     ScannerRegistryEntry, ScannerRegistryRepository,
 };
 use hort_domain::ports::storage::StoragePort;
-use hort_domain::ports::subscription_repository::SubscriptionRepository;
+use hort_domain::ports::subscription_repository::{
+    advance_delivered_position, retained_delivered_position, SubscriptionRepository,
+};
 use hort_domain::ports::upstream_proxy::{UpstreamProxy, UpstreamProxyByFormat};
 use hort_domain::ports::webhook_target_guard::WebhookTargetGuard;
 use hort_domain::ports::BoxFuture;
@@ -531,7 +533,12 @@ impl SubscriptionRepository for MockSubscriptionRepository {
     }
 
     fn update(&self, s: &Subscription) -> BoxFuture<'_, DomainResult<()>> {
-        self.items.lock().unwrap().insert(s.id, s.clone());
+        let mut s = s.clone();
+        let mut items = self.items.lock().unwrap();
+        s.last_delivered_position =
+            retained_delivered_position(items.get(&s.id), s.last_delivered_position);
+        items.insert(s.id, s);
+        drop(items);
         Box::pin(async { Ok(()) })
     }
 
@@ -549,10 +556,9 @@ impl SubscriptionRepository for MockSubscriptionRepository {
         let lf = last_failure.cloned();
         let mut items = self.items.lock().unwrap();
         if let Some(s) = items.get_mut(&id) {
-            // `None` = no advance to record; mirrors the adapter's COALESCE.
-            if let Some(position) = position {
-                s.last_delivered_position = Some(position);
-            }
+            // Mirrors the adapter's `GREATEST`.
+            s.last_delivered_position =
+                advance_delivered_position(s.last_delivered_position, position);
             s.last_failure = lf;
         }
         Box::pin(async { Ok(()) })
@@ -1230,7 +1236,7 @@ pub fn build_mock_ctx_with_label_flag(
     // they land nowhere and the read paths see no row — the PEP 658
     // `.metadata` serve resolves its CAS hash from the `wheel_metadata` row.
     let lifecycle = Arc::new(
-        MockArtifactLifecycle::new(artifacts.clone())
+        MockArtifactLifecycle::new(artifacts.clone(), events.clone())
             .with_metadata_repo(artifact_metadata.clone())
             .with_content_references(content_references.clone()),
     );
@@ -2456,6 +2462,37 @@ pub fn with_discovery_use_cases(
 
 pub fn with_task_use_case(base: &Arc<AppContext>, new_uc: Arc<TaskUseCase>) -> Arc<AppContext> {
     rebuild(base, |ctx| ctx.task_use_case = new_uc)
+}
+
+/// Swap the wired [`IngestUseCase`] on a mock context, leaving every
+/// other field pointer-identical.
+///
+/// The caller composes the use case, which is the whole point: the
+/// shape this exists for is a *publish* path driven through real
+/// outbound adapters, and [`IngestUseCase::new`] takes the
+/// `ArtifactLifecyclePort` — which is owned by the use cases rather
+/// than held in an [`AppContext`] slot, so no `with_*` helper can
+/// reach it. [`with_storage`] rebuilds the use case here and therefore
+/// has to name `MockPorts.lifecycle`; a test that needs the *Postgres*
+/// lifecycle cannot be served that way and must hand in the whole use
+/// case instead (same shape as [`with_task_use_case`]).
+///
+/// This is the seam `with_artifacts`'s doc comment says a publish-path
+/// real-adapter test needs. It is narrower than driving
+/// `hort_server::composition::build_app_context`: that function wants a
+/// live OIDC issuer, an upstream resolver and ~30 further parameters, so
+/// a test reaching for it to exercise one INSERT would be testing the
+/// composition root instead of the path.
+///
+/// **The halves must agree.** Whatever the supplied use case reads and
+/// writes — repository rows, artifact rows, event streams — has to be
+/// the same universe the handler under test resolves against, because
+/// nothing here cross-checks them. The established way to arrange that
+/// is the hybrid `legacy_quarantine_status_fails_closed_real_db` uses:
+/// insert the real rows the foreign keys need, and seed the mock
+/// repository with entities carrying those same ids.
+pub fn with_ingest_use_case(base: &Arc<AppContext>, new_uc: Arc<IngestUseCase>) -> Arc<AppContext> {
+    rebuild(base, |ctx| ctx.ingest_use_case = new_uc)
 }
 
 /// Swap the wired

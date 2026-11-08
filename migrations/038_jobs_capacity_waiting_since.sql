@@ -1,0 +1,76 @@
+-- Migration 038 — a claimed row says whether it is queued or executing.
+--
+-- The worker allocates capacity at two points: the claim decides which
+-- rows are taken up, and a per-kind run permit decides which of those
+-- rows gets the capacity to run. A row that has been claimed but not yet
+-- granted a permit is already `status = 'running'`, so it is outside the
+-- claim-eligible backlog by construction — the only instrument that
+-- reports queue starvation cannot see it at all.
+--
+-- `locked_until` used to separate the two states by accident: the lease
+-- renewal started when the handler started, so a row waiting for a
+-- permit had a lapsed lease. That was wrong for the mechanism on the
+-- other end — the abandoned-lease sweep recovers rows whose WORKER
+-- died, and a row waiting for capacity is owned by a live worker that
+-- intends to run it — so the renewal now starts at the claim and
+-- `locked_until` means "a live worker owns this row" and nothing more.
+-- That left the queued-vs-executing distinction with no home, which is
+-- what this column is.
+--
+-- ## What the column means
+--
+-- Set by the claim statement for every row it claims; cleared by the
+-- dispatcher the moment that row is granted its run permit. So on a
+-- `running` row with a live lease:
+--
+--   capacity_waiting_since IS NOT NULL  →  queued for capacity
+--   capacity_waiting_since IS NULL      →  a handler is executing it
+--
+-- and `now() - capacity_waiting_since` is how long the row has been
+-- waiting. A reader must pair the column with `locked_until > now()`:
+-- a row whose owner died also carries a non-NULL value until the
+-- abandoned-lease sweep requeues it, and that is a dead owner rather
+-- than a capacity shortage.
+--
+-- On a row that is not `running` the value is stale by design (the
+-- claim overwrites it on the next claim, and no reader looks at a
+-- non-`running` row), which is why this is not a NOT NULL column with a
+-- default: a NULL here is "never claimed", not "executing", and only
+-- the status tells the two apart.
+--
+-- ## Why this column is not event-sourced
+--
+-- Same reason as `artifacts.release_attempt_at` (migration 022): it is
+-- operational scheduling metadata in the same class as the task queue's
+-- other scheduling columns (`locked_by`, `locked_until`, `attempts`),
+-- not lifecycle state. A replay that ignores it reconstructs the
+-- identical artifact and the identical task history; an event per
+-- permit wait would write one immutable record per claimed row carrying
+-- no decision.
+--
+-- ## No index
+--
+-- The two readers are both aggregates the server and the worker run on
+-- a one-minute cadence, and the one that filters on this column
+-- (`status = 'running' AND capacity_waiting_since IS NOT NULL AND
+-- locked_until > now()`) is already served by `jobs_abandoned_lease_idx`
+-- (migration 028, `(locked_until) WHERE status = 'running'`), whose
+-- partial predicate bounds it to fleet concurrency rather than table
+-- size. Adding an index keyed on this column would pay a write on every
+-- claim and every grant to serve a read that is already cheap.
+--
+-- ## Why a new numbered migration
+--
+-- ADR 0022: every already-applied migration is frozen — `sqlx::migrate!`
+-- validates each applied migration's checksum, and any edit (including a
+-- comment-only one) makes an already-migrated database fail with
+-- `VersionMismatch` and refuse to boot. Purely additive: `ADD COLUMN`
+-- names no identifier that previous-release code could lose, so it needs
+-- no `CONTRACTIONS.toml` entry, and a previous-release binary that never
+-- selects the column keeps working against a migrated database.
+
+ALTER TABLE public.jobs
+    ADD COLUMN capacity_waiting_since timestamp with time zone;
+
+COMMENT ON COLUMN public.jobs.capacity_waiting_since IS
+    'When this claimed row started waiting for a run permit. Set by the claim, cleared when the permit is granted, so on a running row with a live lease a non-NULL value means queued-for-capacity and NULL means a handler is executing it. Operational scheduling metadata, deliberately not event-sourced. Stale on any non-running row: the next claim overwrites it.';

@@ -7,6 +7,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-11-08
+
+### Added
+
+- A refused OCI manifest or blob pull is now reconstructable from
+  `hort-server`'s logs, with the repository, the reference, the resolved
+  digest, the status and the reason it was withheld (#258).
+- A held artifact now records whether the publisher must sign it, sign its
+  parent, or wait for an operator to repair verification. Subscribers to
+  provenance event types will begin receiving `ProvenanceHeld` events (#400).
+- A failed admin task now writes a `TaskFailed` audit event alongside its
+  `jobs` row, so a failure outlives the row's 7-day retention; subscribers to
+  the task event types will begin receiving it (#331).
+
+### Changed
+
+- An artifact held `scan_indeterminate` is no longer a dead end: the rescan
+  sweep re-picks it, and a later scan verdict releases or rejects it with no
+  curator waiver (#419).
+- Ingesting a child manifest of a multi-arch OCI index now fetches and ingests
+  that child's config and layer blobs, so a held index no longer leaves the
+  tree under it uncached. Not governed by `prefetchPolicy.enabled` (#312).
+- Artifact scan subscribers now receive `ScanCompleted` and its policy verdict
+  only when findings or the policy decision change; the latest scan time and
+  findings rows still refresh on every scan. The per-artifact event bound is
+  also raised, so an artifact whose history had outgrown it is scannable and
+  releasable again (#406).
+- Queued work is now ranked by who is waiting on it, and a flood of
+  background work can no longer occupy a worker's whole claim batch or
+  all of a kind's run permits, so scheduled maintenance no longer
+  outranks or crowds out the publish and release paths, and a
+  clearance-gating `provenance-verify` — the last gate before a release
+  decision — is distinguishable from the bulk ingest-time verify rather
+  than sharing its `trigger_source`. Rows already queued keep the rank
+  they were enqueued with and drain normally; no migration or backfill.
+  `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS` (default `1`) sets how many
+  slots each waited-on class is held at both points, and background work
+  therefore drains more slowly under load. A queued task no longer spends
+  a retry attempt while it waits for capacity, so work that only waited
+  is no longer failed terminally for waiting. Whether each class is being
+  served — including the rows that hold a claim while they wait for
+  capacity — is now on `hort-server`'s `/metrics`
+  (`hort_admin_tasks_class_unserved{class}`), at the window
+  `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` sets (default `300`; set it on
+  the server and the worker) (#399).
+- A failed service-account token bootstrap hook now keeps its log until the
+  next install or upgrade, so an operator can read it after the fact (#196).
+
+### Fixed
+
+- The Maven transitive-prefetch cascade now warms a POM's `<parent>` as well
+  as its dependencies, so a parent chain is walked per cascade depth instead
+  of one link per quarantine window (#418).
+- A subscription edited, paused, resumed or disabled while it is delivering, or
+  running on more than one replica, no longer re-delivers events it had already
+  delivered the next time its process restarts (#311).
+- A scan policy written with a negative quarantine duration is now refused by
+  name instead of being stored; already-stored negative values are untouched
+  and are reported when a policy carrying one is next written (#253).
+- Per-version metadata between 64 KB and 256 KB now publishes for npm, PyPI and
+  cargo, and clients read the same fields wherever it is stored (#416).
+- A work class starving at one kind's run permit is now reported even when a
+  different kind of the same class keeps completing: the service verdict is
+  emitted per kind as well as per class, on new
+  `hort_admin_tasks_class_kind_*` series (the existing
+  `hort_admin_tasks_class_*` series are unchanged). Alarm on
+  `hort_admin_tasks_class_kind_unserved` to get the kind named (#415).
+- An artifact's event stream can no longer be grown past its bound: a repeatable
+  write now refuses with 409 instead of freezing the artifact for every later
+  release, scan or transition (#412).
+- A rescan with an unchanged verdict no longer re-adds its findings to the
+  per-repository security-score counts (#412).
+- Background work now runs on a worker whose client-waited queues never empty:
+  past a bound derived from `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` the
+  longest-waiting row takes the next run permit whatever its class. A worker
+  started with `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS=0` now warns at startup
+  which guarantee that waives (#414).
+- A worker whose `HORT_SCANNER_BATCH_SIZE` is too small to serve every work
+  class now refuses to start instead of silently never claiming one of them:
+  raise it to at least
+  `waited-on classes × HORT_SCANNER_RESERVED_SLOTS_PER_CLASS + 1` (`3` at the
+  default share, which the shipped default of `4` already clears). A row handed
+  to another worker while this one waited for capacity is also no longer run
+  twice (#409).
+- Repeated OCI manifest ingests now restore missing constituent claims, keeping their bytes protected from storage GC (#410).
+- Operator-requested work now runs on an instance with sustained client traffic (#405).
+- OCI digest request parameters that violate the descriptor grammar now return
+  `DIGEST_INVALID`; malformed image-index child digests return `MANIFEST_INVALID`
+  instead of `UNSUPPORTED` (#407).
+- Retention previews now identify missing reclaimable content by hash separately
+  from storage failures. Release preflight now names terminal rejection and
+  its re-scan or curator-waiver recovery paths when a dependency remains
+  absent after warming and quarantine (#400).
+- The curation queue now distinguishes an unscanned artifact from a clean
+  scan and identifies OCI blobs and manifests by path. On
+  `GET /api/v1/admin/curation/queue` each row gains a `path`, and
+  `finding_count` is **absent** rather than `0` for an artifact that has never
+  been scanned — a client that reads it as a required field needs updating
+  (#400).
+- The OCI cross-repository blob mount
+  (`POST /v2/<name>/blobs/uploads/?mount=…&from=…`, used by `skopeo copy` and
+  cross-repository re-tagging) answered `500` whenever the target repository's
+  scan policy requested a scan for the mounted blob, leaving the artifact
+  registered but never scanned. It now answers `201` and the scan runs (#402).
+- A scan job enqueued by `hort-server seed-import` could not be claimed, so a
+  seed-imported artifact never received its first scan verdict and stayed held
+  at the release gate (#402).
+- A failed cross-repository mount, coalesced pull-through follower
+  registration or seed import no longer leaves an unscanned, immediately
+  downloadable artifact behind: the registration and its quarantine/scan gate
+  now commit together or not at all (#403).
+- An artifact left unquarantined and unscanned by an earlier failed
+  registration is now healed by repeating the mount (the same `skopeo copy`,
+  re-tag or seed import), which runs the quarantine/scan gate instead of
+  reporting success and changing nothing. Such an artifact is held — `503`
+  on download — until the scan verdict it was always owed arrives (#404).
+- A pull-through upstream answering `410 Gone` for an artifact, blob or
+  manifest is now a miss (404) rather than a bad gateway (502/503), so a client
+  stops retrying and a virtual repository walks on to the next member (#395).
+- An OCI image index whose child descriptor declares no readable `size` is now
+  refused with `MANIFEST_INVALID` instead of being accepted; `size` is a
+  REQUIRED descriptor property. Re-push such an index with a conformant
+  `manifests[].size` (#395).
+
 ## [0.17.2] - 2026-11-02
 
 ### Added

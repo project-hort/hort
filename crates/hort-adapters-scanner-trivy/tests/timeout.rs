@@ -6,11 +6,9 @@
 //! Without the wrapper a hung child pegs the worker until something
 //! else terminates it.
 //!
-//! Strategy mirrors the OSV adapter's `tests/timeout.rs`: write a tiny
-//! `#!/bin/sh\nsleep 30` script to a `tempfile::TempPath`, mark it
-//! executable, and point `trivy_bin` at it. The adapter appends its
-//! argv (`fs --format json …`); the script ignores it and just
-//! sleeps. With a 100ms configured timeout the only path back is the
+//! A symlink in a private tempdir points at the checked-in fake Trivy.
+//! Its invoked name selects a 30-second sleep; the adapter's argv is
+//! ignored. With a 100ms configured timeout the only path back is the
 //! Rust timeout branch firing.
 //!
 //! On non-Unix the shebang trick does not apply; the test
@@ -23,8 +21,7 @@
 
 #![cfg(unix)]
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,17 +33,6 @@ use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ByteRange, ContentHash};
 use tokio::io::AsyncRead;
-
-/// Serializes every write-then-exec fixture in this test binary. An
-/// executable's write descriptor stays open (and inherited across a fork)
-/// until whichever process holds it execs or closes it — so a second
-/// thread that forks a child while our script is still open for writing
-/// can keep that descriptor alive in the child even after we close our own
-/// handle, and our own later exec of the same path fails with `ETXTBSY`.
-/// Held from script creation through the `scan` call that execs it, so no
-/// other thread in this process can fork while a script is open for
-/// writing.
-static SCRIPT_WRITE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn placeholder_hash() -> ContentHash {
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -100,30 +86,19 @@ impl StoragePort for TinyStorage {
     }
 }
 
-/// Materialise an executable shell script that sleeps for `secs`
-/// seconds then exits 0. `TempPath` (not `NamedTempFile`) so the
-/// writable handle is closed before the child execs it — Linux
-/// returns `ETXTBSY` against a path with an open writable handle.
-fn hung_child_script(secs: u64) -> tempfile::TempPath {
-    let f = tempfile::Builder::new()
-        .prefix("hort-trivy-fake-bin-")
-        .suffix(".sh")
-        .tempfile()
-        .expect("temp file create");
-    let body = format!("#!/bin/sh\nsleep {secs}\n");
-    fs::write(f.path(), body).expect("write script body");
-    let mut perms = fs::metadata(f.path()).expect("stat").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(f.path(), perms).expect("chmod +x");
-    f.into_temp_path()
+fn hung_child_script(dir: &tempfile::TempDir) -> PathBuf {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-trivy.sh");
+    let link = dir.path().join("fake-trivy-hang");
+    std::os::unix::fs::symlink(&fixture, &link).expect("symlink fake Trivy fixture");
+    link
 }
 
 #[tokio::test]
 async fn trivy_scan_timeout_kills_hung_child_within_configured_window() {
-    let _guard = SCRIPT_WRITE_GUARD.lock().await;
-    let script = hung_child_script(30);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = hung_child_script(&dir);
     let cfg = TrivyConfig {
-        trivy_bin: script.to_path_buf(),
+        trivy_bin: script,
         timeout: Duration::from_millis(100),
         ..TrivyConfig::default()
     };
@@ -177,6 +152,4 @@ async fn trivy_scan_timeout_kills_hung_child_within_configured_window() {
              got {other:?}"
         ),
     }
-
-    drop(script);
 }

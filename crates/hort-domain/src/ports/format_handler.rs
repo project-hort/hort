@@ -12,18 +12,65 @@ use crate::types::{ArtifactCoords, ArtifactKind, PayloadAccess, Sbom};
 /// in `docs/architecture/explanation/format-handlers.md`.
 ///
 /// - [`Inline`](Self::Inline) — the full payload rides in the event
-///   and the 1:1 projection row. Appropriate for formats whose p99
-///   metadata fits comfortably inside the 1 MB event-payload ceiling.
+///   and the 1:1 projection row, for formats whose metadata fits in an
+///   event.
 /// - [`HashReference`](Self::HashReference) — if the serialised payload
 ///   exceeds `inline_threshold_bytes`, the full payload is written to
 ///   CAS and the event + projection row carry the handler-extracted
 ///   summary plus a `ContentHash` pointing at the blob. Below the
 ///   threshold, behaviour is identical to `Inline` — no point paying
 ///   a CAS round-trip for a small packument.
+///
+/// Neither arm is a declaration that a payload *may* exceed what an
+/// event can hold: see [`Self::inline_event_budget_bytes`], which is
+/// where the two numbers are related.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataStrategy {
     Inline,
     HashReference { inline_threshold_bytes: usize },
+}
+
+impl MetadataStrategy {
+    /// How many serialised payload bytes this strategy will keep inline
+    /// — **the** statement of the relation between a handler's declared
+    /// threshold and the event cap.
+    ///
+    /// Whatever stays inline rides the `ArtifactIngested` event, and an
+    /// event over [`MAX_EVENT_JSON_BYTES`] is one no store in the
+    /// system will hold (`DomainEvent::validate_serialized`). So a
+    /// handler declaring a threshold **above** the cap gets the cap —
+    /// clamped, not rejected, because the declaration is still a
+    /// meaningful read-path statement about everything below the cap —
+    /// and a handler declaring **less** keeps its own value, which is
+    /// what `inline_threshold_bytes` is for: avoiding a CAS round-trip
+    /// for small payloads is an optimisation a format may decline to
+    /// take as far as the cap allows.
+    ///
+    /// [`Inline`](Self::Inline) declares no threshold at all, so the
+    /// cap is the whole of its budget. That is not a special case of
+    /// this function but the general one: *every* strategy's budget is
+    /// bounded by what an event can carry, and a handler's
+    /// `metadata_expected_max_bytes` — which may legitimately exceed
+    /// the cap, because it bounds the payload the *pre-dispatch* check
+    /// admits for spilling — is a different axis and never a budget.
+    ///
+    /// The budget bounds the payload; the cap bounds the whole
+    /// envelope. The ingest path closes that gap by asking the
+    /// candidate event itself
+    /// (`DomainEvent::fits_storage_cap`) rather than by subtracting an
+    /// allowance here, so no caller has to estimate what the event's
+    /// own fields cost.
+    ///
+    /// [`MAX_EVENT_JSON_BYTES`]: crate::events::MAX_EVENT_JSON_BYTES
+    #[must_use]
+    pub fn inline_event_budget_bytes(&self) -> usize {
+        match self {
+            Self::Inline => crate::events::MAX_EVENT_JSON_BYTES,
+            Self::HashReference {
+                inline_threshold_bytes,
+            } => (*inline_threshold_bytes).min(crate::events::MAX_EVENT_JSON_BYTES),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,17 +718,27 @@ pub trait FormatHandler: Send + Sync {
     /// `result="metadata_too_large"` and returns an `AppError` without
     /// invoking `classify_ingest_error`.
     ///
+    /// **This is not a storage size and is not bounded by the event
+    /// cap.** It bounds what the pre-dispatch check *accepts*; how much
+    /// of an accepted payload may stay inline — i.e. ride the
+    /// `ArtifactIngested` event — is
+    /// [`MetadataStrategy::inline_event_budget_bytes`], which is
+    /// clamped to [`MAX_EVENT_JSON_BYTES`]. A value above the cap here
+    /// is correct and necessary: capping this at 64 KB would reject the
+    /// very payloads the split exists to spill.
+    ///
     /// The default (64 KB) is a conservative fallback for format handlers
     /// that have not yet declared a specific envelope. The compiled-in
     /// handlers override with envelopes calibrated against real-world
-    /// corpus measurements (raised for HashReference formats so the
-    /// pre-dispatch cap does not pre-empt the split decision):
+    /// corpus measurements:
     ///
     /// | Format | Override | Source |
     /// |---|---|---|
     /// | PyPI  | 128 KB | corpus measurement (max 109.9 KB) |
-    /// | Cargo | 64 KB  | corpus measurement (max 53.8 KB)  |
-    /// | npm   | 5 MB   | HashReference ceiling, NOT the inline storage size. npm's inline split threshold lives on `metadata_strategy` (256 KB); this value is the pathological-input cap, sized above the measured 1.37 MB max and below the 10 MB `HORT_METADATA_BLOB_MAX_SIZE` safety net. |
+    /// | Cargo | 8 MB   | pessimistic 1000 versions × ~5 KB, plus headroom |
+    /// | npm   | 5 MB   | pathological-input cap, sized above the measured 1.37 MB max and below the 10 MB `HORT_METADATA_BLOB_MAX_SIZE` safety net |
+    ///
+    /// [`MAX_EVENT_JSON_BYTES`]: crate::events::MAX_EVENT_JSON_BYTES
     fn metadata_expected_max_bytes(&self) -> usize {
         64 * 1024
     }
@@ -689,11 +746,18 @@ pub trait FormatHandler: Send + Sync {
     /// Declares how ingest persists this format's payload metadata.
     ///
     /// Default is [`MetadataStrategy::Inline`] — the full payload rides
-    /// in the event and the `artifact_metadata` row. Formats whose p99
-    /// payload occasionally exceeds the 1 MB event-payload ceiling
-    /// (notably npm) override to
+    /// in the event and the `artifact_metadata` row for as much of it as
+    /// an event can hold. Formats whose p99 payload regularly exceeds
+    /// that (notably npm) override to
     /// [`MetadataStrategy::HashReference`] with a per-format threshold
-    /// measured against real-world corpora.
+    /// measured against real-world corpora, so that the spill happens
+    /// where the format expects it rather than only where the cap
+    /// forces it.
+    ///
+    /// Either way the inline portion is bounded by
+    /// [`MetadataStrategy::inline_event_budget_bytes`]: a declared
+    /// threshold is a statement about the read path, never a licence to
+    /// put more in an event than one can carry.
     fn metadata_strategy(&self) -> MetadataStrategy {
         MetadataStrategy::Inline
     }
@@ -1175,7 +1239,80 @@ pub struct GroupMembership {
 mod tests {
     use super::*;
     use crate::entities::repository::RepositoryFormat;
+    use crate::events::MAX_EVENT_JSON_BYTES;
     use crate::types::ArtifactCoords;
+
+    // -- MetadataStrategy::inline_event_budget_bytes ------------------------
+
+    /// A handler declaring a threshold **above** the event cap gets the
+    /// cap. This is the whole point of the clamp: npm declared 256 KB
+    /// against a 64 KB cap, so the band between them was "small enough
+    /// to inline" and "too big for an event" at once, and a package
+    /// whose metadata landed there could not be published at all.
+    #[test]
+    fn a_threshold_above_the_event_cap_is_clamped_to_it() {
+        let strategy = MetadataStrategy::HashReference {
+            inline_threshold_bytes: 4 * MAX_EVENT_JSON_BYTES,
+        };
+        assert_eq!(strategy.inline_event_budget_bytes(), MAX_EVENT_JSON_BYTES);
+    }
+
+    /// A handler declaring **less** keeps its own value: the threshold
+    /// is a read-path statement ("do not pay a CAS round-trip below
+    /// this") and a format is free to spill earlier than the cap
+    /// forces it to.
+    #[test]
+    fn a_threshold_below_the_event_cap_is_kept() {
+        let strategy = MetadataStrategy::HashReference {
+            inline_threshold_bytes: 4096,
+        };
+        assert_eq!(strategy.inline_event_budget_bytes(), 4096);
+    }
+
+    /// At the cap exactly, the clamp is a no-op — `min` has no
+    /// off-by-one to get wrong, and this pins which side of it the
+    /// equal case lands on.
+    #[test]
+    fn a_threshold_equal_to_the_event_cap_is_the_cap() {
+        let strategy = MetadataStrategy::HashReference {
+            inline_threshold_bytes: MAX_EVENT_JSON_BYTES,
+        };
+        assert_eq!(strategy.inline_event_budget_bytes(), MAX_EVENT_JSON_BYTES);
+    }
+
+    /// `Inline` declares no threshold, so the cap is the whole of its
+    /// budget. Not a special case — it is the general rule with nothing
+    /// to clamp against, which is what keeps a handler whose declared
+    /// `metadata_expected_max_bytes` exceeds the cap (pypi's 128 KB,
+    /// cargo's 8 MB) from inlining a payload no event can hold.
+    #[test]
+    fn the_inline_strategy_budget_is_the_event_cap() {
+        assert_eq!(
+            MetadataStrategy::Inline.inline_event_budget_bytes(),
+            MAX_EVENT_JSON_BYTES
+        );
+    }
+
+    /// No strategy's budget can exceed the cap. Stated over the arms
+    /// rather than per arm, so a third variant added without a budget
+    /// rule fails here instead of silently declaring one.
+    #[test]
+    fn no_strategy_budget_exceeds_the_event_cap() {
+        for strategy in [
+            MetadataStrategy::Inline,
+            MetadataStrategy::HashReference {
+                inline_threshold_bytes: 0,
+            },
+            MetadataStrategy::HashReference {
+                inline_threshold_bytes: usize::MAX,
+            },
+        ] {
+            assert!(
+                strategy.inline_event_budget_bytes() <= MAX_EVENT_JSON_BYTES,
+                "{strategy:?} declares a budget an event cannot carry"
+            );
+        }
+    }
 
     // -- require_https_metadata_url -----------------------------------------
 

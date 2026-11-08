@@ -407,6 +407,11 @@ impl ApplyConfigUseCase {
         let stream_id = paired.stream_id().clone();
         let expected_version = paired.expected_version();
         let artifact_id = paired.artifact().id;
+        // One `ArtifactRejected`. Repeatable: the retroactive pass runs
+        // on every gitops apply that carries curation rules, and an
+        // artifact a curator waived between two applies is re-held by the
+        // next one.
+        crate::use_cases::refuse_append_past_cap(&stream_id, paired.stream_len(), 1)?;
         let reject_event = paired
             .artifact_mut()
             .reject_from_retroactive_curation(rule_id, reason)?;
@@ -443,7 +448,9 @@ impl ApplyConfigUseCase {
                 error = %e,
                 stage = "content_references_delete_on_reject",
                 "content_references delete failed on retroactive curation reject; refcount row \
-                 not deleted on reject — refcount eventual, operator reconcile is future work"
+                 not deleted on reject — refcount eventual; \
+                 RefcountReconcileUseCase::sweep_drift removes it \
+                 (RefcountRepair::DeleteRejectedSourceRows)"
             );
         }
 
@@ -1030,7 +1037,8 @@ mod tests {
         assert_eq!(
             h.content_refs.entry_count(),
             1,
-            "warn-on-fail must leave the seeded row in place; reconcile is future work"
+            "warn-on-fail must leave the seeded row in place; the row is repaired by \
+             RefcountRepair::DeleteRejectedSourceRows, not by a retry here"
         );
         let rows = h
             .content_refs
@@ -1313,6 +1321,83 @@ mod tests {
         ));
         let err = h.uc.apply(desired, env_oidc()).await.unwrap_err();
         assert!(matches!(err, AppError::ConcurrentModification(_)));
+    }
+
+    /// The retroactive block refuses the `ArtifactRejected` that would
+    /// cross the cap. The pass is strict-atomic, so the apply fails
+    /// rather than leaving the artifact frozen — and the refusal, like
+    /// the concurrency one beside it, surfaces as
+    /// `ConcurrentModification` because that is how a `Conflict` out of
+    /// this pass is reported to an operator.
+    ///
+    /// Same fixture as `retro_block_creates_rule_then_rejects_matching_artifact`
+    /// (which commits exactly one rejection), with the artifact's stream
+    /// filled to the cap first.
+    #[tokio::test]
+    async fn retro_block_refuses_the_event_that_would_cross_the_cap() {
+        use crate::use_cases::test_support::PairedEventStore;
+        use hort_domain::events::{system_actor, ArtifactQuarantined};
+        use hort_domain::ports::event_store::{EventToAppend, ExpectedVersion};
+
+        let h = build_harness();
+        let repo_id = seed_repo(&h.repos, "npm-public", RepositoryFormat::Npm);
+        let artifact_id = seed_active_artifact(
+            &h.artifacts,
+            repo_id,
+            "left-pad",
+            hort_domain::entities::artifact::QuarantineStatus::Released,
+        );
+
+        let mut desired = DesiredState::default();
+        desired
+            .curation_rules
+            .push(rule_env("block-leftpad", "allow", "left-pad", "trusted"));
+        h.uc.apply(desired, env_oidc()).await.unwrap();
+        link_rule_after_apply(&h, "block-leftpad", repo_id).await;
+
+        // Fill the artifact's stream to exactly the cap. The mock replays
+        // committed batches as its `read_stream`, so publishing one batch
+        // of `STREAM_EVENT_CAP` events is what the pairing below reads.
+        let stream_id = StreamId::artifact(artifact_id);
+        h.events.publish_committed(&AppendEvents {
+            stream_id: stream_id.clone(),
+            expected_version: ExpectedVersion::Any,
+            events: (0..crate::use_cases::STREAM_EVENT_CAP)
+                .map(|_| {
+                    EventToAppend::new(DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
+                        artifact_id,
+                        quarantine_window_start: Utc::now(),
+                    }))
+                })
+                .collect(),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: system_actor(),
+        });
+
+        let mut desired = DesiredState::default();
+        desired.curation_rules.push(rule_env(
+            "block-leftpad",
+            "block",
+            "left-pad",
+            "supply chain",
+        ));
+        let err = h.uc.apply(desired, env_oidc()).await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)),
+            "the refusal must name the cap it is enforcing; got {err}"
+        );
+        assert!(
+            h.lifecycle.committed_transitions().is_empty(),
+            "no rejection is committed once the refusal fires"
+        );
+        assert_eq!(
+            h.artifacts.get(artifact_id).unwrap().quarantine_status,
+            hort_domain::entities::artifact::QuarantineStatus::Released,
+            "and the artifact is left where it was"
+        );
     }
 
     /// Declaring a NEW rule with action=Allow does NOT trigger any

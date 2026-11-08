@@ -7,18 +7,18 @@
 //!   through under `allowed_indeterminate` (no event, status unchanged;
 //!   never fail-closed on a fault of ours).
 //! - `Required` + fetch-exhausted / verifier error → HELD under the
-//!   indeterminate label (no event, status stays `quarantined`). Still
+//!   indeterminate label (reason event, status stays `quarantined`). Still
 //!   fail-closed — with no `ProvenanceVerified` the release gate reads
 //!   `Pending` — but never terminal: nothing about the artifact was
 //!   established (ADR 0039 D4).
 //! - `Off` policy → no verifier runs (skip).
 //! - No applicable verifier (non-OCI) → skip.
 //! - `Required` + verified → `ProvenanceVerified`, status unchanged.
-//! - `Required` + unsigned (NoAttestation from verifier) → HELD (no
+//! - `Required` + unsigned (NoAttestation from verifier) → HELD (reason
 //!   event, status stays `quarantined` — ADR 0039's 2026-09-12
 //!   amendment, D1).
 //! - `Required` + indeterminate (the check could not be carried out) →
-//!   HELD under the third hold label (no event, status stays
+//!   HELD under the third hold label (reason event, status stays
 //!   `quarantined` — ADR 0039 D4).
 //! - Multi-verifier fold (`fold_two`).
 
@@ -35,6 +35,7 @@ use hort_domain::entities::scan_policy::{
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{DomainEvent, PolicyScope, ScanAssessment};
 use hort_domain::ports::content_reference_index::ContentReference;
+use hort_domain::ports::provenance::ProvenanceHoldReason;
 use hort_domain::ports::provenance::{
     AttestationBundle, IndeterminateReason, ProvenanceOutcome, ProvenancePort,
     ProvenanceRejectReason, ProvenanceRequirements, ProvenanceSubject, ProvenanceVerdict,
@@ -51,6 +52,123 @@ use sha2::Digest;
 use super::*;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
 use crate::use_cases::test_support::*;
+
+fn held_events(f: &Fixture) -> Vec<PersistedEvent> {
+    let stream_id = StreamId::artifact(f.artifact_id);
+    f.events
+        .stream_snapshot(&stream_id)
+        .into_iter()
+        .filter(|stored| matches!(stored.event, DomainEvent::ProvenanceHeld(_)))
+        .collect()
+}
+
+fn artifact_stream_len(f: &Fixture) -> usize {
+    f.events
+        .stream_snapshot(&StreamId::artifact(f.artifact_id))
+        .len()
+}
+
+fn assert_held_on_own_stream(f: &Fixture, reason: ProvenanceHoldReason) {
+    let held = held_events(f);
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].stream_id, StreamId::artifact(f.artifact_id));
+    let DomainEvent::ProvenanceHeld(payload) = &held[0].event else {
+        panic!("expected provenance hold on artifact stream");
+    };
+    assert_eq!(payload.artifact_id, f.artifact_id);
+    assert_eq!(payload.content_hash, f.content_hash);
+    assert_eq!(payload.backend, "cosign");
+    assert_eq!(payload.reason, reason);
+}
+
+#[tokio::test]
+async fn pending_signature_is_recorded_on_artifact_stream() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::Required),
+        vec![],
+        vec![port],
+    );
+    f.uc.verify_artifact(f.artifact_id).await.unwrap();
+    assert_held_on_own_stream(&f, ProvenanceHoldReason::PendingSignature);
+}
+
+#[tokio::test]
+async fn pending_subject_is_recorded_on_artifact_stream() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build_constituent(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::Required),
+        vec![port],
+    );
+    f.uc.verify_artifact(f.artifact_id).await.unwrap();
+    assert_held_on_own_stream(&f, ProvenanceHoldReason::PendingSubject);
+}
+
+#[tokio::test]
+async fn indeterminate_is_recorded_on_artifact_stream() {
+    let port = Arc::new(MockProvenancePort::cosign_erroring());
+    let f = build(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::Required),
+        vec![],
+        vec![port],
+    );
+    f.uc.verify_artifact(f.artifact_id).await.unwrap();
+    assert_held_on_own_stream(&f, ProvenanceHoldReason::Indeterminate);
+}
+
+#[tokio::test]
+async fn hold_is_appended_once_per_reason_change() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::Required),
+        vec![],
+        vec![port.clone()],
+    );
+    f.uc.verify_artifact(f.artifact_id).await.unwrap();
+    assert_eq!(artifact_stream_len(&f), 1);
+    let again = f.uc.verify_artifact(f.artifact_id).await.unwrap();
+    assert!(matches!(
+        again,
+        ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            ..
+        }
+    ));
+    assert_eq!(artifact_stream_len(&f), 1);
+
+    *port.verdict.lock().unwrap() = Some(ProvenanceVerdict::indeterminate(
+        IndeterminateReason::VerifierUnavailable,
+    ));
+    f.uc.verify_artifact(f.artifact_id).await.unwrap();
+    let held = held_events(&f);
+    assert_eq!(held.len(), 2);
+    assert_eq!(artifact_stream_len(&f), 2);
+    let DomainEvent::ProvenanceHeld(last) = &held[1].event else {
+        unreachable!()
+    };
+    assert_eq!(last.reason, ProvenanceHoldReason::Indeterminate);
+    f.uc.verify_artifact(f.artifact_id).await.unwrap();
+    assert_eq!(artifact_stream_len(&f), 2);
+
+    *port.verdict.lock().unwrap() = Some(ProvenanceVerdict::no_attestation());
+    f.uc.verify_artifact(f.artifact_id).await.unwrap();
+    assert_eq!(artifact_stream_len(&f), 3);
+    let held = held_events(&f);
+    let DomainEvent::ProvenanceHeld(last) = &held[2].event else {
+        unreachable!()
+    };
+    assert_eq!(last.reason, ProvenanceHoldReason::PendingSignature);
+}
 
 // ---------------------------------------------------------------------------
 // Mock ProvenancePort
@@ -240,8 +358,9 @@ fn build_inner(
     // commits with its transition actually reach it — the mock's stand-in for
     // the Postgres adapter writing them in the same transaction.
     let lifecycle = Arc::new(
-        MockArtifactLifecycle::new(artifacts.clone())
-            .with_content_references(content_references.clone()),
+        MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+            .with_content_references(content_references.clone())
+            .with_optimistic_concurrency(),
     );
     let upstream_proxy = Arc::new(MockUpstreamProxy::new());
     let upstream_resolver = Arc::new(MockUpstreamResolver::new());
@@ -495,6 +614,57 @@ async fn verify_if_present_verified_signature_records_but_does_not_change_status
     ));
 }
 
+/// The verdict append refuses the event that would cross the cap, and the
+/// run surfaces that rather than freezing the artifact.
+///
+/// A `provenance-verify` is re-enqueued every time a signature referrer
+/// arrives for this subject and again by the window-expiry backstop, so
+/// an artifact held under `Required` accrues one verdict event per run for
+/// as long as it stays unsigned — the plainest repeatable writer on the
+/// provenance axis. The fixture is the one above, which commits exactly
+/// one `ProvenanceVerified`, with the stream filled to the cap.
+#[tokio::test]
+async fn a_verdict_is_refused_before_it_crosses_the_event_cap() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::verified(
+            sample_identity(),
+            Some("https://slsa.dev/provenance/v1".into()),
+        ),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::VerifyIfPresent),
+        vec![sample_pattern()],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_bundle(&f, b"valid-bundle-bytes");
+
+    let stream_id = StreamId::artifact(f.artifact_id);
+    let full: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP)
+        .map(|position| dummy_persisted_event(&stream_id, f.artifact_id, position))
+        .collect();
+    f.events.set_stream(&stream_id, full);
+
+    let err =
+        f.uc.verify_artifact(f.artifact_id)
+            .await
+            .expect_err("the verdict has nowhere to land");
+    assert!(
+        err.to_string()
+            .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)),
+        "the refusal must name the cap it is enforcing; got {err}"
+    );
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "no verdict is committed once the refusal fires"
+    );
+    assert_eq!(
+        f.events.stream_snapshot(&stream_id).len() as u64,
+        crate::use_cases::STREAM_EVENT_CAP,
+        "and the stream is left exactly on the cap"
+    );
+}
+
 // ===========================================================================
 // A bundle-fetch failure, once per mode.
 //
@@ -655,7 +825,7 @@ async fn required_fetch_failure_holds_indeterminate_and_never_releases() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldIndeterminate,
         },
         "a Required fetch failure holds under the indeterminate reason — it must not \
@@ -672,11 +842,7 @@ async fn required_fetch_failure_holds_indeterminate_and_never_releases() {
         saved.rejection_reason, None,
         "no rejection attribution is written for a check that never ran",
     );
-    assert!(
-        f.lifecycle.committed_transitions().is_empty(),
-        "the hold appends no event at all — neither ProvenanceRejected nor \
-         ArtifactRejected",
-    );
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
     assert!(
         port.last_inputs().is_none(),
         "Required fetch failed before the verifier ran"
@@ -729,7 +895,7 @@ async fn required_verified_records_clearance_event_status_unchanged() {
 
 // ===========================================================================
 // Required + no bundles (verifier returns NoAttestation) →
-// no event, status stays `Quarantined` (held / Pending at the release gate).
+// a hold-reason event, status stays `Quarantined` (Pending at the release gate).
 // ===========================================================================
 
 #[tokio::test]
@@ -752,7 +918,7 @@ async fn required_unsigned_holds_and_never_terminalises() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         }
     );
@@ -761,10 +927,7 @@ async fn required_unsigned_holds_and_never_terminalises() {
 
     let saved = f.artifacts.get(f.artifact_id).unwrap();
     assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
-    assert!(
-        f.lifecycle.committed_transitions().is_empty(),
-        "the hold appends no verdict event",
-    );
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
 }
 
 // ===========================================================================
@@ -796,14 +959,14 @@ fn seed_required_policy_with_duration(f: &Fixture, duration_secs: i64) {
 
 // ---------------------------------------------------------------------------
 // Required + unsigned + observation window STILL OPEN → HELD.
-// `complete_provenance` returns Ok(None); no event is appended; the artifact
+// `complete_provenance` returns an empty domain batch; the hold reason is recorded; the artifact
 // stays `Quarantined` (the release gate reads it as Pending / held). This is
 // the push-then-sign round-trip's core: an unsigned image is not rejected at
 // the first verify while it may yet be signed.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn required_unsigned_window_open_holds_pending_no_event() {
+async fn required_unsigned_window_open_records_pending_signature() {
     let port = Arc::new(MockProvenancePort::cosign_returning(
         ProvenanceVerdict::no_attestation(),
     ));
@@ -822,10 +985,10 @@ async fn required_unsigned_window_open_holds_pending_no_event() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
-        "Required + unsigned mid-window must HOLD (no event) as HeldPendingSignature, not reject \
+        "Required + unsigned mid-window must HOLD as HeldPendingSignature, not reject \
          and not conflated with the allowed-unsigned NoAttestation no-op",
     );
     // The verifier ran (with zero bundles — genuinely unsigned).
@@ -837,10 +1000,7 @@ async fn required_unsigned_window_open_holds_pending_no_event() {
         QuarantineStatus::Quarantined,
         "an unsigned Required artifact holds Quarantined while the window is open",
     );
-    assert!(
-        f.lifecycle.committed_transitions().is_empty(),
-        "the hold path appends NO provenance verdict event",
-    );
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -873,14 +1033,14 @@ async fn required_unsigned_window_closed_still_holds() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
         "an expired observation window is not a signing deadline — the artifact holds",
     );
     let saved = f.artifacts.get(f.artifact_id).unwrap();
     assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
-    assert!(f.lifecycle.committed_transitions().is_empty());
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
 }
 
 // ===========================================================================
@@ -945,17 +1105,20 @@ fn age_artifact_past_a_one_second_window(f: &Fixture, elapsed_secs: i64) {
     f.artifacts.insert(artifact);
 }
 
-/// Drive the REAL release gate over the fixture's artifact. The mock
-/// lifecycle records the verdict batch but does not feed the event store,
-/// so the artifact's stream is seeded with what the run persisted: a clean
-/// scan (the ADR 0007 release authority) plus, when `provenance_verified`,
-/// the `ProvenanceVerified` the release gate resolves `Cleared` from.
+/// Drive the real release gate over a temporary stream with a clean scan
+/// and, when requested, a verified provenance verdict. Restore the
+/// fixture's committed stream afterwards so a later verify sees its own
+/// earlier hold reason.
 async fn timer_release_is_granted(f: &Fixture, provenance_verified: bool) -> bool {
+    let stream_id = StreamId::artifact(f.artifact_id);
+    let committed = f.events.stream_snapshot(&stream_id);
     let mut stream = vec![persisted_scan_completed(f.artifact_id, 0, 0)];
     if provenance_verified {
         stream.push(persisted_verified(f.artifact_id, None));
     }
-    timer_release_is_granted_over(f, stream).await
+    let granted = timer_release_is_granted_over(f, stream).await;
+    f.events.set_stream(&stream_id, committed);
+    granted
 }
 
 /// [`timer_release_is_granted`] over a caller-supplied stream, so a test
@@ -968,7 +1131,10 @@ async fn timer_release_is_granted_over(f: &Fixture, stream: Vec<PersistedEvent>)
     let quarantine_uc = QuarantineUseCase::new(
         f.artifacts.clone(),
         crate::event_store_publisher::wrap_for_test(f.events.clone()),
-        Arc::new(MockArtifactLifecycle::new(f.artifacts.clone())),
+        Arc::new(MockArtifactLifecycle::new(
+            f.artifacts.clone(),
+            f.events.clone(),
+        )),
         f.repositories.clone(),
         f.projections.clone(),
         f.content_references.clone(),
@@ -1004,7 +1170,7 @@ async fn push_then_sign_under_a_one_second_window_holds_then_clears_and_releases
         held,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
         "the artifact is unsigned only because nothing has signed it YET — that is a \
@@ -1059,7 +1225,7 @@ async fn constituent_under_a_one_second_window_still_holds() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSubject,
         },
         "a constituent holds on the reason now, and reports the label that says what \
@@ -1069,7 +1235,7 @@ async fn constituent_under_a_one_second_window_still_holds() {
         f.artifacts.get(f.artifact_id).unwrap().quarantine_status,
         QuarantineStatus::Quarantined,
     );
-    assert!(f.lifecycle.committed_transitions().is_empty());
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
 }
 
 /// The same ordering for a **referenced descendant** — an artifact that is
@@ -1093,7 +1259,7 @@ async fn referenced_descendant_under_a_one_second_window_still_holds_then_clears
         held,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
         "a referenced-tree descendant holds without anyone looking up its edges",
@@ -1136,7 +1302,7 @@ async fn never_signed_required_artifact_is_never_released() {
             outcome,
             ProvenanceRunOutcome::Applied {
                 unreadable_skipped: 0,
-                event_appended: false,
+                event_appended: attempt == 1,
                 verdict: ProvenanceVerdictSummary::HeldPendingSignature,
             },
             "attempt {attempt}: the hold is indefinite, and never converts to a verdict",
@@ -1151,7 +1317,7 @@ async fn never_signed_required_artifact_is_never_released() {
              its clearance stays Pending, which denies the timer arm",
         );
     }
-    assert!(f.lifecycle.committed_transitions().is_empty());
+    assert_eq!(held_events(&f).len(), 1);
 }
 
 /// **The other half of D6.** A positive disproof stays terminal, and its
@@ -1241,7 +1407,7 @@ async fn unsigned_hold_never_lifts_a_scan_rejected_artifact_back_to_quarantined(
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
     );
@@ -1251,10 +1417,7 @@ async fn unsigned_hold_never_lifts_a_scan_rejected_artifact_back_to_quarantined(
         "the provenance hold must leave a scan rejection exactly where it found it — \
          re-opening this is how the whole defect stayed concealed",
     );
-    assert!(
-        f.lifecycle.committed_transitions().is_empty(),
-        "the hold commits nothing, so there is no status write to lose a race with",
-    );
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
 }
 
 // ===========================================================================
@@ -1320,7 +1483,7 @@ async fn required_unsigned_window_closed_descendant_holds_instead_of_rejecting()
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
         "a zero-window referenced-tree descendant must HOLD — and must report the \
@@ -1332,10 +1495,7 @@ async fn required_unsigned_window_closed_descendant_holds_instead_of_rejecting()
         QuarantineStatus::Quarantined,
         "held descendant stays Quarantined so the parent's cascade can clear it",
     );
-    assert!(
-        f.lifecycle.committed_transitions().is_empty(),
-        "the descendant hold appends NO provenance verdict event",
-    );
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
 }
 
 /// The carve-out is scoped to the unsigned arm: a descendant whose
@@ -1417,7 +1577,7 @@ async fn required_unsigned_window_closed_constituent_holds_instead_of_rejecting(
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSubject,
         },
         "an unsigned constituent with a closed window and no edges must HOLD, \
@@ -1429,10 +1589,7 @@ async fn required_unsigned_window_closed_constituent_holds_instead_of_rejecting(
         QuarantineStatus::Quarantined,
         "the held constituent stays Quarantined so its subject can clear it",
     );
-    assert!(
-        f.lifecycle.committed_transitions().is_empty(),
-        "no ProvenanceRejected may be emitted for a constituent",
-    );
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
 }
 
 /// The same scope with the format handler answering `false` — a SUBJECT.
@@ -1458,7 +1615,7 @@ async fn required_unsigned_window_closed_non_constituent_holds_pending_signature
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
         "a subject holds pending its OWN signature — same hold as the constituent, \
@@ -1510,7 +1667,7 @@ async fn required_unsigned_window_closed_non_oci_format_holds_pending_signature(
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
         "a non-OCI format's handler answers `false`, so its unsigned artifacts \
@@ -1577,7 +1734,7 @@ async fn required_constituent_fetch_failure_holds_indeterminate_not_pending_subj
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldIndeterminate,
         },
         "a fetch exhaustion under Required holds, and the indeterminate hold is not \
@@ -1586,7 +1743,7 @@ async fn required_constituent_fetch_failure_holds_indeterminate_not_pending_subj
     let saved = f.artifacts.get(f.artifact_id).unwrap();
     assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
     assert_eq!(saved.rejection_reason, None);
-    assert!(f.lifecycle.committed_transitions().is_empty());
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
 }
 
 /// **The S4 window-expiry backstop must not terminalize a held
@@ -1613,7 +1770,7 @@ async fn constituent_stays_held_across_repeated_expired_verifies() {
             outcome,
             ProvenanceRunOutcome::Applied {
                 unreadable_skipped: 0,
-                event_appended: false,
+                event_appended: attempt == 1,
                 verdict: ProvenanceVerdictSummary::HeldPendingSubject,
             },
             "attempt {attempt}: the expiry backstop must re-hold, never terminalize",
@@ -1622,7 +1779,7 @@ async fn constituent_stays_held_across_repeated_expired_verifies() {
             f.artifacts.get(f.artifact_id).unwrap().quarantine_status,
             QuarantineStatus::Quarantined,
         );
-        assert!(f.lifecycle.committed_transitions().is_empty());
+        assert_eq!(held_events(&f).len(), 1);
     }
 }
 
@@ -1700,7 +1857,7 @@ async fn constituent_held_under_short_window_is_cleared_by_its_subject_cascade()
         blob_outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSubject,
         },
         "the blob's window has closed and its manifest does not exist yet — it must HOLD",
@@ -1766,14 +1923,14 @@ async fn required_unsigned_missing_window_start_holds_like_any_other_unsigned() 
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
         "the quarantine anchor is not an input to the provenance verdict any more",
     );
     let saved = f.artifacts.get(f.artifact_id).unwrap();
     assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
-    assert!(f.lifecycle.committed_transitions().is_empty());
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1852,7 +2009,7 @@ async fn required_unsigned_none_status_old_artifact_past_grace_holds() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
         "past the grace window the requeue stops, and what it falls through to is the \
@@ -1864,7 +2021,7 @@ async fn required_unsigned_none_status_old_artifact_past_grace_holds() {
         QuarantineStatus::None,
         "a permissive (never-quarantined) artifact's status is untouched by the hold",
     );
-    assert!(f.lifecycle.committed_transitions().is_empty());
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
 }
 
 // The bounded-requeue guard is scoped to `NoAttestation` ONLY — a forged
@@ -2223,7 +2380,7 @@ async fn verify_artifact_interleaved_with_concurrent_reject_does_not_resurrect_a
     // commits with its transition actually reach it — the mock's stand-in for
     // the Postgres adapter writing them in the same transaction.
     let lifecycle = Arc::new(
-        MockArtifactLifecycle::new(artifacts.clone())
+        MockArtifactLifecycle::new(artifacts.clone(), events.clone())
             .with_content_references(content_references.clone()),
     );
     let upstream_proxy = Arc::new(MockUpstreamProxy::new());
@@ -2363,7 +2520,10 @@ async fn verify_artifact_interleaved_with_concurrent_reject_does_not_resurrect_a
     let quarantine_uc = QuarantineUseCase::new(
         artifacts.clone(),
         crate::event_store_publisher::wrap_for_test(events.clone()),
-        Arc::new(MockArtifactLifecycle::new(artifacts.clone())),
+        Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        )),
         quarantine_repositories,
         projections,
         Arc::new(MockContentReferenceIndex::new()),
@@ -2412,7 +2572,7 @@ async fn required_fetch_failure_holds_the_same_with_the_window_open() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldIndeterminate,
         },
         "a Required fetch failure holds mid-window exactly as it does past it — the \
@@ -2425,10 +2585,7 @@ async fn required_fetch_failure_holds_the_same_with_the_window_open() {
         "an open window cannot make the hold terminal, and does not lift it either",
     );
     assert_eq!(saved.rejection_reason, None);
-    assert!(
-        f.lifecycle.committed_transitions().is_empty(),
-        "no event is appended either way",
-    );
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
     assert!(
         port.last_inputs().is_none(),
         "the fetch failed before the verifier ran",
@@ -2570,7 +2727,7 @@ async fn required_verifier_error_holds_indeterminate_and_never_releases() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldIndeterminate,
         },
         "a Required verifier error holds under the indeterminate reason — it must not \
@@ -2586,10 +2743,7 @@ async fn required_verifier_error_holds_indeterminate_and_never_releases() {
         saved.rejection_reason, None,
         "no rejection attribution is written for a check that produced no answer",
     );
-    assert!(
-        f.lifecycle.committed_transitions().is_empty(),
-        "the hold appends no event at all — neither ProvenanceRejected nor ArtifactRejected",
-    );
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
     assert!(
         port.last_inputs().is_some(),
         "the bundle reached the verifier — this is not the fetch-failure path",
@@ -2632,7 +2786,7 @@ async fn global_policy_applies_when_no_repo_scoped() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         }
     );
@@ -3858,7 +4012,7 @@ async fn bundle_blob_absent_from_cas_surfaces_fetch_failure_not_panic() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldIndeterminate,
         }
     );
@@ -3870,11 +4024,7 @@ async fn bundle_blob_absent_from_cas_surfaces_fetch_failure_not_panic() {
         "an absent bundle blob under Required holds (fail-closed, not terminal), never panics",
     );
     assert_eq!(saved.rejection_reason, None);
-    assert!(
-        f.lifecycle.committed_transitions().is_empty(),
-        "the hold appends no event — the CAS read stage reaches the same verdict as the \
-         other two",
-    );
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
     assert!(
         port.captured_bundles().is_empty(),
         "the verifier never ran — the blob fetch failed first",
@@ -4397,7 +4547,7 @@ async fn required_on_proxy_with_no_upstream_bundle_holds() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         }
     );
@@ -4406,10 +4556,7 @@ async fn required_on_proxy_with_no_upstream_bundle_holds() {
     assert_eq!(port.last_inputs(), Some((0, ARTIFACT_PAYLOAD.len())));
     let saved = f.artifacts.get(f.artifact_id).unwrap();
     assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
-    assert!(
-        f.lifecycle.committed_transitions().is_empty(),
-        "an upstream that has not published a signature yet is not a disproof",
-    );
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
     // No `oci_subject` row — there was nothing to land.
     let rows = f
         .content_references
@@ -5146,7 +5293,7 @@ async fn item4_required_unsigned_index_holds() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
     );
@@ -6597,7 +6744,7 @@ async fn a_decoy_signature_manifest_leaves_its_named_layer_held() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
         "a manifest SHAPED like a signature clears nothing — the hold stands",
@@ -6636,7 +6783,7 @@ async fn an_ordinary_layer_with_no_signature_anywhere_still_holds() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSubject,
         },
     );
@@ -6658,7 +6805,7 @@ async fn a_signature_manifest_declaring_no_subject_leaves_its_payload_held() {
         outcome,
         ProvenanceRunOutcome::Applied {
             unreadable_skipped: 0,
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
         },
     );
@@ -6731,7 +6878,7 @@ fn a_signature_material_clearance_ticks_its_own_metric() {
 
 // ===========================================================================
 // Required + a verdict that could not be reached (the verifier returns
-// Indeterminate) → no event, status stays `Quarantined`, reported under the
+// Indeterminate) → reason event, status stays `Quarantined`, reported under the
 // third hold label.
 //
 // All three producers exist now: the keyless verifier answers
@@ -6768,7 +6915,7 @@ async fn required_indeterminate_holds_under_its_own_label() {
             outcome,
             ProvenanceRunOutcome::Applied {
                 unreadable_skipped: 0,
-                event_appended: false,
+                event_appended: true,
                 verdict: ProvenanceVerdictSummary::HeldIndeterminate,
             },
             "{reason:?}: a check that could not run is a hold, under its own label — \
@@ -6782,10 +6929,7 @@ async fn required_indeterminate_holds_under_its_own_label() {
             "{reason:?}: held, never terminal — nothing about the artifact was established"
         );
         assert_eq!(saved.rejection_reason, None, "{reason:?}");
-        assert!(
-            f.lifecycle.committed_transitions().is_empty(),
-            "{reason:?}: the hold appends no verdict event",
-        );
+        assert_eq!(f.lifecycle.committed_transitions().len(), 1);
     }
 }
 
@@ -6920,12 +7064,10 @@ async fn the_orchestration_mints_no_reject_reason_at_all() {
                 "{mode:?}: an orchestration-side failure proved nothing about the \
                  artifact and must not reach a rejection: {verdict:?}",
             );
-            // And nothing terminal was written, which is the half an
-            // operator sees: no `ProvenanceRejected`, no `ArtifactRejected`,
-            // no rejection attribution on the row.
-            assert!(
-                f.lifecycle.committed_transitions().is_empty(),
-                "{mode:?}: a hold appends no event",
+            assert_eq!(
+                held_events(&f).len(),
+                usize::from(mode == ProvenanceMode::Required),
+                "only a required-mode hold records its reason",
             );
             assert_eq!(
                 f.artifacts.get(f.artifact_id).unwrap().rejection_reason,
@@ -7226,7 +7368,7 @@ async fn required_unreadable_material_alone_holds_indefinitely() {
     assert_eq!(
         outcome,
         ProvenanceRunOutcome::Applied {
-            event_appended: false,
+            event_appended: true,
             verdict: ProvenanceVerdictSummary::HeldPendingSignature,
             unreadable_skipped: 2,
         },
@@ -7240,10 +7382,7 @@ async fn required_unreadable_material_alone_holds_indefinitely() {
         "held — neither rejected nor released",
     );
     assert_eq!(saved.rejection_reason, None);
-    assert!(
-        f.lifecycle.committed_transitions().is_empty(),
-        "the hold appends no verdict event",
-    );
+    assert_eq!(f.lifecycle.committed_transitions().len(), 1);
 }
 
 /// Under `VerifyIfPresent`, unreadable material alone behaves **exactly**

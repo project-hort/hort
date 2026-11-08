@@ -55,6 +55,10 @@ pub(crate) mod name;
 pub(crate) mod prefetch;
 pub(crate) mod quarantine;
 pub mod referrers;
+// The record a refused hosted read leaves. `pub(crate)`: the two pull
+// handlers call it from their own withholding gates and nothing outside
+// the crate emits an OCI refusal.
+pub(crate) mod refusal;
 pub(crate) mod tag;
 pub mod tags;
 pub(crate) mod tail;
@@ -712,12 +716,13 @@ mod tests {
     use uuid::Uuid;
 
     use hort_app::use_cases::test_support::{
-        sample_repository, MockArtifactGroupRepository, MockRefRegistryPort,
-        MockRepositoryRepository,
+        sample_repository, MockArtifactGroupRepository, MockContentReferenceIndex,
+        MockRefRegistryPort, MockRepositoryRepository,
     };
     use hort_domain::entities::artifact_group::ArtifactGroup;
     use hort_domain::entities::mutable_ref::{MutableRef, RefTarget};
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
+    use hort_domain::ports::content_reference_index::ContentReferenceIndex;
     use hort_domain::types::{ArtifactCoords, ContentHash};
     use metrics_exporter_prometheus::PrometheusBuilder;
 
@@ -730,6 +735,7 @@ mod tests {
         repositories: Arc<MockRepositoryRepository>,
         refs: Arc<MockRefRegistryPort>,
         groups: Arc<MockArtifactGroupRepository>,
+        content_references: Arc<MockContentReferenceIndex>,
     }
 
     fn harness() -> Harness {
@@ -740,6 +746,7 @@ mod tests {
             repositories: mocks.repositories,
             refs: mocks.refs,
             groups: mocks.artifact_groups,
+            content_references: mocks.content_references,
         }
     }
 
@@ -1046,16 +1053,16 @@ mod tests {
             let repo = oci_repo("private-repo", false);
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            // Seed a content_references row for this repo via the use
-            // case's own write contract — proves the read path through
+            // Seed a content_references row for this repo through the
+            // port — proves the read path through
             // `find_by_visible_target` still suppresses the row from
             // anonymous callers (i.e. the visibility gate fires BEFORE
-            // any rows are returned, even though the row exists).
+            // any rows are returned, even though the row exists). The row
+            // is this test's precondition, not its subject.
             let ctx = enabled_empty_rbac_ctx(&h.ctx, h.repositories.clone());
             let target_hash: ContentHash = valid_hex.parse().unwrap();
-            ctx.content_reference_use_case
-                .insert_for_repo(
-                    repo_id,
+            h.content_references
+                .insert(
                     hort_domain::ports::content_reference_index::ContentReference {
                         source_artifact_id: Uuid::new_v4(),
                         target_content_hash: target_hash,

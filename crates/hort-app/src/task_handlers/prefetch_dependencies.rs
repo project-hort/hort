@@ -57,10 +57,20 @@
 //!
 //! # Low priority
 //!
-//! All cascade-spawned rows carry `priority = 0` (the schema
-//! default) so manual / cron / advisory work drains
-//! first. The cascade is a background warm; starving it under
-//! load is fine — the next pull re-derives.
+//! All cascade-spawned rows carry `trigger_source = 'prefetch'`, which
+//! `hort_domain::types::task_tier` classifies as work nobody is waiting
+//! on — so they sit in the bottom ordinal band (the schema default) and
+//! every client-waited and operator-waited row drains ahead of them. The
+//! cascade is a background warm; starving it under load is fine — the
+//! next pull re-derives.
+//!
+//! The **root** row the ingest hook enqueues is in the same band even
+//! though it carries `trigger_source = 'ingest'`: `task_tier` classifies
+//! `kind = 'prefetch-dependencies'` off the kind, before the trigger
+//! source, because the push that caused the root has already answered
+//! `201` and the re-derivation above is what makes a walk that never ran
+//! cost nothing. Otherwise one root per ingested artifact would be a
+//! top-band flood on every bulk push.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -75,25 +85,27 @@ use hort_domain::entities::repository::Repository;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::format_handler::{DependencySpec, FormatHandler};
-use hort_domain::ports::jobs_repository::{JobsRepository, PrefetchEnqueueRow};
+use hort_domain::ports::jobs_repository::{JobsRepository, PrefetchEnqueueRow, TriggerSource};
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::BoxFuture;
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::PageRequest;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// `trigger_source` literal on every cascade-enqueued row. Mirrors
-/// the migration-009 CHECK addition. The dedicated literal
-/// distinguishes cascade-spawned rows from cron / advisory / ingest
-/// / manual / seed-import in audit + metric labels
+/// `trigger_source` literal on every cascade-enqueued row, taken from
+/// the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]). The
+/// dedicated literal distinguishes cascade-spawned rows from every other
+/// trigger source in audit + metric labels
 /// (`hort_prefetch_enqueued_total{trigger}`).
-const PREFETCH_TRIGGER_SOURCE: &str = "prefetch";
+const PREFETCH_TRIGGER_SOURCE: &str = TriggerSource::Prefetch.as_str();
 
 /// `kind` literal for the ingest-leaf row. Must match
 /// `ADMIN_INVOKABLE_TASK_KINDS`.
@@ -1075,7 +1087,7 @@ impl PrefetchDependenciesHandler {
                             "package": cold.normalised,
                             "version": concrete,
                         }),
-                        priority: 0,
+                        priority: queue_priority(KIND_PREFETCH_INGEST, PREFETCH_TRIGGER_SOURCE),
                         trigger_source: PREFETCH_TRIGGER_SOURCE.to_string(),
                         target_key: key.clone(),
                     });
@@ -1103,7 +1115,10 @@ impl PrefetchDependenciesHandler {
                                 "version": concrete,
                                 "current_depth": next_depth,
                             }),
-                            priority: 0,
+                            priority: queue_priority(
+                                KIND_PREFETCH_DEPENDENCIES,
+                                PREFETCH_TRIGGER_SOURCE,
+                            ),
                             trigger_source: PREFETCH_TRIGGER_SOURCE.to_string(),
                             target_key: key,
                         });

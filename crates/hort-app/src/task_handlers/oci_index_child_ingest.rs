@@ -28,6 +28,17 @@
 //! scan verdict. ADR 0043 D4 likewise stands — releasing an index does not
 //! release a held child.
 //!
+//! The same holds for the config and layer blobs the handler warms (step 8).
+//! Their anchor is whatever `IngestUseCase` derives, which for a constituent of
+//! a manifest that has already committed its `oci_config` / `oci_layer` edges
+//! includes the **referenced-tree-descendant carve-out** — a window that is
+//! already over. That is not something the warm does: the edge that makes the
+//! blob a descendant is written by the child's own ingest one step earlier, so
+//! a blob a client pulled lazily a day later lands on exactly the same anchor.
+//! What the carve-out removes is the timer and nothing else — the blob still
+//! needs its own clean scan verdict before a byte of it is served, and a warmed
+//! blob is minted `Quarantined` like any other.
+//!
 //! # Params
 //!
 //! | field | type | meaning |
@@ -70,8 +81,12 @@
 //! 3. Short-circuit on local presence, scoped to the **target repository**
 //!    (`find_by_repo_and_checksum`): ADR 0054 keeps the anchor per row, so a row
 //!    in another repository is not this repository's row. A hit returns
-//!    `Completed` without touching the network — never re-mint, never re-anchor.
-//!    This is also what makes the row safe to run twice.
+//!    `Completed` without fetching the manifest again — never re-mint, never
+//!    re-anchor. It reads the stored manifest to restore missing constituent
+//!    claims, and then warms the child's config/layer blobs exactly as step 8
+//!    does, because a child minted before that step existed has its edges and
+//!    none of its bytes. So this branch is a no-op for the **manifest** and not
+//!    for the tree below it: it can issue blob fetches.
 //! 4. Fetch by digest through [`UpstreamProxy::fetch_manifest`], with an
 //!    `accept` list covering both the OCI and the Docker manifest and index
 //!    media types.
@@ -99,7 +114,40 @@
 //!    what it references. A failed edge fails this unit; the job row is
 //!    retried, where a committed manifest with a missing claim was only
 //!    repairable by re-reading manifest bodies out of CAS.
-//! 8. Recurse when the child is itself an index: enqueue
+//!    By design, this handler holds no content-reference port: existing-row
+//!    repair also goes through [`IngestUseCase::reconcile_claimed_edges`].
+//! 8. Warm the child's own config and layer blobs: fetch each through
+//!    [`UpstreamProxy::fetch_blob`] and ingest it, in this same run. The edges
+//!    step 6 derived already name every one of them, so the digests are in
+//!    hand, and for a **quarantined** parent nobody else can learn them — a
+//!    503 carries no body, and the body is the only place those digests are
+//!    published, so without this the whole tree below a held index stays cold
+//!    until the window closes. The set comes from the claims rather than a
+//!    second parse ([`blob_targets`]), which is also why an index warms
+//!    nothing: its `oci_index_member` edges name child manifests, and those
+//!    get their own rows at step 9.
+//!
+//!    **Ungated.** Not conditional on `prefetch_policy.enabled`: this is
+//!    finishing the ingest of a tree a client named, which is the same
+//!    justification the grandchild enqueue below already runs on ungated, and
+//!    not hort deciding by itself to fetch something nobody asked for. The
+//!    switch governs the latter.
+//!
+//!    **Per blob, best-effort, and never fatal to the child.** A blob already
+//!    held at its blob coords path is skipped without an upstream request; an
+//!    upstream 404 is counted and not escalated (an index may name a child
+//!    whose layers the upstream has since dropped); any other failure is
+//!    counted, logged and skipped. The child row stays `Completed` either way
+//!    — its own ingest has already committed, and failing the row would re-do
+//!    that work to retry a blob the lazy pull path still covers, which is
+//!    exactly where it sat before this step existed.
+//!
+//!    **No anchor, and no window shortened.** Nothing here computes, passes or
+//!    overrides an anchor: `IngestUseCase` derives each blob's exactly as it
+//!    would for a lazily pulled blob of the same manifest — see
+//!    *This shortens no quarantine window* above, which covers the blobs for
+//!    the same reason it covers the child.
+//! 9. Recurse when the child is itself an index: enqueue
 //!    one `oci-index-child-ingest` row per grandchild — the whole level in one
 //!    [`JobsRepository::enqueue_idempotent_batch`] statement, never a row at a
 //!    time, because it is a cohort of up to the per-index child cap and each
@@ -148,6 +196,18 @@
 //! Infrastructure reads that must not be guessed at — the repository load and
 //! the local-presence lookup — are `Failed { retry: true }`.
 //!
+//! **The blob warm never moves the outcome label.** Step 8 runs after the
+//! child's own ingest has committed, so none of its per-blob states is a
+//! terminal state of this unit: an `ingested` child with every layer warmed and
+//! an `ingested` child whose layers all 404'd carry the same label. The five
+//! `blobs_*` counters in `result_summary` are where that difference is
+//! legible — `blobs_attempted` closes exactly as
+//! `already_present + ingested + not_found + failed`, so an operator can tell a
+//! warm tree from a cold one, and a cold one from a tree whose upstream has
+//! dropped the layers, without reading logs. A non-zero `blobs_failed` also
+//! raises a `warn!` of its own, the same way a failed grandchild enqueue does:
+//! both mean the eager path degraded to the lazy one for part of the tree.
+//!
 //! # Idempotency
 //!
 //! The row's dedupe key is the pair (`repository_id`, `child_digest`), composed
@@ -158,15 +218,20 @@
 //! [`child_ingest_params`] — the pull-through legs through
 //! [`crate::use_cases::oci_index_child_enqueue::OciIndexChildEnqueueUseCase`],
 //! this handler directly for a grandchild — so the producer→consumer shape has
-//! one definition. Step 3 makes a re-run of an already-ingested child a no-op
-//! regardless.
+//! one definition. Step 3 makes a re-run of an already-ingested child avoid
+//! re-fetching the **manifest** while reconciling any missing claims and
+//! warming any blob that is still absent; a blob already held at its coords
+//! path is likewise not re-fetched, so a repeat run over a fully warm child
+//! issues no upstream request at all.
 //!
 //! **The jobs row is the second dedupe layer, not the only one**, which is what
 //! makes a terminal row of this kind safe to delete: `jobs.idempotency_key`
 //! suppresses a re-enqueue only for as long as the row exists, but step 3's
-//! target-repository presence check suppresses the *work* permanently. A swept
-//! row that is later re-enqueued therefore short-circuits before it touches the
-//! network — a cheap no-op, never a re-fetch and never a re-anchor. Terminal
+//! target-repository presence check suppresses a repeat manifest fetch and the
+//! per-blob presence check suppresses a repeat blob fetch. A swept
+//! row that is later re-enqueued therefore re-mints nothing and re-fetches only
+//! what is genuinely missing, rechecking the stored manifest's claims without
+//! re-anchoring. Terminal
 //! rows of this kind are consequently swept by `prefetch-row-retention-sweep`
 //! along with the rest of the pull-through ingest cascade; nothing durable is
 //! kept in them.
@@ -175,6 +240,8 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
 use hort_domain::entities::repository::{Repository, RepositoryFormat};
@@ -182,17 +249,20 @@ use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::ApiActor;
 use hort_domain::oci::{
     index_child_descriptors, is_image_index, ManifestBlobRole, DOCKER_MANIFEST_LIST_MEDIA_TYPE,
-    OCI_IMAGE_INDEX_MEDIA_TYPE,
+    OCI_BLOB_PATH_PREFIX, OCI_IMAGE_INDEX_MEDIA_TYPE,
 };
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceClaim;
 use hort_domain::ports::format_handler::FormatHandler;
-use hort_domain::ports::jobs_repository::{IdempotentEnqueueRow, JobsRepository};
+use hort_domain::ports::jobs_repository::{IdempotentEnqueueRow, JobsRepository, TriggerSource};
 use hort_domain::ports::repository_repository::RepositoryRepository;
+use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping;
+use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::ports::BoxFuture;
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::{ArtifactCoords, ContentHash, IdempotencyKey};
 
 use crate::use_cases::ingest_use_case::{IngestUseCase, VerifiedIngestRequest};
@@ -228,18 +298,26 @@ const DOCKER_MANIFEST_V2_MEDIA_TYPE: &str = "application/vnd.docker.distribution
 /// fallback the OCI manifest pull-through applies to the same `Option<String>`.
 const FALLBACK_MEDIA_TYPE: &str = "application/octet-stream";
 
+/// `content_type` recorded on a warmed config/layer blob row.
+///
+/// A blob response's own `Content-Type` is not a statement about the blob —
+/// registries serve layers under whatever generic type they like — so the
+/// client-path blob pull-through records this literal unconditionally rather
+/// than the response header, and a warmed blob records the same thing so the
+/// two rows are indistinguishable. Deliberately a separate constant from
+/// [`FALLBACK_MEDIA_TYPE`] even though the string is the same today: that one
+/// is "the upstream declared no media type for this manifest", which is a
+/// fact about one response, and this one is "a blob has no media type",
+/// which is a fact about the artifact class.
+const BLOB_CONTENT_TYPE: &str = "application/octet-stream";
+
 /// `jobs.trigger_source` bound on every `oci-index-child-ingest` row. The row
 /// exists because an ingest observed an index declaring the child — an
 /// unexpectedly high rate here is a runaway index nesting, not a runaway
 /// operator. Shared with the pull-through producer
 /// ([`crate::use_cases::oci_index_child_enqueue`]) so a row minted by the
 /// handler's own recursion is indistinguishable from one minted at a pull leg.
-pub(crate) const CHILD_INGEST_TRIGGER_SOURCE: &str = "ingest";
-
-/// `jobs.priority` bound on every `oci-index-child-ingest` row. Eager child
-/// ingest is a latency optimisation, never urgent work: it drains behind
-/// manual, cron and advisory rows, matching the cascade's priority-0 posture.
-pub(crate) const CHILD_INGEST_ENQUEUE_PRIORITY: i16 = 0;
+pub(crate) const CHILD_INGEST_TRIGGER_SOURCE: &str = TriggerSource::Ingest.as_str();
 
 /// The recursion depth a row minted at a pull-through leg carries: the index
 /// the client pulled is the root, so the children it declares are level zero.
@@ -442,6 +520,60 @@ fn child_manifest_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
     }
 }
 
+/// Build the `ArtifactCoords` for one config or layer **blob** of a child
+/// manifest, where `name` is the same **client-facing requested name** the
+/// child itself is minted under — so a blob warmed here and the same blob
+/// pulled lazily by a client carry an identical `Artifact.name`.
+///
+/// `path = "blobs/sha256:<hex>"`, and the prefix comes from
+/// [`OCI_BLOB_PATH_PREFIX`] rather than a literal. The builder is re-derived
+/// here because `hort-app` must not depend on `hort-http-oci` (ADR 0008 runs
+/// the dependency the other way) — the same reason
+/// [`child_manifest_coords`] exists — but the prefix itself lives in the
+/// domain and both layers read it, so the two cannot drift. The manifest
+/// sibling has to spell its prefix out because no domain constant exists for
+/// manifests; this one must not.
+///
+/// The exactness is load-bearing in two directions. A client blob `GET`
+/// resolves `blobs/sha256:<hex>` by path, so a divergence would leave the
+/// warmed row unreachable from the read path and the next client `GET` would
+/// mint a second row for the same bytes. And
+/// `OciFormatHandler::is_provenance_constituent` reads the same prefix to
+/// decide that a row can never carry its own attestation, so a warmed blob
+/// that did not match it would be asked for a signature it cannot have.
+fn child_blob_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
+    ArtifactCoords {
+        name: name.to_string(),
+        name_as_published: name.to_string(),
+        version: None,
+        path: format!("{OCI_BLOB_PATH_PREFIX}{}", digest.as_ref()),
+        format: RepositoryFormat::Oci,
+        metadata: serde_json::Value::Null,
+    }
+}
+
+/// The config and layer blob digests among `edges` — the set the blob warm
+/// fetches.
+///
+/// Taken from the claims the child was just minted with rather than from a
+/// second parse of the body, so the warmed set and the claimed set cannot
+/// diverge. A `content_references` row is the GC keepalive on exactly these
+/// bytes, which makes the two sets the same question asked twice: a blob with
+/// an edge and no bytes is the cold-tree state the warm exists to close, and
+/// a blob with bytes and no edge would be a row nothing claims.
+///
+/// An **index** therefore yields the empty set and warms nothing: its edges
+/// are `oci_index_member`, which name child *manifests*, and those are fetched
+/// by their own `oci-index-child-ingest` rows rather than as blobs. That is
+/// also why the client path's own warm is a no-op for an index.
+fn blob_targets(edges: &[ContentReferenceClaim]) -> Vec<ContentHash> {
+    edges
+        .iter()
+        .filter(|edge| edge.kind == OCI_CONFIG_KIND || edge.kind == OCI_LAYER_KIND)
+        .map(|edge| edge.target_content_hash.clone())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Per-call outcome + counters
 // ---------------------------------------------------------------------------
@@ -458,8 +590,16 @@ enum ChildOutcome {
     /// but no grandchild rows were enqueued. Its children stay on the lazy
     /// pull path.
     IngestedDepthCapped,
-    /// The target repository already held the content hash; no upstream
-    /// request was made and no row was minted or re-anchored.
+    /// The target repository already held the content hash, so the
+    /// **manifest** was not fetched again and no row was minted or
+    /// re-anchored.
+    ///
+    /// This is not a no-op for the tree below it. The branch reads the stored
+    /// manifest back to reassert any missing constituent claims, and it warms
+    /// the child's config/layer blobs on the same terms as the ingest path —
+    /// a child minted before the warm existed has its edges and none of its
+    /// bytes, and this is where it gets them. So an `already_present` run can
+    /// issue blob fetches, and its `blobs_*` counters say how many.
     AlreadyPresent,
     /// The repository the row names no longer exists.
     RepositoryMissing,
@@ -499,15 +639,14 @@ impl ChildOutcome {
 /// "could not do it".
 ///
 /// The grandchild counters are best-effort follow-up to an ingest that has
-/// already committed and cannot fail the call. `membership_edges_written` is
-/// not follow-up at all any more: those edges ride the child's own minting
-/// transition, so the number is what that transition carried — on a failure
-/// the whole unit reports `hard_failure` and this stays `0`.
+/// already committed and cannot fail the call. `membership_edges_written`
+/// counts claims inserted by a mint or a repeat repair; an already-present
+/// row with every claim intact reports zero.
 #[derive(Debug, Default)]
 struct ChildSummary {
     /// `true` when the ingested child was itself an image index.
     is_index: bool,
-    /// `content_references` rows committed with this child (`oci_index_member`
+    /// `content_references` rows inserted for this child (`oci_index_member`
     /// for an index, `oci_config` + `oci_layer` for an image manifest).
     membership_edges_written: u64,
     /// Grandchild rows that inserted.
@@ -520,6 +659,32 @@ struct ChildSummary {
     /// `true` when the child was an index at [`MAX_CHILD_INGEST_DEPTH`], so
     /// its declared children were deliberately not enqueued.
     depth_capped: bool,
+    /// Config/layer blobs the child's own edges named — the whole set the warm
+    /// considered. Zero for an index, whose members are manifests.
+    ///
+    /// The four counters below partition it exactly
+    /// (`attempted == already_present + ingested + not_found + failed`), which
+    /// is what lets an operator read a cold tree, a warm one and an upstream
+    /// that has dropped the layers apart from each other in `result_summary`
+    /// alone.
+    blobs_attempted: u64,
+    /// Blobs this run fetched from the upstream and ingested.
+    blobs_ingested: u64,
+    /// Blobs the target repository already held at their blob coords path, so
+    /// no upstream request was made for them. The whole set on a repeat run
+    /// over an already-warm child.
+    blobs_already_present: u64,
+    /// Blobs the upstream no longer serves. Deliberately **not** counted as a
+    /// failure: an index may name a child whose layers upstream has since
+    /// dropped, there is nothing to retry, and the child's own ingest stands.
+    blobs_not_found: u64,
+    /// Blobs whose presence probe, fetch or ingest failed for any other
+    /// reason. Best-effort per blob — each one stays reachable through the
+    /// lazy pull path, which is where every one of them was before the warm
+    /// existed — but a non-zero count raises a `warn!`, because that
+    /// fallback means a layer's quarantine window does not start until a
+    /// client asks for it.
+    blobs_failed: u64,
 }
 
 /// What the child's body says it claims, derived **before** the ingest.
@@ -556,10 +721,10 @@ struct ChildClaims {
 /// target-repository presence short-circuit) and the jobs repository (the
 /// grandchild enqueue when the child is itself an index).
 ///
-/// It holds **no** content-reference port. The child's membership edges are
-/// claims on bytes, so they travel into the ingest's own transition as
-/// [`ContentReferenceClaim`]s rather than being written beside it; with no
-/// handle there is nothing here that could write one afterwards.
+/// It holds **no** content-reference port. A new child's membership claims
+/// travel into the ingest transition as [`ContentReferenceClaim`]s. When the
+/// child already exists, [`IngestUseCase::reconcile_claimed_edges`] inserts
+/// only claims recovered from its stored manifest that are still missing.
 pub struct OciIndexChildIngestHandler {
     repositories: Arc<dyn RepositoryRepository>,
     artifacts: Arc<dyn ArtifactRepository>,
@@ -568,6 +733,7 @@ pub struct OciIndexChildIngestHandler {
     /// through exactly the mapping a client pull of that child would.
     upstream_resolver: Arc<dyn UpstreamResolver>,
     jobs: Arc<dyn JobsRepository>,
+    storage: Arc<dyn StoragePort>,
     /// OCI handler. This kind is OCI-only by design; the composition root wires
     /// the OCI handler in directly rather than threading the full per-format
     /// registry, mirroring
@@ -588,6 +754,7 @@ impl OciIndexChildIngestHandler {
         upstream_proxy: Arc<dyn UpstreamProxy>,
         upstream_resolver: Arc<dyn UpstreamResolver>,
         jobs: Arc<dyn JobsRepository>,
+        storage: Arc<dyn StoragePort>,
         oci_handler: Arc<dyn FormatHandler>,
         ingest: Arc<IngestUseCase>,
     ) -> Self {
@@ -597,6 +764,7 @@ impl OciIndexChildIngestHandler {
             upstream_proxy,
             upstream_resolver,
             jobs,
+            storage,
             oci_handler,
             ingest,
         }
@@ -662,12 +830,77 @@ impl OciIndexChildIngestHandler {
             .await
         {
             Ok(Some(existing)) => {
+                // The original transition cannot be replayed. The stored
+                // manifest can still reassert any missing foreign-byte claims.
+                // A blob with the same checksum is not a manifest whose
+                // membership claims this task may derive.
+                if existing.path == child_manifest_coords(&parsed.requested_name, child_hash).path {
+                    match self.storage.get(&existing.sha256_checksum).await {
+                        Ok(mut stream) => {
+                            let mut body = Vec::new();
+                            if let Err(err) = stream.read_to_end(&mut body).await {
+                                return Err(TaskOutcome::fail(
+                                    format!(
+                                        "oci-index-child-ingest: stored child unreadable: {err}"
+                                    ),
+                                    true,
+                                ));
+                            }
+                            let claims = self.derive_claims(
+                                &repo,
+                                parsed,
+                                child_hash,
+                                &existing.content_type,
+                                &body,
+                                summary,
+                            );
+                            summary.membership_edges_written =
+                                self.ingest
+                                    .reconcile_claimed_edges(&existing, &claims.edges)
+                                    .await
+                                    .map_err(|err| {
+                                        TaskOutcome::fail(
+                                    format!("oci-index-child-ingest: claim repair failed: {err}"),
+                                    true,
+                                )
+                                    })?;
+                            // The second warm call site. A child minted
+                            // before the warm existed has its edges and none
+                            // of its bytes — the same cold state this
+                            // branch's claim repair was built for, one level
+                            // down — and both of the warm's inputs are
+                            // already in hand here: the digests out of the
+                            // `derive_claims` the repair just ran, and the
+                            // fetch route out of the mapping resolved above.
+                            self.warm_child_blobs(
+                                &repo,
+                                parsed,
+                                &mapping,
+                                &upstream_name,
+                                &claims.edges,
+                                summary,
+                            )
+                            .await;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                repository = %repo.key,
+                                artifact_id = %existing.id,
+                                error = %err,
+                                "oci-index-child-ingest: stored child unavailable for claim repair",
+                            );
+                        }
+                    }
+                }
                 tracing::debug!(
                     repository = %repo.key,
                     artifact_id = %existing.id,
                     child_digest = %parsed.child_digest,
+                    blobs_attempted = summary.blobs_attempted,
+                    blobs_ingested = summary.blobs_ingested,
                     "oci-index-child-ingest: child already held in the target repository; \
-                     no upstream request, no re-mint, no re-anchor",
+                     no manifest fetch, no re-mint, no re-anchor — its blobs may still \
+                     have been warmed",
                 );
                 return Ok(ChildOutcome::AlreadyPresent);
             }
@@ -837,9 +1070,7 @@ impl OciIndexChildIngestHandler {
             }
         };
 
-        // The transition committed, so every edge it carried is durable —
-        // there is no per-edge outcome left to count.
-        summary.membership_edges_written = claims.edges.len() as u64;
+        summary.membership_edges_written = ingested.claimed_edges_written;
         tracing::debug!(
             repository = %repo.key,
             artifact_id = %ingested.artifact.id,
@@ -847,6 +1078,20 @@ impl OciIndexChildIngestHandler {
             membership_edges = summary.membership_edges_written,
             "oci-index-child-ingest: child minted with its membership edges",
         );
+
+        // The first warm call site: the child and its edges have committed,
+        // so every blob digest this run must warm is both known and claimed.
+        // `warm_child_blobs` is a no-op for an index, whose members are
+        // manifests and get their own rows below.
+        self.warm_child_blobs(
+            &repo,
+            parsed,
+            &mapping,
+            &upstream_name,
+            &claims.edges,
+            summary,
+        )
+        .await;
 
         // The grandchild rows stay post-commit and best-effort. They are
         // `jobs` rows, not claims on bytes: a lost one leaves its
@@ -1017,6 +1262,189 @@ impl OciIndexChildIngestHandler {
         }
     }
 
+    /// Fetch and ingest the child's config and layer blobs — the set
+    /// [`blob_targets`] reads out of the claims the child was minted with.
+    ///
+    /// Why it runs at all: the handler has just written an `oci_config` /
+    /// `oci_layer` edge per blob, so it already knows every digest, and for a
+    /// quarantined parent nobody else can learn them — a 503 carries no body,
+    /// and the manifest body is the only place those digests are published. So
+    /// without this the entire tree under a held index stays cold for the
+    /// whole window, and the client pull that would have warmed it is the one
+    /// the window is refusing.
+    ///
+    /// Why it is **not** gated on `prefetch_policy.enabled`: this is finishing
+    /// the ingest of a tree a client named, which is the same activity (and
+    /// the same justification) as the ungated grandchild enqueue beside it.
+    /// What the switch governs is hort deciding by itself to fetch something
+    /// nobody asked for.
+    ///
+    /// Why each blob is best-effort: the child manifest's own ingest has
+    /// already committed. Failing the row would re-do that work in order to
+    /// retry one blob, and the blob is still reachable through the lazy pull
+    /// path — which is exactly where every one of them sat before this
+    /// existed. So a failure is counted, logged and skipped, and the child
+    /// stays `Completed`.
+    ///
+    /// No `PullDedup`: the sibling
+    /// [`PrefetchIngestHandler`](super::prefetch_ingest::PrefetchIngestHandler)
+    /// does the same fetch-then-ingest in this layer without one, and this
+    /// handler already fetched the child manifest without one. The window a
+    /// dedup would close is a redundant upstream GET whose two ingests
+    /// converge on the same content hash; closing it costs a new constructor
+    /// argument through the composition root and every test construction site.
+    ///
+    /// Nothing here supplies a quarantine anchor or any window arithmetic:
+    /// `ingest_verified` derives each blob's exactly as it would for a lazily
+    /// pulled blob of the same manifest. See the module doc's
+    /// *This shortens no quarantine window* for why that is the same answer
+    /// even though a constituent of a committed manifest takes the
+    /// referenced-tree-descendant carve-out.
+    async fn warm_child_blobs(
+        &self,
+        repo: &Repository,
+        parsed: &OciIndexChildIngestParams,
+        mapping: &RepositoryUpstreamMapping,
+        upstream_name: &str,
+        edges: &[ContentReferenceClaim],
+        summary: &mut ChildSummary,
+    ) {
+        for blob_hash in blob_targets(edges) {
+            summary.blobs_attempted += 1;
+            let coords = child_blob_coords(&parsed.requested_name, &blob_hash);
+            let blob_digest = oci_digest_ref(&blob_hash);
+
+            // The read path resolves a blob by exactly this path, so this is
+            // the question "would a client GET for it still miss?" — and the
+            // answer is what keeps a repeat run (step 3's branch, a re-enqueue
+            // after a sweep, a cycle) from re-downloading a warm tree. A probe
+            // that cannot be answered is NOT read as "absent": re-fetching
+            // content the repository may already hold is the posture every
+            // presence check in this handler refuses, and the blob is left to
+            // the lazy path exactly as any other failure leaves it.
+            match self.artifacts.find_by_path(repo.id, &coords.path).await {
+                Ok(Some(_)) => {
+                    summary.blobs_already_present += 1;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    summary.blobs_failed += 1;
+                    tracing::warn!(
+                        error = %err,
+                        repository = %repo.key,
+                        child_digest = %parsed.child_digest,
+                        blob_digest = %blob_digest,
+                        "oci-index-child-ingest: blob presence lookup failed; leaving this \
+                         blob to the lazy pull path",
+                    );
+                    continue;
+                }
+            }
+
+            let fetch = match self
+                .upstream_proxy
+                .fetch_blob(
+                    mapping.clone(),
+                    upstream_name.to_string(),
+                    blob_digest.clone(),
+                )
+                .await
+            {
+                Ok(f) => f,
+                Err(err) => {
+                    if is_upstream_not_found(&err.to_string()) {
+                        summary.blobs_not_found += 1;
+                        tracing::info!(
+                            repository = %repo.key,
+                            upstream_name = %upstream_name,
+                            child_digest = %parsed.child_digest,
+                            blob_digest = %blob_digest,
+                            "oci-index-child-ingest: upstream no longer serves a blob this \
+                             child references",
+                        );
+                    } else {
+                        summary.blobs_failed += 1;
+                        tracing::warn!(
+                            error = %err,
+                            repository = %repo.key,
+                            upstream_name = %upstream_name,
+                            child_digest = %parsed.child_digest,
+                            blob_digest = %blob_digest,
+                            "oci-index-child-ingest: blob fetch failed; leaving this blob to \
+                             the lazy pull path",
+                        );
+                    }
+                    continue;
+                }
+            };
+
+            // The same request the client-path blob pull-through builds, one
+            // layer out: `upstream_digest` is the digest the manifest bound,
+            // and `ingest_verified` rehashes the streamed bytes against it, so
+            // the fetch is verified (ADR 0006) and nothing unverified reaches
+            // CAS. `claimed_edges: &[]` because a pulled blob claims only its
+            // own content — the `oci_config` / `oci_layer` claims belong to
+            // the manifest that references it, and this handler has just
+            // written them.
+            let request = VerifiedIngestRequest::ProtocolNative {
+                repository_id: repo.id,
+                coords,
+                content_type: BLOB_CONTENT_TYPE.to_string(),
+                actor: ApiActor {
+                    user_id: Uuid::nil(),
+                },
+                // `source` is the one key the client path's blob ingest does
+                // not write, and it is deliberate here: this fetch is one no
+                // client asked for, so the row says which path minted it, and
+                // the two rows this handler mints — the manifest and its
+                // blobs — carry the same attribution. Nothing reads the key;
+                // it is operator-visible provenance, and the properties that
+                // must stay indistinguishable from a lazy pull (the
+                // quarantine anchor, the release authority) are decided by
+                // the rest of this request, not by metadata.
+                payload_metadata: json!({
+                    "oci_source": "upstream",
+                    "oci_upstream_url": mapping.upstream_url,
+                    "oci_upstream_name": upstream_name,
+                    "source": "oci_index_child_ingest",
+                }),
+                upstream_digest: blob_hash.clone(),
+                upstream_published_at: fetch.last_modified,
+                trust_upstream_publish_time: mapping.trust_upstream_publish_time,
+            };
+            let reader: Box<dyn AsyncRead + Send + Unpin> =
+                Box::new(StreamReader::new(fetch.stream));
+            match self
+                .ingest
+                .ingest_verified(request, &[], reader, self.oci_handler.as_ref())
+                .await
+            {
+                Ok(ingested) => {
+                    summary.blobs_ingested += 1;
+                    tracing::debug!(
+                        repository = %repo.key,
+                        artifact_id = %ingested.artifact.id,
+                        child_digest = %parsed.child_digest,
+                        blob_digest = %blob_digest,
+                        "oci-index-child-ingest: child blob warmed",
+                    );
+                }
+                Err(err) => {
+                    summary.blobs_failed += 1;
+                    tracing::warn!(
+                        error = %err,
+                        repository = %repo.key,
+                        child_digest = %parsed.child_digest,
+                        blob_digest = %blob_digest,
+                        "oci-index-child-ingest: blob ingest failed; leaving this blob to the \
+                         lazy pull path",
+                    );
+                }
+            }
+        }
+    }
+
     /// Enqueue one `oci-index-child-ingest` row per grandchild of the index
     /// this call ingested, in a single statement.
     ///
@@ -1052,7 +1480,7 @@ impl OciIndexChildIngestHandler {
                     grandchild,
                     depth,
                 ),
-                priority: CHILD_INGEST_ENQUEUE_PRIORITY,
+                priority: queue_priority(OCI_INDEX_CHILD_INGEST_KIND, CHILD_INGEST_TRIGGER_SOURCE),
                 trigger_source: CHILD_INGEST_TRIGGER_SOURCE.to_string(),
                 idempotency_key: child_ingest_idempotency_key(repo.id, grandchild),
             })
@@ -1134,6 +1562,25 @@ impl TaskHandler for OciIndexChildIngestHandler {
                 );
             }
 
+            // The blob half of the same degradation, reported the same way: a
+            // blob that could not be warmed is still reachable lazily, but its
+            // quarantine window no longer starts until a client asks for it —
+            // and for a held parent that is after the parent's own window
+            // closes. An upstream 404 is deliberately not in this count; it is
+            // not a degradation, there is nothing to warm.
+            if summary.blobs_failed > 0 {
+                tracing::warn!(
+                    repository_id = %parsed.repository_id,
+                    requested_name = %parsed.requested_name,
+                    child_digest = %parsed.child_digest,
+                    blobs_attempted = summary.blobs_attempted,
+                    blobs_ingested = summary.blobs_ingested,
+                    blobs_failed = summary.blobs_failed,
+                    "oci-index-child-ingest: child blobs could not be warmed; eager ingest \
+                     degraded to the lazy pull path for those blobs",
+                );
+            }
+
             if outcome.is_error() {
                 tracing::error!(
                     repository_id = %parsed.repository_id,
@@ -1144,6 +1591,8 @@ impl TaskHandler for OciIndexChildIngestHandler {
                     is_index = summary.is_index,
                     membership_edges_written = summary.membership_edges_written,
                     grandchildren_enqueued = summary.grandchildren_enqueued,
+                    blobs_ingested = summary.blobs_ingested,
+                    blobs_failed = summary.blobs_failed,
                     "oci-index-child-ingest complete",
                 );
             } else {
@@ -1156,6 +1605,8 @@ impl TaskHandler for OciIndexChildIngestHandler {
                     is_index = summary.is_index,
                     membership_edges_written = summary.membership_edges_written,
                     grandchildren_enqueued = summary.grandchildren_enqueued,
+                    blobs_ingested = summary.blobs_ingested,
+                    blobs_failed = summary.blobs_failed,
                     "oci-index-child-ingest complete",
                 );
             }
@@ -1172,6 +1623,11 @@ impl TaskHandler for OciIndexChildIngestHandler {
                     "grandchildren_enqueued":   summary.grandchildren_enqueued,
                     "grandchildren_deduped":    summary.grandchildren_deduped,
                     "grandchildren_failed":     summary.grandchildren_failed,
+                    "blobs_attempted":          summary.blobs_attempted,
+                    "blobs_ingested":           summary.blobs_ingested,
+                    "blobs_already_present":    summary.blobs_already_present,
+                    "blobs_not_found":          summary.blobs_not_found,
+                    "blobs_failed":             summary.blobs_failed,
                 }),
             })
         })
@@ -1223,7 +1679,7 @@ mod tests {
             status: JobStatus::Running,
             params: Some(serde_json::Value::Null),
             actor_id: None,
-            priority: CHILD_INGEST_ENQUEUE_PRIORITY,
+            priority: 0,
             trigger_source: CHILD_INGEST_TRIGGER_SOURCE.to_string(),
             attempts: 1,
             created_at: now,
@@ -1343,6 +1799,7 @@ mod tests {
         proxy: Arc<MockUpstreamProxy>,
         resolver: Arc<MockUpstreamResolver>,
         refs: Arc<MockContentReferenceIndex>,
+        storage: Arc<MockStoragePort>,
         lifecycle: Arc<MockArtifactLifecycle>,
         jobs: Arc<MockJobsRepository>,
         repo: Repository,
@@ -1382,7 +1839,8 @@ mod tests {
         // the membership pins below would read an empty index and an armed
         // insert failure could not abort the ingest.
         let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone()).with_content_references(refs.clone()),
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+                .with_content_references(refs.clone()),
         );
         let storage = Arc::new(MockStoragePort::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -1392,7 +1850,7 @@ mod tests {
         let policies = Arc::new(MockPolicyProjectionRepository::new());
 
         let ingest = Arc::new(IngestUseCase::new(
-            storage,
+            storage.clone(),
             lifecycle.clone(),
             artifacts.clone(),
             repos.clone(),
@@ -1416,6 +1874,7 @@ mod tests {
             proxy.clone(),
             resolver.clone(),
             jobs.clone(),
+            storage.clone(),
             oci_handler,
             ingest,
         );
@@ -1426,6 +1885,7 @@ mod tests {
             proxy,
             resolver,
             refs,
+            storage,
             lifecycle,
             jobs,
             repo,
@@ -1894,6 +2354,31 @@ mod tests {
         assert_no_rows_enqueued(&f.jobs);
     }
 
+    #[tokio::test]
+    async fn same_checksum_blob_row_is_not_read_as_a_manifest_for_claim_repair() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_layer_refs(1),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let hash: ContentHash = sha256_hex(&body).parse().expect("sha");
+        let digest = format!("sha256:{}", hash.as_ref());
+        let mut existing = held_manifest(f.repo.id, &hash, &digest);
+        existing.path = format!("blobs/{digest}");
+        f.artifacts.insert(existing);
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("task outcome"),
+        );
+        assert_eq!(summary["outcome"], "already_present");
+        assert_eq!(summary["membership_edges_written"], 0);
+        assert_eq!(f.storage.get_call_count(), 0);
+        assert_eq!(f.refs.entry_count(), 0);
+    }
+
     /// The presence check is scoped to the TARGET repository: the same
     /// content held elsewhere is a different row with a different anchor
     /// (ADR 0054) and must not suppress the mint here.
@@ -2169,6 +2654,230 @@ mod tests {
             .is_some());
     }
 
+    #[tokio::test]
+    async fn repeat_child_ingest_repairs_missing_claims_without_rewriting_existing_edges() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_layer_refs(1),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+        let child_hash: ContentHash = sha256_hex(&body).parse().expect("child hash");
+        let request = VerifiedIngestRequest::ProtocolNative {
+            repository_id: f.repo.id,
+            coords: child_manifest_coords("library/nginx", &child_hash),
+            content_type: IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            actor: ApiActor {
+                user_id: Uuid::nil(),
+            },
+            payload_metadata: serde_json::Value::Null,
+            upstream_digest: child_hash.clone(),
+            upstream_published_at: None,
+            trust_upstream_publish_time: false,
+        };
+        let first = f
+            .handler
+            .ingest
+            .ingest_verified(
+                request,
+                &[],
+                Box::new(std::io::Cursor::new(body)),
+                f.handler.oci_handler.as_ref(),
+            )
+            .await
+            .expect("initial ingest without constituent claims");
+        assert_eq!(f.refs.entry_count(), 1, "only primary_content exists");
+
+        let config_hash = deterministic_sha(0xC0FF_EE00);
+        assert!(
+            f.refs
+                .find_by_target(f.repo.id, &config_hash, Some(OCI_CONFIG_KIND))
+                .await
+                .expect("config claims before repeat")
+                .is_empty(),
+            "without a claim the config is eligible for storage GC"
+        );
+
+        f.storage
+            .fail_next_get_truncated(child_hash.clone(), Vec::new());
+        let unreadable = f
+            .handler
+            .run(&params(f.repo.id, &digest), make_context())
+            .await
+            .expect("task outcome");
+        assert!(matches!(
+            unreadable,
+            TaskOutcome::Failed { retry: true, .. }
+        ));
+        assert_eq!(f.refs.entry_count(), 1);
+
+        f.refs.fail_next_insert_for_kind(
+            OCI_LAYER_KIND,
+            DomainError::Invariant("simulated repair failure".into()),
+        );
+        let failed = f
+            .handler
+            .run(&params(f.repo.id, &digest), make_context())
+            .await
+            .expect("task outcome");
+        assert!(matches!(failed, TaskOutcome::Failed { retry: true, .. }));
+        assert_eq!(
+            f.refs.entry_count(),
+            1,
+            "a failed batch leaves no partial constituent claim"
+        );
+
+        let repaired = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("repeat succeeds"),
+        );
+        assert_eq!(repaired["outcome"], "already_present");
+        assert_eq!(repaired["membership_edges_written"], 2);
+        assert_eq!(f.refs.entry_count(), 3);
+        let config_rows = f
+            .refs
+            .find_by_target(f.repo.id, &config_hash, Some(OCI_CONFIG_KIND))
+            .await
+            .expect("config claims after repeat");
+        assert_eq!(config_rows.len(), 1, "the config is no longer GC eligible");
+        assert_eq!(config_rows[0].source_artifact_id, first.artifact.id);
+
+        let repeated = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("third ingest succeeds"),
+        );
+        assert_eq!(repeated["membership_edges_written"], 0);
+        assert_eq!(f.refs.entry_count(), 3);
+        assert_eq!(
+            f.refs
+                .find_by_target(f.repo.id, &config_hash, Some(OCI_CONFIG_KIND))
+                .await
+                .expect("config claims after third ingest")[0]
+                .recorded_at,
+            config_rows[0].recorded_at,
+            "an existing claim retains its original timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_dedup_inserts_only_missing_claims_and_reports_inserted_rows() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(Vec::new())).await;
+        let body = image_manifest_body();
+        let child_hash: ContentHash = sha256_hex(&body).parse().expect("child hash");
+        let request = || VerifiedIngestRequest::ProtocolNative {
+            repository_id: f.repo.id,
+            coords: child_manifest_coords("library/nginx", &child_hash),
+            content_type: IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            actor: ApiActor {
+                user_id: Uuid::nil(),
+            },
+            payload_metadata: serde_json::Value::Null,
+            upstream_digest: child_hash.clone(),
+            upstream_published_at: None,
+            trust_upstream_publish_time: false,
+        };
+        let first = f
+            .handler
+            .ingest
+            .ingest_verified(
+                request(),
+                &[],
+                Box::new(std::io::Cursor::new(body.clone())),
+                f.handler.oci_handler.as_ref(),
+            )
+            .await
+            .expect("first ingest");
+        let target = deterministic_sha(0xC0FF_EE00);
+        let claim = ContentReferenceClaim {
+            target_content_hash: target.clone(),
+            kind: OCI_CONFIG_KIND.to_string(),
+            metadata: json!({"digest": oci_digest_ref(&target)}),
+        };
+        let second = f
+            .handler
+            .ingest
+            .ingest_verified(
+                request(),
+                std::slice::from_ref(&claim),
+                Box::new(std::io::Cursor::new(body.clone())),
+                f.handler.oci_handler.as_ref(),
+            )
+            .await
+            .expect("dedup repairs claim");
+        assert_eq!(second.artifact.id, first.artifact.id);
+        assert_eq!(second.claimed_edges_written, 1);
+        assert_eq!(f.refs.entry_count(), 2);
+        let inserted = f
+            .refs
+            .find_by_target(f.repo.id, &target, Some(OCI_CONFIG_KIND))
+            .await
+            .expect("claim after dedup");
+        assert_eq!(inserted.len(), 1);
+
+        let third = f
+            .handler
+            .ingest
+            .ingest_verified(
+                request(),
+                &[claim],
+                Box::new(std::io::Cursor::new(body.clone())),
+                f.handler.oci_handler.as_ref(),
+            )
+            .await
+            .expect("repeated dedup");
+        assert_eq!(third.claimed_edges_written, 0);
+        assert_eq!(f.refs.entry_count(), 2);
+        assert_eq!(
+            f.refs
+                .find_by_target(f.repo.id, &target, Some(OCI_CONFIG_KIND))
+                .await
+                .expect("claim after repeated dedup")[0]
+                .recorded_at,
+            inserted[0].recorded_at,
+        );
+
+        use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
+        use sha2::{Digest, Sha512};
+        let sha512 = hex::encode(Sha512::digest(&body));
+        let checksum = UpstreamPublishedChecksum::new(HashAlgorithm::Sha512, sha512)
+            .expect("valid upstream checksum");
+        let post_put_request = VerifiedIngestRequest::UpstreamPublished {
+            repository_id: f.repo.id,
+            coords: child_manifest_coords("library/nginx", &child_hash),
+            content_type: IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            actor: ApiActor {
+                user_id: Uuid::nil(),
+            },
+            payload_metadata: serde_json::Value::Null,
+            upstream_checksum: checksum,
+            upstream_published_at: None,
+            trust_upstream_publish_time: false,
+        };
+        let layer = ContentReferenceClaim {
+            target_content_hash: deterministic_sha(0xDEC0_0001),
+            kind: OCI_LAYER_KIND.to_string(),
+            metadata: serde_json::Value::Null,
+        };
+        let post_put = f
+            .handler
+            .ingest
+            .ingest_verified(
+                post_put_request,
+                &[layer],
+                Box::new(std::io::Cursor::new(body)),
+                f.handler.oci_handler.as_ref(),
+            )
+            .await
+            .expect("post-put dedup repairs another claim");
+        assert_eq!(post_put.artifact.id, first.artifact.id);
+        assert_eq!(post_put.claimed_edges_written, 1);
+        assert_eq!(f.refs.entry_count(), 3);
+    }
+
     /// Nothing in this handler computes or overrides a quarantine anchor —
     /// the minted row carries whatever `ingest_verified` derived (ADR 0054).
     #[tokio::test]
@@ -2360,6 +3069,83 @@ mod tests {
         );
     }
 
+    /// **The reader path is not an admission gate, and a missing descriptor
+    /// `size` must not be allowed to become one.**
+    ///
+    /// The hosted manifest-`PUT` admission gate refuses an index whose child
+    /// descriptor declares no readable `size`
+    /// (`hort-http-oci`'s `check_child_against_descriptor`) — `size` is a
+    /// REQUIRED descriptor property, and refusing a document that does not
+    /// make a REQUIRED statement is the gate's job. Closing that the tidier
+    /// way — a `DescriptorProblem` variant, so the domain projection faults
+    /// on it — would reach **here** too, because a fault is seen by both
+    /// `IndexChildren` constructors and this path's `into_resolvable` *skips*
+    /// each one. The skipped child would then get no `oci_index_member` edge,
+    /// and that edge is the GC keepalive on its bytes: an index already in
+    /// the catalog would silently lose a member's protection and the bytes it
+    /// was holding alive would become collectable.
+    ///
+    /// So this test stands on the bytes being already stored and
+    /// digest-verified. Refusing them here would not un-store anything; it
+    /// would mint the manifest with a missing edge.
+    #[tokio::test]
+    async fn a_grandchild_descriptor_without_a_size_still_earns_its_member_edge() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(Vec::new())).await;
+        let grandchildren = [deterministic_sha(1), deterministic_sha(2)];
+        let body = index_body_without_child_sizes(&grandchildren);
+        let digest = seed_child(&f.proxy, &body, OCI_IMAGE_INDEX_MEDIA_TYPE, None);
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
+        assert_eq!(summary["outcome"], "ingested");
+        assert_eq!(summary["is_index"], true);
+        assert_eq!(
+            summary["membership_edges_written"], 2,
+            "a descriptor with no `size` is still an addressable child; dropping its \
+             edge would un-keepalive its bytes"
+        );
+
+        let edges = f.lifecycle.ingest_edge_kinds();
+        for grandchild in &grandchildren {
+            assert!(
+                edges.iter().any(|(_, kind, target)| {
+                    kind == OCI_INDEX_MEMBER_KIND && target == grandchild.as_ref()
+                }),
+                "no oci_index_member edge for sha256:{}: {edges:?}",
+                grandchild.as_ref()
+            );
+        }
+        // And the grandchildren are still enqueued, so the whole cascade
+        // below this index is unaffected too.
+        assert_eq!(summary["grandchildren_enqueued"], 2);
+    }
+
+    /// [`index_body`] with the `size` key omitted from every child
+    /// descriptor — the shape the admission gate refuses and this path must
+    /// still read.
+    fn index_body_without_child_sizes(children: &[ContentHash]) -> Vec<u8> {
+        let manifests: Vec<serde_json::Value> = children
+            .iter()
+            .map(|c| {
+                json!({
+                    "mediaType": IMAGE_MANIFEST_MEDIA_TYPE,
+                    "digest": format!("sha256:{}", c.as_ref()),
+                })
+            })
+            .collect();
+        json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_INDEX_MEDIA_TYPE,
+            "manifests": manifests,
+        })
+        .to_string()
+        .into_bytes()
+    }
+
     // =====================================================================
     // Nested index — one enqueue per grandchild
     // =====================================================================
@@ -2394,7 +3180,10 @@ mod tests {
                 row.kind, OCI_INDEX_CHILD_INGEST_KIND,
                 "recursion by own kind"
             );
-            assert_eq!(row.priority, CHILD_INGEST_ENQUEUE_PRIORITY);
+            assert_eq!(
+                row.priority,
+                queue_priority(OCI_INDEX_CHILD_INGEST_KIND, CHILD_INGEST_TRIGGER_SOURCE)
+            );
             assert_eq!(row.trigger_source, CHILD_INGEST_TRIGGER_SOURCE);
             let expected = format!("sha256:{}", grandchild.as_ref());
             assert_eq!(row.params["child_digest"], expected);
@@ -2846,7 +3635,662 @@ mod tests {
         );
     }
 
+    // =====================================================================
+    // The blob warm — the child's config and layer bytes, not only its edges
+    // =====================================================================
+
+    /// Bodies a *successful* warm can be built on.
+    ///
+    /// [`config_and_layer_refs`]'s synthetic digests cannot be warmed, and
+    /// that is not a fixture shortcoming: the warm ingests through
+    /// `ingest_verified`, which rehashes the streamed bytes against the digest
+    /// the manifest bound (ADR 0006), and nothing hashes to
+    /// `format!("{:064x}", 0xC0FF_EE00)`. So a test that needs the warm to
+    /// succeed names its blobs by the hash of bytes it can actually serve,
+    /// while the synthetic set keeps driving every refusal path.
+    const CONFIG_BLOB: &[u8] = br#"{"architecture":"amd64","os":"linux"}"#;
+    const LAYER_BLOB: &[u8] = b"layer-one-bytes";
+    const SECOND_LAYER_BLOB: &[u8] = b"layer-two-bytes";
+    const THIRD_LAYER_BLOB: &[u8] = b"layer-three-bytes";
+
+    fn body_hash(body: &[u8]) -> ContentHash {
+        sha256_hex(body).parse().expect("64-hex sha")
+    }
+
+    /// The `ManifestBlobRef` set the OCI stub derives from a single-image
+    /// manifest body, naming each body by its REAL digest.
+    fn warm_refs(bodies: &[(ManifestBlobRole, &'static [u8])]) -> Vec<ManifestBlobRef> {
+        bodies
+            .iter()
+            .map(|(role, body)| ManifestBlobRef {
+                hash: body_hash(body),
+                role: *role,
+            })
+            .collect()
+    }
+
+    /// The default single-config-plus-one-layer warm set.
+    fn config_and_one_layer() -> Vec<ManifestBlobRef> {
+        warm_refs(&[
+            (ManifestBlobRole::Config, CONFIG_BLOB),
+            (ManifestBlobRole::Layer, LAYER_BLOB),
+        ])
+    }
+
+    /// Seed each body as an upstream blob fixture keyed on its own digest,
+    /// under the catch-all prefix and the default requested name — the exact
+    /// key `fetch_blob` is called with.
+    fn seed_blobs(proxy: &MockUpstreamProxy, bodies: &[&[u8]]) {
+        for body in bodies {
+            proxy.insert_blob(
+                "",
+                "library/nginx",
+                &oci_digest_ref(&body_hash(body)),
+                body.to_vec(),
+                None,
+            );
+        }
+    }
+
+    /// Where the read path resolves `body`'s blob, and therefore where a
+    /// warmed row has to be for a later client GET to find it.
+    fn blob_path(body: &[u8]) -> String {
+        format!("{OCI_BLOB_PATH_PREFIX}{}", body_hash(body).as_ref())
+    }
+
+    /// Re-seed the fixture's repository with `enabled` on its prefetch
+    /// policy, so a test states the configuration it pins instead of
+    /// inheriting a fixture default that could change under it.
+    fn set_prefetch_enabled(f: &Fixture, enabled: bool) {
+        let mut repo = f.repo.clone();
+        repo.prefetch_policy.enabled = enabled;
+        f.repos.insert(repo);
+    }
+
+    /// Every blob row the repository holds, by coords path.
+    async fn blob_row(f: &Fixture, body: &[u8]) -> Option<Artifact> {
+        f.artifacts
+            .find_by_path(f.repo.id, &blob_path(body))
+            .await
+            .expect("query")
+    }
+
+    // ---------- the coords, pinned ---------------------------------------
+
+    /// **The coords acceptance.** A warmed blob row has to sit at exactly
+    /// `blobs/sha256:<hex>` — the path a client blob GET resolves — and the
+    /// prefix has to come from the domain constant both layers read rather
+    /// than from a second literal in this file.
+    #[test]
+    fn child_blob_coords_use_the_domain_blob_prefix_and_oci_format() {
+        let hash = deterministic_sha(0xB10B);
+        let c = child_blob_coords("library/nginx", &hash);
+        assert_eq!(c.path, format!("blobs/sha256:{}", hash.as_ref()));
+        assert_eq!(
+            c.path,
+            format!("{OCI_BLOB_PATH_PREFIX}{}", hash.as_ref()),
+            "the prefix must be the domain constant, not a literal re-typed here",
+        );
+        assert_eq!(c.name, "library/nginx");
+        assert_eq!(c.name_as_published, "library/nginx");
+        assert_eq!(c.version, None);
+        assert!(c.metadata.is_null());
+        assert!(matches!(c.format, RepositoryFormat::Oci));
+        assert_ne!(
+            c.path,
+            child_manifest_coords("library/nginx", &hash).path,
+            "a blob and a manifest of the same bytes must not collide on \
+             (repository_id, path)",
+        );
+    }
+
+    /// The warm fetches exactly the blobs the child's own edges claim: an
+    /// index's `oci_index_member` edges name child manifests, which get their
+    /// own job rows, so they are not in the set.
+    #[test]
+    fn blob_targets_selects_config_and_layer_edges_only() {
+        let claim = |kind: &str, seed: u32| ContentReferenceClaim {
+            target_content_hash: deterministic_sha(seed),
+            kind: kind.to_string(),
+            metadata: serde_json::Value::Null,
+        };
+        let edges = vec![
+            claim(OCI_CONFIG_KIND, 1),
+            claim(OCI_INDEX_MEMBER_KIND, 2),
+            claim(OCI_LAYER_KIND, 3),
+            claim("wheel_metadata", 4),
+        ];
+        assert_eq!(
+            blob_targets(&edges),
+            vec![deterministic_sha(1), deterministic_sha(3)],
+        );
+        assert!(blob_targets(&[]).is_empty());
+    }
+
+    // ---------- call site 1: the ingest path -----------------------------
+
+    /// **The acceptance.** After a handler run over a child manifest, the
+    /// child's config and layer blobs have artifact ROWS — not only
+    /// `oci_config` / `oci_layer` edges pointing at bytes nobody fetched.
+    #[tokio::test]
+    async fn run_warms_the_childs_config_and_layer_blobs_into_artifact_rows() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_one_layer(),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+        seed_blobs(&f.proxy, &[CONFIG_BLOB, LAYER_BLOB]);
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
+        assert_eq!(summary["outcome"], "ingested");
+        assert_eq!(summary["membership_edges_written"], 2);
+        assert_eq!(summary["blobs_attempted"], 2);
+        assert_eq!(summary["blobs_ingested"], 2);
+        assert_eq!(summary["blobs_already_present"], 0);
+        assert_eq!(summary["blobs_not_found"], 0);
+        assert_eq!(summary["blobs_failed"], 0);
+
+        assert_eq!(
+            f.proxy.blob_fetches(),
+            vec![
+                oci_digest_ref(&body_hash(CONFIG_BLOB)),
+                oci_digest_ref(&body_hash(LAYER_BLOB)),
+            ],
+            "the config and then each layer, by the digest the manifest bound",
+        );
+
+        for blob in [CONFIG_BLOB, LAYER_BLOB] {
+            let row = blob_row(&f, blob)
+                .await
+                .expect("the warmed blob must be reachable by the path a client GET uses");
+            assert_eq!(row.sha256_checksum, body_hash(blob));
+            assert_eq!(
+                row.name, "library/nginx",
+                "a warmed blob records the SAME client-facing name a lazy pull records",
+            );
+            assert_eq!(row.content_type, "application/octet-stream");
+            // **The warm makes nothing downloadable.** It is held exactly as
+            // a lazily pulled blob of the same manifest would be: the warm
+            // supplies no anchor and no window arithmetic, so the anchor is
+            // whatever `ingest_verified` derived (ADR 0054) — here the
+            // referenced-tree-descendant carve-out's already-over window,
+            // because the `oci_config` / `oci_layer` edge that makes this
+            // blob a descendant committed in the manifest's own transition
+            // one step earlier. That carve-out removes the *timer* and
+            // nothing else: ADR 0007's release predicate is untouched, so
+            // the blob still needs its own clean scan verdict before a byte
+            // of it is served, which is what this assertion pins.
+            assert!(matches!(
+                row.quarantine_status,
+                QuarantineStatus::Quarantined
+            ));
+            assert!(
+                !row.is_downloadable(),
+                "a warmed blob is held like any other; the warm carries no release authority",
+            );
+            assert!(
+                row.quarantine_window_start.is_some(),
+                "a Quarantined row carries the anchor its window is measured from",
+            );
+            assert!(
+                row.quarantine_deadline.is_none(),
+                "the anchor is stored, never a precomputed deadline (ADR 0054)",
+            );
+        }
+    }
+
+    /// An index warms nothing. Its members are child MANIFESTS, fetched by
+    /// their own `oci-index-child-ingest` rows — which is also why the client
+    /// path's warm is a no-op for an index, and so why this handler is the
+    /// only route to a warm multi-arch tree.
+    #[tokio::test]
+    async fn an_index_child_warms_no_blobs_because_its_members_are_manifests() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_one_layer(),
+        ))
+        .await;
+        let body = index_body(&[deterministic_sha(1), deterministic_sha(2)]);
+        let digest = seed_child(&f.proxy, &body, OCI_IMAGE_INDEX_MEDIA_TYPE, None);
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
+        assert_eq!(summary["outcome"], "ingested");
+        assert_eq!(summary["is_index"], true);
+        assert_eq!(summary["membership_edges_written"], 2);
+        assert_eq!(
+            summary["blobs_attempted"], 0,
+            "an index's member edges name manifests, not blobs",
+        );
+        let fetches = f.proxy.blob_fetches();
+        assert!(
+            fetches.is_empty(),
+            "no blob fetch may be issued for an index: {fetches:?}",
+        );
+    }
+
+    // ---------- call site 2: the already-present path --------------------
+
+    /// **The acceptance for the second call site.** A child minted before the
+    /// warm existed has its edges and none of its bytes. The already-present
+    /// branch already reads the stored manifest back and re-derives those
+    /// digests for the claim repair, so that is where the cold tree gets warm
+    /// — and the branch's own docs no longer claim it makes no upstream
+    /// request.
+    #[tokio::test]
+    async fn an_already_present_child_with_cold_blobs_gets_them_warmed() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_one_layer(),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+
+        // Run one, with no blob fixtures: the child mints with its edges and
+        // its blobs stay absent — the state of every child this handler
+        // ingested before the warm existed.
+        let first = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
+        assert_eq!(first["outcome"], "ingested");
+        assert_eq!(first["blobs_ingested"], 0);
+        assert!(blob_row(&f, CONFIG_BLOB).await.is_none());
+
+        // Run two takes the already-present branch, with the blobs now
+        // reachable upstream.
+        seed_blobs(&f.proxy, &[CONFIG_BLOB, LAYER_BLOB]);
+        let second = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
+        assert_eq!(second["outcome"], "already_present");
+        assert_eq!(
+            second["membership_edges_written"], 0,
+            "the manifest's own claims were already intact — nothing re-minted, \
+             nothing re-anchored",
+        );
+        assert_eq!(second["blobs_attempted"], 2);
+        assert_eq!(second["blobs_ingested"], 2);
+        assert_eq!(second["blobs_failed"], 0);
+
+        for blob in [CONFIG_BLOB, LAYER_BLOB] {
+            assert!(
+                blob_row(&f, blob).await.is_some(),
+                "the already-present branch must leave the child's blobs ingested",
+            );
+        }
+    }
+
+    /// A third run over a fully warm child issues no upstream request at all:
+    /// each blob is already held at its coords path and is skipped there,
+    /// which is what keeps a re-enqueued or cyclic row from re-downloading a
+    /// tree hort already has.
+    #[tokio::test]
+    async fn a_blob_already_held_at_its_coords_path_is_not_refetched() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_one_layer(),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+        seed_blobs(&f.proxy, &[CONFIG_BLOB, LAYER_BLOB]);
+
+        completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
+        let after_warm = f.proxy.blob_fetches();
+        assert_eq!(after_warm.len(), 2);
+
+        let repeat = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
+        assert_eq!(repeat["outcome"], "already_present");
+        assert_eq!(repeat["blobs_attempted"], 2);
+        assert_eq!(repeat["blobs_already_present"], 2);
+        assert_eq!(repeat["blobs_ingested"], 0);
+        assert_eq!(
+            f.proxy.blob_fetches(),
+            after_warm,
+            "a blob already held at its coords path must cost no upstream request",
+        );
+    }
+
+    // ---------- the refusal paths ---------------------------------------
+
+    /// **The acceptance for the failure path.** A blob whose fetch hard-fails
+    /// leaves the child row `Completed` and `ingested`, with the failure
+    /// counted — the alternative silently turns one bad layer into an
+    /// endlessly retried child, and the blob is still reachable through the
+    /// lazy pull path, which is where every one of them was before the warm.
+    #[tokio::test]
+    async fn a_blob_whose_fetch_hard_fails_leaves_the_child_ingested_and_is_counted() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_one_layer(),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+        seed_blobs(&f.proxy, &[CONFIG_BLOB, LAYER_BLOB]);
+        f.proxy.fail_blob_with(
+            &oci_digest_ref(&body_hash(CONFIG_BLOB)),
+            DomainError::Invariant("upstream:upstream_5xx:mock 503".into()),
+        );
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("a failed blob must not fail the child row"),
+        );
+        assert_eq!(
+            summary["outcome"], "ingested",
+            "the child manifest's own ingest stands; the blob warm cannot label it",
+        );
+        assert_eq!(summary["membership_edges_written"], 2);
+        assert_eq!(summary["blobs_attempted"], 2);
+        assert_eq!(summary["blobs_failed"], 1);
+        assert_eq!(summary["blobs_not_found"], 0);
+        assert_eq!(
+            summary["blobs_ingested"], 1,
+            "one bad blob costs only itself — its siblings are warmed",
+        );
+        assert!(blob_row(&f, CONFIG_BLOB).await.is_none());
+        assert!(blob_row(&f, LAYER_BLOB).await.is_some());
+    }
+
+    /// **The acceptance for the 404 path.** An upstream that no longer serves
+    /// a blob the child references is not an error and not a retry: it is
+    /// counted apart from a failure, so `blobs_failed` stays zero and the
+    /// completion line does not escalate. An index may legitimately name a
+    /// child whose layers the upstream has since dropped.
+    #[tokio::test]
+    async fn a_blob_the_upstream_no_longer_serves_is_counted_not_found_not_failed() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_one_layer(),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+        // Only the layer is seeded; the unseeded config answers the mock's
+        // `upstream:not_found:…` sentinel — the production 404 shape.
+        seed_blobs(&f.proxy, &[LAYER_BLOB]);
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("an upstream 404 on a blob is not an error"),
+        );
+        assert_eq!(summary["outcome"], "ingested");
+        assert_eq!(summary["blobs_attempted"], 2);
+        assert_eq!(summary["blobs_not_found"], 1);
+        assert_eq!(
+            summary["blobs_failed"], 0,
+            "a 404 is not a degradation — there is nothing to warm and nothing to retry",
+        );
+        assert_eq!(summary["blobs_ingested"], 1);
+        assert_eq!(
+            f.proxy
+                .blob_fetches()
+                .iter()
+                .filter(|d| *d == &oci_digest_ref(&body_hash(CONFIG_BLOB)))
+                .count(),
+            1,
+            "a 404 is asked once and not retried inside the run",
+        );
+    }
+
+    /// Bytes that do not hash to the digest the manifest bound never become a
+    /// row. The warm's verification is `ingest_verified`'s own rehash
+    /// (ADR 0006), the same one the client-path blob pull-through relies on,
+    /// and its refusal is counted as a failure rather than swallowed.
+    #[tokio::test]
+    async fn a_blob_whose_bytes_do_not_match_the_declared_digest_is_counted_failed() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_one_layer(),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+        seed_blobs(&f.proxy, &[LAYER_BLOB]);
+        // The config's digest key serves somebody else's bytes.
+        f.proxy.insert_blob(
+            "",
+            "library/nginx",
+            &oci_digest_ref(&body_hash(CONFIG_BLOB)),
+            b"not the config blob".to_vec(),
+            None,
+        );
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
+        assert_eq!(summary["outcome"], "ingested");
+        assert_eq!(summary["blobs_attempted"], 2);
+        assert_eq!(summary["blobs_failed"], 1);
+        assert_eq!(summary["blobs_ingested"], 1);
+        assert!(
+            blob_row(&f, CONFIG_BLOB).await.is_none(),
+            "unverified bytes must never become a servable row",
+        );
+    }
+
+    /// A presence probe that cannot be answered is **not** read as "absent".
+    /// Re-fetching content the repository may already hold is the posture
+    /// every presence check in this handler refuses; the blob is left to the
+    /// lazy pull path and counted, exactly as any other failure leaves it.
+    ///
+    /// Driven on the already-present branch because that is the only path
+    /// whose first `find_by_path` is the warm's own — the ingest path's
+    /// manifest `ingest_verified` makes one of its own first, and a one-shot
+    /// injection armed before `run` would land there instead.
+    #[tokio::test]
+    async fn a_failing_blob_presence_probe_is_counted_failed_and_fetches_nothing() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(warm_refs(&[(
+            ManifestBlobRole::Config,
+            CONFIG_BLOB,
+        )])))
+        .await;
+        let body = image_manifest_body();
+        let child_hash = body_hash(&body);
+        let digest = oci_digest_ref(&child_hash);
+        // The already-present state, assembled directly: the manifest row at
+        // its manifest coords path plus its body in CAS, so the branch reads
+        // the body back and re-derives the blob digests as it does in
+        // production.
+        f.artifacts
+            .insert(held_manifest(f.repo.id, &child_hash, &digest));
+        f.storage.insert_content(child_hash.clone(), body.clone());
+        seed_blobs(&f.proxy, &[CONFIG_BLOB]);
+        f.artifacts
+            .fail_next_find_by_path(DomainError::Invariant("simulated probe failure".into()));
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("a failed probe must not fail the child row"),
+        );
+        assert_eq!(summary["outcome"], "already_present");
+        assert_eq!(summary["blobs_attempted"], 1);
+        assert_eq!(summary["blobs_failed"], 1);
+        assert_eq!(summary["blobs_already_present"], 0);
+        assert_eq!(summary["blobs_ingested"], 0);
+        let fetches = f.proxy.blob_fetches();
+        assert!(
+            fetches.is_empty(),
+            "a probe that could not be answered must not be read as 'absent' and \
+             re-fetch content the repository may already hold: {fetches:?}",
+        );
+        assert!(blob_row(&f, CONFIG_BLOB).await.is_none());
+    }
+
+    // ---------- the counters account for every blob ---------------------
+
+    /// **The `result_summary` acceptance.** All four per-blob states in one
+    /// run, and `blobs_attempted` closes exactly as their sum — which is what
+    /// lets an operator read a warm tree, a cold one, and a tree whose
+    /// upstream has dropped its layers apart from each other without reading
+    /// logs.
+    #[tokio::test]
+    async fn result_summary_blob_counters_partition_the_attempted_set() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(warm_refs(&[
+            (ManifestBlobRole::Config, CONFIG_BLOB),
+            (ManifestBlobRole::Layer, LAYER_BLOB),
+            (ManifestBlobRole::Layer, SECOND_LAYER_BLOB),
+            (ManifestBlobRole::Layer, THIRD_LAYER_BLOB),
+        ])))
+        .await;
+        let body = image_manifest_body();
+        let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+
+        // already present: a row the repository already holds at its blob path.
+        f.artifacts.insert(held_blob(f.repo.id, CONFIG_BLOB));
+        // ingested: reachable upstream.
+        seed_blobs(&f.proxy, &[LAYER_BLOB]);
+        // not found: SECOND_LAYER_BLOB stays unseeded.
+        // failed: a persistent 5xx for the third.
+        f.proxy.fail_blob_with(
+            &oci_digest_ref(&body_hash(THIRD_LAYER_BLOB)),
+            DomainError::Invariant("upstream:upstream_5xx:mock 503".into()),
+        );
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
+        assert_eq!(summary["outcome"], "ingested");
+        assert_eq!(summary["blobs_attempted"], 4);
+        assert_eq!(summary["blobs_already_present"], 1);
+        assert_eq!(summary["blobs_ingested"], 1);
+        assert_eq!(summary["blobs_not_found"], 1);
+        assert_eq!(summary["blobs_failed"], 1);
+        for key in [
+            "blobs_already_present",
+            "blobs_ingested",
+            "blobs_not_found",
+            "blobs_failed",
+        ] {
+            assert!(summary[key].is_u64(), "{key} must be in result_summary");
+        }
+        assert_eq!(
+            summary["blobs_attempted"].as_u64().expect("u64"),
+            [
+                "blobs_already_present",
+                "blobs_ingested",
+                "blobs_not_found",
+                "blobs_failed"
+            ]
+            .iter()
+            .map(|k| summary[k].as_u64().expect("u64"))
+            .sum::<u64>(),
+            "the four states must partition the attempted set, or a reader cannot tell \
+             an unaccounted blob from a counting bug",
+        );
+        let fetches = f.proxy.blob_fetches();
+        assert!(
+            !fetches.contains(&oci_digest_ref(&body_hash(CONFIG_BLOB))),
+            "the already-held blob must not have been fetched: {fetches:?}",
+        );
+    }
+
+    // ---------- ungated -------------------------------------------------
+
+    /// **The acceptance for the flag.** The warm is not gated on
+    /// `prefetch_policy.enabled`, and the test states both halves because
+    /// every OCI proxy runs with it OFF — a one-sided test would pass against
+    /// a handler that happened to read the flag the other way round.
+    ///
+    /// The justification for being ungated is the ungated
+    /// `enqueue_grandchildren` three lines up: both are finishing the ingest
+    /// of a tree a client named, where the switch governs hort deciding by
+    /// itself to fetch something nobody asked for.
+    #[tokio::test]
+    async fn the_blob_warm_fires_regardless_of_prefetch_policy_enabled() {
+        let mut observed = Vec::new();
+        for enabled in [false, true] {
+            let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+                config_and_one_layer(),
+            ))
+            .await;
+            set_prefetch_enabled(&f, enabled);
+            assert_eq!(
+                f.repos
+                    .find_by_id(f.repo.id)
+                    .await
+                    .expect("seeded")
+                    .prefetch_policy
+                    .enabled,
+                enabled,
+                "the test must pin the configuration it claims to pin",
+            );
+            let body = image_manifest_body();
+            let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+            seed_blobs(&f.proxy, &[CONFIG_BLOB, LAYER_BLOB]);
+
+            let summary = completed(
+                f.handler
+                    .run(&params(f.repo.id, &digest), make_context())
+                    .await
+                    .expect("Ok"),
+            );
+            assert!(
+                blob_row(&f, LAYER_BLOB).await.is_some(),
+                "prefetch_policy.enabled = {enabled}: the layer must be warmed either way",
+            );
+            observed.push((
+                summary["blobs_attempted"].clone(),
+                summary["blobs_ingested"].clone(),
+                summary["blobs_failed"].clone(),
+                f.proxy.blob_fetches(),
+            ));
+        }
+        assert_eq!(
+            observed[0], observed[1],
+            "the flag must make no difference at all to the warm",
+        );
+        assert_eq!(observed[0].1, serde_json::json!(2));
+    }
+
     // ---------- local doubles -------------------------------------------
+
+    /// Synthesise a blob row already held in `repo_id` for `body` — at
+    /// `body`'s own digest and the blob coords path the read path resolves,
+    /// which is the state the warm must skip without an upstream request.
+    fn held_blob(repo_id: Uuid, body: &[u8]) -> Artifact {
+        Artifact {
+            path: blob_path(body),
+            sha256_checksum: body_hash(body),
+            size_bytes: body.len() as i64,
+            content_type: "application/octet-stream".into(),
+            ..held_manifest(repo_id, &body_hash(body), &oci_digest_ref(&body_hash(body)))
+        }
+    }
 
     /// Synthesise a manifest row already held in `repo_id` at `hash`.
     fn held_manifest(repo_id: Uuid, hash: &ContentHash, digest: &str) -> Artifact {

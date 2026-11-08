@@ -278,7 +278,60 @@ The zero-window carve-out above still leaves a **read-side** race: a cold pull-t
 
 **Candidacy signal correctness matters as much as the wait mechanism.** The helper must gate the wait on the *real* effective deadline (`quarantine_window_start` anchor + the artifact's actually-matched `ScanPolicy` duration) — never on `ArtifactUseCase::hydrate_quarantine_deadline`'s approximation (`quarantine_deadline = quarantine_window_start`, used only for the `check_quarantine` `Retry-After` computation), which reads as "elapsed" for essentially every `Quarantined` artifact almost immediately because `ArtifactUseCase` holds no policy-projection port to resolve a real duration. Using that signal for the wait-candidacy gate would silently defeat the "never await a genuine, not-yet-elapsed time-quarantine" requirement — a still-running multi-minute (or longer) hold would get bounded-waited on every GET instead of 503ing immediately. `QuarantineUseCase::is_window_elapsed` (new, issue #65) resolves the real matched-policy duration via the same `resolve_active_policy_for_repo` + `effective_quarantine_deadline` computation the `record_scan_result` inline fast-path and the `release_expired` sweep already use, and is the only sanctioned source for this gate.
 
+**Footnote (2026-11-02) — the approximation the paragraph above argues against no longer exists; the decision is unchanged.** `ArtifactUseCase::hydrate_quarantine_deadline` no longer sets `quarantine_deadline = quarantine_window_start`: it holds a `ScanPolicy` projection port and resolves the real matched-policy duration through the same `resolve_active_policy_for_repo` helper and the same `DefaultPolicy::quarantine_duration_secs` fallback this section prescribes (`crates/hort-app/src/use_cases/artifact_use_case.rs`). So the two deadlines now agree arithmetically, and the paragraph's stated *reason* — "holds no policy-projection port to resolve a real duration" — is reporting the code as it stood on its own date, per this ADR's amendment convention.
+
+**The sanctioned source for the wait-candidacy gate is still `QuarantineUseCase::is_window_elapsed`, and the reason is now authority rather than arithmetic.** The hydration is read-path only: it appends no event and is never consulted by the release predicate, existing so an adapter-free `hort-http-<format>` crate can emit an honest `Retry-After` without resolving a policy itself (ADR 0008). Sourcing a release-side gate from it would put a read-path convenience value on the fail-closed side of this ADR's line, which is the thing to keep out regardless of whether the two numbers happen to match. **Anyone deriving `Retry-After` semantics from the paragraph above should read the current hydration instead** — "deadline == window_start" would mean the deadline is always already past, and the clamp case reads wrong under that premise.
+
 **Amended (issue #135): a provenance-blocked release is not a wait candidate.** The pattern's premise — "window elapsed ⇒ the only thing left is the artifact's own scan" — predates the provenance release authority (ADR 0039/0041). Under `provenance_mode: Required` with the artifact's clearance still `Pending`, release additionally requires an external signature plus verify/cascade, which cannot land inside the bound, and the inline fast-path release is suppressed for exactly this state — so the await was a guaranteed full-bound stall (measured: a constant 10s per cold blob GET) in front of the same 503. The candidacy gate therefore also consults `QuarantineUseCase::release_blocked_on_provenance`, which delegates to the SAME single-sourced clearance resolution (`release_clearance::resolve_provenance_clearance`) the fast-path suppression and the release sweep use — one authority, no drift; `Pending` ⇒ skip the wait entirely and fall through to the honest `503 + Retry-After` immediately. Both invariants above are untouched: the guard only *narrows* candidacy (it can never start a wait that today would not start, and it never synthesizes a release). A scan-pending artifact whose provenance is already `Cleared` — including a late-joining constituent self-cleared at ingest (ADR 0039 §12) — remains a wait candidate; that is the case the pattern exists for. Corollary for future read paths adopting the pattern: when a NEW release authority is added to the predicate above, every bounded-await candidacy gate must be re-validated against it — an await whose premise omits an authority degrades into a fixed-latency tax on exactly the requests that authority holds.
+
+### A reached verdict supersedes an absent one: `scan_indeterminate` is a hold (issue #419, amended 2026-11-07)
+
+The retry-exhaustion split above gave the `quarantined` branch self-healing
+— re-scanned once the scanner recovers, *"self-healing without operator
+intervention"* — and left the other branch terminal. That terminality was
+carried, not decided: the branch reads *"exactly as before this amendment"*,
+and the only place this ADR argues about `scan_indeterminate` concludes it
+is **not** the graver state. This amendment extends the same property to it.
+
+1. **A new scan verdict is admissible from `scan_indeterminate`.** A
+   `ScanCompleted` whose policy verdict blocks condemns exactly as it does
+   from `quarantined`. A `ScanCompleted` whose verdict does not block
+   returns the artifact to **`quarantined`** — never directly to
+   `released`. The release decision is then the ordinary one, under the
+   live gate, with the authority enumeration above applying unchanged.
+   This mirrors `RepairProvenanceMisrejection`, whose rule is that a
+   repair returns the artifact to the hold and lets the sweep make the
+   release decision.
+2. **The stranded-rescan selector reaches it.** `scan_indeterminate` stops
+   being excluded from `select_stranded`; `rejected` and deleted rows stay
+   excluded. A state nothing re-picks is terminal in practice whatever the
+   transition table says, so the two halves are one decision and not a
+   follow-on.
+3. **`rejected` is untouched.** A positive disproof is a statement about the
+   artifact and stays terminal; an absent verdict is a statement about
+   hort's own coverage and does not.
+
+**Why this is still fail-closed.** The two impossible failure modes in
+*Context* are unchanged. The artifact returns to a **hold**, never to
+`released`: release still requires one of the enumerated authorities, and a
+`ScanCompleted` on the stream is what authority 1 reads. No authority is
+added and no release path changes. What changes is that the stricter of two
+restrictive outcomes stops being the one an *absence* produces — ADR 0065
+D2 and D4, both of which name this ADR as a source.
+
+**A state entered only from `None` or `quarantined`**
+(`FailScanIndeterminate`) never conceals an earlier rejection, so no later
+verdict can silently undo one. That is the one argument terminality would
+have had, and it does not apply.
+
+**Scope.** Read visibility is a different axis and is untouched: ADR 0055's
+write-authorized hold-read exemption still does not extend to
+`scan_indeterminate`, and a held artifact stays unresolvable for every
+caller including its publisher. ADR 0062's closure is unchanged — a
+constituent that leaves the state simply becomes deliverable again.
+Re-assessment stays bounded by the scan job's existing attempt budget and
+backoff: a deterministic abstention answers the same way every time and must
+not become a hot loop.
 
 ## Consequences
 
@@ -303,4 +356,5 @@ The zero-window carve-out above still leaves a **read-side** race: a cold pull-t
 - `crates/hort-domain/src/entities/quarantine_transitions.rs` (`ReleaseCuratorWaiver` / `ReleaseGeneral` source-state rows), `crates/hort-domain/src/entities/artifact.rs` (`is_scan_clearable`, `ReleaseOrigin::permits_scan_reblock`) and `crates/hort-http-core/src/authz/extractors.rs` (`CurateOrAdminPrincipal`) — the sites the issue #345 one-authority amendment above governs.
 - `docs/architecture/how-to/recover-stranded-artifacts.md`; `ScanOrchestrationUseCase::record_outcome` and `RescanCandidatesRepository::select_stranded` — the issue #6 exhaustion-split / stranded-scan recovery amended in above (commit `55a93e40`; ratified by decision issue #32, 2026-07-14).
 - `crates/hort-http-oci/src/blobs.rs` (`maybe_bounded_await_release`) and `crates/hort-app/src/use_cases/quarantine_use_case.rs` (`QuarantineUseCase::is_window_elapsed`) — the issue #65 read-path bounded-await pattern amended in above.
+- `crates/hort-domain/src/entities/quarantine_transitions.rs` (`QuarantineEvent::SupersedeAbsentVerdict`, and `RejectFromScan`'s `ScanIndeterminate` cell), `crates/hort-domain/src/entities/artifact.rs` (`Artifact::supersede_absent_verdict`), `crates/hort-app/src/use_cases/quarantine_use_case.rs` (`record_scan_result`'s non-rejecting branch) and `crates/hort-adapters-postgres/src/rescan_candidates.rs` (`select_stranded`) — the sites the issue #419 "a reached verdict supersedes an absent one" amendment above governs.
 - `crates/hort-app/src/use_cases/ingest_use_case.rs` (`IngestUseCase::ingest_inner`) — the referenced-tree-descendant zero-window anchor-backdating (issue #46, amended above); `docs/adr/0043-oci-image-index-support.md` — the `content_references` membership graph (`oci_index_member` / `oci_subject` / `oci_config` / `oci_layer`) the target-check reads.

@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::entities::artifact::QuarantineStatus;
 use crate::entities::scan_policy::SeverityThreshold;
 use crate::error::{DomainError, DomainResult};
-use crate::ports::provenance::{ProvenanceRejectReason, SignerIdentity};
+use crate::ports::provenance::{ProvenanceHoldReason, ProvenanceRejectReason, SignerIdentity};
 use crate::retention::ExpirationReason;
 use crate::types::checksum::HashAlgorithm;
 use crate::types::{ArtifactCoords, ContentHash, Finding};
@@ -65,14 +65,22 @@ pub struct ArtifactIngested {
     /// yield `None` on any `.get(key)` lookup).
     #[serde(default)]
     pub metadata: serde_json::Value,
-    /// Optional reference to the full payload stored in CAS, when the
+    /// Optional reference to the full payload stored in CAS, written
+    /// when the payload did not fit in this event — either past the
     /// format handler's
-    /// [`MetadataStrategy`](crate::ports::format_handler::MetadataStrategy)
-    /// is `HashReference` and the serialised payload exceeded the
-    /// handler's inline threshold. When `Some(hash)`, `metadata` carries
-    /// the handler-extracted summary and the full JSON payload lives at
-    /// `hash` in content-addressable storage. When `None`, `metadata`
-    /// carries the full payload inline.
+    /// [`inline_event_budget_bytes`](crate::ports::format_handler::MetadataStrategy::inline_event_budget_bytes)
+    /// or past [`MAX_EVENT_JSON_BYTES`](crate::events::MAX_EVENT_JSON_BYTES)
+    /// once this event's own fields are counted.
+    ///
+    /// When `None`, `metadata` carries the full payload inline. When
+    /// `Some(hash)`, the full JSON payload lives at `hash` in
+    /// content-addressable storage and `metadata` carries the
+    /// handler-extracted summary — or `Null`, when the summary did not
+    /// fit either, which is an ordinary outcome for a format whose
+    /// summary is itself unbounded (npm's is three dependency maps).
+    /// **A reader must therefore not treat an inline `metadata` as the
+    /// payload without first consulting `metadata_blob`**, which is
+    /// what `ArtifactUseCase::load_full_metadata` exists to do.
     ///
     /// `#[serde(default)]` so older persisted events — which
     /// never wrote this key — deserialise as `None` under the current
@@ -894,9 +902,9 @@ impl ProvenanceVerified {
 /// (`quarantine_status = 'rejected'`), terminal under the release
 /// surfaces — like `ScanCompleted(findings)`.
 ///
-/// Emitted under `VerifyIfPresent` when a present bundle is forged /
-/// untrusted, and under `Required` for both that case and the
-/// unsigned-but-required case (`reason: Unsigned`). `reason` is the typed
+/// Emitted when a present bundle is forged or untrusted. Historical
+/// events can carry `Unsigned`; an absent signature now holds instead.
+/// `reason` is the typed
 /// [`ProvenanceRejectReason`] so an audit query can distinguish a forged
 /// signature from a malformed bundle from an unsigned-under-`Required`
 /// artifact.
@@ -916,6 +924,26 @@ pub struct ProvenanceRejected {
 }
 
 impl ProvenanceRejected {
+    pub fn validate(&self) -> DomainResult<()> {
+        validate_string("backend", &self.backend, MAX_SCANNER_LEN)
+    }
+}
+
+/// A required-mode provenance check held an artifact pending a change or
+/// an operator repair. Recorded only when the hold reason changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProvenanceHeld {
+    /// The artifact on whose stream this event lands.
+    pub artifact_id: Uuid,
+    /// The CAS content hash of the held artifact.
+    pub content_hash: ContentHash,
+    /// The verifier backend that reached the hold.
+    pub backend: String,
+    /// What the hold waits for.
+    pub reason: ProvenanceHoldReason,
+}
+
+impl ProvenanceHeld {
     pub fn validate(&self) -> DomainResult<()> {
         validate_string("backend", &self.backend, MAX_SCANNER_LEN)
     }

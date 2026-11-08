@@ -43,6 +43,8 @@ use serial_test::serial;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use hort_domain::types::task_tier::queue_priority;
+
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
 use hort_domain::ports::jobs_repository::{EnqueueOutcome, JobsRepository};
 use hort_domain::types::IdempotencyKey;
@@ -83,7 +85,14 @@ async fn oci_index_child_ingest_kind_survives_jobs_kind_check() {
     let key = dedupe_key(repository_id, &hex);
 
     let outcome = jobs
-        .enqueue_task(KIND, &params, None, 0i16, "ingest", Some(&key))
+        .enqueue_task(
+            KIND,
+            &params,
+            None,
+            queue_priority(KIND, "ingest"),
+            "ingest",
+            Some(&key),
+        )
         .await
         .expect(
             "enqueue_task('oci-index-child-ingest') must succeed — a 23514 check_violation \
@@ -114,8 +123,11 @@ async fn oci_index_child_ingest_kind_survives_jobs_kind_check() {
         "the row exists because an ingest observed an index declaring this child",
     );
     assert_eq!(
-        priority, 0,
-        "eager child ingest drains behind operator work"
+        priority,
+        queue_priority(KIND, "ingest"),
+        "the ordinal the table decides round-trips through the column — which also proves \
+         it satisfies `CHECK (priority BETWEEN 0 AND 100)`, the constraint a band pushed \
+         past the column's bound would violate at every producer at once",
     );
     assert_eq!(stored_key.as_deref(), Some(key.as_str()));
     assert_eq!(stored_params, params, "params round-trip");

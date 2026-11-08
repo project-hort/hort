@@ -778,6 +778,7 @@ mod tests {
     use super::*;
 
     use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
 
     use hort_domain::ports::scanner::{ComposedImage, ScanUnit};
     use hort_domain::ports::storage::{PutResult, StoragePort as P};
@@ -785,16 +786,29 @@ mod tests {
     use hort_domain::types::{ByteRange, ContentHash as Ch};
     use tokio::io::AsyncRead;
 
-    /// Serializes every write-then-exec fixture in this test binary. An
-    /// executable's write descriptor stays open (and inherited across a
-    /// fork) until whichever process holds it execs or closes it — so a
-    /// second thread that forks a child while our script is still open for
-    /// writing can keep that descriptor alive in the child even after we
-    /// close our own handle, and our own later exec of the same path fails
-    /// with `ETXTBSY`. Held from script creation through the `scan`/
-    /// `run_scan` call that execs it, so no other thread in this process
-    /// can fork while a script is open for writing.
-    static SCRIPT_WRITE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    #[test]
+    fn fake_trivy_fixture_is_executable() {
+        fake_trivy_fixture();
+    }
+
+    fn fake_trivy_fixture() -> PathBuf {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-trivy.sh");
+        let metadata = std::fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("Trivy fake fixture {} is missing: {e}", path.display()));
+        assert!(
+            metadata.permissions().mode() & 0o111 != 0,
+            "Trivy fake fixture {} must be executable",
+            path.display()
+        );
+        path
+    }
+
+    fn fake_trivy_link(dir: &tempfile::TempDir, mode: &str) -> PathBuf {
+        let path = dir.path().join(format!("fake-trivy-{mode}"));
+        std::os::unix::fs::symlink(fake_trivy_fixture(), &path)
+            .expect("symlink Trivy fake fixture");
+        path
+    }
 
     /// What the one test storage stub does when the adapter calls `get`.
     /// Every other `StoragePort` method is unreachable in these tests, so
@@ -1341,35 +1355,16 @@ mod tests {
     /// `run_scan` kills the child and returns the
     /// distinguishable "report exceeded cap" `Invariant` error (the
     /// shape the orchestrator routes to `ScanIndeterminate`). Uses a
-    /// real child: a tiny executable script that ignores its argv and
-    /// floods stdout, pointed at via `trivy_bin`.
+    /// real child: the checked-in fake Trivy floods stdout when invoked
+    /// through the flood symlink, regardless of argv.
     #[tokio::test]
     async fn run_scan_over_cap_stdout_kills_child_and_returns_report_too_large() {
         // Skip cleanly on hosts without `/bin/sh` (the dev sandbox has it).
         if !std::path::Path::new("/bin/sh").exists() {
             return;
         }
-        let _guard = SCRIPT_WRITE_GUARD.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
-        let script = dir.path().join("fake-trivy.sh");
-        // Emit ~1 MiB of NUL bytes to stdout regardless of argv, then exit 0.
-        // Write via an explicit handle we sync + drop before exec so the
-        // kernel has no open writable fd on the file (avoids the
-        // transient ETXTBSY race on spawn).
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o700)
-                .open(&script)
-                .expect("create script");
-            f.write_all(b"#!/bin/sh\nhead -c 1048576 /dev/zero\nexit 0\n")
-                .expect("write script");
-            f.sync_all().expect("sync script");
-        }
+        let script = fake_trivy_link(&dir, "flood");
         let c = TrivyConfig {
             trivy_bin: script.clone(),
             // 1 KiB cap, far below the ~1 MiB the script emits.
@@ -1377,19 +1372,7 @@ mod tests {
             ..TrivyConfig::default()
         };
         let a = TrivyAdapter::new(c, StubStorage::unused());
-        // Retry the spawn a few times to absorb any residual ETXTBSY on
-        // slow filesystems — the cap-hit behaviour is what we assert.
-        let mut r = a.run_scan(ScanMode::Fs, "/tmp/ignored").await;
-        for _ in 0..5 {
-            match &r {
-                Err(DomainError::Invariant(msg)) if msg.contains("Text file busy") => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    r = a.run_scan(ScanMode::Fs, "/tmp/ignored").await;
-                }
-                _ => break,
-            }
-        }
-        match r {
+        match a.run_scan(ScanMode::Fs, "/tmp/ignored").await {
             Err(DomainError::Invariant(msg)) => {
                 assert!(
                     msg.contains(SCAN_REPORT_TOO_LARGE_MARKER),
@@ -1403,8 +1386,8 @@ mod tests {
 
     // -- "nothing analysable" vs "clean" ----------------------------------
 
-    /// Materialise a fake `trivy` that prints `stdout_json` and exits 0,
-    /// point the adapter at it, and scan the given target.
+    /// Put `stdout_json` beside a symlink to the checked-in fake `trivy`,
+    /// point the adapter at the symlink, and scan the given target.
     ///
     /// A real binary standing in for Trivy is what makes the
     /// `Results`-present / `Results`-absent distinction testable at all:
@@ -1428,29 +1411,10 @@ mod tests {
         target: &ScanTarget<'_>,
         payload: &[u8],
     ) -> DomainResult<ScanAnalysis> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let _guard = SCRIPT_WRITE_GUARD.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
-        let script = dir.path().join("fake-trivy.sh");
-        {
-            // Write through a handle we sync and drop before exec so the
-            // kernel holds no writable fd on the file (ETXTBSY).
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o700)
-                .open(&script)
-                .expect("create script");
-            writeln!(f, "#!/bin/sh").expect("write");
-            writeln!(f, "cat <<'TRIVY_REPORT'").expect("write");
-            writeln!(f, "{stdout_json}").expect("write");
-            writeln!(f, "TRIVY_REPORT").expect("write");
-            writeln!(f, "exit 0").expect("write");
-            f.sync_all().expect("sync");
-        }
+        std::fs::write(dir.path().join("report.json"), format!("{stdout_json}\n"))
+            .expect("write fake Trivy report");
+        let script = fake_trivy_link(&dir, "report");
         let c = TrivyConfig {
             trivy_bin: script,
             ..TrivyConfig::default()

@@ -713,8 +713,14 @@ impl VersionDiscovery for MavenFormatHandler {
         Vec::new()
     }
 
-    /// Extract the declared compile- and runtime-scope dependencies from a
-    /// stored POM.
+    /// Extract the edges a stored POM declares: its `<parent>`
+    /// coordinate, then its compile- and runtime-scope `<dependencies>`.
+    ///
+    /// The parent leads the returned order. A consumer cannot read this
+    /// POM's dependency list at all until it has the parent, so a caller
+    /// that truncates in this order keeps the edge the rest depends on;
+    /// the parent is otherwise an ordinary edge and spends the cascade's
+    /// descendant budget and depth bound like any other.
     ///
     /// **Input is the POM's own bytes** — unlike npm/cargo/pypi, Maven's
     /// declared dependencies are not inside an archive: the `.pom` IS the
@@ -729,13 +735,14 @@ impl VersionDiscovery for MavenFormatHandler {
     /// cascade genuinely warmed from one whose versions all live in a
     /// parent.
     ///
-    /// **`Err` versus `Ok(vec![])`.** `Err` means the bytes are not a POM
-    /// (not XML, wrong root element, over the size cap). A well-formed POM
+    /// **`Err` versus `Ok`.** `Err` means the bytes are not a POM (not
+    /// XML, wrong root element, over the size cap). A well-formed POM
     /// always yields `Ok`, however little of it resolved — a POM whose
-    /// every version is inherited returns `Ok(vec![])` with the skips
-    /// counted. Inverting that would abort the cascade for every
-    /// parent-managed POM instead of partially warming it, which is worse
-    /// than the no-op this method replaces.
+    /// every dependency version is inherited returns `Ok` carrying just
+    /// the parent edge, with the skips counted. Inverting that would
+    /// abort the cascade for every parent-managed POM instead of
+    /// partially warming it, which is worse than the no-op this method
+    /// replaces.
     fn extract_dependency_specs(
         &self,
         content: &mut dyn Read,
@@ -2166,9 +2173,11 @@ mod tests {
     }
 
     #[test]
-    fn extract_dependency_specs_is_ok_empty_when_every_version_is_inherited() {
+    fn extract_dependency_specs_is_ok_with_the_parent_when_versions_are_inherited() {
         // The distinction the cascade depends on: a POM this reader cannot
-        // fully resolve partially warms the tree, it does not abort it.
+        // fully resolve partially warms the tree, it does not abort it —
+        // and what it warms includes the parent, without which the
+        // consumer never reaches the dependency list at all.
         let body = br#"<project>
             <parent><groupId>org.springframework.boot</groupId>
               <artifactId>spring-boot-starter-parent</artifactId>
@@ -2180,7 +2189,13 @@ mod tests {
         let specs = discovery()
             .extract_dependency_specs(&mut Cursor::new(&body[..]))
             .expect("a parent-managed POM is valid input");
-        assert!(specs.is_empty());
+        assert_eq!(
+            specs,
+            [DependencySpec {
+                name: "org.springframework.boot:spring-boot-starter-parent".to_string(),
+                range: "3.2.0".to_string(),
+            }]
+        );
     }
 
     #[test]

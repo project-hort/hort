@@ -77,7 +77,9 @@ use hort_domain::events::{
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
     CompensatingDelete, EnqueueOutcome, JobRow, JobsRepository, ListJobsFilter, ListJobsPage,
+    TriggerSource,
 };
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::IdempotencyKey;
 
 use crate::error::{AppError, AppResult};
@@ -95,6 +97,16 @@ use crate::rbac::RbacEvaluator;
 /// parallelism; exhausting it falls through to the existing
 /// compensating-delete-and-surface-the-error path unchanged.
 const TASK_AUDIT_APPEND_RETRY_ATTEMPTS: u32 = 5;
+
+/// `jobs.trigger_source` every admin task invoke carries.
+///
+/// The POST is operator-initiated even when the operator is a chart
+/// CronJob, and [`TriggerSource::Manual`] is the only member of the set
+/// that fits "an outside caller asked us to enqueue this". An earlier
+/// draft passed `"api"`, which is in no version of the set and surfaced
+/// as a 23514 constraint violation → 500 to the caller; taking the value
+/// from the enum is what makes that spelling impossible.
+const ADMIN_INVOKE_TRIGGER_SOURCE: &str = TriggerSource::Manual.as_str();
 
 /// Application use case for admin-task enqueue operations.
 pub struct TaskUseCase {
@@ -252,11 +264,14 @@ impl TaskUseCase {
     ///
     /// **Split emit-sites (intentional):**
     /// `TaskUseCase` only ever emits `TaskInvoked`; the `TaskFailed`
-    /// audit record is emitted by the worker dispatcher (in
-    /// worker code), not here.
-    /// This shared pure helper is the single reuse point a future
-    /// `TaskFailed` emit-site is expected to call so both records land on
-    /// the same exempt stream.
+    /// audit record is emitted by
+    /// [`TaskDispatcher::record_outcome_for_row`](crate::task_dispatcher::TaskDispatcher),
+    /// which is where a `jobs` row's result state is written. This
+    /// shared pure helper is what both call, so the invocation and the
+    /// failure of one run cannot come to disagree about which stream
+    /// they belong on — a destructive kind's pair stays whole on the
+    /// exempt stream, where an `eventstore-archive` cannot truncate the
+    /// record of its own failure.
     #[must_use]
     pub fn task_audit_stream(kind: &str) -> StreamId {
         if task_kind_is_destructive(kind) {
@@ -350,22 +365,18 @@ impl TaskUseCase {
         //    gated). Shared logic — no parallel evaluator.
         self.authorize_kind(actor, kind, params)?;
 
-        // 3. Insert jobs row. `trigger_source = "manual"` mirrors
-        //    `TriggerSource::Manual` — the admin-task POST is operator-
-        //    initiated even when the operator is a chart CronJob, and
-        //    `"manual"` is the only literal in
-        //    `migration_009`'s CHECK constraint that fits "an outside
-        //    caller asked us to enqueue this". Earlier drafts passed
-        //    `"api"`, which was not in the allow-list and surfaced as
-        //    a 23514 constraint violation → 500 to the caller.
+        // 3. Insert jobs row. The ordinal is decided from `(kind,
+        //    trigger_source)`, not named here; see
+        //    `ADMIN_INVOKE_TRIGGER_SOURCE` for why this path's trigger
+        //    source is `'manual'`.
         let outcome = self
             .jobs
             .enqueue_task(
                 kind,
                 params,
                 Some(actor.user_id),
-                0,
-                "manual",
+                queue_priority(kind, ADMIN_INVOKE_TRIGGER_SOURCE),
+                ADMIN_INVOKE_TRIGGER_SOURCE,
                 idempotency_key,
             )
             .await?;

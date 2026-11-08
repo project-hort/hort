@@ -56,22 +56,25 @@ use tracing::info;
 use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
+use hort_domain::types::task_tier::queue_priority;
 
 use crate::config::MinimalConfig;
 use crate::{pg_identity, telemetry};
 
-/// `trigger_source` literal — must match the SQL CHECK constraint on
-/// `jobs.trigger_source` (`'manual' | 'cron' | 'advisory' | 'ingest'`).
-/// The scheduled CronJob is the `'cron'` trigger source.
-const CRON_TRIGGER_SOURCE: &str = "cron";
+/// `trigger_source` literal for this scheduled CronJob enqueue, taken
+/// from the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]) rather than
+/// re-typed beside it — so CHECK membership is a property of the value
+/// and this comment does not have to carry a copy of the list.
+const CRON_TRIGGER_SOURCE: &str = TriggerSource::Cron.as_str();
 
-/// `priority` for the enqueued row. Matches `CronRescanTickHandler`'s
-/// `CRON_RESCAN_PRIORITY` (the trigger-source ranking: `ingest=0` → `advisory=5` →
-/// `cron=10` → `manual=20`). The worker's claim query orders
-/// `priority DESC, created_at ASC`, so higher drains first; pinning
-/// 10 keeps cron-driven sweeps on equal footing with cron-rescan.
-const CRON_PRIORITY: i16 = 10;
+/// `jobs.kind` of the row this subcommand enqueues. The ordinal it
+/// carries is not named here: it is decided from `(kind,
+/// trigger_source)` in `hort_domain::types::task_tier`, so every
+/// cron-triggered row drains in the same tier by construction rather
+/// than by six constants agreeing.
+const KIND: &str = "quarantine-release-sweep";
 
 /// Arguments to `hort-server enqueue-quarantine-release-sweep`.
 ///
@@ -111,12 +114,13 @@ async fn run_async(_args: EnqueueQuarantineReleaseSweepArgs) -> anyhow::Result<(
     // per-invocation parameters. `actor_id` is `None` because the
     // scheduled path is system-driven (a CronJob is not a
     // human caller; the runtime DSN owns nothing identity-wise).
+    let priority = queue_priority(KIND, CRON_TRIGGER_SOURCE);
     let outcome = jobs
         .enqueue_task(
-            "quarantine-release-sweep",
+            KIND,
             &serde_json::json!({}),
             None, // actor_id — system-driven cron
-            CRON_PRIORITY,
+            priority,
             CRON_TRIGGER_SOURCE,
             None, // No DB-side idempotency key — only the destructive task kinds derive a per-UTC-day key (ADR 0028); this kind is NOT in DESTRUCTIVE_TASK_KINDS.
         )
@@ -131,8 +135,8 @@ async fn run_async(_args: EnqueueQuarantineReleaseSweepArgs) -> anyhow::Result<(
 
     info!(
         job_id = %id,
-        kind = "quarantine-release-sweep",
-        priority = CRON_PRIORITY,
+        kind = KIND,
+        priority,
         trigger_source = CRON_TRIGGER_SOURCE,
         "quarantine-release-sweep job enqueued"
     );
@@ -146,6 +150,8 @@ async fn run_async(_args: EnqueueQuarantineReleaseSweepArgs) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use hort_domain::types::task_tier::scan_queue_priority;
 
     use clap::Parser;
 
@@ -193,10 +199,32 @@ mod tests {
     /// template + the worker dispatch table both reference these
     /// implicitly through the inserted row; a silent drift here would
     /// break the claim ordering.
+    ///
+    /// The ordinal is asserted as a **relation** rather than a number:
+    /// this row's whole reason for ranking where it does is that it
+    /// outranks the scheduled rescan flood it used to tie with. At an
+    /// equal ordinal the claim's `created_at ASC` tiebreak resolves
+    /// against the sweep — a backlog is always older than the next
+    /// scheduled run — which is how a pushed, window-elapsed artifact
+    /// came to sit unreleased (ADR 0066 D3).
     #[test]
     fn constants_match_init33_trigger_source_ranking() {
         assert_eq!(CRON_TRIGGER_SOURCE, "cron");
-        // priority=10 matches CronRescanTickHandler's CRON_RESCAN_PRIORITY.
-        assert_eq!(CRON_PRIORITY, 10);
+        assert_eq!(
+            queue_priority(KIND, CRON_TRIGGER_SOURCE),
+            queue_priority(KIND, TriggerSource::Manual.as_str()),
+            "this kind is client-waited whatever triggers it, so the `'cron'` its CronJob \
+             stamps must not rank it any lower than a hand-invoked sweep"
+        );
+        assert!(
+            queue_priority(KIND, CRON_TRIGGER_SOURCE) > scan_queue_priority(CRON_TRIGGER_SOURCE),
+            "the release sweep must outrank the scheduled rescan flood that shares its \
+             trigger source"
+        );
+        assert!(
+            queue_priority(KIND, CRON_TRIGGER_SOURCE)
+                > queue_priority("jobs-row-retention-sweep", CRON_TRIGGER_SOURCE),
+            "and the other cron-triggered CronJob rows, which nobody waits on"
+        );
     }
 }

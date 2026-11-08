@@ -5442,6 +5442,112 @@ mod tests {
         );
     }
 
+    /// Where the payload metadata lives is not observable on the simple
+    /// index.
+    ///
+    /// Publishes the same distribution twice, differing only in the
+    /// length of its `description` — the free-text METADATA field a long
+    /// README lands in — and asserts the PEP 503 anchor carries
+    /// `data-requires-python` both times. The large case's `pkg_info`
+    /// object is past what an `ArtifactIngested` event can hold, so the
+    /// payload spills to CAS; PyPI declares
+    /// `MetadataStrategy::Inline` and therefore no summary extractor, so
+    /// the committed row's `metadata` is `Null` and the only way to
+    /// recover `requires_python` is through the accessor.
+    ///
+    /// The assertion is written once and run for both, and the only
+    /// thing the test states about which side of the cap a publish
+    /// landed on is the closing counter-assertion — read off the
+    /// committed rows, not arranged. Before this read path went through
+    /// the accessor, the large case published successfully and served an
+    /// anchor with no `data-requires-python` at all, which an installer
+    /// resolves as "this release places no constraint on the
+    /// interpreter".
+    #[tokio::test]
+    async fn an_installer_sees_requires_python_whether_pkg_info_is_inline_or_in_cas() {
+        let mut blob_backed = Vec::new();
+
+        // Over `MAX_EVENT_JSON_BYTES` (64 KB) so the payload cannot ride
+        // the event, and under PyPI's 128 KB `metadata_expected_max_bytes`
+        // so the pre-dispatch cap does not reject it first — the band
+        // this fix is about.
+        for (pkg, description_len) in [("smallpkg", 16_usize), ("bigpkg", 80 * 1024)] {
+            let h = harness();
+            insert_repo(&h, "pypi-test");
+
+            let content = format!("{pkg}-sdist-bytes").into_bytes();
+            let sha = content_sha256_hex(&content);
+            let boundary = "----hortrequirespython";
+            let mut body: Vec<u8> = Vec::new();
+            let push_field = |buf: &mut Vec<u8>, name: &str, value: &str| {
+                buf.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+                buf.extend_from_slice(
+                    format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+                );
+                buf.extend_from_slice(value.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            };
+            push_field(&mut body, "name", pkg);
+            push_field(&mut body, "version", "1.0");
+            push_field(&mut body, ":action", "file_upload");
+            push_field(&mut body, "sha256_digest", &sha);
+            push_field(&mut body, "requires_python", ">=3.8");
+            push_field(&mut body, "description", &"d".repeat(description_len));
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"content\"; \
+                     filename=\"{pkg}-1.0.tar.gz\"\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+            body.extend_from_slice(&content);
+            body.extend_from_slice(b"\r\n");
+            body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+            let res = post_publish(&h, boundary, body).await;
+            assert_eq!(
+                res.status(),
+                StatusCode::OK,
+                "publishing {pkg} must succeed"
+            );
+
+            let md = h.lifecycle.committed_transitions()[0]
+                .2
+                .clone()
+                .expect("pypi ingest must commit an ArtifactMetadata row");
+            blob_backed.push(md.metadata_blob.is_some());
+
+            let res = router(h.ctx.clone())
+                .oneshot(
+                    Request::get(format!("/pypi/pypi-test/simple/{pkg}/"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "serving {pkg} must succeed");
+            let served = to_bytes(res.into_body(), 4 * 1024 * 1024).await.unwrap();
+            let html = std::str::from_utf8(&served).unwrap();
+
+            assert!(
+                html.contains("data-requires-python=\"&gt;=3.8\""),
+                "{pkg}: an installer must see the published Python requirement:\n{html}"
+            );
+        }
+
+        // Counter-assertion: the two publishes landed on opposite sides
+        // of the cap. Both on one side and the loop above compares a
+        // path with itself.
+        assert_eq!(
+            blob_backed,
+            vec![false, true],
+            "the short description must stay inline and the long one must spill — \
+             otherwise this test is not comparing the two read paths"
+        );
+    }
+
     /// PEP 691 JSON simple API — Accept-header negotiation returns
     /// `application/vnd.pypi.simple.v1+json` with meta.api-version="1.1",
     /// name, files (with hashes + requires-python when stored), and

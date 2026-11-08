@@ -1,0 +1,27 @@
+# Hosted OCI repo whose ONLY subject is the manifest DELETE by digest
+# (scripts/native-tests/scenarios/clients/oci-manifest-delete.sh).
+#
+# It is deliberately NOT oci-e2e. The scenario needs a `delete` grant, and
+# oci-e2e is shared by three other scenarios (clients/oci.sh,
+# quarantine/oci-image-index.sh phase A, dogfood/registry-supply-chain.sh):
+# widening its grants would hand those a permission they do not need, and
+# would leave this scenario's own 202 unable to say WHICH grant carried it.
+#
+# `isPublic: true` mirrors every other hosted OCI fixture here. It does not
+# soften what the scenario proves: the public shortcut in
+# `RepositoryAccessUseCase::enforce` is on `AccessLevel::Read` only, and
+# `Permission::Delete` has no such shortcut — a delete authorises through a
+# grant or not at all.
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: oci-delete-e2e
+spec:
+  name: "OCI Manifest-Delete E2E"
+  description: "Hosted OCI repo used by scripts/native-tests/scenarios/clients/oci-manifest-delete.sh to prove a manifest DELETE by digest removes the manifest and leaves its layer blobs resolvable."
+  format: oci
+  type: hosted
+  storage:
+    backend: filesystem
+  isPublic: true
+  replicationPriority: local_only

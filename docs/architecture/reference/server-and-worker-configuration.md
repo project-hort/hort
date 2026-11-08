@@ -67,14 +67,43 @@ each subcommand prints `Error: {err:?}` (full `anyhow` context chain)
 and exits non-zero; a Tokio-runtime build failure prints
 `error: building tokio runtime: {err}`.
 
-> **Why `migrate`/`admin`/`reconcile-groups` use `MinimalConfig`**
+> **Why the DB-only subcommands use `MinimalConfig`**
 > ([ADR 0009](../../adr/0009-least-privilege-runtime-migrate-subcommand.md)):
 > the runtime DSN is least-privilege (DML only) and
-> these DB-only subcommands must not require the storage /
+> these subcommands must not require the storage /
 > public-base-url / OIDC surface. `MinimalConfig` parses exactly the
-> five shared variables in
-> [§ Core (shared)](#core-shared--minimalconfig). `serve` and `scrub`
-> parse the full surface and enforce every interlock. Migrations are
+> variables in [§ Core (shared)](#core-shared--minimalconfig), plus
+> `HORT_TOKEN_ALLOW_ADMIN` (which `admin bootstrap-session` gates on).
+>
+> **Twelve subcommands take this path**, not the three an earlier revision
+> of this note named — so check the list rather than inferring from the
+> three:
+>
+> - `migrate`
+> - `admin issue-svc-token`, `admin bootstrap-session` (both of `admin`)
+> - `reconcile-groups`
+> - `verify-event-chain`
+> - `seed-import`
+> - the six `enqueue-*` commands: `enqueue-prefetch-tick`,
+>   `enqueue-quarantine-release-sweep`,
+>   `enqueue-prefetch-row-retention-sweep`,
+>   `enqueue-scan-row-retention-sweep`,
+>   `enqueue-jobs-row-retention-sweep`,
+>   `enqueue-wheel-metadata-backfill`
+>
+> Re-derive the list instead of trusting the count — it grows with every
+> new `enqueue-*`:
+>
+> ```bash
+> grep -rln 'MinimalConfig::from_env' crates/hort-server/src/cli/
+> ```
+>
+> That returns **11 files** for 12 subcommands — `admin.rs` hosts two of
+> them.
+>
+> `serve` and `scrub` parse the full surface and enforce every interlock;
+> `validate-config`, `license` and `attribution` are DSN-free and parse
+> neither. Migrations are
 > owned **only** by `hort-server migrate` — the `serve` path calls
 > `migrate::assert_current` (a read-only check on `_sqlx_migrations`)
 > and refuses to run `migrate::run`.
@@ -524,6 +553,7 @@ it is referenced, not scheduled here.
 | `HORT_EVENT_CHAIN_CHECKPOINT_CADENCE_SECS` | u64 | `3600` | No | Signed-checkpoint cadence for the tamper-evident event chain (ADR 0002). Read by the always-on `eventstore-checkpoint` `dsn-direct` task. |
 | `HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS` | u64 | `86400` | No | Expected cadence of the `verify-event-chain` CronJob, used only to derive the staleness gauge (matches the chart's default `verifyEventChain` schedule). A query failure is logged and treated as "unknown" — never blocks boot. |
 | `HORT_EVENT_CHAIN_VERIFY_STALENESS_MULTIPLIER` | u32 | `3` | No | Multiplier on the expected interval above before the last-run gauge is considered stale (tolerates missed ticks before alarming). |
+| `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` | u64 | `300` (5 min) | No | Also a **worker** variable — see *Dispatcher tuning* below for the full semantics, and set it on both deployments or neither. On `hort-server` it is the threshold of the `hort_admin_tasks_class_unserved{class}` and `hort_admin_tasks_class_kind_unserved{class,kind}` gauges, which a background sampler re-derives from durable `jobs` rows every 60 s (not a boot-time one-shot like the three liveness gauges above: per-class service arises and clears while the process runs, so a boot-time answer would publish a `0` that stayed true forever). A sample failure is logged at debug and the previous gauge values stand — never blocks boot, never blocks serving. |
 | `HORT_RESCAN_DRIVE_STALENESS_MULTIPLIER` | u32 | `3` | No | Multiplier on the **shortest `rescanIntervalHours` any active `ScanPolicy` declares** before `hort-server`'s boot-time rescan-drive signal reports the cadence undriven (`hort_rescan_drive_undriven` + a `warn!` naming `scheduledTasks.cronRescanTick.enabled`). No paired interval knob: the expected cadence comes from the policies themselves, not from the environment. A query failure is logged and treated as "unknown" — never blocks boot. |
 
 ---
@@ -674,8 +704,10 @@ neither set the error surfaces the name `"DATABASE_URL"`.
 | Variable | Type | Default | Required? | Semantics |
 |---|---|---|---|---|
 | `HORT_SCANNER_POLL_INTERVAL_SECS` | u64 | `5` | No | Dispatcher poll interval. |
-| `HORT_SCANNER_BATCH_SIZE` | u32 | `4` | No | Jobs claimed per poll (clamped to `u16::MAX`). |
+| `HORT_SCANNER_BATCH_SIZE` | u32 | `4` | No | Jobs claimed per poll (clamped to `u16::MAX`). **Bounded from below by `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS`:** the claim spends the batch on the per-class reservation first (up to the share for each of the two waited-on classes), then on one priority-blind oldest row, then on the remainder by rank — and that oldest row is the only guarantee of service for bulk work, which has no reserved share. So the smallest batch that serves every class is `waited-on classes × HORT_SCANNER_RESERVED_SLOTS_PER_CLASS + 1` = `3` at the default share, and the shipped default of `4` leaves one row for the ranked remainder. **A smaller pair fails worker startup** with a message carrying both values and the minimum — it is not warned about and the batch is not quietly raised, because a batch below the minimum never claims one of the classes at all. Lowering this against lock contention is exactly the move that used to do that silently. See [ADR 0066](../../adr/0066-background-work-never-outranks-a-waiting-client.md). |
 | `HORT_SCANNER_MAX_ATTEMPTS` | u32 | `6` | No | Max scan attempts before a job is failed. |
+| `HORT_SCANNER_RESERVED_SLOTS_PER_CLASS` | u32 | `1` | No | Slots held for each non-empty **waited-on** work class (a client is waiting; an operator is waiting) at both points where the dispatcher allocates capacity — the claim batch and the per-kind run permits. Keeps a flood of background work from occupying either, so a client-waited ingest scan is claimed, and runs, alongside a scheduled-rescan backlog. Bulk work (nobody waiting) gets no reserved share: it is served by the claim's one priority-blind oldest slot, and at the permits by arrival order plus a class-blind age net — past three quarters of `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` the longest-waiting row takes the next permit whatever its class, at most once per that bound — so it drains more slowly under load by design but is not held behind a client-waited stream that never lets up. `0` disables the reservation, the time floor and the age net at both points, restoring pure rank-then-age claiming and arrival-ordered permits; ADR 0066 permits that waiver on one condition, so a worker started this way logs a `WARN` at startup naming the guarantee it gave up. One knob rather than two because closing one point and not the other leaves the other's victim. Clamped to `u16::MAX`. **Bounded from above by `HORT_SCANNER_BATCH_SIZE`**, which must be at least `waited-on classes × this value + 1` so the claim's oldest slot survives the reservation; raising this without raising the batch fails worker startup, with the same message and for the same reason. See [ADR 0066](../../adr/0066-background-work-never-outranks-a-waiting-client.md). |
+| `HORT_TASK_CLASS_SERVICE_THRESHOLD_SECS` | u64 | `300` (5 min) | No | How long work of a class may be waiting with **nothing of that class served** before the class is reported as unserved (ADR 0066 D5). The verdict is a pure function of `max(newest completion in the class, arrival of the oldest waiting item)`, so a deep queue that is draining is not reported and an idle class is not reported the moment its first row arrives. **Read by both `hort-server` and `hort-worker`** and it must be set on both or neither: the worker turns the verdict into an ERROR log plus `hort_admin_tasks_class_starved_total` / `hort_admin_tasks_class_kind_starved_total`, and `hort-server` turns the same verdict over the same durable `jobs` rows into the `hort_admin_tasks_class_unserved{class}` and `hort_admin_tasks_class_kind_unserved{class,kind}` gauges an operator scrapes (the worker's own `/metrics` listener is opt-in and off by default). The verdict is reached at **both** granularities from one sampling statement, because the allocator below enforces at both: a class whose rows of one kind are stalled behind that kind's permit is re-armed, in the class-wide answer, by a sibling kind of the same class completing. The **run-permit allocator's two enforcement times are derived from this same number** and have no knobs of their own: half of it is the per-class time floor (a waited-on class below its share that has gone unserved that long takes the next permit) and three quarters of it is the class-blind age net (the longest-waiting row of any class takes it, at most once per bound). Both therefore sit below the window the verdict is reported at, so raising this number relaxes the scheduler as well as the alarm. Tighter than the per-kind starvation audit's fixed 600 s because this predicate cannot fire on a draining queue; `0` reports any waiting class, and the direction to err in is the loud one. See [ADR 0066](../../adr/0066-background-work-never-outranks-a-waiting-client.md) and `docs/metrics-catalog.md`. |
 | `HORT_SCANNER_LOCK_DURATION_SECS` | u64 | `900` (15 min) | No | Job lock / lease duration. |
 | `HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE` | bool | `true` | No | Break-glass switch for the cross-backend finding merge (ADR 0059). Default: for one advisory reported by two backends, the reading that actually assessed a severity supersedes one whose `Critical` is the fail-closed floor a backend fell back to — across tiers, so a scored `Medium` wins over an unassessed `Critical`. `false` reverts to strict always-fail-closed (the floor wins on tier alone), which makes the release gate **stricter**. Set from `worker.scanner.findingMerge.allowInformedDowngrade`. |
 

@@ -323,10 +323,10 @@ the result instead.
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
 | once_cell_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/once_cell_polyfill |
 | serde_spanned | 1.1.2 | MIT | https://github.com/toml-rs/toml |
-| toml | 1.1.8+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml | 1.2.0+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_datetime | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_parser | 1.1.5+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
-| toml_writer | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml_writer | 1.2.0+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | num-conv | 0.2.1 | MIT | https://github.com/jhpratt/num-conv |
 | time-core | 0.1.8 | MIT | https://github.com/time-rs/time |
 | time-macros | 0.2.27 | MIT | https://github.com/time-rs/time |
@@ -377,7 +377,7 @@ the result instead.
 | chrono | 0.4.45 | MIT | https://github.com/chronotope/chrono |
 | governor | 0.10.4 | MIT | https://github.com/boinkor-net/governor.git |
 | granit-parser | 0.0.7 | MIT | https://github.com/bourumir-wyngs/granit-parser |
-| granit-parser | 2.0.0 | MIT | https://github.com/bourumir-wyngs/granit-parser |
+| granit-parser | 2.1.0 | MIT | https://github.com/bourumir-wyngs/granit-parser |
 | libm | 0.2.16 | MIT | https://github.com/rust-lang/compiler-builtins |
 | objc2-app-kit | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-core-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
@@ -454,7 +454,7 @@ the result instead.
 | rustversion | 1.0.22 | MIT | https://github.com/dtolnay/rustversion |
 | semver | 1.0.28 | MIT | https://github.com/dtolnay/semver |
 | serde-saphyr | 0.0.29 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
-| serde-saphyr | 2.0.0 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
+| serde-saphyr | 2.1.0 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
 | serde | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_core | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_derive | 1.0.229 | MIT | https://github.com/serde-rs/serde |
@@ -478,7 +478,7 @@ the result instead.
 | spin | 0.10.1 | MIT | https://github.com/mvdnes/spin-rs.git |
 | spin | 0.9.9 | MIT | https://github.com/mvdnes/spin-rs.git |
 | tracing-core | 0.1.36 | MIT | https://github.com/tokio-rs/tracing |
-| zip | 9.2.1 | MIT | https://github.com/zip-rs/zip2 |
+| zip | 9.3.0 | MIT | https://github.com/zip-rs/zip2 |
 | typenum | 1.20.0 | MIT | https://github.com/paholg/typenum |
 | endian-type | 0.1.2 | MIT | https://github.com/Lolirofle/endian-type.git |
 | base64 | 0.21.7 | MIT | https://github.com/marshallpierce/rust-base64 |
@@ -13436,7 +13436,7 @@ SOFTWARE.
 
 ```
 
-### toml 1.1.8+spec-1.1.0 — MIT
+### toml 1.2.0+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -13517,7 +13517,7 @@ SOFTWARE.
 
 ```
 
-### toml_writer 1.1.3+spec-1.1.0 — MIT
+### toml_writer 1.2.0+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -14958,7 +14958,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### granit-parser 2.0.0 — MIT
+### granit-parser 2.1.0 — MIT
 
 Repository: https://github.com/bourumir-wyngs/granit-parser
 
@@ -17145,7 +17145,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde-saphyr 2.0.0 — MIT
+### serde-saphyr 2.1.0 — MIT
 
 Repository: https://github.com/bourumir-wyngs/serde-saphyr
 
@@ -17858,7 +17858,7 @@ SOFTWARE.
 
 ```
 
-### zip 9.2.1 — MIT
+### zip 9.3.0 — MIT
 
 Repository: https://github.com/zip-rs/zip2
 

@@ -19,6 +19,7 @@ digraph ArtifactQuarantineLifecycle {
     "none" -> "rejected" [label="reject_from_scan"];
     "quarantined" -> "rejected" [label="reject_from_scan"];
     "released" -> "rejected" [label="reject_from_scan"];
+    "scan_indeterminate" -> "rejected" [label="reject_from_scan"];
     "quarantined" -> "rejected" [label="reject_from_retroactive_curation"];
     "released" -> "rejected" [label="reject_from_retroactive_curation"];
     "quarantined" -> "rejected" [label="reject_from_scan_policy_retroactive"];
@@ -42,4 +43,5 @@ digraph ArtifactQuarantineLifecycle {
     "released" -> "rejected" [label="complete_provenance"];
     "scan_indeterminate" -> "rejected" [label="complete_provenance"];
     "rejected" -> "quarantined" [label="repair_provenance_misrejection"];
+    "scan_indeterminate" -> "quarantined" [label="supersede_absent_verdict"];
 }

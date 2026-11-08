@@ -24,8 +24,8 @@ use crate::metrics::{
 };
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::{
-    read_unpaired_append_version, scan_history, ArtifactAtVersion, CallerPrivileges, OverCapStream,
-    UnpairedAppend,
+    read_unpaired_append_version, refuse_append_past_cap, refuse_append_past_cap_at_version,
+    scan_history, ArtifactAtVersion, CallerPrivileges, OverCapStream, UnpairedAppend,
 };
 
 /// Application use case for artifact promotion operations.
@@ -116,6 +116,12 @@ impl PromotionUseCase {
         self.repositories.find_by_id(target_repo_id).await?;
 
         let expected_version = paired.expected_version();
+        // One `PromotionRequested`, and nothing bounds how often a caller
+        // with write access to the source repository may ask: the
+        // `is_promotable` gate above is a state test the artifact keeps
+        // passing, so the verb is repeatable without limit and carries
+        // the refusal itself.
+        refuse_append_past_cap(&stream_id, paired.stream_len(), 1)?;
 
         self.events
             .append(AppendEvents {
@@ -269,6 +275,15 @@ impl PromotionUseCase {
         // a scan verdict committed since then fail this append rather
         // than be overwritten by a promotion decided without it.
         let expected_version = paired.expected_version();
+
+        // Every one of the four outcome branches below appends exactly
+        // two events — a `PolicyEvaluated` and its companion — so the
+        // cap question has one answer for all of them and is asked once,
+        // before the decision is acted on. Repeatable without limit: the
+        // verb has no idempotency of its own, and a promotable artifact
+        // stays promotable, so a caller may drive it as often as it
+        // likes.
+        refuse_append_past_cap(&stream_id, paired.stream_len(), 2)?;
 
         match outcome {
             PromotionOutcome::Allow => {
@@ -526,6 +541,19 @@ impl PromotionUseCase {
             )));
         }
 
+        // One or two events depending on the decision, so the refusal is
+        // asked after the batch is assembled rather than before. The
+        // version above is this site's only observation of the stream and
+        // it states the stream's length, so no second read is needed.
+        // Repeatable without limit: there is no state guard on this verb
+        // at all — a reviewer may decide the same artifact's approval
+        // again and again, and each call appends.
+        refuse_append_past_cap_at_version(
+            &stream_id,
+            expected_version,
+            events_to_append.len() as u64,
+        )?;
+
         self.events
             .append(AppendEvents {
                 stream_id,
@@ -584,6 +612,12 @@ impl PromotionUseCase {
             UnpairedAppend::CallerSuppliedPayload,
         )
         .await?;
+        // One `PromotionRejected`, and this verb has no state guard
+        // whatsoever — it validates the reason, checks write access and
+        // appends. Anyone with write access to either repository can
+        // therefore grow one artifact's stream a call at a time, which
+        // makes it the plainest repeatable writer in the system.
+        refuse_append_past_cap_at_version(&stream_id, expected_version, 1)?;
 
         self.events
             .append(AppendEvents {
@@ -633,7 +667,10 @@ mod tests {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let repositories = Arc::new(MockRepositoryRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(
+            artifacts.clone(),
+            events.clone(),
+        ));
         let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
         let uc = PromotionUseCase::new(
             artifacts.clone(),
@@ -903,7 +940,7 @@ mod tests {
         repos.insert(target);
 
         let stream_id = StreamId::artifact(artifact_id);
-        let over_cap: Vec<_> = (0..201)
+        let over_cap: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP + 1)
             .map(|i| dummy_persisted_with_event(&stream_id, i, dummy_scan_requested(artifact_id)))
             .collect();
         events.set_stream(&stream_id, over_cap);
@@ -915,13 +952,198 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            err.to_string().contains("200-event cap"),
+            err.to_string()
+                .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)),
             "the refusal must name the cap it is enforcing; got {err}"
         );
         assert!(
             lifecycle.committed_transitions().is_empty(),
             "no promotion is committed from a scan summary that may be superseded"
         );
+    }
+
+    /// A promotable artifact, both repositories, and a stream of exactly
+    /// `len` events the promotion gate does not read — the one fixture
+    /// every cap test below needs. Returns everything a verb needs to be
+    /// driven plus the two observers the assertions use.
+    #[allow(clippy::type_complexity)]
+    fn promotable_with_stream_of(
+        len: u64,
+    ) -> (
+        PromotionUseCase,
+        Uuid,
+        Uuid,
+        Uuid,
+        Arc<MockEventStore>,
+        Arc<MockArtifactLifecycle>,
+    ) {
+        let (uc, artifacts, repos, events, lifecycle, _policies) = make_use_case();
+        let artifact = sample_artifact(QuarantineStatus::None);
+        let source = sample_repository();
+        let target = sample_repository();
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        repos.insert(source.clone());
+        repos.insert(target.clone());
+        let stream_id = StreamId::artifact(artifact_id);
+        let seeded: Vec<_> = (0..len)
+            .map(|i| dummy_persisted_with_event(&stream_id, i, dummy_scan_requested(artifact_id)))
+            .collect();
+        events.set_stream(&stream_id, seeded);
+        (uc, artifact_id, source.id, target.id, events, lifecycle)
+    }
+
+    /// Every promotion verb refuses the batch that would cross the cap.
+    ///
+    /// Four verbs, one fixture shape: the artifact's stream sits exactly
+    /// ON the cap, where the `ExpectedVersion` each of them carries is
+    /// the stream's true tail and the adapter's version check therefore
+    /// lets the append through. These are the plainest repeatable writers
+    /// in the system — `reject_promotion` has no state guard at all, so
+    /// anyone with write access can call it in a loop — and nothing but
+    /// the refusal stands between that and a permanently frozen artifact.
+    #[tokio::test]
+    async fn every_promotion_verb_refuses_the_batch_that_would_cross_the_cap() {
+        for verb in ["request", "evaluate", "approve", "reject"] {
+            let (uc, artifact_id, source, target, events, lifecycle) =
+                promotable_with_stream_of(crate::use_cases::STREAM_EVENT_CAP);
+            let privs = write_privileges(vec![source, target]);
+            let err = drive(&uc, verb, artifact_id, source, target, privs)
+                .await
+                .expect_err("the batch has nowhere to land");
+
+            assert!(
+                err.to_string()
+                    .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)),
+                "the {verb} refusal must name the cap it is enforcing; got {err}"
+            );
+            assert!(
+                events.appended_batches().is_empty(),
+                "{verb}: nothing reaches the stream once the refusal fires"
+            );
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "{verb}: nothing is committed once the refusal fires"
+            );
+        }
+    }
+
+    /// The counter-factual: two events short of the cap there is room for
+    /// each verb's batch, so the same fixture appends normally. Without it
+    /// the assertions above would also hold for a fixture that failed for
+    /// some unrelated reason.
+    ///
+    /// `evaluate` is absent because its batch commits through the
+    /// lifecycle port rather than the event store, and its happy path is
+    /// already covered by the four outcome tests above.
+    #[tokio::test]
+    async fn the_promotion_verbs_still_append_two_events_short_of_the_cap() {
+        for verb in ["request", "approve", "reject"] {
+            let (uc, artifact_id, source, target, events, _lifecycle) =
+                promotable_with_stream_of(crate::use_cases::STREAM_EVENT_CAP - 2);
+            let privs = write_privileges(vec![source, target]);
+            drive(&uc, verb, artifact_id, source, target, privs)
+                .await
+                .expect("one more event still fits");
+            assert_eq!(
+                events.appended_batches().len(),
+                1,
+                "{verb}: the append lands when the cap has room for it"
+            );
+        }
+    }
+
+    /// A rejecting approval decision appends a PAIR — `ApprovalDecided`
+    /// plus the `PromotionRejected` it drives — which is why the refusal
+    /// counts the assembled batch rather than assuming one event. One
+    /// short of the cap there is room for the approval alone and not for
+    /// the rejection beside it.
+    #[tokio::test]
+    async fn a_rejecting_approval_is_refused_where_an_approving_one_fits() {
+        let one_short = crate::use_cases::STREAM_EVENT_CAP - 1;
+
+        let (uc, artifact_id, source, target, events, _lifecycle) =
+            promotable_with_stream_of(one_short);
+        uc.decide_approval(
+            artifact_id,
+            source,
+            target,
+            ApprovalDecision::Approved,
+            None,
+            api_actor(),
+            reviewer_privileges(),
+        )
+        .await
+        .expect("a single ApprovalDecided fits one short of the cap");
+        assert_eq!(events.appended_batches()[0].events.len(), 1);
+
+        let (uc, artifact_id, source, target, events, _lifecycle) =
+            promotable_with_stream_of(one_short);
+        let err = uc
+            .decide_approval(
+                artifact_id,
+                source,
+                target,
+                ApprovalDecision::Rejected,
+                Some("not this one".into()),
+                api_actor(),
+                reviewer_privileges(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains(&format!("{}-event cap", crate::use_cases::STREAM_EVENT_CAP)));
+        assert!(
+            events.appended_batches().is_empty(),
+            "the pair does not fit, so neither half of it lands"
+        );
+    }
+
+    /// Drive one promotion verb by name. The four are one table here
+    /// because the cap question has the same answer for all of them and
+    /// the tests above differ only in what they expect back.
+    async fn drive(
+        uc: &PromotionUseCase,
+        verb: &str,
+        artifact_id: Uuid,
+        source: Uuid,
+        target: Uuid,
+        privileges: CallerPrivileges,
+    ) -> AppResult<()> {
+        match verb {
+            "request" => uc
+                .request_promotion(artifact_id, source, target, api_actor(), privileges)
+                .await
+                .map(|_| ()),
+            "evaluate" => {
+                uc.evaluate_and_promote(artifact_id, source, target, api_actor(), privileges)
+                    .await
+            }
+            "approve" => {
+                uc.decide_approval(
+                    artifact_id,
+                    source,
+                    target,
+                    ApprovalDecision::Approved,
+                    None,
+                    api_actor(),
+                    reviewer_privileges(),
+                )
+                .await
+            }
+            _ => {
+                uc.reject_promotion(
+                    artifact_id,
+                    source,
+                    target,
+                    "no longer wanted".into(),
+                    api_actor(),
+                    privileges,
+                )
+                .await
+            }
+        }
     }
 
     /// Filler for an over-cap stream: any event the promotion gate does

@@ -27,7 +27,8 @@
 //!   artifact with no `ScanCompleted` on its own stream cannot prove
 //!   per-artifact freshness and is treated as stale (fail-safe).
 //!   (Per-artifact — deliberately tighter than the per-repo
-//!   `repo_security_score.last_scan_at` reading.) Stale →
+//!   `repo_security_scores.last_scan_at` projection, which this
+//!   evaluator does not read.) Stale →
 //!   `skipped_stale_scan` metric + `tracing::debug!`,
 //!   NOT an error, the sweep continues. The interval is resolved per
 //!   the policy chain (repo-scoped scan policy → … → default
@@ -103,7 +104,7 @@ use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{
     emit_retention_evaluation, emit_retention_expired, RetentionEvaluationResult,
 };
-use crate::use_cases::{read_artifact_stream, STREAM_EVENT_CAP};
+use crate::use_cases::{read_artifact_stream, refuse_append_past_cap};
 
 /// Default rescan interval (hours) when the caller resolved no policy
 /// interval. Mirrors the policy chain's "default 24 h" tail
@@ -675,20 +676,21 @@ impl RetentionUseCase {
     ///
     /// **The cap is enforced here, not by the adapter.**
     /// `ExpectedVersion::Any` means the adapter performs no version check
-    /// at all, so this append gets none of the bound that
-    /// [`read_unpaired_append_version`](crate::use_cases::read_unpaired_append_version)
-    /// gives every `ExpectedVersion::Exact` writer. Without a refusal of
-    /// its own, the expiry sweep is the one writer able to push an
-    /// artifact stream past [`STREAM_EVENT_CAP`] — and past the cap every
-    /// capped reader of that stream (the release authorization above all)
-    /// silently decides on the oldest prefix. `stream_len` is the length
-    /// of the same full read the idempotency check above used, so the
-    /// decision to refuse needs no extra I/O.
+    /// at all, so this append gets none of the (partial) bound an
+    /// `ExpectedVersion::Exact` writer inherits from the version it
+    /// carries. Without a refusal of its own the expiry sweep pushes an
+    /// artifact stream past the event cap, and past the cap every capped
+    /// reader of that stream (the release authorization above all)
+    /// refuses to decide at all, so the artifact is frozen. `stream_len`
+    /// is the length of the same full read the idempotency check above
+    /// used, so the decision to refuse needs no extra I/O.
     ///
-    /// A refusal returns `DomainError::Conflict`, matching
-    /// `read_unpaired_append_version`'s refusal for the same condition; the
-    /// caller folds it into [`EvalStep::Errored`] and keeps sweeping, so
-    /// one frozen artifact does not stall the pass.
+    /// The predicate and its message are
+    /// [`refuse_append_past_cap`](crate::use_cases::refuse_append_past_cap)'s,
+    /// shared with every other repeatable append path. Its refusal is a
+    /// `DomainError::Conflict`, which the caller folds into
+    /// [`EvalStep::Errored`] and keeps sweeping, so one frozen artifact
+    /// does not stall the pass.
     async fn append_expired(
         &self,
         stream_id: &StreamId,
@@ -698,14 +700,9 @@ impl RetentionUseCase {
         now: DateTime<Utc>,
         stream_len: u64,
     ) -> AppResult<()> {
-        if stream_len.saturating_add(1) > STREAM_EVENT_CAP {
-            return Err(AppError::Domain(hort_domain::error::DomainError::Conflict(
-                format!(
-                    "stream {stream_id} holds {stream_len} events; appending \
-                     ArtifactExpired would exceed the {STREAM_EVENT_CAP}-event cap"
-                ),
-            )));
-        }
+        // The sweep appends exactly one `ArtifactExpired`, so one is the
+        // batch size the refusal is asked about.
+        refuse_append_past_cap(stream_id, stream_len, 1)?;
         let event = hort_domain::events::ArtifactExpired {
             artifact_id: artifact.id,
             policy_id: policy.id,

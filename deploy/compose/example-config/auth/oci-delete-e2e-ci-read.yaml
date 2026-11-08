@@ -1,0 +1,22 @@
+# PermissionGrant: serviceAccount oci-delete-e2e-ci -> read oci-delete-e2e
+# (native-token mode, scenarios/clients/oci-manifest-delete.sh).
+#
+# Granted alongside write and delete (permissions are flat; neither implies
+# read). Load-bearing on three legs, not just the obvious pull one:
+#   - the manifest-body GET that records a layer digest before the delete,
+#   - the closing layer-blob GET,
+#   - the delete itself — `delete_by_digest` resolves the manifest through
+#     `ArtifactUseCase::find_visible_by_path`, which enforces
+#     `AccessLevel::Read` on the repository before the artifact is removed.
+# So a delete-only identity cannot delete here: the `pull` half of the
+# capability JWT this grant backs is what the handler's own lookup needs.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-delete-e2e-ci-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-delete-e2e-ci
+  permission: read
+  repository: oci-delete-e2e

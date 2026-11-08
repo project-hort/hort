@@ -65,21 +65,25 @@ use tracing::info;
 use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
+use hort_domain::types::task_tier::queue_priority;
 
 use crate::config::MinimalConfig;
 use crate::{pg_identity, telemetry};
 
-/// `trigger_source` literal — must match the SQL CHECK constraint on
-/// `jobs.trigger_source` (`'manual' | 'cron' | 'advisory' | 'ingest'`).
-/// The scheduled CronJob is the `'cron'` trigger source.
-const CRON_TRIGGER_SOURCE: &str = "cron";
+/// `trigger_source` literal for this scheduled CronJob enqueue, taken
+/// from the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]) rather than
+/// re-typed beside it — so CHECK membership is a property of the value
+/// and this comment does not have to carry a copy of the list.
+const CRON_TRIGGER_SOURCE: &str = TriggerSource::Cron.as_str();
 
-/// `priority` for the enqueued row. The trigger-source ranking is
-/// `ingest=0` → `advisory=5` → `cron=10` → `manual=20`. Matches the
-/// scan-row + prefetch-row sweeps' priority — the CronJobs in the cron
-/// tier drain together.
-const CRON_PRIORITY: i16 = 10;
+/// `jobs.kind` of the row this subcommand enqueues. The ordinal it
+/// carries is not named here: it is decided from `(kind,
+/// trigger_source)` in `hort_domain::types::task_tier`, so every
+/// cron-triggered row drains in the same tier by construction rather
+/// than by six constants agreeing.
+const KIND: &str = "jobs-row-retention-sweep";
 
 /// Arguments to `hort-server enqueue-jobs-row-retention-sweep`.
 ///
@@ -119,12 +123,13 @@ async fn run_async(_args: EnqueueJobsRowRetentionSweepArgs) -> anyhow::Result<()
     // `actor_id` is `None` because the scheduled path is system-driven (a
     // CronJob is not a human caller; the runtime DSN owns nothing
     // identity-wise).
+    let priority = queue_priority(KIND, CRON_TRIGGER_SOURCE);
     let outcome = jobs
         .enqueue_task(
-            "jobs-row-retention-sweep",
+            KIND,
             &serde_json::json!({}),
             None, // actor_id — system-driven cron
-            CRON_PRIORITY,
+            priority,
             CRON_TRIGGER_SOURCE,
             None, // non-destructive task kind — no DB-side idempotency key (ADR 0028)
         )
@@ -139,8 +144,8 @@ async fn run_async(_args: EnqueueJobsRowRetentionSweepArgs) -> anyhow::Result<()
 
     info!(
         job_id = %id,
-        kind = "jobs-row-retention-sweep",
-        priority = CRON_PRIORITY,
+        kind = KIND,
+        priority,
         trigger_source = CRON_TRIGGER_SOURCE,
         "jobs-row-retention-sweep job enqueued"
     );
@@ -194,17 +199,18 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
-    /// Constants stay aligned with the two sibling row-retention sweeps
-    /// (trigger-source ranking; CHECK constraint values). Same priority
-    /// as the other cron-tier CronJobs so they drain in the same tier.
+    /// Constants stay aligned with the trigger-source ranking and the
+    /// CHECK constraint values. The CronJob template and the worker
+    /// dispatch table both reference them implicitly through the
+    /// inserted row; a silent drift here would break the claim
+    /// ordering.
+    ///
+    /// The ordinal is asserted as relations rather than as a number by
+    /// [`crate::cli::assert_scheduled_maintenance_ordinal`], which is
+    /// where the reasoning for both of them lives.
     #[test]
     fn constants_match_cron_trigger_source_ranking() {
         assert_eq!(CRON_TRIGGER_SOURCE, "cron");
-        assert_eq!(
-            CRON_PRIORITY, 10,
-            "jobs-row-retention-sweep must share priority with the other cron-tier \
-             CronJobs (quarantine-release-sweep + the two row-retention sweeps); \
-             changing this skews the worker claim queue"
-        );
+        crate::cli::assert_scheduled_maintenance_ordinal(KIND);
     }
 }

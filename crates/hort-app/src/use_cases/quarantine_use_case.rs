@@ -30,7 +30,7 @@ use hort_domain::ports::quarantine_release::ReleaseExpiredSummary;
 use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInvalidator;
 
 use crate::event_store_publisher::EventStorePublisher;
-use crate::use_cases::ingest_use_case::CLEARANCE_VERIFY_PRIORITY;
+use crate::use_cases::ingest_use_case::{CLEARANCE_TRIGGER_SOURCE, PROVENANCE_VERIFY_KIND};
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::referenced_descendant::is_parent_gated_blob_constituent;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
@@ -38,6 +38,7 @@ use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scan_findings_repository::ScanFindingsRow;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::sbom::Sbom;
+use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::{
     highest_severity, severity_label, severity_summary_from_findings, ArtifactCoords, ArtifactKind,
     ContentHash, Finding,
@@ -54,7 +55,7 @@ use crate::metrics::{
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::release_clearance::provenance_clearance_from;
 use crate::use_cases::scan_history;
-use crate::use_cases::{ArtifactAtVersion, OverCapStream};
+use crate::use_cases::{refuse_append_past_cap, ArtifactAtVersion, OverCapStream};
 
 /// The static authority-kind label for the timer-release
 /// `info!` line. Only the four timer-authorities reach this:
@@ -306,7 +307,8 @@ fn provenance_mode_of(policy: Option<&ScanPolicyProjection>) -> ProvenanceMode {
 
 /// Map per-finding values onto the `scan_findings` projection row
 /// shape. `scan_id` correlates the rows with the
-/// `ScanCompleted` event in the same atomic batch.
+/// scan observation. A repeated finding verdict has no new
+/// `ScanCompleted`, but still receives fresh projection rows.
 fn build_scan_findings_rows(
     findings: &[Finding],
     artifact_id: Uuid,
@@ -431,6 +433,10 @@ struct ScanResultContext<'a> {
     actor: Actor,
     now: DateTime<Utc>,
     scan_event: ScanCompleted,
+    policy_event: PolicyEvaluated,
+    verdict_changed: bool,
+    prior_standing: scan_history::ScanStanding,
+    stream_len: u64,
     scan_findings_rows: Vec<ScanFindingsRow>,
     prior_status: QuarantineStatus,
     prior: Option<(ScanCompleted, DateTime<Utc>)>,
@@ -521,8 +527,8 @@ impl QuarantineUseCase {
 
     /// Place an artifact into quarantine.
     ///
-    /// Reads the event stream to enforce the 200-event cap and determine
-    /// expected version for optimistic concurrency, then transitions the
+    /// Reads the event stream to check the artifact-stream event cap and
+    /// determine the expected version for optimistic concurrency, then transitions the
     /// artifact state machine and persists both the event and the mutated
     /// artifact.
     ///
@@ -559,6 +565,13 @@ impl QuarantineUseCase {
         )
         .await?;
         let expected_version = paired.expected_version();
+        // One `ArtifactQuarantined`, and a repeatable one: an artifact
+        // the sweep or a curator released is quarantinable again, so this
+        // path runs once per quarantine cycle for the artifact's whole
+        // life. `OverCapStream::Refuse` above rejects a stream already
+        // past the cap; this rejects the append that would take a stream
+        // sitting exactly on it past.
+        refuse_append_past_cap(paired.stream_id(), paired.stream_len(), 1)?;
         let repository_id = paired.artifact().repository_id;
         let event_payload = paired.artifact_mut().quarantine(until)?;
         let artifact = paired.into_artifact();
@@ -597,9 +610,9 @@ impl QuarantineUseCase {
     /// logs/metrics. Returns whether `ArtifactBecameVulnerable` was
     /// pushed (`became_vulnerable_pushed`).
     ///
-    /// The `PolicyEvaluated` is unconditional and carries `Fail` for a
-    /// `record`-mode blocking verdict, `Pass` otherwise — see the
-    /// one-verdict-one-event invariant stated at the append.
+    /// A changed scan or policy verdict carries `PolicyEvaluated(Fail)`
+    /// for a `record`-mode block, or `PolicyEvaluated(Pass)` otherwise.
+    /// An unchanged verdict keeps the prior stream evidence.
     ///
     /// `record_clean_scan` is the state guard for a scan observation
     /// that does not transition the artifact — which a clean verdict
@@ -608,14 +621,30 @@ impl QuarantineUseCase {
     /// Released` inline when the computed deadline has already elapsed;
     /// the window-completes-last case still leaves the artifact
     /// `Quarantined` for the `release_expired` sweep. A clean re-scan of
-    /// an artifact ALREADY terminal (`Rejected` / `Released`) is a
-    /// recoverable, idempotent re-scan: record the fresh `ScanCompleted`
-    /// and its findings (so a manual rescan refreshes the stored result),
+    /// an artifact this guard refuses (`Rejected` or `Released`) is a
+    /// recoverable, idempotent re-scan: refresh the findings projection
+    /// and record a `ScanCompleted` only if its findings or policy
+    /// verdict changed,
     /// but do NOT mutate state — a clean signal must not un-reject a
     /// terminal artifact (ADR 0007 fail-closed; `record_clean_scan`
     /// rejects the terminal state for exactly that reason). Propagating
     /// the invariant instead fails the job and loops it forever — the
     /// same churn bug the reject branch already fixes.
+    ///
+    /// **`ScanIndeterminate` is the one state that does transition**
+    /// (ADR 0007, "A reached verdict supersedes an absent one"): the
+    /// artifact is held for want of a verdict, and this is one, so
+    /// [`Artifact::supersede_absent_verdict`] returns it to
+    /// `Quarantined` and its `ArtifactQuarantined` rides the same batch
+    /// — the status change gets its own event exactly as the reject and
+    /// the inline release do. It is a FRESH transition, not an
+    /// already-terminal skip, so the score re-count applies. From there
+    /// the ordinary release gate decides: the fast path below releases
+    /// the artifact in this same batch when its window has already
+    /// elapsed and a scan-axis authority is constructible, and otherwise
+    /// the `release_expired` sweep decides on a later tick. Which half
+    /// of the verdict applies is decided by the caller, exactly as it
+    /// already is between here and the reject branch.
     async fn handle_non_rejecting_verdict(
         &self,
         artifact: &mut Artifact,
@@ -623,6 +652,31 @@ impl QuarantineUseCase {
         violations: Vec<PolicyViolation>,
         new_findings: &[Finding],
     ) -> AppResult<bool> {
+        // The hold this verdict lifts, when there is one. An artifact in
+        // `ScanIndeterminate` is held because no scanner reached a
+        // verdict; this one did and does not block, so it goes back to
+        // `Quarantined` and the release gate decides from there (ADR
+        // 0007, "A reached verdict supersedes an absent one"). Taken
+        // before `record_clean_scan`, which refuses this state by
+        // design — the two events are deliberately distinct.
+        let returned_to_hold = if artifact.quarantine_status == QuarantineStatus::ScanIndeterminate
+        {
+            let quarantined = artifact.supersede_absent_verdict(ctx.now)?;
+            tracing::info!(
+                artifact_id = %ctx.artifact_id,
+                correlation_id = %ctx.correlation_id,
+                "a reached verdict superseded an absent one: artifact returned from \
+                 scan_indeterminate to the hold, where the ordinary release gate decides"
+            );
+            Some(quarantined)
+        } else {
+            None
+        };
+        // The state guard for an observation that does not transition the
+        // artifact. The transition above has already moved a superseded
+        // artifact to `Quarantined`, which this guard accepts, so one
+        // call answers for both paths and a superseding verdict is
+        // correctly NOT an already-terminal skip.
         let already_terminal = match artifact.record_clean_scan() {
             Ok(()) => false,
             Err(DomainError::Invariant(msg)) => {
@@ -643,9 +697,11 @@ impl QuarantineUseCase {
         let findings_recorded = !violations.is_empty();
 
         let mut events_vec = Vec::with_capacity(4);
-        events_vec.push(EventToAppend::new(DomainEvent::ScanCompleted(
-            ctx.scan_event.clone(),
-        )));
+        if ctx.verdict_changed {
+            events_vec.push(EventToAppend::new(DomainEvent::ScanCompleted(
+                ctx.scan_event.clone(),
+            )));
+        }
 
         // Step 7 (continued) — append ArtifactBecameVulnerable when a
         // prior scan existed AND the delta is non-empty.
@@ -656,19 +712,12 @@ impl QuarantineUseCase {
             ctx.prior.as_ref().map(|(_, ts)| *ts),
         )?;
 
-        // INVARIANT — exactly ONE `PolicyEvaluated` per scan verdict:
-        // `Pass` or `Fail`, never both and never none. The two verdict
-        // paths each append their single one unconditionally (the
-        // reject path appends `Fail`; this one appends whichever of the
-        // two the non-rejecting verdict reached), and both ride the
-        // SAME batch as the `ScanCompleted` they belong to. So a reader
-        // of the stream can answer "was a verdict reached on this scan,
-        // and what was it?" from the verdict event itself. Do not make
-        // this append conditional: a verdict that is absent from the
-        // stream is indistinguishable from a scan that never ran, which
-        // is what forces a consumer to re-derive the decision from
-        // `ScanCompleted.finding_count` — a count that says how many
-        // findings there were, never whether they blocked.
+        // A changed verdict writes exactly one PolicyEvaluated beside
+        // its ScanCompleted. An unchanged verdict writes
+        // neither, preserving the previous pair as the stream's latest
+        // evidence while the scan projections record the fresh time and
+        // rows. A bare ScanCompleted without its verdict would leave
+        // readers unable to tell whether its findings blocked.
         //
         // `Fail` whenever violations were recorded. Under
         // `enforcement: record` the verdict is audited with the SAME
@@ -684,24 +733,25 @@ impl QuarantineUseCase {
         // statement whether the finding list was empty or merely
         // harmless. This mirrors the promotion path, which has always
         // recorded a passing gate as a `PolicyEvaluated(Pass)` event.
-        let policy_event = PolicyEvaluated {
-            artifact_id: ctx.artifact_id,
-            policy_id: ctx
-                .policy
-                .as_ref()
-                .map(|p| p.policy_id)
-                .unwrap_or(NO_POLICY),
-            result: if findings_recorded {
-                PolicyResult::Fail
-            } else {
-                PolicyResult::Pass
-            },
-            violations: violations.clone(),
-        };
-        policy_event.validate()?;
-        events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
-            policy_event,
-        )));
+        if ctx.verdict_changed {
+            events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
+                ctx.policy_event.clone(),
+            )));
+        }
+
+        // The `ScanIndeterminate -> Quarantined` transition's own event,
+        // after the verdict that justifies it and before any release
+        // that follows from it. A status change without an event on the
+        // stream is a silent UPDATE: the reject branch appends
+        // `ArtifactRejected` and the fast path below appends
+        // `ArtifactReleased` for exactly the same reason, and the
+        // provenance-misrejection repair appends this same
+        // `ArtifactQuarantined` for its own return to the hold.
+        if let Some(quarantined) = returned_to_hold {
+            events_vec.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(
+                quarantined,
+            )));
+        }
 
         // Event-driven fast-path release (ADR 0007).
         //
@@ -710,9 +760,8 @@ impl QuarantineUseCase {
         // the matched `ScanPolicy.quarantineDuration` or
         // `DefaultPolicy::quarantine_duration_secs()`) is at or before
         // `now`, release it INLINE in the same
-        // `commit_scan_result_with_score` batch as the `ScanCompleted`
-        // append. Not "early release" — the observation window has
-        // elapsed; this collapses the latency from "up to one sweep
+        // `commit_scan_result_with_score` batch. The observation window
+        // has elapsed; this collapses the latency from "up to one sweep
         // interval" to zero.
         //
         // Uses the EXISTING accepted timer pairs the `release_expired`
@@ -720,10 +769,10 @@ impl QuarantineUseCase {
         // `ScanCleared` for one whose verdict permitted its findings,
         // `ScanRecorded` under `enforcement: record`; no authority is
         // introduced here that the sweep cannot also mint. The atomicity
-        // invariant is the batch: a reader rebuilding the projection
-        // from the event store MUST see `[ScanCompleted,
-        // ArtifactReleased]` as one append, never a
-        // clean-but-still-quarantined intermediate.
+        // invariant is the batch: a changed verdict and its release are
+        // one append, never a clean-but-still-quarantined intermediate.
+        // An unchanged verdict uses the prior standing from the paired
+        // stream and appends only the release event.
         //
         // When the deadline is still in the future, behaviour is
         // unchanged — the artifact stays `Quarantined` and the
@@ -772,22 +821,20 @@ impl QuarantineUseCase {
         // and all of them carry the same provenance AND-precondition,
         // re-verified inside `release`.
         //
-        // `None` is unreachable from here, and fail-closed if that ever
-        // changes. This batch opens with its own `ScanCompleted` (pushed
-        // unconditionally above) and carries the verdict reached on it
-        // beside that, so the standing is `Clears` or `Holds` — never
-        // either no-verdict-to-read answer — and the rejecting verdict
-        // is a different function which never releases inline. A
+        // `None` is fail-closed. A changed verdict uses its new pair;
+        // an unchanged verdict uses the complete prior stream. A
         // `Holds` standing here means the verdict blocked without
         // rejecting, which only `enforcement: record` produces
         // (`evaluate_scan_result` maps a blocking action under
         // `reject`, and under the absent-policy default, to
         // `ScanOutcome::Reject`), so the ladder's `record` arm answers
         // for it.
-        let authority = scan_axis_release_authority(
-            scan_history::latest_scan_standing(events_vec.iter().map(|e| &e.event)),
-            ctx.policy.as_ref(),
-        );
+        let standing = if ctx.verdict_changed {
+            scan_history::latest_scan_standing(events_vec.iter().map(|e| &e.event))
+        } else {
+            ctx.prior_standing
+        };
+        let authority = scan_axis_release_authority(standing, ctx.policy.as_ref());
         if let (true, Some(authority)) = (fast_path_fires, authority) {
             // Release-predicate invariant preserved (ADR 0007 + ADR
             // 0027): the timer arm carries the SAME provenance
@@ -831,12 +878,7 @@ impl QuarantineUseCase {
         // `Quarantined → Released` move. For a clean scan severity
         // counts are all zero; the status delta is non-zero only when
         // the fast-path fired.
-        let score_delta = RepoSecurityScoreProjector::compute_scan_completed_delta(
-            ctx.prior_status,
-            artifact.quarantine_status,
-            &ctx.severity,
-            ctx.now,
-        );
+        let score_delta = Self::scan_score_delta(&ctx, artifact.quarantine_status);
 
         // Pass the BOM's subject AND dependencies to the
         // `sbom_components` projection so the artifact-under-scan is
@@ -855,6 +897,7 @@ impl QuarantineUseCase {
             },
             &ctx.scan_findings_rows,
             ctx.now,
+            ctx.stream_len,
             // Mirror the reject branch: no score re-count on an
             // already-terminal re-scan — the status is unchanged and
             // the original reject already counted it.
@@ -932,16 +975,19 @@ impl QuarantineUseCase {
     /// refuses to transition — an already-`Rejected` one, or one an
     /// operator explicitly released
     /// ([`ReleaseOrigin::permits_scan_reblock`]) — is a recoverable,
-    /// idempotent re-scan: we still record the fresh `ScanCompleted` +
-    /// findings below (so a manual rescan refreshes the stored result
-    /// instead of silently doing nothing), but skip the
+    /// idempotent re-scan: we still refresh findings and record a fresh
+    /// `ScanCompleted` when findings or the policy verdict changed, so
+    /// a manual rescan refreshes the stored result, but skip the
     /// `ArtifactRejected` event and the score re-count. Propagating the
     /// invariant instead would fail the job and loop it forever (the
     /// original churn bug).
     ///
     /// A `Timer`- or `PolicyReEvaluation`-released artifact is NOT in
     /// that set: the verdict re-blocks it on the ordinary
-    /// fresh-transition path.
+    /// fresh-transition path. Neither is a `ScanIndeterminate` one —
+    /// an artifact held because no scanner reached a verdict is
+    /// condemned by one that blocks, exactly as a held artifact is (ADR
+    /// 0007, "A reached verdict supersedes an absent one").
     async fn handle_reject_verdict(
         &self,
         artifact: &mut Artifact,
@@ -959,13 +1005,16 @@ impl QuarantineUseCase {
 
         // Transition to `Rejected`. The domain refuses two different
         // things here, and both are recoverable: an artifact already
-        // terminal for the scan axis (`Rejected` / `ScanIndeterminate`),
+        // `Rejected` (a recorded verdict this one does not duplicate),
         // and an artifact an operator explicitly released, whose
         // decision outweighs this verdict
-        // (`ReleaseOrigin::permits_scan_reblock`). In both cases we still
-        // record the fresh `ScanCompleted` + findings below (so a manual
-        // rescan refreshes the stored result instead of silently doing
-        // nothing) and skip only the `ArtifactRejected` event and the
+        // (`ReleaseOrigin::permits_scan_reblock`). A
+        // `ScanIndeterminate` artifact is NOT in that set as of ADR
+        // 0007's "A reached verdict supersedes an absent one": it is
+        // held for want of a verdict, so a blocking one condemns it on
+        // the ordinary fresh-transition path. In both refusal cases we
+        // still refresh findings and record a changed `ScanCompleted`
+        // below, and skip only the `ArtifactRejected` event and the
         // score re-count. Propagating the invariant instead would fail
         // the job and loop it forever (the original churn bug).
         //
@@ -1014,39 +1063,25 @@ impl QuarantineUseCase {
             Err(e) => return Err(AppError::Domain(e)),
         };
 
-        let policy_event = PolicyEvaluated {
-            artifact_id: ctx.artifact_id,
-            // L3 — when the evaluator fell back to the default policy
-            // (no operator policy resolved for this repository), use
-            // the named `NO_POLICY` sentinel rather than a bare
-            // `Uuid::nil()`. The schema requires NOT NULL; the named
-            // constant is the documentation hook that lets downstream
-            // readers match on the "no policy" case explicitly.
-            policy_id: ctx
-                .policy
-                .as_ref()
-                .map(|p| p.policy_id)
-                .unwrap_or(NO_POLICY),
-            result: PolicyResult::Fail,
-            violations: violations.clone(),
-        };
-        policy_event.validate()?;
-
         let violations_count = violations.len();
 
         let mut events_vec = Vec::with_capacity(4);
-        events_vec.push(EventToAppend::new(DomainEvent::ScanCompleted(
-            ctx.scan_event.clone(),
-        )));
+        if ctx.verdict_changed {
+            events_vec.push(EventToAppend::new(DomainEvent::ScanCompleted(
+                ctx.scan_event.clone(),
+            )));
+        }
         let became_vulnerable_pushed = self.maybe_push_became_vulnerable(
             &mut events_vec,
             ctx.artifact_id,
             new_findings,
             ctx.prior.as_ref().map(|(_, ts)| *ts),
         )?;
-        events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
-            policy_event,
-        )));
+        if ctx.verdict_changed {
+            events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
+                ctx.policy_event.clone(),
+            )));
+        }
         if let Some(reject_event) = reject_event {
             events_vec.push(EventToAppend::new(DomainEvent::ArtifactRejected(
                 reject_event,
@@ -1060,12 +1095,7 @@ impl QuarantineUseCase {
         } else {
             Some((
                 ctx.repository_id,
-                RepoSecurityScoreProjector::compute_scan_completed_delta(
-                    ctx.prior_status,
-                    artifact.quarantine_status,
-                    &ctx.severity,
-                    ctx.now,
-                ),
+                Self::scan_score_delta(&ctx, artifact.quarantine_status),
             ))
         };
 
@@ -1083,6 +1113,7 @@ impl QuarantineUseCase {
             },
             &ctx.scan_findings_rows,
             ctx.now,
+            ctx.stream_len,
             score_update,
             sbom_components_owned.as_deref(),
             ctx.prior_status,
@@ -1106,7 +1137,9 @@ impl QuarantineUseCase {
                     error = %e,
                     stage = "content_references_delete_on_reject",
                     "content_references delete failed on reject; refcount row not deleted \
-                     on reject — refcount eventual, operator reconcile is future work"
+                     on reject — refcount eventual; \
+                     RefcountReconcileUseCase::sweep_drift removes it \
+                     (RefcountRepair::DeleteRejectedSourceRows)"
                 );
             }
 
@@ -1283,12 +1316,29 @@ impl QuarantineUseCase {
         // answered from this slice, and an over-cap stream is refused here
         // rather than at each use.
         let stream = paired.evidence()?;
+        let stream_len = stream.len() as u64;
+        let prior_standing = scan_history::latest_scan_standing(stream.iter().map(|e| &e.event));
 
         // Step 5 (hoisted) — the prior `ScanCompleted` baseline for delta
         // detection, and the ingest-source metric label, both read off
         // the paired stream.
         let prior = Self::prior_scan_completed(stream);
         let ingest_source = Self::ingest_source_from(stream);
+        // The prior verdict is the first PolicyEvaluated in the latest
+        // ScanCompleted's batch. ArtifactBecameVulnerable can sit between
+        // them; a later promotion evaluation cannot stand in for it.
+        let prior_policy = stream
+            .iter()
+            .rposition(|event| matches!(event.event, DomainEvent::ScanCompleted(_)))
+            .and_then(|index| {
+                stream[index + 1..]
+                    .iter()
+                    .take_while(|event| event.correlation_id == stream[index].correlation_id)
+                    .find_map(|event| match &event.event {
+                        DomainEvent::PolicyEvaluated(verdict) => Some(verdict.clone()),
+                        _ => None,
+                    })
+            });
 
         let policy = resolve_active_policy_for_repo(
             &*self.policy_projections,
@@ -1351,7 +1401,6 @@ impl QuarantineUseCase {
             assessment,
         };
         scan_event.validate()?;
-
         // Step 8 — drive the per-outcome path. (`expected_version` came
         // from the step-3 pairing; see its contract for why it may not be
         // re-read here.)
@@ -1376,6 +1425,30 @@ impl QuarantineUseCase {
             ScanOutcome::FindingsRecorded(violations) => (false, violations),
             ScanOutcome::Clean => (false, Vec::new()),
         };
+        let policy_event = PolicyEvaluated {
+            artifact_id,
+            // The default evaluator has no operator policy ID, but the
+            // audit event must still attribute the decision.
+            policy_id: policy.as_ref().map(|p| p.policy_id).unwrap_or(NO_POLICY),
+            result: if verdict_rejects || !violations.is_empty() {
+                PolicyResult::Fail
+            } else {
+                PolicyResult::Pass
+            },
+            violations: violations.clone(),
+        };
+        policy_event.validate()?;
+        // The blob hashes deterministically ordered findings, so equal
+        // severity counts alone do not prove equality.
+        let verdict_changed = prior.as_ref().is_none_or(|(previous, _)| {
+            previous.severity_summary != scan_event.severity_summary
+                || previous.findings_blob != scan_event.findings_blob
+                || prior_policy.as_ref().is_none_or(|previous| {
+                    previous.result != policy_event.result
+                        || previous.violations != policy_event.violations
+                        || previous.policy_id != policy_event.policy_id
+                })
+        });
         // The resolved enforcement mode, for the operator-facing log
         // field. Read from the same resolved policy the evaluator used
         // (absent policy ⇒ the enforcing default), so the line reports
@@ -1394,6 +1467,10 @@ impl QuarantineUseCase {
             actor,
             now,
             scan_event,
+            policy_event,
+            verdict_changed,
+            prior_standing,
+            stream_len,
             scan_findings_rows,
             prior_status,
             prior,
@@ -1512,8 +1589,24 @@ impl QuarantineUseCase {
         if findings.is_empty() {
             return Ok(None);
         }
-        let json = serde_json::to_vec(findings)
+        // Each finding's complete JSON value is its sort key. This keeps
+        // distinct findings distinct and makes the blob hash independent
+        // of the scanner's arrival order.
+        let mut serialized = findings
+            .iter()
+            .map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|e| AppError::Storage(format!("serialise findings_blob failed: {e}")))?;
+        serialized.sort_unstable();
+        let mut json = Vec::new();
+        json.push(b'[');
+        for (index, finding) in serialized.iter().enumerate() {
+            if index > 0 {
+                json.push(b',');
+            }
+            json.extend_from_slice(finding);
+        }
+        json.push(b']');
         if json.len() > FINDINGS_BLOB_MAX_BYTES {
             return Err(AppError::Domain(DomainError::Validation(format!(
                 "findings_blob {} bytes exceeds {} byte cap",
@@ -1584,6 +1677,36 @@ impl QuarantineUseCase {
         })
     }
 
+    /// The `repo_security_scores` delta this scan commits.
+    ///
+    /// A changed verdict contributes its severity counts; an unchanged
+    /// one contributes only the status move and the scan timestamp. The
+    /// split is not an optimisation — an unchanged verdict appends no
+    /// `ScanCompleted`, so a severity bump taken on that commit would
+    /// have no event behind it and the projection would stop being
+    /// derivable from the log it projects. See
+    /// [`RepoSecurityScoreProjector::compute_unchanged_scan_delta`].
+    ///
+    /// `new_status` is the artifact's status after the branch has
+    /// applied its transition **and** any in-batch fast-path release, so
+    /// the status half describes the move this one commit makes.
+    fn scan_score_delta(ctx: &ScanResultContext<'_>, new_status: QuarantineStatus) -> ScoreDelta {
+        if ctx.verdict_changed {
+            RepoSecurityScoreProjector::compute_scan_completed_delta(
+                ctx.prior_status,
+                new_status,
+                &ctx.severity,
+                ctx.now,
+            )
+        } else {
+            RepoSecurityScoreProjector::compute_unchanged_scan_delta(
+                ctx.prior_status,
+                new_status,
+                ctx.now,
+            )
+        }
+    }
+
     /// Drive the lifecycle port's `commit_scan_result_with_score`
     /// dual-write (events + per-finding rows + artifact state +
     /// `last_scan_at` + optional `repo_security_scores` projection
@@ -1615,10 +1738,12 @@ impl QuarantineUseCase {
         events: AppendEvents,
         scan_findings_rows: &[ScanFindingsRow],
         last_scan_at: DateTime<Utc>,
+        stream_len: u64,
         score_delta: Option<(Uuid, ScoreDelta)>,
         sbom_components: Option<&[hort_domain::types::sbom::SbomComponent]>,
         prior_status: QuarantineStatus,
     ) -> AppResult<()> {
+        refuse_append_past_cap(&events.stream_id, stream_len, events.events.len() as u64)?;
         self.lifecycle
             .commit_scan_result_with_score(
                 artifact,
@@ -1651,26 +1776,36 @@ impl QuarantineUseCase {
         })
     }
 
-    /// #65 — whether `artifact`'s quarantine window has genuinely
-    /// elapsed, using the SAME anchor + resolved-policy-duration
-    /// computation ([`resolve_active_policy_for_repo`] +
+    /// Whether `artifact`'s quarantine window has genuinely elapsed,
+    /// using the SAME anchor + resolved-policy-duration computation
+    /// ([`resolve_active_policy_for_repo`] +
     /// [`effective_quarantine_deadline`]) as the `record_scan_result`
     /// inline fast-path and the `release_expired` sweep's candidacy
     /// filter.
     ///
-    /// Deliberately NOT the same signal as
+    /// Deliberately a separate signal from
     /// `ArtifactUseCase::hydrate_quarantine_deadline`, which format
-    /// crates read for the `check_quarantine` `Retry-After` computation:
-    /// that hydration sets `quarantine_deadline = quarantine_window_start`
-    /// (the bare ingest-time anchor, with no duration added) because
-    /// `ArtifactUseCase` holds no policy-projection port — so it always
-    /// reads as "elapsed" the instant the anchor is in the past, which is
-    /// true for every `Quarantined` artifact almost immediately. Using
-    /// that signal here would make a bounded-await candidacy check that
-    /// never actually excludes a genuine, still-running, multi-minute (or
-    /// longer) hold. This method resolves the real matched-policy
-    /// duration instead, so a still-running hold correctly reads as NOT
-    /// elapsed.
+    /// crates read for the `check_quarantine` `Retry-After` computation
+    /// — but **not** because the two compute different arithmetic. That
+    /// hydration once set `quarantine_deadline = quarantine_window_start`
+    /// (the bare ingest-time anchor, no duration added) because
+    /// `ArtifactUseCase` held no policy-projection port; it now resolves
+    /// the real matched-policy duration through the same
+    /// `resolve_active_policy_for_repo` helper and the same
+    /// `DefaultPolicy::quarantine_duration_secs` fallback, so both
+    /// deadlines agree.
+    ///
+    /// What keeps them separate is **authority, not arithmetic**: the
+    /// hydration is read-path only — it appends no event and is never
+    /// consulted by the release predicate — and exists so an
+    /// adapter-free `hort-http-<format>` crate, which cannot resolve a
+    /// `ScanPolicy` itself, can still emit an honest `Retry-After`
+    /// (ADR 0008). This method is the candidacy filter the release
+    /// paths share, and resolving the window here is what lets a
+    /// bounded-await gate exclude a genuine, still-running,
+    /// multi-minute (or longer) hold instead of awaiting it on every
+    /// GET. Collapsing the two would put a read-path convenience value
+    /// on the release side of ADR 0007's fail-closed line.
     ///
     /// Read-only candidacy check — consults no release authority and
     /// mutates nothing; never itself an authorization to release (ADR
@@ -1946,6 +2081,9 @@ impl QuarantineUseCase {
                 }
             };
             let expected_version = paired.expected_version();
+            // Captured beside the version, from the same read, because
+            // the pairing is consumed before the commit below.
+            let stream_len = paired.stream_len();
             // Bound once, used by both gates below. An over-cap stream is
             // refused here — not at each use — because every gate in this
             // loop body is decided from these events, and the oldest
@@ -2113,6 +2251,25 @@ impl QuarantineUseCase {
             let mut artifact = paired.into_artifact();
             match artifact.release(ReleaseReason::Timer, authz, provenance) {
                 Ok(event_payload) => {
+                    // One `ArtifactReleased`, appended once per
+                    // quarantine cycle by a sweep that runs on every
+                    // tick — repeatable, so it carries the refusal. A
+                    // candidate with no room left is skipped and the
+                    // sweep continues, exactly as the pairing failure
+                    // above is handled: one frozen artifact must not
+                    // stop every other candidate from releasing, and
+                    // `error!` because nothing else in the system will
+                    // say the artifact is stuck.
+                    if let Err(e) = refuse_append_past_cap(&stream_id, stream_len, 1) {
+                        tracing::error!(
+                            artifact_id = %artifact_id,
+                            error = %e,
+                            "skipping: the candidate's stream has no room for the \
+                             ArtifactReleased this release would append — artifact stays \
+                             quarantined"
+                        );
+                        continue;
+                    }
                     let score_delta =
                         RepoSecurityScoreProjector::compute_released_delta(prior_status);
                     self.lifecycle
@@ -2211,12 +2368,17 @@ impl QuarantineUseCase {
         match self
             .jobs
             .enqueue_task(
-                "provenance-verify",
+                PROVENANCE_VERIFY_KIND,
                 &params,
-                None,                      // actor_id: system-driven expiry backstop
-                CLEARANCE_VERIFY_PRIORITY, // #44: clearance-gating verify preempts bulk ingest
-                "ingest", // reuse the ingest-time verify trigger source (CHECK-valid)
-                None,     // no idempotency key — the in-flight guard above is the dedup
+                None, // actor_id: system-driven expiry backstop
+                // Clearance-gating: this verify is the last thing between
+                // a held artifact and a release decision, so the row says
+                // so and the ordinal follows from it — preempting the
+                // bulk ingest-time verify backlog, which is one row per
+                // ingest.
+                queue_priority(PROVENANCE_VERIFY_KIND, CLEARANCE_TRIGGER_SOURCE),
+                CLEARANCE_TRIGGER_SOURCE,
+                None, // no idempotency key — the in-flight guard above is the dedup
             )
             .await
         {
@@ -2288,6 +2450,12 @@ impl QuarantineUseCase {
         )
         .await?;
         let expected_version = paired.expected_version();
+        // One `ScanIndeterminate`. Repeatable: the state is terminal for
+        // the scan axis but not for the stream — the curator's
+        // reevaluate and the provenance-misrejection repair both return
+        // the artifact to `Quarantined`, from where a later exhausted
+        // scan reaches here again.
+        refuse_append_past_cap(paired.stream_id(), paired.stream_len(), 1)?;
         let prior_status = paired.artifact().quarantine_status;
         let repository_id = paired.artifact().repository_id;
 
@@ -2420,6 +2588,8 @@ mod tests {
 
     use chrono::Utc;
 
+    use crate::use_cases::STREAM_EVENT_CAP;
+
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::scan_policy::{
         CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode,
@@ -2431,6 +2601,7 @@ mod tests {
     };
     use hort_domain::ports::content_reference_index::ContentReference;
     use hort_domain::ports::event_store::ExpectedVersion;
+    use hort_domain::ports::jobs_repository::TriggerSource;
     use hort_domain::types::ComponentRelation;
     use uuid::Uuid;
 
@@ -2528,8 +2699,8 @@ mod tests {
         let events = Arc::new(MockEventStore::new());
         let scan_findings = Arc::new(MockScanFindingsRepository::new());
         let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_scan_result_paired_mocks(events.clone(), scan_findings.clone()),
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+                .with_scan_findings_repo(scan_findings.clone()),
         );
         let repositories = Arc::new(MockRepositoryRepository::new());
         let projections = Arc::new(MockPolicyProjectionRepository::new());
@@ -2612,8 +2783,8 @@ mod tests {
         let events = Arc::new(MockEventStore::new());
         let scan_findings = Arc::new(MockScanFindingsRepository::new());
         let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_scan_result_paired_mocks(events.clone(), scan_findings.clone()),
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+                .with_scan_findings_repo(scan_findings.clone()),
         );
         let repositories = Arc::new(MockRepositoryRepository::new());
         let projections = Arc::new(MockPolicyProjectionRepository::new());
@@ -3197,7 +3368,16 @@ mod tests {
                 low: 0,
                 negligible: 0,
             },
-            findings_blob: None,
+            // A findings blob because the count is non-zero:
+            // `ScanCompleted::validate` requires the pair, so without it
+            // this is an event no scan path can produce and the commit
+            // would be refused before it ever reached the conditional
+            // status write this test is about.
+            findings_blob: Some(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .parse()
+                    .expect("static valid SHA-256 hex"),
+            ),
             assessment: ScanAssessment::Analysed,
         });
         let err = lifecycle
@@ -3279,8 +3459,8 @@ mod tests {
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
         let stream_id = StreamId::artifact(artifact_id);
 
-        // Populate stream with 201 events to exceed the 200 cap
-        let dummy_events: Vec<_> = (0..201)
+        // Populate stream with one event past the cap
+        let dummy_events: Vec<_> = (0..STREAM_EVENT_CAP + 1)
             .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
             .collect();
         events.set_stream(&stream_id, dummy_events);
@@ -3290,7 +3470,9 @@ mod tests {
             .quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("exceeds 200-event cap"));
+        assert!(err
+            .to_string()
+            .contains(&format!("exceeds {STREAM_EVENT_CAP}-event cap")));
     }
 
     #[tokio::test]
@@ -3896,7 +4078,10 @@ mod tests {
             SeverityThreshold::High,
         ));
         let stream_id = StreamId::artifact(artifact_id);
-        events.set_stream(&stream_id, filler_events(&stream_id, artifact_id, 0..201));
+        events.set_stream(
+            &stream_id,
+            filler_events(&stream_id, artifact_id, 0..STREAM_EVENT_CAP + 1),
+        );
 
         let err = uc
             .record_scan_result(
@@ -3911,13 +4096,657 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            err.to_string().contains("200-event cap"),
+            err.to_string()
+                .contains(&format!("{STREAM_EVENT_CAP}-event cap")),
             "the refusal must name the cap it is enforcing; got {err}"
         );
         assert!(
             lifecycle.committed_transitions().is_empty(),
             "no scan result is committed from evidence that cannot be read to its tail"
         );
+    }
+
+    #[tokio::test]
+    async fn unchanged_findings_do_not_spend_stream_events_but_refresh_scan_projections() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        let mut policy = projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        );
+        policy.quarantine_duration_secs = 24 * 3600;
+        projections.insert(policy);
+        let stream_id = StreamId::artifact(artifact_id);
+        let findings = findings_from_summary(&SeveritySummary {
+            critical: 0,
+            high: 2,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        });
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+        let first = lifecycle.committed_transitions()[0].1.clone();
+        assert_eq!(first.events.len(), 2);
+        let before = events.stream_snapshot(&stream_id).len();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.into_iter().rev().collect(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let commits = lifecycle.committed_transitions();
+        assert!(commits[1].1.events.is_empty());
+        assert_eq!(events.stream_snapshot(&stream_id).len(), before);
+        let scans = lifecycle.scan_result_commits();
+        assert_eq!(scans.len(), 2);
+        assert_eq!(scans[0].1.len(), 2);
+        assert_eq!(scans[1].1.len(), 2);
+        assert!(scans[1].0 > scans[0].0);
+        assert_eq!(lifecycle.last_scan_at_writes().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn policy_only_rejection_appends_scan_and_justifying_verdict() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        let mut policy = projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        );
+        policy.quarantine_duration_secs = 24 * 3600;
+        let policy_id = policy.policy_id;
+        projections.insert(policy.clone());
+        let stream_id = StreamId::artifact(artifact_id);
+        let findings = findings_from_summary(&SeveritySummary {
+            critical: 0,
+            high: 1,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        });
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+        let first = lifecycle.committed_transitions()[0].1.clone();
+        assert_eq!(events.stream_snapshot(&stream_id).len(), 2);
+        let DomainEvent::PolicyEvaluated(previous) = &first.events[1].event else {
+            panic!("first scan must carry its policy verdict");
+        };
+        assert_eq!(previous.result, PolicyResult::Pass);
+
+        policy.severity_threshold = SeverityThreshold::High;
+        projections.insert(policy);
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings,
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let second = lifecycle.committed_transitions()[1].1.clone();
+        assert_eq!(second.events.len(), 3);
+        assert!(matches!(
+            second.events[0].event,
+            DomainEvent::ScanCompleted(_)
+        ));
+        let DomainEvent::PolicyEvaluated(verdict) = &second.events[1].event else {
+            panic!("policy-only rejection must carry its structured verdict");
+        };
+        assert_eq!(verdict.policy_id, policy_id);
+        assert_eq!(verdict.result, PolicyResult::Fail);
+        assert!(!verdict.violations.is_empty());
+        assert!(matches!(
+            second.events[2].event,
+            DomainEvent::ArtifactRejected(_)
+        ));
+        assert_eq!(events.stream_snapshot(&stream_id).len(), 5);
+    }
+
+    #[tokio::test]
+    async fn changed_policy_id_alone_appends_a_new_scan_verdict_pair() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        let mut policy = projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        );
+        policy.quarantine_duration_secs = 24 * 3600;
+        projections.insert(policy.clone());
+        let stream_id = StreamId::artifact(artifact_id);
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        policy.archived = true;
+        projections.insert(policy.clone());
+        policy.policy_id = Uuid::new_v4();
+        policy.name = format!("replacement-{}", policy.policy_id);
+        policy.archived = false;
+        let replacement_id = policy.policy_id;
+        projections.insert(policy);
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let second = lifecycle.committed_transitions()[1].1.clone();
+        assert_eq!(second.events.len(), 2);
+        assert!(matches!(
+            second.events[0].event,
+            DomainEvent::ScanCompleted(_)
+        ));
+        let DomainEvent::PolicyEvaluated(verdict) = &second.events[1].event else {
+            panic!("replacement policy must be recorded beside the scan");
+        };
+        assert_eq!(verdict.policy_id, replacement_id);
+        assert_eq!(verdict.result, PolicyResult::Pass);
+        assert!(verdict.violations.is_empty());
+        assert_eq!(events.stream_snapshot(&stream_id).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn changed_policy_violations_alone_append_a_new_scan_verdict_pair() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        let mut policy = projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        );
+        projections.insert(policy.clone());
+        let stream_id = StreamId::artifact(artifact_id);
+        let findings = findings_from_summary(&SeveritySummary {
+            critical: 1,
+            high: 1,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        });
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+        let first = lifecycle.committed_transitions()[0].1.clone();
+        let DomainEvent::PolicyEvaluated(previous) = &first.events[1].event else {
+            panic!("first scan must carry its policy verdict");
+        };
+        assert_eq!(previous.result, PolicyResult::Fail);
+
+        policy.severity_threshold = SeverityThreshold::High;
+        projections.insert(policy);
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings,
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let second = lifecycle.committed_transitions()[1].1.clone();
+        assert_eq!(second.events.len(), 2);
+        assert!(matches!(
+            second.events[0].event,
+            DomainEvent::ScanCompleted(_)
+        ));
+        let DomainEvent::PolicyEvaluated(verdict) = &second.events[1].event else {
+            panic!("changed violations must be recorded beside the scan");
+        };
+        assert_eq!(verdict.result, PolicyResult::Fail);
+        assert_eq!(verdict.policy_id, previous.policy_id);
+        assert_ne!(verdict.violations, previous.violations);
+        assert_eq!(events.stream_snapshot(&stream_id).len(), 5);
+    }
+
+    #[tokio::test]
+    async fn changed_findings_with_the_same_summary_append_a_scan_verdict() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        let mut policy = projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        );
+        policy.quarantine_duration_secs = 24 * 3600;
+        projections.insert(policy);
+        let stream_id = StreamId::artifact(artifact_id);
+        let mut findings = findings_from_summary(&SeveritySummary {
+            critical: 0,
+            high: 1,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        });
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+        let first = lifecycle.committed_transitions()[0].1.clone();
+        let before = events.stream_snapshot(&stream_id).len();
+        findings[0].vulnerability_id = "CVE-DIFFERENT".into();
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings,
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+        let second = &lifecycle.committed_transitions()[1].1;
+        assert!(matches!(
+            second.events[0].event,
+            DomainEvent::ScanCompleted(_)
+        ));
+        assert_eq!(second.events.len(), 3);
+        assert_eq!(before + second.events.len(), 5);
+        let DomainEvent::ScanCompleted(previous) = &first.events[0].event else {
+            unreachable!()
+        };
+        let DomainEvent::ScanCompleted(current) = &second.events[0].event else {
+            unreachable!()
+        };
+        assert_eq!(previous.severity_summary, current.severity_summary);
+        assert_ne!(previous.findings_blob, current.findings_blob);
+    }
+
+    #[tokio::test]
+    async fn scan_refuses_before_its_batch_breaches_the_event_cap() {
+        for initial_len in [STREAM_EVENT_CAP - 1, STREAM_EVENT_CAP] {
+            let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+            let artifact_id =
+                seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+            let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+            let mut policy = projection(
+                PolicyScope::Repository(repo_id),
+                SeverityThreshold::Critical,
+            );
+            policy.quarantine_duration_secs = 24 * 3600;
+            projections.insert(policy);
+            let stream_id = StreamId::artifact(artifact_id);
+            events.set_stream(
+                &stream_id,
+                filler_events(&stream_id, artifact_id, 0..initial_len),
+            );
+
+            let err = uc
+                .record_scan_result(
+                    artifact_id,
+                    "trivy".into(),
+                    Vec::new(),
+                    ScanAssessment::Analysed,
+                    TEST_SCAN_KIND,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(&stream_id.to_string()));
+            assert!(err
+                .to_string()
+                .contains(&format!("{STREAM_EVENT_CAP}-event cap")));
+            assert!(lifecycle.committed_transitions().is_empty());
+            assert_eq!(events.stream_snapshot(&stream_id).len() as u64, initial_len);
+        }
+    }
+
+    /// The quarantine transition refuses before its own event crosses
+    /// the cap. `OverCapStream::Refuse` on the pairing covers a stream
+    /// already past; this is the boundary case it admits, where the
+    /// version check would have succeeded and left the stream frozen.
+    #[tokio::test]
+    async fn quarantine_artifact_refuses_before_its_event_crosses_the_cap() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            filler_events(&stream_id, artifact_id, 0..STREAM_EVENT_CAP),
+        );
+
+        let err = uc
+            .quarantine_artifact(artifact_id, Utc::now(), system_actor())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains(&stream_id.to_string()));
+        assert!(err
+            .to_string()
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")));
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "nothing is committed once the refusal fires"
+        );
+    }
+
+    /// One short of the cap there IS room, so the same fixture
+    /// quarantines normally — without this counter-factual the assertion
+    /// above would also hold for a fixture that simply never transitioned.
+    #[tokio::test]
+    async fn quarantine_artifact_still_lands_one_event_short_of_the_cap() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            filler_events(&stream_id, artifact_id, 0..STREAM_EVENT_CAP - 1),
+        );
+
+        uc.quarantine_artifact(artifact_id, Utc::now(), system_actor())
+            .await
+            .expect("one event still fits");
+
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+    }
+
+    /// The terminal scan-failure transition carries the same refusal. It
+    /// is terminal for the scan axis but not for the stream — the curator
+    /// reevaluate and the misrejection repair both return the artifact to
+    /// `Quarantined` — so the path is repeatable and pays for it.
+    #[tokio::test]
+    async fn record_scan_indeterminate_refuses_before_its_event_crosses_the_cap() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            filler_events(&stream_id, artifact_id, 0..STREAM_EVENT_CAP),
+        );
+
+        let err = uc
+            .record_scan_indeterminate(artifact_id, "trivy".into(), "exhausted".into(), 3)
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains(&format!("{STREAM_EVENT_CAP}-event cap")));
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// The release sweep skips a candidate whose stream has no room and
+    /// keeps going. One frozen artifact must not stop every other
+    /// candidate from releasing — the same posture the pairing failure
+    /// above it takes.
+    #[tokio::test]
+    async fn release_expired_skips_a_candidate_with_no_room_and_keeps_sweeping() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
+        let full =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let roomy =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        seed_stream_with_scan_completed(&events, roomy);
+
+        // The full candidate's stream sits exactly on the cap and still
+        // carries the successful scan the release authority needs, so the
+        // ONLY thing that can stop it is the append refusal.
+        let full_stream = StreamId::artifact(full);
+        seed_stream_with_scan_completed(&events, full);
+        let mut stream = events.stream_snapshot(&full_stream);
+        let seeded = stream.len() as u64;
+        stream.extend(filler_events(&full_stream, full, seeded..STREAM_EVENT_CAP));
+        assert_eq!(stream.len() as u64, STREAM_EVENT_CAP);
+        events.set_stream(&full_stream, stream);
+
+        let summary = uc
+            .release_expired(vec![full, roomy])
+            .await
+            .expect("the sweep completes");
+
+        assert_eq!(
+            summary.released,
+            vec![roomy],
+            "the candidate with room releases; the full one is skipped, not erroring the pass"
+        );
+        assert_eq!(
+            lifecycle.committed_transitions().len(),
+            1,
+            "exactly one release committed"
+        );
+        assert_eq!(
+            events.stream_snapshot(&full_stream).len() as u64,
+            STREAM_EVENT_CAP,
+            "the full candidate's stream is left exactly where it was"
+        );
+    }
+
+    /// Residue of the unchanged-verdict skip: an unchanged rescan appends
+    /// no `ScanCompleted`, so it must contribute no severity counts
+    /// either. Adding them again would count the same findings on every
+    /// rescan tick, and — since the commit carries no event — would leave
+    /// the `repo_security_scores` projection un-derivable from the log it
+    /// projects.
+    #[tokio::test]
+    async fn an_unchanged_rescan_contributes_no_severity_delta() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        let mut policy = projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        );
+        policy.quarantine_duration_secs = 24 * 3600;
+        projections.insert(policy);
+        let findings = findings_from_summary(&SeveritySummary {
+            critical: 0,
+            high: 2,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        });
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings,
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stream_id = StreamId::artifact(artifact_id);
+        assert!(
+            lifecycle.committed_transitions()[1].1.events.is_empty(),
+            "the premise: the second scan's verdict is unchanged, so it appends nothing"
+        );
+        let deltas = lifecycle.score_deltas();
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(
+            deltas[0].1.high_delta, 2,
+            "the first, changed verdict contributes its severity counts"
+        );
+        assert_eq!(
+            deltas[1].1.high_delta, 0,
+            "the unchanged rescan contributes none — every severity count in the \
+             projection has a ScanCompleted behind it"
+        );
+        assert!(
+            deltas[1].1.last_scan_at.is_some(),
+            "the scan timestamp still refreshes: a timestamp is not a count, and \
+             refreshing the scan projections is what an unchanged rescan is for"
+        );
+        assert_eq!(
+            events.stream_snapshot(&stream_id).len(),
+            2,
+            "and the stream still holds only the first verdict's pair"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_scan_at_the_cap_still_refreshes_the_projection() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        let mut policy = projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        );
+        policy.quarantine_duration_secs = 24 * 3600;
+        let policy_id = policy.policy_id;
+        projections.insert(policy);
+        let stream_id = StreamId::artifact(artifact_id);
+        let mut stream = filler_events(&stream_id, artifact_id, 0..STREAM_EVENT_CAP - 2);
+        stream.push(scan_completed_event(
+            artifact_id,
+            STREAM_EVENT_CAP - 2,
+            no_findings(),
+        ));
+        let mut verdict =
+            policy_evaluated_event(artifact_id, STREAM_EVENT_CAP - 1, PolicyResult::Pass);
+        verdict.correlation_id = stream.last().expect("scan event").correlation_id;
+        let DomainEvent::PolicyEvaluated(payload) = &mut verdict.event else {
+            unreachable!()
+        };
+        payload.policy_id = policy_id;
+        stream.push(verdict);
+        assert_eq!(stream.len() as u64, STREAM_EVENT_CAP);
+        events.set_stream(&stream_id, stream);
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(lifecycle.committed_transitions()[0].1.events.is_empty());
+        assert_eq!(
+            events.stream_snapshot(&stream_id).len() as u64,
+            STREAM_EVENT_CAP
+        );
+        assert_eq!(lifecycle.last_scan_at_writes().len(), 1);
+        assert_eq!(lifecycle.scan_result_commits().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_rejecting_rescan_refreshes_findings_without_an_event() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        let findings = one_critical_finding();
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+        let before = events.stream_snapshot(&stream_id).len();
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings,
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(lifecycle.committed_transitions()[1].1.events.is_empty());
+        assert_eq!(events.stream_snapshot(&stream_id).len(), before);
+        assert_eq!(lifecycle.scan_result_commits()[1].1.len(), 1);
+        assert_eq!(lifecycle.last_scan_at_writes().len(), 2);
     }
 
     /// The findings themselves are persisted exactly as on a reject —
@@ -4173,8 +5002,8 @@ mod tests {
         );
     }
 
-    /// The one-verdict-one-event invariant, asserted across the whole
-    /// verdict space in one place: every scan outcome —
+    /// The changed-verdict event pair, asserted across the whole
+    /// verdict space in one place: each first scan outcome —
     /// `Clean` / `FindingsRecorded` / `Reject` — commits EXACTLY one
     /// `PolicyEvaluated`, never zero and never two. Items downstream of
     /// this (the release-authority derivation) read that event as the
@@ -5409,18 +6238,31 @@ spec:
     /// Under `provenance_mode = Required` with a `ProvenanceVerified` event
     /// already on the stream, the clearance resolves to `Cleared`, which
     /// satisfies the timer-arm AND-precondition. A clean scan after the
-    /// deadline therefore DOES release inline — `ScanCompleted` +
-    /// `ArtifactReleased` commit in one batch, exactly as the default-mode
-    /// fast-path does.
+    /// deadline therefore DOES release inline. When the clean verdict is
+    /// unchanged, the batch contains only `ArtifactReleased`.
     #[tokio::test]
     async fn clean_scan_deadline_elapsed_required_with_provenance_releases_inline() {
         let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
         let artifact_id =
             seed_quarantined_with_anchor(&artifacts, &repositories, chrono::Duration::hours(25));
         let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
-        seed_required_provenance_policy(&projections, repo_id);
+        let policy = seed_required_provenance_policy(&projections, repo_id);
         // Stream carries a `ProvenanceVerified` ⇒ clearance `Cleared`.
         seed_stream_scanned_and_provenance_verified(&events, artifact_id);
+        let stream_id = StreamId::artifact(artifact_id);
+        let mut stream = events.stream_snapshot(&stream_id);
+        let mut verified = stream.pop().expect("provenance event");
+        verified.stream_position += 1;
+        verified.global_position += 1;
+        let mut verdict = policy_evaluated_event(artifact_id, 2, PolicyResult::Pass);
+        verdict.correlation_id = stream[1].correlation_id;
+        let DomainEvent::PolicyEvaluated(payload) = &mut verdict.event else {
+            unreachable!()
+        };
+        payload.policy_id = policy.policy_id;
+        stream.push(verdict);
+        stream.push(verified);
+        events.set_stream(&stream_id, stream);
 
         uc.record_scan_result(
             artifact_id,
@@ -5436,16 +6278,10 @@ spec:
         let transitions = lifecycle.committed_transitions();
         assert_eq!(transitions.len(), 1);
         let (saved_artifact, batch, _metadata) = &transitions[0];
-        assert_eq!(
-            batch.events.len(),
-            3,
-            "Required + provenance Cleared: ScanCompleted + PolicyEvaluated(Pass) + \
-             ArtifactReleased commit in one batch"
-        );
-        let tail = assert_passing_verdict_prefix(&batch.events);
-        let released = match &tail[0].event {
+        assert_eq!(batch.events.len(), 1);
+        let released = match &batch.events[0].event {
             DomainEvent::ArtifactReleased(r) => r,
-            other => panic!("expected ArtifactReleased after the verdict pair; got {other:?}"),
+            other => panic!("expected ArtifactReleased; got {other:?}"),
         };
         assert_eq!(released.released_by, ReleaseReason::Timer);
         assert_eq!(saved_artifact.quarantine_status, QuarantineStatus::Released);
@@ -5831,7 +6667,8 @@ spec:
         assert_eq!(
             content_refs.entry_count(),
             1,
-            "warn-on-fail must leave the seeded row in place; reconcile is future work"
+            "warn-on-fail must leave the seeded row in place; the row is repaired by \
+             RefcountRepair::DeleteRejectedSourceRows, not by a retry here"
         );
         let rows = content_refs
             .find_by_target(repo_id, &primary_hash, Some("primary_content"))
@@ -6138,7 +6975,7 @@ spec:
     // the suffix after it. Both halves are answers about the whole
     // stream, and a capped `ReadFrom::Start` read only supplies the whole
     // stream while the stream fits inside `STREAM_EVENT_CAP`. Past the
-    // cap the reverse scan finds the latest scan *among the oldest 200*
+    // cap the reverse scan finds the latest scan *among the oldest `STREAM_EVENT_CAP`*
     // and the suffix check runs over events that are not the suffix — so
     // a stale clean scan reads as current and the rejection that
     // superseded it is invisible. `read_artifact_stream` refuses such a
@@ -6160,7 +6997,7 @@ spec:
     }
 
     /// A clean scan early on the stream, a rejection PAST the cap, and
-    /// enough events between them that a 200-event read sees the first and
+    /// enough events between them that a capped read sees the first and
     /// not the second. The release authorization must not decide at all.
     ///
     /// This is the shape the retention-expiry bypass produced: nothing but
@@ -6179,10 +7016,14 @@ spec:
             // The stale clean verdict — inside any capped read.
             scan_completed_event(artifact_id, 1, no_findings()),
         ];
-        stream.extend(filler_events(&stream_id, artifact_id, 2..201));
-        // The rejection that supersedes it — outside a 200-event read.
-        stream.push(rejected_event(artifact_id, 201));
-        assert_eq!(stream.len(), 202);
+        stream.extend(filler_events(
+            &stream_id,
+            artifact_id,
+            2..STREAM_EVENT_CAP + 1,
+        ));
+        // The rejection that supersedes it — outside a capped read.
+        stream.push(rejected_event(artifact_id, STREAM_EVENT_CAP + 1));
+        assert_eq!(stream.len() as u64, STREAM_EVENT_CAP + 2);
         events.set_stream(&stream_id, stream);
 
         let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
@@ -6214,10 +7055,14 @@ spec:
             dummy_persisted_event(&stream_id, artifact_id, 0),
             scan_completed_event(artifact_id, 1, no_findings()),
         ];
-        stream.extend(filler_events(&stream_id, artifact_id, 2..199));
+        stream.extend(filler_events(
+            &stream_id,
+            artifact_id,
+            2..STREAM_EVENT_CAP - 1,
+        ));
         // Last event of a stream that sits exactly ON the cap: still read.
-        stream.push(rejected_event(artifact_id, 199));
-        assert_eq!(stream.len(), 200);
+        stream.push(rejected_event(artifact_id, STREAM_EVENT_CAP - 1));
+        assert_eq!(stream.len() as u64, STREAM_EVENT_CAP);
         events.set_stream(&stream_id, stream);
 
         let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
@@ -6244,8 +7089,12 @@ spec:
 
         let frozen_stream = StreamId::artifact(frozen);
         let mut stream = vec![dummy_persisted_event(&frozen_stream, frozen, 0)];
-        stream.extend(filler_events(&frozen_stream, frozen, 1..201));
-        assert_eq!(stream.len(), 201);
+        stream.extend(filler_events(
+            &frozen_stream,
+            frozen,
+            1..STREAM_EVENT_CAP + 1,
+        ));
+        assert_eq!(stream.len() as u64, STREAM_EVENT_CAP + 1);
         events.set_stream(&frozen_stream, stream);
 
         seed_stream_with_scan_completed(&events, healthy);
@@ -8462,11 +9311,32 @@ spec:
         );
         assert!(actor_id.is_none(), "expiry backstop is system-driven");
         assert_eq!(jobs.enqueue_idem_keys(), vec![None]);
-        // #44: the expiry-backstop verify is clearance-gating → elevated tier.
+        // What the backstop's row says about itself. It is one row per
+        // held artifact reaching its window, and it used to carry the
+        // literal of the one-per-ingest backlog, so an audit of the
+        // queue could not tell the two apart. The ordinal is the one the
+        // table decides for this pair, and the relation beneath it is
+        // the claim worth making: this row outranks that backlog.
+        assert_eq!(
+            jobs.enqueue_trigger_sources(),
+            vec![TriggerSource::Clearance.as_str().to_string()],
+            "the expiry backstop must stamp its own trigger source, not borrow the \
+             ingest-time verify's"
+        );
         assert_eq!(
             jobs.enqueue_priorities(),
-            vec![CLEARANCE_VERIFY_PRIORITY],
-            "expiry-backstop provenance-verify must enqueue at the elevated clearance tier (#44)"
+            vec![queue_priority(
+                PROVENANCE_VERIFY_KIND,
+                CLEARANCE_TRIGGER_SOURCE
+            )],
+            "expiry-backstop provenance-verify must enqueue at the ordinal the table \
+             decides for its own trigger source"
+        );
+        assert!(
+            jobs.enqueue_priorities()[0]
+                > queue_priority(PROVENANCE_VERIFY_KIND, TriggerSource::Ingest.as_str()),
+            "it must outrank the ingest-time verify backlog, or a held artifact waits for \
+             the backlog rather than for its own verify"
         );
     }
 
@@ -9432,6 +10302,419 @@ spec:
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("artifact"));
         assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    // -- A reached verdict supersedes an absent one (ADR 0007) ---------------
+    //
+    // `scan_indeterminate` is a hold: a later verdict that blocks
+    // condemns the artifact, one that does not returns it to
+    // `quarantined`, and the ordinary release gate decides from there.
+
+    /// Seed an artifact held `scan_indeterminate` together with the
+    /// stream that put it there — the `ArtifactQuarantined` its hold was
+    /// taken on, then the `ScanIndeterminate` that ended its scan
+    /// without a verdict. `anchor` is the observation-window anchor, so
+    /// a caller decides whether the window is open or elapsed.
+    ///
+    /// The stream matters as much as the row: the release gate derives
+    /// its authority from the stream, and a `ScanIndeterminate` is not a
+    /// `ScanCompleted`, so before the rescan lands there is no
+    /// scan-axis authority to be had.
+    fn seed_scan_indeterminate_artifact(
+        artifacts: &Arc<MockArtifactRepository>,
+        repositories: &Arc<MockRepositoryRepository>,
+        events: &Arc<MockEventStore>,
+        anchor: DateTime<Utc>,
+    ) -> Uuid {
+        let mut artifact = sample_artifact(QuarantineStatus::ScanIndeterminate);
+        artifact.quarantine_window_start = Some(anchor);
+        let mut repo = sample_repository();
+        repo.id = artifact.repository_id;
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+        repositories.insert(repo);
+
+        let stream_id = StreamId::artifact(artifact_id);
+        let mut quarantined = dummy_persisted_event(&stream_id, artifact_id, 0);
+        quarantined.event =
+            DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+                artifact_id,
+                quarantine_window_start: anchor,
+            });
+        let mut indeterminate = dummy_persisted_event(&stream_id, artifact_id, 1);
+        indeterminate.event =
+            DomainEvent::ScanIndeterminate(hort_domain::events::ScanIndeterminate {
+                artifact_id,
+                scanner: "trivy".into(),
+                reason: "trivy=no_analyzer_matched".into(),
+                attempts: 5,
+            });
+        events.set_stream(&stream_id, vec![quarantined, indeterminate]);
+        artifact_id
+    }
+
+    /// A repo-scoped policy with a real, non-zero observation window, so
+    /// a freshly-anchored artifact is genuinely mid-window and the
+    /// inline fast-path release cannot fire.
+    fn seed_windowed_policy(
+        projections: &Arc<MockPolicyProjectionRepository>,
+        repository_id: Uuid,
+    ) -> Uuid {
+        let mut policy = projection(
+            PolicyScope::Repository(repository_id),
+            SeverityThreshold::Critical,
+        );
+        policy.quarantine_duration_secs = 24 * 3600;
+        let policy_id = policy.policy_id;
+        projections.insert(policy);
+        policy_id
+    }
+
+    /// The non-blocking half: the artifact returns to the hold, and the
+    /// `ArtifactQuarantined` that records the move rides the same batch
+    /// as the verdict that justified it. The window is still open here,
+    /// so nothing is released — which is the point of targeting the
+    /// hold rather than `released`.
+    #[tokio::test]
+    async fn record_scan_result_non_blocking_verdict_returns_scan_indeterminate_to_the_hold() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let anchor = Utc::now();
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, anchor);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_windowed_policy(&projections, repo_id);
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::NotApplicable,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "a reached non-blocking verdict returns the artifact to the hold"
+        );
+        assert!(!saved.is_downloadable(), "a hold is not downloadable");
+        let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert_eq!(
+            kinds,
+            vec!["ScanCompleted", "PolicyEvaluated", "ArtifactQuarantined"],
+            "the status change gets its own event, after the verdict that justifies it"
+        );
+        let DomainEvent::ArtifactQuarantined(ev) = &batch.events[2].event else {
+            panic!("expected ArtifactQuarantined third");
+        };
+        assert_eq!(
+            ev.quarantine_window_start, anchor,
+            "the window is restored, not restarted"
+        );
+        // A fresh transition, not an already-terminal skip: the score
+        // projection is told the artifact became quarantined.
+        let deltas = lifecycle.score_deltas();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].1.quarantined_delta, 1);
+    }
+
+    /// The blocking half: a verdict that blocks condemns a
+    /// `scan_indeterminate` artifact exactly as it condemns a held one,
+    /// through the ordinary fresh-transition path.
+    #[tokio::test]
+    async fn record_scan_result_blocking_verdict_condemns_a_scan_indeterminate_artifact() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, Utc::now());
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_windowed_policy(&projections, repo_id);
+
+        let severity = SeveritySummary {
+            critical: 1,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        };
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings_from_summary(&severity),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Rejected);
+        assert_eq!(
+            saved.rejection_reason,
+            Some(hort_domain::events::RejectionReason::Scanner)
+        );
+        assert_eq!(
+            batch
+                .events
+                .iter()
+                .filter(|e| matches!(e.event, DomainEvent::ArtifactRejected(_)))
+                .count(),
+            1,
+            "the reject is a fresh transition, not an already-terminal skip"
+        );
+        assert!(
+            !batch
+                .events
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ArtifactQuarantined(_))),
+            "a blocking verdict never routes through the hold"
+        );
+    }
+
+    /// **Unattended healing, over the whole chain.** The exemplar: a
+    /// layer blob held `scan_indeterminate` because every backend
+    /// abstained about it, whose next sweep rescan returns
+    /// `Completed { assessment: NotApplicable }` once the cause of the
+    /// abstention goes away. The verdict lands, the artifact leaves the
+    /// state, and the release gate releases it — with no `waive` and no
+    /// operator step anywhere in the sequence.
+    ///
+    /// Three assertions, because the chain has three links and the
+    /// middle one is the only one this change adds:
+    ///
+    /// 1. **Before** the verdict the ordinary sweep releases nothing —
+    ///    the stream carries a `ScanIndeterminate` and no
+    ///    `ScanCompleted`, so no scan-axis authority is constructible.
+    ///    Without this the test would pass against an artifact that was
+    ///    releasable all along.
+    /// 2. The verdict moves the artifact out of the state and into the
+    ///    hold.
+    /// 3. The release follows from the gate, under
+    ///    `ReleaseReason::Timer` and an enumerated scan-axis authority —
+    ///    not `CuratorWaiver`, which is the exit this change exists to
+    ///    stop being the only one. The artifact's window elapsed long
+    ///    ago, so the gate is applied inline in the same batch; where it
+    ///    has not, the `release_expired` sweep applies the identical
+    ///    ladder on a later tick (the sibling test below).
+    #[tokio::test]
+    async fn scan_indeterminate_heals_unattended_over_the_whole_chain() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        // The hold was taken three days ago under a one-day window, so
+        // the observation window is long over — only the missing verdict
+        // was holding the artifact.
+        let anchor = Utc::now() - chrono::Duration::days(3);
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, anchor);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_windowed_policy(&projections, repo_id);
+
+        // (1) The sweep has nothing to do with it yet.
+        let before = uc.release_expired(vec![artifact_id]).await.unwrap();
+        assert!(
+            before.released.is_empty(),
+            "an artifact held for want of a verdict is not releasable before one arrives"
+        );
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::ScanIndeterminate
+        );
+
+        // The rescan the ordinary sweep enqueues, landing its verdict.
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::NotApplicable,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // (2) + (3) — one commit, the two transitions in order.
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "ScanCompleted",
+                "PolicyEvaluated",
+                "ArtifactQuarantined",
+                "ArtifactReleased"
+            ],
+            "the artifact passes through the hold and is then released by the gate"
+        );
+        let DomainEvent::ArtifactReleased(release) = &batch.events[3].event else {
+            panic!("expected ArtifactReleased last");
+        };
+        assert_eq!(
+            release.released_by,
+            ReleaseReason::Timer,
+            "the release is the ordinary unattended one, not a curator's waiver"
+        );
+        assert!(release.released_by_user_id.is_none(), "no operator decided");
+        assert_eq!(batch.actor, system_actor());
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+        assert!(saved.is_downloadable());
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Released,
+            "the row a reader sees afterwards"
+        );
+
+        // And the sweep is idempotent over the healed artifact — the
+        // chain completed, so a later tick finds nothing to release.
+        let after = uc.release_expired(vec![artifact_id]).await.unwrap();
+        assert!(after.released.is_empty());
+    }
+
+    /// The one population that has no observation-window anchor: it
+    /// reached `scan_indeterminate` from `None` under
+    /// `quarantineDuration: 0`, so it was never time-held. It heals in
+    /// the same commit, because the hold it returns to is a window of
+    /// zero length rather than an absent one — the same "a zero window
+    /// is a window of zero length" property the provenance-misrejection
+    /// repair's permissive-strand test pins.
+    ///
+    /// The anchor is `now` and not the artifact's ingest time, which is
+    /// the fail-closed direction: an earlier anchor would be a default
+    /// substituted for missing evidence on the permissive side of a
+    /// release gate (ADR 0065 D2). Under a zero window the two agree,
+    /// and under a non-zero one the artifact serves a window instead of
+    /// skipping it.
+    #[tokio::test]
+    async fn scan_indeterminate_with_no_window_anchor_heals_in_a_permissive_repository() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let started = Utc::now();
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, started);
+        // The permissive posture these artifacts come from: no window,
+        // and a policy whose window is zero seconds long.
+        artifacts.insert({
+            let mut a = artifacts.get(artifact_id).unwrap();
+            a.quarantine_window_start = None;
+            a
+        });
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // `projection()` carries `quarantine_duration_secs: 0`.
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::NotApplicable,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "ScanCompleted",
+                "PolicyEvaluated",
+                "ArtifactQuarantined",
+                "ArtifactReleased"
+            ]
+        );
+        let DomainEvent::ArtifactQuarantined(ev) = &batch.events[2].event else {
+            panic!("expected ArtifactQuarantined third");
+        };
+        assert!(
+            ev.quarantine_window_start >= started,
+            "an artifact that never had a window is anchored now, not earlier"
+        );
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+    }
+
+    /// The same chain where the window is still open: the verdict leaves
+    /// the artifact in the hold and the release decision with the
+    /// ordinary sweep's gate, which is what "returns the artifact to
+    /// `quarantined`, never directly to `released`" buys.
+    ///
+    /// What the verdict changed is asserted through the sweep's own
+    /// authority resolution: `None` before (a `ScanIndeterminate` is not
+    /// a `ScanCompleted`), `ScanSucceeded` after. The candidacy half is
+    /// asserted beside it through
+    /// [`QuarantineUseCase::is_window_elapsed`], the anchor +
+    /// resolved-duration computation the sweep's candidate query shares
+    /// — still `false` here, so the sweep correctly has not picked the
+    /// artifact up yet and will on the tick after its window ends.
+    #[tokio::test]
+    async fn scan_indeterminate_verdict_hands_the_release_decision_to_the_sweep() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, Utc::now());
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_windowed_policy(&projections, repo_id);
+        let stream_id = StreamId::artifact(artifact_id);
+        let policy = resolve_active_policy_for_repo(&*projections, repo_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            QuarantineUseCase::resolve_release_authority(
+                &events.stream_snapshot(&stream_id),
+                policy.as_ref()
+            ),
+            None,
+            "no scan-axis authority exists while the verdict is absent"
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::NotApplicable,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let healed = artifacts.get(artifact_id).unwrap();
+        assert_eq!(
+            healed.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "the window is still running, so the artifact stays held"
+        );
+        assert!(
+            !uc.is_window_elapsed(&healed).await.unwrap(),
+            "the sweep's candidacy filter has not reached this artifact yet"
+        );
+        assert!(!lifecycle.committed_transitions()[0]
+            .1
+            .events
+            .iter()
+            .any(|e| matches!(e.event, DomainEvent::ArtifactReleased(_))));
+
+        assert_eq!(
+            QuarantineUseCase::resolve_release_authority(
+                &events.stream_snapshot(&stream_id),
+                policy.as_ref()
+            ),
+            Some(ReleaseAuthorization::ScanSucceeded),
+            "what the verdict changed: the authority the sweep will release under"
+        );
     }
 
     /// Commit failure propagates (the atomic event+state append failed).

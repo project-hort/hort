@@ -36,6 +36,12 @@
       "enabled": false
     },
     {
+      "description": "Hold kube majors for the same reason the k8s-openapi rule above exists, from the other direction. That rule stops a solo k8s-openapi bump; it cannot stop a solo *kube* bump, because a kube major drags k8s-openapi to a new major transitively while our own declaration stays on the old one - and then two majors sit in the graph with the `features = [\"latest\"]` declaration on only one of them, which k8s-openapi's build script rejects outright. Measured, not assumed: !797 (kube 4.2 -> 5) failed test:lint with 'failed to run custom build command for k8s-openapi v0.29.0', the crate telling us to check Cargo.lock for a second copy - the same failure as !767, reached from the opposite side. So the pair moves as ONE change in both directions and a bot may propose neither half alone. Minor and patch updates inside kube 4.x keep flowing; only the major is held. Unpark together with the rule above, and when doing it verify what features = [\"latest\"] resolves to on the new k8s-openapi (v1_36 on 0.28, and release-specific) and whether the new kube moves the rustls crypto-provider default that Cargo.toml reasons about for kube 4 (ADR 0010).",
+      "matchPackageNames": ["kube", "kube-client", "kube-core"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
       "description": "Hold cvss below 3.0: 3.0 removes or renames cvss::v3::Base - measured, not assumed (test:lint fails with 'cannot find type Base in module cvss::v3') - and both call sites, crates/hort-adapters-scanner-osv/src/severity.rs and crates/hort-adapters-advisory-osv/src/severity.rs, parse a CVSS v3 vector into the base score that drives severity classification, which is what the scan-policy gates act on. 2.2.0 carries no advisory, so the bump buys nothing functional while costing a port on the path that decides what gets quarantined. Unlike the other holds here this one waits on no upstream: unpark when the port is deliberately scheduled, or when an advisory against 2.2.0 forces it.",
       "matchPackageNames": ["cvss"],
       "matchUpdateTypes": ["minor", "major"],

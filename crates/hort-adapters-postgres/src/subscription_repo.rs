@@ -223,6 +223,7 @@ pub(crate) fn event_type_kind_to_text(k: EventTypeKind) -> &'static str {
         EventTypeKind::ScanIndeterminate => "ScanIndeterminate",
         EventTypeKind::ProvenanceVerified => "ProvenanceVerified",
         EventTypeKind::ProvenanceRejected => "ProvenanceRejected",
+        EventTypeKind::ProvenanceHeld => "ProvenanceHeld",
         EventTypeKind::ArtifactReEvaluated => "ArtifactReEvaluated",
         EventTypeKind::PromotionRequested => "PromotionRequested",
         EventTypeKind::PolicyEvaluated => "PolicyEvaluated",
@@ -307,6 +308,7 @@ pub(crate) fn event_type_kind_from_text(s: &str) -> DomainResult<EventTypeKind> 
         "ScanIndeterminate" => Ok(EventTypeKind::ScanIndeterminate),
         "ProvenanceVerified" => Ok(EventTypeKind::ProvenanceVerified),
         "ProvenanceRejected" => Ok(EventTypeKind::ProvenanceRejected),
+        "ProvenanceHeld" => Ok(EventTypeKind::ProvenanceHeld),
         "ArtifactReEvaluated" => Ok(EventTypeKind::ArtifactReEvaluated),
         "PromotionRequested" => Ok(EventTypeKind::PromotionRequested),
         "PolicyEvaluated" => Ok(EventTypeKind::PolicyEvaluated),
@@ -1110,8 +1112,6 @@ impl SubscriptionRepository for PgSubscriptionRepository {
                 _ => (None, None),
             };
             let last_failure_json = sub.last_failure.as_ref().map(LastFailureDto::to_json);
-            let last_delivered_position_i64: Option<i64> =
-                sub.last_delivered_position.map(|p| p as i64);
 
             // UPDATE and NOTIFY in one transaction — see `create`.
             let mut tx = self
@@ -1123,6 +1123,19 @@ impl SubscriptionRepository for PgSubscriptionRepository {
             // Immutable post-create: id, owner_user_id, created_by_token_id,
             // created_at — these are NOT in the SET list (use-case enforces
             // the contract; the SQL surface mirrors it).
+            //
+            // `last_delivered_position` is absent for a different reason:
+            // it is not immutable, it has another owner. Every caller of
+            // this method read the row, edited unrelated fields and
+            // handed it back, while the dispatcher advances that column
+            // on its own debounced schedule from another task — and, at
+            // `replicaCount > 1`, another process. Assigning the value
+            // this caller happens to be carrying would therefore publish
+            // a read it has already outlived, rewinding a delivery
+            // cursor that a later read resumes strictly above. The
+            // callers lose nothing: a pause, a resume, a disable and a
+            // PATCH all mean "keep the progress", which is what leaving
+            // the column alone does.
             sqlx::query(
                 r#"
                 UPDATE subscriptions SET
@@ -1135,8 +1148,7 @@ impl SubscriptionRepository for PgSubscriptionRepository {
                     state = $8,
                     disable_reason = $9,
                     disabled_since = $10,
-                    last_delivered_position = $11,
-                    last_failure = $12
+                    last_failure = $11
                 WHERE id = $1
                 "#,
             )
@@ -1150,7 +1162,6 @@ impl SubscriptionRepository for PgSubscriptionRepository {
             .bind(state_str)
             .bind(disable_reason_str)
             .bind(disabled_since)
-            .bind(last_delivered_position_i64)
             .bind(&last_failure_json)
             .execute(&mut *tx)
             .await
@@ -1204,14 +1215,34 @@ impl SubscriptionRepository for PgSubscriptionRepository {
                 subscription_id = %id.0,
                 "update_last_delivered"
             );
-            // COALESCE, not a bare assignment: a `None` position means the
-            // caller has no advance to record (it is writing a failure for
-            // an event at or below the stored position), and overwriting
-            // the column with NULL would rewind the cursor to the start of
-            // the log and replay everything.
+            // GREATEST, not a bare assignment, and not COALESCE either.
+            //
+            // It covers both ways this caller can fail to be an advance,
+            // in one atomic statement with no read-modify-write window:
+            //
+            // - A `None` position is "no advance to record" — the caller
+            //   is writing a failure for an event at or below the stored
+            //   position. `GREATEST` ignores NULL arguments and yields
+            //   NULL only when every argument is NULL, so a `None` here
+            //   leaves the column exactly as COALESCE did, and a
+            //   never-delivered subscription stays unset.
+            // - A position *below* the stored one is equally not an
+            //   advance. The value is flushed from a cursor held in
+            //   memory per task, one task per replica with no leader
+            //   election, so a slower writer's flush routinely lands
+            //   after a faster writer's. Taking the greater is the
+            //   correct reduction and not just a tie-break: each writer's
+            //   value is a position it walked contiguously, so the
+            //   greatest of them is still a position everything below
+            //   which was delivered or filtered by somebody.
+            //
+            // The rule has one statement in
+            // `hort_domain::ports::subscription_repository::advance_delivered_position`,
+            // which the non-SQL implementations of this port call; this
+            // statement is the same rule where it has to be atomic.
             sqlx::query(
                 "UPDATE subscriptions SET \
-                 last_delivered_position = COALESCE($2, last_delivered_position), \
+                 last_delivered_position = GREATEST($2, last_delivered_position), \
                  last_failure = $3 \
                  WHERE id = $1",
             )
@@ -1498,6 +1529,7 @@ mod tests {
             EventTypeKind::ScanIndeterminate,
             EventTypeKind::ProvenanceVerified,
             EventTypeKind::ProvenanceRejected,
+            EventTypeKind::ProvenanceHeld,
             EventTypeKind::ArtifactReEvaluated,
             EventTypeKind::PromotionRequested,
             EventTypeKind::PolicyEvaluated,

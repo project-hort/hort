@@ -10,10 +10,10 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
 use hort_domain::entities::repository::Repository;
 use hort_domain::entities::scan_policy::{ProvenanceMode, ScanPolicyProjection};
-use hort_domain::error::DomainError;
+use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{
     Actor, ApiActor, ArtifactIngested, ChecksumMismatch, ChecksumVerified, DomainEvent,
-    IngestSource, ScanRequested, StreamId,
+    IngestSource, PersistedEvent, ScanRequested, StreamId,
 };
 use hort_domain::policy::curation::{evaluate_curation, CurationOutcome};
 use hort_domain::policy::effective_quarantine_deadline;
@@ -30,12 +30,13 @@ use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 
 use crate::event_store_publisher::EventStorePublisher;
-use hort_domain::ports::format_handler::{FormatHandler, MetadataStrategy};
-use hort_domain::ports::jobs_repository::JobsRepository;
+use hort_domain::ports::format_handler::FormatHandler;
+use hort_domain::ports::jobs_repository::{JobsRepository, TriggerSource};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
+use hort_domain::types::task_tier::{queue_priority, scan_queue_priority};
 use hort_domain::types::{ArtifactCoords, ContentHash, PayloadAccess};
 
 use crate::error::{AppError, AppResult};
@@ -53,18 +54,59 @@ use crate::use_cases::quarantine_hold::{resolve_transient_hold, TransientHold};
 use crate::use_cases::referenced_descendant::resolve_referenced_tree_descendant_fail_safe;
 use crate::use_cases::{
     append_any_with_conflict_retry, event_append_backoff, read_unpaired_append_version,
-    UnpairedAppend, EVENT_APPEND_RETRY_ATTEMPTS,
+    ArtifactAtVersion, OverCapStream, UnpairedAppend, EVENT_APPEND_RETRY_ATTEMPTS,
 };
 
-/// Enqueue priority for **clearance-gating** `provenance-verify` jobs — the
-/// signature-arrival hook and the expiry backstop. Set to the cron/sweep tier
-/// (10) so these latency-sensitive, post-hold jobs preempt the bulk priority-0
-/// ingest scan/verify backlog in the shared `ORDER BY priority DESC` claim.
-/// Under full-suite load a priority-0 signature-arrival verify was starved
-/// behind the backlog, so a signed image's release lagged past the E2E poll
-/// window (#44). Bulk ingest-time scan/verify stay at priority 0 — they ARE the
-/// backlog; only the sign-triggered clearance jobs (rare) jump the queue.
-pub(crate) const CLEARANCE_VERIFY_PRIORITY: i16 = 10;
+/// `jobs.kind` of the provenance gate (ADR 0027) — what
+/// `IngestEnqueue::ProvenanceVerify` lands, and what the
+/// signature-arrival hook and the expiry backstop enqueue directly.
+pub(crate) const PROVENANCE_VERIFY_KIND: &str = "provenance-verify";
+
+/// `jobs.kind` of the transitive prefetch cascade driver.
+const PREFETCH_DEPENDENCIES_KIND: &str = "prefetch-dependencies";
+
+/// `jobs.trigger_source` every enqueue this use case makes at ingest
+/// time carries, taken from the one definition of the set
+/// ([`hort_domain::ports::jobs_repository::TriggerSource`]). The
+/// `register_by_hash` path stamps one of the two below instead, because
+/// its caller class is what distinguishes it.
+pub(crate) const INGEST_TRIGGER_SOURCE: &str = TriggerSource::Ingest.as_str();
+
+/// `jobs.trigger_source` on the enqueues `register_by_hash` makes for a
+/// caller that supplies **no** quarantine-anchor override: the OCI
+/// cross-repository blob mount and the cross-repository pull-dedup
+/// followers.
+///
+/// Distinct from [`INGEST_TRIGGER_SOURCE`] because the caller class is
+/// what separates a mount or a coalesced follower from an ordinary
+/// ingest in the audit trail. The literal had no CHECK entry until
+/// migration 036, which is why the mount answered `500` whenever the
+/// target repository's gate requested a scan.
+pub(crate) const REGISTER_BY_HASH_TRIGGER_SOURCE: &str = TriggerSource::RegisterByHash.as_str();
+
+/// `jobs.trigger_source` on the enqueues `register_by_hash` makes for a
+/// caller that **does** supply a quarantine-anchor override — the
+/// `hort-server seed-import` cutover, whose own `jobs` row carries the
+/// same literal.
+pub(crate) const SEED_IMPORT_TRIGGER_SOURCE: &str = TriggerSource::SeedImport.as_str();
+
+/// `jobs.trigger_source` on a **clearance-gating** `provenance-verify`
+/// — the last thing between an artifact already held and a release
+/// decision. Two producers stamp it: the `ingest_signature_manifest`
+/// re-verify below (a subject-based signature referrer just landed, so
+/// the held subject can clear now rather than at its window edge) and
+/// `QuarantineUseCase::enqueue_final_provenance_verify` (the window
+/// elapsed with the candidate still `Pending`).
+///
+/// Distinct from [`INGEST_TRIGGER_SOURCE`], which both producers
+/// borrowed because it was the only CHECK-valid literal that came
+/// close. The ingest-time verify is one per ingest and so *is* the
+/// backlog; a clearance verify is one per held artifact reaching its
+/// window. The pair `('provenance-verify', 'ingest')` could say neither,
+/// which is why each producer used to name its own ordinal — the one
+/// violation of ADR 0066 D6 ("no producer names a number") that
+/// survived the vocabulary step.
+pub(crate) const CLEARANCE_TRIGGER_SOURCE: &str = TriggerSource::Clearance.as_str();
 
 /// Request payload for [`IngestUseCase::ingest`].
 ///
@@ -429,6 +471,11 @@ pub enum VerifiedIngestRequest {
 pub struct IngestOutcome {
     pub artifact: Artifact,
     pub ingested_event_id: Uuid,
+    /// Number of caller-supplied content claims written by this ingest.
+    /// A fresh transition commits the whole claim set atomically; a dedup
+    /// reports the insert-only port's affected-row count, which is zero
+    /// when all claims already exist.
+    pub claimed_edges_written: u64,
 }
 
 /// Map an error returned from the ingest pipeline to an `IngestResult`
@@ -509,13 +556,19 @@ fn classify_ingest_error(err: &AppError) -> IngestResult {
 /// `storage.put` until after dedup checks have cleared so a duplicate
 /// re-publish does not orphan a just-written blob in CAS.
 enum MetadataDecision {
-    /// Full payload stays inline. The `Value` goes into both
-    /// `ArtifactIngested.metadata` and `ArtifactMetadata.metadata`.
+    /// Full payload is within the strategy's inline budget. The `Value`
+    /// goes into both `ArtifactIngested.metadata` and
+    /// `ArtifactMetadata.metadata` — unless
+    /// [`IngestUseCase::resolve_metadata_decision`] finds the event
+    /// carrying it still over the cap once the event's own fields are
+    /// counted, in which case it spills after all. A budget bounds a
+    /// payload; only the event can answer for an envelope.
     Inline(serde_json::Value),
-    /// Blob write deferred until after dedup. `bytes` is the
-    /// serialised full payload; `summary` is the handler-extracted
-    /// subset that will ride inline alongside the `Some(hash)`
-    /// produced by the deferred `storage.put`.
+    /// Over the budget: blob write deferred until after dedup. `bytes`
+    /// is the serialised full payload; `summary` is the
+    /// handler-extracted subset that will ride inline alongside the
+    /// `Some(hash)` produced by the deferred `storage.put` — if it
+    /// fits, which is the same question asked of the same event.
     Pending {
         bytes: Vec<u8>,
         summary: serde_json::Value,
@@ -1122,20 +1175,24 @@ impl IngestUseCase {
         // Metadata strategy dispatch. The pre-dispatch metadata cap
         // check above has already rejected pathological payloads; the
         // decision here is purely about where the payload-bearing bytes
-        // live:
-        //   - Inline               → full payload in event + projection row.
-        //   - HashReference        → if serialised length ≤ threshold,
-        //                            behave like Inline (no CAS round-trip
-        //                            for small packuments). Otherwise
-        //                            defer the blob put until after the
-        //                            dedup checks in `ingest_inner` have
-        //                            cleared, so a duplicate re-publish
-        //                            does not orphan a just-written CAS
-        //                            object (post-review
-        //                            hardening — see `MetadataDecision`).
-        //                            On the split path, the event +
-        //                            projection row carry only the
-        //                            handler-extracted summary.
+        // live — full payload in the event + projection row, or full
+        // payload in CAS with the handler-extracted summary inline
+        // beside a `ContentHash` pointing at it.
+        //
+        // ONE decision, for every strategy: the strategy supplies the
+        // budget (`MetadataStrategy::inline_event_budget_bytes`, which
+        // is where a handler-declared threshold is related to the event
+        // cap) and nothing else. A branch per strategy is what let
+        // npm declare a 256 KB inline threshold against a 64 KB event
+        // cap and `MetadataStrategy::Inline` declare none at all: both
+        // produced `Inline` decisions for payloads no event could
+        // carry, and the publish failed at the append with the content
+        // already in CAS.
+        //
+        // Over the budget, the blob put is deferred until after the
+        // dedup checks in `ingest_inner` have cleared, so a duplicate
+        // re-publish does not orphan a just-written CAS object (see
+        // `MetadataDecision`).
         //
         // The blob-cap rejection reuses the `MetadataTooLarge` IngestResult
         // label — it is the same semantic failure at a different storage
@@ -1155,76 +1212,66 @@ impl IngestUseCase {
         // determines whether a split really happened is deferred.
         let had_payload_metadata = !payload_metadata.is_null();
         let strategy = handler.metadata_strategy();
-        let metadata_decision: MetadataDecision = match strategy {
-            MetadataStrategy::Inline => MetadataDecision::Inline(payload_metadata),
-            MetadataStrategy::HashReference {
-                inline_threshold_bytes,
-            } => {
-                // Reuse the already-serialised bytes from the cap check
-                // above. For `Value::Null` payloads the serialisation
-                // was skipped (0 bytes) — they always hit the inline
-                // fast path regardless of threshold.
-                match serialized_metadata {
-                    None => MetadataDecision::Inline(payload_metadata),
-                    Some(bytes) if bytes.len() <= inline_threshold_bytes => {
-                        // Small enough to inline — no CAS round-trip
-                        // needed. Labelled `inline` downstream because
-                        // no split happened — the counter answers "how
-                        // many ingests split" not "how many declared
-                        // HashReference".
-                        MetadataDecision::Inline(payload_metadata)
-                    }
-                    Some(bytes) => {
-                        // Blob safety cap. `0` is the documented "accept
-                        // anything" escape hatch used by tests; any
-                        // non-zero value rejects payloads exceeding it
-                        // with the same `metadata_too_large` counter
-                        // label as the pre-dispatch metadata cap.
-                        if self.metadata_blob_max_bytes > 0
-                            && bytes.len() > self.metadata_blob_max_bytes
-                        {
-                            let repo_key = self
-                                .repositories
-                                .find_by_id(repository_id)
-                                .await
-                                .ok()
-                                .map(|r| r.key);
-                            let elapsed = started.elapsed().as_secs_f64();
-                            metrics::counter!(
-                                "hort_ingest_total",
-                                labels::FORMAT => format.clone(),
-                                labels::REPOSITORY => self.repo_label(repo_key.as_deref()),
-                                labels::RESULT => IngestResult::MetadataTooLarge.as_str(),
-                            )
-                            .increment(1);
-                            metrics::histogram!(
-                                "hort_ingest_duration_seconds",
-                                labels::FORMAT => format,
-                            )
-                            .record(elapsed);
-                            // Public info: blob cap. Explicit `reason`
-                            // label distinguishes this from the
-                            // pre-dispatch `metadata-too-large` log
-                            // which shares the counter label but is a
-                            // different code path.
-                            tracing::info!(
-                                format = %handler.format_key(),
-                                blob_cap = self.metadata_blob_max_bytes,
-                                reason = "blob-too-large",
-                                "metadata-blob-too-large"
-                            );
-                            return Err(AppError::Domain(DomainError::Validation(
-                                "upload-payload metadata exceeds blob cap".into(),
-                            )));
-                        }
-                        // Defer the CAS write: compute the handler's
-                        // summary now (cheap, pure) and hand the
-                        // serialised bytes to `ingest_inner` alongside
-                        // it. The blob is only put AFTER dedup clears.
-                        let summary = handler.extract_metadata_summary(&payload_metadata);
-                        MetadataDecision::Pending { bytes, summary }
-                    }
+        let inline_budget = strategy.inline_event_budget_bytes();
+        // Reuse the already-serialised bytes from the cap check above.
+        // For `Value::Null` payloads the serialisation was skipped
+        // (0 bytes) — they always hit the inline fast path.
+        let metadata_decision: MetadataDecision = match serialized_metadata {
+            None => MetadataDecision::Inline(payload_metadata),
+            Some(bytes) if bytes.len() <= inline_budget => {
+                // Within the budget — no CAS round-trip needed.
+                // Labelled `inline` downstream because no split
+                // happened: the counter answers "how many ingests
+                // split" not "how many declared HashReference".
+                MetadataDecision::Inline(payload_metadata)
+            }
+            Some(bytes) => {
+                // Blob safety cap. `0` is the documented "accept
+                // anything" escape hatch used by tests; any
+                // non-zero value rejects payloads exceeding it
+                // with the same `metadata_too_large` counter
+                // label as the pre-dispatch metadata cap.
+                if self.metadata_blob_max_bytes > 0 && bytes.len() > self.metadata_blob_max_bytes {
+                    let repo_key = self
+                        .repositories
+                        .find_by_id(repository_id)
+                        .await
+                        .ok()
+                        .map(|r| r.key);
+                    let elapsed = started.elapsed().as_secs_f64();
+                    metrics::counter!(
+                        "hort_ingest_total",
+                        labels::FORMAT => format.clone(),
+                        labels::REPOSITORY => self.repo_label(repo_key.as_deref()),
+                        labels::RESULT => IngestResult::MetadataTooLarge.as_str(),
+                    )
+                    .increment(1);
+                    metrics::histogram!(
+                        "hort_ingest_duration_seconds",
+                        labels::FORMAT => format,
+                    )
+                    .record(elapsed);
+                    // Public info: blob cap. Explicit `reason`
+                    // label distinguishes this from the
+                    // pre-dispatch `metadata-too-large` log
+                    // which shares the counter label but is a
+                    // different code path.
+                    tracing::info!(
+                        format = %handler.format_key(),
+                        blob_cap = self.metadata_blob_max_bytes,
+                        reason = "blob-too-large",
+                        "metadata-blob-too-large"
+                    );
+                    return Err(AppError::Domain(DomainError::Validation(
+                        "upload-payload metadata exceeds blob cap".into(),
+                    )));
                 }
+                // Defer the CAS write: compute the handler's
+                // summary now (cheap, pure) and hand the
+                // serialised bytes to `ingest_inner` alongside
+                // it. The blob is only put AFTER dedup clears.
+                let summary = handler.extract_metadata_summary(&payload_metadata);
+                MetadataDecision::Pending { bytes, summary }
             }
         };
 
@@ -1295,7 +1342,7 @@ impl IngestUseCase {
         let elapsed = started.elapsed().as_secs_f64();
         let (result_label, repository_label, size_emitted): (&'static str, String, Option<u64>) =
             match &result {
-                Ok((artifact, was_duplicate, repo_key, _)) => {
+                Ok(((artifact, was_duplicate, repo_key, _), _)) => {
                     let label = if *was_duplicate {
                         IngestResult::Duplicate.as_str()
                     } else {
@@ -1349,10 +1396,13 @@ impl IngestUseCase {
         }
 
         match result {
-            Ok((artifact, _duplicate, _repo_key, ingested_event_id)) => Ok(IngestOutcome {
-                artifact,
-                ingested_event_id,
-            }),
+            Ok(((artifact, _duplicate, _repo_key, ingested_event_id), claimed_edges_written)) => {
+                Ok(IngestOutcome {
+                    artifact,
+                    ingested_event_id,
+                    claimed_edges_written,
+                })
+            }
             Err((err, _repo_key, _preclassified)) => Err(err),
         }
     }
@@ -1679,6 +1729,12 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
+        // ONCE-ONLY-APPEND: a genesis append. `artifact_id` was minted
+        // in this call, so the stream does not exist yet and the batch
+        // below is its first event — a stream of length zero cannot be
+        // taken past the cap. The `enforce_cap` argument above stays
+        // `true` as the net for a mint that somehow collided with an
+        // existing stream.
         let expected_version = read_unpaired_append_version(
             &*self.events,
             &stream_id,
@@ -1742,11 +1798,18 @@ impl IngestUseCase {
                     match self
                         .jobs
                         .enqueue_task(
-                            "provenance-verify",
+                            PROVENANCE_VERIFY_KIND,
                             &params,
                             None, // actor_id: system-driven signature-arrival hook
-                            CLEARANCE_VERIFY_PRIORITY, // #44: preempt bulk ingest so sign→release isn't queue-depth-dependent
-                            "ingest",
+                            // Clearance-gating, so the row says so and
+                            // the ordinal follows from it: this verify
+                            // preempts the bulk ingest backlog, because
+                            // a signature-arrival verify ranked with
+                            // every ingest-time scan makes a signed
+                            // image's release lag by the queue depth
+                            // rather than by the verify's own cost.
+                            queue_priority(PROVENANCE_VERIFY_KIND, CLEARANCE_TRIGGER_SOURCE),
+                            CLEARANCE_TRIGGER_SOURCE,
                             None, // no idempotency key — a re-verify is harmless (idempotent verdict)
                         )
                         .await
@@ -1788,6 +1851,7 @@ impl IngestUseCase {
         Ok(IngestOutcome {
             artifact,
             ingested_event_id,
+            claimed_edges_written: claimed_edges.len() as u64,
         })
     }
 
@@ -2229,7 +2293,7 @@ impl IngestUseCase {
         };
 
         match result {
-            Ok((artifact, was_duplicate, repo_key, ingested_event_id)) => {
+            Ok(((artifact, was_duplicate, repo_key, ingested_event_id), claimed_edges_written)) => {
                 let result_label = if was_duplicate {
                     IngestResult::Duplicate.as_str()
                 } else {
@@ -2242,6 +2306,7 @@ impl IngestUseCase {
                 Ok(IngestOutcome {
                     artifact,
                     ingested_event_id,
+                    claimed_edges_written,
                 })
             }
             Err((inner_err, repo_key, preclassified)) => {
@@ -2431,14 +2496,14 @@ impl IngestUseCase {
         // audit events forever. The workspace-wide `STREAM_EVENT_CAP`
         // is calibrated for *artifact* streams (finite lifecycle, ~5–10
         // events). Capping the audit stream silently drops
-        // `ChecksumMismatch` events past the 200th — exactly when an
+        // `ChecksumMismatch` events past that cap — exactly when an
         // audit trail matters most (sustained tampering = many events).
         // The "auditors run … get zero rows by design" invariant
         // requires uncapped emission on the repository aggregate.
         //
         // Issue #88: this unbounded stream must NOT derive its append
         // version from `read_unpaired_append_version`'s capped forward-scan —
-        // past 201 accumulated events (exactly the "sustained tampering"
+        // past the cap (exactly the "sustained tampering"
         // case above) that read returns a STALE position and every
         // subsequent append fails `Conflict` deterministically and
         // permanently (the #87-class bug, on this stream instead of the
@@ -2829,37 +2894,119 @@ impl IngestUseCase {
         ))
     }
 
-    /// Resolve the deferred metadata decision. The blob's `storage.put`
-    /// happens HERE — AFTER both dedup returns in
+    /// Resolve the deferred metadata decision into the `(inline
+    /// metadata, blob reference, strategy label)` triple the
+    /// `ArtifactIngested` event and its projection row carry. The
+    /// blob's `storage.put` happens HERE — AFTER both dedup returns in
     /// [`Self::find_existing_and_check_declared_dedup`] /
     /// [`Self::put_and_check_post_dedup`] — so a duplicate re-publish never
     /// orphans a fresh CAS object. See `MetadataDecision` docstring.
+    ///
+    /// `candidate` builds the event that *would* be appended for a
+    /// given `(metadata, metadata_blob)` pair, and the caller builds
+    /// the real one with the same closure — so the question asked here
+    /// ("does this fit in an event?") is asked of the event that is
+    /// actually committed, from one struct literal. That is what makes
+    /// an inline outcome *imply* "fits in an event": the budget the
+    /// outer dispatch applied bounds the payload, the cap bounds the
+    /// whole envelope, and the difference is the event's own fields —
+    /// which only the event knows.
+    ///
+    /// Whatever does not fit goes to CAS, and that is invisible to
+    /// every reader: `ArtifactUseCase::load_full_metadata` follows a
+    /// `metadata_blob` reference transparently, so this is a choice
+    /// about where bytes live and never about which fields a client
+    /// sees.
     async fn resolve_metadata_decision(
         &self,
         metadata_decision: MetadataDecision,
         repo_key: &str,
+        handler: &dyn FormatHandler,
+        candidate: &(dyn Fn(&serde_json::Value, Option<&ContentHash>) -> DomainEvent + Sync),
     ) -> Result<(serde_json::Value, Option<ContentHash>, &'static str), IngestInnerError> {
         match metadata_decision {
-            MetadataDecision::Inline(value) => Ok((value, None, values::STRATEGY_INLINE)),
-            MetadataDecision::Pending { bytes, summary } => {
-                let put_result = self
-                    .storage
-                    .put(Box::new(std::io::Cursor::new(bytes)))
+            // A `Value::Null` payload cannot be what pushes an envelope
+            // past the cap, and there would be nothing to spill if it
+            // were: the fit question only arises where there are
+            // payload bytes to answer it with.
+            MetadataDecision::Inline(value) if value.is_null() => {
+                Ok((value, None, values::STRATEGY_INLINE))
+            }
+            MetadataDecision::Inline(value) if candidate(&value, None).fits_storage_cap() => {
+                Ok((value, None, values::STRATEGY_INLINE))
+            }
+            MetadataDecision::Inline(value) => {
+                // Inside the handler's inline budget and still over the
+                // cap, so the event's own fields are what tip it. Spill
+                // rather than refuse — the alternative is a publish that
+                // fails after the content is already in CAS, which is
+                // what this path did for every payload in the band
+                // between the budget and the cap.
+                //
+                // Serialising here rather than carrying the bytes down
+                // from the outer dispatch keeps the cost on this arm
+                // alone: it is reached only when a payload lands within
+                // one event's worth of fields of the cap. `to_string`
+                // rather than `serde_json::to_vec` because a `Value`
+                // always renders — both emit the same compact JSON, and
+                // the infallible one leaves no error arm here that no
+                // input can reach.
+                let bytes = value.to_string().into_bytes();
+                let summary = handler.extract_metadata_summary(&value);
+                self.spill_metadata(bytes, summary, repo_key, candidate)
                     .await
-                    .map_err(|e| {
-                        (
-                            InnerIngestError::Other(AppError::Storage(e.to_string())),
-                            Some(repo_key.to_string()),
-                            None,
-                        )
-                    })?;
-                Ok((
-                    summary,
-                    Some(put_result.hash),
-                    values::STRATEGY_HASH_REFERENCE,
-                ))
+            }
+            MetadataDecision::Pending { bytes, summary } => {
+                self.spill_metadata(bytes, summary, repo_key, candidate)
+                    .await
             }
         }
+    }
+
+    /// Write the full payload to CAS and decide what rides the event
+    /// beside the reference.
+    ///
+    /// The summary is **not** a special case: it is another payload that
+    /// may not fit, decided by the same question against the same
+    /// candidate event. A summary over the cap used to make the whole
+    /// ingest fail — npm's summary is a per-version block's
+    /// `dependencies` / `devDependencies` / `peerDependencies` maps, and
+    /// a package with a few thousand entries exceeds 64 KB on its own —
+    /// and trimming it is not available: its key list is what an
+    /// installer needs to resolve a tree without the full packument, so
+    /// serving less makes every version look dependency-free to a
+    /// fresh, non-lockfile install.
+    ///
+    /// So when it does not fit, nothing but the reference rides the
+    /// event. That costs the read path one CAS round-trip and costs a
+    /// reader nothing at all: `load_full_metadata` returns the same
+    /// fields either way, and that is the only guarantee the summary
+    /// ever carried.
+    async fn spill_metadata(
+        &self,
+        bytes: Vec<u8>,
+        summary: serde_json::Value,
+        repo_key: &str,
+        candidate: &(dyn Fn(&serde_json::Value, Option<&ContentHash>) -> DomainEvent + Sync),
+    ) -> Result<(serde_json::Value, Option<ContentHash>, &'static str), IngestInnerError> {
+        let put_result = self
+            .storage
+            .put(Box::new(std::io::Cursor::new(bytes)))
+            .await
+            .map_err(|e| {
+                (
+                    InnerIngestError::Other(AppError::Storage(e.to_string())),
+                    Some(repo_key.to_string()),
+                    None,
+                )
+            })?;
+        let hash = put_result.hash;
+        let inline = if candidate(&summary, Some(&hash)).fits_storage_cap() {
+            summary
+        } else {
+            serde_json::Value::Null
+        };
+        Ok((inline, Some(hash), values::STRATEGY_HASH_REFERENCE))
     }
 
     /// Resolve the `ScanPolicy` governing this ingest and the decisions
@@ -3654,18 +3801,21 @@ impl IngestUseCase {
             "artifact_id": artifact_id,
             "current_depth": 0u32,
         });
-        // `priority = 0` — cascade rows drain after operator/cron work.
         // `trigger_source = "ingest"` — the cascade is event-driven by the
         // ingest; the CHECK in migration 009 lists `ingest` as a valid
-        // trigger source.
+        // trigger source. The ordinal the table answers for that pair is
+        // the bottom band all the same: the cascade is a warm-up walk and
+        // the push it rides on has already answered, so the root ranks
+        // with the children the walk enqueues rather than with the gates
+        // the push is actually waiting on.
         match self
             .jobs
             .enqueue_task(
-                "prefetch-dependencies",
+                PREFETCH_DEPENDENCIES_KIND,
                 &params,
                 None, // actor_id: system-driven post-ingest hook
-                0i16,
-                "ingest",
+                queue_priority(PREFETCH_DEPENDENCIES_KIND, INGEST_TRIGGER_SOURCE),
+                INGEST_TRIGGER_SOURCE,
                 None, // non-destructive task — no DB-side idempotency key (ADR 0028)
             )
             .await
@@ -3796,7 +3946,7 @@ impl IngestUseCase {
         // `false` (they ARE the seed). Derived from the verified request's
         // `payload_metadata.cascade_internal` in `ingest_with_verification`.
         suppress_cascade_seed: bool,
-    ) -> Result<IngestInnerOk, IngestInnerError> {
+    ) -> Result<(IngestInnerOk, u64), IngestInnerError> {
         let repo = self
             .verify_repository_and_format(repository_id, &coords)
             .await?;
@@ -3812,7 +3962,13 @@ impl IngestUseCase {
             )
             .await?
         {
-            ControlFlow::Break(early_ok) => return Ok(early_ok),
+            ControlFlow::Break(early_ok) => {
+                let written = self
+                    .reconcile_claimed_edges(&early_ok.0, claimed_edges)
+                    .await
+                    .map_err(|e| (InnerIngestError::Other(e), Some(repo_key.clone()), None))?;
+                return Ok((early_ok, written));
+            }
             ControlFlow::Continue(existing) => existing,
         };
 
@@ -3826,7 +3982,13 @@ impl IngestUseCase {
             )
             .await?
         {
-            ControlFlow::Break(early_ok) => return Ok(early_ok),
+            ControlFlow::Break(early_ok) => {
+                let written = self
+                    .reconcile_claimed_edges(&early_ok.0, claimed_edges)
+                    .await
+                    .map_err(|e| (InnerIngestError::Other(e), Some(repo_key.clone()), None))?;
+                return Ok((early_ok, written));
+            }
             ControlFlow::Continue(put_result) => put_result,
         };
 
@@ -3837,10 +3999,6 @@ impl IngestUseCase {
             .await?;
         let computed_sha1_hex = self
             .verify_sha1_upstream(verification.as_ref(), &put_result.hash, &repo_key)
-            .await?;
-
-        let (final_metadata, final_blob, strategy_label) = self
-            .resolve_metadata_decision(metadata_decision, &repo_key)
             .await?;
 
         // 4. Build Artifact entity.
@@ -3898,38 +4056,63 @@ impl IngestUseCase {
         // to thread the same caller identity into `ArtifactGroupMemberAdded`.
         let actor_for_group = actor.clone();
 
+        // THE construction of this ingest's `ArtifactIngested` — used
+        // twice, for the same reason it is a closure rather than a
+        // struct literal. `resolve_metadata_decision` below asks a
+        // candidate `(metadata, metadata_blob)` pair whether the event
+        // carrying it fits inside `MAX_EVENT_JSON_BYTES`, and the event
+        // that is actually appended is built from this same closure
+        // with the pair it chose. So the fit question is asked of the
+        // event that gets committed, not of a second description of
+        // one: a field added to `ArtifactIngested` enters the decision
+        // automatically, with no shape to keep in step.
+        let make_ingested_event =
+            |metadata: &serde_json::Value, metadata_blob: Option<&ContentHash>| ArtifactIngested {
+                artifact_id,
+                repository_id,
+                name: artifact.name.clone(),
+                version: artifact.version.clone(),
+                // The CAS hash the content was stored under —
+                // `artifact.sha256_checksum` is `put_result.hash`, written
+                // onto the row a few lines above.
+                sha256: artifact.sha256_checksum.clone(),
+                size_bytes: artifact.size_bytes,
+                source: IngestSource::Direct,
+                metadata: metadata.clone(),
+                metadata_blob: metadata_blob.cloned(),
+                // Record the upstream-asserted
+                // publish hint on the *event* alongside the projection
+                // (it is written onto `Artifact.upstream_published_at`
+                // too; the event is the rebuild source of truth, so
+                // both must carry the same value). The opt-in path makes
+                // this
+                // value load-bearing for `quarantine_window_start`; a
+                // projection rebuild that lost the hint would silently
+                // shift release authority on every replay.
+                upstream_published_at,
+            };
+
+        // Resolve where the payload metadata lives. The blob put (if
+        // any) happens here, AFTER both dedup returns above, so a
+        // duplicate re-publish never orphans a fresh CAS object.
+        let (final_metadata, final_blob, strategy_label) = self
+            .resolve_metadata_decision(metadata_decision, &repo_key, handler, &|metadata, blob| {
+                DomainEvent::ArtifactIngested(make_ingested_event(metadata, blob))
+            })
+            .await?;
+
         // Snapshot the metadata-blob hash before it's moved
         // into the projection row below. Used to build the
         // `kind = "metadata_blob"` refcount edge (Some) or omit it from the
         // transition's edge set (None).
         let metadata_blob_for_refcount = final_blob.clone();
 
-        let ingested_event = ArtifactIngested {
-            artifact_id,
-            repository_id,
-            name: artifact.name.clone(),
-            version: artifact.version.clone(),
-            sha256: put_result.hash,
-            size_bytes: artifact.size_bytes,
-            source: IngestSource::Direct,
-            // `final_metadata` is the outer strategy dispatch's output:
-            // full payload for Inline, summary for a split HashReference,
-            // full payload for HashReference under its inline threshold.
-            metadata: final_metadata.clone(),
-            // `final_blob` is `Some(hash)` iff the outer dispatch put
-            // the full payload to CAS.
-            metadata_blob: final_blob.clone(),
-            // Record the upstream-asserted
-            // publish hint on the *event* alongside the projection
-            // (it is written onto `Artifact.upstream_published_at`
-            // too; the event is the rebuild source of truth, so
-            // both must carry the same value). The opt-in path makes
-            // this
-            // value load-bearing for `quarantine_window_start`; a
-            // projection rebuild that lost the hint would silently
-            // shift release authority on every replay.
-            upstream_published_at,
-        };
+        // `final_metadata` is the resolver's output: the full payload
+        // when it fits in an event, the handler summary when the
+        // payload spilled and the summary fits, and `Null` when
+        // neither does — in which case `final_blob` is the only route
+        // to the metadata, which is what `load_full_metadata` is for.
+        let ingested_event = make_ingested_event(&final_metadata, final_blob.as_ref());
 
         // 1:1 projection row sharing the event's metadata verbatim. The
         // repository's `format` is the authority here — coords.format has
@@ -3965,6 +4148,13 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
+        // ONCE-ONLY-APPEND: a genesis append. `artifact_id` was minted
+        // in this call, so the stream does not exist yet and everything
+        // this ingest appends — `ArtifactIngested`, the optional
+        // `ChecksumVerified`, `ScanRequested`, the quarantine transition
+        // — is its first handful of events. The `enforce_cap` argument
+        // stays `true` as the net for a mint that somehow collided with
+        // an existing stream.
         let expected_version = read_unpaired_append_version(
             &*self.events,
             &stream_id,
@@ -4040,14 +4230,14 @@ impl IngestUseCase {
         if scan_decision.scan_will_run {
             enqueues.push(IngestEnqueue::Scan {
                 format: scan_enqueue_format.clone(),
-                priority: 0, // default tier for ingest-time enqueue
-                trigger_source: "ingest".to_string(),
+                priority: scan_queue_priority(INGEST_TRIGGER_SOURCE),
+                trigger_source: INGEST_TRIGGER_SOURCE.to_string(),
             });
         }
         if scan_decision.provenance_will_run {
             enqueues.push(IngestEnqueue::ProvenanceVerify {
-                priority: 0, // default tier for ingest-time enqueue
-                trigger_source: "ingest".to_string(),
+                priority: queue_priority(PROVENANCE_VERIFY_KIND, INGEST_TRIGGER_SOURCE),
+                trigger_source: INGEST_TRIGGER_SOURCE.to_string(),
             });
         }
 
@@ -4199,7 +4389,36 @@ impl IngestUseCase {
         )
         .await;
 
-        Ok((artifact, false, repo_key, artifact_ingested_event_id))
+        Ok((
+            (artifact, false, repo_key, artifact_ingested_event_id),
+            claimed_edges.len() as u64,
+        ))
+    }
+
+    /// Reassert foreign-byte claims on an existing artifact without a new
+    /// artifact transition. The storage GC lock and inserted-row count are
+    /// supplied by the index port; the row shape stays `ingest_edges`'s.
+    pub async fn reconcile_claimed_edges(
+        &self,
+        artifact: &Artifact,
+        claimed_edges: &[ContentReferenceClaim],
+    ) -> AppResult<u64> {
+        if claimed_edges.is_empty() {
+            return Ok(0);
+        }
+        let edges = Self::ingest_edges(
+            artifact,
+            artifact.repository_id,
+            None,
+            claimed_edges,
+            Utc::now(),
+        );
+        // `ingest_edges` emits `primary_content` first, and the existing row
+        // already owns that edge; only its foreign-byte claims can be missing.
+        self.content_references
+            .insert_missing(&edges[1..])
+            .await
+            .map_err(AppError::Domain)
     }
 
     /// Register a pre-existing CAS object into the target repository by
@@ -4236,7 +4455,9 @@ impl IngestUseCase {
     /// "duplicate"}`. Different hash at the same path returns
     /// `DomainError::Conflict`. Mirrors [`Self::ingest`]'s dedup
     /// semantics so retries on a lossy network do not corrupt the
-    /// aggregate.
+    /// aggregate. A duplicate also inserts any missing caller-supplied
+    /// foreign-byte claims without appending another artifact event; a
+    /// failed claim insert fails the call so another retry can repair it.
     ///
     /// **Dedup-path `ingested_event_id` caveat.** On the same-path-
     /// same-hash dedup return, the `ingested_event_id` is a freshly-
@@ -4285,6 +4506,7 @@ impl IngestUseCase {
         handler: &dyn FormatHandler,
     ) -> AppResult<IngestOutcome> {
         let format = req.coords.format.to_string();
+        let claimed_count = req.claimed_edges.len() as u64;
         let started = Instant::now();
 
         let result = self
@@ -4310,7 +4532,9 @@ impl IngestUseCase {
                     self.repo_label(Some(repo_key)),
                     Some(artifact.size_bytes),
                 ),
-                Ok(RegisterOutcome::Duplicate { artifact, repo_key }) => (
+                Ok(RegisterOutcome::Duplicate {
+                    artifact, repo_key, ..
+                }) => (
                     IngestResult::Duplicate.as_str(),
                     self.repo_label(Some(repo_key)),
                     Some(artifact.size_bytes),
@@ -4358,12 +4582,18 @@ impl IngestUseCase {
             }) => Ok(IngestOutcome {
                 artifact,
                 ingested_event_id,
+                claimed_edges_written: claimed_count,
             }),
-            Ok(RegisterOutcome::Duplicate { artifact, .. }) => Ok(IngestOutcome {
+            Ok(RegisterOutcome::Duplicate {
+                artifact,
+                claimed_edges_written,
+                ..
+            }) => Ok(IngestOutcome {
                 artifact,
                 // Dedup path: caller-visible id is a fresh uuid that
                 // points at no persisted event. See method docstring.
                 ingested_event_id: Uuid::new_v4(),
+                claimed_edges_written,
             }),
             Err(RegisterError::MetadataTooLarge { err, .. }) => Err(err),
             Err(RegisterError::Other { err, .. }) => Err(err),
@@ -4589,6 +4819,19 @@ impl IngestUseCase {
         // `scan_enqueue_format` capture (~line 2662) — same reason there.
         let scan_enqueue_format = repo.format.to_string();
 
+        // The `jobs.trigger_source` for whatever this call enqueues:
+        // `"seed-import"` when the caller supplied a backdated anchor,
+        // `"register-by-hash"` otherwise (the mount + follower callers,
+        // which always pass `None`). Resolved here rather than beside the
+        // mint's gate below because a repeat's catch-up enqueues under the
+        // same vocabulary: the value names the CALLER class, and a repeat
+        // is the same caller making the same request a second time.
+        let trigger_source = if quarantine_anchor_override.is_some() {
+            SEED_IMPORT_TRIGGER_SOURCE
+        } else {
+            REGISTER_BY_HASH_TRIGGER_SOURCE
+        };
+
         // Idempotence guard — same-path dedup. If an artifact already
         // sits at `(repository_id, coords.path)`, we must not emit a
         // second `ArtifactIngested` for the same logical location.
@@ -4607,9 +4850,40 @@ impl IngestUseCase {
                     artifact_id = %existing.id,
                     "register_by_hash deduplicated via same-path-same-hash"
                 );
+                // ...and the dedup is GATE-AWARE: a row whose gate never
+                // landed gets it now instead of a repeat that reports
+                // success and changes nothing. The criterion for "no gate
+                // result" and why each of its three parts is load-bearing
+                // live on the method.
+                // Unlike the gate catch-up below, a failed claim repair
+                // fails the call. The two heals sit one line apart and have
+                // opposite failure policies on purpose: a missing gate
+                // result leaves a servable row whose verdict the next
+                // repeat can still land, while a missing claim lets the
+                // storage GC collect the bytes this row serves. So the
+                // gate's "never turn a 201 into a 500" does not carry
+                // here — reporting success over an unclaimed blob is how
+                // the content goes away, not just the evidence.
+                let claimed_edges_written = self
+                    .reconcile_claimed_edges(&existing, &claimed_edges)
+                    .await
+                    .map_err(|err| RegisterError::Other {
+                        err,
+                        repo_key: Some(repo_key.clone()),
+                    })?;
+                let artifact = self
+                    .dedup_or_catch_up_gate(
+                        existing,
+                        quarantine_anchor_override,
+                        trigger_source,
+                        &scan_enqueue_format,
+                        &actor,
+                    )
+                    .await;
                 return Ok(RegisterOutcome::Duplicate {
-                    artifact: existing,
+                    artifact,
                     repo_key,
+                    claimed_edges_written,
                 });
             }
             return Err(RegisterError::Other {
@@ -4743,9 +5017,10 @@ impl IngestUseCase {
         let now = Utc::now();
         // Bound `mut`: every caller (seed-import, OCI cross-repo blob
         // mount, and the cross-repo pull-dedup followers) may transition
-        // the artifact to `Quarantined` after the `ArtifactIngested`
-        // commit lands, per the generalized gate below (issue #107 Item
-        // 1). Only a `quarantineDuration: 0` policy leaves it `None`.
+        // the artifact to `Quarantined` before it is committed, per the
+        // generalized gate below, so the single commit persists the gated
+        // state rather than this permissive initial one. Only a
+        // `quarantineDuration: 0` policy leaves it `None`.
         let mut artifact = Artifact {
             id: artifact_id,
             repository_id,
@@ -4802,6 +5077,10 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
+        // ONCE-ONLY-APPEND: a genesis append. The register path reaches
+        // here only for a freshly minted `artifact_id` — a repeat
+        // registration of an existing row takes the dedup / catch-up-gate
+        // branch instead — so the stream does not exist yet.
         let expected_version = read_unpaired_append_version(
             &*self.events,
             &stream_id,
@@ -4814,55 +5093,10 @@ impl IngestUseCase {
             repo_key: Some(repo_key.clone()),
         })?;
 
-        // The registration's refcount edges, committed WITH the row that
-        // claims them. This path mints a per-repo artifact over a CAS blob
-        // the source repository's artifact already holds, so the new row
-        // needs its own `primary_content` claim: CAS deduplicates, and
-        // without this edge the new artifact counts zero against bytes it
-        // shares with the source. Release and purge that sibling and the
-        // storage GC's count reaches zero with this artifact still live and
-        // servable — a missing edge does not delay collection, it brings it
-        // forward. No `metadata_blob` edge: `register_by_hash` never splits
-        // (the bytes are already in CAS, owned by the source).
-        //
-        // A failed edge now fails the registration, which is the recoverable
-        // direction: the mount/follower/seed caller retries, where an
-        // edgeless committed artifact cannot be repaired from the artifact
-        // row alone by anything in the request path.
-        let edges = Self::ingest_edges(
-            &artifact,
-            repository_id,
-            // `register_by_hash` never splits the payload metadata into CAS.
-            None,
-            &claimed_edges,
-            now,
-        );
-
-        self.lifecycle
-            .commit_transition_with_enqueues(
-                &artifact,
-                AppendEvents {
-                    stream_id: stream_id.clone(),
-                    expected_version,
-                    events: vec![EventToAppend {
-                        event_id: ingested_event_id,
-                        event: DomainEvent::ArtifactIngested(ingested_event),
-                    }],
-                    correlation_id,
-                    causation_id: None,
-                    actor: Actor::Api(actor.clone()),
-                },
-                Some(artifact_metadata),
-                // The gate's scan / provenance enqueues ride the follow-on
-                // commit below, which is where that decision is resolved.
-                &[],
-                &edges,
-            )
-            .await
-            .map_err(|e| RegisterError::Other {
-                err: AppError::Domain(e),
-                repo_key: Some(repo_key.clone()),
-            })?;
+        // Everything from here to the single commit below resolves the
+        // gate; the mint's own event is pushed onto `events` inside it, and
+        // the commit carries both. The edges are built down there too, so
+        // they ride the same call.
 
         // Quarantine-by-default, generalized to EVERY
         // `register_by_hash_inner` caller (issue #107 Item 1).
@@ -4935,20 +5169,25 @@ impl IngestUseCase {
         //    `Artifact::reject_from_scan`).
         // 4. Land whatever combination of `ArtifactQuarantined` +
         //    `ScanRequested` + the `Scan`/`ProvenanceVerify` job-row
-        //    enqueues applies, ATOMICALLY, in ONE follow-on commit
-        //    (`commit_transition_with_enqueues`, ADR 0002/0004 no-strand
-        //    — mirrors `ingest_inner`'s own guarantee that a quarantine
-        //    transition and its scan/provenance enqueue can never land
-        //    separately). `trigger_source` on the enqueued jobs
-        //    distinguishes the caller class: `"seed-import"` when the
-        //    caller supplied a backdated anchor, `"register-by-hash"`
-        //    otherwise (mount + follower callers, which always pass
-        //    `None`). The commit is skipped entirely when there is
-        //    nothing to append or enqueue (a fully waived policy —
+        //    enqueues applies on the SAME commit as the mint — one
+        //    `commit_transition_with_enqueues` for `ArtifactIngested`, the
+        //    gate's events, the artifact row in its final gated state, its
+        //    metadata, the job rows and the `primary_content` edge (ADR
+        //    0002/0004 no-strand), which is `ingest_inner`'s own shape. The
+        //    atomicity has to span the mint, not just the gate: a gate in
+        //    its own commit is atomic with itself while the mint it follows
+        //    has already published a servable artifact, so its failure
+        //    leaves one behind that is never scanned and owes a verdict
+        //    nothing records. See the commit site for that remainder in
+        //    full.
+        //    `trigger_source` on the enqueued jobs distinguishes the caller
+        //    class: `"seed-import"` when the caller supplied a backdated
+        //    anchor, `"register-by-hash"` otherwise (mount + follower
+        //    callers, which always pass `None`). A fully waived policy —
         //    `quarantineDuration: 0` AND `scanBackends: []` AND
-        //    `provenanceMode: off` — under which the artifact stays
-        //    `None` with no gate at all, matching `ingest_inner`'s
-        //    identical case).
+        //    `provenanceMode: off` — appends and enqueues nothing, so the
+        //    commit carries the bare mint and the artifact stays `None`,
+        //    matching `ingest_inner`'s identical case.
         //
         // **Not** `ScanWaived`, **not** permissive (when duration > 0). A
         // dirty scan still transitions the artifact to `Rejected` via
@@ -4964,213 +5203,127 @@ impl IngestUseCase {
         // ever does. The observation window is not a signing deadline
         // (ADR 0039's 2026-09-12 amendment, D1/D4), so the anchor this fn
         // stamps does not bound the provenance axis.
-        let trigger_source = if quarantine_anchor_override.is_some() {
-            "seed-import"
-        } else {
-            "register-by-hash"
-        };
-
-        let matched_policy: Option<ScanPolicyProjection> =
-            resolve_active_policy_for_repo(&*self.policy_projections, repository_id)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        artifact_id = %artifact_id,
-                        repository_id = %repository_id,
-                        error = %e,
-                        "register_by_hash: policy_projections.list_active failed; \
-                         skipping scan auto-enqueue (artifact still registers)",
-                    );
-                    None
-                });
-
-        let scan_will_run = match matched_policy.as_ref() {
-            Some(p) => !p.scan_backends.is_empty(),
-            None => !DefaultPolicy::block_on_critical_default_backends().is_empty(),
-        };
-        let provenance_mode = matched_policy
-            .as_ref()
-            .map(|p| p.provenance_mode)
-            .unwrap_or_default();
-        let provenance_will_run = provenance_mode != ProvenanceMode::Off
-            && self
-                .provenance_capable_formats
-                .contains(&scan_enqueue_format);
-        let effective_duration_secs: i64 = matched_policy
-            .as_ref()
-            .map(|p| p.quarantine_duration_secs)
-            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
-
-        let quarantined = effective_duration_secs > 0;
-        // Threaded to the gate log below so an operator can tell WHICH
-        // source anchored the window without reconstructing the evidence.
-        let mut anchor_source = AnchorSource::Mint;
-        let mut events: Vec<EventToAppend> = Vec::new();
-        if quarantined {
-            // The descendant carve-out, evaluated exactly as
-            // `ingest_inner` evaluates it. Like there, the lookup cannot
-            // match this registration's OWN `primary_content` row — that
-            // is written below, after the mint — so it only ever sees edges
-            // written by OTHER, already-ingested artifacts.
-            //
-            // Both probes are skipped entirely when an explicit anchor is
-            // supplied: the override wins absolutely, so they could only
-            // spend two round-trips on values nothing reads.
-            let (is_referenced_descendant, first_seen_at) = match quarantine_anchor_override {
-                Some(_) => (false, None),
-                None => (
-                    resolve_referenced_tree_descendant_fail_safe(
-                        &*self.content_references,
-                        repository_id,
-                        artifact_id,
-                        &artifact.sha256_checksum,
-                    )
-                    .await,
-                    read_content_age_evidence(&*self.artifacts, &artifact.sha256_checksum).await,
-                ),
-            };
-
-            // The SAME derivation `ingest_inner` runs, over the same
-            // sources — which is what makes the leader/follower asymmetry
-            // disappear as a property of the model rather than as a patch
-            // at each call site. A follower minting its row over
-            // already-resident CAS content reads the same content-level
-            // age evidence the leader read, so the two agree on the
-            // anchor whichever of them won the dedup race.
-            //
-            // `trusted_upstream_published_at` is unconditionally `None`
-            // here: this path mints a per-repo row over content already
-            // in CAS with no upstream fetch, so there is no publish-time
-            // hint in scope (`upstream_published_at` is `None` on both
-            // the row and the event, above). Reaching for the value the
-            // LEADER observed through ITS repository's mapping is exactly
-            // the transit this model forbids — the opt-in is a per-mapping
-            // trust statement, and an untrusted mirror's claim must not
-            // shorten a repository proxying the genuine upstream.
-            let derived = derive_quarantine_anchor(&AnchorEvidence {
-                minted_at: now,
-                window: chrono::Duration::seconds(effective_duration_secs),
-                // The seed-import cutover's backdated anchor. Absolute
-                // precedence: an explicit anchor is never overridden by a
-                // derived one, in either direction.
-                explicit_override: quarantine_anchor_override,
-                first_seen_at,
-                trusted_upstream_published_at: None,
-                is_referenced_descendant,
-            });
-            let anchor = derived.anchor;
-            anchor_source = derived.source;
-            let quarantine_event =
-                artifact
-                    .quarantine(anchor)
-                    .map_err(|e| RegisterError::Other {
-                        err: AppError::Domain(e),
-                        repo_key: Some(repo_key.clone()),
-                    })?;
-            events.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(
-                quarantine_event,
-            )));
-            // Same stamp `ingest_inner`'s mint applies: the follower row
-            // this method returns is rendered straight into a `503` by the
-            // post-coalesce cross-repo branch of every format's
-            // pull-through, so it has to carry the window it just derived.
-            self.stamp_transient_hold(
-                &mut artifact,
-                anchor,
-                effective_duration_secs,
-                provenance_mode,
-            )
+        //
+        // Both halves are shared with the catch-up a repeat runs
+        // ([`Self::dedup_or_catch_up_gate`]) rather than re-derived there:
+        // the gate a repeat lands has to be the gate the mint would have
+        // landed, and two copies of this derivation could disagree about
+        // the same policy.
+        let gate = self
+            .resolve_register_gate(repository_id, artifact_id, &scan_enqueue_format)
             .await;
-        }
-        if scan_will_run {
-            events.push(EventToAppend {
-                event_id: Uuid::new_v4(),
-                event: DomainEvent::ScanRequested(ScanRequested {
-                    artifact_id,
-                    scanner: matched_policy
-                        .as_ref()
-                        .map(|p| p.name.clone())
-                        .unwrap_or_else(|| "default".to_string()),
-                }),
-            });
-        }
 
-        let mut enqueues: Vec<IngestEnqueue> = Vec::new();
-        if scan_will_run {
-            enqueues.push(IngestEnqueue::Scan {
-                format: scan_enqueue_format.clone(),
-                priority: 0, // default tier, mirrors ingest_inner's ingest-time enqueue
-                trigger_source: trigger_source.to_string(),
-            });
-        }
-        if provenance_will_run {
-            enqueues.push(IngestEnqueue::ProvenanceVerify {
-                priority: 0,
-                trigger_source: trigger_source.to_string(),
-            });
-        }
-
-        if !events.is_empty() || !enqueues.is_empty() {
-            let expected_version = read_unpaired_append_version(
-                &*self.events,
-                &stream_id,
-                true,
-                UnpairedAppend::SameCallFollowUp,
+        // The batch opens with the mint's own genesis event and the gate
+        // appends to it, so the artifact's first and only commit carries
+        // its final gated state.
+        let mut events: Vec<EventToAppend> = vec![EventToAppend {
+            event_id: ingested_event_id,
+            event: DomainEvent::ArtifactIngested(ingested_event),
+        }];
+        let applied = self
+            .apply_register_gate(
+                &mut artifact,
+                &gate,
+                quarantine_anchor_override,
+                trigger_source,
+                &scan_enqueue_format,
+                now,
             )
             .await
             .map_err(|e| RegisterError::Other {
-                err: e,
+                err: AppError::Domain(e),
+                repo_key: Some(repo_key.clone()),
+            })?;
+        events.extend(applied.events);
+        let enqueues = applied.enqueues;
+
+        // The registration's refcount edges, committed WITH the row that
+        // claims them. This path mints a per-repo artifact over a CAS blob
+        // the source repository's artifact already holds, so the new row
+        // needs its own `primary_content` claim: CAS deduplicates, and
+        // without this edge the new artifact counts zero against bytes it
+        // shares with the source. Release and purge that sibling and the
+        // storage GC's count reaches zero with this artifact still live and
+        // servable — a missing edge does not delay collection, it brings it
+        // forward. No `metadata_blob` edge: `register_by_hash` never splits
+        // (the bytes are already in CAS, owned by the source).
+        //
+        // A failed edge now fails the registration, which is the recoverable
+        // direction: the mount/follower/seed caller retries, where an
+        // edgeless committed artifact cannot be repaired from the artifact
+        // row alone by anything in the request path.
+        let edges = Self::ingest_edges(
+            &artifact,
+            repository_id,
+            // `register_by_hash` never splits the payload metadata into CAS.
+            None,
+            &claimed_edges,
+            now,
+        );
+
+        // ONE commit, carrying the mint AND the gate it resolved above:
+        // `ArtifactIngested`, the `ArtifactQuarantined` / `ScanRequested`
+        // the gate produced, the artifact row in its final gated state,
+        // its metadata, the `Scan` / `ProvenanceVerify` job rows and the
+        // `primary_content` edge land in one transaction or none at all
+        // (ADR 0002/0004 no-strand), exactly as `ingest_inner`'s own
+        // single commit does.
+        //
+        // Splitting this — minting first and gating in a follow-on commit
+        // — is what the shape must never go back to. The mint alone
+        // publishes a SERVABLE artifact: `QuarantineStatus::None` is the
+        // most permissive state in the system, `Artifact::is_downloadable`
+        // admits it and the default `ReleasedOnly` index mode serves it.
+        // So a failure of the second commit leaves exactly the remainder
+        // nothing in the request path can repair — a servable artifact
+        // with one `ArtifactIngested` on its stream, no quarantine anchor,
+        // and no `jobs` row to make anyone aware a verdict is owed. The
+        // atomicity that matters is therefore between the mint and the
+        // gate, not merely within the gate.
+        self.lifecycle
+            .commit_transition_with_enqueues(
+                &artifact,
+                AppendEvents {
+                    stream_id,
+                    expected_version,
+                    events,
+                    correlation_id,
+                    causation_id: None,
+                    actor: Actor::Api(actor),
+                },
+                Some(artifact_metadata),
+                &enqueues,
+                &edges,
+            )
+            .await
+            .map_err(|e| RegisterError::Other {
+                err: AppError::Domain(e),
                 repo_key: Some(repo_key.clone()),
             })?;
 
-            self.lifecycle
-                .commit_transition_with_enqueues(
-                    &artifact,
-                    AppendEvents {
-                        stream_id,
-                        expected_version,
-                        events,
-                        correlation_id,
-                        causation_id: None,
-                        // System actor — this follow-on commit is
-                        // mechanical bookkeeping regardless of caller
-                        // (mirrors `ingest_inner`'s strict-mode
-                        // quarantine step).
-                        actor: hort_domain::events::system_actor(),
-                    },
-                    None, // metadata was persisted on the preceding ingest transition
-                    &enqueues,
-                    // No edges: this is the gate follow-up, not the mint.
-                    // The registration's own `primary_content` edge is
-                    // written below, against the `commit_transition` that
-                    // minted the row.
-                    &[],
-                )
-                .await
-                .map_err(|e| RegisterError::Other {
-                    err: AppError::Domain(e),
-                    repo_key: Some(repo_key.clone()),
-                })?;
-
+        // Emitted only when the gate resolved to something, so a fully
+        // waived policy (nothing appended, nothing enqueued) stays silent.
+        if gate.quarantined || gate.scan_will_run || gate.provenance_will_run {
             tracing::info!(
                 %artifact_id,
                 trigger_source,
-                quarantined,
-                anchor_source = ?anchor_source,
-                scan_will_run,
-                provenance_will_run,
+                quarantined = gate.quarantined,
+                anchor_source = ?applied.anchor_source,
+                scan_will_run = gate.scan_will_run,
+                provenance_will_run = gate.provenance_will_run,
                 "register_by_hash: quarantine/scan/provenance gate resolved"
             );
         }
 
         // Late-joiner provenance self-clear — the same post-commit hook
-        // `ingest_inner` runs, on this path's own quarantine commit. The
-        // OCI cross-repo blob mount lands a fresh per-repo row over
-        // content whose subject may already be verified in this repo.
+        // `ingest_inner` runs, behind this path's own single commit, so the
+        // quarantine it may clear is already durable. The OCI cross-repo
+        // blob mount lands a fresh per-repo row over content whose subject
+        // may already be verified in this repo.
         self.resolve_late_joiner_clearance(
             &artifact,
-            provenance_mode,
-            quarantined,
+            gate.provenance_mode,
+            gate.quarantined,
             &scan_enqueue_format,
         )
         .await;
@@ -5203,11 +5356,11 @@ impl IngestUseCase {
             match self
                 .jobs
                 .enqueue_task(
-                    "prefetch-dependencies",
+                    PREFETCH_DEPENDENCIES_KIND,
                     &params,
                     None,
-                    0i16,
-                    "ingest",
+                    queue_priority(PREFETCH_DEPENDENCIES_KIND, INGEST_TRIGGER_SOURCE),
+                    INGEST_TRIGGER_SOURCE,
                     None, // non-destructive task — no DB-side idempotency key (ADR 0028)
                 )
                 .await
@@ -5234,6 +5387,624 @@ impl IngestUseCase {
             repo_key,
         })
     }
+
+    /// Resolve the target repository's active policy and the three gate
+    /// axes derived from it — identical derivation to `ingest_inner`'s
+    /// [`Self::resolve_scan_and_provenance_decision`], over the same
+    /// sources.
+    ///
+    /// Policy-lookup failure is non-fatal: log and treat as "no policy
+    /// applies". Aborting a registration on a transient projection-read
+    /// failure would make scanning a hard dependency of every mount /
+    /// follower / seed registration, which the design explicitly avoids —
+    /// the artifact still registers and an operator can rescan once the
+    /// projection is back.
+    ///
+    /// Shared by the mint and by the catch-up a repeat runs, so the gate a
+    /// repeat lands is the gate the mint would have landed: two copies of
+    /// this derivation could disagree about the same policy, and then
+    /// "this artifact has no gate result" would be answered against a
+    /// different gate from the one that runs.
+    async fn resolve_register_gate(
+        &self,
+        repository_id: Uuid,
+        artifact_id: Uuid,
+        scan_enqueue_format: &str,
+    ) -> RegisterGate {
+        let matched_policy: Option<ScanPolicyProjection> =
+            resolve_active_policy_for_repo(&*self.policy_projections, repository_id)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        artifact_id = %artifact_id,
+                        repository_id = %repository_id,
+                        error = %e,
+                        "register_by_hash: policy_projections.list_active failed; \
+                         skipping scan auto-enqueue (artifact still registers)",
+                    );
+                    None
+                });
+
+        let scan_will_run = match matched_policy.as_ref() {
+            Some(p) => !p.scan_backends.is_empty(),
+            None => !DefaultPolicy::block_on_critical_default_backends().is_empty(),
+        };
+        let provenance_mode = matched_policy
+            .as_ref()
+            .map(|p| p.provenance_mode)
+            .unwrap_or_default();
+        let provenance_will_run = provenance_mode != ProvenanceMode::Off
+            && self
+                .provenance_capable_formats
+                .contains(scan_enqueue_format);
+        let effective_duration_secs: i64 = matched_policy
+            .as_ref()
+            .map(|p| p.quarantine_duration_secs)
+            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
+
+        RegisterGate {
+            matched_policy,
+            scan_will_run,
+            provenance_mode,
+            provenance_will_run,
+            effective_duration_secs,
+            quarantined: effective_duration_secs > 0,
+        }
+    }
+
+    /// Apply a resolved [`RegisterGate`] to `artifact`: transition it to
+    /// `Quarantined` when the window applies, and build the events the
+    /// gate appends plus the job rows it enqueues.
+    ///
+    /// Returns them rather than committing, because they belong in the
+    /// caller's single [`ArtifactLifecyclePort::commit_transition_with_enqueues`]
+    /// — the mint's, carrying `ArtifactIngested` alongside them, or a
+    /// catch-up's, carrying them alone.
+    async fn apply_register_gate(
+        &self,
+        artifact: &mut Artifact,
+        gate: &RegisterGate,
+        quarantine_anchor_override: Option<DateTime<Utc>>,
+        trigger_source: &str,
+        scan_enqueue_format: &str,
+        now: DateTime<Utc>,
+    ) -> DomainResult<AppliedRegisterGate> {
+        let artifact_id = artifact.id;
+        let repository_id = artifact.repository_id;
+        // Threaded out to the caller's gate log so an operator can tell
+        // WHICH source anchored the window without reconstructing the
+        // evidence.
+        let mut anchor_source = AnchorSource::Mint;
+        let mut events: Vec<EventToAppend> = Vec::new();
+
+        if gate.quarantined {
+            // The descendant carve-out, evaluated exactly as
+            // `ingest_inner` evaluates it. The probe is a TOPOLOGY
+            // question — "is this content already a `content_references`
+            // target of some OTHER already-ingested artifact in this
+            // repository" — and `is_referenced_tree_descendant` filters
+            // `primary_content` / `metadata_blob` out as self-referential,
+            // so it answers the same whether or not this artifact's own
+            // edges are written yet. That is what lets the mint (whose
+            // edges ride the commit this feeds) and a catch-up (whose row
+            // has carried its edges since its mint) share it.
+            //
+            // Both probes are skipped entirely when an explicit anchor is
+            // supplied: the override wins absolutely, so they could only
+            // spend two round-trips on values nothing reads.
+            let (is_referenced_descendant, first_seen_at) = match quarantine_anchor_override {
+                Some(_) => (false, None),
+                None => (
+                    resolve_referenced_tree_descendant_fail_safe(
+                        &*self.content_references,
+                        repository_id,
+                        artifact_id,
+                        &artifact.sha256_checksum,
+                    )
+                    .await,
+                    read_content_age_evidence(&*self.artifacts, &artifact.sha256_checksum).await,
+                ),
+            };
+
+            // The SAME derivation `ingest_inner` runs, over the same
+            // sources — which is what makes the leader/follower asymmetry
+            // disappear as a property of the model rather than as a patch
+            // at each call site. A follower minting its row over
+            // already-resident CAS content reads the same content-level
+            // age evidence the leader read, so the two agree on the
+            // anchor whichever of them won the dedup race.
+            //
+            // It is also why a catch-up does not punish content that has
+            // been resident for weeks with a fresh full window: the row's
+            // own `created_at` is part of the content-level age evidence
+            // by the time a repeat runs, so the window is anchored on when
+            // hort first held these bytes and the artifact becomes
+            // releasable as soon as the verdict this gate requests lands.
+            //
+            // `trusted_upstream_published_at` is unconditionally `None`
+            // here: this path mints a per-repo row over content already
+            // in CAS with no upstream fetch, so there is no publish-time
+            // hint in scope (`upstream_published_at` is `None` on both
+            // the row and the event). Reaching for the value the LEADER
+            // observed through ITS repository's mapping is exactly the
+            // transit this model forbids — the opt-in is a per-mapping
+            // trust statement, and an untrusted mirror's claim must not
+            // shorten a repository proxying the genuine upstream.
+            let derived = derive_quarantine_anchor(&AnchorEvidence {
+                minted_at: now,
+                window: chrono::Duration::seconds(gate.effective_duration_secs),
+                // The seed-import cutover's backdated anchor. Absolute
+                // precedence: an explicit anchor is never overridden by a
+                // derived one, in either direction.
+                explicit_override: quarantine_anchor_override,
+                first_seen_at,
+                trusted_upstream_published_at: None,
+                is_referenced_descendant,
+            });
+            let anchor = derived.anchor;
+            anchor_source = derived.source;
+            let quarantine_event = artifact.quarantine(anchor)?;
+            events.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(
+                quarantine_event,
+            )));
+            // Same stamp `ingest_inner`'s mint applies: the row this
+            // method's caller returns is rendered straight into a `503` by
+            // the post-coalesce cross-repo branch of every format's
+            // pull-through, so it has to carry the window just derived.
+            self.stamp_transient_hold(
+                artifact,
+                anchor,
+                gate.effective_duration_secs,
+                gate.provenance_mode,
+            )
+            .await;
+        }
+        if gate.scan_will_run {
+            events.push(EventToAppend {
+                event_id: Uuid::new_v4(),
+                event: DomainEvent::ScanRequested(ScanRequested {
+                    artifact_id,
+                    scanner: gate
+                        .matched_policy
+                        .as_ref()
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "default".to_string()),
+                }),
+            });
+        }
+
+        let mut enqueues: Vec<IngestEnqueue> = Vec::new();
+        if gate.scan_will_run {
+            enqueues.push(IngestEnqueue::Scan {
+                format: scan_enqueue_format.to_string(),
+                priority: scan_queue_priority(trigger_source),
+                trigger_source: trigger_source.to_string(),
+            });
+        }
+        if gate.provenance_will_run {
+            enqueues.push(IngestEnqueue::ProvenanceVerify {
+                priority: queue_priority(PROVENANCE_VERIFY_KIND, trigger_source),
+                trigger_source: trigger_source.to_string(),
+            });
+        }
+
+        Ok(AppliedRegisterGate {
+            events,
+            enqueues,
+            anchor_source,
+        })
+    }
+
+    /// The answer a same-path-same-hash repeat gets: `Duplicate`, or — when
+    /// the row it found has no gate result — the gate it never got, landed
+    /// now.
+    ///
+    /// # Why the dedup check is gate-aware at all
+    ///
+    /// The guard above answers `Duplicate` *before* any policy resolution
+    /// and before the gate, and the OCI mount maps that to `201`. So an
+    /// artifact whose gate commit never landed stayed ungated **forever,
+    /// even if the same mount was repeated**: a `skopeo copy` or a re-tag
+    /// somebody ran again reported success and changed nothing. The
+    /// resulting row is servable, carries one `ArtifactIngested` and
+    /// nothing else, and owes a scan verdict that nothing records — in a
+    /// repository whose policy both quarantines and scans.
+    ///
+    /// Making the repeat heal the row is what removes the need for a
+    /// backfill sweep over existing installations: the healing rides the
+    /// path that is repeated anyway.
+    ///
+    /// # The criterion: what "no gate result" means
+    ///
+    /// Three conjuncts. Each carries a different part of the question, and
+    /// none of them is redundant.
+    ///
+    /// 1. **`quarantine_status == None`.** The cheap necessary condition,
+    ///    and it costs nothing: the dedup hit already carries the whole
+    ///    row. A gate that ran with `quarantine_duration_secs > 0` left
+    ///    `Quarantined`, and every later lifecycle transition moves the
+    ///    column further (`Released` / `Rejected` / `ScanIndeterminate`) —
+    ///    no transition in the domain ever returns it to `None`. So a
+    ///    non-`None` status is itself gate output. It is also the
+    ///    fail-closed direction: whatever decided a terminal state decided
+    ///    it on evidence, and a mount must not undo that with a late
+    ///    window. Only the permissive case (`duration == 0`) leaves a
+    ///    gated row at `None`, which is why this is necessary and not
+    ///    sufficient.
+    ///
+    /// 2. **No `ArtifactQuarantined` and no `ScanRequested` on the
+    ///    artifact's own stream.** These two are the gate's entire durable
+    ///    output. Its `Scan` / `ProvenanceVerify` job rows are **not**
+    ///    evidence: the scan-row retention sweep deletes them once the
+    ///    scan is done, so wherever job rows are pruned a missing
+    ///    `kind='scan'` row is just as true of an artifact that was
+    ///    scanned and rejected as of one that was never gated. The
+    ///    missing *event* is the evidence; the missing row is not.
+    ///
+    ///    Deliberately not "has anything at all happened to this
+    ///    artifact": a `ScanCompleted` that a `cronRescanTick` drove is
+    ///    not this gate, and the observation window the gate owed is still
+    ///    missing. What protects a verdict another mechanism reached is
+    ///    conjunct 1, re-read inside the pairing below.
+    ///
+    /// 3. **The policy governing the row now expects at least one of those
+    ///    two events** ([`RegisterGate::appends_a_durable_event`]). The
+    ///    question is per axis because the gate is: a fully waived policy
+    ///    (`quarantineDuration: 0` AND `scanBackends: []`) legitimately
+    ///    appends nothing, so by conjuncts 1 and 2 alone its rows are
+    ///    indistinguishable from a broken one — and re-gating them would
+    ///    turn every mount into a re-gate. That row is healthy and looks
+    ///    the most like the broken one; this conjunct is what separates
+    ///    them.
+    ///
+    ///    It is also what makes the criterion **self-extinguishing**, which
+    ///    is what keeps idempotence: the catch-up appends at least one of
+    ///    the two events conjunct 2 looks for, so conjunct 2 is false for
+    ///    every later repeat. The provenance axis is excluded for exactly
+    ///    that reason and not as an oversight — `provenance_will_run`
+    ///    enqueues a job row and appends **no** event, so a criterion that
+    ///    admitted it would re-run the gate on every repeat of a
+    ///    scan-waived, provenance-only policy and never terminate.
+    ///
+    /// ## What the scan axis does and does not carve out for constituents
+    ///
+    /// The provenance axis has a constituent carve-out —
+    /// [`is_parent_gated_blob_constituent`](crate::use_cases::referenced_descendant::is_parent_gated_blob_constituent):
+    /// a config/layer blob can never carry an attestation of its own, so
+    /// it legitimately has no verdict and its clearance comes from the
+    /// parent's cascade. **The scan axis has no equivalent, and this
+    /// criterion deliberately does not invent one.** `scan_will_run` is
+    /// `!scan_backends.is_empty()` at both mint sites and at neither is it
+    /// conditioned on membership, so every row minted into a scanning
+    /// repository gets its *own* `ScanRequested`. A constituent without
+    /// one was therefore not gated either, and healing it once is correct.
+    /// Because the criterion self-extinguishes, "once" is the whole cost
+    /// even where the population is large.
+    ///
+    /// The two axes are asymmetric **by nature** and not merely in the
+    /// current implementation, which is why there is nothing here to
+    /// mirror. The provenance carve-out rests on a blob never being able
+    /// to *acquire* an attestation — the OCI referrers `subject` is a
+    /// manifest descriptor and cosign signs manifest digests — so the
+    /// verify has no reachable outcome. A blob is the opposite case for
+    /// scanning: `OciFormatHandler::scan_kind` classifies it
+    /// `ArtifactKind::OciBlob` precisely because its bytes are the
+    /// package surface a scanner examines. A layer blob can reach a
+    /// verdict, so it is owed one.
+    ///
+    /// ## The one shape this criterion cannot tell apart
+    ///
+    /// [`Self::ingest_signature_manifest`] deliberately mints a pure
+    /// Sigstore-bundle referrer at `quarantine_status = None` with no
+    /// `ScanRequested` — quarantining a signature is a category error —
+    /// and that row is state-identical to a broken one. It is not
+    /// reachable here today: the cross-mount caller registers under the
+    /// `blobs/` path prefix and a signature manifest lives under
+    /// `manifests/` (disjoint by construction), the coalesced-follower
+    /// manifest registration only runs when no row in the repository holds
+    /// those bytes at all, the non-OCI follower paths have no signature
+    /// manifests, and seed-import builds `<name>/<version>`. A future
+    /// `register_by_hash` caller that CAN land on a pure-signature
+    /// manifest's `(path, hash)` has to re-open this: the heal would
+    /// quarantine it once.
+    ///
+    /// # Concurrency, and what the loser answers
+    ///
+    /// The decision is derived from stored evidence and committed behind
+    /// an optimistic append, which is [`ArtifactAtVersion`]'s contract, so
+    /// the version is read **beside** the evidence and never through
+    /// [`read_unpaired_append_version`]. `load` (not `pair`) re-reads the
+    /// artifact row *after* the version, so a verdict that landed between
+    /// the two is in the row — conjunct 1 is re-checked on it — and a
+    /// verdict that lands after both fails this append. Two simultaneous
+    /// repeats therefore land ONE gate: the second fails the version
+    /// check instead of adding a second window and a second scan request.
+    ///
+    /// **Every failure from here answers `Duplicate`** — the pairing, the
+    /// gate, the commit, the `Conflict` a concurrent repeat earns. That is
+    /// the answer this path gave before the catch-up existed, over a row
+    /// the winner has already healed: the registration is complete and the
+    /// caller's mount succeeded, so an opportunistic heal must never turn
+    /// a `201` into a `500`. A repeat is a retry by nature, and the next
+    /// one retries the heal too.
+    async fn dedup_or_catch_up_gate(
+        &self,
+        existing: Artifact,
+        quarantine_anchor_override: Option<DateTime<Utc>>,
+        trigger_source: &str,
+        scan_enqueue_format: &str,
+        actor: &ApiActor,
+    ) -> Artifact {
+        // Conjunct 1, on the row the dedup already holds — free, and it
+        // short-circuits every gated row in a quarantining repository
+        // before any further I/O.
+        if existing.quarantine_status != QuarantineStatus::None {
+            return existing;
+        }
+
+        let artifact_id = existing.id;
+        let repository_id = existing.repository_id;
+
+        // The evidence, the append version and a re-read of the row, from
+        // ONE observation. `OverCapStream::Tolerate` here with the refusal
+        // left to `evidence()` below: an over-cap stream is a stream whose
+        // tail a capped read cannot prove it reached, and a prefix cannot
+        // show that the gate's events are absent — only that they are
+        // absent from the oldest `STREAM_EVENT_CAP` of them.
+        let paired = match ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Tolerate,
+        )
+        .await
+        {
+            Ok(paired) => paired,
+            Err(e) => {
+                tracing::warn!(
+                    %artifact_id,
+                    error = %e,
+                    "register_by_hash: could not read the deduplicated row's stream, so \
+                     whether its gate ran is unknown; answering duplicate unchanged \
+                     (the next repeat re-checks)"
+                );
+                return existing;
+            }
+        };
+
+        // Conjunct 1 again, on the freshly loaded row: a verdict that
+        // landed between the version read and the row read is here and not
+        // in the version, so this is the half of the fail-closed pair
+        // `load` provides (the append losing is the other).
+        if paired.artifact().quarantine_status != QuarantineStatus::None {
+            return paired.into_artifact();
+        }
+
+        // Conjunct 2.
+        let gate_output_present = match paired.evidence() {
+            Ok(stream) => carries_register_gate_output(stream),
+            Err(e) => {
+                tracing::warn!(
+                    %artifact_id,
+                    error = %e,
+                    "register_by_hash: the deduplicated row's stream breached the event cap, \
+                     so a capped read cannot show its gate is missing; answering duplicate \
+                     unchanged"
+                );
+                true
+            }
+        };
+        if gate_output_present {
+            return paired.into_artifact();
+        }
+
+        // Conjunct 3.
+        let gate = self
+            .resolve_register_gate(repository_id, artifact_id, scan_enqueue_format)
+            .await;
+        if !gate.appends_a_durable_event() {
+            return paired.into_artifact();
+        }
+
+        // Applying the gate and committing it are ONE fallible step with
+        // ONE answer, rather than two arms: everything that can go wrong
+        // from here leaves the row exactly as the caller already had it,
+        // and says the same thing about it.
+        let (artifact, anchor_source) = match self
+            .commit_catch_up_gate(
+                &paired,
+                &gate,
+                quarantine_anchor_override,
+                trigger_source,
+                scan_enqueue_format,
+                actor,
+            )
+            .await
+        {
+            Ok(healed) => healed,
+            Err(e) => {
+                tracing::warn!(
+                    %artifact_id,
+                    error = %e,
+                    "register_by_hash: the gate catch-up did not land (a Conflict is a \
+                     concurrent repeat that landed the same gate first); answering \
+                     duplicate unchanged"
+                );
+                return paired.into_artifact();
+            }
+        };
+
+        tracing::info!(
+            %artifact_id,
+            %repository_id,
+            trigger_source,
+            quarantined = gate.quarantined,
+            anchor_source = ?anchor_source,
+            scan_will_run = gate.scan_will_run,
+            provenance_will_run = gate.provenance_will_run,
+            "register_by_hash: repeat caught up the missing quarantine/scan gate"
+        );
+
+        // The same post-commit hook the mint runs, behind this path's own
+        // single commit, so the quarantine it may clear is already durable.
+        self.resolve_late_joiner_clearance(
+            &artifact,
+            gate.provenance_mode,
+            gate.quarantined,
+            scan_enqueue_format,
+        )
+        .await;
+
+        // `Duplicate`, still: no second `ArtifactIngested` and no second
+        // row, so the metric label stays truthful about the registration.
+        // The artifact returned is the HEALED row — every format's
+        // post-coalesce cross-repo branch renders exactly this row into
+        // its `503`, and the pre-catch-up row would advertise a
+        // deadline-unknown constant over a window that now exists.
+        artifact
+    }
+
+    /// The catch-up's whole write: apply `gate` to a clone of the paired
+    /// row and commit it as **one** transition. Returns the healed row and
+    /// the anchor source for the caller's log.
+    ///
+    /// ONE commit, exactly as the mint's gate is one commit: the
+    /// `ArtifactQuarantined` / `ScanRequested` the gate produced, the row
+    /// in its gated state and the `Scan` / `ProvenanceVerify` job rows land
+    /// together or not at all (ADR 0002/0004 no-strand). An `Err` therefore
+    /// means nothing of the gate landed and the row is untouched, which is
+    /// what lets the caller answer `Duplicate` over it.
+    ///
+    /// No edges and no metadata, which is not an omission: this is the
+    /// gate, not the mint. The row's `primary_content` claim and its
+    /// `artifact_metadata` row committed with its own `ArtifactIngested` —
+    /// a row that lost only its gate is repairable precisely because the
+    /// mint's own claims are already durable. Re-claiming *this repeat's*
+    /// edges would instead write a set the row never claimed.
+    ///
+    /// The `expected_version` is the paired read's, not a fresh one: it is
+    /// what makes a verdict committed since that read fail this append
+    /// rather than be overwritten by it, and it is the whole reason two
+    /// simultaneous repeats land one gate.
+    async fn commit_catch_up_gate(
+        &self,
+        paired: &ArtifactAtVersion,
+        gate: &RegisterGate,
+        quarantine_anchor_override: Option<DateTime<Utc>>,
+        trigger_source: &str,
+        scan_enqueue_format: &str,
+        actor: &ApiActor,
+    ) -> DomainResult<(Artifact, AnchorSource)> {
+        // ONCE-ONLY-APPEND: the gate's own output is what gates it.
+        // `carries_register_gate_output` refuses this path for any stream
+        // that already holds an `ArtifactQuarantined` or a
+        // `ScanRequested`, and those are exactly the events the batch
+        // below appends — so the gate runs at most once per artifact, and
+        // the simultaneous-repeat case the paired version exists for
+        // lands one of them and conflicts the other.
+        let mut artifact = paired.artifact().clone();
+        let applied = self
+            .apply_register_gate(
+                &mut artifact,
+                gate,
+                quarantine_anchor_override,
+                trigger_source,
+                scan_enqueue_format,
+                Utc::now(),
+            )
+            .await?;
+        self.lifecycle
+            .commit_transition_with_enqueues(
+                &artifact,
+                AppendEvents {
+                    stream_id: paired.stream_id().clone(),
+                    expected_version: paired.expected_version(),
+                    events: applied.events,
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: Actor::Api(actor.clone()),
+                },
+                None,
+                &applied.enqueues,
+                &[],
+            )
+            .await?;
+        Ok((artifact, applied.anchor_source))
+    }
+}
+
+/// Does this artifact's stream carry the `register_by_hash` gate's own
+/// output?
+///
+/// `ArtifactQuarantined` (the observation window) and `ScanRequested` (the
+/// verdict the release authority depends on) are the gate's entire durable
+/// trace, which is why the question is asked of the *events* and not of
+/// the `jobs` table — see
+/// [`IngestUseCase::dedup_or_catch_up_gate`] for the criterion this
+/// answers conjunct 2 of, and for why a `ScanCompleted` some other
+/// mechanism drove is deliberately not counted here.
+///
+/// The stream is read through [`ArtifactAtVersion`], whose `stream_id` is
+/// built by [`StreamId::artifact`]. That constructor is the only correct
+/// way to reach these events: `events.stream_id` carries an `artifact-`
+/// prefix, so a lookup by the bare UUID matches nothing and returns a
+/// silent zero — which would read here as "the gate never ran" for every
+/// artifact in the system.
+fn carries_register_gate_output(stream: &[PersistedEvent]) -> bool {
+    stream.iter().any(|persisted| {
+        matches!(
+            persisted.event,
+            DomainEvent::ArtifactQuarantined(_) | DomainEvent::ScanRequested(_)
+        )
+    })
+}
+
+/// The `register_by_hash` gate's policy-derived decisions, resolved once by
+/// [`IngestUseCase::resolve_register_gate`] and applied by
+/// [`IngestUseCase::apply_register_gate`].
+struct RegisterGate {
+    /// The matched operator policy, or `None` when the hardcoded
+    /// `DefaultPolicy` applies. Retained because the `ScanRequested`
+    /// payload carries its name.
+    matched_policy: Option<ScanPolicyProjection>,
+    /// The operator's `scan_backends` is non-empty (an empty list is
+    /// scanning waived), or no policy matched and `DefaultPolicy` scans.
+    scan_will_run: bool,
+    /// The resolved provenance mode — threaded to the hold stamp and the
+    /// post-commit late-joiner clearance.
+    provenance_mode: ProvenanceMode,
+    /// `mode != Off` AND some registered verifier applies to this format.
+    provenance_will_run: bool,
+    /// The observation-window length. `0` is the operator's explicit
+    /// permissive opt-out and is honoured verbatim.
+    effective_duration_secs: i64,
+    /// `effective_duration_secs > 0`.
+    quarantined: bool,
+}
+
+impl RegisterGate {
+    /// Does this gate append at least one event to the artifact's stream?
+    ///
+    /// The **only** half of the gate a later reader can observe, and so the
+    /// only half a "did this artifact's gate ever run" question may rest
+    /// on. The provenance axis is absent on purpose: it enqueues a job row
+    /// and appends nothing, and job rows are pruned — see conjunct 3 on
+    /// [`IngestUseCase::dedup_or_catch_up_gate`] for why admitting it
+    /// would make the catch-up non-terminating.
+    fn appends_a_durable_event(&self) -> bool {
+        self.quarantined || self.scan_will_run
+    }
+}
+
+/// What applying a [`RegisterGate`] produced, for the caller's single
+/// commit to carry.
+struct AppliedRegisterGate {
+    /// `ArtifactQuarantined` and/or `ScanRequested`, in that order.
+    events: Vec<EventToAppend>,
+    /// The `Scan` / `ProvenanceVerify` job rows.
+    enqueues: Vec<IngestEnqueue>,
+    /// Which source anchored the window — observability only.
+    anchor_source: AnchorSource,
 }
 
 /// Internal return shape for [`IngestUseCase::register_by_hash_inner`].
@@ -5250,6 +6021,7 @@ enum RegisterOutcome {
     Duplicate {
         artifact: Artifact,
         repo_key: String,
+        claimed_edges_written: u64,
     },
 }
 
@@ -5288,8 +6060,8 @@ mod tests {
 
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
-    use hort_domain::events::DomainEvent;
-    use hort_domain::ports::format_handler::GroupMembership;
+    use hort_domain::events::{DomainEvent, MAX_EVENT_JSON_BYTES};
+    use hort_domain::ports::format_handler::{GroupMembership, MetadataStrategy};
 
     use super::*;
     use crate::metrics::capture_metrics;
@@ -5438,6 +6210,28 @@ mod tests {
         make_use_case_with_flag(true)
     }
 
+    /// The lifecycle double every harness in this module wires, with the
+    /// two pairings an ingest / register test needs: the `content_references`
+    /// edges a commit carries are actually applied, and the events it
+    /// carries become readable off `events` afterwards.
+    ///
+    /// The second pairing is the Postgres adapter's own semantics (its
+    /// `commit_*` appends to the event store inside the same transaction
+    /// as the artifact row) and the gate-aware dedup depends on it: that
+    /// path asks whether a deduplicated row's stream carries the gate's
+    /// events, and an unpaired double would answer "no" for every row
+    /// this harness itself gated.
+    fn mock_lifecycle(
+        artifacts: &Arc<MockArtifactRepository>,
+        events: &Arc<MockEventStore>,
+        content_references: &Arc<MockContentReferenceIndex>,
+    ) -> Arc<MockArtifactLifecycle> {
+        Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+                .with_content_references(content_references.clone()),
+        )
+    }
+
     #[allow(clippy::type_complexity)]
     fn make_use_case_with_flag(
         include_repository_label: bool,
@@ -5524,10 +6318,7 @@ mod tests {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let content_references = Arc::new(MockContentReferenceIndex::new());
-        let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_content_references(content_references.clone()),
-        );
+        let lifecycle = mock_lifecycle(&artifacts, &events, &content_references);
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -5605,10 +6396,7 @@ mod tests {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let content_references = Arc::new(MockContentReferenceIndex::new());
-        let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_content_references(content_references.clone()),
-        );
+        let lifecycle = mock_lifecycle(&artifacts, &events, &content_references);
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -5672,10 +6460,7 @@ mod tests {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let content_references = Arc::new(MockContentReferenceIndex::new());
-        let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_content_references(content_references.clone()),
-        );
+        let lifecycle = mock_lifecycle(&artifacts, &events, &content_references);
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -6990,8 +7775,7 @@ mod tests {
         fn put(
             &self,
             _stream: Box<dyn AsyncRead + Send + Unpin>,
-        ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<PutResult>>
-        {
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<PutResult>> {
             Box::pin(async {
                 Err(DomainError::Invariant(
                     "storage write failed: disk full".into(),
@@ -7002,10 +7786,8 @@ mod tests {
         fn get(
             &self,
             _hash: &ContentHash,
-        ) -> hort_domain::ports::BoxFuture<
-            '_,
-            hort_domain::error::DomainResult<Box<dyn AsyncRead + Send + Unpin>>,
-        > {
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>>
+        {
             Box::pin(async {
                 Err(DomainError::Invariant(
                     "storage read failed: disk failure".into(),
@@ -7017,24 +7799,22 @@ mod tests {
             &self,
             _hash: &ContentHash,
             _range: hort_domain::types::ByteRange,
-        ) -> hort_domain::ports::BoxFuture<
-            '_,
-            hort_domain::error::DomainResult<Box<dyn AsyncRead + Send + Unpin>>,
-        > {
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>>
+        {
             Box::pin(async { unreachable!("FailingStoragePort.get_range not exercised") })
         }
 
         fn exists(
             &self,
             _hash: &ContentHash,
-        ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<bool>> {
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<bool>> {
             Box::pin(async { Ok(false) })
         }
 
         fn size_of(
             &self,
             _hash: &ContentHash,
-        ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<u64>> {
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<u64>> {
             Box::pin(async { Ok(0) })
         }
     }
@@ -7053,7 +7833,7 @@ mod tests {
                 let events = Arc::new(MockEventStore::new());
                 let content_references = Arc::new(MockContentReferenceIndex::new());
                 let lifecycle = Arc::new(
-                    MockArtifactLifecycle::new(artifacts.clone())
+                    MockArtifactLifecycle::new(artifacts.clone(), events.clone())
                         .with_content_references(content_references.clone()),
                 );
                 let storage: Arc<dyn StoragePort> = Arc::new(FailingStoragePort);
@@ -7843,6 +8623,261 @@ mod tests {
         });
     }
 
+    // -- "what stays inline fits in an event" --------------------------------
+    //
+    // The decision's budget (`MetadataStrategy::inline_event_budget_bytes`)
+    // bounds the PAYLOAD; `MAX_EVENT_JSON_BYTES` bounds the whole
+    // ENVELOPE. The three tests below cover the implication the ingest
+    // path owes the event store across that gap, the summary that used
+    // to collapse it, and the strategy that declared no threshold at
+    // all.
+
+    /// The boundary from both sides, at the level that decides whether a
+    /// package can be published: not which variant the dispatch chose
+    /// but what the committed event holds.
+    ///
+    /// A payload's serialised length is not its envelope's — the
+    /// event's own fields (ids, name, version, checksum) sit beside it —
+    /// so the exact byte at which inlining stops being possible is a
+    /// property of the event and not a number this test can name. It
+    /// sweeps across it instead and asserts the implication directly:
+    /// every size publishes, and every size that stayed inline produced
+    /// an event the store accepts.
+    #[test]
+    fn an_inline_decision_implies_the_event_fits() {
+        let mut inlined = 0_usize;
+        let mut spilled = 0_usize;
+
+        for target in [
+            MAX_EVENT_JSON_BYTES - 1024,
+            MAX_EVENT_JSON_BYTES - 512,
+            MAX_EVENT_JSON_BYTES - 64,
+            MAX_EVENT_JSON_BYTES - 1,
+            MAX_EVENT_JSON_BYTES,
+            MAX_EVENT_JSON_BYTES + 1,
+            MAX_EVENT_JSON_BYTES + 512,
+        ] {
+            let repo = pypi_repository();
+            let repo_id = repo.id;
+
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let (uc, _artifacts, _events, lifecycle, _storage, repos) = make_use_case();
+                repos.insert(repo);
+
+                // A threshold far above the cap — the shape npm
+                // shipped, and the one the clamp exists to answer.
+                let handler = StubFormatHandler::new("pypi")
+                    .with_max_bytes(10 * 1024 * 1024)
+                    .with_strategy(MetadataStrategy::HashReference {
+                        inline_threshold_bytes: 4 * MAX_EVENT_JSON_BYTES,
+                    });
+
+                uc.ingest_direct(
+                    req_with_metadata_bytes(repo_id, target),
+                    content_stream(b"payload"),
+                    &handler,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("a {target}-byte payload must publish, got {e:?}"));
+
+                let transitions = lifecycle.committed_transitions();
+                assert_eq!(transitions.len(), 1);
+                let event = &transitions[0].1.events[0].event;
+                let DomainEvent::ArtifactIngested(ingested) = event else {
+                    panic!("expected ArtifactIngested, got: {event:?}")
+                };
+                if ingested.metadata_blob.is_none() {
+                    inlined += 1;
+                    assert!(
+                        event.fits_storage_cap(),
+                        "a {target}-byte payload stayed inline in an event no store                          will hold — the decision did not see the cap"
+                    );
+                } else {
+                    spilled += 1;
+                }
+            });
+        }
+
+        // Counter-assertion: the sweep crossed the boundary. Entirely on
+        // one side of it, the assertion above would be about nothing.
+        assert!(
+            inlined > 0 && spilled > 0,
+            "the sweep must land on both sides of the boundary —              {inlined} inlined, {spilled} spilled"
+        );
+    }
+
+    /// A summary over the event cap is a successful ingest, not a
+    /// refusal. The summary is not a special case: it is another payload
+    /// that may not fit, and when it does not, the reference is all that
+    /// rides the event and `load_full_metadata` serves the full payload
+    /// from CAS.
+    ///
+    /// npm's summary is a per-version block's dependency maps, which a
+    /// package with a few thousand entries pushes over 64 KB on its
+    /// own, and its key list is not negotiable — serving less makes
+    /// every version look dependency-free to a fresh, non-lockfile
+    /// install.
+    #[test]
+    fn a_summary_over_the_event_cap_still_ingests() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        // Over the 128-byte threshold, so the payload spills; the
+        // stub's summary is then what would ride the event, and it does
+        // not fit either.
+        let payload = serde_json::json!({ "pad": "a".repeat(500) });
+        let serialised = serde_json::to_vec(&payload).unwrap();
+        let expected_hash: ContentHash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&serialised))
+                .parse()
+                .unwrap()
+        };
+        let oversize_summary = serde_json::json!({ "deps": "d".repeat(MAX_EVENT_JSON_BYTES) });
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            let handler = StubFormatHandler::new("pypi")
+                .with_max_bytes(10 * 1024 * 1024)
+                .with_strategy(MetadataStrategy::HashReference {
+                    inline_threshold_bytes: 128,
+                })
+                .with_summary(oversize_summary);
+
+            uc.ingest_direct(
+                DirectIngestRequest {
+                    payload_metadata: payload,
+                    ..req(repo_id)
+                },
+                content_stream(b"payload"),
+                &handler,
+            )
+            .await
+            .expect("an oversize summary must not refuse the ingest");
+
+            // Content and metadata blob — the full payload is in CAS.
+            assert_eq!(storage.put_call_count(), 2);
+            assert!(storage.stored_hashes().contains(&expected_hash));
+
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 1);
+            let event = &transitions[0].1.events[0].event;
+            let DomainEvent::ArtifactIngested(ingested) = event else {
+                panic!("expected ArtifactIngested, got: {event:?}")
+            };
+            assert_eq!(
+                ingested.metadata,
+                serde_json::Value::Null,
+                "a summary that does not fit does not ride the event"
+            );
+            assert_eq!(ingested.metadata_blob, Some(expected_hash.clone()));
+            assert!(event.fits_storage_cap());
+
+            // The projection row is the event's materialised view and
+            // must not diverge from it.
+            let md = transitions[0].2.as_ref().expect("metadata row present");
+            assert_eq!(md.metadata, serde_json::Value::Null);
+            assert_eq!(md.metadata_blob, Some(expected_hash));
+        });
+    }
+
+    /// `MetadataStrategy::Inline` declares no threshold, and two
+    /// compiled-in handlers declare a `metadata_expected_max_bytes`
+    /// above the event cap (pypi 128 KB, cargo 8 MB) — so the arm that
+    /// had no threshold to clamp is the one that could inline a payload
+    /// no event can carry. It spills instead of refusing, through the
+    /// same decision.
+    #[test]
+    fn an_inline_strategy_payload_over_the_cap_spills_rather_than_failing() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            // The trait default strategy, which is what every
+            // compiled-in handler but npm declares.
+            let handler = StubFormatHandler::new("pypi").with_max_bytes(10 * 1024 * 1024);
+            assert_eq!(handler.metadata_strategy(), MetadataStrategy::Inline);
+
+            uc.ingest_direct(
+                req_with_metadata_bytes(repo_id, 100 * 1024),
+                content_stream(b"payload"),
+                &handler,
+            )
+            .await
+            .expect("a payload over the cap must publish, not fail at the append");
+
+            assert_eq!(storage.put_call_count(), 2);
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 1);
+            let event = &transitions[0].1.events[0].event;
+            let DomainEvent::ArtifactIngested(ingested) = event else {
+                panic!("expected ArtifactIngested, got: {event:?}")
+            };
+            assert!(ingested.metadata_blob.is_some());
+            assert!(event.fits_storage_cap());
+        });
+    }
+
+    /// The metadata blob's CAS write is the one fallible step the spill
+    /// adds, and a failure there fails the ingest with nothing
+    /// committed — the same disposition as the wheel-METADATA blob
+    /// (`ingest_wheel_metadata_cas_put_failure_propagates_err`). It must
+    /// not commit an event carrying a reference to a blob that was never
+    /// written: `load_full_metadata` would then answer `AppError::Storage`
+    /// for every read of that artifact's metadata, for good.
+    ///
+    /// Targets the SECOND put via `fail_put_after_calls` — the first is
+    /// the artifact content, and failing that fails the ingest before the
+    /// spill is reached.
+    #[test]
+    fn a_metadata_blob_put_failure_commits_nothing() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            let handler = StubFormatHandler::new("pypi")
+                .with_max_bytes(10 * 1024 * 1024)
+                .with_strategy(MetadataStrategy::HashReference {
+                    inline_threshold_bytes: 128,
+                });
+
+            storage.fail_put_after_calls(
+                1,
+                DomainError::Invariant("synthetic CAS failure: metadata_blob put".into()),
+            );
+
+            let err = uc
+                .ingest_direct(
+                    DirectIngestRequest {
+                        payload_metadata: serde_json::json!({ "pad": "a".repeat(500) }),
+                        ..req(repo_id)
+                    },
+                    content_stream(b"payload"),
+                    &handler,
+                )
+                .await
+                .expect_err("a metadata-blob CAS failure must propagate");
+
+            assert!(
+                matches!(err, AppError::Storage(_)),
+                "expected AppError::Storage(_), got {err:?}"
+            );
+            assert_eq!(
+                lifecycle.committed_transitions().len(),
+                0,
+                "no event may reference a blob the spill failed to write"
+            );
+        });
+    }
+
     // -- content_references refcount writes -----------------------------------
     //
     // Every successful `ArtifactIngested` writes one `kind =
@@ -8381,7 +9416,7 @@ mod tests {
                 let events = Arc::new(MockEventStore::new());
                 let content_references = Arc::new(MockContentReferenceIndex::new());
                 let lifecycle = Arc::new(
-                    MockArtifactLifecycle::new(artifacts.clone())
+                    MockArtifactLifecycle::new(artifacts.clone(), events.clone())
                         .with_content_references(content_references.clone()),
                 );
                 let storage: Arc<dyn StoragePort> = Arc::new(FailingStoragePort);
@@ -8799,22 +9834,20 @@ mod tests {
                 assert_eq!(outcome.artifact.sha256_checksum, hash);
                 assert_eq!(outcome.artifact.size_bytes, 4242);
 
-                // Two transitions: the `ArtifactIngested` commit, then
-                // the generalized gate's follow-on commit (issue #107
-                // Item 1) — the shared permissive-global test policy has
-                // `quarantine_duration_secs: 0` (no quarantine) but
-                // `scan_backends: ["trivy"]` (non-empty), so
-                // `ScanRequested` + a `Scan` job enqueue land in a second
-                // commit even though nothing quarantines.
-                // `ingested_event_id` equals the id on the event actually
-                // committed (same contract as `ingest`).
+                // ONE transition carrying the mint and the generalized
+                // gate together — the shared permissive-global test policy
+                // has `quarantine_duration_secs: 0` (no quarantine) but
+                // `scan_backends: ["trivy"]` (non-empty), so `ScanRequested`
+                // + a `Scan` job enqueue ride the same commit as
+                // `ArtifactIngested`. `ingested_event_id` equals the id on
+                // the event actually committed (same contract as `ingest`).
                 let transitions = lifecycle.committed_transitions();
-                assert_eq!(transitions.len(), 2);
+                assert_eq!(transitions.len(), 1, "{transitions:?}");
                 let appended = &transitions[0].1.events[0];
                 assert!(matches!(appended.event, DomainEvent::ArtifactIngested(_)));
                 assert_eq!(outcome.ingested_event_id, appended.event_id);
                 assert!(matches!(
-                    transitions[1].1.events[0].event,
+                    transitions[0].1.events[1].event,
                     DomainEvent::ScanRequested(_)
                 ));
 
@@ -9127,18 +10160,18 @@ mod tests {
             assert_eq!(outcome.artifact.sha256_checksum, hash);
             assert_eq!(outcome.artifact.repository_id, target_id);
 
-            // Two transitions — see the identical note in
-            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
-            // gate: the shared permissive-global test policy still scans
-            // even though it does not quarantine).
+            // ONE transition — see the identical note in
+            // `register_by_hash_some_src_happy_path` (the shared
+            // permissive-global test policy still scans even though it does
+            // not quarantine, and that `ScanRequested` rides the mint).
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2);
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
             assert!(matches!(
                 transitions[0].1.events[0].event,
                 DomainEvent::ArtifactIngested(_)
             ));
             assert!(matches!(
-                transitions[1].1.events[0].event,
+                transitions[0].1.events[1].event,
                 DomainEvent::ScanRequested(_)
             ));
         });
@@ -9274,27 +10307,24 @@ mod tests {
                 "follower registration must not call storage.put"
             );
 
-            // Two commits per caller: `ArtifactIngested`, then the
-            // generalized gate's follow-on `ScanRequested` commit (issue
-            // #107 Item 1 — the shared permissive-global test policy
-            // still scans even though it does not quarantine). Leader:
-            // transitions[0..2). Follower's own repo-B mint:
-            // transitions[2..4) — the same `ArtifactIngested` event the
-            // leader's non-concurrent cross-repo dedup emits, now
-            // followed by its own scan enqueue too.
+            // One commit per caller, each carrying its own mint AND its own
+            // gate — the shared permissive-global test policy still scans
+            // even though it does not quarantine, so `ScanRequested` rides
+            // the `ArtifactIngested` batch. Leader: transitions[0].
+            // Follower's own repo-B mint: transitions[1].
             let transitions = lifecycle.committed_transitions();
             assert_eq!(
                 transitions.len(),
-                4,
-                "two commits (Ingested + scan-gate) for the leader's resolve, \
-                 two for the follower's repo-B mint"
+                2,
+                "one commit for the leader's resolve, one for the follower's \
+                 repo-B mint: {transitions:?}"
             );
             assert!(matches!(
-                transitions[2].1.events[0].event,
+                transitions[1].1.events[0].event,
                 DomainEvent::ArtifactIngested(_)
             ));
             assert!(matches!(
-                transitions[3].1.events[0].event,
+                transitions[1].1.events[1].event,
                 DomainEvent::ScanRequested(_)
             ));
         });
@@ -9331,16 +10361,946 @@ mod tests {
                 first.artifact.id, second.artifact.id,
                 "idempotent: same repo-B row returned, no second mint"
             );
-            // Two commits for the FIRST call (`ArtifactIngested` + the
-            // gate's follow-on `ScanRequested`, issue #107 Item 1); the
-            // second call short-circuits on the same-path-same-hash
-            // dedup guard before ever reaching the gate, so it adds none.
+            // One commit for the FIRST call (`ArtifactIngested` +
+            // `ScanRequested` in one batch); the second call
+            // short-circuits on the same-path-same-hash dedup guard before
+            // ever reaching the gate, so it adds none.
             assert_eq!(
                 lifecycle.committed_transitions().len(),
-                2,
+                1,
                 "same-path-same-hash dedup must not emit a second commit"
             );
         });
+    }
+
+    /// A follower can find an existing manifest row whose foreign-byte
+    /// claims were absent at mint time. Its repeat has the manifest body
+    /// again, so it must restore those claims without minting another row.
+    #[tokio::test]
+    async fn register_existing_cas_blob_repeat_restores_missing_manifest_claims() {
+        let repo = oci_repo();
+        let repo_id = repo.id;
+        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
+        let layer: ContentHash = ZERO_HASH.parse().unwrap();
+        let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs, refs, _events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        seed_permissive_global_policy(&policies);
+        storage.insert_content(hash.clone(), b"manifest".to_vec());
+
+        let mut first_req = recb_req(repo_id, hash.clone());
+        first_req.coords = oci_coords();
+        let first = uc
+            .register_existing_cas_blob(first_req, &test_handler())
+            .await
+            .expect("initial follower registration succeeds");
+        assert!(
+            refs.find_by_target(repo_id, &layer, Some("oci_layer"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "the first registration has no foreign-byte claim"
+        );
+
+        let claimed_layer = ContentReferenceClaim {
+            target_content_hash: layer.clone(),
+            kind: "oci_layer".into(),
+            metadata: serde_json::json!({}),
+        };
+        let mut repeat_req = recb_req(repo_id, hash.clone());
+        repeat_req.coords = oci_coords();
+        repeat_req.claimed_edges = vec![claimed_layer.clone()];
+        let repeat = uc
+            .register_existing_cas_blob(repeat_req, &test_handler())
+            .await
+            .expect("repeat follower registration restores the missing claim");
+
+        assert_eq!(first.artifact.id, repeat.artifact.id);
+        assert_eq!(repeat.claimed_edges_written, 1);
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+        let claims = refs
+            .find_by_target(repo_id, &layer, Some("oci_layer"))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1, "the layer is no longer GC-eligible");
+        assert_eq!(claims[0].source_artifact_id, first.artifact.id);
+
+        let mut third_req = recb_req(repo_id, hash);
+        third_req.coords = oci_coords();
+        third_req.claimed_edges = vec![claimed_layer];
+        let third = uc
+            .register_existing_cas_blob(third_req, &test_handler())
+            .await
+            .expect("already-restored claim stays idempotent");
+        assert_eq!(third.claimed_edges_written, 0);
+    }
+
+    /// A failed repair cannot claim success: the missing edge is still
+    /// absent, and the next repeat must be able to write it.
+    #[tokio::test]
+    async fn register_existing_cas_blob_repeat_retries_failed_claim_repair() {
+        let repo = oci_repo();
+        let repo_id = repo.id;
+        let hash: ContentHash = EMPTY_HASH.parse().unwrap();
+        let layer: ContentHash = ZERO_HASH.parse().unwrap();
+        let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs, refs, _events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        seed_permissive_global_policy(&policies);
+        storage.insert_content(hash.clone(), b"manifest".to_vec());
+
+        let claim = ContentReferenceClaim {
+            target_content_hash: layer.clone(),
+            kind: "oci_layer".into(),
+            metadata: serde_json::json!({}),
+        };
+        let request = |claimed_edges| {
+            let mut req = recb_req(repo_id, hash.clone());
+            req.coords = oci_coords();
+            req.claimed_edges = claimed_edges;
+            req
+        };
+        uc.register_existing_cas_blob(request(Vec::new()), &test_handler())
+            .await
+            .expect("initial registration succeeds");
+        refs.fail_next_insert_for_kind(
+            "oci_layer",
+            DomainError::Invariant("synthetic claim repair failure".into()),
+        );
+
+        let err = uc
+            .register_existing_cas_blob(request(vec![claim.clone()]), &test_handler())
+            .await
+            .expect_err("a failed repair must fail the duplicate call");
+        assert!(matches!(err, AppError::Domain(DomainError::Invariant(_))));
+        assert!(
+            refs.find_by_target(repo_id, &layer, Some("oci_layer"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failed repair leaves the foreign bytes GC-eligible"
+        );
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+
+        let retry = uc
+            .register_existing_cas_blob(request(vec![claim]), &test_handler())
+            .await
+            .expect("next repeat repairs the claim");
+        assert_eq!(retry.claimed_edges_written, 1);
+        assert_eq!(
+            refs.find_by_target(repo_id, &layer, Some("oci_layer"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // ----- register_by_hash: the gate-aware dedup ------------------------
+    //
+    // A repeat of a mount whose gate never landed runs the gate instead of
+    // reporting success and changing nothing. The criterion, and why each
+    // of its three conjuncts is load-bearing, is on
+    // `IngestUseCase::dedup_or_catch_up_gate`; these tests pin the three,
+    // the idempotence that has to survive them, and what a losing
+    // concurrent repeat answers.
+
+    /// A `PersistedEvent` carrying `event` at `stream_position` on the
+    /// artifact's own stream.
+    ///
+    /// Addressed through [`StreamId::artifact`] and never by the bare
+    /// UUID: `events.stream_id` carries an `artifact-` prefix, so a stream
+    /// addressed by the UUID alone matches nothing and reads back **empty**
+    /// — which the gate-aware dedup would take as "the gate never ran",
+    /// for every artifact in the system. The catch-up assertions below
+    /// carry a positive control against exactly that: the committed
+    /// batch's `ExpectedVersion::Exact(0)` is reachable only if the seeded
+    /// genesis event was really read, where an unreadable stream would
+    /// have produced `NoStream`.
+    fn persisted_on_artifact_stream(
+        artifact_id: Uuid,
+        stream_position: u64,
+        event: DomainEvent,
+    ) -> PersistedEvent {
+        PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: StreamId::artifact(artifact_id),
+            stream_position,
+            global_position: stream_position,
+            event,
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: Actor::Api(api_actor()),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }
+    }
+
+    /// The genesis event of `artifact`, as its own mint wrote it.
+    fn genesis_event_of(artifact: &Artifact) -> DomainEvent {
+        DomainEvent::ArtifactIngested(ArtifactIngested {
+            artifact_id: artifact.id,
+            repository_id: artifact.repository_id,
+            name: artifact.name.clone(),
+            version: artifact.version.clone(),
+            sha256: artifact.sha256_checksum.clone(),
+            size_bytes: artifact.size_bytes,
+            source: IngestSource::Direct,
+            metadata: serde_json::Value::Null,
+            metadata_blob: None,
+            upstream_published_at: None,
+        })
+    }
+
+    /// An artifact row at [`sample_coords`]'s path, in whatever
+    /// quarantine state the caller names.
+    fn row_at_sample_coords(
+        repository_id: Uuid,
+        hash: &ContentHash,
+        quarantine_status: QuarantineStatus,
+    ) -> Artifact {
+        let coords = sample_coords();
+        let now = Utc::now();
+        Artifact {
+            id: Uuid::new_v4(),
+            repository_id,
+            name: coords.name,
+            name_as_published: coords.name_as_published,
+            version: coords.version,
+            path: coords.path,
+            size_bytes: 21,
+            sha256_checksum: hash.clone(),
+            sha1_checksum: None,
+            md5_checksum: None,
+            content_type: "application/gzip".into(),
+            quarantine_status,
+            rejection_reason: None,
+            quarantine_window_start: None,
+            quarantine_deadline: None,
+            provenance_hold_indefinite: false,
+            deleted_at: None,
+            upstream_published_at: None,
+            uploaded_by: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Seed the row the two-commit gate split left behind: minted,
+    /// servable, `quarantine_status` NULL, one `ArtifactIngested` on its
+    /// stream and nothing else — the gate-less genesis row the catch-up
+    /// has to recognise.
+    fn seed_gate_less_row(
+        artifacts: &MockArtifactRepository,
+        events: &MockEventStore,
+        repository_id: Uuid,
+        hash: &ContentHash,
+    ) -> Artifact {
+        let artifact = row_at_sample_coords(repository_id, hash, QuarantineStatus::None);
+        artifacts.insert(artifact.clone());
+        events.set_stream(
+            &StreamId::artifact(artifact.id),
+            vec![persisted_on_artifact_stream(
+                artifact.id,
+                0,
+                genesis_event_of(&artifact),
+            )],
+        );
+        artifact
+    }
+
+    /// A policy with every axis waived — `quarantineDuration: 0` AND
+    /// `scanBackends: []` AND `provenanceMode: off`. Its rows are
+    /// legitimately gate-less, which makes them the healthy shape that
+    /// looks most like the broken one.
+    fn fully_waived_policy() -> ScanPolicyProjection {
+        ScanPolicyProjection {
+            quarantine_duration_secs: 0,
+            scan_backends: Vec::new(),
+            provenance_mode: ProvenanceMode::Off,
+            ..global_scan_policy()
+        }
+    }
+
+    /// The event type names of a committed batch, in order.
+    fn committed_event_types(batch: &AppendEvents) -> Vec<&str> {
+        batch.events.iter().map(|e| e.event.event_type()).collect()
+    }
+
+    // -- conjunct 2's evidence predicate --------------------------------
+
+    #[test]
+    fn an_empty_stream_carries_no_gate_output() {
+        assert!(!carries_register_gate_output(&[]));
+    }
+
+    #[test]
+    fn a_genesis_only_stream_carries_no_gate_output() {
+        let artifact = row_at_sample_coords(
+            Uuid::new_v4(),
+            &ZERO_HASH.parse().unwrap(),
+            QuarantineStatus::None,
+        );
+        let stream = vec![persisted_on_artifact_stream(
+            artifact.id,
+            0,
+            genesis_event_of(&artifact),
+        )];
+        assert!(!carries_register_gate_output(&stream));
+    }
+
+    #[test]
+    fn an_artifact_quarantined_is_gate_output() {
+        let artifact_id = Uuid::new_v4();
+        let stream = vec![persisted_on_artifact_stream(
+            artifact_id,
+            0,
+            DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+                artifact_id,
+                quarantine_window_start: Utc::now(),
+            }),
+        )];
+        assert!(carries_register_gate_output(&stream));
+    }
+
+    #[test]
+    fn a_scan_requested_is_gate_output() {
+        let artifact_id = Uuid::new_v4();
+        let stream = vec![persisted_on_artifact_stream(
+            artifact_id,
+            0,
+            DomainEvent::ScanRequested(ScanRequested {
+                artifact_id,
+                scanner: "osv".into(),
+            }),
+        )];
+        assert!(carries_register_gate_output(&stream));
+    }
+
+    /// A `ScanCompleted` is deliberately **not** gate output. A rescan
+    /// sweep drove it — `cronRescanTick`'s `select_eligible` catches
+    /// `quarantine_status IS NULL` rows — and the observation window the
+    /// gate owed is still missing. Counting it would make the criterion
+    /// answer "has anything happened to this artifact" instead of "did
+    /// the gate run".
+    #[test]
+    fn a_scan_completed_from_another_mechanism_is_not_gate_output() {
+        let artifact_id = Uuid::new_v4();
+        let stream = vec![persisted_on_artifact_stream(
+            artifact_id,
+            0,
+            DomainEvent::ScanCompleted(hort_domain::events::ScanCompleted {
+                artifact_id,
+                scanner: "osv".into(),
+                finding_count: 0,
+                severity_summary: hort_domain::events::SeveritySummary {
+                    critical: 0,
+                    high: 0,
+                    medium: 0,
+                    low: 0,
+                    negligible: 0,
+                },
+                findings_blob: None,
+                assessment: hort_domain::events::ScanAssessment::Analysed,
+            }),
+        )];
+        assert!(!carries_register_gate_output(&stream));
+    }
+
+    // -- conjunct 3's per-axis expectation ------------------------------
+
+    #[test]
+    fn a_gate_that_quarantines_appends_a_durable_event() {
+        let gate = RegisterGate {
+            matched_policy: None,
+            scan_will_run: false,
+            provenance_mode: ProvenanceMode::Off,
+            provenance_will_run: false,
+            effective_duration_secs: 3600,
+            quarantined: true,
+        };
+        assert!(gate.appends_a_durable_event());
+    }
+
+    #[test]
+    fn a_gate_that_only_scans_appends_a_durable_event() {
+        let gate = RegisterGate {
+            matched_policy: None,
+            scan_will_run: true,
+            provenance_mode: ProvenanceMode::Off,
+            provenance_will_run: false,
+            effective_duration_secs: 0,
+            quarantined: false,
+        };
+        assert!(gate.appends_a_durable_event());
+    }
+
+    /// The fully waived policy: nothing appended, so its rows stay
+    /// `Duplicate` forever. A criterion that could not see this would
+    /// re-gate a healthy artifact on every mount.
+    #[test]
+    fn a_fully_waived_gate_appends_no_durable_event() {
+        let gate = RegisterGate {
+            matched_policy: None,
+            scan_will_run: false,
+            provenance_mode: ProvenanceMode::Off,
+            provenance_will_run: false,
+            effective_duration_secs: 0,
+            quarantined: false,
+        };
+        assert!(!gate.appends_a_durable_event());
+    }
+
+    /// The provenance axis is excluded on purpose: it enqueues a job row
+    /// and appends **no** event, so a catch-up driven by it would leave
+    /// the criterion that selected it still true and re-run on every
+    /// later repeat — an idempotence defect, not a heal.
+    #[test]
+    fn a_provenance_only_gate_appends_no_durable_event() {
+        let gate = RegisterGate {
+            matched_policy: None,
+            scan_will_run: false,
+            provenance_mode: ProvenanceMode::VerifyIfPresent,
+            provenance_will_run: true,
+            effective_duration_secs: 0,
+            quarantined: false,
+        };
+        assert!(
+            !gate.appends_a_durable_event(),
+            "a gate whose only output is a job row leaves no evidence a \
+             later repeat could read, so it must not found a catch-up"
+        );
+    }
+
+    // -- the catch-up ---------------------------------------------------
+
+    /// **The heal.** A repeat of the same mount over a gate-less row runs
+    /// the gate: ONE commit carrying `ArtifactQuarantined` +
+    /// `ScanRequested` and the scan job row, over the row that already
+    /// exists — no second `ArtifactIngested`, no second row.
+    #[tokio::test]
+    async fn a_repeat_over_a_gate_less_row_catches_up_the_window_and_the_scan() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        policies.insert(global_scan_policy());
+        let existing = seed_gate_less_row(&artifacts, &events, repo_id, &hash);
+
+        let outcome = uc
+            .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+            .await
+            .expect("the repeat must succeed, not fail");
+
+        assert_eq!(
+            outcome.artifact.id, existing.id,
+            "the repeat is still a dedup: no second row"
+        );
+        assert_eq!(
+            outcome.artifact.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "the row handed back is the HEALED one — every format's \
+             post-coalesce cross-repo branch renders exactly this row into \
+             its 503"
+        );
+        assert!(
+            outcome.artifact.quarantine_window_start.is_some(),
+            "the healed row carries the window the gate just derived"
+        );
+
+        let commits = lifecycle.committed_transitions();
+        assert_eq!(commits.len(), 1, "the catch-up is ONE commit: {commits:?}");
+        let (committed, batch, metadata) = &commits[0];
+        assert_eq!(committed.id, existing.id);
+        assert!(
+            metadata.is_none(),
+            "the gate writes no metadata row — the mint's own commit did"
+        );
+        // POSITIVE CONTROL on the `artifact-` prefix trap: `Exact(0)` is
+        // reachable only because the seeded genesis `ArtifactIngested` was
+        // really read back. A stream the read could not find would have
+        // produced `NoStream` here and the assertion below would still
+        // have passed.
+        assert_eq!(
+            batch.expected_version,
+            ExpectedVersion::Exact(0),
+            "the catch-up's version comes from the SAME read its evidence \
+             did, and that read saw the genesis event"
+        );
+        assert_eq!(
+            committed_event_types(batch),
+            vec!["ArtifactQuarantined", "ScanRequested"],
+            "the gate's own two events and nothing else"
+        );
+
+        let enqueues = lifecycle.ingest_enqueues();
+        assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+        assert!(
+            enqueues[0].1.iter().any(|e| matches!(
+                e,
+                IngestEnqueue::Scan { trigger_source, .. }
+                    if trigger_source == REGISTER_BY_HASH_TRIGGER_SOURCE
+            )),
+            "the catch-up enqueues the scan under the same trigger_source \
+             the mint would have: {:?}",
+            enqueues[0].1
+        );
+        let edges = lifecycle.ingest_edges();
+        assert_eq!(edges.len(), 1);
+        assert!(
+            edges[0].1.is_empty(),
+            "the catch-up claims no bytes: the row's primary_content edge \
+             committed with its own mint, and re-claiming this repeat's \
+             edges would write a set the row never claimed: {:?}",
+            edges[0].1
+        );
+    }
+
+    /// A second repeat after the heal adds nothing: the catch-up appended
+    /// the very events conjunct 2 looks for, so the criterion is
+    /// **self-extinguishing**. This is the property that keeps the heal
+    /// from becoming an idempotence defect however large the broken
+    /// population is.
+    #[tokio::test]
+    async fn the_catch_up_runs_once_and_a_further_repeat_is_a_plain_duplicate() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        policies.insert(global_scan_policy());
+        seed_gate_less_row(&artifacts, &events, repo_id, &hash);
+
+        for attempt in 1..=3 {
+            uc.register_by_hash(req_legacy(repo_id), hash.clone(), None, &test_handler())
+                .await
+                .unwrap_or_else(|e| panic!("repeat {attempt} must succeed: {e:?}"));
+        }
+
+        assert_eq!(
+            lifecycle.committed_transitions().len(),
+            1,
+            "three repeats, one gate"
+        );
+    }
+
+    /// Conjunct 1. A row whose gate ran with a window keeps answering
+    /// `Duplicate` — and the cheap status check is what gets it there
+    /// without any further I/O.
+    #[tokio::test]
+    async fn a_repeat_over_a_quarantined_row_stays_a_plain_duplicate() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, _events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        policies.insert(global_scan_policy());
+        artifacts.insert(row_at_sample_coords(
+            repo_id,
+            &hash,
+            QuarantineStatus::Quarantined,
+        ));
+
+        uc.register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+            .await
+            .expect("the repeat must succeed");
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "a gated row must not be re-gated"
+        );
+    }
+
+    /// Conjunct 1, fail-closed direction. A `Rejected` row is terminal:
+    /// whatever rejected it decided on evidence, and a mount must not undo
+    /// that decision with a late quarantine.
+    #[tokio::test]
+    async fn a_repeat_over_a_rejected_row_never_re_gates_it() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, _events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        policies.insert(global_scan_policy());
+        artifacts.insert(row_at_sample_coords(
+            repo_id,
+            &hash,
+            QuarantineStatus::Rejected,
+        ));
+
+        uc.register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+            .await
+            .expect("the repeat must succeed");
+
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// Conjunct 2 under the permissive window. `quarantineDuration: 0`
+    /// leaves a correctly-gated row at `QuarantineStatus::None`, so
+    /// conjunct 1 cannot separate it — its `ScanRequested` is what does.
+    #[tokio::test]
+    async fn a_repeat_over_a_permissive_row_that_has_its_scan_request_stays_a_duplicate() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        let mut permissive = global_scan_policy();
+        permissive.quarantine_duration_secs = 0;
+        policies.insert(permissive);
+        let existing = seed_gate_less_row(&artifacts, &events, repo_id, &hash);
+        // ...and its gate's `ScanRequested`, which is all a permissive
+        // policy's gate appends.
+        events.set_stream(
+            &StreamId::artifact(existing.id),
+            vec![
+                persisted_on_artifact_stream(existing.id, 0, genesis_event_of(&existing)),
+                persisted_on_artifact_stream(
+                    existing.id,
+                    1,
+                    DomainEvent::ScanRequested(ScanRequested {
+                        artifact_id: existing.id,
+                        scanner: "osv".into(),
+                    }),
+                ),
+            ],
+        );
+
+        uc.register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+            .await
+            .expect("the repeat must succeed");
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "a permissive row that already has its scan request must not be \
+             re-gated"
+        );
+    }
+
+    /// Conjunct 3. The fully waived policy — `quarantineDuration: 0` AND
+    /// `scanBackends: []` AND `provenanceMode: off` — legitimately appends
+    /// nothing, so its rows are indistinguishable from a broken one by
+    /// conjuncts 1 and 2 alone. This is the healthy row that looks most
+    /// like the broken one, and re-gating it would turn every mount into a
+    /// re-gate.
+    #[tokio::test]
+    async fn a_repeat_under_a_fully_waived_policy_stays_a_plain_duplicate() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        policies.insert(fully_waived_policy());
+        seed_gate_less_row(&artifacts, &events, repo_id, &hash);
+
+        let outcome = uc
+            .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+            .await
+            .expect("the repeat must succeed");
+
+        assert_eq!(outcome.artifact.quarantine_status, QuarantineStatus::None);
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "a fully waived policy's row is gate-less BY POLICY and must \
+             keep answering duplicate"
+        );
+        assert!(
+            lifecycle.ingest_enqueues().is_empty(),
+            "and it enqueues nothing"
+        );
+    }
+
+    /// Conjunct 3's provenance exclusion, end to end. A scan-waived,
+    /// zero-window policy on a provenance-capable format would have the
+    /// gate enqueue a `provenance-verify` and append nothing — so a
+    /// catch-up founded on it could never extinguish itself. It must
+    /// answer `Duplicate`.
+    #[tokio::test]
+    async fn a_repeat_under_a_provenance_only_policy_stays_a_plain_duplicate() {
+        let mut repo = sample_repository();
+        repo.format = RepositoryFormat::Oci;
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        policies.insert(ScanPolicyProjection {
+            quarantine_duration_secs: 0,
+            scan_backends: Vec::new(),
+            provenance_mode: ProvenanceMode::VerifyIfPresent,
+            ..global_scan_policy()
+        });
+        seed_gate_less_row(&artifacts, &events, repo_id, &hash);
+
+        let mut req = req_legacy(repo_id);
+        req.coords.format = RepositoryFormat::Oci;
+        uc.register_by_hash(req, hash, None, &test_handler())
+            .await
+            .expect("the repeat must succeed");
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "the provenance axis leaves no durable evidence, so it must not \
+             drive a catch-up that would repeat forever"
+        );
+    }
+
+    /// **A concurrent double repeat lands one gate, not two.** Both
+    /// repeats observe "no gate result"; the version read beside that
+    /// evidence is what makes the second append lose. The loser answers
+    /// `Duplicate` — the answer this path gave before the catch-up
+    /// existed, over a row the winner has already healed.
+    ///
+    /// The interleaving is forced rather than hoped for:
+    /// `set_stream_after_next_read` serves the gate-less stream to this
+    /// call's read and installs the winner's gated stream behind it, which
+    /// is exactly "a concurrent repeat committed between our read and our
+    /// append".
+    #[tokio::test]
+    async fn the_losing_half_of_a_concurrent_double_repeat_answers_duplicate() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let events = Arc::new(MockEventStore::new());
+        let content_references = Arc::new(MockContentReferenceIndex::new());
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone(), events.clone())
+                .with_content_references(content_references.clone())
+                // The optimistic-concurrency check the Postgres adapter
+                // gets for free from the event-store append inside its
+                // transaction.
+                .with_optimistic_concurrency(),
+        );
+        let groups = Arc::new(MockArtifactGroupRepository::new());
+        let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+        let uc = IngestUseCase::new(
+            Arc::new(MockStoragePort::new()),
+            lifecycle.clone(),
+            artifacts.clone(),
+            {
+                let repos = Arc::new(MockRepositoryRepository::new());
+                repos.insert(repo);
+                repos
+            },
+            crate::event_store_publisher::wrap_for_test(events.clone()),
+            Arc::new(MockCurationRuleRepository::new()),
+            Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true)),
+            true,
+            HashMap::new(),
+            0,
+            content_references,
+            policies.clone(),
+            Arc::new(MockJobsRepository::default()),
+        );
+        policies.insert(global_scan_policy());
+
+        let existing = seed_gate_less_row(&artifacts, &events, repo_id, &hash);
+        let stream_id = StreamId::artifact(existing.id);
+        // The winner's commit, landing between this call's stream read and
+        // its append.
+        events.set_stream_after_next_read(
+            &stream_id,
+            vec![
+                persisted_on_artifact_stream(existing.id, 0, genesis_event_of(&existing)),
+                persisted_on_artifact_stream(
+                    existing.id,
+                    1,
+                    DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+                        artifact_id: existing.id,
+                        quarantine_window_start: Utc::now(),
+                    }),
+                ),
+                persisted_on_artifact_stream(
+                    existing.id,
+                    2,
+                    DomainEvent::ScanRequested(ScanRequested {
+                        artifact_id: existing.id,
+                        scanner: "osv".into(),
+                    }),
+                ),
+            ],
+        );
+
+        let outcome = uc
+            .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+            .await
+            .expect("the loser answers duplicate, never an error");
+
+        assert_eq!(
+            outcome.artifact.id, existing.id,
+            "the loser hands back the deduplicated row, not a new one"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "the loser's append failed the version check, so nothing of its \
+             gate was recorded: {:?}",
+            lifecycle.committed_transitions()
+        );
+        assert_eq!(
+            events.stream_snapshot(&stream_id).len(),
+            3,
+            "the winner's three events and no fourth — one gate, not two"
+        );
+    }
+
+    /// A stream read that fails leaves whether the gate ran **unknown**,
+    /// and an unknown answers `Duplicate`: the registration is complete
+    /// and the caller's mount succeeded, so an opportunistic heal must
+    /// never turn that into an error.
+    #[tokio::test]
+    async fn a_repeat_whose_stream_read_fails_answers_duplicate_unchanged() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        policies.insert(global_scan_policy());
+        let existing = seed_gate_less_row(&artifacts, &events, repo_id, &hash);
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+        let outcome = uc
+            .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+            .await
+            .expect("a failed heal must not fail the registration");
+
+        assert_eq!(outcome.artifact.id, existing.id);
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// An over-cap stream cannot show that the gate's events are absent —
+    /// only that they are absent from the oldest `STREAM_EVENT_CAP`. The
+    /// pairing refuses to answer and the repeat stays a `Duplicate`.
+    #[tokio::test]
+    async fn a_repeat_over_an_over_cap_stream_answers_duplicate_unchanged() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        policies.insert(global_scan_policy());
+        let existing = seed_gate_less_row(&artifacts, &events, repo_id, &hash);
+        let over_cap: Vec<PersistedEvent> = (0..=crate::use_cases::STREAM_EVENT_CAP)
+            .map(|position| {
+                persisted_on_artifact_stream(existing.id, position, genesis_event_of(&existing))
+            })
+            .collect();
+        events.set_stream(&StreamId::artifact(existing.id), over_cap);
+
+        let outcome = uc
+            .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+            .await
+            .expect("the repeat must succeed");
+
+        assert_eq!(outcome.artifact.id, existing.id);
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// Conjunct 1 is checked **twice**, on two different reads of the row,
+    /// and the second check is the one this pins. `ArtifactAtVersion::load`
+    /// reads the version first and the artifact row after, so a verdict
+    /// that committed between the dedup's `find_by_path` and the pairing is
+    /// in the fresh row while the version still predates it — and without
+    /// the re-check the catch-up would quarantine an artifact something
+    /// else has already terminalised, with an append that does **not**
+    /// conflict.
+    ///
+    /// The race is expressed directly: `existing` is the dedup's earlier,
+    /// now-stale read, and the repository holds the same row at the verdict
+    /// that landed since. A rescan sweep reaches exactly this state —
+    /// `cronRescanTick` selects on `quarantine_status IS NULL`, so a
+    /// gate-less row can acquire a `ScanCompleted` and an
+    /// `ArtifactRejected` while carrying neither of the gate's own events.
+    #[tokio::test]
+    async fn a_repeat_whose_row_was_terminalised_since_the_dedup_read_does_not_re_gate_it() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        policies.insert(global_scan_policy());
+        let existing = seed_gate_less_row(&artifacts, &events, repo_id, &hash);
+
+        // The verdict that landed since the dedup read it: terminal on the
+        // row, and with neither of the gate's own events on the stream, so
+        // conjunct 2 cannot see it either.
+        let mut rejected_since = existing.clone();
+        rejected_since.quarantine_status = QuarantineStatus::Rejected;
+        artifacts.insert(rejected_since);
+
+        let artifact = uc
+            .dedup_or_catch_up_gate(
+                // The dedup's own, now-stale read.
+                existing.clone(),
+                None,
+                REGISTER_BY_HASH_TRIGGER_SOURCE,
+                "pypi",
+                &api_actor(),
+            )
+            .await;
+        assert_eq!(
+            artifact.quarantine_status,
+            QuarantineStatus::Rejected,
+            "and the row handed back is the FRESH one, not the stale read"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "a late quarantine must never overwrite a verdict that is              already durable"
+        );
+    }
+
+    /// A commit failure that is not a `Conflict` answers the same way, for
+    /// the same reason: the mount succeeded, the heal did not, and the
+    /// next repeat retries it.
+    #[tokio::test]
+    async fn a_repeat_whose_catch_up_commit_fails_answers_duplicate_unchanged() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, artifacts, lifecycle, _storage, repos, policies, _jobs, _refs, events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        policies.insert(global_scan_policy());
+        let existing = seed_gate_less_row(&artifacts, &events, repo_id, &hash);
+        lifecycle.fail_next_commit(DomainError::Invariant("database down".into()));
+
+        let outcome = uc
+            .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+            .await
+            .expect("a failed heal must not fail the registration");
+
+        assert_eq!(
+            outcome.artifact.id, existing.id,
+            "the row handed back is the UNHEALED one the caller already had"
+        );
+        assert_eq!(
+            outcome.artifact.quarantine_status,
+            QuarantineStatus::None,
+            "and it must not advertise a window that never committed"
+        );
     }
 
     /// The cross-repo follower's row is the one artifact every format's
@@ -9507,25 +11467,23 @@ mod tests {
                 "the lookup failure must not prevent the quarantine transition"
             );
 
-            // Two commits — ArtifactIngested, then the quarantine
-            // follow-on (`commit_transition_with_enqueues`).
+            // One commit — ArtifactIngested and the quarantine transition
+            // in the same `commit_transition_with_enqueues`.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2, "{transitions:?}");
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
 
             // Default policy (no operator policy resolved — the lookup
-            // failed) still scans by default. Index 0 is the mint, which
-            // rides the same method to carry its `primary_content` edge and
-            // enqueues nothing.
+            // failed) still scans by default, and that enqueue rides the
+            // one commit alongside the `primary_content` edge.
             let enqueues = lifecycle.ingest_enqueues();
-            assert_eq!(enqueues.len(), 2, "{enqueues:?}");
-            assert!(enqueues[0].1.is_empty(), "the mint enqueues nothing");
+            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
             assert!(
-                enqueues[1].1.iter().any(|e| matches!(
+                enqueues[0].1.iter().any(|e| matches!(
                     e,
                     IngestEnqueue::Scan { trigger_source, .. } if trigger_source == "seed-import"
                 )),
                 "policy-lookup failure must still fall back to the scanning DefaultPolicy: {:?}",
-                enqueues[1].1
+                enqueues[0].1
             );
         });
     }
@@ -9565,13 +11523,12 @@ mod tests {
                 .await
                 .expect("metadata round-trip path must succeed");
 
-            // Two transitions — `ArtifactIngested` (asserted below),
-            // then the generalized gate's follow-on `ScanRequested`
-            // commit (issue #107 Item 1; the shared permissive-global
-            // test policy still scans even though it does not
-            // quarantine). Only the FIRST commit is this test's concern.
+            // One transition, carrying `ArtifactIngested` (asserted below)
+            // and the gate's `ScanRequested` in the same batch (the shared
+            // permissive-global test policy still scans even though it does
+            // not quarantine). Only the mint event is this test's concern.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2);
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
 
             // Event payload carries the exact JSON the caller supplied.
             match &transitions[0].1.events[0].event {
@@ -9661,11 +11618,10 @@ mod tests {
                 "new artifact is a fresh row"
             );
 
-            // Two transitions — see the identical note in
-            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
-            // gate).
+            // One transition — see the identical note in
+            // `register_by_hash_some_src_happy_path`.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2);
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
         });
     }
 
@@ -10017,15 +11973,14 @@ mod tests {
                 // Same artifact row — idempotent on the aggregate id.
                 assert_eq!(first.artifact.id, second.artifact.id);
 
-                // Two commits total: `ArtifactIngested` + the generalized
-                // gate's follow-on `ScanRequested` (issue #107 Item 1)
-                // for the FIRST call only — the second call's dedup path
-                // short-circuits before the lifecycle port (and before
-                // the gate) entirely.
+                // One commit total: `ArtifactIngested` + the gate's
+                // `ScanRequested` in one batch, for the FIRST call only —
+                // the second call's dedup path short-circuits before the
+                // lifecycle port (and before the gate) entirely.
                 let transitions = lifecycle.committed_transitions();
                 assert_eq!(
                     transitions.len(),
-                    2,
+                    1,
                     "same-path-same-hash dedup must not emit a second commit"
                 );
             });
@@ -10089,11 +12044,11 @@ mod tests {
                 "expected Conflict, got {err:?}"
             );
 
-            // Two commits from the first (successful) placement only —
-            // `ArtifactIngested` + the generalized gate's follow-on
-            // `ScanRequested` (issue #107 Item 1); the conflict
-            // rejection on the second call did not emit any event.
-            assert_eq!(lifecycle.committed_transitions().len(), 2);
+            // One commit from the first (successful) placement only —
+            // `ArtifactIngested` + the gate's `ScanRequested` in one
+            // batch; the conflict rejection on the second call did not
+            // emit any event.
+            assert_eq!(lifecycle.committed_transitions().len(), 1);
         });
     }
 
@@ -10127,12 +12082,12 @@ mod tests {
                 outcome.artifact.size_bytes, expected_size as i64,
                 "register_by_hash must source size_bytes authoritatively from storage.size_of"
             );
-            // Event payload carries the same authoritative size. Two
-            // transitions total — see the identical note in
-            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
-            // gate); only the FIRST commit is this test's concern.
+            // Event payload carries the same authoritative size. One
+            // transition total — see the identical note in
+            // `register_by_hash_some_src_happy_path`; only the mint event
+            // is this test's concern.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2);
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
             match &transitions[0].1.events[0].event {
                 DomainEvent::ArtifactIngested(ev) => {
                     assert_eq!(ev.size_bytes, expected_size as i64);
@@ -10178,11 +12133,10 @@ mod tests {
                 "register_by_hash writes exactly one refcount row (primary_content)"
             );
 
-            // Two transitions — see the identical note in
-            // `register_by_hash_some_src_happy_path` (issue #107 Item 1
-            // gate).
+            // One transition — see the identical note in
+            // `register_by_hash_some_src_happy_path`.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2);
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
             let artifact = &transitions[0].0;
 
             let rows = content_refs
@@ -10960,8 +12914,8 @@ mod tests {
             assert_eq!(
                 lifecycle.committed_transitions().len(),
                 0,
-                "no transition may commit — not the mint, and therefore not the \
-                 generalized gate's follow-on either"
+                "no transition may commit — the edge rides the same call as the \
+                 mint and the gate, so a failed edge takes all three with it"
             );
             assert_eq!(
                 content_refs.entry_count(),
@@ -11005,8 +12959,8 @@ mod tests {
                 .expect("register_by_hash must succeed");
             let artifact = outcome.artifact;
 
-            // The mint carries the edge; the gate's follow-on commit carries
-            // none (it is a transition over an artifact that already exists).
+            // One call carries the whole registration, the edge included —
+            // there is no second commit for an edge to be topped up on.
             assert_eq!(
                 lifecycle.ingest_edge_kinds(),
                 vec![(
@@ -14158,19 +16112,19 @@ mod tests {
     /// `ChecksumMismatch` audit events forever. The workspace-wide
     /// `STREAM_EVENT_CAP` (200) is calibrated for *artifact* streams
     /// (finite lifecycle, ~5–10 events); capping the audit stream would
-    /// silently drop mismatch events past the 200th — exactly when an
+    /// silently drop mismatch events past the cap — exactly when an
     /// audit trail matters most (sustained tampering = many events).
     ///
     /// Issue #88 revised the mechanism entirely: `append_repository_event`
     /// no longer calls `read_unpaired_append_version` (whose capped forward-scan
     /// is only correct for a *bounded* stream) at all — it appends at
     /// `ExpectedVersion::Any` with bounded conflict-retry. This test
-    /// drives 250 (`STREAM_EVENT_CAP + 50`) consecutive `ChecksumMismatch`
+    /// drives `STREAM_EVENT_CAP + 50` consecutive `ChecksumMismatch`
     /// appends and asserts every one succeeds AND that zero `read_stream`
     /// calls ever happen — the strongest possible pin against the
     /// capped-read staleness bug recurring on this stream (a real,
-    /// unbounded-past-201-events repository stream would have made every
-    /// append past #201 fail `Conflict` under the pre-#88 mechanism, since
+    /// repository stream past the cap would have made later appends fail
+    /// `Conflict` under the old mechanism, since
     /// that mechanism's version-number read was a truncated,
     /// increasingly-stale scan-from-start — see the mod.rs doc on
     /// `read_unpaired_append_version` for the full mechanism).
@@ -14396,10 +16350,7 @@ mod tests {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let content_references = Arc::new(MockContentReferenceIndex::new());
-        let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_content_references(content_references.clone()),
-        );
+        let lifecycle = mock_lifecycle(&artifacts, &events, &content_references);
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -14789,6 +16740,28 @@ mod tests {
             );
             assert_eq!(params["current_depth"], 0);
             assert!(actor_id.is_none(), "cascade hook is system-driven");
+            // The band, through the table rather than as a number. The
+            // cascade root carries `'ingest'` because an ingest caused
+            // it, and the table files it with the cascade's own children
+            // anyway: nobody waits on a warm-up walk, and one root per
+            // artifact is a flood that would otherwise preempt the
+            // operator work it drains behind.
+            assert_eq!(
+                jobs.enqueue_trigger_sources(),
+                vec![INGEST_TRIGGER_SOURCE.to_string()],
+            );
+            assert_eq!(
+                jobs.enqueue_priorities(),
+                vec![queue_priority(
+                    PREFETCH_DEPENDENCIES_KIND,
+                    INGEST_TRIGGER_SOURCE
+                )],
+                "the cascade root must enqueue at the ordinal the table decides for its pair"
+            );
+            assert!(
+                jobs.enqueue_priorities()[0] < scan_queue_priority(INGEST_TRIGGER_SOURCE),
+                "it must not outrank the ingest-time gates the same push is waiting on"
+            );
         });
     }
 
@@ -14919,6 +16892,70 @@ mod tests {
         });
     }
 
+    /// The second producer of the cascade root: `register_by_hash`'s
+    /// own hook (the OCI cross-repository mount and the pull-dedup
+    /// followers), which mirrors `ingest_inner`'s.
+    ///
+    /// Asserted here because the two hooks are separate code paths that
+    /// each call the table for themselves, and the thing worth pinning
+    /// is that they agree — a root minted over content already in CAS
+    /// is the same warm-up walk nobody waits on as a root spawned by a
+    /// push, and it stamps the same pair.
+    #[test]
+    fn cascade_hook_on_register_by_hash_enqueues_the_root_in_the_bulk_band() {
+        let repo = repo_with_transitive_deps_trigger();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, storage, repos, policy_projections, jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            seed_permissive_global_policy(&policy_projections);
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            uc.register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("register_by_hash must succeed");
+
+            let cascade_calls: Vec<_> = jobs
+                .enqueue_calls()
+                .into_iter()
+                .filter(|(kind, _, _)| kind == PREFETCH_DEPENDENCIES_KIND)
+                .collect();
+            assert_eq!(
+                cascade_calls.len(),
+                1,
+                "the register_by_hash hook fires one depth-0 root when the TransitiveDeps \
+                 trigger is configured"
+            );
+            assert_eq!(cascade_calls[0].1["current_depth"], 0);
+            assert!(
+                cascade_calls[0].2.is_none(),
+                "the hook is system-driven (no actor_id)"
+            );
+
+            // Same pair, and the band through the table — not a number.
+            assert_eq!(
+                jobs.enqueue_trigger_sources(),
+                vec![INGEST_TRIGGER_SOURCE.to_string()],
+            );
+            assert_eq!(
+                jobs.enqueue_priorities(),
+                vec![queue_priority(
+                    PREFETCH_DEPENDENCIES_KIND,
+                    INGEST_TRIGGER_SOURCE
+                )],
+                "both cascade producers must enqueue at the ordinal the table decides"
+            );
+            assert!(
+                jobs.enqueue_priorities()[0] < scan_queue_priority(REGISTER_BY_HASH_TRIGGER_SOURCE),
+                "a mount's warm-up walk must not outrank the gates the mount itself is \
+                 waiting on"
+            );
+        });
+    }
+
     #[test]
     fn item_12b_cascade_hook_enqueue_failure_does_not_abort_ingest() {
         // The cascade is best-effort — an enqueue error logs `warn!`
@@ -14967,10 +17004,7 @@ mod tests {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let content_references = Arc::new(MockContentReferenceIndex::new());
-        let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_content_references(content_references.clone()),
-        );
+        let lifecycle = mock_lifecycle(&artifacts, &events, &content_references);
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -15016,10 +17050,7 @@ mod tests {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let content_references = Arc::new(MockContentReferenceIndex::new());
-        let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_content_references(content_references.clone()),
-        );
+        let lifecycle = mock_lifecycle(&artifacts, &events, &content_references);
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -15117,34 +17148,38 @@ mod tests {
                 "non-seed anchor must be `now` (no backdated override supplied)"
             );
 
+            // One commit, carrying the mint and the gate it resolved: the
+            // artifact row never reaches the backend at
+            // `QuarantineStatus::None`.
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2, "{transitions:?}");
-            assert!(transitions[1]
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
+            let kinds: Vec<&str> = transitions[0]
                 .1
                 .events
                 .iter()
-                .any(|e| matches!(e.event, DomainEvent::ArtifactQuarantined(_))));
-            assert!(transitions[1]
-                .1
-                .events
-                .iter()
-                .any(|e| matches!(e.event, DomainEvent::ScanRequested(_))));
+                .map(|e| e.event.event_type())
+                .collect();
+            assert_eq!(
+                kinds,
+                vec!["ArtifactIngested", "ArtifactQuarantined", "ScanRequested"],
+                "mint and gate ride one batch: {kinds:?}"
+            );
+            assert_eq!(
+                transitions[0].0.quarantine_status,
+                QuarantineStatus::Quarantined,
+                "the row this commit persists is already gated"
+            );
 
-            // Index 0 is the mint: the genesis commit rides
-            // `commit_transition_with_enqueues` too — not for enqueues (it
-            // has none) but to carry the artifact's `primary_content` edge
-            // in its own transaction. The gate's batch is index 1.
             let enqueues = lifecycle.ingest_enqueues();
-            assert_eq!(enqueues.len(), 2, "{enqueues:?}");
-            assert!(enqueues[0].1.is_empty(), "the mint enqueues nothing");
+            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
             assert!(
-                enqueues[1].1.iter().any(|e| matches!(
+                enqueues[0].1.iter().any(|e| matches!(
                     e,
                     IngestEnqueue::Scan { trigger_source, .. } if trigger_source == "register-by-hash"
                 )),
                 "non-seed caller's enqueue must carry trigger_source=register-by-hash, \
                  not seed-import: {:?}",
-                enqueues[1].1
+                enqueues[0].1
             );
         });
     }
@@ -15179,26 +17214,26 @@ mod tests {
             );
 
             let transitions = lifecycle.committed_transitions();
-            assert_eq!(transitions.len(), 2, "{transitions:?}");
-            let follow_on_kinds: Vec<&str> = transitions[1]
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
+            let kinds: Vec<&str> = transitions[0]
                 .1
                 .events
                 .iter()
                 .map(|e| e.event.event_type())
                 .collect();
             assert_eq!(
-                follow_on_kinds,
-                vec!["ArtifactQuarantined"],
-                "no ScanRequested under an explicit scan_backends:[] waiver: {follow_on_kinds:?}"
+                kinds,
+                vec!["ArtifactIngested", "ArtifactQuarantined"],
+                "no ScanRequested under an explicit scan_backends:[] waiver: {kinds:?}"
             );
             // `commit_transition_with_enqueues` records a `(id, enqueues)`
-            // entry on EVERY call, including ones with an empty `enqueues`
+            // entry on EVERY call, including one with an empty `enqueues`
             // slice (the call happened; nothing was requested) — assert
-            // the SLICES are empty, not that no call was recorded. Two
-            // calls: the mint (riding this method for its `primary_content`
-            // edge) and the gate's quarantine commit.
+            // the SLICE is empty, not that no call was recorded. The one
+            // call carries the mint, the quarantine transition and the
+            // artifact's `primary_content` edge.
             let enqueues = lifecycle.ingest_enqueues();
-            assert_eq!(enqueues.len(), 2, "{enqueues:?}");
+            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
             assert!(
                 enqueues.iter().all(|(_, e)| e.is_empty()),
                 "no Scan job enqueue under an explicit scan_backends:[] waiver: {enqueues:?}"
@@ -15252,14 +17287,14 @@ mod tests {
     }
 
     /// non-seed x fully-waived policy (duration=0 AND scan_backends=[] AND
-    /// provenance_mode=off): the generalized gate has NOTHING to append or
-    /// enqueue, so it must skip its follow-on commit ENTIRELY — exactly one
-    /// `ArtifactIngested` commit, artifact stays `None`/downloadable.
-    /// Exercises the `!events.is_empty() || !enqueues.is_empty()` guard's
-    /// false arm, which no other test reaches (every other register_by_hash
-    /// test's policy enqueues at least a scan).
+    /// provenance_mode=off): the gate has NOTHING to append or enqueue, so
+    /// the one commit carries the bare mint — a single `ArtifactIngested`,
+    /// no enqueue, artifact stays `None`/downloadable. The only cell of the
+    /// matrix in which the committed `None` status is the intended end
+    /// state rather than a stage; every other register_by_hash test's
+    /// policy appends or enqueues something.
     #[test]
-    fn register_by_hash_non_seed_fully_waived_policy_skips_follow_on_commit_entirely() {
+    fn register_by_hash_non_seed_fully_waived_policy_commits_the_bare_mint() {
         let repo = pypi_repository();
         let repo_id = repo.id;
 
@@ -15286,12 +17321,18 @@ mod tests {
                 "a fully-waived policy (duration=0, scan off, provenance off) leaves the \
                  artifact None/downloadable, matching ingest_inner's identical case"
             );
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 1, "{transitions:?}");
+            let kinds: Vec<&str> = transitions[0]
+                .1
+                .events
+                .iter()
+                .map(|e| e.event.event_type())
+                .collect();
             assert_eq!(
-                lifecycle.committed_transitions().len(),
-                1,
-                "nothing to append or enqueue -> the follow-on commit must be skipped \
-                 entirely, not sent empty: {:?}",
-                lifecycle.committed_transitions()
+                kinds,
+                vec!["ArtifactIngested"],
+                "a fully-waived policy appends nothing beyond the mint: {kinds:?}"
             );
             // One recorded call — the mint, which carries the artifact's
             // `primary_content` edge and no enqueue at all.
@@ -15302,6 +17343,250 @@ mod tests {
                     .all(|(_, e)| e.is_empty()),
                 "{:?}",
                 lifecycle.ingest_enqueues()
+            );
+        });
+    }
+
+    // =====================================================================
+    // Mint and gate are ONE commit — the pair the registration path must
+    // never split again.
+    //
+    // The first pins what the merged shape commits; the second pins what
+    // is left behind when that commit fails; the third pins that the
+    // second's failure seam is selective rather than blanket. None of them
+    // is about a cause — a `trigger_source` CHECK, a deadlock, a dropped
+    // connection — because the remainder is the same whatever the route:
+    // the first commit of a split pair already publishes a SERVABLE
+    // artifact (`QuarantineStatus::None` is the most permissive state in
+    // the system, `Artifact::is_downloadable` admits it, and the default
+    // `ReleasedOnly` index mode serves it), so a failure after it leaves
+    // an artifact that is never scanned and no job row to record that a
+    // verdict is owed.
+    // =====================================================================
+
+    /// What holds the merged shape: under a quarantining, scanning policy
+    /// the registration makes exactly ONE lifecycle call, and that one call
+    /// carries all of it — the mint event, the gate's events, the artifact
+    /// row already at `Quarantined`, its metadata projection, the scan
+    /// enqueue and the `primary_content` edge.
+    ///
+    /// A re-split fails this test in whichever form it takes: a second
+    /// `commit_transition_with_enqueues`, a second plain
+    /// `commit_transition`, or a best-effort second commit whose error is
+    /// swallowed all land a second entry in `committed_transitions()`.
+    #[test]
+    fn register_by_hash_mint_and_gate_ride_one_commit() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs, content_refs, _events) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+            policies.insert(global_scan_policy()); // duration = 24h, scan_backends = ["osv"]
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash.clone(), None, &test_handler())
+                .await
+                .expect("registration under a quarantining, scanning policy must succeed");
+            let artifact_id = outcome.artifact.id;
+
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(
+                transitions.len(),
+                1,
+                "the mint and the gate must be ONE commit — a second entry here is the \
+                 split that leaves a servable, never-scanned artifact behind: {transitions:?}"
+            );
+            let (committed, batch, metadata) = &transitions[0];
+
+            let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+            assert_eq!(
+                kinds,
+                vec!["ArtifactIngested", "ArtifactQuarantined", "ScanRequested"],
+                "one batch carries the mint event and both gate events: {kinds:?}"
+            );
+            assert_eq!(
+                batch.expected_version,
+                ExpectedVersion::NoStream,
+                "the batch is the stream's genesis — there is no earlier append of \
+                 this registration's to be ordered after"
+            );
+
+            // The row this commit persists is the GATED one: the backend
+            // never sees the permissive `None` the struct was built with.
+            assert_eq!(committed.quarantine_status, QuarantineStatus::Quarantined);
+            assert!(
+                !committed.is_downloadable(),
+                "the only artifact state this path ever persists under a quarantining \
+                 policy must not be servable"
+            );
+            assert!(committed.quarantine_window_start.is_some());
+            assert!(
+                metadata.is_some(),
+                "the metadata projection rides the same commit as the row it describes"
+            );
+
+            // The gate's enqueue and the mint's edge ride that SAME call —
+            // asserted through the per-call snapshots, which say *which*
+            // write carried them, rather than through the index contents,
+            // which do not.
+            let enqueues = lifecycle.ingest_enqueues();
+            assert_eq!(enqueues.len(), 1, "{enqueues:?}");
+            assert_eq!(enqueues[0].0, artifact_id);
+            assert!(
+                enqueues[0].1.iter().any(|e| matches!(
+                    e,
+                    IngestEnqueue::Scan { trigger_source, .. }
+                        if trigger_source == "register-by-hash"
+                )),
+                "the scan job rides the commit that gated the row: {:?}",
+                enqueues[0].1
+            );
+            assert_eq!(
+                lifecycle.ingest_edge_kinds(),
+                vec![(
+                    artifact_id,
+                    "primary_content".to_string(),
+                    hash.as_ref().to_owned()
+                )],
+                "and so does the artifact's claim on its own bytes"
+            );
+            assert_eq!(content_refs.entry_count(), 1, "the edge reached the index");
+        });
+    }
+
+    /// The gate-bearing commit fails, and NOTHING servable is left behind.
+    ///
+    /// The discriminator is the commit's **content**, never its ordinal: a
+    /// double armed to fail "the second call" states a property of a split
+    /// that, once merged, selects nothing and passes vacuously. Armed on
+    /// content — "the commit carrying the quarantine transition, or a
+    /// non-empty enqueue list" — the same test selects the gate-bearing
+    /// commit in either shape. Against the split it fails the follow-on
+    /// and finds the mint's servable `QuarantineStatus::None` row, its
+    /// `primary_content` edge and its event still committed; against one
+    /// commit it fails the whole registration and finds none of them.
+    ///
+    /// The injected error is a `DomainError::Invariant`, deliberately not
+    /// anything the `jobs.trigger_source` CHECK would produce: that cause
+    /// is fixed, and the hazard this pins is the class, not the cause.
+    #[test]
+    fn register_by_hash_failed_gate_commit_leaves_nothing_servable() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, lifecycle, storage, repos, policies, _jobs, content_refs, _events) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+            policies.insert(global_scan_policy()); // duration = 24h, scan_backends = ["osv"]
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            lifecycle.fail_commits_carrying(
+                |c| {
+                    c.events
+                        .events
+                        .iter()
+                        .any(|e| matches!(e.event, DomainEvent::ArtifactQuarantined(_)))
+                        || !c.enqueues.is_empty()
+                },
+                DomainError::Invariant(
+                    "synthetic gate-commit failure (not the trigger_source CHECK)".into(),
+                ),
+            );
+
+            let err = uc
+                .register_by_hash(req_legacy(repo_id), hash.clone(), None, &test_handler())
+                .await
+                .expect_err("a failed gate-bearing commit must fail the registration");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Invariant(_))),
+                "expected the injected Invariant, got {err:?}"
+            );
+
+            // The remainder. An artifact row here is the defect itself: it
+            // would carry `QuarantineStatus::None`, which `is_downloadable`
+            // admits and the default `ReleasedOnly` index mode serves.
+            let left_behind = artifacts
+                .find_by_repo_and_checksum(repo_id, &hash)
+                .await
+                .unwrap();
+            assert!(
+                left_behind.is_none(),
+                "a failed gate commit left an artifact behind: status={:?}, \
+                 downloadable={:?} — it will never be scanned and no job row says \
+                 a verdict is owed",
+                left_behind.as_ref().map(|a| a.quarantine_status),
+                left_behind.as_ref().map(Artifact::is_downloadable),
+            );
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "no transition may commit: {:?}",
+                lifecycle.committed_transitions()
+            );
+            assert_eq!(
+                content_refs.entry_count(),
+                0,
+                "and no edge claiming its bytes may survive either"
+            );
+            // The other half of the remainder, which held in the split
+            // shape too and must keep holding: no `jobs` row exists, so
+            // nothing would have made anyone aware a verdict was owed.
+            assert!(
+                lifecycle.scan_enqueues().is_empty(),
+                "{:?}",
+                lifecycle.scan_enqueues()
+            );
+        });
+    }
+
+    /// Counter-assertion to the class test above: the seam it stands on is
+    /// SELECTIVE. A predicate naming content this path never commits must
+    /// leave the registration untouched — without this, a double that
+    /// failed every commit would make that test green for the wrong
+    /// reason, and the test would say nothing about *which* commit carries
+    /// the gate.
+    #[test]
+    fn register_by_hash_commit_failure_seam_fires_only_on_matching_content() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, lifecycle, storage, repos, policies, _jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            policies.insert(global_scan_policy());
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            // `ArtifactRejected` is never part of a registration's batch.
+            lifecycle.fail_commits_carrying(
+                |c| {
+                    c.events
+                        .events
+                        .iter()
+                        .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_)))
+                },
+                DomainError::Invariant("must never fire on a registration batch".into()),
+            );
+
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("a non-matching predicate must not fail the registration");
+            assert_eq!(
+                outcome.artifact.quarantine_status,
+                QuarantineStatus::Quarantined
+            );
+            assert_eq!(
+                lifecycle.committed_transitions().len(),
+                1,
+                "{:?}",
+                lifecycle.committed_transitions()
             );
         });
     }
@@ -15791,10 +18076,7 @@ mod tests {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let content_references = Arc::new(MockContentReferenceIndex::new());
-        let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_content_references(content_references.clone()),
-        );
+        let lifecycle = mock_lifecycle(&artifacts, &events, &content_references);
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
@@ -16540,7 +18822,8 @@ mod tests {
                 sample_actor(),
                 serde_json::Value::Null,
                 upstream_digest,
-                Some(subject_hash), &[],
+                Some(subject_hash),
+                &[],
                 content_stream(content),
             )
             .await
@@ -16568,12 +18851,35 @@ mod tests {
             // No idempotency key — a re-verify is a harmless idempotent
             // verdict.
             assert_eq!(jobs.enqueue_idem_keys(), vec![None]);
-            // #44: the signature-arrival verify is clearance-gating, so it
-            // enqueues at the elevated tier to preempt the bulk ingest backlog.
+            // Both halves of the row, because this hook used to get
+            // one of them wrong: it stamped `'ingest'`, so a
+            // signature-arrival verify was indistinguishable from the
+            // ingest-time backlog it is supposed to preempt. The
+            // ordinal is the one the table decides for this pair, not a
+            // re-typed number — and the claim that makes it worth
+            // asserting is the relation beneath it: this row outranks
+            // the one-per-ingest verify backlog it used to share an
+            // ordinal with.
+            assert_eq!(
+                jobs.enqueue_trigger_sources(),
+                vec![TriggerSource::Clearance.as_str().to_string()],
+                "the signature-arrival verify must stamp its own trigger source, not borrow \
+                 the ingest-time verify's"
+            );
             assert_eq!(
                 jobs.enqueue_priorities(),
-                vec![CLEARANCE_VERIFY_PRIORITY],
-                "signature-arrival provenance-verify must enqueue at the elevated clearance tier (#44)"
+                vec![queue_priority(
+                    PROVENANCE_VERIFY_KIND,
+                    CLEARANCE_TRIGGER_SOURCE
+                )],
+                "signature-arrival provenance-verify must enqueue at the ordinal the table \
+                 decides for its own trigger source"
+            );
+            assert!(
+                jobs.enqueue_priorities()[0]
+                    > queue_priority(PROVENANCE_VERIFY_KIND, INGEST_TRIGGER_SOURCE),
+                "it must outrank the ingest-time verify backlog, or a held artifact waits \
+                 for the backlog rather than for its own verify"
             );
         });
     }
@@ -16687,10 +18993,7 @@ mod tests {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
         let content_references = Arc::new(MockContentReferenceIndex::new());
-        let lifecycle = Arc::new(
-            MockArtifactLifecycle::new(artifacts.clone())
-                .with_content_references(content_references.clone()),
-        );
+        let lifecycle = mock_lifecycle(&artifacts, &events, &content_references);
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());

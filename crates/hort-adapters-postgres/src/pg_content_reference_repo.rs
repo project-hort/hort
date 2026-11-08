@@ -52,6 +52,8 @@
 //! under a *different* kind OR a different target adds a sibling row —
 //! the refcount design and the OCI index's N-children membership both
 //! require this.
+//! `insert_missing` uses the same statement with the conflict update
+//! disabled, so a dedup repair leaves existing metadata and timestamps alone.
 //!
 //! # Why the upsert runs in a transaction that first takes a lock
 //!
@@ -173,13 +175,13 @@ fn row_to_reference(row: ContentReferenceRow) -> DomainResult<ContentReference> 
 /// Upsert `edges` inside a transaction the caller owns, under the
 /// blob-reclamation lock for every target hash.
 ///
-/// Both of its callers go through it: the port's
+/// Both of its callers go through the shared writer below: the port's
 /// [`ContentReferenceIndex::insert`] (which wraps it in a transaction of its
 /// own) and the ingest's artifact transition (`crate::artifact_lifecycle`,
 /// which hands it the unit of work that is already writing the events, the
 /// artifact row, its metadata and the job queue — so the artifact and its
 /// claim on the bytes commit or roll back together). One spelling means the
-/// row an ingest writes and the row an OCI manifest PUT writes cannot diverge
+/// row an ingest writes and the row a dedup repair writes cannot diverge
 /// in shape. `refcount_reconcile`'s repair keeps its own statement, because
 /// it is a delete-then-insert over a different key.
 ///
@@ -200,8 +202,17 @@ pub(crate) async fn upsert_edges_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     edges: &[ContentReference],
 ) -> DomainResult<()> {
+    write_edges_in_tx(tx, edges, true).await?;
+    Ok(())
+}
+
+async fn write_edges_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    edges: &[ContentReference],
+    refresh_existing: bool,
+) -> DomainResult<u64> {
     if edges.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     // The blob-reclamation lock, taken before the rows that claim those
     // bytes exist and held to the owning transaction's end. A reference
@@ -210,6 +221,7 @@ pub(crate) async fn upsert_edges_in_tx(
     // bytes that no longer exist.
     crate::blob_lock::lock_blobs_in_tx(tx, edges.iter().map(|e| e.target_content_hash.clone()))
         .await?;
+    let mut written = 0;
     for edge in edges {
         tracing::debug!(
             entity = "ContentReference",
@@ -220,7 +232,7 @@ pub(crate) async fn upsert_edges_in_tx(
             "upsert"
         );
         let ctx = format!("{}/{}", edge.repository_id, edge.source_artifact_id);
-        sqlx::query(
+        let result = sqlx::query(
             r#"INSERT INTO content_references (
                    source_artifact_id, target_content_hash, kind, metadata,
                    repository_id, recorded_at
@@ -228,7 +240,8 @@ pub(crate) async fn upsert_edges_in_tx(
                ON CONFLICT (repository_id, source_artifact_id, target_content_hash, kind)
                DO UPDATE SET
                    metadata    = EXCLUDED.metadata,
-                   recorded_at = EXCLUDED.recorded_at"#,
+                   recorded_at = EXCLUDED.recorded_at
+               WHERE $7"#,
         )
         .bind(edge.source_artifact_id)
         .bind(edge.target_content_hash.as_ref())
@@ -236,11 +249,13 @@ pub(crate) async fn upsert_edges_in_tx(
         .bind(&edge.metadata)
         .bind(edge.repository_id)
         .bind(edge.recorded_at)
+        .bind(refresh_existing)
         .execute(&mut **tx)
         .await
         .map_err(|e| map_sqlx_error(&e, "ContentReference", &ctx))?;
+        written += result.rows_affected();
     }
-    Ok(())
+    Ok(written)
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +263,33 @@ pub(crate) async fn upsert_edges_in_tx(
 // ---------------------------------------------------------------------------
 
 impl ContentReferenceIndex for PgContentReferenceRepo {
+    fn insert_missing(&self, references: &[ContentReference]) -> BoxFuture<'_, DomainResult<u64>> {
+        let references = references.to_vec();
+        Box::pin(async move {
+            if references.is_empty() {
+                return Ok(0);
+            }
+            with_contention_retry(
+                "content-reference insert missing",
+                CONTENTION_RETRY_ATTEMPTS,
+                contention_backoff,
+                || async {
+                    let mut tx = self
+                        .pool
+                        .begin()
+                        .await
+                        .map_err(|e| map_sqlx_error(&e, "ContentReference", "batch"))?;
+                    let written = write_edges_in_tx(&mut tx, &references, false).await?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| map_sqlx_error(&e, "ContentReference", "batch"))?;
+                    Ok(written)
+                },
+            )
+            .await
+        })
+    }
+
     fn insert(&self, reference: ContentReference) -> BoxFuture<'_, DomainResult<()>> {
         Box::pin(async move {
             // Retried on a contention abort. Sibling manifests of one push
@@ -689,6 +731,72 @@ mod tests {
             // flaky. Truncating via `with_timezone` is the house style.
             recorded_at: Utc::now().with_timezone(&Utc),
         }
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn insert_missing_counts_new_rows_and_preserves_existing_row() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let source = seed_artifact(&pool, repo, "insert-missing").await;
+        let adapter = PgContentReferenceRepo::new(pool.clone());
+        assert_eq!(adapter.insert_missing(&[]).await.unwrap(), 0);
+        let first = make_reference(
+            repo,
+            source,
+            VALID_SHA256_A,
+            "oci_config",
+            serde_json::json!({"original": true}),
+        );
+        assert_eq!(
+            adapter
+                .insert_missing(std::slice::from_ref(&first))
+                .await
+                .unwrap(),
+            1
+        );
+        let mut changed = first.clone();
+        changed.metadata = serde_json::json!({"original": false});
+        changed.recorded_at += chrono::Duration::seconds(30);
+        let sibling = make_reference(
+            repo,
+            source,
+            VALID_SHA256_B,
+            "oci_layer",
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            adapter.insert_missing(&[changed, sibling]).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            adapter
+                .insert_missing(std::slice::from_ref(&first))
+                .await
+                .unwrap(),
+            0
+        );
+        let rows = adapter
+            .find_by_target(repo, &first.target_content_hash, Some("oci_config"))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].metadata, first.metadata);
+        assert_eq!(
+            rows[0].recorded_at.timestamp_micros(),
+            first.recorded_at.timestamp_micros()
+        );
+        let mut refreshed = first.clone();
+        refreshed.metadata = serde_json::json!({"refreshed": true});
+        adapter.insert(refreshed.clone()).await.unwrap();
+        let refreshed_rows = adapter
+            .find_by_target(repo, &first.target_content_hash, Some("oci_config"))
+            .await
+            .unwrap();
+        assert_eq!(refreshed_rows[0].metadata, refreshed.metadata);
+        cleanup_repo(&pool, repo).await;
     }
 
     /// Insert → `find_by_target` round-trip preserves the metadata

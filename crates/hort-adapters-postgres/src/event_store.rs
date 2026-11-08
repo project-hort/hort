@@ -91,9 +91,6 @@ fn emit_read_metrics(category: &'static str, operation: &'static str) {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Maximum allowed size for serialized event JSON (64 KB).
-const MAX_EVENT_JSON_BYTES: usize = 65_536;
-
 /// SQLSTATE Postgres returns for `RAISE EXCEPTION` without `ERRCODE`.
 /// The `events_immutable` trigger uses `RAISE EXCEPTION` so its errors
 /// carry this code. See `inspect_audit_block` for the full classifier.
@@ -1418,26 +1415,28 @@ async fn append_with_conn(
     })
 }
 
-/// Validate each event's per-field invariants (string-length caps, enum
-/// sanity, cross-field sums) **before** serialising,
-/// then enforce the 64 KB overall-serialised cap as defence-in-depth. The
-/// two checks are complementary: per-field validation catches specific
-/// attacker-controlled inputs (oversize `name`, too-many-violations sums);
-/// the 64 KB cap catches anything future event types might slip through.
+/// Serialise each event into the value the row binds, refusing any the
+/// domain says no store may hold: per-field invariants (string-length
+/// caps, enum sanity, cross-field sums) **before** serialising, then the
+/// `MAX_EVENT_JSON_BYTES` cap on the serialised envelope as
+/// defence-in-depth. The two checks are complementary — per-field
+/// validation catches specific attacker-controlled inputs (oversize
+/// `name`, too-many-violations sums); the cap catches anything future
+/// event types might slip through.
+///
+/// Both of them are [`DomainEvent::validate_serialized`], and that is
+/// the point: the rule used to be two statements spelled out here, which
+/// put the cap out of reach of `hort-app` (ADR 0008 — nothing depends on
+/// an adapter) and left the event-store double able to implement only
+/// the half it could see. The size is checked on the value this function
+/// returns, so what the cap measured is what the `INSERT` writes.
 fn validate_and_serialize(events: &[EventToAppend]) -> DomainResult<Vec<serde_json::Value>> {
     events
         .iter()
         .map(|to_append| {
             let event = &to_append.event;
-            event.validate()?;
             let json = serialize_event_data(event);
-            let size = json.to_string().len();
-            if size > MAX_EVENT_JSON_BYTES {
-                return Err(DomainError::Validation(format!(
-                    "serialized event {} exceeds 64 KB limit ({size} bytes)",
-                    event.event_type()
-                )));
-            }
+            event.validate_serialized(&json)?;
             Ok(json)
         })
         .collect()
@@ -1545,11 +1544,26 @@ mod tests {
         });
         // Sanity: per-field validate passes.
         event.validate().expect("per-field validate should accept");
+        // The size the operator-facing message quotes, measured the way
+        // the append path measures it — the value this function returns.
+        let size = hort_domain::events::stored_payload_envelope(&event)
+            .to_string()
+            .len();
         let err = validate_and_serialize(&[EventToAppend::new(event)]).unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
         assert!(
             err.to_string().contains("64 KB"),
             "expected 64 KB cap error, got: {err}"
+        );
+        // The whole message, not just a substring: it is what an
+        // operator reads, so moving the rule into `hort-domain` had to
+        // leave every byte of it alone.
+        let DomainError::Validation(msg) = &err else {
+            panic!("expected a validation error, got: {err:?}")
+        };
+        assert_eq!(
+            msg,
+            &format!("serialized event PolicyEvaluated exceeds 64 KB limit ({size} bytes)"),
         );
     }
 

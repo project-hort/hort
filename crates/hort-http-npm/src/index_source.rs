@@ -292,10 +292,14 @@ const REF_LIST_MAX: u32 = 1000;
 /// makes the trusted-ids batch read legitimate.
 ///
 /// One batched read covers the whole served set. A row whose payload
-/// exceeded npm's inline threshold at ingest keeps only the handler's
-/// summary in `metadata` and holds the full block in CAS, so those rows —
-/// and only those — pay one blob read each to recover the whitelist keys
-/// the summary drops.
+/// spilled at ingest keeps at most the handler's summary in `metadata`
+/// and holds the full block in CAS, so those rows — and only those —
+/// pay one blob read each to recover the whitelist keys the summary
+/// drops. [`ArtifactUseCase::load_full_metadata`] is what makes that
+/// "and only those" true without this function knowing which rows they
+/// are: its no-blob arm is the same clone with no I/O, so asking it
+/// unconditionally costs an unspilled row nothing and keeps where the
+/// metadata lives a question no reader has to answer.
 ///
 /// Goes through `ArtifactUseCase`: `AppContext::artifact_metadata` and
 /// `::storage` are `pub(crate)` and off-limits to a format crate (ADR
@@ -312,11 +316,7 @@ async fn hydrate_hosted_manifests(
             // published nothing we can pass through.
             continue;
         };
-        let block = if row.metadata_blob.is_some() {
-            ctx.artifact_use_case.load_full_metadata(row).await?
-        } else {
-            row.metadata.clone()
-        };
+        let block = ctx.artifact_use_case.load_full_metadata(row).await?;
         let PerVersionPayload::Npm(payload) = &mut entry.payload else {
             continue;
         };
