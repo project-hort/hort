@@ -116,7 +116,7 @@ the result instead.
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
-| flate2 | 1.1.10 | MIT | https://github.com/rust-lang/flate2-rs |
+| flate2 | 1.1.11 | MIT | https://github.com/rust-lang/flate2-rs |
 | hyper | 1.12.0 | MIT | https://github.com/hyperium/hyper |
 | unicase | 2.9.0 | MIT | https://github.com/seanmonstar/unicase |
 | either | 1.15.0 | MIT | https://github.com/rayon-rs/either |
@@ -549,7 +549,7 @@ the result instead.
 | zerotrie | 0.2.4 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerovec-derive | 0.11.3 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerovec | 0.11.6 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| zlib-rs | 0.6.6 | Zlib | https://github.com/trifectatechfoundation/zlib-rs |
+| zlib-rs | 0.6.8 | Zlib | https://github.com/trifectatechfoundation/zlib-rs |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash |
 
 ## License texts
@@ -6808,7 +6808,7 @@ IN THE SOFTWARE.
 
 ```
 
-### flate2 1.1.10 — MIT
+### flate2 1.1.11 — MIT
 
 Repository: https://github.com/rust-lang/flate2-rs
 
@@ -20770,7 +20770,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ```
 
-### zlib-rs 0.6.6 — Zlib
+### zlib-rs 0.6.8 — Zlib
 
 Repository: https://github.com/trifectatechfoundation/zlib-rs
 
