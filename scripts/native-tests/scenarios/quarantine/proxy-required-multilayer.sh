@@ -106,30 +106,75 @@ COSIGN_KEY="${COSIGN_KEY:-${FIXTURES:-}/cosign/cosign.key}"
 export COSIGN_PASSWORD="${COSIGN_PASSWORD:-}"
 IMAGE="${IMAGE:-redis:7-alpine}"
 RESOLVER_REFRESH_GUESS="${RESOLVER_REFRESH_GUESS:-8}"
-# Sized against the release path's real worst case, which is CADENCE-bound,
-# not window-bound: release happens on the first quarantine-release-sweep
-# pass after the observation window closes, and the compose sweep-ticker
-# enqueues that sweep every SWEEP_TICK_SECS (dev/CI default 15s — see
-# deploy/compose/docker-compose.yml; now parameterized, previously a
-# hardcoded 15s, NOT the 300s this budget used to assume — the old 420s
-# default over-provisioned against a cadence the ticker never actually ran
-# at). From the moment the wait starts (right after
-# ProvenanceVerified — typically landing around T+70s, once the constituent
-# pulls and the sign have run), the window itself doesn't close until T+120s
-# (the quarantineDuration), so the releasing tick can land up to
-# ~(120-70)=50s later for the window, plus one full SWEEP_TICK_SECS tick (15s
-# interval, plus job-claim/release/pull processing (~10-40s) on top:
-# default) — ~75-105s worst case. The 240s default keeps >2x margin; a
-# passing run still exits on the first poll hit.
+# The repository policy's quarantine window, in seconds — the literal
+# `quarantineDuration: 120s` in
+# deploy/compose/example-config/policies/oci-provenance-proxy-e2e-required.yaml.
+# Hardcoded rather than resolved from `policy_projections` (mirrors
+# proxy-multiarch-zero-window.sh, which hardcodes its own policy's 24h for the
+# identical reason: the `scope` column is jsonb keyed by repository NAME, not a
+# `repository_id` foreign key, so a dynamic lookup would need the same
+# scope-resolution logic the application layer already owns — out of scope for
+# a scenario script to reimplement).
+#
+# ONE definition with TWO consumers: Step 7's zero-window assertion and Step
+# 9b-i's release budget below. Change the policy's duration and both follow.
+QUARANTINE_DURATION_SECS=120
+#
+# Step 8 budget (await ProvenanceVerified on the signed index). Deliberately
+# NOT window-bound: `cosign sign` has already returned by the time this wait
+# starts, so what is outstanding is the worker claiming the provenance-verify
+# job and running one keyed verification — seconds in practice. 240s is a
+# generous ceiling against a backed-up worker queue, not a window computation.
+# The window arithmetic belongs to Step 9b-i, which is the only wait in this
+# scenario that sits behind the quarantine window.
 WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-240}"
-# Step 9b budget: after 9a has driven every foreign platform through cold
-# pull-through and each has self-cleared at its own quarantine commit, the
-# anonymous poll is waiting only on clearance + the release sweep tick — not
-# on any pull-through round-trip. ~2 sweep ticks (default SWEEP_TICK_SECS
-# 15s) plus job-claim/release/pull processing is the expected worst case; 90s
-# keeps a comfortable margin without reintroducing the unbounded serial-pull
-# wait 9a now absorbs.
-ANON_PULL_WAIT_SECS="${ANON_PULL_WAIT_SECS:-90}"
+#
+# Step 9b-i budget — await the INDEX row's release, the one window-bound wait
+# here. Step 7 asserts the index carries the FULL window
+# (`quarantine_window_start == created_at`, anchored on the Step 0 cold ingest:
+# the index is not a content_references target, so the zero-window descendant
+# carve-out does not reach it), and release lands on the first
+# quarantine-release-sweep pass AFTER that window closes. The budget is
+# therefore the whole window + one full sweep-tick interval (a window closing
+# just after a tick fired waits for the next one) + the job-claim/release work
+# behind that tick.
+#
+# FASTER MUST NOT BE WORSE. The elapsed time between Step 0 and this wait is
+# deliberately NOT subtracted from the window. That time is window the clock
+# has already burned, so subtracting it shrinks the budget as the earlier steps
+# get faster — a budget that holds only because the steps before it were slow.
+# Summing against the WHOLE window makes the worst case "this wait starts at
+# the instant of ingest", which no future speed-up of Steps 0-9a can beat. (The
+# 90s this step used to get assumed that gap was >= ~45s. Two lanes that ran
+# Steps 0-9a in ~15s timed out 14-15s BEFORE the window had even closed, with
+# hort holding the index exactly as ADR 0007 requires — same commit, green on
+# a slower machine, red on a faster one.)
+#
+# The sweep cadence the budget must assume. This scenario cannot OBSERVE the
+# server's cadence — the compose ticker's SWEEP_TICK_SECS is not passed into
+# the client container — so budget against the compose file's own default of
+# 15s, the slower of the two values a compose run uses
+# (scripts/native-tests/run.sh lowers it to 5s at `up` time). A stack whose
+# release sweep runs less often than this needs INDEX_RELEASE_WAIT_SECS raised.
+RELEASE_SWEEP_TICK_BUDGET_SECS=15
+# Job claim + release commit + projection behind the releasing tick: observed
+# 10-40s on compose, budgeted well past that on purpose. It is the only term in
+# the sum that is an OBSERVATION rather than a configured bound (the window is
+# the policy's own number, the tick is the compose file's), so it is where this
+# budget's margin belongs — and the margin has to be real slack, because the
+# sum deliberately refuses to count the elapsed time before the wait.
+RELEASE_PROCESSING_BUDGET_SECS=105
+INDEX_RELEASE_WAIT_SECS="${INDEX_RELEASE_WAIT_SECS:-$(( QUARANTINE_DURATION_SECS + RELEASE_SWEEP_TICK_BUDGET_SECS + RELEASE_PROCESSING_BUDGET_SECS ))}"
+#
+# Step 9b-ii budget — the anonymous `--all` pull, which runs only after 9b-i
+# has proved the index released. Nothing behind this leg is window-bound: the
+# index is released, and every late joiner 9a drove in is a referenced-tree
+# descendant with a ZERO-length window (Step 7 asserts that carve-out), so the
+# most one can still owe is its own clearance plus a sweep tick — which 9b-i's
+# wait has in practice already absorbed. What remains is a warm pull from local
+# storage. Keeping this budget SHORT is what makes a timeout here mean
+# "clearance or cascade" and never "the window".
+ANON_PULL_WAIT_SECS="${ANON_PULL_WAIT_SECS:-60}"
 
 REGISTRY_HOST="${HORT_URL#http://}"
 REGISTRY_HOST="${REGISTRY_HOST#https://}"
@@ -563,15 +608,11 @@ else
     fail "index quarantine_window_start == created_at" "got '${index_full_window}' (expected t)"
 fi
 
-# Duration is the literal `quarantineDuration: 120s` in
-# oci-provenance-proxy-e2e-required.yaml — hardcoded here rather than
-# resolved from `policy_projections` (mirrors proxy-multiarch-zero-window.sh,
-# which hardcodes its own policy's 24h for the identical reason: the
-# `scope` column is jsonb keyed by repository NAME, not a `repository_id`
-# foreign key, so a dynamic lookup would need the same scope-resolution
-# logic the application layer already owns — out of scope for a scenario
-# script to reimplement).
-QUARANTINE_DURATION_SQL="interval '120 seconds'"
+# Built from QUARANTINE_DURATION_SECS, the single definition of this policy's
+# window at the top of this file (which also carries the reason it is a literal
+# rather than a `policy_projections` lookup). Shared so this assertion and Step
+# 9b-i's release budget cannot disagree about how long the window is.
+QUARANTINE_DURATION_SQL="interval '${QUARANTINE_DURATION_SECS} seconds'"
 # Exact, not a bound: the carve-out contributes `minted_at - duration`, and
 # ADR 0054's other sources cannot beat it here — the constituents are pulled
 # seconds before this step, so any age evidence for them is far younger than
@@ -609,7 +650,8 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# Step 9 — two-phase contract, split per backlog 093.
+# Step 9 — three-phase contract: 9a ingests, 9b-i waits out the window,
+# 9b-ii pulls.
 #
 # `--all` forces every platform child of the index through pull-through.
 # This scenario ingests exactly one platform subtree before the sign, so
@@ -630,8 +672,17 @@ fi
 # skopeo aborts the whole copy at the FIRST held (503) artifact, so an
 # anonymous-only poll advances the ingest frontier by ~one artifact per
 # retry — a serial crawl that is unbounded against any fixed budget, not
-# a slow-but-finite wait. 9a removes that dependency; 9b then only waits
-# on clearance + the release sweep tick.
+# a slow-but-finite wait. 9a removes that dependency.
+#
+# What is left after 9a is TWO different waits, which is why 9b is itself
+# two steps. The index carries the FULL quarantine window and is the last
+# thing in the tree to become servable; every constituent, first subtree
+# and late joiner alike, has a ZERO-length window and owes only its own
+# clearance plus a sweep tick. 9b-i waits out the window against the
+# database; 9b-ii then pulls. Folding them back together would reinstate
+# a single budget that has to cover a 120s window while its wording
+# blames clearance — which is what it did, and the diagnosis it produced
+# was of a cascade defect that was not there.
 # ---------------------------------------------------------------------
 log ""
 log "--- Step 9a: authenticated warm pass (late-joiner ingest vehicle)"
@@ -648,18 +699,62 @@ else
 fi
 rm -f "$WARM_ARCHIVE"
 
+# ---------------------------------------------------------------------
+# Step 9b-i: await the INDEX row's release — the window leg.
+#
+# Split out of the pull below because the two legs wait on different
+# things, and a reader of a failing run has to be able to tell which one
+# gave out. This is the only wait in the scenario that sits behind the
+# quarantine window: Step 7 has asserted the index carries the FULL one,
+# so until it elapses NOTHING anonymous can be served, and that is hort
+# behaving correctly (ADR 0007), not a defect.
+#
+# The database is what is polled, not the registry, because a 503 from an
+# anonymous pull cannot distinguish "the window has not closed" from
+# "clearance never came" — and reading the first as the second is how a
+# timeout here gets diagnosed as a cascade defect that is not present.
+# See INDEX_RELEASE_WAIT_SECS at the top of this file for why its budget
+# is big enough no matter how fast Steps 0-9a ran.
+# ---------------------------------------------------------------------
 log ""
-log "--- Step 9b: await release + anonymous FULL-index pull (release acceptance after warm pass)"
-rm -f "$PULLED_ARCHIVE"
+log "--- Step 9b-i: await the index row's release (full ${QUARANTINE_DURATION_SECS}s window + release sweep, budget ${INDEX_RELEASE_WAIT_SECS}s)"
+INDEX_RELEASED=0
 if bounded_poll \
-        "signed image pullable (anonymous)" \
-        "$ANON_PULL_WAIT_SECS" \
-        "skopeo copy --all --insecure-policy --src-tls-verify=false 'docker://${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}' 'oci-archive:${PULLED_ARCHIVE}'" \
+        "index artifact ${INDEX_ID} released" \
+        "$INDEX_RELEASE_WAIT_SECS" \
+        "[ \"\$(psql_one \"SELECT quarantine_status FROM artifacts WHERE id = '${INDEX_ID}';\")\" = 'released' ]" \
         5; then
-    pass "release acceptance after warm pass: the signed+cleared multi-arch index pulled anonymously in full (Cleared + timer gate satisfied for every platform, late joiners included)"
+    INDEX_RELEASED=1
+    pass "index released: its full quarantine window elapsed and the release sweep acted on it"
 else
-    fail "release acceptance after warm pass: signed index pulls anonymously with --all" \
-         "the signed index never became fully (--all) anonymously pullable within ${ANON_PULL_WAIT_SECS}s (window, cascade, LATE-JOINER clearance, or release-sweep gate not satisfied)"
+    INDEX_STATE="$(psql_one "SELECT COALESCE(quarantine_status::text,'null') FROM artifacts WHERE id = '${INDEX_ID}';" || true)"
+    fail "index releases once its full quarantine window elapses" \
+         "THE WINDOW LEG, not the clearance leg: quarantine_status='${INDEX_STATE:-<row gone>}' for the index after ${INDEX_RELEASE_WAIT_SECS}s, a budget that covers the full ${QUARANTINE_DURATION_SECS}s window from this artifact's own ingest plus the release sweep behind it — so the window running late is not an available explanation. If Step 8 passed, the signature verified and this is the release SWEEP not acting: look at the sweep ticker and the jobs table, not at the cascade or at late joiners."
+fi
+
+# ---------------------------------------------------------------------
+# Step 9b-ii: the ANONYMOUS `--all` pull — the acceptance criterion
+# itself. Runs only once 9b-i has proved the window closed, which is what
+# makes the failure wording below TRUE rather than merely plausible: with
+# the index released, a timeout here really is clearance, cascade or a
+# late joiner, and cannot be the window.
+# ---------------------------------------------------------------------
+log ""
+log "--- Step 9b-ii: anonymous FULL-index pull (release acceptance after warm pass)"
+rm -f "$PULLED_ARCHIVE"
+if [ "$INDEX_RELEASED" = "1" ]; then
+    if bounded_poll \
+            "signed image pullable (anonymous)" \
+            "$ANON_PULL_WAIT_SECS" \
+            "skopeo copy --all --insecure-policy --src-tls-verify=false 'docker://${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}' 'oci-archive:${PULLED_ARCHIVE}'" \
+            5; then
+        pass "release acceptance after warm pass: the signed+cleared multi-arch index pulled anonymously in full (Cleared + timer gate satisfied for every platform, late joiners included)"
+    else
+        fail "release acceptance after warm pass: signed index pulls anonymously with --all" \
+             "the signed index did not become fully (--all) anonymously pullable within ${ANON_PULL_WAIT_SECS}s of its OWN release. The window is not the explanation — 9b-i proved it closed — so this is cascade, LATE-JOINER clearance, or the release sweep still owing a zero-window constituent."
+    fi
+else
+    log "  NOTE: Step 9b-ii not attempted — the index row never released, so an anonymous --all pull cannot succeed, and running it would report a clearance failure for a window that never closed (see Step 9b-i)."
 fi
 
 # ---------------------------------------------------------------------
@@ -667,7 +762,7 @@ fi
 #
 # Step 3 issues exactly this request as a forcing GET and throws the status
 # away, on purpose — at that point in the lifecycle a hold-503 is the
-# designed answer. Here the tree has released (9b pulled it anonymously in
+# designed answer. Here the tree has released (9b-ii pulled it anonymously in
 # full), so the status is no longer about the clock and the request is the
 # one a client actually makes: resolve a manifest, then fetch the layers it
 # names. A released image whose layer blob answers 503 is an image hort
@@ -675,7 +770,7 @@ fi
 # notices is the client. Asserted ANONYMOUSLY, so a write-authorized
 # hold-read exemption cannot stand in for a release.
 #
-# One blob, not the whole set: 9b already pulled every constituent of every
+# One blob, not the whole set: 9b-ii already pulled every constituent of every
 # platform: this assertion exists to put a status code on the layer-blob
 # route rather than to re-walk the tree.
 # ---------------------------------------------------------------------
