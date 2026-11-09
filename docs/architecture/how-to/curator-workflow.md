@@ -1184,6 +1184,117 @@ threat-model-aligned answer.
 
 ---
 
+## 10. The held set — artifacts waiting on a signature
+
+`Curate` gates a second read surface beside the queue, and this is the
+one to reach for when someone asks "what is hort sitting on?"
+
+```sh
+# The aggregate: one cell per repository x bucket.
+curl -sH "Authorization: Bearer $TOKEN" \
+  "$HORT_URL/api/v1/admin/retention/overview" | jq .
+
+# The list you act on. `bucket` is required.
+curl -sH "Authorization: Bearer $TOKEN" \
+  "$HORT_URL/api/v1/admin/retention/held?bucket=in_own_right&limit=100" | jq .
+
+# Page with the cursor the previous response returned, until it is null.
+curl -sH "Authorization: Bearer $TOKEN" \
+  "$HORT_URL/api/v1/admin/retention/held?bucket=in_own_right&after=$NEXT_CURSOR" | jq .
+```
+
+### 10.1 What the held set is
+
+An artifact is in it when all four of these hold:
+
+1. it is `quarantined`;
+2. its observation window has **expired** — the window anchor plus the
+   effective `quarantineDuration`, resolved with the same precedence
+   everything else uses (the repository's own non-archived policy before
+   the global one). A repository with no resolvable policy has no
+   deadline, so its artifacts are not in the set at all;
+3. the effective `provenanceMode` is `required`;
+4. no verified attestation has ever been recorded for it.
+
+So it is the population the release gate is holding **because a
+signature it requires has not arrived** — not the artifacts your scanner
+rejected (those are `Rejected` on the curation queue, §2) and not the
+artifacts still inside their window (those are simply young).
+
+The set is split into two **buckets**, because the operator action
+differs:
+
+- **`in_own_right`** — an artifact that could still acquire a signature
+  of its own. Someone can publish an attestation for it, or you decide
+  the exposure is acceptable and waive it (§4).
+- **`constituent`** — a config or layer blob held only because its
+  parent manifest is unsigned. A blob can never carry its own
+  attestation, so there is nothing to wait for *on this row*: the thing
+  to fix is the parent. Waiving constituents one at a time is almost
+  always the wrong move.
+
+### 10.2 The hold has no deadline, and this view is why that is defensible
+
+Nothing times an unsigned hold out. There is no value an operator could
+set that is better than "wait": a deadline would have to either release
+an artifact whose signature never came, or reject one whose signature is
+still on its way, and neither is a decision a timer can make correctly.
+The hold therefore persists until a signature arrives, a curator waives
+the artifact, or an operator disposes of it deliberately.
+
+That is only defensible because **the set is visible and carries its
+age**. A status transition would collapse "held for 20 seconds" and
+"held for 20 days" into one value, and the age is precisely what tells
+you whether you are looking at normal publishing latency or at something
+that is never going to resolve. Every response here carries it —
+`oldest_age_secs` per cell, `age_secs` per row, both relative to the
+`measured_at` in the same body. If this view is unreachable, the "no
+deadline" decision is resting on something you cannot check, and that is
+worth raising rather than working around.
+
+Disposal of a held artifact is a separate, operator-confirmed mechanism.
+These two endpoints are read-only: nothing here deletes anything, and
+nothing here will.
+
+### 10.3 The two numbers mean different things
+
+**The overview is a superset. The drill-down is exact.**
+
+The aggregate resolves the policy and the window expiry in the database
+and stops there. It deliberately does not evaluate whether each artifact
+has in fact been cleared — that verdict has exactly one implementation
+in hort, and a second copy of it inside a counting query is how two
+computations of the same rule drift apart. So the overview can count an
+artifact that was cleared moments ago and has not yet been swept. That
+is why its field is called `held_pending_signature_candidates` and not
+"held artifacts": it is an upper bound, and the name says so.
+
+The drill-down resolves every row through that one authority before
+showing it to you. Act on the drill-down; read the overview as the
+shape of the problem.
+
+One consequence worth knowing before you page: because rows are filtered
+*after* they are fetched, **a page can come back empty and still carry a
+`next_cursor`**. That means the page you asked for was entirely stale,
+not that the set is exhausted. Keep going until `next_cursor` is `null`.
+
+### 10.4 An artifact count is not a byte count
+
+`artifact_count` and `distinct_content_count` are both reported per
+cell, and they are **not** the same number. hort stores content by hash,
+so several artifact rows routinely point at one set of bytes — the first
+real retention dry run on a live instance reported 3 647 rows against
+3 608 distinct contents.
+
+Do not read either number as reclaimable storage. The row count is not
+bytes; the distinct-content count is not bytes you would get back
+either, because a held artifact's content may still be referenced by
+something you are keeping. What a disposal would actually free is a
+different question, answered by the content's reference count rather
+than by this view.
+
+---
+
 ## Related
 
 - Patch-release operator playbook: [`quarantine-patch-release.md`](quarantine-patch-release.md)
@@ -1194,3 +1305,5 @@ threat-model-aligned answer.
   [prefetch-pipeline.md](../explanation/prefetch-pipeline.md)
 - Claim-based RBAC: [`operate/claim-based-rbac.md`](operate/claim-based-rbac.md),
   [ADR 0012](../../adr/0012-claim-based-rbac-claimless-static-tokens.md)
+- Keyed provenance verification, the indefinite hold and the surfaces it
+  rests on: [ADR 0039](../../adr/0039-keyed-provenance-verification.md) D4

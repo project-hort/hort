@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A bulk waive caps at 25 entries and is all-or-nothing — one unresolvable,
   ambiguous or non-quarantined entry returns `409` with a per-entry report
   and releases nothing (#176).
+- New curator/admin read surface for the artifacts the release gate is holding
+  for a missing attestation, with each hold's age:
+  `GET /api/v1/admin/retention/{overview,held}`. The overview's counts are an
+  upper bound (`held_pending_signature_candidates`) and are artifact counts,
+  not byte counts (#244).
 
 ### Changed
 

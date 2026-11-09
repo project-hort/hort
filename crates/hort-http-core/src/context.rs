@@ -26,6 +26,7 @@ use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUseCase;
 use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
 use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
+use hort_app::use_cases::held_set_use_case::HeldSetUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::list_deliverability::ListDeliverabilityUseCase;
 use hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase;
@@ -319,6 +320,16 @@ pub struct AppContext {
     /// matches the manual release this listing feeds, which one
     /// authority owns (ADR 0007).
     pub patch_candidate_use_case: Arc<PatchCandidateUseCase>,
+    /// Curator-or-admin read of the set the release gate holds pending a
+    /// signature (`GET /api/v1/admin/retention/{overview,held}`) — the
+    /// surface ADR 0039 D4 names when it declines to deadline an
+    /// unsigned hold, so an operator can see the held set *and its age*.
+    ///
+    /// Read-only over the artifact set: no event, no state transition,
+    /// no delete. The aggregate is a declared superset named
+    /// `held_pending_signature_candidates`; the drill-down re-decides
+    /// every row through the one provenance authority in `hort-app`.
+    pub held_set_use_case: Arc<HeldSetUseCase>,
     /// Admin-only read of the `scanner_registry` worker table
     /// (`GET /api/v1/admin/workers`). The use case enforces
     /// `Permission::Admin` (defence in depth — the `AdminPrincipal`
@@ -997,6 +1008,8 @@ pub struct AppContextParts {
     pub manual_rescan_use_case: Arc<ManualRescanUseCase>,
     /// See [`AppContext::patch_candidate_use_case`].
     pub patch_candidate_use_case: Arc<PatchCandidateUseCase>,
+    /// See [`AppContext::held_set_use_case`].
+    pub held_set_use_case: Arc<HeldSetUseCase>,
     /// See [`AppContext::scanner_worker_query_use_case`].
     pub scanner_worker_query_use_case: Arc<ScannerWorkerQueryUseCase>,
     /// See [`AppContext::effective_repository_config_use_case`].
@@ -1140,6 +1153,7 @@ impl AppContext {
             task_use_case: parts.task_use_case,
             manual_rescan_use_case: parts.manual_rescan_use_case,
             patch_candidate_use_case: parts.patch_candidate_use_case,
+            held_set_use_case: parts.held_set_use_case,
             scanner_worker_query_use_case: parts.scanner_worker_query_use_case,
             effective_repository_config_use_case: parts.effective_repository_config_use_case,
             gitops_apply_status: parts.gitops_apply_status,

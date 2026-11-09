@@ -52,6 +52,11 @@ pub mod effective_permissions_use_case;
 pub mod event_visibility;
 pub mod eventstore_retention_use_case;
 pub mod group_reconcile_use_case;
+// The operator-facing view of the set the release gate holds pending a
+// signature — the surface ADR 0039 D4's "no deadline" argument points
+// at. Read-only over the artifact set; disposal is operator-confirmed
+// and is not part of it.
+pub mod held_set_use_case;
 // Shared `IndexFilter` implementations
 // (`NonServableStatusFilter` + `IndexModeFilter`) used by the
 // per-format unified serve handlers. The
@@ -161,10 +166,15 @@ pub mod self_service_prefetch_use_case;
 // HARD PREREQUISITE for `PurgeUseCase`, whose start-gate
 // refuses to run until this sweep has converged at least once.
 pub mod refcount_reconcile_use_case;
-// Shared referenced-tree-descendant predicate (issue #115 item 3) —
-// one definition for BOTH the ingest zero-window anchor carve-out (#46)
-// and the provenance orchestrator's `NoAttestation × Required` hold.
-pub(crate) mod referenced_descendant;
+// Shared referenced-tree-descendant predicate — one definition for the
+// ingest zero-window anchor carve-out, the release sweep's final
+// `provenance-verify` skip, and the held-set overview's
+// constituent/in-own-right bucket split. `pub` for the last of those
+// three only: the bucket rule's kind lists and its kind-based primitive
+// are read by the Postgres adapter that binds them as query parameters
+// and by the parity test that drives both paths. Everything else in the
+// module stays `pub(crate)`.
+pub mod referenced_descendant;
 pub mod repository_access;
 pub mod repository_use_case;
 // Seed-import cutover path.

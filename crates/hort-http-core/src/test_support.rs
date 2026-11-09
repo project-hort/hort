@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use metrics_exporter_prometheus::PrometheusHandle;
 
 use hort_adapters_ephemeral_memory::{InMemoryEphemeralStore, MeteredEphemeralStore};
@@ -40,6 +41,7 @@ use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUseCase;
 use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
 use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
+use hort_app::use_cases::held_set_use_case::HeldSetUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::patch_candidate_use_case::PatchCandidateUseCase;
@@ -100,6 +102,10 @@ use hort_domain::ports::curation_queue_repository::{
     CurationQueueEntry, CurationQueueFilter, CurationQueueRepository,
 };
 use hort_domain::ports::event_store::EventStore;
+use hort_domain::ports::held_set_reader::{
+    ConstituentKindSets, HeldBucket, HeldCandidateBucket, HeldCandidateQuery, HeldCandidateRow,
+    HeldSetReader,
+};
 use hort_domain::ports::metadata_mirror_store::MetadataMirrorStore;
 use hort_domain::ports::patch_candidate_repository::{
     PatchCandidate, PatchCandidateFilter, PatchCandidateRepository,
@@ -299,6 +305,101 @@ impl CurationQueueRepository for MockCurationQueueRepository {
     ) -> BoxFuture<'a, DomainResult<Vec<CurationQueueEntry>>> {
         self.recorded.lock().unwrap().push(filter);
         let result = match &*self.result.lock().unwrap() {
+            Ok(v) => Ok(v.clone()),
+            Err(e) => Err(e.clone()),
+        };
+        Box::pin(async move { result })
+    }
+}
+
+/// Recording mock for [`HeldSetReader`].
+///
+/// `set_aggregate` / `set_page` seed what the two reads return;
+/// `aggregate_calls` and `recorded_page_queries` are what the handler
+/// tests assert against. The default is `Ok(Vec::new())` for both, so a
+/// handler that seeds nothing still observes the empty happy path.
+///
+/// Mirrors [`MockCurationQueueRepository`]'s shape.
+pub struct MockHeldSetReader {
+    aggregate_result: Mutex<DomainResult<Vec<HeldCandidateBucket>>>,
+    page_result: Mutex<DomainResult<Vec<HeldCandidateRow>>>,
+    aggregate_calls: Mutex<usize>,
+    /// One entry per `list_candidates` call, FIFO.
+    page_queries: Mutex<Vec<RecordedHeldQuery>>,
+}
+
+/// What one `HeldSetReader::list_candidates` call asked for, as a
+/// handler test reads it back.
+///
+/// A named record rather than a tuple so an assertion says which field
+/// it is checking: the bucket, the repository narrowing, the keyset
+/// cursor and the page size are four values a reader must not confuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedHeldQuery {
+    pub bucket: HeldBucket,
+    pub repository_id: Option<Uuid>,
+    pub after: Option<Uuid>,
+    pub limit: u32,
+}
+
+impl Default for MockHeldSetReader {
+    fn default() -> Self {
+        Self {
+            aggregate_result: Mutex::new(Ok(Vec::new())),
+            page_result: Mutex::new(Ok(Vec::new())),
+            aggregate_calls: Mutex::new(0),
+            page_queries: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl MockHeldSetReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_aggregate(&self, result: DomainResult<Vec<HeldCandidateBucket>>) {
+        *self.aggregate_result.lock().unwrap() = result;
+    }
+
+    pub fn set_page(&self, result: DomainResult<Vec<HeldCandidateRow>>) {
+        *self.page_result.lock().unwrap() = result;
+    }
+
+    pub fn aggregate_calls(&self) -> usize {
+        *self.aggregate_calls.lock().unwrap()
+    }
+
+    pub fn recorded_page_queries(&self) -> Vec<RecordedHeldQuery> {
+        self.page_queries.lock().unwrap().clone()
+    }
+}
+
+impl HeldSetReader for MockHeldSetReader {
+    fn aggregate_candidates<'a>(
+        &'a self,
+        _now: DateTime<Utc>,
+        _kinds: ConstituentKindSets<'a>,
+    ) -> BoxFuture<'a, DomainResult<Vec<HeldCandidateBucket>>> {
+        *self.aggregate_calls.lock().unwrap() += 1;
+        let result = match &*self.aggregate_result.lock().unwrap() {
+            Ok(v) => Ok(v.clone()),
+            Err(e) => Err(e.clone()),
+        };
+        Box::pin(async move { result })
+    }
+
+    fn list_candidates<'a>(
+        &'a self,
+        query: HeldCandidateQuery<'a>,
+    ) -> BoxFuture<'a, DomainResult<Vec<HeldCandidateRow>>> {
+        self.page_queries.lock().unwrap().push(RecordedHeldQuery {
+            bucket: query.bucket,
+            repository_id: query.repository_id,
+            after: query.after,
+            limit: query.limit,
+        });
+        let result = match &*self.page_result.lock().unwrap() {
             Ok(v) => Ok(v.clone()),
             Err(e) => Err(e.clone()),
         };
@@ -899,6 +1000,12 @@ pub struct MockPorts {
     /// `GET /api/v1/admin/curation/queue` then assert the filter the
     /// use case forwarded via [`MockCurationQueueRepository::recorded_filters`].
     pub curation_queue: Arc<MockCurationQueueRepository>,
+    /// Recording mock for the held-set read port. Same `Arc` wired into
+    /// `HeldSetUseCase`; tests seed cells via
+    /// [`MockHeldSetReader::set_aggregate`] / rows via
+    /// [`MockHeldSetReader::set_page`] then drive
+    /// `GET /api/v1/admin/retention/{overview,held}`.
+    pub held_set: Arc<MockHeldSetReader>,
     /// Recording mock for the curation-decisions
     /// list port. Tests seed events via
     /// [`MockCurationDecisionsRepository::set_result`] then drive
@@ -1587,6 +1694,19 @@ pub fn build_mock_ctx_with_label_flag(
     // assert filters via the
     // `mocks.curation_{queue,decisions,exclusions}` handles.
     let curation_queue = Arc::new(MockCurationQueueRepository::new());
+    // The held-set read port. `HeldSetUseCase` also takes the shared
+    // event store and policy projections, so a handler test seeds the
+    // per-row provenance authority through `mocks.events` /
+    // `mocks.policy_projections` exactly as production resolves it.
+    let held_set = Arc::new(MockHeldSetReader::new());
+    let held_set_use_case = Arc::new(HeldSetUseCase::new(
+        held_set.clone() as Arc<dyn HeldSetReader>,
+        events.clone() as Arc<dyn EventStore>,
+        policy_projections.clone()
+            as Arc<
+                dyn hort_domain::ports::policy_projection_repository::PolicyProjectionRepository,
+            >,
+    ));
     let curation_decisions = Arc::new(MockCurationDecisionsRepository::new());
     let curation_exclusions = Arc::new(MockCurationExclusionsRepository::new());
     let curation_use_case = Arc::new(CurationUseCase::new(
@@ -1714,6 +1834,7 @@ pub fn build_mock_ctx_with_label_flag(
         manual_rescan_use_case,
         // See field doc.
         patch_candidate_use_case,
+        held_set_use_case,
         // See field doc.
         scanner_worker_query_use_case,
         // See field doc.
@@ -1902,6 +2023,7 @@ pub fn build_mock_ctx_with_label_flag(
         subscriptions,
         webhook_guard,
         curation_queue,
+        held_set,
         curation_decisions,
         curation_exclusions,
         upstream_metadata,
@@ -2005,6 +2127,7 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         // `RepositoryAccessUseCase`, so no `with_*` helper rebuild is
         // needed when the access policy flips.
         patch_candidate_use_case: base.patch_candidate_use_case.clone(),
+        held_set_use_case: base.held_set_use_case.clone(),
         // Carry forward. The worker-list surface is admin-only and does
         // not consume `RepositoryAccessUseCase`, so no rebuild is needed.
         scanner_worker_query_use_case: base.scanner_worker_query_use_case.clone(),

@@ -44,7 +44,11 @@ use hort_domain::types::ContentHash;
 /// **its own** hash, so an unfiltered "is this hash a target of ANY
 /// kind" check would match every artifact against itself and always
 /// fire. `metadata_blob` is the same shape for the split-metadata path.
-const SELF_REFERENTIAL_KINDS: [&str; 2] = ["primary_content", "metadata_blob"];
+/// `pub` because the held-set overview's SQL binds this list as a
+/// `text[]` parameter rather than restating it: the bucket rule has
+/// exactly one definition in Rust and SQL forms only the boolean from
+/// it. See [`is_parent_gated_blob_constituent_kinds`].
+pub const SELF_REFERENTIAL_KINDS: [&str; 2] = ["primary_content", "metadata_blob"];
 
 /// Is this artifact a **referenced-tree descendant** — i.e. already a
 /// `content_references` target of some OTHER, already-ingested artifact?
@@ -135,7 +139,9 @@ pub(crate) async fn resolve_referenced_tree_descendant_fail_safe(
 /// *manifest*, and a manifest CAN acquire its own signature later; a
 /// blob cannot (the OCI referrers `subject` is a manifest descriptor,
 /// and cosign signs manifest digests).
-const PARENT_GATE_BLOB_KINDS: [&str; 2] = ["oci_config", "oci_layer"];
+/// `pub` for the same reason as [`SELF_REFERENTIAL_KINDS`] — the
+/// held-set overview binds it as a query parameter.
+pub const PARENT_GATE_BLOB_KINDS: [&str; 2] = ["oci_config", "oci_layer"];
 
 /// Is this artifact a **parent-gated blob constituent** — a config/layer
 /// blob whose only inbound edges are its parent manifest's, so no verify
@@ -179,9 +185,32 @@ const PARENT_GATE_BLOB_KINDS: [&str; 2] = ["oci_config", "oci_layer"];
 /// here, an unknown kind disqualifies the skip (enqueue-safe). Both
 /// directions default to "do not terminally decide this artifact".
 pub(crate) fn is_parent_gated_blob_constituent(refs: &[ContentReference]) -> bool {
+    is_parent_gated_blob_constituent_kinds(refs.iter().map(|r| r.kind.as_str()))
+}
+
+/// [`is_parent_gated_blob_constituent`] over the edges' **kinds** alone
+/// — the whole of what the predicate reads.
+///
+/// This is the one definition of the rule, and it exists separately from
+/// the `&[ContentReference]` form for one reason: the held-set
+/// overview's aggregate has to answer the same question in SQL, over
+/// rows it never materialises as `ContentReference` values. Binding
+/// [`PARENT_GATE_BLOB_KINDS`] and [`SELF_REFERENTIAL_KINDS`] into that
+/// query as `text[]` parameters lets SQL form only the boolean, so the
+/// rule is not re-implemented there — and a DB-backed parity test drives
+/// this function and that query over the same kind sets, so neither side
+/// can be edited alone.
+///
+/// Equivalent to: at least one kind in [`PARENT_GATE_BLOB_KINDS`], and
+/// every kind in `PARENT_GATE_BLOB_KINDS ∪ SELF_REFERENTIAL_KINDS`. An
+/// empty iterator is `false` — a reference-less artifact is nobody's
+/// constituent.
+pub fn is_parent_gated_blob_constituent_kinds<'a, I>(kinds: I) -> bool
+where
+    I: IntoIterator<Item = &'a str>,
+{
     let mut saw_blob_edge = false;
-    for r in refs {
-        let kind = r.kind.as_str();
+    for kind in kinds {
         if PARENT_GATE_BLOB_KINDS.contains(&kind) {
             saw_blob_edge = true;
         } else if !SELF_REFERENTIAL_KINDS.contains(&kind) {

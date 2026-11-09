@@ -316,7 +316,7 @@ fn collect_reads() -> Vec<Read> {
 /// hole in it. A stance that flips in either direction fails here too,
 /// which is the point: a reader going from filtered to declared is a
 /// review conversation, not an edit made on the way past.
-const CENSUS: [(&str, usize, usize, usize, usize); 16] = [
+const CENSUS: [(&str, usize, usize, usize, usize); 17] = [
     // -- the two proven defects, now filtered -----------------------------
     //
     // One literal, two legs: the `effective_policy_duration` CTE's
@@ -465,13 +465,27 @@ const CENSUS: [(&str, usize, usize, usize, usize); 16] = [
         1,
         0,
     ),
+    // The held-pending-signature overview. Both of its statements are
+    // built around ONE membership CTE, so there is one literal reading
+    // the table and one filter — the predicate travels with the fragment
+    // that names `artifacts`, which is the only place it can be seen
+    // from. A curator's worklist is the exact surface a soft-deleted row
+    // must not appear in, which is why this is filtered rather than
+    // declared.
+    (
+        "crates/hort-adapters-postgres/src/held_set_reader.rs",
+        1,
+        1,
+        1,
+        0,
+    ),
 ];
 
 /// The total number of literals the scan found at introduction. A floor,
 /// not an equality: a new reader is expected and is already covered by the
 /// main assertion, whereas a *shrinking* corpus means the scan stopped
 /// seeing things. [`CENSUS`] is what pins the per-file detail.
-const CENSUS_FLOOR: usize = 48;
+const CENSUS_FLOOR: usize = 49;
 
 // ---------------------------------------------------------------------------
 // The property.
