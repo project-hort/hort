@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <artifact_id>`; `waive versions`, `waive digests` and `block digests`
   address a decision in bulk (#176).
 
+### Fixed
+
+- The `transitive_deps` prefetch trigger no longer enqueues a dependency-walk
+  job for an artifact that declares none — only the format's own manifest
+  document is walked. Skips are counted on
+  `hort_prefetch_cascade_seed_skipped_total{format}` (#421).
+
 ## [0.17.3] - 2026-11-08
 
 ### Added

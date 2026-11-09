@@ -63,7 +63,9 @@ use hort_domain::ports::event_store::{
     AppendEvents, AppendResult, EventStore, ExpectedVersion, ReadFrom, SealAuthority, SealOutcome,
     SubscribeFrom,
 };
-use hort_domain::ports::format_handler::{FormatHandler, GroupMembership, MetadataStrategy};
+use hort_domain::ports::format_handler::{
+    DependencySpec, FormatHandler, GroupMembership, MetadataStrategy, VersionDiscovery,
+};
 use hort_domain::ports::identity_provider::{IdentityProvider, IdpClaims, OidcValidationError};
 use hort_domain::ports::jobs_repository::{
     ClaimReservation, CompensatingDelete, JobRow, JobsRepository, ListJobsFilter, ListJobsPage,
@@ -5414,6 +5416,32 @@ pub struct StubFormatHandler {
     /// stand in for an OCI blob row without pulling `hort-formats` into
     /// `hort-app` (the dependency direction forbids it).
     pub provenance_constituent: bool,
+    /// Which artifact paths the stub's `VersionDiscovery` group admits
+    /// as dependency documents — the gate on the transitive-prefetch
+    /// cascade seed.
+    ///
+    /// `Some(suffixes)`: the stub declares the group
+    /// (`version_discovery()` is `Some`) and
+    /// `path_carries_dependency_specs` is `true` iff the path ends in
+    /// one of them.
+    ///
+    /// **The default is empty, and that is deliberate.** A stub that
+    /// admitted every path would be a format no handler in
+    /// `hort-formats` matches — every real one names the single stored
+    /// shape that carries its declarations — and it would make a test
+    /// asserting a cascade enqueue pass over a path production refuses.
+    /// Empty fails closed instead: a test that needs the cascade to
+    /// fire names the suffix its own artifact path carries, via
+    /// [`with_dependency_document_suffixes`](StubFormatHandler::with_dependency_document_suffixes),
+    /// which is also where a fixture's per-format literal belongs
+    /// rather than in this always-compiled module (ADR 0008).
+    ///
+    /// `None`: the stub declares NO `VersionDiscovery` group at all
+    /// (`version_discovery()` returns `None`) — the oci / helm / rpm /
+    /// debian / generic shape, which has no `extract_dependency_specs`
+    /// for a walk to call and must therefore seed no cascade. Set via
+    /// [`StubFormatHandler::without_version_discovery`].
+    pub dependency_document_suffixes: Option<Vec<&'static str>>,
     /// The [`PayloadAccess`](hort_domain::types::PayloadAccess) variant
     /// each `extract_wheel_metadata_bytes` call was handed, in call
     /// order — read back through
@@ -5501,6 +5529,7 @@ impl StubFormatHandler {
             oci_membership_edges: None,
             collision_fold: false,
             provenance_constituent: false,
+            dependency_document_suffixes: Some(Vec::new()),
             wheel_payload_shapes: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -5509,6 +5538,24 @@ impl StubFormatHandler {
     /// stub is moved into an `Arc<dyn FormatHandler>`.
     pub fn wheel_payload_shapes(&self) -> Arc<Mutex<Vec<WheelPayloadShape>>> {
         Arc::clone(&self.wheel_payload_shapes)
+    }
+
+    /// Make this stub declare no `VersionDiscovery` capability group
+    /// (ADR 0005) — the oci / helm / rpm / debian / generic shape. Such
+    /// a format has no `extract_dependency_specs` at all, so the
+    /// transitive-prefetch cascade has nothing to seed over its
+    /// artifacts however the repository's policy is configured.
+    pub fn without_version_discovery(mut self) -> Self {
+        self.dependency_document_suffixes = None;
+        self
+    }
+
+    /// Replace the artifact-path suffixes this stub admits as dependency
+    /// documents (see
+    /// [`dependency_document_suffixes`](Self::dependency_document_suffixes)).
+    pub fn with_dependency_document_suffixes(mut self, suffixes: Vec<&'static str>) -> Self {
+        self.dependency_document_suffixes = Some(suffixes);
+        self
     }
 
     /// Make this stub classify every artifact as a provenance
@@ -5661,6 +5708,86 @@ impl FormatHandler for StubFormatHandler {
                 Err(DomainError::Validation((*reason).to_string()))
             }
         }
+    }
+    /// `Some(self)` unless the stub was built with
+    /// [`without_version_discovery`](StubFormatHandler::without_version_discovery).
+    /// Participation is what a caller reads before asking the group
+    /// anything, so a stub standing in for a non-participating format
+    /// has to be able to say `None` here rather than answer `false` to
+    /// every member.
+    fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+        self.dependency_document_suffixes
+            .as_ref()
+            .map(|_| self as &dyn VersionDiscovery)
+    }
+}
+
+/// The stub's `VersionDiscovery` group.
+///
+/// Only
+/// [`path_carries_dependency_specs`](VersionDiscovery::path_carries_dependency_specs)
+/// carries behaviour — it is the member the ingest and registration
+/// paths consult, and the one the cascade-seed gate is written against.
+/// The other seven are inert in the sense the trait's own doc
+/// prescribes for a participant with nothing to contribute (`None` /
+/// `Vec::new()` / `Ok(vec![])`), NOT `unimplemented!`: the walk, the
+/// tick and the leaf-ingest each have their own purpose-built doubles
+/// in `crates/hort-app/src/task_handlers/`, so a test that reached one
+/// of these through the ingest stub would be asking the wrong double —
+/// and an inert answer leaves it with an empty result rather than a
+/// panic whose stack says nothing about which double it wanted.
+impl VersionDiscovery for StubFormatHandler {
+    fn extract_upstream_versions(
+        &self,
+        _body: &mut dyn std::io::Read,
+    ) -> DomainResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+    fn upstream_metadata_path(&self, _package: &str) -> Option<String> {
+        None
+    }
+    fn upstream_metadata_accept(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// `true` iff `path` ends in one of
+    /// [`dependency_document_suffixes`](StubFormatHandler::dependency_document_suffixes).
+    fn path_carries_dependency_specs(&self, path: &str) -> bool {
+        let lower = path.to_ascii_lowercase();
+        self.dependency_document_suffixes
+            .as_ref()
+            .is_some_and(|suffixes| suffixes.iter().any(|s| lower.ends_with(s)))
+    }
+    fn extract_dependency_specs(
+        &self,
+        _content: &mut dyn std::io::Read,
+    ) -> DomainResult<Vec<DependencySpec>> {
+        Ok(Vec::new())
+    }
+    fn resolve_range_max(&self, _range: &str, _available: &[&str]) -> DomainResult<Option<String>> {
+        Ok(None)
+    }
+    fn download_config_path(&self) -> Option<String> {
+        None
+    }
+    fn compose_download_url_from_config(
+        &self,
+        _body: &mut dyn std::io::Read,
+        _package: &str,
+        _version: &str,
+        _cksum_hex: Option<&str>,
+    ) -> DomainResult<String> {
+        Err(DomainError::Validation(
+            "StubFormatHandler composes no download URL".into(),
+        ))
+    }
+    fn resolve_download_url_from_metadata(
+        &self,
+        _body: &mut dyn std::io::Read,
+        _coords: &ArtifactCoords,
+    ) -> DomainResult<String> {
+        Err(DomainError::Validation(
+            "StubFormatHandler resolves no download URL".into(),
+        ))
     }
 }
 
@@ -9964,6 +10091,99 @@ mod tests {
     const VALID_SHA256_A: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const VALID_SHA256_B: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
     const VALID_SHA256_C: &str = "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae";
+
+    /// The ingest stub's `VersionDiscovery` group, in both
+    /// participation states.
+    ///
+    /// The default participates and admits nothing, so a cascade test
+    /// has to name the suffix its own artifact path carries — a double
+    /// admitting every path would make the refusal under test
+    /// unobservable, and the enqueue it then reported would be a
+    /// property of the double. `without_version_discovery` withdraws
+    /// the group entirely, the way a format with no
+    /// dependency-extraction concept does.
+    #[test]
+    fn stub_format_handler_answers_the_dependency_document_predicate_per_suffix() {
+        // The default participates and admits nothing: a cascade test
+        // that forgot to name its suffix sees a refusal, never a
+        // false enqueue.
+        let stub = StubFormatHandler::new("pypi");
+        let vd = stub
+            .version_discovery()
+            .expect("the stub participates by default");
+        assert!(!vd.path_carries_dependency_specs("my-package/1.0.0/my-package-1.0.0.tar.gz"));
+
+        let sdist_shaped =
+            StubFormatHandler::new("pypi").with_dependency_document_suffixes(vec![".tar.gz"]);
+        let vd = sdist_shaped.version_discovery().expect("participates");
+        assert!(vd.path_carries_dependency_specs("my-package/1.0.0/my-package-1.0.0.tar.gz"));
+        assert!(vd.path_carries_dependency_specs("MY-PACKAGE-1.0.0.TAR.GZ"));
+        assert!(!vd.path_carries_dependency_specs("com/example/lib/1.0.0/lib-1.0.0.jar"));
+
+        let maven_shaped =
+            StubFormatHandler::new("maven").with_dependency_document_suffixes(vec![".pom"]);
+        let vd = maven_shaped.version_discovery().expect("participates");
+        assert!(vd.path_carries_dependency_specs("com/example/lib/1.0.0/lib-1.0.0.pom"));
+        assert!(!vd.path_carries_dependency_specs("com/example/lib/1.0.0/lib-1.0.0.jar"));
+
+        assert!(
+            StubFormatHandler::new("oci")
+                .without_version_discovery()
+                .version_discovery()
+                .is_none(),
+            "withdrawing the group is how a non-participating format is stood in for — \
+             answering `false` to every member would instead stand in for a participant \
+             that warms nothing",
+        );
+    }
+
+    /// The other seven members are inert rather than `unimplemented!`,
+    /// so a test that reaches one through the ingest stub gets an empty
+    /// answer instead of a panic. Exercised here because nothing else
+    /// does: the walk, the tick and the leaf-ingest each have their own
+    /// purpose-built doubles.
+    #[test]
+    fn stub_format_handler_version_discovery_group_is_otherwise_inert() {
+        let stub = StubFormatHandler::new("pypi");
+        let vd = stub.version_discovery().expect("participates");
+
+        assert!(vd
+            .extract_upstream_versions(&mut std::io::Cursor::new(b"ignored".to_vec()))
+            .expect("inert, not failing")
+            .is_empty());
+        assert!(vd.upstream_metadata_path("pkg").is_none());
+        assert!(vd.upstream_metadata_accept().is_empty());
+        assert!(vd
+            .extract_dependency_specs(&mut std::io::Cursor::new(b"ignored".to_vec()))
+            .expect("inert, not failing")
+            .is_empty());
+        assert!(vd
+            .resolve_range_max(">=1", &["1.0.0"])
+            .expect("inert, not failing")
+            .is_none());
+        assert!(vd.download_config_path().is_none());
+        assert!(vd
+            .compose_download_url_from_config(
+                &mut std::io::Cursor::new(b"{}".to_vec()),
+                "pkg",
+                "1.0.0",
+                None,
+            )
+            .is_err());
+        assert!(vd
+            .resolve_download_url_from_metadata(
+                &mut std::io::Cursor::new(b"{}".to_vec()),
+                &ArtifactCoords {
+                    name: "pkg".into(),
+                    name_as_published: "pkg".into(),
+                    version: Some("1.0.0".into()),
+                    path: "pkg/1.0.0/pkg-1.0.0.tar.gz".into(),
+                    format: RepositoryFormat::Pypi,
+                    metadata: serde_json::Value::Null,
+                },
+            )
+            .is_err());
+    }
 
     /// The lifecycle mock refuses a pair whose batch is not the
     /// handed-in artifact's stream, exactly as the adapter does — and

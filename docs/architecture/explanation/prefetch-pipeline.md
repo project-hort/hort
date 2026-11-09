@@ -196,14 +196,40 @@ stateless and re-derivable.
 
 ## The transitive cascade
 
-When a repository's triggers include `transitive_deps`, every ingest
-fires a seed hook (`crates/hort-app/src/use_cases/ingest_use_case.rs`,
-the block guarded by `suppress_cascade_seed` and the
-`TransitiveDeps` membership check) that enqueues one root
-`prefetch-dependencies` row for the just-ingested artifact at depth 0.
-The hook runs strictly after the ingest transition commits and is
-best-effort: an enqueue failure logs a warning and leaves the ingest's
-success untouched — the next pull re-triggers.
+When a repository's triggers include `transitive_deps`, an ingest fires
+a seed hook (`IngestUseCase::enqueue_prefetch_cascade` in
+`crates/hort-app/src/use_cases/ingest_use_case.rs`) that enqueues one
+root `prefetch-dependencies` row for the just-ingested artifact at
+depth 0. `register_by_hash` — the OCI cross-repository blob mount and
+the pull-dedup followers — is the second producer of a root and
+delegates to the same method, so both take the same decisions. The hook
+runs strictly after the transition commits and is best-effort: an
+enqueue failure logs a warning and leaves the ingest's success
+untouched — the next pull re-triggers.
+
+**The trigger is not the whole gate: the artifact has to be the
+document.** The trigger is the operator's opt-in, and it says nothing
+about whether *this* artifact declares any dependencies. So the hook
+asks the format, through
+`VersionDiscovery::path_carries_dependency_specs` — Maven answers for
+the `.pom` and refuses the jar, the sources jar, the signature and the
+checksum sidecar; cargo answers for the `.crate` and npm for the
+`.tgz`, where the archive IS the document; PyPI answers for the wheel
+and the gzip sdist. A format that declares no `VersionDiscovery` group
+at all (oci, helm, rpm, debian, generic) refuses structurally: there is
+no `extract_dependency_specs` for a walk to call, so a root over its
+artifacts has no reachable outcome.
+
+Without that question the hook enqueued a root per ingest, and for
+Maven most of those roots could not succeed: the extractor reads the
+POM's own bytes and reports `Err` for anything whose root element is
+not `<project>`, which is the correct contract — `Err` is what keeps a
+genuinely corrupt POM distinguishable from a file that was never one —
+so the refusal has to happen before the enqueue rather than be absorbed
+after it. The refusals are counted on
+`hort_prefetch_cascade_seed_skipped_total{format}` and deliberately not
+logged per artifact: a Maven repository holds far more jars than POMs,
+so the skip is the ordinary case.
 
 `PrefetchDependenciesHandler`
 (`crates/hort-app/src/task_handlers/prefetch_dependencies.rs`) drives

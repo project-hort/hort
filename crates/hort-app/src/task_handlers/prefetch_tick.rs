@@ -1154,7 +1154,40 @@ mod tests {
             Some(self)
         }
     }
+    /// The tick doubles' dependency-document predicate, exercised
+    /// where it is declared — see the stance on `NpmHandlerForTests`
+    /// below. The scheduled tick plans versions from an upstream
+    /// document and never reads this member.
+    #[test]
+    fn tick_doubles_admit_every_path() {
+        let doubles: Vec<Box<dyn FormatHandler>> = vec![
+            Box::new(NpmHandlerForTests),
+            Box::new(PypiHandlerForTests),
+            Box::new(MavenHandlerForTests),
+            Box::new(OrderinglessParticipantHandler),
+            Box::new(AlwaysFailingParserHandler),
+        ];
+        for d in doubles {
+            let vd = d
+                .version_discovery()
+                .expect("every tick double declares the group");
+            assert!(vd.path_carries_dependency_specs("whatever/it/is-1.0.0.bin"));
+        }
+    }
+
     impl VersionDiscovery for NpmHandlerForTests {
+        // These tests hand the handler a manifest they built
+        // themselves, so the dependency-document predicate is not on the
+        // path they drive and no assertion below reads it. Answered
+        // `true` rather than left to panic because a refusal here would
+        // be an answer to a question this double was never asked — and
+        // `true` is the stance its sibling methods already take: this
+        // double's `extract_dependency_specs` deliberately parses plain
+        // JSON instead of the format's real container, so it stands for
+        // the walk's logic, not for any format's stored layout.
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn upstream_metadata_path(&self, package: &str) -> Option<String> {
             Some(format!("/{package}"))
         }
@@ -1233,6 +1266,9 @@ mod tests {
         }
     }
     impl VersionDiscovery for PypiHandlerForTests {
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn upstream_metadata_path(&self, package: &str) -> Option<String> {
             Some(format!("/simple/{}/", self.normalize_name(package)))
         }
@@ -1326,6 +1362,9 @@ mod tests {
         }
     }
     impl VersionDiscovery for MavenHandlerForTests {
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn upstream_metadata_path(&self, package: &str) -> Option<String> {
             let (group_id, artifact_id) = package.split_once(':')?;
             Some(format!(
@@ -1413,6 +1452,9 @@ mod tests {
         }
     }
     impl VersionDiscovery for OrderinglessParticipantHandler {
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn upstream_metadata_path(&self, package: &str) -> Option<String> {
             Some(format!("/{package}"))
         }
@@ -1485,6 +1527,9 @@ mod tests {
         }
     }
     impl VersionDiscovery for AlwaysFailingParserHandler {
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn upstream_metadata_path(&self, package: &str) -> Option<String> {
             Some(format!("/{package}"))
         }

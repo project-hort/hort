@@ -962,6 +962,24 @@ impl VersionDiscovery for NpmFormatHandler {
         Vec::new()
     }
 
+    /// The published `.tgz` tarball, which for npm IS the dependency
+    /// document:
+    /// [`extract_dependency_specs`](VersionDiscovery::extract_dependency_specs)
+    /// opens it and reads `package/package.json` out of it, so the
+    /// artifact a client pulls and the manifest a cascade reads are the
+    /// same bytes.
+    ///
+    /// The packument is resolved from upstream metadata rather than
+    /// stored as an artifact row, so the tarball is the only stored
+    /// shape that can carry declarations. The same signal
+    /// [`NpmFormatHandler::scan_kind`] reads, answered independently
+    /// because the two decisions are independent: that one picks a
+    /// scanner's analyzer, this one decides whether there is a manifest
+    /// to walk.
+    fn path_carries_dependency_specs(&self, path: &str) -> bool {
+        path.to_ascii_lowercase().ends_with(".tgz")
+    }
+
     /// Extract the *declared runtime* dependency specs from the **stored
     /// npm `.tgz` artifact stream**.
     ///
@@ -3569,6 +3587,26 @@ mod tests {
                 handler().upstream_checksum_metadata_path(&coords),
                 "upstream_metadata_path and upstream_checksum_metadata_path diverged for {name}",
             );
+        }
+    }
+
+    /// For npm, as for cargo, the archive IS the document: the stored
+    /// `.tgz` carries the `package/package.json` the extractor reads.
+    /// The packument is resolved from upstream metadata and never
+    /// stored as an artifact row.
+    #[test]
+    fn path_carries_dependency_specs_admits_the_package_tarball() {
+        let handler = handler();
+
+        for admitted in ["lodash/-/lodash-4.17.21.tgz", "@scope/pkg/-/pkg-1.0.0.TGZ"] {
+            assert!(
+                handler.path_carries_dependency_specs(admitted),
+                "{admitted}"
+            );
+        }
+
+        for refused in ["lodash", "@scope/pkg", "lodash/-/lodash-4.17.21.tgz.sig"] {
+            assert!(!handler.path_carries_dependency_specs(refused), "{refused}");
         }
     }
 

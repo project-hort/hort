@@ -1213,6 +1213,32 @@ impl VersionDiscovery for PyPiFormatHandler {
         ]
     }
 
+    /// The two containers
+    /// [`extract_dependency_specs`](VersionDiscovery::extract_dependency_specs)
+    /// recognises: the `.whl` zip, whose `*.dist-info/METADATA` carries
+    /// `Requires-Dist`, and the `.tar.gz` sdist.
+    ///
+    /// The long-tail sdist containers PyPI still hosts — `.zip`,
+    /// `.tar.bz2`, `.tar.xz`, `.egg` — answer `false`, for the same
+    /// reason [`PyPiFormatHandler::scan_kind`] classifies them
+    /// `Other`: the extractor sniffs the container from its leading
+    /// bytes and reads a zip as a wheel or a gzip as an sdist, so a
+    /// `.zip`/`.egg` reaches the wheel arm and fails on the absent
+    /// `*.dist-info/METADATA` while a `.tar.bz2`/`.tar.xz` is neither
+    /// container at all. Claiming a container the extractor cannot read
+    /// turns a clean refusal into a failing job, which is the whole
+    /// hazard this predicate exists to close.
+    ///
+    /// The sdist arm answers `true` even though it is a documented
+    /// best-effort skip (PKG-INFO rarely carries `Requires-Dist`): a
+    /// gzip sdist IS input the extractor reads and reports `Ok` on, and
+    /// "read it and found nothing declared" is a different fact from
+    /// "there was nothing to read". Only the second belongs here.
+    fn path_carries_dependency_specs(&self, path: &str) -> bool {
+        let lower = path.to_ascii_lowercase();
+        lower.ends_with(".whl") || lower.ends_with(".tar.gz")
+    }
+
     /// Extract the *declared runtime* dependency specs from the **stored
     /// PyPI distribution artifact stream**.
     ///
@@ -3673,6 +3699,44 @@ mod tests {
             handler.upstream_metadata_path("zope.interface"),
             Some("/simple/zope-interface/".to_string()),
         );
+    }
+
+    /// The two containers the extractor recognises, and the long tail
+    /// it does not.
+    ///
+    /// `.zip` and `.egg` are refused even though they ARE sdists: the
+    /// extractor sniffs the leading bytes, reads any zip as a wheel and
+    /// then fails on the absent `*.dist-info/METADATA`, so admitting
+    /// them would enqueue exactly the job that cannot succeed.
+    /// `.tar.bz2` and `.tar.xz` are neither of its containers at all.
+    /// The same split, for the same reason,
+    /// [`PyPiFormatHandler::scan_kind`] makes between `PyWheel` /
+    /// `PySdist` and `Other`.
+    #[test]
+    fn path_carries_dependency_specs_admits_the_wheel_and_the_gzip_sdist() {
+        let handler = handler();
+
+        for admitted in [
+            "simple/requests/requests-2.31.0-py3-none-any.whl",
+            "simple/requests/requests-2.31.0.tar.gz",
+            "simple/requests/REQUESTS-2.31.0-PY3-NONE-ANY.WHL",
+        ] {
+            assert!(
+                handler.path_carries_dependency_specs(admitted),
+                "{admitted}"
+            );
+        }
+
+        for refused in [
+            "simple/requests/requests-2.31.0.zip",
+            "simple/requests/requests-2.31.0.egg",
+            "simple/requests/requests-2.31.0.tar.bz2",
+            "simple/requests/requests-2.31.0.tar.xz",
+            "simple/requests/",
+            "simple/requests/requests-2.31.0-py3-none-any.whl.metadata",
+        ] {
+            assert!(!handler.path_carries_dependency_specs(refused), "{refused}");
+        }
     }
 
     #[test]
