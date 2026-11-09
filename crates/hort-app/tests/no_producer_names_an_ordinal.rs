@@ -612,14 +612,18 @@ fn no_producer_names_a_queue_ordinal() {
     };
     assert_eq!(
         count(Ordinal::Table, "enqueue"),
-        10,
+        9,
         "the scan found {} in-place table calls at an enqueue entry point; an exact count rather \
          than a floor, because a floor cannot tell a hit that vanished from one that was never \
          there — a call site rewritten into a form the scan does not read would leave the \
          remainder satisfying a lower bound. If one was legitimately added or removed, move this \
          count deliberately. The count spans both call forms, so rewriting a site from \
          `self.jobs.enqueue_task(…)` into `JobsRepository::enqueue_task(&*self.jobs, …)` must \
-         leave it unchanged",
+         leave it unchanged. Nine and not ten since the two producers of a transitive-prefetch \
+         cascade root — the ingest tail and `register_by_hash` — came to share one call: the \
+         second carried a copy of the first, and a copy is how two sites whose only requirement \
+         is to agree stop agreeing (the copy was missing the gate that asks whether the artifact \
+         is the dependency document at all)",
         count(Ordinal::Table, "enqueue")
     );
     assert_eq!(

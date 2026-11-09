@@ -1461,7 +1461,41 @@ mod tests {
             Some(self)
         }
     }
+    /// The walk doubles' dependency-document predicate, exercised
+    /// where it is declared. Nothing in these tests consults it — the
+    /// gate that does lives at the ingest/registration enqueue, not on
+    /// the walk — so this pins the stance stated on `NpmInTest` below
+    /// rather than inferring it from a test that never asks.
+    #[test]
+    fn walk_doubles_admit_every_path() {
+        let doubles: Vec<Box<dyn FormatHandler>> = vec![
+            Box::new(NpmInTest),
+            Box::new(CargoInTest),
+            Box::new(PypiInTest),
+            Box::new(MavenInTest),
+            Box::new(AlwaysFailingExtractor),
+        ];
+        for d in doubles {
+            let vd = d
+                .version_discovery()
+                .expect("every walk double declares the group");
+            assert!(vd.path_carries_dependency_specs("whatever/it/is-1.0.0.bin"));
+        }
+    }
+
     impl VersionDiscovery for NpmInTest {
+        // These tests hand the handler a manifest they built
+        // themselves, so the dependency-document predicate is not on the
+        // path they drive and no assertion below reads it. Answered
+        // `true` rather than left to panic because a refusal here would
+        // be an answer to a question this double was never asked — and
+        // `true` is the stance its sibling methods already take: this
+        // double's `extract_dependency_specs` deliberately parses plain
+        // JSON instead of the format's real container, so it stands for
+        // the walk's logic, not for any format's stored layout.
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn extract_upstream_versions(
             &self,
             body: &mut dyn std::io::Read,
@@ -1561,6 +1595,9 @@ mod tests {
         }
     }
     impl VersionDiscovery for CargoInTest {
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn extract_upstream_versions(
             &self,
             body: &mut dyn std::io::Read,
@@ -1640,6 +1677,9 @@ mod tests {
         }
     }
     impl VersionDiscovery for PypiInTest {
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn extract_upstream_versions(
             &self,
             body: &mut dyn std::io::Read,
@@ -1724,6 +1764,9 @@ mod tests {
         }
     }
     impl VersionDiscovery for MavenInTest {
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn extract_upstream_versions(
             &self,
             body: &mut dyn std::io::Read,
@@ -1857,6 +1900,9 @@ mod tests {
         }
     }
     impl VersionDiscovery for AlwaysFailingExtractor {
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn extract_upstream_versions(
             &self,
             _body: &mut dyn std::io::Read,

@@ -65,6 +65,14 @@ pub(crate) const PROVENANCE_VERIFY_KIND: &str = "provenance-verify";
 /// `jobs.kind` of the transitive prefetch cascade driver.
 const PREFETCH_DEPENDENCIES_KIND: &str = "prefetch-dependencies";
 
+/// `producer` log field on the two entry points that mint a cascade
+/// root. Both stamp the same `jobs` row and take the same decisions;
+/// the field is what lets an operator tell a root minted over a push
+/// from one minted over content already in CAS.
+const CASCADE_PRODUCER_INGEST: &str = "ingest";
+/// See [`CASCADE_PRODUCER_INGEST`].
+const CASCADE_PRODUCER_REGISTER_BY_HASH: &str = "register_by_hash";
+
 /// `jobs.trigger_source` every enqueue this use case makes at ingest
 /// time carries, taken from the one definition of the set
 /// ([`hort_domain::ports::jobs_repository::TriggerSource`]). The
@@ -3761,6 +3769,36 @@ impl IngestUseCase {
         .increment(1);
     }
 
+    /// Whether the artifact stored at `path` is the document a
+    /// `prefetch-dependencies` walk would read — the format's own
+    /// answer, through
+    /// [`VersionDiscovery::path_carries_dependency_specs`].
+    ///
+    /// **A format that does not declare the capability group answers
+    /// "no" structurally.** `version_discovery()` is `None` for oci,
+    /// helm, rpm, debian and generic, which means there is no
+    /// `extract_dependency_specs` for a walk to call at all: a root job
+    /// over such an artifact has no reachable outcome, so the `is_some`
+    /// arm here is the gate rather than a convenience. Apply-time
+    /// linting already refuses the `transitive_deps` trigger on such a
+    /// format, which makes this the second layer and not the first —
+    /// but a projection written before that rule existed, or any path
+    /// to a policy that does not transit gitops apply, reaches here
+    /// instead.
+    ///
+    /// Per-format knowledge — which stored suffix carries declarations
+    /// — stays behind the port in `hort-formats` (ADR 0008). This
+    /// function reads an answer and spells no suffix of its own; the
+    /// media type is deliberately not consulted, because a stored
+    /// `Content-Type` is a copy of an inbound adapter's presentation
+    /// default and a read decision must not move when a MIME type is
+    /// adjusted.
+    fn artifact_carries_dependency_specs(handler: &dyn FormatHandler, path: &str) -> bool {
+        handler
+            .version_discovery()
+            .is_some_and(|vd| vd.path_carries_dependency_specs(path))
+    }
+
     /// Transitive prefetch cascade enqueue hook. Fires per-ingest when the
     /// repository's `prefetch_policy.triggers` contained `TransitiveDeps`
     /// (`prefetch_transitive_deps_triggered`, precomputed by the caller
@@ -3786,14 +3824,55 @@ impl IngestUseCase {
     /// the transitive_depth / max_descendants caps). Seeds (client pulls,
     /// self-service ROOT leaves) leave it `false` so the hook fires as
     /// before.
+    ///
+    /// `artifact_carries_dependency_specs` is the format's own answer to
+    /// "is this artifact the document the walk would read", precomputed
+    /// by the caller via [`Self::artifact_carries_dependency_specs`] for
+    /// the same reason `prefetch_transitive_deps_triggered` is: the
+    /// handler is borrowed by the caller, and the enqueue reaches for no
+    /// port of its own.
+    ///
+    /// `producer` names the entry point for the log line only — the two
+    /// producers of a cascade root (`ingest_inner` and
+    /// `register_by_hash_inner`) share every decision this method makes,
+    /// and an operator still needs to tell a root minted over a push
+    /// from one minted over content already in CAS.
+    #[allow(clippy::too_many_arguments)]
     async fn enqueue_prefetch_cascade(
         &self,
         suppress_cascade_seed: bool,
         prefetch_transitive_deps_triggered: bool,
+        artifact_carries_dependency_specs: bool,
         artifact_id: Uuid,
         repository_id: Uuid,
+        format: &str,
+        producer: &'static str,
     ) {
         if suppress_cascade_seed || !prefetch_transitive_deps_triggered {
+            return;
+        }
+
+        // No job here, and the absence IS the answer rather than a gap:
+        // the format has said that an artifact at this path does not
+        // declare dependencies, so a `prefetch-dependencies` walk over
+        // it has nothing to read and the row it would claim could only
+        // fail. The extractor's refusal is deliberate — `Err` there
+        // means "these bytes are not the manifest", which is what keeps
+        // a genuinely corrupt manifest distinguishable from a file that
+        // was never one — so the question has to be asked before the
+        // enqueue, not survived after it. A format that does not
+        // declare the capability group at all lands here too: there is
+        // no extractor for the walk to call.
+        //
+        // Counted, never logged per artifact: a Maven repository holds
+        // far more jars than poms, so this is the ordinary case and an
+        // `info!` per skip would turn every jar ingest into log volume.
+        if !artifact_carries_dependency_specs {
+            metrics::counter!(
+                "hort_prefetch_cascade_seed_skipped_total",
+                labels::FORMAT => format.to_string(),
+            )
+            .increment(1);
             return;
         }
 
@@ -3823,12 +3902,14 @@ impl IngestUseCase {
             Ok(outcome) => tracing::debug!(
                 artifact_id = %artifact_id,
                 repository_id = %repository_id,
+                producer,
                 ?outcome,
                 "prefetch cascade: enqueued prefetch-dependencies root job",
             ),
             Err(e) => tracing::warn!(
                 artifact_id = %artifact_id,
                 repository_id = %repository_id,
+                producer,
                 error = %e,
                 "prefetch cascade: prefetch-dependencies enqueue failed; \
                  cascade skipped (best-effort — next pull re-triggers)",
@@ -4140,6 +4221,15 @@ impl IngestUseCase {
             .triggers
             .contains(&hort_domain::entities::repository::PrefetchTrigger::TransitiveDeps);
 
+        // The second half of the cascade-seed gate, precomputed here for
+        // the same reason as the trigger above: `handler` is borrowed
+        // from the outer `ingest` for the duration of this call, and the
+        // post-commit hook takes the answer rather than the port. The
+        // path is the row's own — `artifact.path` is built from
+        // `coords.path` below, so the two cannot disagree.
+        let artifact_carries_dependency_specs =
+            Self::artifact_carries_dependency_specs(handler, &coords.path);
+
         let artifact_metadata = ArtifactMetadata {
             artifact_id,
             format: repo.format,
@@ -4384,8 +4474,11 @@ impl IngestUseCase {
         self.enqueue_prefetch_cascade(
             suppress_cascade_seed,
             prefetch_transitive_deps_triggered,
+            artifact_carries_dependency_specs,
             artifact_id,
             repository_id,
+            &scan_enqueue_format,
+            CASCADE_PRODUCER_INGEST,
         )
         .await;
 
@@ -5336,50 +5429,36 @@ impl IngestUseCase {
             "registered_by_hash"
         );
 
-        // Transitive prefetch cascade
-        // enqueue hook (mirror of `ingest_inner`'s hook). Same
-        // contract: gated on `prefetch_policy.triggers.contains(
-        // TransitiveDeps)`, best-effort (warn-and-continue), fires
-        // after the registration commit lands. Covers the OCI
-        // cross-repo blob-mount and any future hash-only registration
-        // paths so the cascade is event-driven uniformly across both
-        // ingest entry points.
-        if repo
-            .prefetch_policy
-            .triggers
-            .contains(&hort_domain::entities::repository::PrefetchTrigger::TransitiveDeps)
-        {
-            let params = serde_json::json!({
-                "artifact_id": artifact.id,
-                "current_depth": 0u32,
-            });
-            match self
-                .jobs
-                .enqueue_task(
-                    PREFETCH_DEPENDENCIES_KIND,
-                    &params,
-                    None,
-                    queue_priority(PREFETCH_DEPENDENCIES_KIND, INGEST_TRIGGER_SOURCE),
-                    INGEST_TRIGGER_SOURCE,
-                    None, // non-destructive task — no DB-side idempotency key (ADR 0028)
-                )
-                .await
-            {
-                Ok(outcome) => tracing::debug!(
-                    artifact_id = %artifact.id,
-                    %repository_id,
-                    ?outcome,
-                    "prefetch cascade: enqueued prefetch-dependencies root job (register_by_hash path)",
-                ),
-                Err(e) => tracing::warn!(
-                    artifact_id = %artifact.id,
-                    %repository_id,
-                    error = %e,
-                    "prefetch cascade: prefetch-dependencies enqueue failed (register_by_hash); \
-                     cascade skipped (best-effort — next pull re-triggers)",
-                ),
-            }
-        }
+        // Transitive prefetch cascade enqueue hook — the second
+        // producer of a cascade root, behind the SAME gate as
+        // `ingest_inner`'s: the repository's `TransitiveDeps` trigger
+        // AND the format's answer to whether this artifact is the
+        // document a walk would read. Covers the OCI cross-repo
+        // blob-mount and any future hash-only registration path, so the
+        // cascade is event-driven uniformly across both ingest entry
+        // points.
+        //
+        // Delegated rather than mirrored. The two hooks' only
+        // requirement has always been that they agree — a root minted
+        // over content already in CAS is the same warm-up walk, stamping
+        // the same pair — and a copy is how they stop agreeing: this one
+        // was a copy, and it would have been the half of the gate a
+        // reader could not find. `suppress_cascade_seed` is `false`
+        // because registration has no cascade-internal caller: a
+        // `prefetch` leaf-ingest goes through `ingest_with_verification`,
+        // never through here, so this path is always a seed.
+        self.enqueue_prefetch_cascade(
+            false,
+            repo.prefetch_policy
+                .triggers
+                .contains(&hort_domain::entities::repository::PrefetchTrigger::TransitiveDeps),
+            Self::artifact_carries_dependency_specs(handler, &artifact.path),
+            artifact.id,
+            repository_id,
+            &scan_enqueue_format,
+            CASCADE_PRODUCER_REGISTER_BY_HASH,
+        )
+        .await;
 
         Ok(RegisterOutcome::Fresh {
             artifact,
@@ -6055,7 +6134,7 @@ mod tests {
 
     use chrono::Utc;
     use metrics::{Key, SharedString};
-    use metrics_util::debugging::DebugValue;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use metrics_util::{CompositeKey, MetricKind};
 
     use hort_domain::entities::artifact::QuarantineStatus;
@@ -6512,6 +6591,17 @@ mod tests {
     /// for the small payloads these tests build.
     fn test_handler() -> StubFormatHandler {
         StubFormatHandler::new("pypi").with_max_bytes(10 * 1024 * 1024)
+    }
+
+    /// [`test_handler`] for a test that must reach the cascade-seed
+    /// enqueue: the stub admits `sample_coords`' sdist suffix as its
+    /// dependency document, which is half of the hook's gate (the
+    /// repository's `TransitiveDeps` trigger is the other half). The
+    /// default stub admits nothing, so a cascade test that did not say
+    /// this would be asserting over a refusal it did not mean to
+    /// configure.
+    fn test_handler_carrying_dependency_specs() -> StubFormatHandler {
+        test_handler().with_dependency_document_suffixes(vec![".tar.gz"])
     }
 
     fn sample_coords() -> ArtifactCoords {
@@ -16717,9 +16807,13 @@ mod tests {
             // doesn't trip the test fixture's mock.
             seed_permissive_global_policy(&policy_projections);
 
-            uc.ingest_direct(req(repo_id), content_stream(b"x"), &test_handler())
-                .await
-                .expect("ingest");
+            uc.ingest_direct(
+                req(repo_id),
+                content_stream(b"x"),
+                &test_handler_carrying_dependency_specs(),
+            )
+            .await
+            .expect("ingest");
 
             let enqueue_calls = jobs.enqueue_calls();
             let cascade_calls: Vec<_> = enqueue_calls
@@ -16874,9 +16968,14 @@ mod tests {
                 upstream_published_at: None,
                 trust_upstream_publish_time: false,
             };
-            uc.ingest_verified(req, &[], content_stream(content), &test_handler())
-                .await
-                .expect("verified ingest");
+            uc.ingest_verified(
+                req,
+                &[],
+                content_stream(content),
+                &test_handler_carrying_dependency_specs(),
+            )
+            .await
+            .expect("verified ingest");
 
             let cascade_calls: Vec<_> = jobs
                 .enqueue_calls()
@@ -16914,9 +17013,14 @@ mod tests {
             let hash: ContentHash = ZERO_HASH.parse().unwrap();
             storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
 
-            uc.register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
-                .await
-                .expect("register_by_hash must succeed");
+            uc.register_by_hash(
+                req_legacy(repo_id),
+                hash,
+                None,
+                &test_handler_carrying_dependency_specs(),
+            )
+            .await
+            .expect("register_by_hash must succeed");
 
             let cascade_calls: Vec<_> = jobs
                 .enqueue_calls()
@@ -16952,6 +17056,257 @@ mod tests {
                 jobs.enqueue_priorities()[0] < scan_queue_priority(REGISTER_BY_HASH_TRIGGER_SOURCE),
                 "a mount's warm-up walk must not outrank the gates the mount itself is \
                  waiting on"
+            );
+        });
+    }
+
+    // =====================================================================
+    // Cascade-seed gate: the artifact has to BE the dependency document
+    // =====================================================================
+    //
+    // The trigger is the repository's opt-in; it says the operator wants
+    // dependency closures warmed. It does not say that THIS artifact
+    // declares any. A Maven repository holds far more jars than poms,
+    // and a root `prefetch-dependencies` job over a jar can only fail —
+    // the extractor reads the POM's own bytes and reports `Err` for
+    // anything whose root element is not `<project>`. So the enqueue
+    // asks the format first, through
+    // `VersionDiscovery::path_carries_dependency_specs`.
+    //
+    // `hort-app` cannot name `MavenFormatHandler` (the dependency
+    // direction forbids `hort-formats` here), so these tests stand a
+    // `StubFormatHandler` in its place with the same answer shape —
+    // `.pom` admitted, everything else refused. The real handler's own
+    // answers are pinned in `hort-formats`
+    // (`maven::tests::path_carries_dependency_specs_*` and the
+    // cross-format `version_discovery_participation` guard).
+
+    /// A maven-shaped stub: the POM is the dependency document, nothing
+    /// else a coordinate's directory holds is.
+    fn maven_shaped_handler() -> StubFormatHandler {
+        StubFormatHandler::new("maven")
+            .with_dependency_document_suffixes(vec![".pom"])
+            .with_max_bytes(10 * 1024 * 1024)
+    }
+
+    /// A Maven repository carrying the `TransitiveDeps` trigger — the
+    /// configuration the defect was reported on. The format is Maven
+    /// rather than inherited from `pypi_repository` so the skip
+    /// counter's `format` label reads the way an operator would see it.
+    fn maven_repo_with_transitive_deps_trigger() -> Repository {
+        let mut repo = repo_with_transitive_deps_trigger();
+        repo.format = RepositoryFormat::Maven;
+        repo
+    }
+
+    /// Maven-format coords at `path` — the one input the gate reads,
+    /// with the format matching the repository above (ingest refuses a
+    /// coords/repository format mismatch before it reaches the hook).
+    fn maven_coords_at(path: &str) -> ArtifactCoords {
+        ArtifactCoords {
+            path: path.into(),
+            format: RepositoryFormat::Maven,
+            ..sample_coords()
+        }
+    }
+
+    fn req_at_path(repo_id: Uuid, path: &str) -> DirectIngestRequest {
+        DirectIngestRequest {
+            coords: maven_coords_at(path),
+            ..req(repo_id)
+        }
+    }
+
+    fn cascade_enqueues(jobs: &MockJobsRepository) -> usize {
+        jobs.enqueue_calls()
+            .iter()
+            .filter(|(kind, _, _)| kind == PREFETCH_DEPENDENCIES_KIND)
+            .count()
+    }
+
+    /// The reported defect, in one test: a `.jar` ingest on a repository
+    /// with the `TransitiveDeps` trigger seeds NO cascade root, and the
+    /// skip is counted rather than logged.
+    #[test]
+    fn cascade_seed_refused_for_an_artifact_that_is_not_the_dependency_document() {
+        let repo = maven_repo_with_transitive_deps_trigger();
+        let repo_id = repo.id;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let jobs = metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (uc, _artifacts, _lifecycle, _storage, repos, policy_projections, jobs) =
+                        make_scan_gated_use_case();
+                    repos.insert(repo);
+                    seed_permissive_global_policy(&policy_projections);
+
+                    uc.ingest_direct(
+                        req_at_path(repo_id, "com/example/lib/1.0.0/lib-1.0.0.jar"),
+                        content_stream(b"PK\x03\x04 not a pom"),
+                        &maven_shaped_handler(),
+                    )
+                    .await
+                    .expect("the ingest itself must still succeed");
+                    jobs
+                })
+        });
+
+        let enqueue_calls = jobs.enqueue_calls();
+        assert_eq!(
+            cascade_enqueues(&jobs),
+            0,
+            "a jar declares no dependencies, so there is nothing for a \
+             prefetch-dependencies walk to read and no job may be enqueued; \
+             got {enqueue_calls:?}"
+        );
+
+        // Counted on the format axis, so an operator who enabled the
+        // trigger and sees no cascade can tell "nothing was warmable"
+        // from "the hook is broken".
+        let snap = snapshotter.snapshot().into_vec();
+        let skipped = snap
+            .iter()
+            .find(|(ck, _, _, _)| {
+                ck.kind() == MetricKind::Counter
+                    && ck.key().name() == "hort_prefetch_cascade_seed_skipped_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == labels::FORMAT && l.value() == "maven")
+            })
+            .expect("hort_prefetch_cascade_seed_skipped_total{format=maven} must fire");
+        let value = &skipped.3;
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "the refusal is counted exactly once per refused artifact; got {value:?}"
+        );
+    }
+
+    /// The other direction, same coordinate: the `.pom` IS the document,
+    /// so it seeds exactly one root — and the skip counter stays silent,
+    /// which is what separates "gated correctly" from "gated always".
+    #[test]
+    fn cascade_seed_fires_for_the_pom_of_the_same_coordinate() {
+        let repo = maven_repo_with_transitive_deps_trigger();
+        let repo_id = repo.id;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let jobs = metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (uc, _artifacts, _lifecycle, _storage, repos, policy_projections, jobs) =
+                        make_scan_gated_use_case();
+                    repos.insert(repo);
+                    seed_permissive_global_policy(&policy_projections);
+
+                    uc.ingest_direct(
+                        req_at_path(repo_id, "com/example/lib/1.0.0/lib-1.0.0.pom"),
+                        content_stream(b"<project/>"),
+                        &maven_shaped_handler(),
+                    )
+                    .await
+                    .expect("ingest");
+                    jobs
+                })
+        });
+
+        assert_eq!(
+            cascade_enqueues(&jobs),
+            1,
+            "the POM of the same coordinate still seeds the cascade",
+        );
+        assert!(
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .iter()
+                .all(|(ck, _, _, _)| ck.key().name() != "hort_prefetch_cascade_seed_skipped_total"),
+            "nothing was skipped, so the skip counter must not fire",
+        );
+    }
+
+    /// A format that declares no `VersionDiscovery` group at all (oci,
+    /// helm, rpm, debian, generic) seeds nothing, however the policy is
+    /// configured: there is no `extract_dependency_specs` for a walk to
+    /// call, so the root job it would claim has no reachable outcome.
+    ///
+    /// Apply-time linting already refuses the `transitive_deps` trigger
+    /// on such a format, which makes this the second layer — reached by
+    /// a projection written before that rule, or by any route to a
+    /// policy that does not transit a gitops apply.
+    #[test]
+    fn cascade_seed_refused_for_a_format_with_no_version_discovery_group() {
+        let repo = repo_with_transitive_deps_trigger();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, _storage, repos, policy_projections, jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            seed_permissive_global_policy(&policy_projections);
+
+            let handler = StubFormatHandler::new("oci")
+                .without_version_discovery()
+                .with_max_bytes(10 * 1024 * 1024);
+            assert!(
+                handler.version_discovery().is_none(),
+                "the premise: this stub stands for a non-participating format",
+            );
+
+            uc.ingest_direct(req(repo_id), content_stream(b"x"), &handler)
+                .await
+                .expect("ingest");
+
+            let enqueue_calls = jobs.enqueue_calls();
+            assert_eq!(
+                cascade_enqueues(&jobs),
+                0,
+                "a format with no VersionDiscovery group has no extractor for the walk to \
+                 call, so the trigger alone cannot seed a root; got {enqueue_calls:?}"
+            );
+        });
+    }
+
+    /// The gate reaches the SECOND producer of a cascade root too.
+    /// `register_by_hash` (the OCI cross-repository blob mount and the
+    /// pull-dedup followers) carried its own copy of this hook; a copy
+    /// is how the two stop agreeing, so it now delegates to the same
+    /// method and inherits the same refusal.
+    #[test]
+    fn cascade_seed_gate_also_governs_register_by_hash() {
+        let repo = maven_repo_with_transitive_deps_trigger();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, storage, repos, policy_projections, jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            seed_permissive_global_policy(&policy_projections);
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            let req = IngestRequest {
+                coords: maven_coords_at("com/example/lib/1.0.0/lib-1.0.0.jar"),
+                ..req_legacy(repo_id)
+            };
+            uc.register_by_hash(req, hash, None, &maven_shaped_handler())
+                .await
+                .expect("register_by_hash must succeed");
+
+            let enqueue_calls = jobs.enqueue_calls();
+            assert_eq!(
+                cascade_enqueues(&jobs),
+                0,
+                "the mount of a jar seeds no cascade either; got {enqueue_calls:?}"
             );
         });
     }

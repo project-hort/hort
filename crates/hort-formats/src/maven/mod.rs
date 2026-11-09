@@ -713,6 +713,33 @@ impl VersionDiscovery for MavenFormatHandler {
         Vec::new()
     }
 
+    /// The `.pom`, and nothing else a Maven repository stores.
+    ///
+    /// Maven is the one participating format whose declared manifest is
+    /// stored BESIDE the binary rather than inside it — the POM is its
+    /// own group member — so a `.jar`, a `-sources.jar`, a
+    /// `-javadoc.jar`, a `.module`, a `.asc` signature, a checksum
+    /// sidecar and `maven-metadata.xml` are all not input to
+    /// [`extract_dependency_specs`](VersionDiscovery::extract_dependency_specs)
+    /// at all. That method reads the POM's own bytes and reports `Err`
+    /// for anything whose root element is not `<project>`, so a walk
+    /// pointed at a jar could only fail — and a jar is what a Maven
+    /// repository mostly holds.
+    ///
+    /// A jar's embedded `META-INF/maven/**/pom.xml` is a different
+    /// reader's input: [`PayloadSbom`] opens the archive, this method's
+    /// consumer does not. Answering `true` for a jar on the strength of
+    /// what is inside it would point the cascade at a reader that never
+    /// looks there.
+    ///
+    /// Extension-driven via [`is_pom_filename`], the same signal
+    /// [`classify_scan_kind`] reads, because a Maven repository path
+    /// carries no other marker: a POM's own `<packaging>` element lives
+    /// inside XML that a path-level predicate does not open.
+    fn path_carries_dependency_specs(&self, path: &str) -> bool {
+        is_pom_filename(path.rsplit('/').next().unwrap_or(path))
+    }
+
     /// Extract the edges a stored POM declares: its `<parent>`
     /// coordinate, then its compile- and runtime-scope `<dependencies>`.
     ///
@@ -2071,6 +2098,57 @@ mod tests {
         HANDLER
             .version_discovery()
             .expect("maven declares VersionDiscovery")
+    }
+
+    /// The POM is the only stored shape a cascade can read, and the
+    /// jar — which is most of what a Maven repository holds — is not
+    /// one. Every refused name below is a real member of a published
+    /// Maven coordinate's directory, and handing any of them to
+    /// `extract_dependency_specs` yields `Err`, because none of them is
+    /// XML with a `<project>` root.
+    #[test]
+    fn path_carries_dependency_specs_admits_the_pom_and_nothing_else() {
+        let vd = discovery();
+
+        for admitted in [
+            "com/example/lib/1.0.0/lib-1.0.0.pom",
+            "com/example/lib/1.0.0/LIB-1.0.0.POM",
+            "lib-1.0.0.pom",
+        ] {
+            assert!(
+                vd.path_carries_dependency_specs(admitted),
+                "the POM carries the declarations: {admitted}"
+            );
+        }
+
+        for refused in [
+            // The measured failure: the extractor is handed a ZIP and
+            // reports its header as the XML root element.
+            "com/example/lib/1.0.0/lib-1.0.0.jar",
+            "com/example/lib/1.0.0/lib-1.0.0-sources.jar",
+            "com/example/lib/1.0.0/lib-1.0.0-javadoc.jar",
+            "com/example/lib/1.0.0/lib-1.0.0.war",
+            "com/example/lib/1.0.0/lib-1.0.0.aar",
+            "com/example/lib/1.0.0/lib-1.0.0.module",
+            "com/example/lib/1.0.0/lib-1.0.0.jar.asc",
+            // A sidecar beside the POM is still not the POM.
+            "com/example/lib/1.0.0/lib-1.0.0.pom.sha1",
+            "com/example/lib/maven-metadata.xml",
+        ] {
+            assert!(
+                !vd.path_carries_dependency_specs(refused),
+                "not a POM, so nothing declares dependencies here: {refused}"
+            );
+        }
+    }
+
+    /// A directory component that happens to carry a dot does not make
+    /// the artifact a POM — the predicate reads the file name, the way
+    /// `classify_scan_kind` does, not the longest dotted run in the
+    /// path.
+    #[test]
+    fn path_carries_dependency_specs_reads_the_file_name_not_the_directory() {
+        assert!(!discovery().path_carries_dependency_specs("com/example.pom/lib/1.0.0/lib.jar"));
     }
 
     #[test]

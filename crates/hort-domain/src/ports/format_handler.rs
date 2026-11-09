@@ -228,6 +228,18 @@ pub fn split_metadata_files_per_version(total: usize) -> (usize, usize) {
 /// `FormatHandler` doc comments (reproduced below); only the "default"
 /// framing changes, since there is no longer a trait-level default to
 /// inherit.
+///
+/// One member is newer than the extraction:
+/// [`path_carries_dependency_specs`](VersionDiscovery::path_carries_dependency_specs)
+/// was added here, beside the extractor it gates, and the no-default
+/// rule above is why it is here rather than on [`FormatHandler`]. On
+/// that trait it would need a default body across forty-odd
+/// implementors, and the only defaults available are the two answers
+/// themselves: a defaulted "yes" is how the next format inherits a job
+/// whose handler cannot read what it was pointed at, and a defaulted
+/// "no" silently un-warms a format that does participate. Here the
+/// group's four implementors each answer in their own body and the
+/// compiler reaches every one of them.
 pub trait VersionDiscovery: Send + Sync {
     /// Extract the set of upstream-published version identifiers from a
     /// just-fetched upstream metadata body.
@@ -307,6 +319,55 @@ pub trait VersionDiscovery: Send + Sync {
     /// (RubyGems JSON/marshal, Conda repodata variants) implement this
     /// for real.
     fn upstream_metadata_accept(&self) -> Vec<String>;
+
+    /// Whether an artifact stored at `path` IS the document
+    /// [`extract_dependency_specs`](Self::extract_dependency_specs)
+    /// reads — "does this format declare its dependencies in a file at
+    /// this path?"
+    ///
+    /// **Total on the path, and free of I/O.** Which stored shape
+    /// carries a format's declarations is a property of the format's own
+    /// layout, and a path already states it; nothing has to be opened to
+    /// answer. Callers consult this BEFORE enqueuing work that would
+    /// read the artifact, so that a job exists only when there is
+    /// something for it to read.
+    ///
+    /// The participating formats answer differently, and the difference
+    /// is the whole reason the question is asked per format:
+    ///
+    /// - **cargo** — the `.crate` tarball, and **npm** — the `.tgz`
+    ///   tarball. For both, the archive IS the document: the declared
+    ///   manifest (`Cargo.toml`, `package/package.json`) lives inside
+    ///   the artifact the client pulls.
+    /// - **pypi** — the `.whl` zip and the `.tar.gz` sdist, the two
+    ///   containers the extractor recognises.
+    /// - **maven** — the `.pom`, and nothing else. Maven is the one
+    ///   participating format whose declared manifest is stored BESIDE
+    ///   the binary rather than inside it, so a `.jar`, a sources jar,
+    ///   a checksum sidecar or a `maven-metadata.xml` is not input to
+    ///   `extract_dependency_specs` at all.
+    ///
+    /// **`false` is not "unparseable".** This separates "not input" from
+    /// "bad input", which the extractor's own contract above depends on:
+    /// `extract_dependency_specs` returns `Err` for bytes that are not
+    /// the expected container, and that `Err` is the signal that
+    /// distinguishes a genuinely corrupt manifest from a file that was
+    /// never one. Teaching the extractor to tolerate the wrong container
+    /// would destroy the distinction; asking this question first means it
+    /// is never handed the wrong container to begin with.
+    ///
+    /// **Never derived from a media type.** A `Content-Type` is a
+    /// presentation default an inbound HTTP adapter chose, and a stored
+    /// media type is a copy of one — binding a read decision to either
+    /// hands the next MIME-type adjustment the power to change which
+    /// artifacts get read. The format answers from its own layout.
+    ///
+    /// A format that cannot extract dependency specs at all answers "no"
+    /// structurally rather than through this method: it does not
+    /// implement `VersionDiscovery`, [`FormatHandler::version_discovery`]
+    /// is `None`, and a caller holding only a `&dyn FormatHandler` never
+    /// reaches here.
+    fn path_carries_dependency_specs(&self, path: &str) -> bool;
 
     /// Extract the *declared runtime*
     /// dependency specs from the **stored artifact stream** (the format's

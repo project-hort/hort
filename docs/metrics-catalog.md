@@ -2162,6 +2162,40 @@ spawned task fetches the per-version JSON manifest and drives a
 `hort_prefetch_enqueued_total` and `hort_prefetch_skipped_total` carry
 PyPI-keyed `repository` labels alongside npm and cargo.
 
+### Prefetch cascade — seed refused
+
+| Metric | Type | Labels | Unit | Label values |
+|--------|------|--------|------|--------------|
+| `hort_prefetch_cascade_seed_skipped_total` | counter | `format` | — | `format` is the repository's format key (`maven`, `npm`, …) |
+
+Emitted by `hort_app::use_cases::ingest_use_case::IngestUseCase::enqueue_prefetch_cascade`,
+once per ingested or hash-registered artifact that a repository's
+`transitive_deps` trigger WOULD have seeded a root
+`prefetch-dependencies` job over, and that the format says is not the
+document such a walk reads
+(`VersionDiscovery::path_carries_dependency_specs`, or no
+`VersionDiscovery` capability group at all).
+
+**It moves in normal operation, and the normal case is Maven.** A Maven
+repository holds far more jars, sources jars, signatures and checksum
+sidecars than POMs, and only the POM declares dependencies, so a busy
+Maven mirror ticks this counter on most ingests. A rate near the total
+Maven ingest rate is the expected shape, not an incident. What it
+answers is the question an operator otherwise cannot: whether a
+repository with the trigger enabled and no cascade activity has nothing
+warmable (this counter moving) or a broken hook (neither this counter
+nor `jobs` rows moving). The skip is deliberately NOT logged per
+artifact — an `info!` on the ordinary case would be pure volume.
+
+Labelled by `format` and not by `repository`: the answer is a property
+of the format's stored layout rather than of any repository's
+configuration, so a per-repository breakdown would multiply series
+without separating causes. The repository and the artifact ride on the
+cascade's `tracing::debug!`/`warn!` lines on the same code path.
+
+**Forbidden labels.** No `path`, `package` or `artifact_id` — unbounded
+cardinality per the global rule.
+
 ### Prefetch tick — missing version ordering
 
 | Metric | Type | Labels | Unit | Label values |
