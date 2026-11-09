@@ -43,6 +43,10 @@ pub mod event_repository_resolver;
 pub mod event_store;
 pub mod federated_jwt_validator;
 pub mod format_handler;
+// The operator-facing view of the set the release gate holds pending a
+// signature. ADR 0039 D4 declines to deadline that hold and argues it on
+// the ground that the set and its age are visible; this is that read.
+pub mod held_set_reader;
 // `group_mapping_repository` / `role_repository` are retired
 // (replaced by `claim_mapping_repository` / `permission_grant_repository`,
 // registered above / below — ADR 0012).

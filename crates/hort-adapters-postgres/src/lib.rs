@@ -73,6 +73,12 @@ pub mod event_chain_head_reader;
 pub mod event_chain_reader;
 pub mod event_repository_resolver;
 pub mod event_store;
+// The held-pending-signature overview and its drill-down — a NEW read
+// path with its own statements, deliberately not a widening of
+// `retention_candidate_reader`'s query. Invariant 1's GC protection and
+// the operator's view of the held set stay on separate code paths so a
+// change to one cannot silently be a change to the other.
+pub mod held_set_reader;
 pub mod jobs_repository;
 // The list-surface census behind ADR 0062's omission shape: one
 // recursive statement over the `content_references` membership

@@ -150,6 +150,59 @@ grant with no repository scope as matching every scope checked against
 it. See [declare-gitops-config.md](architecture/how-to/declare-gitops-config.md)
 `kind: PermissionGrant`.
 
+### Held set (held pending signature)
+
+The artifacts the release gate is holding **because an attestation it
+requires has not arrived**: `quarantined`, past the end of their
+observation window, under an effective `provenanceMode: required`, with
+no verified attestation recorded. A repository that resolves no policy
+has no deadline, so its artifacts are not in the set.
+
+Distinct from the three populations it is routinely confused with: an
+artifact still *inside* its window (young, not held), a `Rejected`
+artifact (a terminal verdict on the scan, curation or provenance axis —
+see [Terminal](#terminal-quarantine-status)) and a
+`scan_indeterminate` one. The hold is **indefinite** by decision: no
+timer resolves it, because no value a timer could carry is better than
+"wait". That decision is argued on the ground that the set and *its
+age* are visible, which is what the held-set overview
+(`GET /api/v1/admin/retention/{overview,held}`) exists to be. Split for
+operator action into the two
+[held-set buckets](#held-set-bucket-constituent--in-own-right). See
+[ADR 0039](adr/0039-keyed-provenance-verification.md) D4 and
+[curator-workflow.md](architecture/how-to/curator-workflow.md) §10.
+
+### Held-pending-signature candidate
+
+One row of the held-set **aggregate**, and the name is a precision
+rather than a hedge. The aggregate resolves the policy and the window
+expiry in SQL and stops: the provenance clearance verdict has exactly one
+implementation in hort, and a second copy inside a counting query is how
+two computations of one rule drift apart. So the count is a declared
+**superset** — it can include an artifact cleared moments ago and not
+yet swept — and the API field, the query and the docs all say
+`held_pending_signature_candidates` rather than naming it as the gate's
+decision. The drill-down beside it resolves every row through the one
+authority and *is* exact. See
+[curator-workflow.md](architecture/how-to/curator-workflow.md) §10.3.
+
+### Held-set bucket (`constituent` / `in_own_right`)
+
+The two halves of a repository's [held set](#held-set-held-pending-signature),
+split because the operator action differs rather than for presentation.
+A **`constituent`** is a config or layer blob whose only inbound
+`content_references` edges are its parent manifest's: a blob cannot carry
+its own attestation, so there is nothing to wait for on that row and the
+thing to fix is the parent. An **`in_own_right`** artifact could still
+acquire an attestation of its own. The rule has one definition in Rust
+(`is_parent_gated_blob_constituent_kinds`), whose two kind lists reach
+the aggregate as query parameters so SQL forms only the boolean; a
+DB-backed parity test drives both paths over the same kind sets. Not the
+same concept as a [signature constituent](#signature-constituent), which
+is a blob of a *signature* manifest. See
+[ADR 0039](adr/0039-keyed-provenance-verification.md) and
+[curator-workflow.md](architecture/how-to/curator-workflow.md) §10.1.
+
 ### In-UAT
 
 A resting state for an issue whose fix is in User Acceptance Testing on
@@ -237,6 +290,21 @@ staging. See [ADR 0048](adr/0048-release-branch-staging-strategy.md) D3, D5.
 suffix. A single promotion can batch-close many issues that had been
 resting in `ready-for-staging` / `in-uat`. See
 [ADR 0048](adr/0048-release-branch-staging-strategy.md) D1, D5.
+
+### Rows are not bytes
+
+The reason every artifact-population figure hort reports carries a
+**distinct-content count** beside its row count. Content is stored by
+hash, so several artifact rows routinely point at one set of bytes: the
+first real retention dry run on a live instance reported 3 647 rows
+against 3 608 distinct contents. Neither number is reclaimable storage —
+the row count is not bytes, and the distinct-content count is not bytes
+you would get back either, because a held artifact's content may still be
+referenced by something being kept. What a disposal would free is
+answered by the content's reference count. See
+[ADR 0003](adr/0003-streaming-enforced-cas.md),
+[ADR 0054](adr/0054-content-level-age-evidence-anchors-quarantine.md) and
+[curator-workflow.md](architecture/how-to/curator-workflow.md) §10.4.
 
 ### Scan unit
 

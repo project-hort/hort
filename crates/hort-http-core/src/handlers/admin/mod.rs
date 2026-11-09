@@ -97,6 +97,18 @@ pub mod curation;
 /// `admin_routes()` tree.
 pub mod policies;
 
+/// Retention's held-set overview, mounted under
+/// `/api/v1/admin/retention/...` — the surface ADR 0039 D4 names when it
+/// declines to put a deadline on an unsigned hold. Exposed as a
+/// sub-module so the composition-root mount site
+/// (`hort-server::http::control_plane_routes`) can pull the sub-router
+/// via `admin::retention::retention_routes()`. Gated by
+/// [`crate::authz::CurateOrAdminPrincipal`], like [`curation`] and
+/// unlike this module's [`AdminPrincipal`]-gated `admin_routes()` tree:
+/// `Curate` is already the decision authority over the quarantined and
+/// rejected artifacts this view enumerates.
+pub mod retention;
+
 /// The one-shot corrective path for artifacts stranded `Rejected` with no
 /// `ArtifactRejected` behind them (ADR 0039's 2026-09-12 amendment, D6).
 /// Unlike [`curation`] and [`policies`], this one IS part of this

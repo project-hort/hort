@@ -20,6 +20,7 @@ use hort_adapters_postgres::curation_decisions_repository::PgCurationDecisionsRe
 use hort_adapters_postgres::curation_exclusions_repository::PgCurationExclusionsRepository;
 use hort_adapters_postgres::curation_queue_repository::PgCurationQueueRepository;
 use hort_adapters_postgres::curation_rule_repo::PgCurationRuleRepository;
+use hort_adapters_postgres::held_set_reader::PgHeldSetReader;
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
 use hort_adapters_postgres::oidc_issuer_repo::PgOidcIssuerRepository;
 use hort_adapters_postgres::patch_candidate_repo::PgPatchCandidateRepository;
@@ -44,6 +45,7 @@ use hort_app::use_cases::content_reference::ContentReferenceUseCase;
 use hort_app::use_cases::curation_use_case::CurationUseCase;
 use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUseCase;
 use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
+use hort_app::use_cases::held_set_use_case::HeldSetUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::oci_index_child_enqueue::OciIndexChildEnqueueUseCase;
@@ -3259,6 +3261,24 @@ pub async fn build_app_context(
     let patch_candidate_repo = Arc::new(PgPatchCandidateRepository::new(db.clone()));
     let patch_candidate_use_case = Arc::new(PatchCandidateUseCase::new(patch_candidate_repo));
 
+    // `HeldSetUseCase` for the held-pending-signature overview
+    // (`GET /api/v1/admin/retention/{overview,held}`) — the surface
+    // ADR 0039 D4 names when it declines to deadline an unsigned hold.
+    //
+    // Its own reader and its own statements, deliberately NOT a widening
+    // of `PgRetentionCandidateReader`: the GC protection of invariant 1
+    // and the operator's view of the held set stay on separate code
+    // paths, so a change to one cannot silently be a change to the
+    // other. The event store and the policy projections come in because
+    // the drill-down re-decides every row through the one provenance
+    // authority in `hort-app` rather than trusting the SQL superset.
+    let held_set_reader = Arc::new(PgHeldSetReader::new(db.clone()));
+    let held_set_use_case = Arc::new(HeldSetUseCase::new(
+        held_set_reader,
+        event_publisher.clone(),
+        policy_projections.clone(),
+    ));
+
     // `ScannerWorkerQueryUseCase` for the admin `GET /admin/workers`
     // endpoint. Wires the READ side of the `scanner_registry`
     // worker-coordination table — the consumer for the worker heartbeat
@@ -3720,6 +3740,7 @@ pub async fn build_app_context(
         task_use_case,
         manual_rescan_use_case,
         patch_candidate_use_case,
+        held_set_use_case,
         scanner_worker_query_use_case,
         effective_repository_config_use_case,
         gitops_apply_status: Arc::new(ArcSwap::from_pointee(gitops_apply_status)),
