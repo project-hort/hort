@@ -44,7 +44,7 @@ use hort_domain::ports::artifact_lifecycle::{
     require_paired_artifact_stream, ArtifactLifecyclePort, IngestEnqueue,
 };
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
-use hort_domain::ports::artifact_repository::ArtifactRepository;
+use hort_domain::ports::artifact_repository::{ArtifactRepository, ChecksumMatchRow};
 use hort_domain::ports::composite_scan_observation::{
     CompositeScanObservation, CompositeScanObservationRepository,
 };
@@ -197,6 +197,43 @@ pub struct MockArtifactRepository {
     /// must not read a failed lookup as "not present" and re-fetch content the
     /// repository may already hold.
     find_by_path_errors: Mutex<std::collections::VecDeque<DomainError>>,
+    /// FIFO of injected errors for
+    /// [`find_by_name_in_repo`](ArtifactRepository::find_by_name_in_repo).
+    /// Each call pops the front and returns it verbatim. Lets a test
+    /// drive a bulk-decision resolver's failure arm: a failed version
+    /// resolution must fail the call, never read as "nothing matched"
+    /// and act on an empty candidate set.
+    find_by_name_in_repo_errors: Mutex<std::collections::VecDeque<DomainError>>,
+    /// Per-artifact one-shot row replacement applied **after** the next
+    /// [`find_by_id`](ArtifactRepository::find_by_id) of that artifact
+    /// has served the current row — the artifact-row mirror of
+    /// [`MockEventStore::set_stream_after_next_read`], and it exists for
+    /// the same reason: a caller that reads one row twice for two
+    /// different decisions can only be tested against a concurrent
+    /// change if the change lands *between* its reads.
+    ///
+    /// `Some(status)` rewrites the stored row's `quarantine_status`;
+    /// `None` removes the row, so the second read answers `NotFound`.
+    /// Seeded via
+    /// [`set_status_after_next_find_by_id`](Self::set_status_after_next_find_by_id)
+    /// and [`remove_after_next_find_by_id`](Self::remove_after_next_find_by_id).
+    row_after_next_find_by_id: Mutex<HashMap<Uuid, Option<QuarantineStatus>>>,
+    /// The same one-shot, hooked to the digest-set read
+    /// ([`find_live_rows_by_repo_and_checksums`](ArtifactRepository::find_live_rows_by_repo_and_checksums))
+    /// instead.
+    ///
+    /// A **separate** map rather than one shared with
+    /// [`Self::row_after_next_find_by_id`], because the two model
+    /// different windows and a caller that reads through both needs to
+    /// choose which one a change lands in: a bulk curation decision
+    /// resolves through the digest-set read and then applies through
+    /// `find_by_id`, so "the row moved after validation" and "the row
+    /// moved after the apply step's own load" are two distinct races
+    /// and a shared one-shot could only express the first.
+    ///
+    /// Seeded via
+    /// [`set_status_after_next_checksum_read`](Self::set_status_after_next_checksum_read).
+    status_after_next_checksum_read: Mutex<HashMap<Uuid, QuarantineStatus>>,
 }
 
 /// One recorded call to either backfill-candidacy query. See
@@ -225,7 +262,58 @@ impl MockArtifactRepository {
             oci_calls: Mutex::new(Vec::new()),
             package_version_status_errors: Mutex::new(std::collections::VecDeque::new()),
             find_by_path_errors: Mutex::new(std::collections::VecDeque::new()),
+            find_by_name_in_repo_errors: Mutex::new(std::collections::VecDeque::new()),
+            row_after_next_find_by_id: Mutex::new(HashMap::new()),
+            status_after_next_checksum_read: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Arm the next
+    /// [`find_by_name_in_repo`](ArtifactRepository::find_by_name_in_repo)
+    /// call to fail with `err`. Queued, so a test can arm several
+    /// consecutive failures.
+    pub fn fail_next_find_by_name_in_repo(&self, err: DomainError) {
+        self.find_by_name_in_repo_errors
+            .lock()
+            .unwrap()
+            .push_back(err);
+    }
+
+    /// After the next `find_by_id(artifact_id)` serves the current row,
+    /// rewrite that row's `quarantine_status` to `status`.
+    ///
+    /// Models a concurrent transition landing inside a caller's
+    /// read-decide-append window: the decision is made on the row as it
+    /// was, and a re-read after a lost append sees the row as it now is.
+    pub fn set_status_after_next_find_by_id(&self, artifact_id: Uuid, status: QuarantineStatus) {
+        self.row_after_next_find_by_id
+            .lock()
+            .unwrap()
+            .insert(artifact_id, Some(status));
+    }
+
+    /// After the next `find_by_id(artifact_id)` serves the current row,
+    /// remove it — so a caller's own re-read answers `NotFound` rather
+    /// than a state it can classify.
+    pub fn remove_after_next_find_by_id(&self, artifact_id: Uuid) {
+        self.row_after_next_find_by_id
+            .lock()
+            .unwrap()
+            .insert(artifact_id, None);
+    }
+
+    /// After the next digest-set read observes `artifact_id`, rewrite
+    /// that row's `quarantine_status` to `status`.
+    ///
+    /// Models a transition landing in the window a bulk curation
+    /// decision has between **resolving** its entries and **applying**
+    /// them: resolution sees the state it validated against, and the
+    /// apply step's own load sees the state the artifact is now in.
+    pub fn set_status_after_next_checksum_read(&self, artifact_id: Uuid, status: QuarantineStatus) {
+        self.status_after_next_checksum_read
+            .lock()
+            .unwrap()
+            .insert(artifact_id, status);
     }
 
     /// Accepted deletions in call order, each with its attributed actor.
@@ -543,16 +631,29 @@ impl MockArtifactRepository {
 
 impl ArtifactRepository for MockArtifactRepository {
     fn find_by_id(&self, id: Uuid) -> BoxFut<'_, DomainResult<Artifact>> {
-        let result = self
-            .artifacts
-            .lock()
-            .unwrap()
+        let mut artifacts = self.artifacts.lock().unwrap();
+        let result = artifacts
             .get(&id)
             .map(Self::projected)
             .ok_or_else(|| DomainError::NotFound {
                 entity: "Artifact",
                 id: id.to_string(),
             });
+        // The current row has been served; apply any armed one-shot
+        // replacement so a *second* read of the same id sees the change.
+        if let Some(replacement) = self.row_after_next_find_by_id.lock().unwrap().remove(&id) {
+            match replacement {
+                Some(status) => {
+                    if let Some(row) = artifacts.get_mut(&id) {
+                        row.quarantine_status = status;
+                    }
+                }
+                None => {
+                    artifacts.remove(&id);
+                }
+            }
+        }
+        drop(artifacts);
         Box::pin(async move { result })
     }
 
@@ -590,6 +691,45 @@ impl ArtifactRepository for MockArtifactRepository {
             .find(|a| a.repository_id == repository_id && a.sha256_checksum.as_ref() == sha)
             .map(Self::projected);
         Box::pin(async move { Ok(result) })
+    }
+
+    /// Mirrors the adapter's repo-scoped `checksum_sha256 = ANY($2)`
+    /// read: **every** live row, soft-deleted rows excluded, grouped by
+    /// the digest it was asked with.
+    ///
+    /// Deliberately not `find_by_repo_and_checksum`'s `.find(…)`: the
+    /// whole point of this method is that a digest can carry several
+    /// rows, so a double that returned the first one would let a test
+    /// prove a pick the production resolver refuses to make.
+    fn find_live_rows_by_repo_and_checksums(
+        &self,
+        repository_id: Uuid,
+        checksums: &[ContentHash],
+    ) -> BoxFut<'_, DomainResult<Vec<ChecksumMatchRow>>> {
+        let wanted: Vec<ContentHash> = checksums.to_vec();
+        let mut artifacts = self.artifacts.lock().unwrap();
+        let rows: Vec<ChecksumMatchRow> = artifacts
+            .values()
+            .filter(|a| {
+                a.repository_id == repository_id
+                    && a.deleted_at.is_none()
+                    && wanted.contains(&a.sha256_checksum)
+            })
+            .map(|a| (a.sha256_checksum.clone(), a.id, a.quarantine_status))
+            .collect();
+        // The resolution answer has been served; apply any armed
+        // one-shot so the caller's later per-row load sees the change.
+        let mut armed = self.status_after_next_checksum_read.lock().unwrap();
+        for (_, id, _) in &rows {
+            if let Some(status) = armed.remove(id) {
+                if let Some(row) = artifacts.get_mut(id) {
+                    row.quarantine_status = status;
+                }
+            }
+        }
+        drop(armed);
+        drop(artifacts);
+        Box::pin(async move { Ok(rows) })
     }
 
     /// Mirrors the adapter's `MIN(created_at) WHERE checksum_sha256 = $1`
@@ -714,6 +854,9 @@ impl ArtifactRepository for MockArtifactRepository {
         normalized_name: &str,
         page: PageRequest,
     ) -> BoxFut<'_, DomainResult<Page<Artifact>>> {
+        if let Some(err) = self.find_by_name_in_repo_errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
         let mut items: Vec<Artifact> = self
             .artifacts
             .lock()
@@ -1495,6 +1638,11 @@ impl CurationQueueRepository for MockCurationQueueRepository {
 /// repair surface reads (identity + the operator-recognisable name) are
 /// meaningful; the scan-findings and deadline columns are the listing's
 /// concern, not this caller's.
+///
+/// `checksum_sha256` comes off the artifact rather than being invented,
+/// because it is the one column the adapter cannot produce a row without;
+/// `tags` is empty, which is the listing's answer for bytes nothing points
+/// at and is never read by a decision anyway.
 pub fn queue_entry_for(artifact: &Artifact, repository_key: &str) -> CurationQueueEntry {
     CurationQueueEntry {
         artifact_id: artifact.id,
@@ -1504,6 +1652,8 @@ pub fn queue_entry_for(artifact: &Artifact, repository_key: &str) -> CurationQue
         package_name: artifact.name.clone(),
         version: artifact.version.clone(),
         path: artifact.path.clone(),
+        checksum_sha256: artifact.sha256_checksum.as_ref().to_string(),
+        tags: Vec::new(),
         quarantine_status: artifact.quarantine_status,
         quarantine_window_start: artifact.quarantine_window_start,
         quarantine_deadline: None,

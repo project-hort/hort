@@ -146,11 +146,11 @@ hort-cli admin quarantine list-patch-candidates --repo npm-proxy --output json \
 npm view lodash@4.17.21 --registry https://registry.npmjs.org \
   | grep -E 'dist|integrity|signatures'
 
-# 3. Release the quarantined artifact. This is `curation waive` — the
-#    one manual release (ADR 0007). --justification is REQUIRED and
+# 3. Release the quarantined artifact. This is `curation waive artifact`
+#    — the one manual release (ADR 0007). --justification is REQUIRED and
 #    is recorded in the ArtifactReleased event's `justification` field
 #    (max 512 bytes, non-empty after trimming whitespace).
-hort-cli curation waive <quarantined_artifact_id> \
+hort-cli curation waive artifact <quarantined_artifact_id> \
   --justification "lodash@4.17.21 fixes CVE-2024-XXXX (prototype pollution
                    reported in GHSA-...); verified upstream npm signature
                    2026-05-11; risk-accepted by security@example.com"

@@ -4714,14 +4714,22 @@ same change (architect anti-pattern checklist).
 
 **`decision` semantics** (closed taxonomy of 5):
 
-- `waive` — `CurationUseCase::waive`. Curator-driven release
-  of a quarantined or held artifact — the manual release authority
-  (ADR 0007). One tick per call.
+- `waive` — `CurationUseCase::waive` and
+  `CurationUseCase::waive_bulk`. Curator-driven release of a
+  quarantined or held artifact — the manual release authority
+  (ADR 0007). The per-artifact route emits one tick per call. The bulk
+  routes (`waive-versions`, `waive-digests`) emit **one tick per
+  attempted append**, plus one tick for a pre-loop refusal: a
+  pre-validation abort ticks `conflict` (it is a state precondition,
+  409 at the edge per ADR 0025) and a malformed or oversize request
+  ticks `invalid`. No new `decision` value — the label does not
+  discriminate addressing mode, exactly as it does not for `block`.
 - `block` — `CurationUseCase::block`. Curator-driven
   rejection. For `BlockTarget::Artifact` emits one tick per call; for
-  `BlockTarget::VersionList` (continue-on-error)
-  emits **one tick per attempted append** so operators can dashboard
-  per-append error rates on bulk operations.
+  the bulk targets `BlockTarget::VersionList` /
+  `BlockTarget::DigestList` (continue-on-error) emits **one tick per
+  attempted append** so operators can dashboard per-append error rates
+  on bulk operations.
 - `reevaluate` — `CurationUseCase::reevaluate`. Curator-invoked
   per-artifact recompute of a `Rejected` artifact's verdict from
   stored findings under the active policy. One tick per call; `ok`

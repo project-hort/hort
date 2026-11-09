@@ -179,6 +179,53 @@ impl AkClient {
         Ok((status, parsed))
     }
 
+    /// POST `path` with `body` serialised as JSON, handing back the
+    /// server's refusal instead of flattening it into an error message.
+    ///
+    /// Three outcomes, each distinct:
+    ///
+    /// - `Ok(Ok(parsed))` — the server answered 2xx and its body
+    ///   deserialised as `T`.
+    /// - `Ok(Err(failure))` — the server answered non-2xx, and its status
+    ///   and body text are the caller's to interpret.
+    /// - `Err(_)` — the request never reached an answer (URL, transport,
+    ///   or a 2xx body that would not parse).
+    ///
+    /// The POST-side sibling of
+    /// [`delete_capturing_failure`](Self::delete_capturing_failure), and
+    /// it exists for the same reason: a route can answer a refusal with
+    /// the data the caller's *next* request needs. `waive-versions` /
+    /// `waive-digests` answer an aborted batch with the full per-entry
+    /// report, which an operator has to read to know which entry stopped
+    /// the batch — recovering that from the `"HTTP <status>: <body
+    /// text>"` sentence every other call surfaces would mean parsing an
+    /// error message. A caller that only needs the refusal surfaced
+    /// should use [`post`](Self::post).
+    pub async fn post_capturing_failure<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<std::result::Result<T, HttpFailure>> {
+        let url = self.base_url.join(path).context("joining URL path")?;
+        // SECURITY: only the URL is traced — no headers, no body.
+        tracing::debug!(method = "POST", url = %url, "request");
+        let resp = self
+            .http
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .context("HTTP POST")?;
+        if resp.status().is_success() {
+            Ok(Ok(resp
+                .json::<T>()
+                .await
+                .context("parsing JSON response body")?))
+        } else {
+            Ok(Err(HttpFailure::from_response(resp).await))
+        }
+    }
+
     /// POST to `path` with `body` serialised as JSON; succeed on any 2xx
     /// without attempting to deserialise the response body. Used by
     /// endpoints that answer with an empty body (e.g.

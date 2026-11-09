@@ -763,7 +763,7 @@ or command beside it.
 
 ```bash
 hort-cli curation queue --status quarantined --repo npm-proxy --output table
-hort-cli curation waive "$ARTIFACT_ID" \
+hort-cli curation waive artifact "$ARTIFACT_ID" \
     --justification "Alpha test — clean scan, accepting advisory lag."
 ```
 

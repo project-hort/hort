@@ -1,9 +1,11 @@
 //! Integration tests for `hort-cli curation block`.
 //!
-//! Covers both sub-subcommands:
+//! Covers all three sub-subcommands:
 //! - `block artifact <id>` → `POST /admin/curation/quarantine/:id/block`
 //! - `block versions --repo ... --package ... --versions ...` →
 //!   `POST /admin/curation/block-versions`
+//! - `block digests --repo ... --digests ...` →
+//!   `POST /admin/curation/block-digests`
 //!
 //! Four tests per sub-subcommand (happy table, happy JSON, 403,
 //! oversize-justification client-side reject). Plus one extra test on
@@ -17,7 +19,8 @@ use mockito::Server;
 use hort_cli::client::AkClient;
 use hort_cli::config::{EffectiveConfig, OutputFormat};
 use hort_cli::curation::block::{
-    run_artifact_with_output, run_versions_with_output, BlockArtifactArgs, BlockVersionsArgs,
+    run_artifact_with_output, run_digests_with_output, run_versions_with_output, BlockArtifactArgs,
+    BlockDigestsArgs, BlockVersionsArgs,
 };
 
 // ---------------------------------------------------------------------------
@@ -59,6 +62,7 @@ fn trivial_envelope_blocked() -> String {
             "blocked_artifact_ids": ["{ARTIFACT_ID}"],
             "already_rejected_ids": [],
             "not_found_versions": [],
+            "not_found_digests": [],
             "failed": []
         }}"#
     )
@@ -261,6 +265,7 @@ async fn block_versions_happy_path_table() {
             "blocked_artifact_ids": ["{ARTIFACT_ID}"],
             "already_rejected_ids": [],
             "not_found_versions": [],
+            "not_found_digests": [],
             "failed": []
         }}"#
     );
@@ -307,15 +312,17 @@ async fn block_versions_happy_path_json() {
         clear_env();
     }
 
-    let body = format!(
+    let sent_body = format!(
         r#"{{
             "correlation_id": "{CORRELATION_ID}",
             "blocked_artifact_ids": ["{ARTIFACT_ID}"],
             "already_rejected_ids": [],
             "not_found_versions": [],
+            "not_found_digests": [],
             "failed": []
         }}"#
     );
+    let body = sent_body.clone();
     let mut server = Server::new_async().await;
     let m = server
         .mock("POST", BULK_ROUTE)
@@ -348,6 +355,17 @@ async fn block_versions_happy_path_json() {
             .unwrap(),
         CORRELATION_ID
     );
+    // The envelope passes through whole. `not_found_digests` is the
+    // member this asserts by name: the CLI's mirror DTO did not carry it
+    // when the server gained it, so a `--output json` re-serialisation
+    // dropped the key — harmless while a versions call always leaves it
+    // empty, and exactly the drift the DTO's sync-required comment names.
+    assert!(
+        parsed.get("not_found_digests").is_some(),
+        "the envelope keeps both not-found lists: {out}"
+    );
+    let sent: serde_json::Value = serde_json::from_str(&sent_body).expect("fixture");
+    assert_eq!(parsed, sent, "the envelope passes through verbatim");
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +455,7 @@ async fn block_versions_partial_success_highlights_failed_in_red() {
             "blocked_artifact_ids": ["{ARTIFACT_ID}"],
             "already_rejected_ids": [],
             "not_found_versions": ["9.9.9"],
+            "not_found_digests": [],
             "failed": [
                 {{
                     "artifact_id": "{failed_id}",
@@ -508,4 +527,161 @@ async fn block_versions_partial_success_highlights_failed_in_red() {
         count >= 2,
         "correlation_id appears in retry hint + header row (got {count}): {out}"
     );
+}
+
+// ===========================================================================
+// `block digests` — the digest-addressed mode
+// ===========================================================================
+
+const DIGESTS_ROUTE: &str = "/api/v1/admin/curation/block-digests";
+const DIGEST: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+// ---------------------------------------------------------------------------
+// Test 10 — the two spellings of one digest send the same request body.
+// `match_body` is the assertion: the mock only answers the bare form, so
+// a CLI that forwarded the `sha256:` prefix would get no match and
+// `assert_async` would fail.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn block_digests_prefixed_and_bare_send_the_same_body() {
+    {
+        let _g = lock_env();
+        clear_env();
+    }
+
+    let body = format!(
+        r#"{{
+            "correlation_id": "{CORRELATION_ID}",
+            "blocked_artifact_ids": ["{ARTIFACT_ID}"],
+            "already_rejected_ids": [],
+            "not_found_versions": [],
+            "not_found_digests": [],
+            "failed": []
+        }}"#
+    );
+
+    for spelling in [DIGEST.to_string(), format!("sha256:{DIGEST}")] {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", DIGESTS_ROUTE)
+            .match_header("authorization", "Bearer test-token")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "repository": "oci-proxy",
+                "digests": [DIGEST],
+                "justification": "reviewed these bytes"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.clone())
+            .create_async()
+            .await;
+
+        let client = test_client(&server.url());
+        let args = BlockDigestsArgs {
+            repository: "oci-proxy".to_string(),
+            digests: vec![spelling.clone()],
+            justification: "reviewed these bytes".to_string(),
+        };
+
+        let mut buf = Vec::new();
+        run_digests_with_output(client, args, OutputFormat::Table, &mut buf)
+            .await
+            .unwrap_or_else(|e| panic!("{spelling} succeeds: {e}"));
+        m.assert_async().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 11 — an unmatched digest surfaces in its own section, with the
+// consequence stated: this surface does not auto-block a future ingest
+// of those bytes.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn block_digests_unmatched_digest_is_reported_as_not_found() {
+    {
+        let _g = lock_env();
+        clear_env();
+    }
+
+    let body = format!(
+        r#"{{
+            "correlation_id": "{CORRELATION_ID}",
+            "blocked_artifact_ids": [],
+            "already_rejected_ids": [],
+            "not_found_versions": [],
+            "not_found_digests": ["{DIGEST}"],
+            "failed": []
+        }}"#
+    );
+    let mut server = Server::new_async().await;
+    let m = server
+        .mock("POST", DIGESTS_ROUTE)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+        .create_async()
+        .await;
+
+    let client = test_client(&server.url());
+    let args = BlockDigestsArgs {
+        repository: "oci-proxy".to_string(),
+        digests: vec![DIGEST.to_string()],
+        justification: "reviewed these bytes".to_string(),
+    };
+
+    let mut buf = Vec::new();
+    run_digests_with_output(client, args, OutputFormat::Table, &mut buf)
+        .await
+        .expect("an unmatched digest is still a 200");
+    m.assert_async().await;
+
+    let out = String::from_utf8(buf).expect("utf8");
+    assert!(
+        out.contains("NOT_FOUND_DIGESTS (1)"),
+        "digest section header present: {out}"
+    );
+    assert!(out.contains(DIGEST), "the digest is named: {out}");
+    assert!(
+        out.contains("NOT auto-blocked"),
+        "the consequence is stated: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 12 — a digest written with another algorithm is refused before
+// the round trip (`expect(0)` proves the server was never asked).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn block_digests_wrong_algorithm_does_not_call_server() {
+    {
+        let _g = lock_env();
+        clear_env();
+    }
+
+    let mut server = Server::new_async().await;
+    let m = server
+        .mock("POST", DIGESTS_ROUTE)
+        .expect(0)
+        .create_async()
+        .await;
+
+    let client = test_client(&server.url());
+    let args = BlockDigestsArgs {
+        repository: "oci-proxy".to_string(),
+        digests: vec![format!("sha512:{}", "a".repeat(128))],
+        justification: "reviewed these bytes".to_string(),
+    };
+
+    let mut buf = Vec::new();
+    let result = run_digests_with_output(client, args, OutputFormat::Table, &mut buf).await;
+    assert!(result.is_err(), "refused before the HTTP call");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("unsupported algorithm prefix"),
+        "names the cause: {err}"
+    );
+    m.assert_async().await;
 }

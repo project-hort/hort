@@ -14,7 +14,7 @@
 #      neither Curate nor Admin claims; used by Scenario 8 negative
 #      privilege denial).
 #   4. hort-cli wrapper (`run_hort_cli`) that injects HORT_API_URL + HORT_TOKEN
-#      so a scenario script can call `run_hort_cli curation waive …`
+#      so a scenario script can call `run_hort_cli curation waive artifact …`
 #      without scattering env-var plumbing through every call site.
 #   5. psql one-shot + count helpers for event-stream + projection
 #      assertions (same pattern as test-task-framework.sh).
@@ -61,12 +61,37 @@ export REPO_ROOT
 
 COMPOSE_FILE="${COMPOSE_FILE:-$REPO_ROOT/deploy/compose/docker-compose.yml}"
 API_URL="${API_URL:-http://localhost:25080}"
-METRICS_URL="${METRICS_URL:-http://localhost:25090/metrics}"
+# Readiness probe. `/readyz` sits on the BARE router beside `/healthz`
+# (`crates/hort-server/src/http.rs`, "the probes stay bare"), so it is
+# anonymous by construction, and it answers 200 only once the event store's
+# health check passes — i.e. "the database is there", which is the part of a
+# cold bring-up that actually takes time.
+#
+# This used to poll the metrics endpoint (`:25090/metrics`) with `curl -f`,
+# which could never succeed: that endpoint unconditionally requires a bearer
+# carrying `read_metrics` (ADR 0052), so an anonymous probe gets a non-2xx
+# and `-f` turns that into a failure. The same call decides "is a stack
+# already up?", so the suite reported "no stack up" against a perfectly
+# healthy stack, rebuilt it, and then timed out waiting for a condition that
+# cannot occur. `deploy/compose/docker-compose.yml` states the rule this now
+# follows: readiness polls the main listener's bare probe, never the metrics
+# endpoint.
+#
+# The old variable name means an optional *metrics scrape* target elsewhere
+# in this repository (`scripts/k8s-tests/`), which is why it is not reused
+# here for a liveness check.
+READY_URL="${READY_URL:-http://localhost:25080/readyz}"
 KEYCLOAK_TOKEN_URL="${KEYCLOAK_TOKEN_URL:-http://localhost:25082/realms/hort/protocol/openid-connect/token}"
 KEYCLOAK_CLIENT_ID="${KEYCLOAK_CLIENT_ID:-hort-server}"
 KEYCLOAK_CLIENT_SECRET="${KEYCLOAK_CLIENT_SECRET:-hort-server-secret-dev-only}"
 
-READY_TIMEOUT_SECS="${READY_TIMEOUT_SECS:-60}"
+# A cold `docker compose up -d --build` returns before the server is
+# serving: the database still has to accept connections and the migration set
+# still has to run. 60s was marginal enough that a first-ever bring-up lost
+# the race. The poll returns the instant the probe answers, so a generous
+# ceiling costs nothing on a warm machine and is the difference between a
+# SKIP and a run on a cold one.
+READY_TIMEOUT_SECS="${READY_TIMEOUT_SECS:-180}"
 
 # hort-cli binary — release-built into target/release by the v2 CI lane;
 # fallback to debug if release isn't there.
@@ -134,8 +159,8 @@ require_stack_up() {
         log "      bring it up with: docker compose -f $COMPOSE_FILE up -d"
         exit 2
     fi
-    if ! curl -fsSL -o /dev/null --max-time 5 "$METRICS_URL"; then
-        log "SKIP: hort-server metrics endpoint unreachable at $METRICS_URL"
+    if ! curl -fsSL -o /dev/null --max-time 5 "$READY_URL"; then
+        log "SKIP: hort-server not ready at $READY_URL"
         exit 2
     fi
     if ! curl -fsSL -o /dev/null --max-time 5 \
@@ -165,8 +190,8 @@ ensure_stack_up() {
         log "SKIP: docker not available — the curator E2E needs a compose stack"
         exit 2
     fi
-    if curl -fsSL -o /dev/null --max-time 3 "$METRICS_URL" 2>/dev/null; then
-        log "  using the already-running stack ($METRICS_URL)"
+    if curl -fsSL -o /dev/null --max-time 3 "$READY_URL" 2>/dev/null; then
+        log "  using the already-running stack ($READY_URL)"
         return 0
     fi
     log "  no stack up — bringing up $COMPOSE_FILE (this can take a minute) ..."
@@ -180,7 +205,7 @@ ensure_stack_up() {
     kc_disc="${KEYCLOAK_TOKEN_URL%/protocol/openid-connect/token}/.well-known/openid-configuration"
     deadline=$(( $(date +%s) + READY_TIMEOUT_SECS ))
     while :; do
-        if curl -fsSL -o /dev/null --max-time 3 "$METRICS_URL" 2>/dev/null \
+        if curl -fsSL -o /dev/null --max-time 3 "$READY_URL" 2>/dev/null \
            && curl -fsSL -o /dev/null --max-time 3 "$kc_disc" 2>/dev/null; then
             log "  stack ready"
             return 0
@@ -260,7 +285,7 @@ keycloak_token() {
 #   run_hort_cli <token> -- <hort-cli subcommand and args>
 #
 # Example:
-#   run_hort_cli "$CURATOR_TOKEN" -- curation waive "$AID" --justification "..."
+#   run_hort_cli "$CURATOR_TOKEN" -- curation waive artifact "$AID" --justification "..."
 #
 # All output captured; exit code preserved. We do NOT use `hort-cli auth login`
 # (the v2 dev stack has its own flow) — instead we set HORT_TOKEN env var

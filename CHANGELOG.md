@@ -14,6 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New default-on daily `api-token-retention-sweep` deletes rows over 90 days past
   their own `expires_at` or `revoked_at`, discarding the last-used timestamp, IP
   and user-agent; a token with neither mark set is never touched (#271).
+- The curation queue now names the bytes each row decides about: the
+  artifact's SHA-256 digest and the tags pointing at it, in the admin API
+  JSON, `hort-cli curation queue --output json`, and the CLI table (digest
+  abbreviated there) (#176).
+- Curation decisions can be addressed by version list or content digest:
+  `POST /api/v1/admin/curation/{waive-versions,waive-digests,block-digests}`.
+  A bulk waive caps at 25 entries and is all-or-nothing — one unresolvable,
+  ambiguous or non-quarantined entry returns `409` with a per-entry report
+  and releases nothing (#176).
+
+### Changed
+
+- `hort-cli curation waive <artifact_id>` is now `curation waive artifact
+  <artifact_id>`; `waive versions`, `waive digests` and `block digests`
+  address a decision in bulk (#176).
 
 ## [0.17.3] - 2026-11-08
 
