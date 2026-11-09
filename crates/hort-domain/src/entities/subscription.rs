@@ -1195,7 +1195,7 @@ pub fn validate_webhook_url(url: &Url, allow_plaintext: bool) -> DomainResult<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entities::api_token::TokenKind;
+    use crate::entities::api_token::{IssuedVia, TokenKind};
     use crate::entities::artifact::QuarantineStatus;
     use crate::entities::mutable_ref::RefTarget;
     use crate::entities::rbac::Permission;
@@ -1963,6 +1963,7 @@ mod tests {
                     source_issuer: None,
                     source_jti: None,
                     source_sub: None,
+                    issued_via: IssuedVia::HttpMint,
                 }),
                 EventTypeKind::ApiTokenIssued,
                 None,

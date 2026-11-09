@@ -81,13 +81,13 @@ use hort_app::rbac::RbacEvaluator;
 use hort_app::task_dispatcher::TaskDispatcher;
 use hort_app::task_handlers::eventstore_checkpoint::BackfillBaselineConfig;
 use hort_app::task_handlers::{
-    AdvisoryWatchTickHandler, CheckpointEmissionHook, CheckpointEmitterHookAdapter,
-    CronRescanTickHandler, EventStoreArchiveHandler, EventstoreCheckpointHandler,
-    JobsRowRetentionSweepHandler, NoopTaskHandler, OciIndexChildIngestHandler,
-    OciMembershipEdgeBackfillHandler, PrefetchDependenciesHandler, PrefetchIngestHandler,
-    PrefetchRowRetentionSweepHandler, PrefetchTickHandler, ProvenanceVerifyHandler,
-    QuarantineReleaseSweepHandler, ReplaySeenPruneHandler, RetentionEvaluateHandler,
-    RetentionPurgeHandler, ScanRowRetentionSweepHandler, ScanTaskHandler,
+    AdvisoryWatchTickHandler, ApiTokenRetentionSweepHandler, CheckpointEmissionHook,
+    CheckpointEmitterHookAdapter, CronRescanTickHandler, EventStoreArchiveHandler,
+    EventstoreCheckpointHandler, JobsRowRetentionSweepHandler, NoopTaskHandler,
+    OciIndexChildIngestHandler, OciMembershipEdgeBackfillHandler, PrefetchDependenciesHandler,
+    PrefetchIngestHandler, PrefetchRowRetentionSweepHandler, PrefetchTickHandler,
+    ProvenanceVerifyHandler, QuarantineReleaseSweepHandler, ReplaySeenPruneHandler,
+    RetentionEvaluateHandler, RetentionPurgeHandler, ScanRowRetentionSweepHandler, ScanTaskHandler,
     ScannerRegistryPruneHandler, SeedImportHandler, ServiceAccountRotationHandler,
     StagingSweepHandler, WheelMetadataBackfillHandler,
 };
@@ -982,6 +982,32 @@ pub async fn build_app_context(
     // rows they read. Single-active per worker replica, same as every
     // other sweep in this file.
     dispatcher.register(Arc::new(JobsRowRetentionSweepHandler::new(jobs.clone())), 1);
+
+    // Credential-store retention sweep — the first in this family whose
+    // DELETE lands outside `public.jobs`. Deletes an `api_tokens` row
+    // whose own `expires_at` or `revoked_at` is more than 90 days in the
+    // past; a row with both marks NULL is a durable identity and matches
+    // neither disjunct. Registered unconditionally: the table grows on
+    // every deployment from day one (one row per issued credential, plus
+    // one per federated workload exchange) and had no horizon at all
+    // before this handler.
+    //
+    // Its own `ApiTokenRepository` rather than the one
+    // `register_service_account_rotation` builds: that one is scoped to
+    // the rotation handler's conditional registration (it returns early
+    // without `HORT_ROTATION_NAMESPACES` / `HORT_PUBLIC_REGISTRY_HOST`),
+    // and this sweep must run whether or not rotation is configured.
+    //
+    // Concurrency = 1 — single-active per worker replica, same as every
+    // other sweep in this file. Two concurrent runs would be harmless
+    // (the second `DELETE` finds the first one's rows already gone) but
+    // there is nothing to gain from one.
+    dispatcher.register(
+        Arc::new(ApiTokenRetentionSweepHandler::new(Arc::new(
+            PgApiTokenRepository::new(pool.clone()),
+        ))),
+        1,
+    );
 
     // -----------------------------------------------------------------
     // 12.e.tris Register the WheelMetadataBackfillHandler (kind

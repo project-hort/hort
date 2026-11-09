@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `api_tokens` rows record which issuance path minted them (`issued_via`, also
+  on the token-list response); rows predating the column read `unknown` (#271).
+- New default-on daily `api-token-retention-sweep` deletes rows over 90 days past
+  their own `expires_at` or `revoked_at`, discarding the last-used timestamp, IP
+  and user-agent; a token with neither mark set is never touched (#271).
+
 ## [0.17.3] - 2026-11-08
 
 ### Added

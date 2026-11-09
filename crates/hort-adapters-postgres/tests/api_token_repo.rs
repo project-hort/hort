@@ -24,6 +24,25 @@
 //!    IP is stored verbatim, NOT crashed. (Sub-bullet d.)
 //! 9. `revoke_sets_revoked_at_idempotently` — first revoke flips the
 //!    column; double-revoke is a no-op (no error).
+//! 10. `insert_round_trips_every_issued_via_value` — the provenance
+//!     column survives the INSERT bind and the SELECT decode, which are
+//!     two separate statements in the adapter.
+//! 11. `operator_authority_query_separates_identities_from_exchange_rows`
+//!     — the query the column exists for, over rows that `kind`,
+//!     `revoked_at` and `created_by_user_id` cannot separate.
+//! 12. The credential-store retention sweep's predicate, **one test per
+//!     NULL case** rather than one sweep over a mixed fixture:
+//!     `retention_sweep_deletes_a_row_expired_past_the_horizon`,
+//!     `…_keeps_a_row_expired_inside_the_horizon`,
+//!     `…_deletes_a_row_revoked_past_the_horizon`,
+//!     `…_keeps_a_row_revoked_inside_the_horizon`,
+//!     `…_keeps_a_row_with_both_marks_null`, and
+//!     `…_keeps_a_row_whose_only_old_mark_is_a_future_expiry`. The
+//!     both-NULL case is the one that matters most and is deliberately
+//!     its own test rather than a corollary of another: that row is a
+//!     durable identity that never expires, and a `COALESCE`-flattened
+//!     or negated predicate reaches it. A mixed fixture asserting one
+//!     deleted count would pass with the branches swapped.
 //!
 //! These tests follow the project convention (mirrored from
 //! `api_tokens_migration.rs`): require `DATABASE_URL` to be set;
@@ -42,7 +61,7 @@ use std::env;
 
 use chrono::{Duration, Utc};
 use hort_adapters_postgres::api_token_repo::PgApiTokenRepository;
-use hort_domain::entities::api_token::{ApiToken, TokenKind};
+use hort_domain::entities::api_token::{ApiToken, IssuedVia, TokenKind};
 use hort_domain::entities::rbac::Permission;
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
 use hort_domain::types::PageRequest;
@@ -93,6 +112,7 @@ fn sample_token(user_id: Uuid, prefix: &str) -> ApiToken {
         last_used_user_agent: None,
         created_by_user_id: user_id,
         created_at: Utc::now(),
+        issued_via: IssuedVia::HttpMint,
     }
 }
 
@@ -409,4 +429,404 @@ async fn find_by_id_raises_not_found_on_unknown_id() {
             ..
         }
     ));
+}
+
+// ---------------------------------------------------------------------------
+// `issued_via` — the adapter writes and reads back the provenance, and the
+// operator authority query separates identities from exchange rows.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn insert_round_trips_every_issued_via_value() {
+    // The INSERT bind and the SELECT decode are two separate statements
+    // in the adapter, so a value that writes but does not read back
+    // (or the reverse) is a real failure mode: one column dropped from
+    // `SELECT_COLS` and every read turns into a hard error, one missing
+    // bind and every row lands on the column default.
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let user_id = create_test_user(&pool).await;
+    let repo = PgApiTokenRepository::new(pool);
+
+    for (i, via) in [
+        IssuedVia::Unknown,
+        IssuedVia::AdminCli,
+        IssuedVia::HttpMint,
+        IssuedVia::FederationExchange,
+        IssuedVia::Bootstrap,
+        IssuedVia::ServiceAccountRotation,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let token = ApiToken {
+            issued_via: via,
+            ..sample_token(user_id, &format!("via{i:05}"))
+        };
+        repo.insert(&token).await.expect("insert succeeds");
+        let fetched = repo.find_by_id(token.id).await.expect("find_by_id");
+        assert_eq!(fetched.issued_via, via, "round trip failed for {via:?}");
+    }
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn operator_authority_query_separates_identities_from_exchange_rows() {
+    // The query this column exists for: the token cap lives in the row
+    // rather than in an envelope (ADR 0012), so establishing an
+    // identity's effective authority means reading `name`,
+    // `declared_permissions` and `repository_ids` out of `api_tokens`.
+    // Every row below is `kind = 'pat'` or `'service_account'` and
+    // every one of them is live, so `kind`, `revoked_at` and
+    // `created_by_user_id` cannot tell the identities from the
+    // exchange residue — `issued_via` is what does.
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let user_id = create_test_user(&pool).await;
+    let repo = PgApiTokenRepository::new(pool.clone());
+
+    let mut expected_identities = Vec::new();
+    for (i, (name, kind, via)) in [
+        (
+            "durable-ci-pusher",
+            TokenKind::ServiceAccount,
+            IssuedVia::AdminCli,
+        ),
+        (
+            "durable-rotated",
+            TokenKind::ServiceAccount,
+            IssuedVia::ServiceAccountRotation,
+        ),
+        ("durable-human-pat", TokenKind::Pat, IssuedVia::HttpMint),
+        ("durable-pre-column", TokenKind::Pat, IssuedVia::Unknown),
+        ("durable-break-glass", TokenKind::Pat, IssuedVia::Bootstrap),
+        (
+            "exchange-ci-job-a",
+            TokenKind::ServiceAccount,
+            IssuedVia::FederationExchange,
+        ),
+        (
+            "exchange-ci-job-b",
+            TokenKind::ServiceAccount,
+            IssuedVia::FederationExchange,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let token = ApiToken {
+            name: name.to_string(),
+            kind,
+            issued_via: via,
+            ..sample_token(user_id, &format!("opq{i:05}"))
+        };
+        if via != IssuedVia::FederationExchange {
+            expected_identities.push(name.to_string());
+        }
+        repo.insert(&token).await.expect("insert succeeds");
+    }
+    // A revoked identity is out of scope either way — the query asks
+    // about live authority.
+    let revoked = ApiToken {
+        name: "revoked-identity".into(),
+        issued_via: IssuedVia::AdminCli,
+        ..sample_token(user_id, "opqrevok")
+    };
+    repo.insert(&revoked).await.expect("insert succeeds");
+    repo.revoke(revoked.id).await.expect("revoke succeeds");
+
+    let rows: Vec<(String, Vec<String>, Option<Vec<Uuid>>)> = sqlx::query_as(
+        "SELECT name, declared_permissions, repository_ids \
+           FROM public.api_tokens \
+          WHERE revoked_at IS NULL \
+            AND issued_via <> 'federation_exchange' \
+            AND user_id = $1 \
+          ORDER BY name",
+    )
+    .bind(user_id)
+    .fetch_all(&pool)
+    .await
+    .expect("the operator authority query runs");
+
+    expected_identities.sort();
+    let names: Vec<String> = rows.iter().map(|(n, _, _)| n.clone()).collect();
+    assert_eq!(
+        names, expected_identities,
+        "the query must answer with exactly the durable identities — \
+         the exchange rows and the revoked row are out"
+    );
+    // And it answers with the cap, which is the point of asking.
+    for (_, permissions, _) in &rows {
+        assert_eq!(permissions, &vec!["read".to_string(), "write".to_string()]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance — the credential-store retention sweep's predicate
+// (bullet 12).
+//
+// `delete_expired_or_revoked_older_than` is the one statement in this
+// adapter that removes a credential, and the table it removes it from is
+// the one that decides who may do what. So the predicate is asserted
+// **per branch**, against a real Postgres, rather than by one sweep over
+// a mixed fixture whose single deleted count would be satisfied by the
+// branches being swapped.
+//
+// Each test seeds exactly one row for a fresh user in an isolated
+// database and asserts on that row's survival, so the two directions are
+// never read off the same number.
+// ---------------------------------------------------------------------------
+
+/// The horizon every test below measures against — the handler's
+/// `DEFAULT_HORIZON`, re-stated here as a `chrono::Duration` because the
+/// fixtures place timestamps and the port takes a `std::time::Duration`.
+const HORIZON_DAYS: i64 = 90;
+
+fn horizon() -> std::time::Duration {
+    std::time::Duration::from_secs((HORIZON_DAYS as u64) * 24 * 60 * 60)
+}
+
+/// Does a row with this id still exist?
+async fn row_exists(pool: &PgPool, id: Uuid) -> bool {
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM public.api_tokens WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("count the row");
+    n == 1
+}
+
+/// Seed one token for a fresh user, with the two marks set explicitly.
+/// Written through SQL rather than `repo.insert` because `insert` has no
+/// way to place `revoked_at` (the adapter's `revoke` sets it to `NOW()`),
+/// and the whole point here is to place both marks at chosen times.
+async fn seed_token_with_marks(
+    pool: &PgPool,
+    prefix: &str,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    revoked_at: Option<chrono::DateTime<Utc>>,
+) -> Uuid {
+    let user_id = create_test_user(pool).await;
+    let token = ApiToken {
+        expires_at,
+        revoked_at,
+        ..sample_token(user_id, prefix)
+    };
+    sqlx::query(
+        "INSERT INTO public.api_tokens \
+           (id, user_id, name, description, kind, token_hash, token_prefix, \
+            declared_permissions, repository_ids, expires_at, revoked_at, \
+            created_by_user_id, created_at, issued_via) \
+         VALUES ($1, $2, $3, $4, 'pat', $5, $6, ARRAY['read']::text[], NULL, $7, $8, $9, \
+                 now(), 'http_mint')",
+    )
+    .bind(token.id)
+    .bind(token.user_id)
+    .bind(&token.name)
+    .bind(&token.description)
+    .bind(&token.token_hash)
+    .bind(&token.token_prefix)
+    .bind(token.expires_at)
+    .bind(token.revoked_at)
+    .bind(token.created_by_user_id)
+    .execute(pool)
+    .await
+    .expect("seed api_tokens row with explicit marks");
+    token.id
+}
+
+/// A row whose `expires_at` is older than the horizon is deleted.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn retention_sweep_deletes_a_row_expired_past_the_horizon() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let id = seed_token_with_marks(
+        &pool,
+        "exppast1",
+        Some(Utc::now() - Duration::days(HORIZON_DAYS + 1)),
+        None,
+    )
+    .await;
+
+    let repo = PgApiTokenRepository::new(pool.clone());
+    let deleted = repo
+        .delete_expired_or_revoked_older_than(horizon())
+        .await
+        .expect("the sweep runs");
+
+    assert_eq!(deleted, 1, "the one eligible row is the one deleted");
+    assert!(
+        !row_exists(&pool, id).await,
+        "a row expired longer than the horizon must be gone"
+    );
+}
+
+/// A row whose `expires_at` is inside the horizon survives. The
+/// credential is already dead; what the window is still holding is its
+/// last-use trail.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn retention_sweep_keeps_a_row_expired_inside_the_horizon() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let id = seed_token_with_marks(
+        &pool,
+        "expinsid",
+        Some(Utc::now() - Duration::days(HORIZON_DAYS - 1)),
+        None,
+    )
+    .await;
+
+    let repo = PgApiTokenRepository::new(pool.clone());
+    let deleted = repo
+        .delete_expired_or_revoked_older_than(horizon())
+        .await
+        .expect("the sweep runs");
+
+    assert_eq!(deleted, 0, "nothing in this database is eligible yet");
+    assert!(
+        row_exists(&pool, id).await,
+        "a row expired inside the horizon must survive"
+    );
+}
+
+/// A row whose `revoked_at` is older than the horizon is deleted — the
+/// second disjunct, asserted on its own rather than inferred from the
+/// first.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn retention_sweep_deletes_a_row_revoked_past_the_horizon() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    // `expires_at` left NULL on purpose: this row is eligible *only*
+    // through the revocation disjunct, so a predicate that lost that
+    // disjunct fails here rather than passing on the other one.
+    let id = seed_token_with_marks(
+        &pool,
+        "revpast1",
+        None,
+        Some(Utc::now() - Duration::days(HORIZON_DAYS + 1)),
+    )
+    .await;
+
+    let repo = PgApiTokenRepository::new(pool.clone());
+    let deleted = repo
+        .delete_expired_or_revoked_older_than(horizon())
+        .await
+        .expect("the sweep runs");
+
+    assert_eq!(deleted, 1, "the one eligible row is the one deleted");
+    assert!(
+        !row_exists(&pool, id).await,
+        "a row revoked longer than the horizon must be gone"
+    );
+}
+
+/// A row revoked inside the horizon survives.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn retention_sweep_keeps_a_row_revoked_inside_the_horizon() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let id = seed_token_with_marks(
+        &pool,
+        "revinsid",
+        None,
+        Some(Utc::now() - Duration::days(HORIZON_DAYS - 1)),
+    )
+    .await;
+
+    let repo = PgApiTokenRepository::new(pool.clone());
+    let deleted = repo
+        .delete_expired_or_revoked_older_than(horizon())
+        .await
+        .expect("the sweep runs");
+
+    assert_eq!(deleted, 0, "nothing in this database is eligible yet");
+    assert!(
+        row_exists(&pool, id).await,
+        "a row revoked inside the horizon must survive"
+    );
+}
+
+/// **The one that matters.** A row with `expires_at IS NULL` and
+/// `revoked_at IS NULL` is a durable identity that never expires, and the
+/// sweep must never reach it — however old the row itself is.
+///
+/// Its own test rather than a corollary of the four above: it is the
+/// failure a `COALESCE(expires_at, revoked_at) < now() - $horizon` or a
+/// `NOT (…still live…)` predicate produces, and either of those would
+/// pass every other test in this block. The `created_at` is placed well
+/// past the horizon so that a predicate which quietly started measuring
+/// from the wrong column fails here too.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn retention_sweep_keeps_a_row_with_both_marks_null() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let id = seed_token_with_marks(&pool, "durable1", None, None).await;
+    sqlx::query(
+        "UPDATE public.api_tokens SET created_at = now() - interval '5 years' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .expect("age the durable identity well past the horizon");
+
+    let repo = PgApiTokenRepository::new(pool.clone());
+    let deleted = repo
+        .delete_expired_or_revoked_older_than(horizon())
+        .await
+        .expect("the sweep runs");
+
+    assert_eq!(
+        deleted, 0,
+        "a credential with neither mark set is live; the sweep must delete nothing"
+    );
+    assert!(
+        row_exists(&pool, id).await,
+        "a row with both marks NULL is a durable identity and must survive any horizon"
+    );
+}
+
+/// A row whose only non-NULL mark is a *future* `expires_at` survives.
+///
+/// The complement of the both-NULL case: here a mark IS present, so a
+/// predicate that tested only `IS NOT NULL` without comparing the
+/// timestamp would delete it. Together the two tests pin both halves of
+/// each disjunct — the mark must be present AND older than the horizon.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn retention_sweep_keeps_a_row_whose_only_old_mark_is_a_future_expiry() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let id = seed_token_with_marks(
+        &pool,
+        "futureex",
+        Some(Utc::now() + Duration::days(30)),
+        None,
+    )
+    .await;
+
+    let repo = PgApiTokenRepository::new(pool.clone());
+    let deleted = repo
+        .delete_expired_or_revoked_older_than(horizon())
+        .await
+        .expect("the sweep runs");
+
+    assert_eq!(deleted, 0, "a credential that has not expired yet is live");
+    assert!(
+        row_exists(&pool, id).await,
+        "a row with a future expiry must survive"
+    );
 }

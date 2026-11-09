@@ -1339,7 +1339,9 @@ mod tests {
     use metrics_util::{CompositeKey, MetricKind};
     use uuid::Uuid;
 
-    use hort_domain::entities::api_token::{cap_allows_optional_repo, ApiToken, TokenKind};
+    use hort_domain::entities::api_token::{
+        cap_allows_optional_repo, ApiToken, IssuedVia, TokenKind,
+    };
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::rbac::{GrantSubject, PermissionGrant};
     use hort_domain::entities::repository::{
@@ -1801,6 +1803,7 @@ mod tests {
             last_used_user_agent: None,
             created_by_user_id: user_id,
             created_at: now,
+            issued_via: IssuedVia::HttpMint,
         };
         tokens.insert("aaaaaaaa", token);
         (plaintext, user_id)

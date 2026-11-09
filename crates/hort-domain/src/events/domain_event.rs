@@ -899,7 +899,7 @@ pub(crate) mod tests {
         SubscriptionUpdated, TargetKindWire,
     };
     use super::*;
-    use crate::entities::api_token::TokenKind;
+    use crate::entities::api_token::{IssuedVia, TokenKind};
     use crate::entities::artifact::QuarantineStatus;
     use crate::entities::mutable_ref::RefTarget;
     use crate::entities::rbac::Permission;
@@ -1292,6 +1292,7 @@ pub(crate) mod tests {
                 source_issuer: None,
                 source_jti: None,
                 source_sub: None,
+                issued_via: IssuedVia::HttpMint,
             }),
             DomainEvent::ApiTokenRevoked(ApiTokenRevoked {
                 token_id: Uuid::nil(),

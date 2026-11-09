@@ -52,6 +52,13 @@ pub mod enqueue_quarantine_release_sweep;
 // Runtime DSN; no svc-token. Same delivery contract
 // as `enqueue-prefetch-row-retention-sweep`.
 pub mod enqueue_jobs_row_retention_sweep;
+// DB-only enqueue subcommand the Helm CronJob and the
+// systemd timer run to schedule the credential-store retention sweep.
+// Runtime DSN; no svc-token. Same delivery contract as the three
+// `jobs`-row sweeps above — and the same contract matters more here,
+// because this one's DELETE lands on `public.api_tokens` rather than on
+// the task queue.
+pub mod enqueue_api_token_retention_sweep;
 pub mod enqueue_scan_row_retention_sweep;
 // DB-only enqueue subcommand the Helm CronJob
 // runs to retrofit older PyPI wheels with their PEP 658 metadata
@@ -272,6 +279,22 @@ pub enum Command {
     EnqueueJobsRowRetentionSweep(
         enqueue_jobs_row_retention_sweep::EnqueueJobsRowRetentionSweepArgs,
     ),
+    /// Enqueue one `api-token-retention-sweep` job and exit. The Helm
+    /// CronJob runs this daily (operator-tunable) using the runtime DSN
+    /// (no svc-token; no `cronJobs.enabled` umbrella dependency). The
+    /// always-on worker picks the row up and dispatches to
+    /// `ApiTokenRetentionSweepHandler`, which deletes a
+    /// `public.api_tokens` row whose own `expires_at` is more than the
+    /// handler's 90-day `DEFAULT_HORIZON` in the past, or whose own
+    /// `revoked_at` is — the schedule is a chart value, the horizon is
+    /// not settable by any supported path. A row with **both** marks
+    /// NULL is a durable identity that never expires and survives: each
+    /// disjunct requires that row's own mark to be present. The first
+    /// sweep in this family whose DELETE lands outside `public.jobs`;
+    /// `api_tokens` had no horizon at all before it.
+    EnqueueApiTokenRetentionSweep(
+        enqueue_api_token_retention_sweep::EnqueueApiTokenRetentionSweepArgs,
+    ),
     /// Enqueue one `wheel-metadata-backfill`
     /// job and exit. The Helm CronJob runs this on the operator's
     /// chosen schedule (default-disabled — backfill is a one-shot
@@ -332,6 +355,9 @@ fn dispatch(command: Command) -> ExitCode {
         }
         Command::EnqueueScanRowRetentionSweep(args) => enqueue_scan_row_retention_sweep::run(args),
         Command::EnqueueJobsRowRetentionSweep(args) => enqueue_jobs_row_retention_sweep::run(args),
+        Command::EnqueueApiTokenRetentionSweep(args) => {
+            enqueue_api_token_retention_sweep::run(args)
+        }
         Command::EnqueueWheelMetadataBackfill(args) => enqueue_wheel_metadata_backfill::run(args),
         Command::ValidateConfig(args) => validate_config::run(&args),
         Command::License(args) => license::run(&args),
@@ -357,8 +383,8 @@ fn dispatch(command: Command) -> ExitCode {
 ///   against the sweep, because a backlog is always older than the next
 ///   scheduled run.
 ///
-/// Shared by the five `enqueue-*` subcommands that write such a row —
-/// one invariant, asserted once. Five copies of it is the shape the
+/// Shared by the six `enqueue-*` subcommands that write such a row —
+/// one invariant, asserted once. Six copies of it is the shape the
 /// ordinal itself had before it was decided in one place.
 #[cfg(test)]
 pub(crate) fn assert_scheduled_maintenance_ordinal(kind: &str) {
@@ -599,6 +625,21 @@ mod tests {
         ));
     }
 
+    // `enqueue-api-token-retention-sweep` subcommand parses.
+    // Accepts bare invocation — the subcommand has no flags, and for
+    // this one that is a deliberate refusal to make the credential
+    // store's retention window settable per invocation.
+
+    #[test]
+    fn enqueue_api_token_retention_sweep_parses_bare_invocation() {
+        let cli =
+            Cli::try_parse_from(["hort-server", "enqueue-api-token-retention-sweep"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::EnqueueApiTokenRetentionSweep(_))
+        ));
+    }
+
     // `verify-event-chain` subcommand parses.
     // Accepts bare invocation — every arg is optional / has a default.
 
@@ -634,11 +675,11 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
-    // Counter-assertion for the shared ordinal helper the five
+    // Counter-assertion for the shared ordinal helper the six
     // scheduled-maintenance subcommands call: it can still fail. Handed
     // the release sweep — the one `'cron'` kind that is client-waited —
     // it must reject rather than accept, so a layout that flattened the
-    // sweep back into the scheduled band fails at all six call sites
+    // sweep back into the scheduled band fails at all seven call sites
     // instead of at none.
 
     #[test]

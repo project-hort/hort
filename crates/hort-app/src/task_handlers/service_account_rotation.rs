@@ -56,6 +56,7 @@ use serde_json::json;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use hort_domain::entities::api_token::IssuedVia;
 use hort_domain::error::DomainResult;
 use hort_domain::events::{
     system_actor, DomainEvent, SerdeSecretFormat, ServiceAccountTokenRotated, StreamId,
@@ -347,6 +348,15 @@ impl TaskHandler for ServiceAccountRotationHandler {
                     // the federation handler is the only
                     // call site that populates these audit fields.
                     federation_source: None,
+                    // Its own origin, distinct from the admin CLI's
+                    // `issue-svc-token`: this mint is unattended and its
+                    // cap is a snapshot of the grants at the tick, so a
+                    // row that named an operator action would send a
+                    // reader looking for one that never happened. The
+                    // two paths share `issue_for_service_account_system`
+                    // and stamp the same `created_by_user_id`, so the
+                    // column is what tells their rows apart.
+                    issued_via: IssuedVia::ServiceAccountRotation,
                 };
                 let issued = match self
                     .api_tokens
@@ -1563,6 +1573,32 @@ mod tests {
             "per-repo scoping stays on the live User-subject grants; the cap's \
              repo axis stays unset",
         );
+    }
+
+    #[tokio::test]
+    async fn rotated_token_row_names_the_rotation_reconciler_as_its_origin() {
+        // The reconciler and the admin CLI's `issue-svc-token` share
+        // `issue_for_service_account_system` and stamp the same
+        // `created_by_user_id` (the service account's own backing user),
+        // so without this value a row minted unattended on a tick is
+        // indistinguishable from one an operator declared at a terminal
+        // — and an operator reading the first as the second goes looking
+        // for a decision nobody made.
+        use hort_domain::entities::api_token::IssuedVia;
+
+        let writer = Arc::new(MockKubernetesSecretWriter::new());
+        let sa_repo = Arc::new(MockServiceAccountRepository::new());
+        sa_repo.insert(sample_sa("ci-pusher"));
+        let (handler, _, tokens, _events) = make_handler(sa_repo, writer, ns_set(&["ci-system"]));
+
+        handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        let minted = tokens.inserted();
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].issued_via, IssuedVia::ServiceAccountRotation);
     }
 
     #[tokio::test]

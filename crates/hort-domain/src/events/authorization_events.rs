@@ -492,6 +492,28 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // touched, and non-terminal rows (including a row abandoned in
     // `running` by a crashed worker) are never deleted.
     "jobs-row-retention-sweep",
+    // The horizon on `public.api_tokens` — the first sweep in this
+    // family whose DELETE lands outside `public.jobs`. Consumed by
+    // `ApiTokenRetentionSweepHandler` in the worker. Deletes a row whose
+    // own `expires_at` is more than `$horizon` (default 90 days) in the
+    // past, or whose own `revoked_at` is — per `kind`, for every kind the
+    // column admits. Both columns are nullable and a row with **neither**
+    // set is a durable identity that never expires: it matches neither
+    // disjunct and survives, which is the sweep's whole safety property,
+    // because the table it reclaims from is the one that decides who may
+    // do what. `api_tokens` had no horizon at all before this kind —
+    // nothing in the tree deleted one — while a row accrues per issued
+    // credential and the federation branch of `/auth/token-exchange`
+    // writes one per workload exchange. Destructive at the *credential*
+    // level in the sense that the 90-day window is also the decision that
+    // `last_used_at` / `last_used_ip` / `last_used_user_agent` are not
+    // worth keeping past it (they live nowhere else — the event store
+    // keeps `ApiTokenIssued` / `ApiTokenRevoked` / `ApiTokenUsed`, not
+    // those three fields), but it releases no authority and forecloses no
+    // decision: the row it deletes could not authenticate anybody for 90
+    // days before it went, and `PatCache` re-checks both marks on every
+    // cache hit so no cached entry can outlive its row's eligibility.
+    "api-token-retention-sweep",
     // PEP 658 wheel-metadata backfill — consumed by
     // `WheelMetadataBackfillHandler` in the worker. The ingest
     // hook extracts wheel METADATA into CAS + a
@@ -695,6 +717,7 @@ pub const EVENT_TASK_KINDS: &[&str] = &[
     "prefetch-row-retention-sweep",
     "scan-row-retention-sweep",
     "jobs-row-retention-sweep",
+    "api-token-retention-sweep",
     "wheel-metadata-backfill",
     "provenance-verify",
     "scanner-registry-prune",

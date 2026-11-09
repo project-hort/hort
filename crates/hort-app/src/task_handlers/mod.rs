@@ -88,6 +88,15 @@ pub mod scan_row_retention_sweep;
 // the newest terminal row). Without it 19 of the 25 allow-listed kinds
 // accumulated terminal rows forever.
 pub mod jobs_row_retention_sweep;
+// Credential-store retention sweep (`api-token-retention-sweep`) — the
+// first sweep in this family whose DELETE lands outside `public.jobs`.
+// Periodically deletes an `api_tokens` row whose own `expires_at` or
+// `revoked_at` is older than the handler's 90-day `DEFAULT_HORIZON`. A
+// row with both marks NULL is a durable identity and matches neither
+// disjunct: `api_tokens` is the table that decides who may do what, so
+// the predicate selecting only on a row's own non-NULL mark is the whole
+// safety property. The table had no horizon at all before this handler.
+pub mod api_token_retention_sweep;
 // Scanner-worker registry housekeeping (kind
 // `scanner-registry-prune`). Deletes `scanner_registry` rows whose
 // `last_heartbeat` is older than the retention horizon so pod churn does
@@ -118,6 +127,7 @@ pub mod oci_index_child_ingest;
 pub mod wheel_metadata_backfill;
 
 pub use advisory_watch_tick::AdvisoryWatchTickHandler;
+pub use api_token_retention_sweep::ApiTokenRetentionSweepHandler;
 pub use cron_rescan_tick::CronRescanTickHandler;
 pub use eventstore_archive::EventStoreArchiveHandler;
 pub use eventstore_checkpoint::{

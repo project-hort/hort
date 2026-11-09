@@ -624,8 +624,8 @@ fn no_producer_names_a_queue_ordinal() {
     );
     assert_eq!(
         count(Ordinal::TableLocal, "enqueue"),
-        7,
-        "the scan found {} locals bound from the table; the seven `hort-server` CronJob \
+        8,
+        "the scan found {} locals bound from the table; the eight `hort-server` CronJob \
          subcommands are that shape, each because it also logs the ordinal it enqueued at. If \
          one was legitimately added or removed, move this count deliberately — a drifting count \
          means the `let` resolution stopped working and every one of them would then read as a \

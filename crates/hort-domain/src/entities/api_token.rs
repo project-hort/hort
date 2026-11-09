@@ -77,6 +77,100 @@ pub enum TokenKind {
 }
 
 // ---------------------------------------------------------------------------
+// IssuedVia
+// ---------------------------------------------------------------------------
+
+/// Which issuance path minted a token row.
+///
+/// Provenance, and deliberately a different axis from [`TokenKind`]:
+/// `kind` says what a credential *is* and which caps and lifetimes
+/// apply to it, and it is [`TokenKind::ServiceAccount`] both for a
+/// durable machine identity an operator administers and for the
+/// short-lived bearer a federated workload exchange mints. So `kind`
+/// cannot answer "is this row an identity, or the residue of an
+/// exchange?".
+///
+/// That question is what makes the token cap readable at all. The cap
+/// lives in the row rather than in an envelope (ADR 0012), so the query
+/// that establishes an identity's effective authority is
+/// `SELECT name, declared_permissions, repository_ids FROM api_tokens
+/// WHERE revoked_at IS NULL AND issued_via <> 'federation_exchange'`.
+/// Without the last predicate the durable identities arrive mixed into
+/// one short-lived row per workload exchange ever performed, and the
+/// only other marker in the row is a free-text `description`.
+///
+/// [`Unknown`](Self::Unknown) is for rows written before the column
+/// existed: the one origin recoverable from such a row is
+/// [`FederationExchange`](Self::FederationExchange), whose description
+/// text the backfill matches, so every other pre-existing row keeps the
+/// honest answer. It is **not** a value a mint path may choose. Every
+/// path names its own origin, and both this entity and `hort-app`'s
+/// issuance request type carry the field with no default, so a mint
+/// path that fails to name an origin does not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IssuedVia {
+    /// The row predates the provenance column, and its description did
+    /// not identify it as a federated exchange. Written only by the
+    /// migration that added the column.
+    Unknown,
+    /// `hort-server admin issue-svc-token` — an operator at a terminal
+    /// declaring a service-account cap explicitly.
+    AdminCli,
+    /// `POST /users/me/tokens` (self-mint) or
+    /// `POST /admin/users/{user_id}/tokens` (admin-mint).
+    HttpMint,
+    /// The federation branch of `POST /auth/token-exchange`: a foreign
+    /// workload JWT exchanged for a short-lived service-account bearer.
+    /// The value the operator authority query excludes.
+    FederationExchange,
+    /// `hort-server admin bootstrap-session` — the DSN-gated break-glass
+    /// mint for the reserved bootstrap-admin identity (ADR 0038).
+    Bootstrap,
+    /// The service-account rotation reconciler's unattended system mint,
+    /// whose cap is a snapshot of the service account's grants at the
+    /// tick rather than an operator's declaration.
+    ServiceAccountRotation,
+}
+
+impl IssuedVia {
+    /// The stored spelling — the `api_tokens.issued_via` vocabulary, and
+    /// the form the token-list API echoes. One definition serves both so
+    /// an operator filtering the column by hand and one reading the API
+    /// response are looking at the same string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::AdminCli => "admin_cli",
+            Self::HttpMint => "http_mint",
+            Self::FederationExchange => "federation_exchange",
+            Self::Bootstrap => "bootstrap",
+            Self::ServiceAccountRotation => "service_account_rotation",
+        }
+    }
+
+    /// Parse a stored spelling; `None` for anything else.
+    ///
+    /// The column's CHECK admits exactly [`Self::as_str`]'s outputs, so
+    /// an unrecognised literal means the row was written around the
+    /// schema, and the caller must refuse it rather than substitute a
+    /// value. [`Unknown`](Self::Unknown) is the most permissive answer
+    /// this column has — the authority query reads it as "not an
+    /// exchange row" and so lists the row as an identity — which makes
+    /// it exactly the wrong fallback for a decode that failed.
+    pub fn parse_stored(stored: &str) -> Option<Self> {
+        match stored {
+            "unknown" => Some(Self::Unknown),
+            "admin_cli" => Some(Self::AdminCli),
+            "http_mint" => Some(Self::HttpMint),
+            "federation_exchange" => Some(Self::FederationExchange),
+            "bootstrap" => Some(Self::Bootstrap),
+            "service_account_rotation" => Some(Self::ServiceAccountRotation),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TokenCap
 // ---------------------------------------------------------------------------
 
@@ -164,6 +258,12 @@ pub struct TokenCap {
 /// - `created_by_user_id` is the actor who minted the token; for
 ///   self-mint PATs this equals `user_id`, for admin-mint
 ///   service-account tokens it is the issuing admin.
+/// - `issued_via` is the issuance *path* (see [`IssuedVia`]), which
+///   `created_by_user_id` cannot stand in for: the system-mint paths all
+///   stamp the token owner's own id there, so the rotation reconciler,
+///   the federated exchange and the break-glass mint are
+///   indistinguishable by actor. It carries no default — a mint path
+///   that does not name its origin does not compile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiToken {
     pub id: Uuid,
@@ -182,6 +282,7 @@ pub struct ApiToken {
     pub last_used_user_agent: Option<String>,
     pub created_by_user_id: Uuid,
     pub created_at: DateTime<Utc>,
+    pub issued_via: IssuedVia,
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +878,7 @@ mod tests {
             last_used_user_agent: None,
             created_by_user_id: Uuid::from_u128(1),
             created_at: Utc::now(),
+            issued_via: IssuedVia::HttpMint,
         }
     }
 
@@ -1146,5 +1248,141 @@ mod tests {
                 "native-token cap leg changed for {c:?} {perm:?} {repo:?}"
             );
         }
+    }
+
+    // -- IssuedVia -----------------------------------------------------------
+
+    /// Every variant of the stored vocabulary, in one place. The
+    /// wildcard-free match below forces whoever adds a variant to come
+    /// here; the list and the match together are what keep the codec
+    /// tests exhaustive.
+    const EVERY_ISSUED_VIA: [IssuedVia; 6] = [
+        IssuedVia::Unknown,
+        IssuedVia::AdminCli,
+        IssuedVia::HttpMint,
+        IssuedVia::FederationExchange,
+        IssuedVia::Bootstrap,
+        IssuedVia::ServiceAccountRotation,
+    ];
+
+    #[test]
+    fn every_issued_via_variant_is_listed() {
+        for v in EVERY_ISSUED_VIA {
+            match v {
+                IssuedVia::Unknown
+                | IssuedVia::AdminCli
+                | IssuedVia::HttpMint
+                | IssuedVia::FederationExchange
+                | IssuedVia::Bootstrap
+                | IssuedVia::ServiceAccountRotation => {}
+            }
+        }
+        assert_eq!(EVERY_ISSUED_VIA.len(), 6);
+    }
+
+    #[test]
+    fn issued_via_stored_spelling_round_trips_every_variant() {
+        // `as_str` and `parse_stored` are an inverse pair: the column's
+        // CHECK admits exactly the former's outputs, so a spelling the
+        // latter cannot read back is a row the adapter will refuse.
+        for v in EVERY_ISSUED_VIA {
+            assert_eq!(
+                IssuedVia::parse_stored(v.as_str()),
+                Some(v),
+                "round trip failed for {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issued_via_stored_spellings_are_the_column_vocabulary() {
+        // Pinned literally, because these strings are also what the
+        // migration's CHECK lists, what the backfill writes and what the
+        // token-list API echoes — a rename here is a schema change.
+        assert_eq!(IssuedVia::Unknown.as_str(), "unknown");
+        assert_eq!(IssuedVia::AdminCli.as_str(), "admin_cli");
+        assert_eq!(IssuedVia::HttpMint.as_str(), "http_mint");
+        assert_eq!(
+            IssuedVia::FederationExchange.as_str(),
+            "federation_exchange"
+        );
+        assert_eq!(IssuedVia::Bootstrap.as_str(), "bootstrap");
+        assert_eq!(
+            IssuedVia::ServiceAccountRotation.as_str(),
+            "service_account_rotation"
+        );
+    }
+
+    #[test]
+    fn issued_via_spellings_are_distinct() {
+        // Two variants sharing a spelling would make the decode lossy in
+        // the one direction nothing else checks.
+        let mut seen = std::collections::BTreeSet::new();
+        for v in EVERY_ISSUED_VIA {
+            assert!(seen.insert(v.as_str()), "duplicate spelling for {v:?}");
+        }
+        assert_eq!(seen.len(), EVERY_ISSUED_VIA.len());
+    }
+
+    #[test]
+    fn issued_via_parse_stored_refuses_an_unlisted_spelling() {
+        // Not `Unknown`: that is the value the authority query reads as
+        // "an identity, list it", so substituting it for a failed decode
+        // would promote a row written around the schema into an
+        // operator's identity review. The caller gets `None` and refuses.
+        for bogus in [
+            "",
+            "UNKNOWN",
+            "AdminCli",
+            "admin-cli",
+            "federation",
+            "federation_exchange ",
+            "rotation",
+        ] {
+            assert_eq!(
+                IssuedVia::parse_stored(bogus),
+                None,
+                "{bogus:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn issued_via_round_trips_through_serde() {
+        // The event payload carries the enum, and the event store
+        // replays every historical row through `Deserialize`.
+        for v in EVERY_ISSUED_VIA {
+            let json = serde_json::to_string(&v).unwrap();
+            let decoded: IssuedVia = serde_json::from_str(&json).unwrap();
+            assert_eq!(v, decoded);
+        }
+    }
+
+    #[test]
+    fn issued_via_clone_copy_eq_hash() {
+        let a = IssuedVia::AdminCli;
+        let b = a;
+        #[allow(clippy::clone_on_copy)]
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_ne!(a, IssuedVia::ServiceAccountRotation);
+        let set: std::collections::HashSet<IssuedVia> = EVERY_ISSUED_VIA.into_iter().collect();
+        assert_eq!(set.len(), EVERY_ISSUED_VIA.len());
+    }
+
+    #[test]
+    fn token_row_carries_its_issuance_path() {
+        // The entity field is what makes the row answer the question at
+        // all; `created_by_user_id` cannot, because every system-mint
+        // path stamps the token owner's own id there.
+        let token = ApiToken {
+            issued_via: IssuedVia::ServiceAccountRotation,
+            created_by_user_id: Uuid::from_u128(1),
+            user_id: Uuid::from_u128(1),
+            ..sample_token()
+        };
+        assert_eq!(token.issued_via, IssuedVia::ServiceAccountRotation);
+        assert_eq!(token.created_by_user_id, token.user_id);
     }
 }
