@@ -209,6 +209,89 @@ Both of the above endpoints are gated by the same `AdminPrincipal` check as
 rationale behind the admin-only scope, the in-memory apply-status
 semantics, and the secrets-exclusion mechanism.
 
+### Read what each repository holds
+
+`GET /api/v1/admin/inventory` answers "how many artifacts and how many
+bytes does each repository hold?" — the measurement that makes a
+retention cleanup verifiable, because without a before and an after
+there is nothing to check the sweep against.
+
+```sh
+curl -sH "Authorization: Bearer $TOKEN" "$HORT_URL/api/v1/admin/inventory" | jq .
+```
+
+```json
+{
+  "measured_at": "2026-11-09T10:14:22.481Z",
+  "repositories": [
+    {
+      "repository_id": "7c1e...",
+      "repository_key": "oci-main",
+      "artifact_count": 3647,
+      "distinct_content_count": 3608,
+      "live_primary_content_bytes": 142117796
+    }
+  ]
+}
+```
+
+Three numbers per repository, and each name says which one it is:
+
+- **`artifact_count`** — live artifact rows. Soft-deleted artifacts are
+  excluded: they are no longer in the repository's served catalog.
+- **`distinct_content_count`** — how many distinct contents those rows
+  name. hort stores content by hash, so several rows routinely point at
+  one set of bytes; the figures above are from a real instance, where
+  3 647 rows stood on 3 608 contents.
+- **`live_primary_content_bytes`** — `size_bytes` summed over those
+  **distinct** contents, each counted once however many rows name it.
+
+Every repository the installation declares appears, ordered by key,
+**including the ones holding nothing** — those report zeros. That is
+deliberate: "retention emptied this repository" is a result you need to
+be able to read, and an omitted entry would be indistinguishable from a
+repository the readout never saw.
+
+#### `live_primary_content_bytes` is a catalog weight, not disk usage
+
+This is the one number here that can be acted on wrongly, so it is worth
+being exact about what it is not. **Three things:**
+
+- **It is not additive across repositories.** One stored content can be
+  held by several repositories, and each one's figure counts it in full.
+  Adding the figures up double-counts every shared blob — and there is
+  no per-repository physical ownership to report instead, because
+  ownership is not what content-addressed storage has.
+- **It is not a measurement of bytes at rest.** It sums the *primary*
+  content of artifact rows only, so it omits metadata hort stores in CAS
+  and every other kind of content it references.
+- **It is not reclaimable space.** A deleted artifact leaves these
+  numbers immediately while its bytes stay resident until the
+  reference-counted collector removes them, and what a disposal would
+  actually free depends on every other claim on that content — which is
+  what `hort-cli admin retention preview` below answers, and this
+  readout does not.
+
+What it *is*: how much this repository's served catalog weighs. Use it
+to compare a repository against itself over time, which is what a
+before/after needs; do not use it for capacity planning or to predict
+what a cleanup will return.
+
+The readout reports **no quota**, and hort has none to report: the
+`quotaBytes` field on a repository envelope was never enforced and is now
+retired — an apply that declares it fails, telling you to drop the line.
+Putting a stored leftover beside a usage figure here would make this look
+like quota monitoring when no quota exists to monitor.
+
+This is a read-only admin endpoint and needs the `admin` claim like the
+other `admin` subcommands. It is not the held-set overview
+(`GET /api/v1/admin/retention/overview`, see the
+[curator workflow](curator-workflow.md)): that reports the same first
+two numbers under the same two names over the narrow slice the release
+gate is holding pending a signature, and carries no byte figure at all,
+because what a *disposal* would free is refcount-decided and not
+computable from the rows.
+
 ### Preview and execute a retention cleanup
 
 Retention deletes real content, so the CLI puts a readable proposal and a

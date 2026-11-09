@@ -176,6 +176,12 @@ pub mod refcount_reconcile_use_case;
 // module stays `pub(crate)`.
 pub mod referenced_descendant;
 pub mod repository_access;
+// The admin readout of what each repository's live catalog holds —
+// rows, distinct contents, and the weight of those contents. A readout
+// and not a gauge: it emits no metric and answers an interactive
+// operator question, which is what makes a retention before/after
+// verifiable at all.
+pub mod repository_inventory_use_case;
 pub mod repository_use_case;
 // Seed-import cutover path.
 // Bulk-registers an operator-supplied dependency set with backdated

@@ -45,6 +45,7 @@ use hort_app::use_cases::held_set_use_case::HeldSetUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::patch_candidate_use_case::PatchCandidateUseCase;
+use hort_app::use_cases::repository_inventory_use_case::RepositoryInventoryUseCase;
 use hort_app::use_cases::scanner_worker_query_use_case::ScannerWorkerQueryUseCase;
 // `PolicyUseCase` wired into the mock
 // `AppContext` so the HTTP exclusion write endpoints
@@ -109,6 +110,9 @@ use hort_domain::ports::held_set_reader::{
 use hort_domain::ports::metadata_mirror_store::MetadataMirrorStore;
 use hort_domain::ports::patch_candidate_repository::{
     PatchCandidate, PatchCandidateFilter, PatchCandidateRepository,
+};
+use hort_domain::ports::repository_inventory_reader::{
+    RepositoryInventory, RepositoryInventoryReader,
 };
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scanner_registry_repository::{
@@ -400,6 +404,55 @@ impl HeldSetReader for MockHeldSetReader {
             limit: query.limit,
         });
         let result = match &*self.page_result.lock().unwrap() {
+            Ok(v) => Ok(v.clone()),
+            Err(e) => Err(e.clone()),
+        };
+        Box::pin(async move { result })
+    }
+}
+
+/// Recording mock for [`RepositoryInventoryReader`].
+///
+/// `set_inventory` seeds what the one read returns and `calls` is what
+/// the handler tests assert against — a denial must not reach the port.
+/// The default is `Ok(Vec::new())`, so a handler that seeds nothing
+/// observes the empty-installation happy path.
+///
+/// Mirrors [`MockHeldSetReader`]'s shape. It round-trips nothing (there
+/// is no stream behind it), so the validity rule for round-tripping
+/// doubles does not apply.
+pub struct MockRepositoryInventoryReader {
+    result: Mutex<DomainResult<Vec<RepositoryInventory>>>,
+    calls: Mutex<usize>,
+}
+
+impl Default for MockRepositoryInventoryReader {
+    fn default() -> Self {
+        Self {
+            result: Mutex::new(Ok(Vec::new())),
+            calls: Mutex::new(0),
+        }
+    }
+}
+
+impl MockRepositoryInventoryReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_inventory(&self, result: DomainResult<Vec<RepositoryInventory>>) {
+        *self.result.lock().unwrap() = result;
+    }
+
+    pub fn calls(&self) -> usize {
+        *self.calls.lock().unwrap()
+    }
+}
+
+impl RepositoryInventoryReader for MockRepositoryInventoryReader {
+    fn inventory(&self) -> BoxFuture<'_, DomainResult<Vec<RepositoryInventory>>> {
+        *self.calls.lock().unwrap() += 1;
+        let result = match &*self.result.lock().unwrap() {
             Ok(v) => Ok(v.clone()),
             Err(e) => Err(e.clone()),
         };
@@ -1006,6 +1059,11 @@ pub struct MockPorts {
     /// [`MockHeldSetReader::set_page`] then drive
     /// `GET /api/v1/admin/retention/{overview,held}`.
     pub held_set: Arc<MockHeldSetReader>,
+    /// Recording mock for the repository-inventory read port. Same
+    /// `Arc` wired into `RepositoryInventoryUseCase`; tests seed rows
+    /// via [`MockRepositoryInventoryReader::set_inventory`] then drive
+    /// `GET /api/v1/admin/inventory`.
+    pub repository_inventory: Arc<MockRepositoryInventoryReader>,
     /// Recording mock for the curation-decisions
     /// list port. Tests seed events via
     /// [`MockCurationDecisionsRepository::set_result`] then drive
@@ -1707,6 +1765,13 @@ pub fn build_mock_ctx_with_label_flag(
                 dyn hort_domain::ports::policy_projection_repository::PolicyProjectionRepository,
             >,
     ));
+    // The repository-inventory read port. One port, one use case: the
+    // readout resolves no policy and reads no event stream, so there is
+    // nothing else for a handler test to seed.
+    let repository_inventory = Arc::new(MockRepositoryInventoryReader::new());
+    let repository_inventory_use_case = Arc::new(RepositoryInventoryUseCase::new(
+        repository_inventory.clone() as Arc<dyn RepositoryInventoryReader>,
+    ));
     let curation_decisions = Arc::new(MockCurationDecisionsRepository::new());
     let curation_exclusions = Arc::new(MockCurationExclusionsRepository::new());
     let curation_use_case = Arc::new(CurationUseCase::new(
@@ -1835,6 +1900,8 @@ pub fn build_mock_ctx_with_label_flag(
         // See field doc.
         patch_candidate_use_case,
         held_set_use_case,
+        // See field doc.
+        repository_inventory_use_case,
         // See field doc.
         scanner_worker_query_use_case,
         // See field doc.
@@ -2024,6 +2091,7 @@ pub fn build_mock_ctx_with_label_flag(
         webhook_guard,
         curation_queue,
         held_set,
+        repository_inventory,
         curation_decisions,
         curation_exclusions,
         upstream_metadata,
@@ -2128,6 +2196,10 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         // needed when the access policy flips.
         patch_candidate_use_case: base.patch_candidate_use_case.clone(),
         held_set_use_case: base.held_set_use_case.clone(),
+        // Carry forward. The inventory readout is admin-only and spans
+        // every repository, so it does not consume
+        // `RepositoryAccessUseCase` and needs no rebuild.
+        repository_inventory_use_case: base.repository_inventory_use_case.clone(),
         // Carry forward. The worker-list surface is admin-only and does
         // not consume `RepositoryAccessUseCase`, so no rebuild is needed.
         scanner_worker_query_use_case: base.scanner_worker_query_use_case.clone(),

@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GET /api/v1/admin/retention/{overview,held}`. The overview's counts are an
   upper bound (`held_pending_signature_candidates`) and are artifact counts,
   not byte counts (#244).
+- New admin readout of what each repository holds — live artifact rows,
+  distinct contents and the weight of those contents:
+  `GET /api/v1/admin/inventory`. The byte figure is a catalog weight, not disk
+  usage: it is not additive across repositories and not reclaimable space (#280).
 
 ### Changed
 
@@ -41,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   job for an artifact that declares none — only the format's own manifest
   document is walked. Skips are counted on
   `hort_prefetch_cascade_seed_skipped_total{format}` (#421).
+
+### Removed
+
+- `quotaBytes` on an `ArtifactRepository` envelope is retired: no quota was
+  ever enforced, so a gitops apply declaring the field now fails — drop the
+  line to apply. The admin effective-config response no longer reports it
+  (#280).
 
 ## [0.17.3] - 2026-11-08
 

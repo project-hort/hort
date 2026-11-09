@@ -316,7 +316,7 @@ fn collect_reads() -> Vec<Read> {
 /// hole in it. A stance that flips in either direction fails here too,
 /// which is the point: a reader going from filtered to declared is a
 /// review conversation, not an edit made on the way past.
-const CENSUS: [(&str, usize, usize, usize, usize); 17] = [
+const CENSUS: [(&str, usize, usize, usize, usize); 18] = [
     // -- the two proven defects, now filtered -----------------------------
     //
     // One literal, two legs: the `effective_policy_duration` CTE's
@@ -479,13 +479,27 @@ const CENSUS: [(&str, usize, usize, usize, usize); 17] = [
         1,
         0,
     ),
+    // The per-repository catalog readout. One statement, one leg
+    // naming the table — the predicate sits in the CTE that reads it,
+    // which is the only place it can be seen from. A catalog weight
+    // counts what the repository actually serves, and a soft-deleted
+    // artifact is not in that catalog: its bytes may well still be
+    // resident, but that is the refcount-gated purge GC's question.
+    // Filtered rather than declared for that reason.
+    (
+        "crates/hort-adapters-postgres/src/repository_inventory_reader.rs",
+        1,
+        1,
+        1,
+        0,
+    ),
 ];
 
 /// The total number of literals the scan found at introduction. A floor,
 /// not an equality: a new reader is expected and is already covered by the
 /// main assertion, whereas a *shrinking* corpus means the scan stopped
 /// seeing things. [`CENSUS`] is what pins the per-file detail.
-const CENSUS_FLOOR: usize = 49;
+const CENSUS_FLOOR: usize = 50;
 
 // ---------------------------------------------------------------------------
 // The property.

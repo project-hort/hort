@@ -780,6 +780,11 @@ const PRE_WRITE_REJECT_ROWS: &[(LinterRule, &str, RowAbort)] = &[
         "gitops apply: compositeVerdictMode × scanBackends:[] linter rejected ScanPolicy envelope(s) (a waived scan resolves no composed image, so the promoted verdict is never produced)",
         RowAbort::EveryFinding,
     ),
+    (
+        LinterRule::RepositoryQuotaBytesRetired,
+        "gitops apply: quotaBytes linter rejected ArtifactRepository envelope(s) (the field is retired and was never enforced — nothing compared it to a usage figure)",
+        RowAbort::EveryFinding,
+    ),
 ];
 
 impl ApplyConfigUseCase {
@@ -2952,6 +2957,9 @@ mod tests {
             download_audit_enabled: false,
             index_mode: IndexMode::default(),
             prefetch_policy: hort_domain::entities::repository::PrefetchPolicy::default(),
+            // `None` for the same reason as `path` above: row 17 rejects
+            // every declaration, so a shared builder that carried a
+            // value would fail every apply test in the module.
             quota_bytes: None,
             replication_priority: "immediate".into(),
             promotion: None,
@@ -8126,6 +8134,21 @@ mod tests {
                 expect_rule: LinterRule::CompositeVerdictPromotedRequiresScanBackends,
                 effective_backend: None,
             },
+            // Row 17 — a repository declaring the retired `quotaBytes`.
+            // The shared builder sets nothing else that rejects, so row
+            // 17 is the first (and only) error.
+            Case {
+                desired: DesiredState {
+                    repositories: vec![{
+                        let mut r = repo_env("npm-quota", "hosted");
+                        r.spec.quota_bytes = Some(1_073_741_824);
+                        r
+                    }],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::RepositoryQuotaBytesRetired,
+                effective_backend: None,
+            },
         ];
 
         for case in cases {
@@ -8409,7 +8432,8 @@ mod tests {
                 | LinterRule::VirtualMemberFormatNotEnforced
                 | LinterRule::ScanPolicyMaxArtifactAgeNotImplemented
                 | LinterRule::SaRotationTargetConflict
-                | LinterRule::CompositeVerdictPromotedRequiresScanBackends => Consumption::Table,
+                | LinterRule::CompositeVerdictPromotedRequiresScanBackends
+                | LinterRule::RepositoryQuotaBytesRetired => Consumption::Table,
                 // Row 2 — its own abort immediately before row 4, so the
                 // cross-kind FK keeps its distinct log line and its
                 // `"; "`-joined envelope.
@@ -8445,6 +8469,7 @@ mod tests {
             LinterRule::SaRotationTargetConflict,
             LinterRule::CompositeVerdictPromotedRequiresScanBackends,
             LinterRule::RepositoryStoragePathDeprecated,
+            LinterRule::RepositoryQuotaBytesRetired,
         ];
 
         let in_table: HashSet<LinterRule> =
@@ -8488,7 +8513,7 @@ mod tests {
             .count();
         assert_eq!(
             (table, dedicated, advisory),
-            (14, 1, 2),
+            (15, 1, 2),
             "the LinterRule bucket counts changed — a silent reclassification \
              (or a variant missing from ALL_RULES) is exactly what this guard \
              exists to catch"
@@ -9626,6 +9651,91 @@ mod tests {
         );
     }
 
+    /// Row-17 metric — two repositories declaring the retired
+    /// `quotaBytes` tick `repository_quota_bytes_retired` twice (once per
+    /// offending repository, not once per row), and the abort names both.
+    /// The label is asserted verbatim against the catalog key, because a
+    /// label that drifts is a silently-renamed series.
+    #[test]
+    fn apply_row17_metric_ticks_once_per_offending_repository() {
+        use crate::metrics::capture_metrics;
+
+        let mut captured_err: Option<AppError> = None;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let mut r1 = repo_env("npm-quota-a", "hosted");
+                r1.spec.quota_bytes = Some(1_073_741_824);
+                let mut r2 = repo_env("npm-quota-b", "hosted");
+                r2.spec.quota_bytes = Some(1);
+                let desired = DesiredState {
+                    repositories: vec![r1, r2],
+                    ..Default::default()
+                };
+                captured_err = Some(
+                    h.uc.apply(desired, env_oidc())
+                        .await
+                        .expect_err("a declared quotaBytes must reject the apply"),
+                );
+            });
+        });
+        match captured_err.expect("apply must have errored") {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(
+                    msg.contains("npm-quota-a") && msg.contains("npm-quota-b"),
+                    "every offender is named in one pass: {msg}"
+                );
+                assert!(
+                    msg.contains("retired") && msg.contains("Remove the field to apply"),
+                    "the abort carries the retirement and the recourse: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+        let entries = snap.into_vec();
+        assert_eq!(
+            counter_value_for(
+                &entries,
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "repository_quota_bytes_retired"),
+                    ("result", "reject"),
+                ],
+            ),
+            2,
+            "row-17 linter metric must tick once PER offending repository (2)",
+        );
+    }
+
+    /// The write path is never reached: a rejected apply must not have
+    /// created the repository row. Row 17 lands in the pre-write pass, so
+    /// a bundle whose only fault is a declared `quotaBytes` leaves
+    /// nothing behind — which is what makes the reject safe to add to an
+    /// existing tree rather than a half-apply hazard.
+    #[tokio::test]
+    async fn a_rejected_quota_apply_writes_no_repository() {
+        let h = build_harness();
+        let mut repo = repo_env("npm-quota", "hosted");
+        repo.spec.quota_bytes = Some(1_073_741_824);
+        let desired = DesiredState {
+            repositories: vec![repo],
+            ..Default::default()
+        };
+
+        h.uc.apply(desired, env_oidc())
+            .await
+            .expect_err("must reject");
+
+        assert!(
+            h.repos.find_by_key("npm-quota").await.is_err(),
+            "the pre-write pass rejects before the repository stage writes"
+        );
+    }
+
     /// Row-5 multi-offender metric — two trust_pt mappings whose resolved
     /// policy waives scanning ⇒ the counter ticks twice, and the abort
     /// is that rule's error. (Row 5 precedes row 6.)
@@ -10332,7 +10442,6 @@ mod tests {
             index_upstream_url: None,
             is_public: true,
             download_audit_enabled: false,
-            quota_bytes: None,
             replication_priority: ReplicationPriority::OnDemand,
             promotion: None,
             curation_rule_names: Vec::new(),

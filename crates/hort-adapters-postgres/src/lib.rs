@@ -113,6 +113,13 @@ pub mod refcount_reconcile;
 pub mod replay_guard_repo;
 pub mod replay_seen_prune;
 pub mod repo_security_score_repository;
+// The per-repository live-catalog readout — rows, distinct contents and
+// the weight of those contents, in one set-based aggregate. Its own
+// statements rather than a widening of `held_set_reader`'s: that query
+// resolves a policy and a quarantine predicate, this one reads every
+// live row, and one query answering both would mean a change to either
+// question was silently a change to the other.
+pub mod repository_inventory_reader;
 pub mod repository_repo;
 pub mod repository_upstream_mapping_repo;
 pub mod rescan_candidates;

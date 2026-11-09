@@ -44,7 +44,6 @@ const SELECT_COLS: &str = r#"
     prefetch_enabled, prefetch_triggers, prefetch_depth,
     prefetch_transitive_depth, prefetch_max_age_days,
     prefetch_max_descendants,
-    quota_bytes,
     replication_priority::TEXT as replication_priority,
     promotion_target_id, promotion_policy_id,
     created_at, updated_at,
@@ -244,7 +243,6 @@ impl RepositoryRepository for PgRepositoryRepository {
                     prefetch_enabled, prefetch_triggers, prefetch_depth,
                     prefetch_transitive_depth, prefetch_max_age_days,
                     prefetch_max_descendants,
-                    quota_bytes,
                     replication_priority,
                     promotion_target_id, promotion_policy_id,
                     created_at, updated_at
@@ -258,10 +256,9 @@ impl RepositoryRepository for PgRepositoryRepository {
                     $14, $15, $16,
                     $17, $18,
                     $19,
-                    $20,
-                    $21::replication_priority,
-                    $22, $23,
-                    $24, $25
+                    $20::replication_priority,
+                    $21, $22,
+                    $23, $24
                 )
                 ON CONFLICT (id) DO UPDATE SET
                     key = EXCLUDED.key,
@@ -282,7 +279,6 @@ impl RepositoryRepository for PgRepositoryRepository {
                     prefetch_transitive_depth = EXCLUDED.prefetch_transitive_depth,
                     prefetch_max_age_days = EXCLUDED.prefetch_max_age_days,
                     prefetch_max_descendants = EXCLUDED.prefetch_max_descendants,
-                    quota_bytes = EXCLUDED.quota_bytes,
                     replication_priority = EXCLUDED.replication_priority,
                     promotion_target_id = EXCLUDED.promotion_target_id,
                     promotion_policy_id = EXCLUDED.promotion_policy_id,
@@ -308,7 +304,6 @@ impl RepositoryRepository for PgRepositoryRepository {
             .bind(prefetch_transitive_depth_db)
             .bind(prefetch_max_age_db)
             .bind(prefetch_max_descendants_db)
-            .bind(repo.quota_bytes)
             .bind(&replication_str)
             .bind(promotion_target_id)
             .bind(promotion_policy_id)
@@ -563,7 +558,6 @@ impl RepositoryRepository for PgRepositoryRepository {
                     prefetch_enabled, prefetch_triggers, prefetch_depth,
                     prefetch_transitive_depth, prefetch_max_age_days,
                     prefetch_max_descendants,
-                    quota_bytes,
                     replication_priority,
                     promotion_target_id, promotion_policy_id,
                     created_at, updated_at,
@@ -578,11 +572,10 @@ impl RepositoryRepository for PgRepositoryRepository {
                     $14, $15, $16,
                     $17, $18,
                     $19,
-                    $20,
-                    $21::replication_priority,
-                    $22, $23,
-                    $24, $25,
-                    'gitops', $26
+                    $20::replication_priority,
+                    $21, $22,
+                    $23, $24,
+                    'gitops', $25
                 )
                 ON CONFLICT (id) DO UPDATE SET
                     key = EXCLUDED.key,
@@ -603,7 +596,6 @@ impl RepositoryRepository for PgRepositoryRepository {
                     prefetch_transitive_depth = EXCLUDED.prefetch_transitive_depth,
                     prefetch_max_age_days = EXCLUDED.prefetch_max_age_days,
                     prefetch_max_descendants = EXCLUDED.prefetch_max_descendants,
-                    quota_bytes = EXCLUDED.quota_bytes,
                     replication_priority = EXCLUDED.replication_priority,
                     promotion_target_id = EXCLUDED.promotion_target_id,
                     promotion_policy_id = EXCLUDED.promotion_policy_id,
@@ -631,7 +623,6 @@ impl RepositoryRepository for PgRepositoryRepository {
             .bind(prefetch_transitive_depth_db)
             .bind(prefetch_max_age_db)
             .bind(prefetch_max_descendants_db)
-            .bind(repo.quota_bytes)
             .bind(&replication_str)
             .bind(promotion_target_id)
             .bind(promotion_policy_id)
@@ -678,11 +669,11 @@ impl RepositoryRepository for PgRepositoryRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::repository::{
-        IndexMode, PrefetchPolicy, PrefetchTrigger, ReplicationPriority, Repository,
-        RepositoryFormat, RepositoryType,
+        IndexMode, PrefetchPolicy, PrefetchTrigger, PromotionConfig, ReplicationPriority,
+        Repository, RepositoryFormat, RepositoryType,
     };
     use serial_test::serial;
     use std::env;
@@ -725,7 +716,6 @@ mod tests {
             index_upstream_url: None,
             is_public: true,
             download_audit_enabled: false,
-            quota_bytes: None,
             replication_priority: ReplicationPriority::OnDemand,
             promotion: None,
             curation_rule_names: Vec::new(),
@@ -928,6 +918,199 @@ mod tests {
 
         let loaded = adapter.find_by_key(&key).await.expect("find_by_key");
         assert_eq!(loaded.prefetch_policy, repo.prefetch_policy);
+    }
+
+    /// Every field a repository still has survives `save → find_by_key`
+    /// byte-for-byte.
+    ///
+    /// This is the assertion that proves no positional parameter slid.
+    /// Dropping `quota_bytes` renumbered every placeholder after it —
+    /// `$21..$25` became `$20..$24` — and `$N` is **not** type-checked
+    /// against the `INSERT` column list, so an off-by-one would compile,
+    /// pass clippy, and write `replication_priority` into the column
+    /// that used to take the quota. Only a round trip that reads back
+    /// *every* field catches that, and only if each field carries a
+    /// value distinguishable from its neighbours': the fixture below
+    /// therefore sets non-default, mutually-distinct values rather than
+    /// reusing [`sample_repository`]'s defaults.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn save_round_trips_every_remaining_field() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = PgRepositoryRepository::new(pool.clone());
+        let key = format!("it-save-rt-{}", Uuid::new_v4().simple());
+        let repo = with_promotion(distinct_repository(&key), &adapter).await;
+
+        adapter.save(&repo).await.expect("save");
+
+        let loaded = adapter.find_by_key(&key).await.expect("find_by_key");
+        assert_round_trip_fields(&repo, &loaded);
+        // `save` names neither `managed_by` nor `managed_by_digest`, so
+        // the column defaults decide them — pinned here so the
+        // all-fields claim above is honest about which two the statement
+        // does not carry.
+        assert_eq!(loaded.managed_by, ManagedBy::Local);
+        assert_eq!(loaded.managed_by_digest, None);
+    }
+
+    /// The same round trip through the **other** UPSERT, which took the
+    /// same edit: `save_managed`'s placeholders went `$1..$26` →
+    /// `$1..$25`, with `managed_by_digest` landing on `$25`. Asserting
+    /// the digest reads back is what pins the *last* placeholder, which
+    /// is the one an off-by-one strands.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn save_managed_round_trips_every_remaining_field() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = PgRepositoryRepository::new(pool.clone());
+        let key = format!("it-managed-rt-{}", Uuid::new_v4().simple());
+        let repo = with_promotion(distinct_repository(&key), &adapter).await;
+        let digest = [0x5au8; 32];
+
+        adapter
+            .save_managed(&repo, &digest)
+            .await
+            .expect("save_managed");
+
+        let loaded = adapter.find_by_key(&key).await.expect("find_by_key");
+        assert_round_trip_fields(&repo, &loaded);
+        assert_eq!(loaded.managed_by, ManagedBy::GitOps);
+        assert_eq!(
+            loaded.managed_by_digest,
+            Some(digest),
+            "the last positional parameter must still be the digest"
+        );
+    }
+
+    /// Attach a promotion config whose two columns hold **different**
+    /// UUIDs, so the round trip can tell them apart.
+    ///
+    /// This closes the one gap a `promotion: None` fixture leaves. The
+    /// two binds are adjacent and both `Option<Uuid>`, so swapping them
+    /// is the one renumbering mistake Postgres cannot catch on type —
+    /// and with both NULL it cannot catch it on value either. Only
+    /// `promotion_target_id` carries a FK to `repositories(id)`
+    /// (migration 002), so the target is a real row saved first and the
+    /// policy id is a free UUID: a swap then either trips the FK or
+    /// reads back transposed.
+    async fn with_promotion(mut repo: Repository, adapter: &PgRepositoryRepository) -> Repository {
+        let target_key = format!("{}-promo-target", repo.key);
+        let target = distinct_repository(&target_key);
+        adapter.save(&target).await.expect("save promotion target");
+        repo.promotion = Some(PromotionConfig {
+            target_id: target.id,
+            policy_id: Some(Uuid::new_v4()),
+        });
+        repo
+    }
+
+    /// A repository whose every column-backed field holds a non-default
+    /// value distinct from its neighbours', so a bind that shifted by
+    /// one cannot read back as equal. Timestamps are microsecond-
+    /// truncated because Postgres `timestamptz` stores microseconds.
+    fn distinct_repository(key: &str) -> Repository {
+        let created = DateTime::from_timestamp_micros(1_762_000_000_000_000).unwrap();
+        let updated =
+            DateTime::from_timestamp_micros(1_762_000_123_456_789 / 1_000 * 1_000).unwrap();
+        Repository {
+            id: Uuid::new_v4(),
+            key: key.into(),
+            name: format!("{key} display name"),
+            description: Some(format!("{key} description")),
+            format: RepositoryFormat::Cargo,
+            repo_type: RepositoryType::Proxy,
+            storage_backend: "filesystem".into(),
+            storage_path: format!("/srv/{key}"),
+            upstream_url: Some("https://upstream.example.com/a".into()),
+            index_upstream_url: Some("https://index.example.com/b".into()),
+            is_public: true,
+            download_audit_enabled: true,
+            replication_priority: ReplicationPriority::Scheduled,
+            promotion: None,
+            curation_rule_names: Vec::new(),
+            index_mode: IndexMode::IncludePending,
+            prefetch_policy: PrefetchPolicy {
+                enabled: true,
+                triggers: vec![PrefetchTrigger::Scheduled],
+                depth: 11,
+                transitive_depth: 6,
+                max_age_days: Some(77),
+                max_descendants: 321,
+            },
+            created_at: created,
+            updated_at: updated,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+        }
+    }
+
+    /// Every field both UPSERTs carry, compared as **one struct** rather
+    /// than field by field.
+    ///
+    /// `managed_by` / `managed_by_digest` are the two the two statements
+    /// write differently by design (each caller pins its own), so they
+    /// are normalised onto the expectation and everything else must
+    /// match exactly. Comparing the whole value is what makes this
+    /// survive the next schema change: a field added to [`Repository`]
+    /// is covered by this round trip without anyone remembering to
+    /// extend a list of asserts, which is precisely the omission that
+    /// lets a bind slide unnoticed.
+    fn assert_round_trip_fields(wrote: &Repository, read: &Repository) {
+        let mut expected = wrote.clone();
+        expected.managed_by = read.managed_by;
+        expected.managed_by_digest = read.managed_by_digest;
+        assert_eq!(read, &expected, "a column-for-column round trip");
+    }
+
+    /// The `repositories` row a gitops apply writes names no quota
+    /// column, which is the "last code reference is gone" half ADR 0030
+    /// requires before any contraction can be scheduled. Asserted on
+    /// the live `information_schema` rather than on the SQL literal: the
+    /// column is still *there* (this change deliberately ships no DDL),
+    /// so the claim worth pinning is that the write path leaves it NULL
+    /// and never sets it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn the_write_path_never_sets_the_quota_column() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = PgRepositoryRepository::new(pool.clone());
+        let key = format!("it-quota-null-{}", Uuid::new_v4().simple());
+
+        adapter
+            .save_managed(&distinct_repository(&key), &[0x11u8; 32])
+            .await
+            .expect("save_managed");
+
+        let still_there: Option<String> = sqlx::query_scalar(
+            "SELECT column_name::TEXT FROM information_schema.columns \
+             WHERE table_name = 'repositories' AND column_name = 'quota_bytes'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("information_schema read");
+        assert_eq!(
+            still_there.as_deref(),
+            Some("quota_bytes"),
+            "no DDL ships here — the column outlives the code reference by \
+             one release under expand/contract"
+        );
+
+        let quota: Option<i64> =
+            sqlx::query_scalar("SELECT quota_bytes FROM repositories WHERE key = $1")
+                .bind(&key)
+                .fetch_one(&pool)
+                .await
+                .expect("scalar quota_bytes");
+        assert_eq!(
+            quota, None,
+            "the UPSERT must not name the column, so a fresh row is NULL"
+        );
     }
 
     /// The default policy (disabled, empty triggers, default depths)

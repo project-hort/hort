@@ -16,6 +16,25 @@ alpha tag builds container images and a Helm chart, published to the
 **internal** registry only (never the public ghcr). See
 [ADR 0048](adr/0048-release-branch-staging-strategy.md) D1, D2, D4.
 
+### Catalog weight (`live_primary_content_bytes`)
+
+What a repository's **served catalog** weighs: `size_bytes` summed over
+the *distinct* contents its live artifact rows name, each content counted
+once however many rows name it. Reported per repository by
+`GET /api/v1/admin/inventory`, and named at length because it is **not**
+disk usage. It is not additive across repositories (one stored content
+can be held by several of them, so adding the figures double-counts it
+and there is no per-repository physical ownership to report instead), it
+omits CAS-resident metadata and every other kind of referenced content,
+and it is not reclaimable space (a deleted artifact leaves the figure
+while its bytes stay resident until refcount-gated collection). Compare a
+repository against itself over time — that is what a retention
+before/after needs; do not plan capacity with it. The distinctness is on
+the **hash**, never on the size: two different contents can be exactly
+the same length. See [Rows are not bytes](#rows-are-not-bytes),
+[ADR 0054](adr/0054-content-level-age-evidence-anchors-quarantine.md) and
+[using-hort-cli-with-admin-ops.md](architecture/how-to/using-hort-cli-with-admin-ops.md).
+
 ### Closed
 
 The terminal state of an issue. Issues auto-close only on merge to the
