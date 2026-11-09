@@ -27,6 +27,16 @@ use super::BoxFuture;
 /// only the anchor (migration `003_artifacts_cas.sql`).
 pub type PackageVersionStatusRow = (String, QuarantineStatus, Option<DateTime<Utc>>);
 
+/// One **live** `artifacts` row matched by content digest inside one
+/// repository: `(checksum, artifact_id, quarantine_status)`.
+///
+/// Produced by [`ArtifactRepository::find_live_rows_by_repo_and_checksums`].
+/// The checksum travels back with the row because the caller asked about
+/// a *set* of digests and has to re-group the answer by the digest it
+/// asked with — a row cannot be attributed to a question by position when
+/// one question can answer with several rows and another with none.
+pub type ChecksumMatchRow = (ContentHash, Uuid, QuarantineStatus);
+
 /// Per-`(repository, package)` publish-timestamp row: `(version,
 /// created_at, upstream_published_at)`.
 ///
@@ -106,6 +116,56 @@ pub trait ArtifactRepository: Send + Sync {
         repository_id: Uuid,
         sha256: &ContentHash,
     ) -> BoxFuture<'_, DomainResult<Option<Artifact>>>;
+
+    /// Every **live** row in `repository_id` whose `checksum_sha256` is
+    /// one of `checksums`, as [`ChecksumMatchRow`]s.
+    ///
+    /// The plural sibling of [`Self::find_by_repo_and_checksum`], and the
+    /// reason both exist: that method answers `LIMIT 1`, which is right
+    /// for "does this repository hold these bytes at all" and wrong for
+    /// any caller that has to *act* on the row. Identical bytes can be
+    /// ingested at several paths in one repository — an OCI blob also
+    /// pushed as a manifest, a wheel re-uploaded under a second name — so
+    /// a decision addressed by digest has to see every candidate row
+    /// before it picks, or refuse to pick. The curation bulk-decision
+    /// resolver is that caller: more than one row is a refusal naming the
+    /// rows, never a pick.
+    ///
+    /// Returns a row per match, so the result can be shorter than
+    /// `checksums` (a digest nothing matches contributes nothing) or
+    /// longer (a digest several rows carry contributes all of them). A
+    /// caller re-groups by the returned checksum; order is unspecified.
+    ///
+    /// **Not paginated, deliberately.** A bound here would have to be
+    /// able to invert a verdict: a truncation that dropped a digest's
+    /// only row would read as "this repository does not hold these
+    /// bytes", which is a different answer rather than a shorter one. The
+    /// read is bounded instead by its inputs — an equality set of at most
+    /// the caller's per-call entry cap, on the repository-scoped
+    /// `checksum_sha256` index, each row three small columns — and by
+    /// CAS: the rows carrying one exact digest in one repository are one
+    /// per ingest path, not one per version.
+    ///
+    /// Soft-deleted rows are excluded, like every live read on this port
+    /// except the content-age anchor ([`Self::first_seen_for_checksum`]).
+    ///
+    /// **Default impl returns `Err(DomainError::Invariant)`** so the test
+    /// doubles that never address a decision by digest compile unchanged.
+    /// An error rather than an empty vector: "no rows" is a resolution
+    /// answer a caller acts on, and an unimplemented adapter must not be
+    /// able to hand one back.
+    fn find_live_rows_by_repo_and_checksums(
+        &self,
+        repository_id: Uuid,
+        checksums: &[ContentHash],
+    ) -> BoxFuture<'_, DomainResult<Vec<ChecksumMatchRow>>> {
+        let _ = (repository_id, checksums);
+        Box::pin(async {
+            Err(DomainError::Invariant(
+                "find_live_rows_by_repo_and_checksums not implemented".into(),
+            ))
+        })
+    }
     fn list_by_repository(
         &self,
         repository_id: Uuid,
@@ -900,5 +960,43 @@ mod tests {
         )
         .expect("default impl returns Ok");
         assert_eq!(canonical, None);
+    }
+
+    /// The digest-set read is the one defaulted method whose default is
+    /// an **error**, and that asymmetry is the contract: its callers act
+    /// on "no rows" — a curation decision addressed by a digest nothing
+    /// matches is refused on that basis — so an adapter that has not
+    /// implemented it must not be able to answer "nothing matched".
+    #[test]
+    fn find_live_rows_by_repo_and_checksums_defaults_to_refusing_to_answer() {
+        let hash: ContentHash = "b".repeat(64).parse().expect("valid sha256 hex");
+        let repo = stub();
+        let err = futures::executor::block_on(
+            repo.find_live_rows_by_repo_and_checksums(Uuid::nil(), &[hash]),
+        )
+        .expect_err("an unimplemented digest-set read must not answer 'no rows'");
+        assert!(
+            matches!(&err, DomainError::Invariant(m)
+                if m.contains("find_live_rows_by_repo_and_checksums")),
+            "the default must name itself so the gap is diagnosable, got: {err:?}"
+        );
+    }
+
+    /// The empty-input edge of the same default: an empty digest set is
+    /// still a question the stub cannot answer, so it refuses rather
+    /// than short-circuiting to an empty vector. A default that
+    /// special-cased the empty set would be a default that sometimes
+    /// answers, which is the shape this method deliberately does not
+    /// have.
+    #[test]
+    fn find_live_rows_by_repo_and_checksums_default_refuses_an_empty_set_too() {
+        let repo = stub();
+        assert!(
+            futures::executor::block_on(
+                repo.find_live_rows_by_repo_and_checksums(Uuid::nil(), &[])
+            )
+            .is_err(),
+            "the default refuses regardless of input"
+        );
     }
 }

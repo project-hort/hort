@@ -198,7 +198,7 @@ const EXPECTED_SITES: &[(&str, usize)] = &[
         1,
     ),
     ("crates/hort-app/src/use_cases/cas_scrub_use_case.rs", 2),
-    ("crates/hort-app/src/use_cases/curation_use_case.rs", 3),
+    ("crates/hort-app/src/use_cases/curation_use_case.rs", 4),
     ("crates/hort-app/src/use_cases/ingest_use_case.rs", 4),
     ("crates/hort-app/src/use_cases/policy_use_case.rs", 2),
     ("crates/hort-app/src/use_cases/promotion_use_case.rs", 7),
@@ -230,7 +230,7 @@ const EXPECTED_REFUSAL_CALLS: &[(&str, usize)] = &[
         1,
     ),
     ("crates/hort-app/src/use_cases/cas_scrub_use_case.rs", 1),
-    ("crates/hort-app/src/use_cases/curation_use_case.rs", 3),
+    ("crates/hort-app/src/use_cases/curation_use_case.rs", 4),
     ("crates/hort-app/src/use_cases/policy_use_case.rs", 2),
     ("crates/hort-app/src/use_cases/promotion_use_case.rs", 4),
     (

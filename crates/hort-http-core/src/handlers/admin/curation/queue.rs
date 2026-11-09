@@ -131,6 +131,20 @@ pub struct CurationQueueEntryDto {
     pub package_name: String,
     pub version: Option<String>,
     pub path: String,
+    /// The bytes the row is about: bare 64 lowercase hex, **whole**. This
+    /// is the key a curation decision is addressed by, so it is never
+    /// shortened on the wire — the CLI table abbreviates it for alignment,
+    /// and that abbreviation stops at the table.
+    pub checksum_sha256: String,
+    /// Mutable refs pointing at [`Self::checksum_sha256`], for a human to
+    /// read. Always serialised, including as `[]`: an empty array is the
+    /// complete answer ("nothing points at these bytes"), which a missing
+    /// field would not distinguish from an older server that never
+    /// answered.
+    ///
+    /// Display only — a tag is a mutable pointer and no curation verb
+    /// takes one as a target.
+    pub tags: Vec<String>,
     pub quarantine_status: String,
     pub quarantine_window_start: Option<DateTime<Utc>>,
     pub quarantine_deadline: Option<DateTime<Utc>>,
@@ -151,6 +165,8 @@ impl CurationQueueEntryDto {
             package_name: e.package_name,
             version: e.version,
             path: e.path,
+            checksum_sha256: e.checksum_sha256,
+            tags: e.tags,
             quarantine_status: e.quarantine_status.to_string(),
             quarantine_window_start: e.quarantine_window_start,
             quarantine_deadline: e.quarantine_deadline,
@@ -364,6 +380,10 @@ mod tests {
         req
     }
 
+    /// A full 64-hex digest, so the wire assertions below are measuring
+    /// the whole value rather than a stand-in that happens to be short.
+    const SAMPLE_DIGEST: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
     fn sample_queue_entry() -> CurationQueueEntry {
         CurationQueueEntry {
             artifact_id: Uuid::new_v4(),
@@ -373,6 +393,8 @@ mod tests {
             package_name: "evil-pkg".into(),
             version: Some("1.0.0".into()),
             path: "evil-pkg/-/evil-pkg-1.0.0.tgz".into(),
+            checksum_sha256: SAMPLE_DIGEST.to_string(),
+            tags: Vec::new(),
             quarantine_status: QuarantineStatus::Quarantined,
             quarantine_window_start: Some(Utc::now()),
             quarantine_deadline: Some(Utc::now()),
@@ -400,6 +422,72 @@ mod tests {
         assert_eq!(clean_json["finding_count"], 0);
         assert!(clean_json.get("max_severity").is_none());
         assert_eq!(unscanned_json["path"], clean_json["path"]);
+    }
+
+    /// **The JSON carries the digest whole.** It is the key item-2-shaped
+    /// addressing resolves against, so a shortened one is not a cosmetic
+    /// loss — it is a value that looks usable and resolves to nothing,
+    /// with the truncation invisible to whoever tried.
+    #[test]
+    fn queue_wire_carries_the_whole_digest() {
+        let json = serde_json::to_value(CurationQueueEntryDto::from_domain(sample_queue_entry()))
+            .expect("DTO serializes");
+        assert_eq!(json["checksum_sha256"], SAMPLE_DIGEST);
+        assert_eq!(
+            json["checksum_sha256"].as_str().map(str::len),
+            Some(64),
+            "the wire digest is the full 64 hex, not an abbreviation"
+        );
+    }
+
+    /// Tags round-trip, and the no-tags answer is an empty array rather
+    /// than an absent field — "nothing points at these bytes" is an
+    /// answer, and a missing key would not say it.
+    #[test]
+    fn queue_wire_renders_tags_and_an_empty_list_when_nothing_points_at_the_bytes() {
+        let mut tagged = sample_queue_entry();
+        tagged.tags = vec!["latest".into(), "v1.0.0".into()];
+        let tagged_json =
+            serde_json::to_value(CurationQueueEntryDto::from_domain(tagged)).expect("serializes");
+        assert_eq!(tagged_json["tags"][0], "latest");
+        assert_eq!(tagged_json["tags"][1], "v1.0.0");
+
+        let untagged_json =
+            serde_json::to_value(CurationQueueEntryDto::from_domain(sample_queue_entry()))
+                .expect("serializes");
+        assert_eq!(
+            untagged_json["tags"],
+            serde_json::json!([]),
+            "an artifact nothing points at carries an empty array, not a \
+             missing field"
+        );
+    }
+
+    /// **A tag never addresses anything on this surface.** The queue takes
+    /// `repository`, `status`, `reason` and `limit`, and a ref — which can
+    /// be moved to other bytes right after a curator reviewed these — is
+    /// deliberately not among them: an unrecognised parameter is dropped
+    /// by the extractor and cannot narrow the listing.
+    #[tokio::test]
+    async fn queue_ignores_a_tag_shaped_query_parameter() {
+        let (router, mocks) = harness();
+        let resp = router
+            .oneshot(queue_get(
+                "tags=latest&tag=latest",
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let recorded = mocks.curation_queue.recorded_filters();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0],
+            CurationQueueFilter::default(),
+            "a tag-shaped parameter must leave the filter exactly as the \
+             default — no tag reaches the port, because the port has no tag \
+             to reach"
+        );
     }
 
     /// Happy path — curator + seeded entry → 200 with rendered DTO.

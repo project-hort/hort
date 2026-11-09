@@ -54,9 +54,17 @@ async fn queue_happy_path_table_includes_rejection_reason_kind() {
         clear_env();
     }
 
-    // Two rows: one Quarantined (no reason kind), one Rejected with
-    // `rejection_reason_kind = "curator"`. Asserts both the header and
-    // the per-row projection of the discriminator.
+    // Two rows: one Quarantined (no reason kind) carrying two tags, one
+    // Rejected with `rejection_reason_kind = "curator"` and nothing
+    // pointing at its bytes. Asserts both the header and the per-row
+    // projection of the discriminator, the digest and the tags.
+    //
+    // `checksum_sha256` and `tags` are present on both rows because the
+    // server always sends them — the digest column is `NOT NULL` and the
+    // tag list is an empty array when nothing points at the bytes. The
+    // CLI DTO takes both as required fields rather than defaulting them,
+    // so a server that stopped sending one is a decode error here instead
+    // of a row that silently renders an empty digest.
     let body = r#"{
         "entries": [
             {
@@ -67,6 +75,8 @@ async fn queue_happy_path_table_includes_rejection_reason_kind() {
                 "package_name": "evil-pkg",
                 "version": "1.0.0",
                 "path": "evil-pkg/-/evil-pkg-1.0.0.tgz",
+                "checksum_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+                "tags": ["latest", "v1.0.0"],
                 "quarantine_status": "quarantined",
                 "quarantine_window_start": "2026-05-01T00:00:00Z",
                 "quarantine_deadline": "2026-05-08T00:00:00Z",
@@ -82,6 +92,8 @@ async fn queue_happy_path_table_includes_rejection_reason_kind() {
                 "package_name": "shadow-IT",
                 "version": "2.0.0",
                 "path": "shadow-IT/-/shadow-IT-2.0.0.tgz",
+                "checksum_sha256": "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752",
+                "tags": [],
                 "quarantine_status": "rejected",
                 "quarantine_window_start": null,
                 "quarantine_deadline": null,
@@ -136,6 +148,21 @@ async fn queue_happy_path_table_includes_rejection_reason_kind() {
         out.contains("2026-05-08T00:00:00Z"),
         "ISO-8601 deadline: {out}"
     );
+    // The digest column names the bytes, abbreviated for the table and
+    // only for the table — the whole value is what `--output json`
+    // carries, because that is the key a curation decision is addressed
+    // by. Asserted on both halves: the abbreviation is present and the
+    // full digest is not.
+    assert!(out.contains("DIGEST"), "DIGEST column required: {out}");
+    assert!(out.contains("9f86d081884c"), "abbreviated digest: {out}");
+    assert!(
+        !out.contains("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"),
+        "the table renders the abbreviation, not the whole digest: {out}"
+    );
+    // Tags are an annotation for the reader: rendered when refs point at
+    // the bytes, `-` when none.
+    assert!(out.contains("TAGS"), "TAGS column required: {out}");
+    assert!(out.contains("latest,v1.0.0"), "tags rendered: {out}");
     // Empty-result message MUST NOT appear when rows are present.
     assert!(!out.contains("No curation queue entries"));
 }

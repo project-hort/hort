@@ -3717,7 +3717,10 @@ pub fn emit_patch_candidates_listed(repository: &str, result: PatchCandidateList
 /// `docs/metrics-catalog.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CurationDecisionLabel {
-    /// `CurationUseCase::waive` — curator-driven release.
+    /// `CurationUseCase::waive` and `CurationUseCase::waive_bulk` —
+    /// curator-driven release (any target shape; the bulk routes'
+    /// per-append ticks and their pre-validation refusal share this
+    /// label, so a new addressing mode adds no `decision` value).
     Waive,
     /// `CurationUseCase::block` — curator-driven rejection (any target
     /// shape; per-append ticks share this label).

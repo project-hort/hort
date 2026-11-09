@@ -392,11 +392,14 @@ const CENSUS: [(&str, usize, usize, usize, usize); 16] = [
     // The 24th filtered statement is `package_file_digests`: a proxy index
     // serve asks it which files hort holds so it can advertise its own
     // digest for them, and a soft-deleted row is not a file hort serves.
+    // The 25th is `find_live_rows_by_repo_and_checksums`, the digest-set
+    // resolver behind the content-addressed curation decisions: a
+    // soft-deleted row is not a row a curator can release or block.
     (
         "crates/hort-adapters-postgres/src/artifact_repo.rs",
-        27,
-        27,
-        24,
+        28,
+        28,
+        25,
         3,
     ),
     // `protected_claimants` is a live read (both legs); the purge worklist,

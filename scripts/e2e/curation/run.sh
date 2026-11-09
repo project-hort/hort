@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Orchestrator for the curator-surface E2E.
 #
-# Runs the nine scenarios in sequence against the v2 stack
+# Runs the ten scenarios in sequence against the v2 stack
 # (deploy/compose/docker-compose.yml). Each scenario script is self-contained
 # (sources _lib.sh, sets up its own fixtures, runs its assertions, prints
 # its summary) and exits with one of:
@@ -9,7 +9,7 @@
 #   1 — at least one assertion failed
 #   2 — environment unmet (treat as SKIP)
 #
-# The orchestrator aggregates the nine exit codes into a single overall result.
+# The orchestrator aggregates the ten exit codes into a single overall result.
 # It brings the compose stack up if one isn't already running (and tears down
 # only a stack it started — an operator-provided stack is left alone; --keep
 # leaves a started stack up), and seeds the artifact fixtures the data-driven
@@ -70,7 +70,7 @@ log "  Curator E2E orchestrator"
 log "=============================================="
 log "compose : $COMPOSE_FILE"
 log "api     : $API_URL"
-log "metrics : $METRICS_URL"
+log "ready   : $READY_URL"
 log "hort-cli  : $HORT_CLI_BIN"
 log ""
 
@@ -107,6 +107,7 @@ SCENARIOS=(
     "07_queue_listing.sh"
     "08_privilege_denial.sh"
     "09_curator_waive_then_admin_block.sh"
+    "10_bulk_waive_abort_then_apply.sh"
 )
 
 # -----------------------------------------------------------------------------
@@ -123,10 +124,15 @@ declare -a SKIPPED_SCENARIOS=()
 # Run
 # -----------------------------------------------------------------------------
 
+declare -i SELECTED_COUNT=0
+declare -a RAN_SCENARIOS=()
+
 for scenario in "${SCENARIOS[@]}"; do
     if [ -n "$ONLY" ] && [[ "$scenario" != *"$ONLY"* ]]; then
         continue
     fi
+    SELECTED_COUNT=$((SELECTED_COUNT + 1))
+    RAN_SCENARIOS+=("$scenario")
     scenario_path="$SCRIPT_DIR/$scenario"
     if [ ! -f "$scenario_path" ]; then
         log "WARN: scenario script missing: $scenario_path"
@@ -168,9 +174,41 @@ log ""
 log "=============================================="
 log "  Curator E2E summary"
 log "=============================================="
-log "  scenarios passed : $PASS_COUNT"
-log "  scenarios failed : $FAIL_COUNT"
-log "  scenarios skipped: $SKIP_COUNT"
+log "  scenarios selected: $SELECTED_COUNT of ${#SCENARIOS[@]}"
+log "  scenarios passed  : $PASS_COUNT"
+log "  scenarios failed  : $FAIL_COUNT"
+log "  scenarios skipped : $SKIP_COUNT"
+
+# The tally must account for every selected scenario, and a run that
+# selected none is not a pass.
+#
+# Both halves are failures that used to read as success. `RESULT: PASS`
+# is `FAIL_COUNT == 0`, so a scenario that never ran left the verdict
+# green while contributing nothing: `--only` with a name matching no
+# scenario selected zero and reported PASS, and any future path that
+# leaves the loop body without hitting the case statement would under-count
+# by one and still pass. A suite reporting a verdict over fewer scenarios
+# than it listed is a suite whose verdict does not mean what it says.
+declare -i ACCOUNTED=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
+if [ "$SELECTED_COUNT" -eq 0 ]; then
+    log ""
+    log "  no scenario matched --only '$ONLY' — the roster is:"
+    for s in "${SCENARIOS[@]}"; do
+        log "    - $s"
+    done
+    log "RESULT: FAIL (selected no scenarios)"
+    exit 1
+fi
+if [ "$ACCOUNTED" -ne "$SELECTED_COUNT" ]; then
+    log ""
+    log "  ACCOUNTING ERROR: $ACCOUNTED of $SELECTED_COUNT selected scenarios"
+    log "  reached the tally. The scenarios the loop entered were:"
+    for s in "${RAN_SCENARIOS[@]}"; do
+        log "    - $s"
+    done
+    log "RESULT: FAIL (tally does not match the roster)"
+    exit 1
+fi
 
 if [ "${#SKIPPED_SCENARIOS[@]}" -gt 0 ]; then
     log "  skipped:"

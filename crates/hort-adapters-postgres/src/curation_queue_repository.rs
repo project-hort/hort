@@ -108,6 +108,45 @@
 //! projection uses that anchor to leave the finding summary absent;
 //! a completed clean scan still reports zero findings.
 //!
+//! ## `tags` aggregates INSIDE its LATERAL
+//!
+//! The tag annotation reads `mutable_refs` for every ref pointing at the
+//! driving row's bytes — `(repository_id, target_hash) =
+//! (a.repository_id, a.checksum_sha256)`, which is exactly the shape of
+//! the partial index `idx_mutable_refs_target_hash` (the equality is
+//! strict in `target_hash`, so it implies the index's
+//! `WHERE target_hash IS NOT NULL` predicate).
+//!
+//! **The aggregate is inside the subquery, and that is the load-bearing
+//! part.** A plain `LEFT JOIN mutable_refs` returns one row *per ref*, so
+//! an artifact with three tags would appear three times and `LIMIT $4`
+//! would stop counting artifacts — a queue page would silently hold fewer
+//! pieces of curator work than it claims, and the one row the curator acts
+//! on would be indistinguishable from its duplicates. An aggregate with no
+//! `GROUP BY` returns exactly one row over any input including none, so
+//! `LEFT JOIN LATERAL (…) ON true` is one row in, one row out, tags or no
+//! tags. `COALESCE(…, ARRAY[]::text[])` keeps the column non-NULL for the
+//! no-tags case so the `Vec<String>` decode never meets a SQL NULL
+//! (same shape as `repository_repo`'s `curation_rule_names`).
+//!
+//! `DISTINCT` because the uniqueness in the schema is
+//! `(repository_id, namespace, ref_name)`: one repository can carry the
+//! same ref name under two namespaces, both pointing at these bytes, and
+//! this column is a display annotation that cannot show the namespace
+//! it came from — a doubled name would read as a defect while telling the
+//! curator nothing they could act on. `ORDER BY` so the rendered order is
+//! the same on every read.
+//!
+//! The join does **not** reach `artifacts` a second time: the digest it
+//! matches on is projected from the driving row, which the outer
+//! `WHERE` has already restricted to live rows. A soft-deleted artifact
+//! therefore stays out of the listing however many refs point at it.
+//!
+//! **Tags are never an addressing key here.** `CurationQueueFilter`
+//! carries no tag field and the query has no tag predicate — a ref is a
+//! mutable pointer, so a decision binds to the digest and the tag is for
+//! a human to read.
+//!
 //! See `docs/architecture/how-to/curator-workflow.md` for operator guidance.
 
 use chrono::{DateTime, Utc};
@@ -167,6 +206,9 @@ impl PgCurationQueueRepository {
 ///   `sf.detected_at = a.last_scan_at` (see the module docs).
 /// - `LEFT JOIN` for findings + LATERAL so a row with no findings and no
 ///   rejection event still surfaces (e.g. `scan_indeterminate` rows).
+/// - `t.tags` is the `mutable_refs` annotation, aggregated **inside** its
+///   own LATERAL so the join yields exactly one row per artifact — tags
+///   or no tags (see the module docs).
 /// - `$1` = optional repository_id, `$2` = optional status text,
 ///   `$3` = optional rejection_reason_kind, `$4` = limit i64,
 ///   `$5` = optional artifact_id.
@@ -205,6 +247,11 @@ const QUEUE_SQL: &str = r#"
                     a.name                      AS package_name,
                     a.version                   AS version,
                     a.path                      AS path,
+                    -- The bytes the curator is deciding about, whole:
+                    -- `character(64) NOT NULL`, projected unshortened
+                    -- because this is the key a decision is addressed by.
+                    a.checksum_sha256           AS checksum_sha256,
+                    t.tags                      AS tags,
                     a.last_scan_at              AS last_scan_at,
                     a.quarantine_status         AS quarantine_status,
                     a.quarantine_window_start   AS quarantine_window_start,
@@ -296,6 +343,40 @@ const QUEUE_SQL: &str = r#"
                     ORDER BY ev.stream_position DESC
                     LIMIT 1
                 ) e ON true
+                LEFT JOIN LATERAL (
+                    -- Display-only tag annotation: every mutable ref that
+                    -- points at THESE bytes in THIS repository. The
+                    -- aggregate lives inside the subquery, which is what
+                    -- makes the join one-row-in-one-row-out: an aggregate
+                    -- with no GROUP BY returns a single row over any
+                    -- input, empty included, so an artifact with three
+                    -- tags still occupies one slot of `LIMIT $4` and an
+                    -- artifact with none still appears. A plain
+                    -- `LEFT JOIN mutable_refs` would return one row per
+                    -- ref and the limit would stop counting artifacts.
+                    --
+                    -- `(repository_id, target_hash)` is the partial index
+                    -- `idx_mutable_refs_target_hash`; the equality is
+                    -- strict in `target_hash` and so implies that index's
+                    -- `target_hash IS NOT NULL` predicate. No second read
+                    -- of `artifacts`: the digest comes from the driving
+                    -- row, which the outer WHERE has already restricted
+                    -- to live rows.
+                    --
+                    -- DISTINCT because `(repository_id, namespace,
+                    -- ref_name)` is the unique key — one repository can
+                    -- carry the same ref name under two namespaces, and a
+                    -- column that cannot show the namespace would render
+                    -- the name twice for no reader's benefit. ORDER BY so
+                    -- the rendering is stable across reads.
+                    SELECT COALESCE(
+                               ARRAY_AGG(DISTINCT mr.ref_name ORDER BY mr.ref_name),
+                               ARRAY[]::text[]
+                           ) AS tags
+                    FROM mutable_refs mr
+                    WHERE mr.repository_id = a.repository_id
+                      AND mr.target_hash = a.checksum_sha256
+                ) t ON true
                 WHERE a.quarantine_status IN ('quarantined','rejected','scan_indeterminate')
                   AND a.deleted_at IS NULL
                   AND ($1::uuid IS NULL OR a.repository_id = $1)
@@ -349,6 +430,14 @@ struct CurationQueueRow {
     package_name: String,
     version: Option<String>,
     path: String,
+    /// `artifacts.checksum_sha256` — `character(64) NOT NULL`, so no
+    /// `Option`: a row without a digest is a row the schema refuses.
+    checksum_sha256: String,
+    /// `COALESCE(ARRAY_AGG(…), ARRAY[]::text[])` from the tags LATERAL,
+    /// and `mutable_refs.ref_name` is itself `NOT NULL` — so neither the
+    /// column nor an element is ever SQL NULL and the decode needs no
+    /// `Option` either. The empty vector is the no-tags answer.
+    tags: Vec<String>,
     last_scan_at: Option<DateTime<Utc>>,
     quarantine_status: Option<String>,
     quarantine_window_start: Option<DateTime<Utc>>,
@@ -420,6 +509,8 @@ impl CurationQueueRow {
             package_name: self.package_name,
             version: self.version,
             path: self.path,
+            checksum_sha256: self.checksum_sha256,
+            tags: self.tags,
             quarantine_status,
             quarantine_window_start: self.quarantine_window_start,
             quarantine_deadline: self.quarantine_deadline,
@@ -608,6 +699,109 @@ mod tests {
             normalise_rejection_reason_kind("FutureVariant"),
             "futurevariant"
         );
+    }
+
+    // -- the tags LATERAL's shape -------------------------------------------
+
+    /// **The aggregate is inside the LATERAL.** The DB-backed
+    /// `list_queue_lateral_does_not_widen_the_row_set` proves the
+    /// behaviour; this pins the shape that produces it, because moving
+    /// the aggregate out to the outer query — or turning the subquery
+    /// into a plain `LEFT JOIN mutable_refs` — still compiles, still
+    /// returns the right tag *names*, and only breaks the row count.
+    #[test]
+    fn tags_are_aggregated_inside_their_lateral() {
+        let (before, after) = QUEUE_SQL
+            .split_once("FROM mutable_refs")
+            .expect("the tags annotation reads `mutable_refs`");
+        let lateral_open = before
+            .rfind("LEFT JOIN LATERAL (")
+            .expect("the `mutable_refs` scan sits inside a LEFT JOIN LATERAL");
+        assert!(
+            before[lateral_open..].contains("ARRAY_AGG(DISTINCT mr.ref_name ORDER BY mr.ref_name)"),
+            "the aggregate must be INSIDE the lateral: a plain join over \
+             `mutable_refs` returns one row per ref, so an artifact with \
+             three tags would take three of `LIMIT $4`'s slots and appear \
+             three times in the curator's worklist"
+        );
+        assert!(
+            after.contains(") t ON true"),
+            "the lateral joins `ON true`, which is what keeps the row of an \
+             artifact that nothing points at"
+        );
+        // And no GROUP BY in the outer query, which is where one would
+        // have to sit: the aggregation is the lateral's alone, and an
+        // outer one would be the same widening repaired after the fact.
+        // Asked of the text AFTER the lateral closes, not of the whole
+        // query — the comment inside the lateral explains why there is no
+        // outer GROUP BY, and a scan that could not tell a clause from a
+        // sentence about one would read that explanation as the thing it
+        // forbids.
+        let outer_tail = after
+            .rsplit_once(") t ON true")
+            .expect("the lateral closes before the outer query's tail")
+            .1;
+        assert!(
+            !outer_tail.contains("GROUP BY"),
+            "the outer query must have no GROUP BY — found one in {outer_tail}"
+        );
+    }
+
+    /// The no-tags case comes out of SQL as an empty array, not NULL —
+    /// which is what lets the row decode into a plain `Vec<String>`
+    /// instead of an `Option` nothing could reach.
+    #[test]
+    fn the_tags_column_is_never_null() {
+        assert!(
+            QUEUE_SQL.contains("ARRAY[]::text[]"),
+            "the tags aggregate needs its COALESCE fallback: ARRAY_AGG over \
+             zero rows is NULL, and a NULL column would fail the \
+             `Vec<String>` decode for every artifact nothing points at"
+        );
+    }
+
+    /// The tag is an annotation, never a selector.
+    ///
+    /// A ref is a mutable pointer: it can be moved to other bytes
+    /// immediately after a curator reviewed these, so a listing that could
+    /// be *narrowed* by tag would be offering an addressing mode whose
+    /// answer changes under it. The digest is the addressing key, and the
+    /// five bound parameters are the whole filterable surface.
+    #[test]
+    fn the_queue_cannot_be_filtered_by_tag() {
+        let predicate_surface = QUEUE_SQL
+            .rsplit_once(") t ON true")
+            .expect("the tags lateral closes before the WHERE clause")
+            .1;
+        for tag_column in ["ref_name", "tags", "mutable_refs"] {
+            assert!(
+                !predicate_surface.contains(tag_column),
+                "`{tag_column}` appears in the WHERE/ORDER/LIMIT surface — a \
+                 tag is a mutable pointer and must not select which rows a \
+                 curator sees"
+            );
+        }
+    }
+
+    /// The digest reaches the caller whole.
+    ///
+    /// The CLI table shortens it to 12 hex for alignment; a digest
+    /// shortened in SQL would be shortened for the HTTP JSON too, where it
+    /// is the key a curation decision is addressed by — and the truncation
+    /// would be invisible to whoever tried to use it.
+    #[test]
+    fn the_digest_is_projected_whole() {
+        assert!(
+            QUEUE_SQL.contains("AS checksum_sha256"),
+            "the projection must carry the digest column"
+        );
+        for shortener in ["left(", "LEFT(", "substr", "SUBSTR", "starts_with"] {
+            assert!(
+                !QUEUE_SQL.contains(shortener),
+                "`{shortener}` in the query would shorten a projected value; \
+                 the digest is an addressing key and is projected whole"
+            );
+        }
     }
 
     // -- severity_from_rank --------------------------------------------------

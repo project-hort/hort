@@ -467,7 +467,7 @@ sensitive).
 
 ```bash
 hort-cli auth login --paste  # paste the maintainer-curator hort_svc_* token
-hort-cli curation waive <artifact_id> \
+hort-cli curation waive artifact <artifact_id> \
   --justification "CVE-YYYY-NNNN: security fix, fix PR #NNN merged, window waiver authorized by maintainer"
 ```
 

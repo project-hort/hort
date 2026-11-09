@@ -4,9 +4,11 @@ This guide is for operators acting in the **curator** role: making
 day-to-day decisions on artifacts that quarantine-by-default has held,
 or that the scanner has rejected, without escalating to a full admin
 session. It covers how the curator grant is made, the three decision
-flows (waive / block / exclude-finding), the audit trail produced, and
-the operational caveats — especially the **finding-exclusion blast
-radius** and the **`block-versions` continue-on-error contract**.
+flows (waive / block / exclude-finding), how each of the two decision
+verbs names its target, the audit trail produced, and the operational
+caveats — especially the **finding-exclusion blast radius** and the two
+bulk contracts, which are deliberately **not** symmetric: a bulk block
+is continue-on-error (§8), a bulk waive is all-or-nothing (§9).
 
 The quarantine state model, the quarantine-by-default posture, and the
 fail-closed release predicate are documented in
@@ -26,11 +28,20 @@ surface:
 
 | Authority                            | `Permission::Curate` | `Permission::Admin` |
 | ------------------------------------ | -------------------- | ------------------- |
-| Waive a held artifact (release it)   | yes                  | yes                 |
-| Block any non-terminal artifact      | yes                  | yes                 |
-| Bulk-block via explicit version list | yes                  | yes                 |
-| Exclude / unexclude a CVE finding    | yes                  | yes                 |
-| All other admin endpoints            | no                   | yes                 |
+| Waive a held artifact (release it)    | yes                 | yes                 |
+| Bulk-waive via explicit version list  | yes                 | yes                 |
+| Bulk-waive via explicit digest list   | yes                 | yes                 |
+| Block any non-terminal artifact       | yes                 | yes                 |
+| Bulk-block via explicit version list  | yes                 | yes                 |
+| Bulk-block via explicit digest list   | yes                 | yes                 |
+| Exclude / unexclude a CVE finding     | yes                 | yes                 |
+| All other admin endpoints             | no                  | yes                 |
+
+A batch entry's authority is one decision's authority, so the bulk rows
+need no higher permission than the single ones: what keeps a bulk waive
+safe is the all-or-nothing contract in §9, not a permission tier. That
+also keeps the gitops pipeline — which applies decision files under its
+own service identity — able to apply the decisions it declares.
 
 An admin passes the same gate (`CurateOrAdminPrincipal` admits either
 permission), so an admin never needs an explicit curate grant — but
@@ -164,8 +175,8 @@ to.
 
 ```sh
 hort-cli curation queue --status quarantined --repo npm-proxy
-# Identify the artifact_id and, for OCI, the path. Then look at its
-# finding count and scan status. A waive is appropriate when
+# Identify the artifact_id or the digest and, for OCI, the path. Then
+# look at its finding count and scan status. A waive is appropriate when
 # finding_count = 0 (a completed clean scan)
 # or the findings are known false-positives you intend to follow up
 # with --exclude-finding.
@@ -179,10 +190,27 @@ ever true. An artifact that has never been scanned shows `unscanned` in
 both finding columns instead of `0` / empty. OCI rows also show their
 stored path, which distinguishes blobs and manifests of the same image.
 
-**Issue the waive:**
+Every row also carries **`checksum_sha256`**, the SHA-256 of the bytes
+the decision is about, and **`tags`**, the mutable refs currently
+pointing at those bytes. The two are not interchangeable:
+
+- The **digest is the addressing key.** Read it off the row and hand it
+  to `waive digests` (§2.1.2) or `block digests` (§2.2) — that is the
+  path for an OCI row, whose `version` is `NULL` by construction, and
+  for any decision you want bound to the bytes you reviewed rather than
+  to a version string. The table abbreviates it to its first 12 hex so
+  the columns stay readable; `--output json` carries the whole 64, which
+  is the form a decision is addressed by.
+- The **tags are an annotation and never an address.** A ref is a
+  mutable pointer — it can be moved to other bytes the moment after you
+  reviewed these — so no curation command takes one as a target. Tags
+  are there so a human recognises the row (`3.19`, `latest`) before
+  deciding about the digest beside them.
+
+**Issue the waive** — one artifact, by id:
 
 ```sh
-hort-cli curation waive <artifact_id> \
+hort-cli curation waive artifact <artifact_id> \
   --justification "lodash@4.17.21 fixes CVE-2024-XXXX (verified upstream
                     npm signature 2026-05-23); risk-accepted by
                     security@example.com"
@@ -224,6 +252,73 @@ with the state in the message. The queue listing carries the status;
 check it before issuing, because the status is also what tells you
 *which* decision you are making (see §4).
 
+`waive artifact` is the **only** mode that reaches `ScanIndeterminate`
+or overrides a `Rejected` verdict. The two bulk modes below reach
+`Quarantined` and `Released` and nothing else: overriding a recorded
+verdict is a decision taken with that verdict in view, which is a
+one-at-a-time decision by construction.
+
+#### 2.1.1 Waive a batch by version list
+
+**Use it when:** one advisory, one review, several versions of the same
+package — and `artifacts.version` is populated for the format (npm,
+PyPI, Cargo, Maven).
+
+```sh
+hort-cli curation waive versions \
+  --repo npm-proxy \
+  --package left-pad \
+  --versions 1.0.0,1.0.1,1.0.2 \
+  --justification "CVE-2026-XXXX not reachable in our configuration per
+                    SEC-2026-031; risk-accepted by security@example.com"
+```
+
+Every released artifact gets its own `ArtifactReleased` event carrying
+the same justification, tied together by one `correlation_id` — so
+`curation decisions --by-correlation` surfaces the batch as the one
+decision you took. Read §9 before using it: **the batch is
+all-or-nothing**, and one entry the server cannot release refuses the
+whole call.
+
+#### 2.1.2 Waive a batch by content digest
+
+**Use it when:** the bytes are the address — an OCI row (no `version` to
+name), or any release where what you reviewed is a specific artifact
+rather than a version string.
+
+```sh
+# Read the digest off the queue row (--output json carries all 64 hex).
+hort-cli curation waive digests \
+  --repo oci-proxy \
+  --digests sha256:9f86d081884c…,3f79bb7b435b… \
+  --justification "base image rebuilt on patched upstream; scanned clean
+                    out of band, risk-accepted by security@example.com"
+```
+
+A bare 64-hex digest and the same value with a `sha256:` prefix are one
+address — paste whichever your source printed. Any other algorithm
+prefix (`sha512:…`) is **refused by name**, not stripped: hort addresses
+content by SHA-256
+([ADR 0003](../../adr/0003-streaming-enforced-cas.md)), so
+stripping it would turn "you asked with the wrong algorithm" into "that
+artifact is not here" and send you looking for a missing artifact
+instead of a mistyped request.
+
+**A digest that matches more than one live row is refused**, naming the
+candidate `artifact_id`s. Identical bytes can be ingested at several
+paths, and which of those rows you reviewed is not the server's to
+guess. Release the one you reviewed with `waive artifact <artifact_id>`.
+
+**A multi-file release is addressed by digest, not by version.** A
+version string resolves to the **first matching row**, and a PyPI
+release can hold an sdist *and* a wheel under one version — so
+`waive versions` on such a package releases one of the two rows and
+leaves the other held. The direction is safe (it releases *less* than
+you may have intended, never more), and the queue listing shows both
+rows with their own digests. When a version names more than one row,
+use `waive digests` and name the rows you mean. `block versions`
+resolves the same way, for the same reason.
+
 ### 2.2 Block — reject a non-terminal artifact
 
 **Use it when:** you've identified an artifact that should not be
@@ -231,7 +326,7 @@ served — a shadow-IT upload, a supply-chain risk surfaced by external
 intelligence (out-of-band of the scanner DB), a deprecation you want to
 hard-pull rather than wait for clients to update.
 
-Two shapes:
+Three shapes — the same three `waive` has, addressed the same way:
 
 **Single artifact:**
 
@@ -255,8 +350,26 @@ hort-cli curation block versions \
                     backport"
 ```
 
-The bulk variant caps at **100 versions per call** (mirrors the
-queue's `limit` shape — bounded per-call work).
+**Bulk by content digest** — for OCI rows, and for any block you want
+bound to the bytes rather than to a version string:
+
+```sh
+hort-cli curation block digests \
+  --repo oci-proxy \
+  --digests sha256:9f86d081884c…,3f79bb7b435b… \
+  --justification "malicious layer confirmed in these images per
+                    GHSA-aaaa-bbbb-cccc"
+```
+
+Digests follow the same rules as on the waive side (§2.1.2): the bare
+and `sha256:`-prefixed spellings are one address, another algorithm
+prefix is refused by name, and a digest matching more than one live row
+is refused naming the candidates — block the row you reviewed with
+`block artifact <artifact_id>`.
+
+Both bulk variants cap at **100 entries per call** (bounded per-call
+work, the same shape as the queue's `limit`). That is four times the
+bulk-waive cap, and §9 is why.
 
 **Source-state guard:** `None | Quarantined | Released → Rejected`.
 `Released → Rejected` is the shadow-IT / retroactive-rejection case
@@ -284,12 +397,18 @@ ArtifactRejected {
   "blocked_artifact_ids": ["..."],      // transitioned to Rejected on this call
   "already_rejected_ids": ["..."],      // idempotent no-op (no event appended)
   "not_found_versions": ["..."],        // not ingested yet — NOT auto-blocked
+  "not_found_digests": ["..."],         // same, for a digest-addressed call
   "failed": [["...", "<error>"], ...]   // per-append failures (continue-on-error)
 }
 ```
 
-See §2.4 below for the **continue-on-error contract** — this is the
-load-bearing operational contract on `block versions`.
+Both `not_found_*` lists are always present; a call addresses by
+versions or by digests, so the other one is empty. The CLI table counts
+them in one `NOT_FOUND` column and names the unmatched keys in a
+section below it.
+
+See §8 below for the **continue-on-error contract** — this is the
+load-bearing operational contract on both bulk block modes.
 
 ### 2.3 Exclude / unexclude a CVE finding
 
@@ -544,8 +663,10 @@ hort-cli curation queue --status rejected --repo npm-proxy
 #    whether this deployment's exposure makes them acceptable, and
 #    record what made that true.
 
-# 3. Issue the override — the same command as any other waive.
-hort-cli curation waive <artifact_id> \
+# 3. Issue the override — the same command as any other single waive.
+#    Only `waive artifact` reaches a Rejected verdict; the bulk modes
+#    deliberately do not (see 2.1).
+hort-cli curation waive artifact <artifact_id> \
   --justification "sha256:<hash> matches the signed release listing at
                     https://example.org/releases/v1.2.3 (checked
                     2026-10-11); upstream signing key rotation broke the
@@ -728,11 +849,20 @@ All decision subcommands require `--justification` (non-empty, ≤ 512
 bytes); the CLI rejects malformed input before the HTTP round trip.
 
 ```sh
-# Decision flows
-hort-cli curation waive <artifact_id> --justification <text>
+# Decision flows — each verb, each addressing mode
+hort-cli curation waive artifact <artifact_id> --justification <text>
+hort-cli curation waive versions \
+  --repo <key> --package <name> --versions v1,v2,v3 \
+  --justification <text>
+hort-cli curation waive digests \
+  --repo <key> --digests <sha256>,<sha256> \
+  --justification <text>
 hort-cli curation block artifact <artifact_id> --justification <text>
 hort-cli curation block versions \
   --repo <key> --package <name> --versions v1,v2,v3 \
+  --justification <text>
+hort-cli curation block digests \
+  --repo <key> --digests <sha256>,<sha256> \
   --justification <text>
 hort-cli curation exclude-finding   --policy <id> --cve <id> --justification <text>
 hort-cli curation unexclude-finding --policy <id> --cve <id> --justification <text>
@@ -780,39 +910,52 @@ hort-cli curation exclusions \
   therefore shows an empty `REJECT_REASON`; it will not match
   `--reason corruption`.
 - `curation decisions` defaults to **uncollapsed** (one row per event);
-  `--by-correlation` groups by `correlation_id` so a bulk `block
-  versions` operation surfaces as one logical decision rather than N
+  `--by-correlation` groups by `correlation_id` so any bulk operation —
+  a `block versions` / `block digests` call, a `waive versions` /
+  `waive digests` call — surfaces as one logical decision rather than N
   rows.
+- **The flat `curation waive <artifact_id>` form no longer exists.** It
+  is `curation waive artifact <artifact_id>`. A script still running the
+  old form gets a message naming the replacement, not a bare clap
+  error — but it does not run, so fix the line.
+- The digest flags take the bare 64-hex or the `sha256:`-prefixed
+  spelling interchangeably, on both verbs (§2.1.2).
 - `curation exclusions` reads the projection's current state — distinct
   from `decisions`, which is a point-in-time history. An exclusion is
   active until removed or expired.
 
 ---
 
-## 8. `block versions` — the continue-on-error contract
+## 8. `block versions` / `block digests` — the continue-on-error contract
 
 This is the **most operationally subtle** curation surface and the
-one operators most often misread.
+one operators most often misread. Both bulk block modes share it; §9 is
+its deliberate opposite on the waive side, and the two must not be
+tidied into one shape.
 
 ### 8.1 What the contract says
 
-Event-sourcing rules out "all-or-nothing" — events are immutable, there
-is no rollback once appended. The use case picks **continue-on-error**:
+Event-sourcing rules out **rollback** — events are immutable, so once an
+append has landed nothing takes it back. A bulk verb therefore has
+exactly two honest contracts: apply what it can and report the rest
+(continue-on-error), or refuse the whole batch *before the first append*
+(all-or-nothing, which is what §9 does). Block picks
+**continue-on-error**, because what lands is the restrictive direction:
 
 - The justification cap is enforced **once** at the call boundary
   (`AppError::Validation` before any append).
 - The use case attempts every resolved-and-non-terminal artifact in
-  the version list.
+  the version or digest list.
 - Per-append failures (event-store version conflict on a concurrent
   decision, aggregate-load failure, etc.) **do not abort the call**.
 - Each failure lands in `BlockOutcome.failed: Vec<(Uuid, AppError)>`
   with the artifact_id and the per-append error.
 - Successful appends are **never** rolled back.
 
-The HTTP layer mirrors this: a `block-versions` call with a non-empty
-`failed` array returns `200 OK` (with the full outcome body), **NOT**
-`5xx`. Partial success is a successful outcome at the HTTP semantics
-level.
+The HTTP layer mirrors this: a `block-versions` / `block-digests` call
+with a non-empty `failed` array returns `200 OK` (with the full outcome
+body), **NOT** `5xx`. Partial success is a successful outcome at the HTTP
+semantics level.
 
 ### 8.2 What operators MUST do
 
@@ -893,12 +1036,13 @@ landed vs what was skipped" on every retry. Continue-on-error gives
 the operator a single complete result envelope they can act on (retry
 the failed subset only). The choice was made deliberately.
 
-### 8.5 The `not_found_versions` caveat
+### 8.5 The `not_found_versions` / `not_found_digests` caveat
 
-Versions in the `not_found_versions` list **are not auto-blocked on
-future ingest**. If the version arrives in the proxy later, it goes
-through the normal scan + policy gate (it does **not** automatically
-inherit your curator-block intent). Stored curator block-rules (a
+Keys in the `not_found_versions` / `not_found_digests` lists **are not
+auto-blocked on future ingest**. If the version arrives in the proxy
+later, or those bytes are ingested at some other path, it goes through
+the normal scan + policy gate (it does **not** automatically inherit
+your curator-block intent). Stored curator block-rules (a
 forward-blocking layer keyed on `(repo, package, version-range)`) are
 **deliberately not built** — a recognised gap, deferred.
 
@@ -915,17 +1059,109 @@ If you need to block versions that haven't been ingested yet:
 
 ---
 
-## 9. What the system does NOT do automatically (and why)
+## 9. `waive versions` / `waive digests` — the all-or-nothing contract
+
+The bulk waive is the **fail-open** half of curation, and its contract is
+the inverse of §8's on purpose. A future editor tidying the two into one
+shape would be removing the asymmetry deliberately — don't.
+
+| | bulk **block** | bulk **waive** |
+| --- | --- | --- |
+| entries per call | 100 | **25** |
+| one bad entry | reported, the rest still applies | **the whole batch is refused** |
+| partial application | yes, and it is not rolled back | **never** |
+| HTTP answer on a bad entry | `200 OK` with the outcome body | `409 Conflict` with the per-entry report |
+
+### 9.1 Why the two differ
+
+`ArtifactReleased` is **history that cannot be retracted.** Nothing
+un-releases an artifact: a later block is a new decision over bytes
+consumers may already have pulled. So releasing the resolvable subset of
+a list you wrote wrongly is not a kindness — it is the defect this
+contract exists to prevent. A block you did not mean, by contrast, is
+reversible by the same curator a minute later, and the artifact stayed
+*unavailable* in the meantime; continue-on-error there costs an operator
+a retry, not a release they never reviewed.
+
+The same reasoning sets the caps. Twenty-five entries is a list a curator
+can still have read line by line before signing one justification for all
+of them; the block side can afford four times that because its failure
+mode is a hold, not an exposure.
+
+### 9.2 What an abort looks like
+
+One entry that is unresolvable, ambiguous, or in a state the bulk waive
+does not reach (anything other than `Quarantined` / `Released`) refuses
+the call:
+
+```sh
+hort-cli curation waive versions --repo npm-proxy --package left-pad \
+  --versions 1.0.0,9.9.9 --justification "…"
+# exit status 3
+```
+
+```text
+BATCH ABORTED — nothing was released. 1 of 2 entries cannot be released;
+a bulk waive is all-or-nothing because a release cannot be retracted.
+Fix the entries below and re-run:
+KEY    ARTIFACT_ID                           VERDICT       DETAIL
+1.0.0  7c0e…-…                               releasable    -
+9.9.9  -                                     unresolvable  -
+```
+
+The report names **every** entry, the fine ones included, so you can see
+which one stopped the batch without bisecting your list. `--output json`
+hands back the server's report verbatim for a script to branch on; the
+command exits **3** (distinct from `0` for an applied batch and from `1`
+for a request that never got an answer — a 403, a bad repository key, a
+transport failure).
+
+Per-entry verdicts you will see:
+
+| verdict | what it means | what to do |
+| --- | --- | --- |
+| `releasable` | this entry was fine | nothing — it is listed so you can see it was not the problem |
+| `already_released` | already `Released`; an idempotent no-op | nothing — a re-applied decision file converges instead of failing forever |
+| `unresolvable` | no live row matches the key | check the spelling, or the repository, or whether the artifact was ever ingested |
+| `ambiguous` | the digest names more than one live row | release the row you reviewed with `waive artifact <artifact_id>` — the report lists the candidates |
+| `state_not_releasable` | the row is in a state a bulk waive does not reach | read the `DETAIL` status; a `Rejected` verdict is overridden one artifact at a time (§4.1), and a `scan_indeterminate` hold has an exit that is not a curator override (the rescan sweep re-picks it) |
+
+### 9.3 After an applied batch
+
+A `200` partitions the call into three lists, and the first two are
+**different facts**:
+
+- `released_artifact_ids` — released **by this call**; one
+  `ArtifactReleased` event each.
+- `already_released_ids` — released **earlier**; idempotent, no event
+  appended now. An operator who reads this as the first believes a
+  waiver took effect now when it took effect before.
+- `failed` — entries that passed pre-validation and then lost their
+  append (a concurrent decision on the same artifact, say). The CLI
+  highlights the count; re-issue for that subset, with the same
+  justification text, exactly as §8.3 describes for the block side.
+
+A non-empty `failed` is still a `200` and still exits `0`: those entries
+are per-artifact apply failures inside a batch that *was* valid, and the
+envelope is how you learn which.
+
+---
+
+## 10. What the system does NOT do automatically (and why)
 
 These deliberate non-features are the same shape as the patch-release
 playbook (`docs/architecture/how-to/quarantine-patch-release.md` §6),
 extended for the curator surface:
 
-- **No bulk-waive.** Curator decisions are per-artifact and
-  justification-gated. A bulk-waive primitive would re-create the
-  auto-release pattern the threat model rejects. The
-  asymmetric concession is **bulk-block** (the conservative direction —
-  more restrictive, never less); waive has no symmetric primitive.
+- **No rule-driven or self-service release.** Both bulk decision verbs
+  take an **explicit list** the curator wrote, under one
+  justification — that is what makes a batch a reviewed decision rather
+  than an automation. There is no range, no pattern, no predicate, and
+  nothing that releases on a condition; the bulk waive additionally
+  refuses the whole batch rather than release an entry the curator's
+  list named wrongly (§9). A rule that released artifacts matching a
+  shape is the auto-release pattern the threat model rejects, and it
+  stays unbuilt.
 - **No auto-block on future ingest.** Curator block is per-artifact
   retroactive. Stored block-rules (range/pattern-scoped auto-block at
   ingest) are out of scope — see §8.5 above.

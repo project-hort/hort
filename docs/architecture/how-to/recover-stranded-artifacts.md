@@ -165,8 +165,8 @@ a last resort if the HTTP surface itself is unreachable.
   change, a backend that can analyse the format), after which the next
   tick's verdict lands and the release sweep decides. The curator's
   manual release is the immediate exit
-  (`hort-cli curation waive <artifact_id> --justification '…'`, or
-  `POST /api/v1/admin/curation/quarantine/:artifact_id/waive`), which
+  (`hort-cli curation waive artifact <artifact_id> --justification '…'`,
+  or `POST /api/v1/admin/curation/quarantine/:artifact_id/waive`), which
   reaches `ScanIndeterminate` as well as `Quarantined`: one authority
   owns the manual release, and what it requires is the source state
   rather than a second permission tier. The gate is
