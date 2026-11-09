@@ -1825,7 +1825,6 @@ mod tests {
             index_upstream_url: None,
             is_public: false,
             download_audit_enabled: false,
-            quota_bytes: None,
             replication_priority: hort_domain::entities::repository::ReplicationPriority::OnDemand,
             promotion: None,
             curation_rule_names: Vec::new(),

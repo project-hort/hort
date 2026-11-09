@@ -5180,7 +5180,6 @@ pub fn sample_repository() -> Repository {
         index_upstream_url: None,
         is_public: true,
         download_audit_enabled: false,
-        quota_bytes: None,
         replication_priority: ReplicationPriority::OnDemand,
         promotion: None,
         curation_rule_names: Vec::new(),

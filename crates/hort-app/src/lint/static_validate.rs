@@ -240,6 +240,29 @@ pub(crate) const RULE_COMPOSITE_VERDICT_PROMOTED_REQUIRES_SCAN_BACKENDS: &str =
 pub(crate) const RULE_REPOSITORY_STORAGE_PATH_DEPRECATED: &str =
     "repository_storage_path_deprecated";
 
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when an `ArtifactRepository`
+/// envelope declares the **retired** `quotaBytes`. No use case has ever
+/// compared the value to a usage figure, so every byte past the declared
+/// limit was admitted — the same ADR 0015 accepted-but-inert surface
+/// [`RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED`] closes for
+/// `maxAgeDays`, on the capacity axis and in its sharpest form: the
+/// apply *range-checked* the field, which is a stronger claim that it
+/// works than merely accepting it.
+///
+/// **Retired, not deferred**, which is why this label does not end in
+/// `_not_implemented` like its eleven inert-field siblings: enforcement
+/// was decided against rather than postponed, so the operator's move is
+/// to delete the line and not to wait for a release. The reasoning and
+/// the retirement trigger live on
+/// [`hort_config::desired::validate_repository_quota_bytes_retired`].
+/// One increment per offending repository. Catalog entry update ships in
+/// the same PR (`docs/metrics-catalog.md`).
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_REPOSITORY_QUOTA_BYTES_RETIRED: &str = "repository_quota_bytes_retired";
+
 /// The snapshot-free apply-config lint rules.
 ///
 /// The discriminant is carried on every [`LintFinding`] so the apply
@@ -343,6 +366,13 @@ pub enum LinterRule {
     /// already-failing config rejects with either way, and appending
     /// keeps the row order one monotonic list.
     RepositoryStoragePathDeprecated,
+    /// Row 17 — an `ArtifactRepository` declaring the **retired**
+    /// `quotaBytes`, which nothing has ever enforced. Reject + metric.
+    /// Appended after row 16 for row 9's own reason: apply aborts on the
+    /// first row with error findings, so appending is the only placement
+    /// that leaves every existing config's reject message exactly as it
+    /// was.
+    RepositoryQuotaBytesRetired,
 }
 
 impl LinterRule {
@@ -388,6 +418,7 @@ impl LinterRule {
             Self::RepositoryStoragePathDeprecated => {
                 Some(RULE_REPOSITORY_STORAGE_PATH_DEPRECATED)
             }
+            Self::RepositoryQuotaBytesRetired => Some(RULE_REPOSITORY_QUOTA_BYTES_RETIRED),
             Self::SaIssuerFk
             | Self::UnderConstrainedFederatedIdentities
             | Self::ProvenanceConfig
@@ -788,6 +819,24 @@ impl StaticConfigValidator {
                     repository: finding.repository,
                     detail: finding.message,
                 }),
+            ));
+        }
+
+        // Row 17 — an `ArtifactRepository` declaring the retired
+        // `quotaBytes`. Unlike row 16 this one REJECTS: the field is in
+        // no documentation, example or deploy file, so there is no
+        // install base a reject would park, and unlike its inert-field
+        // siblings it was range-checked at apply and echoed back by the
+        // admin effective-config response — an operator could watch the
+        // field be validated and read it back while nothing compared it
+        // to a usage figure. Appended after row 16 for row 9's own
+        // reason — apply aborts on the first row with error findings, so
+        // appending is the only placement that leaves every existing
+        // config's reject message exactly as it was.
+        for err in hort_config::desired::validate_repository_quota_bytes_retired(desired) {
+            report.errors.push(LintFinding::error(
+                LinterRule::RepositoryQuotaBytesRetired,
+                err.to_string(),
             ));
         }
 
@@ -1541,6 +1590,9 @@ mod tests {
                 download_audit_enabled: false,
                 index_mode: IndexMode::default(),
                 prefetch_policy: hort_domain::entities::repository::PrefetchPolicy::default(),
+                // `None` for the same reason as `path` above: row 17
+                // rejects every declaration, so a shared builder that
+                // carried a value would fail every test in the module.
                 quota_bytes: None,
                 replication_priority: "immediate".into(),
                 promotion: None,
@@ -2316,6 +2368,112 @@ mod tests {
         assert_eq!(
             LinterRule::RepositoryStoragePathDeprecated.metric_rule(),
             Some("repository_storage_path_deprecated")
+        );
+    }
+
+    // ---- row 17: retired quotaBytes -----------------------------------
+
+    /// The row **rejects**, unlike its row-16 neighbour: the field is in
+    /// no documentation, example or deploy file, so there is no install
+    /// base a reject would park, and it was range-checked at apply —
+    /// which made it look more load-bearing than the siblings that were
+    /// merely accepted.
+    #[test]
+    fn declared_quota_bytes_is_rejected_once_per_repository() {
+        let mut alpha = repo_env("alpha", "oci");
+        alpha.spec.quota_bytes = Some(1_073_741_824);
+        let mut beta = repo_env("beta", "oci");
+        beta.spec.quota_bytes = Some(1);
+        let desired = DesiredState {
+            repositories: vec![alpha, beta, repo_env("gamma", "oci")],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+
+        let hits: Vec<_> = report
+            .errors
+            .iter()
+            .filter(|f| f.rule == LinterRule::RepositoryQuotaBytesRetired)
+            .collect();
+        assert_eq!(hits.len(), 2, "one per declaring repository: {hits:?}");
+        assert!(
+            hits[0].message.contains("alpha") && hits[1].message.contains("beta"),
+            "each error names its own offender: {hits:?}"
+        );
+        assert!(
+            !hits.iter().any(|f| f.message.contains("gamma")),
+            "the repository declaring none is untouched: {hits:?}"
+        );
+        assert!(
+            hits[0].message.contains("retired") && hits[0].message.contains("never enforced"),
+            "the operator must read `retired`, not a deferral: {}",
+            hits[0].message
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|f| f.rule != LinterRule::RepositoryQuotaBytesRetired),
+            "a retirement that only warned would keep accepting the field, \
+             which is the anti-pattern rather than a close of it: {:?}",
+            report.warnings
+        );
+    }
+
+    /// The remedy is silent — the counter-assertion that the rejection
+    /// is not over-broad. Every other test in this module relies on it
+    /// (the shared builder declares no quota), so a rule that fired on
+    /// absence would fail the whole file; pinning it here is what names
+    /// the reason.
+    #[test]
+    fn quota_bytes_absent_produces_no_finding() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("no-quota", "oci")],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(
+            report
+                .errors
+                .iter()
+                .chain(report.warnings.iter())
+                .all(|f| f.rule != LinterRule::RepositoryQuotaBytesRetired),
+            "dropping the line is the remedy: {report:?}"
+        );
+    }
+
+    /// Row 17 is LAST in row order. A config that trips both row 6 and
+    /// row 17 must still abort on row 6 — appending the row cannot
+    /// change which message an already-failing config rejects with.
+    #[test]
+    fn quota_bytes_row_17_is_last_in_row_order() {
+        let mut repo = repo_env("npm-inert", "oci");
+        repo.spec.prefetch_policy.max_age_days = Some(90);
+        repo.spec.quota_bytes = Some(1_073_741_824);
+        let desired = DesiredState {
+            repositories: vec![repo],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let rules: Vec<LinterRule> = report.errors.iter().map(|f| f.rule).collect();
+        let pos = |want: LinterRule| rules.iter().position(|r| *r == want).unwrap();
+        assert!(
+            pos(LinterRule::PrefetchMaxAgeDaysNotImplemented)
+                < pos(LinterRule::RepositoryQuotaBytesRetired),
+            "{rules:?}"
+        );
+    }
+
+    /// The row carries a metric. Pinned on the label value rather than
+    /// on `is_some()`, because a label that drifts from the catalog is a
+    /// silently-renamed series — and this one deliberately does not end
+    /// in `_not_implemented` like its inert-field siblings, because the
+    /// field is retired rather than pending.
+    #[test]
+    fn row_17_metric_label_matches_the_catalog() {
+        assert_eq!(
+            LinterRule::RepositoryQuotaBytesRetired.metric_rule(),
+            Some("repository_quota_bytes_retired")
         );
     }
 

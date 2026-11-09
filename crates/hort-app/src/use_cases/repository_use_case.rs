@@ -30,7 +30,6 @@ pub struct CreateRepository {
     pub storage_path: String,
     pub upstream_url: Option<String>,
     pub is_public: bool,
-    pub quota_bytes: Option<i64>,
     pub replication_priority: ReplicationPriority,
     pub promotion: Option<PromotionConfig>,
     /// Names of `CurationRule` objects attached to this repository.
@@ -47,7 +46,6 @@ pub struct UpdateRepository {
     pub name: Option<String>,
     pub description: Option<Option<String>>,
     pub is_public: Option<bool>,
-    pub quota_bytes: Option<Option<i64>>,
     pub upstream_url: Option<Option<String>>,
 }
 
@@ -134,7 +132,6 @@ impl RepositoryUseCase {
             // (yet) carry it; the same posture as `index_upstream_url`
             // above. CRUD-created repos default to `false`.
             download_audit_enabled: false,
-            quota_bytes: cmd.quota_bytes,
             replication_priority: cmd.replication_priority,
             promotion: cmd.promotion,
             curation_rule_names: cmd.curation_rule_names,
@@ -216,9 +213,6 @@ impl RepositoryUseCase {
         }
         if let Some(is_public) = cmd.is_public {
             repo.is_public = is_public;
-        }
-        if let Some(quota_bytes) = cmd.quota_bytes {
-            repo.quota_bytes = quota_bytes;
         }
         if let Some(upstream_url) = cmd.upstream_url {
             repo.upstream_url = upstream_url;
@@ -478,7 +472,6 @@ mod tests {
                 index_upstream_url: None,
                 is_public: true,
                 download_audit_enabled: false,
-                quota_bytes: None,
                 replication_priority: ReplicationPriority::LocalOnly,
                 promotion: None,
                 curation_rule_names: Vec::new(),
@@ -504,7 +497,6 @@ mod tests {
             storage_path: "/data/repos/maven-hosted".into(),
             upstream_url: None,
             is_public: true,
-            quota_bytes: None,
             replication_priority: ReplicationPriority::LocalOnly,
             promotion: None,
             curation_rule_names: Vec::new(),
@@ -538,7 +530,6 @@ mod tests {
             storage_path: "/data/repos/npm-proxy".into(),
             upstream_url: Some("https://registry.npmjs.org".into()),
             is_public: true,
-            quota_bytes: None,
             replication_priority: ReplicationPriority::Scheduled,
             promotion: None,
             curation_rule_names: Vec::new(),
@@ -670,7 +661,6 @@ mod tests {
                     name: Some("Renamed Repo".into()),
                     description: Some(None), // clear description
                     is_public: Some(false),
-                    quota_bytes: Some(Some(1_000_000)),
                     upstream_url: None, // don't change
                 },
             )
@@ -680,7 +670,6 @@ mod tests {
         assert_eq!(updated.name, "Renamed Repo");
         assert!(updated.description.is_none());
         assert!(!updated.is_public);
-        assert_eq!(updated.quota_bytes, Some(1_000_000));
         assert!(updated.updated_at > repo.updated_at);
     }
 
@@ -694,7 +683,6 @@ mod tests {
                     name: Some("x".into()),
                     description: None,
                     is_public: None,
-                    quota_bytes: None,
                     upstream_url: None,
                 },
             )
@@ -736,7 +724,6 @@ mod tests {
                     name: Some("renamed".into()),
                     description: None,
                     is_public: None,
-                    quota_bytes: None,
                     upstream_url: None,
                 },
             )
@@ -819,7 +806,6 @@ mod tests {
                     name: Some("renamed".into()),
                     description: None,
                     is_public: None,
-                    quota_bytes: None,
                     upstream_url: None,
                 },
             )

@@ -99,7 +99,6 @@ pub struct RepositoryRow {
     /// row mapper narrows `i32 → u32` defensively (negative wrap on
     /// write → `unwrap_or(default)` on read).
     pub prefetch_max_descendants: Option<i32>,
-    pub quota_bytes: Option<i64>,
     pub replication_priority: String,
     pub promotion_target_id: Option<Uuid>,
     pub promotion_policy_id: Option<Uuid>,
@@ -225,7 +224,6 @@ impl From<RepositoryRow> for Repository {
             index_upstream_url: row.index_upstream_url,
             is_public: row.is_public,
             download_audit_enabled: row.download_audit_enabled,
-            quota_bytes: row.quota_bytes,
             replication_priority,
             promotion,
             curation_rule_names: Vec::new(),
@@ -1170,7 +1168,6 @@ mod tests {
             prefetch_transitive_depth: None,
             prefetch_max_age_days: None,
             prefetch_max_descendants: None,
-            quota_bytes: Some(1_000_000),
             replication_priority: "on_demand".into(),
             promotion_target_id: None,
             promotion_policy_id: None,

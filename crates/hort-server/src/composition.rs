@@ -29,6 +29,7 @@ use hort_adapters_postgres::policy_projection_repo::PgPolicyProjectionRepository
 use hort_adapters_postgres::ref_lifecycle::PgRefLifecycle;
 use hort_adapters_postgres::ref_registry_repo::PgRefRegistry;
 use hort_adapters_postgres::repo_security_score_repository::PgRepoSecurityScoreRepository;
+use hort_adapters_postgres::repository_inventory_reader::PgRepositoryInventoryReader;
 use hort_adapters_postgres::repository_repo::PgRepositoryRepository;
 use hort_adapters_postgres::repository_upstream_mapping_repo::PgRepositoryUpstreamMappingRepo;
 use hort_adapters_postgres::subscription_repo::PgSubscriptionRepository;
@@ -53,6 +54,7 @@ use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
 use hort_app::use_cases::pat_validation_use_case::{PatLockoutConfig, PatValidationUseCase};
 use hort_app::use_cases::patch_candidate_use_case::PatchCandidateUseCase;
 use hort_app::use_cases::provenance_misrejection_repair::ProvenanceMisrejectionRepairUseCase;
+use hort_app::use_cases::repository_inventory_use_case::RepositoryInventoryUseCase;
 use hort_app::use_cases::scanner_worker_query_use_case::ScannerWorkerQueryUseCase;
 // `PolicyUseCase` is exposed on `AppContext` for
 // the HTTP exclusion write surface
@@ -3279,6 +3281,18 @@ pub async fn build_app_context(
         policy_projections.clone(),
     ));
 
+    // `RepositoryInventoryUseCase` for the per-repository live-catalog
+    // readout (`GET /api/v1/admin/inventory`) — the measurement a
+    // retention before/after needs, which nothing in the product
+    // answered until this surface existed.
+    //
+    // One port and nothing else: the readout resolves no policy and
+    // reads no event stream, which is what keeps it a different
+    // question from the held-set overview rather than a widening of it.
+    let repository_inventory_use_case = Arc::new(RepositoryInventoryUseCase::new(Arc::new(
+        PgRepositoryInventoryReader::new(db.clone()),
+    )));
+
     // `ScannerWorkerQueryUseCase` for the admin `GET /admin/workers`
     // endpoint. Wires the READ side of the `scanner_registry`
     // worker-coordination table — the consumer for the worker heartbeat
@@ -3741,6 +3755,7 @@ pub async fn build_app_context(
         manual_rescan_use_case,
         patch_candidate_use_case,
         held_set_use_case,
+        repository_inventory_use_case,
         scanner_worker_query_use_case,
         effective_repository_config_use_case,
         gitops_apply_status: Arc::new(ArcSwap::from_pointee(gitops_apply_status)),

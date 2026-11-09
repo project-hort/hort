@@ -1605,6 +1605,83 @@ pub fn validate_repository_storage_path_deprecated(
     findings
 }
 
+/// Apply-time linter rejecting a declared `ArtifactRepository.spec.quota_bytes`.
+///
+/// **The field is retired, not deferred.** A quota was never enforced:
+/// no use case in the system has ever compared `repositories.quota_bytes`
+/// to a usage figure, so a declared limit admitted every byte past it.
+/// That is ADR 0015's "accepted at apply, inert at runtime" block, and
+/// the canonical exemplar is
+/// [`validate_prefetch_max_age_days_not_implemented`].
+///
+/// **Sharper than that exemplar, because this field was *validated*.**
+/// `maxAgeDays` was merely accepted; `quotaBytes` was range-checked at
+/// apply (`quotaBytes must be > 0`), echoed back by the admin
+/// effective-config response and persisted to its column. An operator
+/// could declare a quota, watch the apply validate it, read it back from
+/// the API — and have it decide nothing. Validating a field is a
+/// stronger claim that it works than merely accepting one.
+///
+/// **Why the field stays in the schema.** The repository spec carries
+/// `deny_unknown_fields`, so deleting the field would make an envelope
+/// that still declares `quotaBytes` fail with ``unknown field
+/// `quotaBytes` `` — which tells an operator they may have mistyped
+/// something or be running the wrong version, and nothing about why.
+/// Keeping the field and refusing it is what produces an error that
+/// explains itself. It also makes re-enabling a **visible act**:
+/// enforcing a quota later means deleting a named linter rule, not
+/// quietly populating a column that was already being accepted.
+///
+/// **And why this is not a deprecation.** The sibling `storage.path`
+/// warns rather than rejects (see
+/// [`validate_repository_storage_path_deprecated`]) because that field
+/// is in every pre-existing envelope, so a reject would park the first
+/// apply after an upgrade for every operator at once. `quotaBytes` is in
+/// no documentation, no example and no deploy file — there is no install
+/// base to spare — and a deprecation that keeps accepting an inert field
+/// is the anti-pattern rather than a retirement of it.
+///
+/// The per-envelope `quotaBytes must be > 0` shape check stays where it
+/// is: it is reached first for a non-positive value, and both refusals
+/// land on an apply that must not commit either way.
+///
+/// **Fail-closed.** No escape hatch. The operator-actionable error names
+/// the offending `repo_key` and the recourse is to drop the field; once
+/// removed the apply re-runs cleanly. The column itself survives this
+/// change — removing the last code reference is what ADR 0030's
+/// expand/contract requires *before* a drop, so a later release can
+/// schedule one.
+///
+/// **Retirement trigger.** Delete this function, its `LinterRule` row,
+/// its metric constant and its metrics-catalog entry **in the same
+/// commit** that either removes the field from the spec or gives it a
+/// real consumer — a rejection of a field that no longer parses is
+/// unreachable code a later reader has to re-derive.
+///
+/// Pure function of `DesiredState`; runs alongside
+/// [`validate_prefetch_max_age_days_not_implemented`] after the
+/// snapshot-validation stage. One error per offending repository.
+pub fn validate_repository_quota_bytes_retired(state: &DesiredState) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for env in &state.repositories {
+        if env.spec.quota_bytes.is_some() {
+            errors.push(ValidationError::Invalid {
+                kind: Kind::ArtifactRepository,
+                name: env.metadata.name.clone(),
+                detail: format!(
+                    "`quotaBytes` is retired and was never enforced: nothing in hort has \
+                     ever compared it to a usage figure, so every byte past the declared \
+                     limit was admitted. The field is going; it is kept in the schema only \
+                     so this message can replace an `unknown field` parse error. Remove \
+                     the field to apply. (repository: `{repo_key}`)",
+                    repo_key = env.metadata.name,
+                ),
+            });
+        }
+    }
+    errors
+}
+
 /// Every `UpstreamMapping.spec.repository` must resolve to a declared
 /// `ArtifactRepository.metadata.name`. The apply pipeline needs the
 /// repository_id for the row insert; a dangling reference at
@@ -5001,5 +5078,151 @@ spec:
     #[test]
     fn no_repositories_is_silent() {
         assert!(validate_repository_storage_path_deprecated(&DesiredState::default()).is_empty());
+    }
+
+    // ---- quotaBytes: retired, not deferred -----------------------------
+    //
+    // The field stays in the `deny_unknown_fields` spec so this
+    // rejection can replace an `unknown field` parse error, which means
+    // every test here goes through the real parser: "it still parses"
+    // and "the apply refuses it" are both load-bearing.
+
+    /// A repository envelope with the given `quotaBytes:` body (pass
+    /// `""` for an envelope that declares none).
+    fn repo_yaml_with_quota(name: &str, quota_line: &str) -> Vec<u8> {
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: {name}
+spec:
+  name: {name}
+  format: npm
+  type: hosted
+  storage: {{ backend: filesystem }}
+{quota_line}  isPublic: true
+  replicationPriority: immediate
+"
+        )
+        .into_bytes()
+    }
+
+    /// One error per declaring repository, carrying that repository's
+    /// key — and the message says the field is **retired** and was never
+    /// enforced, not that enforcement is pending, because the two tell
+    /// an operator to do opposite things with the line.
+    #[test]
+    fn declared_quota_bytes_is_refused_once_per_repository() {
+        let state = DesiredState::parse_files(vec![
+            (
+                p("a.yaml"),
+                repo_yaml_with_quota("alpha", "  quotaBytes: 1073741824\n"),
+            ),
+            (
+                p("b.yaml"),
+                repo_yaml_with_quota("beta", "  quotaBytes: 1\n"),
+            ),
+            (p("c.yaml"), repo_yaml_with_quota("gamma", "")),
+        ])
+        .unwrap();
+
+        let errors = validate_repository_quota_bytes_retired(&state);
+        assert_eq!(errors.len(), 2, "one per declaring repo: {errors:?}");
+
+        let rendered: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            rendered[0].contains("alpha") && rendered[1].contains("beta"),
+            "each error names its own offender: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|m| m.contains("gamma")),
+            "the repository that declares none is untouched: {rendered:?}"
+        );
+        assert!(
+            rendered[0].contains("retired"),
+            "the message says retired: {}",
+            rendered[0]
+        );
+        assert!(
+            rendered[0].contains("never enforced"),
+            "the message says it never worked, not that it is pending: {}",
+            rendered[0]
+        );
+        assert!(
+            !rendered[0].contains("not yet"),
+            "`not yet` would promise a future the maintainer decided against: {}",
+            rendered[0]
+        );
+        assert!(
+            rendered[0].contains("Remove the field to apply"),
+            "the message names the operator's recourse: {}",
+            rendered[0]
+        );
+    }
+
+    /// A **positive** value is the shape that used to pass every check
+    /// in the system, so it is the one the retirement exists for: the
+    /// per-envelope `quotaBytes must be > 0` validator accepts it and
+    /// this rule is what refuses the apply.
+    #[test]
+    fn a_positive_quota_bytes_passes_envelope_validation_and_is_refused_here() {
+        let state = DesiredState::parse_files(vec![(
+            p("a.yaml"),
+            repo_yaml_with_quota("alpha", "  quotaBytes: 1073741824\n"),
+        )])
+        .unwrap();
+
+        assert!(
+            validate_repository(&state.repositories[0]).is_empty(),
+            "the per-envelope pass has no objection to a positive value — \
+             which is why the retirement is an apply-time rule"
+        );
+        assert_eq!(validate_repository_quota_bytes_retired(&state).len(), 1);
+    }
+
+    /// A non-positive value is refused twice over: the pre-existing
+    /// per-envelope shape check still fires (its own tests in
+    /// `crate::repository` pin the message), and this rule fires too —
+    /// so no shape of the field reaches a committing apply.
+    #[test]
+    fn a_non_positive_quota_bytes_is_refused_by_both_passes() {
+        for line in ["  quotaBytes: 0\n", "  quotaBytes: -100\n"] {
+            let state =
+                DesiredState::parse_files(vec![(p("a.yaml"), repo_yaml_with_quota("alpha", line))])
+                    .unwrap();
+            assert!(
+                validate_repository(&state.repositories[0])
+                    .iter()
+                    .any(|e| e.to_string().contains("quotaBytes must be > 0")),
+                "the pre-existing shape check still fires on {line:?}"
+            );
+            assert_eq!(
+                validate_repository_quota_bytes_retired(&state).len(),
+                1,
+                "the retirement does not care which value it is: {line:?}"
+            );
+        }
+    }
+
+    /// An envelope **without** the field applies cleanly — the
+    /// counter-assertion that the refusal is not over-broad. Without
+    /// this, a rule that rejected every repository would pass every
+    /// assertion above.
+    #[test]
+    fn an_envelope_without_quota_bytes_is_silent() {
+        let state =
+            DesiredState::parse_files(vec![(p("a.yaml"), repo_yaml_with_quota("alpha", ""))])
+                .unwrap();
+        assert!(
+            validate_repository_quota_bytes_retired(&state).is_empty(),
+            "dropping the line is the remedy, so it cannot be a finding"
+        );
+    }
+
+    /// An empty desired state produces nothing — the counter-assertion
+    /// that the tests above are not passing on an empty corpus.
+    #[test]
+    fn no_repositories_yields_no_quota_finding() {
+        assert!(validate_repository_quota_bytes_retired(&DesiredState::default()).is_empty());
     }
 }

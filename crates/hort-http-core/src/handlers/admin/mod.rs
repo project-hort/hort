@@ -6,6 +6,7 @@
 //! - `GET    /gitops/apply-status`                        — this process's boot apply (read-only)
 //! - `GET    /quarantine/patch-candidates`                — list patch-candidate surface (curator-or-admin)
 //! - `POST   /quarantine/provenance-misrejections/repair` — one-shot repair of D6's illegal state (dry-run by default)
+//! - `GET    /inventory`                                 — per-repository live-catalog readout (admin)
 //!
 //! Mounted under `/api/v1/admin` by [`crate::router::build_router`].
 //! Every handler in this module declares an authorization extractor as its
@@ -116,6 +117,14 @@ pub mod retention;
 /// module's own docs for why the admin gate rather than the curator one.
 pub mod provenance_misrejections;
 
+/// The per-repository live-catalog readout
+/// (`GET /api/v1/admin/inventory`) — the measurement a retention
+/// before/after needs. Part of this module's [`AdminPrincipal`]-gated
+/// `admin_routes()` tree: it enumerates every repository the
+/// installation declares, so there is no per-repository authority that
+/// answers the same question.
+pub mod inventory;
+
 /// Build the admin route tree. Mount under `/admin` in the top-level router.
 pub fn admin_routes() -> Router<Arc<AppContext>> {
     Router::new()
@@ -192,6 +201,19 @@ pub fn admin_routes() -> Router<Arc<AppContext>> {
         // the routes above); the use-case-side `require_admin()` is a
         // no-op defence-in-depth check. Read-only — no domain event.
         .route("/workers", get(get_scanner_workers))
+        // Admin-only readout of what each repository's live catalog
+        // holds — live rows, distinct contents, and the weight of those
+        // contents. Gated by the `AdminPrincipal` extractor (same as
+        // the routes above); the use-case-side `require_admin()` is a
+        // no-op defence-in-depth check. Read-only — no domain event.
+        //
+        // Mounted as `/inventory` and deliberately NOT as
+        // `/repositories/inventory`: a static segment beside the
+        // `/repositories/{key}` route above wins the match, so a
+        // repository whose key happened to be `inventory` would become
+        // unresolvable through the lookup endpoint that exists so
+        // tooling can resolve a key to its UUID.
+        .route("/inventory", get(inventory::get_inventory))
     // There are no REST writes to repository_upstream_mappings;
     // gitops is the only writer. The standalone `UpstreamMappingSpec` gitops
     // kind is that writer — ApplyConfigUseCase emits RepositoryUpstreamMapping
@@ -318,6 +340,16 @@ impl EffectiveScanPolicyDto {
 /// here derives `Serialize` for API purposes beyond what already exists
 /// on [`PrefetchPolicy`] (a plain CRUD config value with no secret
 /// fields).
+///
+/// **No `quota_bytes`.** This response reports the *effective applied*
+/// configuration (ADR 0058), and a quota is no longer applicable: the
+/// apply refuses the field
+/// (`hort_config::desired::validate_repository_quota_bytes_retired`) and
+/// nothing ever enforced it. Any value still in the column is a
+/// pre-existing row's leftover, so echoing it would report as effective
+/// configuration something that is neither effective nor settable —
+/// which is worse than omitting it, because this surface is where an
+/// operator goes to confirm what a repository is actually running.
 #[derive(Debug, Serialize)]
 struct EffectiveRepositoryConfigResponse {
     key: String,
@@ -327,7 +359,6 @@ struct EffectiveRepositoryConfigResponse {
     is_public: bool,
     storage_backend: String,
     download_audit_enabled: bool,
-    quota_bytes: Option<i64>,
     index_mode: String,
     prefetch_policy: PrefetchPolicy,
     curation_rule_names: Vec<String>,
@@ -373,7 +404,6 @@ async fn get_repository_effective_config(
         is_public: repo.is_public,
         storage_backend: repo.storage_backend,
         download_audit_enabled: repo.download_audit_enabled,
-        quota_bytes: repo.quota_bytes,
         index_mode: repo.index_mode.to_string(),
         prefetch_policy: repo.prefetch_policy,
         curation_rule_names: repo.curation_rule_names,
@@ -1131,6 +1161,67 @@ mod tests {
         (router, repos)
     }
 
+    // ----- GET /admin/inventory — per-repository catalog readout -----
+
+    /// The readout is mounted where the module docs promise. An
+    /// unmounted route would not 404 on its own here — axum falls
+    /// through to the not-found fallback — so "not 404" is the
+    /// discriminator between a mounted gated route and a missing one.
+    #[tokio::test]
+    async fn inventory_route_is_mounted() {
+        let (router, _repos) = lookup_harness();
+        let mut req = Request::get("/admin/inventory")
+            .body(Body::empty())
+            .unwrap();
+        crate::middleware::auth::test_support::inject_optional_principal_some(
+            &mut req,
+            principal_with_claims(&["admin"]),
+        );
+
+        let response = router.oneshot(req).await.expect("response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "`GET /admin/inventory` is the path the module docs promise"
+        );
+    }
+
+    /// **The readout's path does not shadow the repository lookup.**
+    ///
+    /// This is why it is mounted at `/inventory` rather than at
+    /// `/repositories/inventory`: a static segment there would win the
+    /// match against `/repositories/{key}`, and the lookup endpoint
+    /// exists precisely so tooling can resolve a stable key to the UUID
+    /// minted at first apply. A repository an operator keyed `inventory`
+    /// would have become unresolvable. Seeded with exactly that key, so
+    /// a future move of the route fails here.
+    #[tokio::test]
+    async fn a_repository_keyed_inventory_is_still_resolvable() {
+        use hort_app::use_cases::test_support::sample_repository;
+        let (router, repos) = lookup_harness();
+
+        let mut row = sample_repository();
+        row.key = "inventory".into();
+        repos.insert(row);
+
+        let response = router
+            .oneshot(admin_get(
+                "inventory",
+                Some(principal_with_claims(&["admin"])),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["key"], "inventory",
+            "the lookup endpoint still answers for this key: {body}"
+        );
+    }
+
     // ----- GET /admin/repositories/:key — repository lookup ----------
 
     #[tokio::test]
@@ -1349,6 +1440,42 @@ mod tests {
         );
         assert_eq!(v["scan_policy"]["severity_threshold"], "critical");
         assert_eq!(v["scan_policy"]["quarantine_duration_secs"], 0);
+    }
+
+    /// **No `quota_bytes` anywhere in the body** — asserted on absence
+    /// rather than on a value, because a value is exactly what this can
+    /// no longer legitimately report. The apply refuses the field, so
+    /// anything still in the column is a pre-existing row's leftover,
+    /// and this response's contract (ADR 0058) is the *effective
+    /// applied* config.
+    #[tokio::test]
+    async fn effective_config_carries_no_quota_field() {
+        use hort_app::use_cases::test_support::sample_repository;
+
+        let (router, mocks) = effective_config_harness();
+        let mut repo = sample_repository();
+        repo.key = "npm-proxy".into();
+        mocks.repositories.insert(repo);
+
+        let response = router
+            .oneshot(effective_config_get(
+                "npm-proxy",
+                Some(principal_with_claims(&["admin"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v.get("quota_bytes").is_none(),
+            "a retired field must not be reported as effective config: {v}"
+        );
+        assert!(
+            !v.to_string().to_lowercase().contains("quota"),
+            "nothing quota-shaped belongs in this projection: {v}"
+        );
     }
 
     #[tokio::test]

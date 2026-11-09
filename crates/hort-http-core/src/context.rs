@@ -34,6 +34,7 @@ use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeUseCase;
 use hort_app::use_cases::pat_cache::PatCache;
 use hort_app::use_cases::patch_candidate_use_case::PatchCandidateUseCase;
+use hort_app::use_cases::repository_inventory_use_case::RepositoryInventoryUseCase;
 use hort_app::use_cases::scanner_worker_query_use_case::ScannerWorkerQueryUseCase;
 // The finding-exclusion HTTP write surface
 // (`POST/DELETE /api/v1/admin/policies/:policy_id/exclusions[/:cve_id]`)
@@ -330,6 +331,19 @@ pub struct AppContext {
     /// `held_pending_signature_candidates`; the drill-down re-decides
     /// every row through the one provenance authority in `hort-app`.
     pub held_set_use_case: Arc<HeldSetUseCase>,
+    /// Admin-only readout of what each repository's live catalog holds
+    /// (`GET /api/v1/admin/inventory`) — live rows, distinct contents,
+    /// and the weight of those contents. The measurement a retention
+    /// before/after needs, which nothing in the product answered until
+    /// this surface existed.
+    ///
+    /// A readout and **not a gauge**: no metric is emitted. Read-only —
+    /// no event, no state transition, no delete. The byte figure is a
+    /// catalog weight: non-additive across repositories, not disk usage
+    /// and not reclaimable space, and it reports no `quota_bytes` —
+    /// nothing ever enforced one and the operator surface that declared
+    /// them is retired, refused at apply.
+    pub repository_inventory_use_case: Arc<RepositoryInventoryUseCase>,
     /// Admin-only read of the `scanner_registry` worker table
     /// (`GET /api/v1/admin/workers`). The use case enforces
     /// `Permission::Admin` (defence in depth — the `AdminPrincipal`
@@ -1010,6 +1024,8 @@ pub struct AppContextParts {
     pub patch_candidate_use_case: Arc<PatchCandidateUseCase>,
     /// See [`AppContext::held_set_use_case`].
     pub held_set_use_case: Arc<HeldSetUseCase>,
+    /// See [`AppContext::repository_inventory_use_case`].
+    pub repository_inventory_use_case: Arc<RepositoryInventoryUseCase>,
     /// See [`AppContext::scanner_worker_query_use_case`].
     pub scanner_worker_query_use_case: Arc<ScannerWorkerQueryUseCase>,
     /// See [`AppContext::effective_repository_config_use_case`].
@@ -1154,6 +1170,7 @@ impl AppContext {
             manual_rescan_use_case: parts.manual_rescan_use_case,
             patch_candidate_use_case: parts.patch_candidate_use_case,
             held_set_use_case: parts.held_set_use_case,
+            repository_inventory_use_case: parts.repository_inventory_use_case,
             scanner_worker_query_use_case: parts.scanner_worker_query_use_case,
             effective_repository_config_use_case: parts.effective_repository_config_use_case,
             gitops_apply_status: parts.gitops_apply_status,

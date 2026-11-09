@@ -112,6 +112,30 @@ pub struct RepositorySpec {
     /// are non-breaking. See `explanation/prefetch-pipeline.md`.
     #[serde(default)]
     pub prefetch_policy: PrefetchPolicy,
+    /// **Retired. Declaring any value fails the apply.**
+    ///
+    /// A quota was never enforced — nothing has ever compared this
+    /// number to a usage figure — while the apply range-checked it, the
+    /// admin effective-config response echoed it and a column stored
+    /// it, so the field looked load-bearing from every side an operator
+    /// could see it from. The apply now refuses it
+    /// ([`crate::desired::validate_repository_quota_bytes_retired`],
+    /// which carries the full reasoning).
+    ///
+    /// **The field survives in the schema solely so that refusal is
+    /// legible.** This spec is `deny_unknown_fields`: deleting the field
+    /// would answer a still-declaring envelope with ``unknown field
+    /// `quotaBytes` ``, which reads as a typo or a version mismatch and
+    /// explains nothing. It is deliberately **not** a deprecation — the
+    /// sibling `path` below is deprecated-not-removed because it still
+    /// parses *and is accepted*, which for an inert field is the
+    /// anti-pattern rather than a retirement of it.
+    ///
+    /// [`validate_quota_bytes_field`] still runs ahead of the apply-time
+    /// rule and still rejects a non-positive value with its own message.
+    /// It is left exactly as it was: it is the shape check it always
+    /// was, the retirement is a separate verdict, and both land on an
+    /// apply that must not commit.
     pub quota_bytes: Option<i64>,
     /// `immediate | scheduled | on_demand | local_only`.
     pub replication_priority: String,
@@ -933,6 +957,12 @@ mod tests {
         );
         let errors = validate_repository(&env);
         assert!(errors.is_empty(), "should be valid: {errors:?}");
+        // `quotaBytes` above is retired, and this pass is still the one
+        // that accepts it — the refusal is an apply-time rule
+        // (`crate::desired::validate_repository_quota_bytes_retired`),
+        // which is why the field must keep parsing: it exists only so
+        // that rule's message can replace an `unknown field` error.
+        assert_eq!(env.spec.quota_bytes, Some(1_073_741_824));
     }
 
     #[test]
