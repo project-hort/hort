@@ -1894,6 +1894,54 @@ scheduledTasks:
     # 7-day horizon gives 6 days of headroom even after a missed run.
     schedule: "30 3 * * *"
 
+  # -- Credential-store retention sweep --------------------
+  # Periodic api-token-retention-sweep CronJob. Inserts ONE
+  # `kind='api-token-retention-sweep'` row into `public.jobs` every tick
+  # using the RUNTIME DSN; the worker picks it up and runs
+  # `ApiTokenRetentionSweepHandler`, which deletes a `public.api_tokens`
+  # row whose own `expires_at` is more than the handler's 90-day
+  # `DEFAULT_HORIZON` in the past, or whose own `revoked_at` is. The
+  # horizon is not a chart value and is not settable at all: the CronJob
+  # runs the subcommand with no arguments and the subcommand writes
+  # `params` unconditionally empty.
+  #
+  # **A row with both marks NULL survives.** `expires_at` and
+  # `revoked_at` are both nullable, and a row with neither set is a
+  # durable identity that never expires — each disjunct of the predicate
+  # requires that row's own mark to be present, so a both-NULL row
+  # matches neither. This is the only sweep in the chart whose DELETE
+  # lands on the table that decides who may do what, so that is its
+  # acceptance criterion rather than a nicety.
+  #
+  # What the 90 days buy: the deleted row carries `last_used_at`,
+  # `last_used_ip` and `last_used_user_agent`, which exist nowhere else
+  # in hort. The credential has been dead since its mark was set, so the
+  # window is not protecting the credential — it keeps the last-use trail
+  # available to an investigation opened within the quarter. Longer than
+  # the three `jobs`-row sweeps' 7 days because those age out operational
+  # accounting and this ages out audit material.
+  #
+  # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
+  # umbrella — and no HTTP invoke route: `hort-http-admin-tasks`
+  # enumerates its invoke routes one by one and no retention kind is
+  # among them. An off-schedule pass is
+  # `hort-server enqueue-api-token-retention-sweep` on the runtime DSN —
+  # the same command this CronJob runs.
+  apiTokenRetentionSweep:
+    executionPath: dsn-direct
+    # Render the CronJob. **Default true.** `api_tokens` grows on every
+    # deployment from day one — one row per issued credential, plus one
+    # per federated workload exchange — and had no horizon at all before
+    # this CronJob, so there is no opt-in gate that would leave the table
+    # empty.
+    enabled: true
+    # Cron schedule. Default: daily at 04:30 UTC (offset from the
+    # prefetch-row sweep's 02:00, the scan-row sweep's 03:00 and the
+    # jobs-row sweep's 03:30 so the DSN-only CronJobs do not contend for
+    # the same minute). The 90-day horizon leaves months of headroom even
+    # after a long outage of this tick.
+    schedule: "30 4 * * *"
+
   # -- Wheel-metadata backfill -----------------------------
   # Periodic wheel-metadata-backfill CronJob. Inserts ONE
   # `kind='wheel-metadata-backfill'` row into `public.jobs` every tick

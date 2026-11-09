@@ -6,7 +6,7 @@ use sqlx::postgres::types::PgInterval;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use hort_domain::entities::api_token::{ApiToken, TokenKind};
+use hort_domain::entities::api_token::{ApiToken, IssuedVia, TokenKind};
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata};
 use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::oidc_issuer::{JwtAlg, OidcIssuer};
@@ -692,7 +692,9 @@ pub(crate) fn stream_id_to_columns(stream_id: &StreamId) -> (String, &'static st
 /// [`Permission::from_str`] — an unknown element surfaces as
 /// [`DomainError::Invariant`] (mirroring the role repo's discipline) rather
 /// than silently dropping. `repository_ids` is `uuid[]` (NULL = inherit user
-/// grants).
+/// grants). `issued_via` is `VARCHAR(32)` with the CHECK added by
+/// `040_api_tokens_issued_via.sql` and maps to [`IssuedVia`] the same way
+/// `kind` maps to [`TokenKind`].
 #[derive(Debug, FromRow)]
 pub struct ApiTokenRow {
     pub id: Uuid,
@@ -711,6 +713,7 @@ pub struct ApiTokenRow {
     pub last_used_user_agent: Option<String>,
     pub created_by_user_id: Uuid,
     pub created_at: DateTime<Utc>,
+    pub issued_via: String,
 }
 
 impl ApiTokenRow {
@@ -723,6 +726,12 @@ impl ApiTokenRow {
     ///   [`Permission::from_str`]. ANY unrecognised element fails the
     ///   conversion — silently dropping a permission could narrow the cap
     ///   in a way that surprises operators reading audit logs.
+    /// - `issued_via` is parsed via [`issued_via_from_text`], for the
+    ///   same reason and with the same verdict: a value the column's
+    ///   CHECK does not admit came from out-of-band SQL, and the
+    ///   permissive reading of this column — `unknown`, which the
+    ///   operator authority query lists as an identity — is exactly
+    ///   what a substituted default would hand back.
     pub fn try_into_api_token(self) -> Result<ApiToken, DomainError> {
         let kind = token_kind_from_text(&self.kind).inspect_err(|_| {
             tracing::warn!(
@@ -730,6 +739,15 @@ impl ApiTokenRow {
                 token_id = %self.id,
                 value = %self.kind,
                 "unknown kind in api_tokens row"
+            );
+        })?;
+
+        let issued_via = issued_via_from_text(&self.issued_via).inspect_err(|_| {
+            tracing::warn!(
+                entity = "ApiToken",
+                token_id = %self.id,
+                value = %self.issued_via,
+                "unknown issued_via in api_tokens row"
             );
         })?;
 
@@ -768,6 +786,7 @@ impl ApiTokenRow {
             last_used_user_agent: self.last_used_user_agent,
             created_by_user_id: self.created_by_user_id,
             created_at: self.created_at,
+            issued_via,
         })
     }
 }
@@ -786,6 +805,20 @@ pub(crate) fn token_kind_from_text(s: &str) -> Result<TokenKind, DomainError> {
             "corrupt kind value in api_tokens row: {other}"
         ))),
     }
+}
+
+/// Convert the stored `api_tokens.issued_via` string into the domain
+/// [`IssuedVia`].
+///
+/// The column's CHECK pins it to [`IssuedVia::as_str`]'s outputs, so any
+/// other literal reached the row around the schema. Fail-closed, like
+/// `kind`: there is no safe substitute, because the value this column
+/// defaults to — `unknown` — is the one the authority query reads as
+/// "an identity, list it".
+pub(crate) fn issued_via_from_text(s: &str) -> Result<IssuedVia, DomainError> {
+    IssuedVia::parse_stored(s).ok_or_else(|| {
+        DomainError::Invariant(format!("corrupt issued_via value in api_tokens row: {s}"))
+    })
 }
 
 /// Render the domain [`TokenKind`] into the wire-format string the
@@ -2155,6 +2188,43 @@ mod tests {
         assert_eq!(original, decoded);
     }
 
+    /// A stored `ApiTokenIssued` payload written before
+    /// `issued_via` existed still decodes through the production read
+    /// path, with no origin recorded.
+    ///
+    /// The sibling in `hort-domain` asserts the struct's own serde
+    /// contract; this one asserts the path a replayed row actually takes
+    /// — `event_type` column + `{"type", "data"}` envelope through
+    /// `deserialize_event_data` — because that is where an additive
+    /// field would surface as a hard `Invariant` error on every
+    /// historical row if it were not additive.
+    #[test]
+    fn event_row_api_token_issued_pre_issued_via_payload_decodes_as_unknown() {
+        use hort_domain::entities::api_token::IssuedVia;
+        let stored = serde_json::json!({
+            "type": "ApiTokenIssued",
+            "data": {
+                "token_id": "0000000a-cef0-0000-0000-000000000000",
+                "user_id": "00000000-0000-0000-0000-000000000ace",
+                "kind": "ServiceAccount",
+                "declared_permissions": ["Read"],
+                "repository_ids": null,
+                "expires_at": "2026-05-13T12:00:00Z",
+                "minted_by_admin_id": null,
+                "at": "2026-05-13T12:00:00Z"
+            }
+        });
+        let decoded = deserialize_event_data("ApiTokenIssued", &stored)
+            .expect("a pre-change stored payload must still decode");
+        match decoded {
+            DomainEvent::ApiTokenIssued(e) => {
+                assert_eq!(e.issued_via, IssuedVia::Unknown);
+                assert_eq!(e.source_issuer, None);
+            }
+            other => panic!("expected ApiTokenIssued, got {other:?}"),
+        }
+    }
+
     /// Companion round-trip for `DomainEvent::RefRetired`, catching any
     /// wire-format drift specific to the retirement event.
     #[test]
@@ -2317,6 +2387,7 @@ mod tests {
             last_used_user_agent: None,
             created_by_user_id: Uuid::from_u128(1),
             created_at: Utc::now(),
+            issued_via: "http_mint".into(),
         }
     }
 
@@ -2386,6 +2457,56 @@ mod tests {
         };
         let token = row.try_into_api_token().unwrap();
         assert!(token.repository_ids.is_none());
+    }
+
+    #[test]
+    fn api_token_row_decodes_every_issued_via_spelling() {
+        use hort_domain::entities::api_token::IssuedVia;
+        for expected in [
+            IssuedVia::Unknown,
+            IssuedVia::AdminCli,
+            IssuedVia::HttpMint,
+            IssuedVia::FederationExchange,
+            IssuedVia::Bootstrap,
+            IssuedVia::ServiceAccountRotation,
+        ] {
+            let row = ApiTokenRow {
+                issued_via: expected.as_str().into(),
+                ..base_api_token_row()
+            };
+            let token = row.try_into_api_token().unwrap();
+            assert_eq!(token.issued_via, expected);
+        }
+    }
+
+    #[test]
+    fn api_token_row_unknown_issued_via_is_invariant() {
+        // The column's CHECK forbids this, so the mapper is
+        // defence-in-depth against out-of-band SQL — and it must refuse
+        // rather than substitute `IssuedVia::Unknown`, which the
+        // operator authority query reads as "an identity, list it".
+        let row = ApiTokenRow {
+            issued_via: "bogus".into(),
+            ..base_api_token_row()
+        };
+        let err = row.try_into_api_token().unwrap_err();
+        assert!(matches!(err, DomainError::Invariant(_)));
+        assert!(err.to_string().contains("bogus"));
+    }
+
+    #[test]
+    fn issued_via_from_text_round_trip() {
+        use hort_domain::entities::api_token::IssuedVia;
+        for via in [
+            IssuedVia::Unknown,
+            IssuedVia::AdminCli,
+            IssuedVia::HttpMint,
+            IssuedVia::FederationExchange,
+            IssuedVia::Bootstrap,
+            IssuedVia::ServiceAccountRotation,
+        ] {
+            assert_eq!(issued_via_from_text(via.as_str()).unwrap(), via);
+        }
     }
 
     #[test]

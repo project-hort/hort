@@ -26,17 +26,84 @@
 //! `LISTEN`s on this channel; the in-transaction emission means
 //! cache drops cannot race ahead of the revocation row's visibility.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use hort_app::metrics::client_ip_bucket;
 use hort_domain::entities::api_token::ApiToken;
 use hort_domain::error::DomainResult;
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
 use hort_domain::types::{Page, PageRequest};
+use sqlx::postgres::types::PgInterval;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::mappers::{token_kind_to_text, ApiTokenRow};
 use crate::{map_sqlx_error, BoxFuture};
+
+/// The credential-store retention sweep's `DELETE`, as one statement.
+///
+/// Named rather than inlined so the predicate a reviewer has to read is
+/// one block of text in one place, and so the unit test below can assert
+/// the shape of it without a database.
+///
+/// **Each disjunct tests a row's own non-NULL mark.** `expires_at` and
+/// `revoked_at` are both nullable (`migrations/008_api_tokens.sql`), so a
+/// row with **neither** set is a durable identity that never expires: it
+/// satisfies neither disjunct and is never deleted. That is the whole
+/// safety property of this statement — the table it reclaims from is the
+/// one that decides who may do what, so the bar is that the predicate
+/// reads as obviously unable to reach a live credential.
+///
+/// Two forms are therefore ruled out, both of which compile, run, and
+/// delete live credentials:
+///
+/// - `COALESCE(expires_at, revoked_at) < now() - $1` — flattens the two
+///   marks, and `COALESCE(NULL, NULL)` is `NULL` only until somebody adds
+///   a third argument to make it total.
+/// - `NOT (expires_at > now() OR revoked_at IS NULL)` and relatives — any
+///   predicate phrased as the negation of "still live" answers `TRUE` for
+///   the row whose liveness is expressed by the *absence* of a mark.
+///
+/// The explicit `IS NOT NULL` guards are redundant under SQL's
+/// three-valued logic (`NULL < anything` is `NULL`, which `WHERE` treats
+/// as not-matched), and are written anyway: they put the NULL reasoning
+/// inside the statement, so a reader checking this `DELETE` against a
+/// live credential does not have to recall a rule from elsewhere.
+///
+/// `issued_via` is deliberately absent. It records which issuance path
+/// minted the row; a sweep that consulted it would retain or discard
+/// credentials by origin rather than by whether they can still
+/// authenticate anybody.
+const DELETE_EXPIRED_OR_REVOKED_SQL: &str = "DELETE FROM public.api_tokens\n\
+                 WHERE (expires_at IS NOT NULL AND expires_at < now() - $1::interval)\n\
+                    OR (revoked_at IS NOT NULL AND revoked_at < now() - $1::interval)";
+
+/// `Duration` → `PgInterval` for the retention sweep's one bind
+/// parameter.
+///
+/// Local to this adapter, matching how `jobs_repository`,
+/// `scanner_registry_repository`, `oidc_issuer_repo` and
+/// `service_account_repo` each carry their own: this crate's convention
+/// is per-adapter, and consolidating the five is a change to four files
+/// this one does not touch (and a real decision, since two of them
+/// *reject* overflow where the other two clamp).
+///
+/// Clamping is the right direction **for a `DELETE`**: `i64::MAX`
+/// microseconds is roughly 292 471 years, so a clamped horizon makes the
+/// predicate match no row at all. An over-long horizon deletes less; a
+/// saturating-to-zero one would delete every expired row at once. The
+/// branch is unreachable from the handler in any case —
+/// `resolve_sweep_horizon` caps the horizon at 365 days, about six orders
+/// of magnitude below the overflow point — so it is tested directly
+/// rather than through the sweep.
+fn duration_to_pg_interval(d: Duration) -> PgInterval {
+    PgInterval {
+        months: 0,
+        days: 0,
+        microseconds: d.as_micros().try_into().unwrap_or(i64::MAX),
+    }
+}
 
 /// Cap on the persisted `last_used_user_agent` length.
 ///
@@ -65,7 +132,7 @@ const SELECT_COLS: &str = r#"
     declared_permissions, repository_ids,
     expires_at, revoked_at,
     last_used_at, last_used_ip, last_used_user_agent,
-    created_by_user_id, created_at
+    created_by_user_id, created_at, issued_via
 "#;
 
 // ---------------------------------------------------------------------------
@@ -126,6 +193,7 @@ impl ApiTokenRepository for PgApiTokenRepository {
             );
 
             let kind_str = token_kind_to_text(token.kind);
+            let issued_via_str = token.issued_via.as_str();
             let perms: Vec<String> = token
                 .declared_permissions
                 .iter()
@@ -140,7 +208,7 @@ impl ApiTokenRepository for PgApiTokenRepository {
                     declared_permissions, repository_ids,
                     expires_at, revoked_at,
                     last_used_at, last_used_ip, last_used_user_agent,
-                    created_by_user_id, created_at
+                    created_by_user_id, created_at, issued_via
                 )
                 VALUES (
                     $1, $2, $3, $4, $5,
@@ -148,7 +216,7 @@ impl ApiTokenRepository for PgApiTokenRepository {
                     $8::text[], $9::uuid[],
                     $10, $11,
                     $12, $13, $14,
-                    $15, $16
+                    $15, $16, $17
                 )
                 "#,
             )
@@ -168,6 +236,7 @@ impl ApiTokenRepository for PgApiTokenRepository {
             .bind(&token.last_used_user_agent)
             .bind(token.created_by_user_id)
             .bind(token.created_at)
+            .bind(issued_via_str)
             .execute(&self.pool)
             .await
             .map_err(|e| map_sqlx_error(&e, "ApiToken", &token.id.to_string()))?;
@@ -328,6 +397,31 @@ impl ApiTokenRepository for PgApiTokenRepository {
             Ok(())
         })
     }
+
+    fn delete_expired_or_revoked_older_than(
+        &self,
+        horizon: Duration,
+    ) -> BoxFuture<'_, DomainResult<u64>> {
+        let interval = duration_to_pg_interval(horizon);
+        Box::pin(async move {
+            // Horizon only — no token id, no prefix, no row identity. The
+            // deleted-row count is the handler's business and reaches an
+            // operator through the task's `result_summary`.
+            tracing::debug!(
+                entity = "ApiToken",
+                horizon_seconds = horizon.as_secs(),
+                "delete_expired_or_revoked_older_than"
+            );
+            let res = sqlx::query(DELETE_EXPIRED_OR_REVOKED_SQL)
+                .bind(interval)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    map_sqlx_error(&e, "ApiToken", "delete_expired_or_revoked_older_than")
+                })?;
+            Ok(res.rows_affected())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +431,114 @@ mod tests {
     // -----------------------------------------------------------------------
     // Pure tests — no database required.
     // -----------------------------------------------------------------------
+
+    /// The retention `DELETE` tests each mark against **its own**
+    /// `IS NOT NULL`.
+    ///
+    /// Asserted on the statement text because the property is a property
+    /// of the text: a database proves the current statement behaves, and
+    /// this proves the next edit of it cannot quietly become one of the
+    /// two forms that reach a live credential. The DB-gated test in
+    /// `tests/api_token_repo.rs` asserts the behaviour against a real
+    /// Postgres; the two together are what make the predicate readable
+    /// *and* correct.
+    /// The statement with every run of whitespace collapsed to one
+    /// space.
+    ///
+    /// The assertions below are about the predicate, not about where the
+    /// literal's line breaks fall — the statement is written across three
+    /// source lines for a reader, and a check that depended on that
+    /// layout would fail the next time it is re-wrapped while saying
+    /// nothing about whether the predicate is still safe.
+    fn normalized_retention_sql() -> String {
+        DELETE_EXPIRED_OR_REVOKED_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn retention_delete_pairs_each_mark_with_its_own_not_null_guard() {
+        let sql = normalized_retention_sql();
+        assert!(
+            sql.contains("expires_at IS NOT NULL AND expires_at < now() - $1::interval"),
+            "the expiry disjunct must require its own mark to be present: {sql}"
+        );
+        assert!(
+            sql.contains("revoked_at IS NOT NULL AND revoked_at < now() - $1::interval"),
+            "the revocation disjunct must require its own mark to be present: {sql}"
+        );
+        assert!(
+            sql.contains(") OR ("),
+            "the two marks are alternatives, not a conjunction: {sql}"
+        );
+    }
+
+    /// The three shapes that would make the sweep reach a row it must
+    /// never reach, or delete by provenance instead of by state.
+    ///
+    /// A counter-assertion to the test above: that one would still pass
+    /// if a `COALESCE` arm were bolted on beside the two correct
+    /// disjuncts, and this one would not.
+    #[test]
+    fn retention_delete_has_no_coalesce_no_negation_and_no_issued_via() {
+        let sql = normalized_retention_sql();
+        let lower = sql.to_ascii_lowercase();
+        assert!(
+            !lower.contains("coalesce"),
+            "a COALESCE over the two marks flattens them and can reach a both-NULL row: {sql}"
+        );
+        // The two `IS NOT NULL` guards are the legitimate `NOT` in this
+        // statement, so they come out before the negation check — which
+        // is then looking for a `NOT` that inverts a liveness test. A
+        // predicate phrased as the negation of "still live" answers TRUE
+        // for the row whose liveness is the *absence* of a mark.
+        let without_guards = lower.replace("is not null", "");
+        assert!(
+            !without_guards.contains("not "),
+            "the only NOT in the predicate must be the two IS NOT NULL guards: {sql}"
+        );
+        assert!(
+            !lower.contains("issued_via"),
+            "the sweep deletes by state, never by provenance: {sql}"
+        );
+        // Counter-assertion: the scan is not vacuous — it is looking at a
+        // statement that really does name the table and both marks.
+        assert!(
+            lower.contains("delete from public.api_tokens")
+                && lower.contains("expires_at")
+                && lower.contains("revoked_at"),
+            "the checks above must be reading the retention DELETE: {sql}"
+        );
+    }
+
+    /// 90 days — the handler's default horizon — round-trips as
+    /// microseconds, with no month or day component. `months`/`days` are
+    /// calendar-relative in Postgres; the horizon is a fixed duration, so
+    /// carrying it entirely in `microseconds` is what keeps the window the
+    /// same length across a DST boundary.
+    #[test]
+    fn duration_to_pg_interval_ninety_days() {
+        let i = duration_to_pg_interval(Duration::from_secs(90 * 24 * 60 * 60));
+        assert_eq!(i.months, 0);
+        assert_eq!(i.days, 0);
+        assert_eq!(i.microseconds, 90 * 24 * 60 * 60 * 1_000_000);
+    }
+
+    /// Overflow clamps to `i64::MAX` microseconds rather than wrapping.
+    ///
+    /// Unreachable from the handler (`resolve_sweep_horizon` caps at 365
+    /// days), and the direction matters anyway: `i64::MAX` microseconds is
+    /// roughly 292 471 years, so a clamped horizon makes the `DELETE`
+    /// match nothing. For a statement that removes credentials, clamping
+    /// up is the safe failure.
+    #[test]
+    fn duration_to_pg_interval_clamps_overflow_to_a_horizon_that_matches_nothing() {
+        let i = duration_to_pg_interval(Duration::from_secs(u64::MAX));
+        assert_eq!(i.microseconds, i64::MAX);
+        assert_eq!(i.months, 0);
+        assert_eq!(i.days, 0);
+    }
 
     /// IPv4 `203.0.113.42` buckets to `203.0.113.0/24`.
     #[test]

@@ -1018,8 +1018,16 @@ pub struct RequeuedJob {
 ///   event-version optimistic concurrency (ADR 0041 Item 3).
 /// - `replay-seen-prune`, `scanner-registry-prune`,
 ///   `prefetch-row-retention-sweep`, `scan-row-retention-sweep`,
-///   `jobs-row-retention-sweep`, `staging-sweep` — `DELETE` over a
-///   predicate: running the set operation twice reaches the same set.
+///   `jobs-row-retention-sweep`, `api-token-retention-sweep`,
+///   `staging-sweep` — `DELETE` over a predicate: running the set
+///   operation twice reaches the same set. `api-token-retention-sweep`
+///   is the one of these whose `DELETE` lands outside `public.jobs`, and
+///   it has a second effect its siblings do not: an `api_tokens` row
+///   removal nulls `subscriptions.created_by_token_id` through that
+///   column's `ON DELETE SET NULL`. That does not weaken the absorption
+///   argument — setting an already-NULL column to NULL is idempotent,
+///   and the loser of the race finds the row gone rather than the
+///   column half-written.
 /// - `oci-index-child-ingest`, `oci-membership-edge-backfill`,
 ///   `wheel-metadata-backfill` — content-addressed ingest / edge
 ///   re-derivation / metadata backfill, all upsert- or CAS-shaped.
@@ -1046,6 +1054,7 @@ pub const REQUEUE_ON_LEASE_EXPIRY_KINDS: &[&str] = &[
     "prefetch-row-retention-sweep",
     "scan-row-retention-sweep",
     "jobs-row-retention-sweep",
+    "api-token-retention-sweep",
     "staging-sweep",
     "oci-index-child-ingest",
     "oci-membership-edge-backfill",

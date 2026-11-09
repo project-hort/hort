@@ -1,0 +1,177 @@
+{{/*
+Credential-store retention-sweep CronJob — the horizon on
+`public.api_tokens`.
+
+Periodically invokes `hort-server enqueue-api-token-retention-sweep`,
+which inserts ONE `kind='api-token-retention-sweep'` row into
+`public.jobs` using the runtime DSN. The always-on worker (`hort-worker`)
+picks the row up and dispatches to `ApiTokenRetentionSweepHandler`, which
+deletes a `public.api_tokens` row whose own `expires_at` is more than the
+90-day `DEFAULT_HORIZON` in the past, or whose own `revoked_at` is. No
+supported path supplies a different horizon: this CronJob runs the
+subcommand with no arguments, the subcommand writes `params`
+unconditionally empty, and there is no chart value and no CLI flag behind
+it.
+
+What it cannot reach, and why that is the point: a row with **both**
+marks NULL. `expires_at` and `revoked_at` are both nullable, and a row
+with neither set is a durable identity that never expires — the handful
+of long-lived credentials an operator administers. Each disjunct of the
+predicate requires that row's own mark to be present, so a both-NULL row
+matches neither and survives. This is the only sweep in the chart whose
+DELETE lands on the table that decides who may do what, so "the
+predicate cannot reach a live credential" is its acceptance criterion
+rather than a nicety.
+
+What the 90 days are actually buying: the deleted row carries
+`last_used_at`, `last_used_ip` and `last_used_user_agent`, which exist
+nowhere else in hort — the event store keeps `ApiTokenIssued`,
+`ApiTokenRevoked` and `ApiTokenUsed`, not those three fields. The
+credential itself has been dead since the moment its mark was set, so the
+window is not protecting the credential; it is keeping the last-use trail
+available to an investigation opened within the quarter. Shortening the
+window shortens that trail and nothing else.
+
+Why the horizon is longer than the three `jobs`-row sweeps' 7 days: those
+age out operational accounting. This one ages out audit material, and the
+two are answering different questions.
+
+Design rationale (delivery path): a default-enabled CronJob going through
+the `hort-cli` HTTP admin-task path would drag the whole
+`svc-token-bootstrap` Job chain + a standing `admin_task_invoke` token
+mount to default-on. The runtime DSN is least-privilege — it can
+`INSERT INTO public.jobs` and read the schema, full stop. Reversing that
+for the credential store is the last place it would be worth doing, which
+is why there is no `POST /api/v1/admin/tasks/api-token-retention-sweep`
+route: that router enumerates its invoke routes one by one and no
+retention kind is among them.
+
+So this CronJob:
+
+  - Uses `hort-server.runtimeEnv` (DSN + log/metric tunables only —
+    same env block the migrate Job uses, MinimalConfig discipline).
+  - Has NO `valueFrom.secretKeyRef` for any svc-token.
+  - Is gated by `apiTokenRetentionSweep.enabled` (default **true** —
+    `api_tokens` grows on every deployment from day one, one row per
+    issued credential plus one per federated workload exchange, and had
+    no horizon at all before this CronJob; there is no opt-in gate that
+    would leave the table empty).
+  - Does NOT depend on `scheduledTasks.adminTasksEnabled` — that toggle
+    gates the svc-token chain this template deliberately avoids.
+
+Default schedule: daily at 04:30 UTC (offset from the prefetch-row
+sweep's 02:00, the scan-row sweep's 03:00 and the jobs-row sweep's 03:30
+so the DSN-only CronJobs do not contend for the same minute; also clear
+of the wheel-metadata backfill's 04:00 Sunday slot). The 90-day horizon
+means even a long outage of this tick leaves the operator with months of
+headroom; the sweep is one DELETE per tick, so cron-tier drift is
+harmless.
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents the
+controller from spawning a second pod while the previous tick is still
+running. (The tick is just one INSERT; controller-restart double-fire is
+harmless — the worker drains both rows, and the DELETE is idempotent: the
+second run finds the first run's rows already gone.)
+
+Hex-onion discipline: `enqueue-api-token-retention-sweep` is an inbound
+CLI adapter (parses MinimalConfig, builds the PgPool, calls
+`JobsRepository::enqueue_task`) — no application logic in the binary
+surface.
+*/}}
+{{- if .Values.scheduledTasks.apiTokenRetentionSweep.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-api-token-retention-sweep
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: api-token-retention-sweep
+spec:
+  schedule: {{ .Values.scheduledTasks.apiTokenRetentionSweep.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
+  # `Forbid` is the cron-conventional choice for "this job is
+  # idempotent but must not overlap itself." The enqueue is one row
+  # insert, so a missed tick is fine — the next tick picks up the
+  # slack within the 90-day retention window.
+  concurrencyPolicy: Forbid
+  # Bound the history Kubernetes retains so a long-running deployment
+  # does not accumulate hundreds of completed Job objects.
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  # Surface a missed-deadline (the previous run still active when
+  # the schedule fires under `Forbid`) as a non-fatal event in the
+  # controller log rather than a CronJob failure. 600s window is
+  # generous for an INSERT-only pod.
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: api-token-retention-sweep
+        spec:
+          serviceAccountName: {{ include "hort-server.serviceAccountName" . }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: enqueue-api-token-retention-sweep
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                - "enqueue-api-token-retention-sweep"
+              env:
+                # DB-only subcommand. The `hort-server.runtimeEnv` helper
+                # populates HORT_DATABASE_URL + log/metric tunables; we
+                # deliberately do NOT mount any svc-token secret here (see
+                # template docstring).
+                {{- include "hort-server.runtimeEnv" . | nindent 16 }}
+                {{- with .Values.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+                {{- /* Gate the mount on the auto-mount source
+                       (configMapName/secretName), NOT on `.path` alone:
+                       with `.path` set but no source the volume below
+                       never renders, leaving a dangling volumeMount that
+                       fails pod admission. */}}
+                {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 16 }}
+                {{- end }}
+                {{- with .Values.extraVolumeMounts }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+            {{- include "hort-server.extraCaBundle.volume" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraVolumes }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

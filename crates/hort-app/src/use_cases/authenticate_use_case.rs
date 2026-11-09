@@ -2907,7 +2907,7 @@ mod tests {
 
         use bytes::Bytes;
         use chrono::DateTime;
-        use hort_domain::entities::api_token::{ApiToken, TokenKind};
+        use hort_domain::entities::api_token::{ApiToken, IssuedVia, TokenKind};
         use hort_domain::entities::rbac::Permission;
         use hort_domain::entities::user::AuthProvider;
         use hort_domain::error::DomainResult;
@@ -3147,6 +3147,7 @@ mod tests {
                 last_used_user_agent: None,
                 created_by_user_id: user_id,
                 created_at: Utc::now(),
+                issued_via: IssuedVia::HttpMint,
             }
         }
 

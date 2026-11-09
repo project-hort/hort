@@ -2249,6 +2249,12 @@ pub struct MockApiTokenRepository {
     /// in-memory append. Mirrors `MockRefRegistry::fail_next_insert`
     /// and ten other `fail_next_*` precedents in this file.
     fail_next_insert: Mutex<Option<DomainError>>,
+    /// Recorded calls to `delete_expired_or_revoked_older_than`. Each
+    /// call appends the horizon argument the sweep ran with.
+    retention_calls: Mutex<Vec<std::time::Duration>>,
+    /// When `Some`, the retention sweep returns this row count instead
+    /// of the default 0.
+    retention_deleted_count: Mutex<Option<u64>>,
 }
 
 impl Default for MockApiTokenRepository {
@@ -2266,6 +2272,8 @@ impl MockApiTokenRepository {
             list_calls: Mutex::new(Vec::new()),
             canned_list: Mutex::new(Vec::new()),
             fail_next_insert: Mutex::new(None),
+            retention_calls: Mutex::new(Vec::new()),
+            retention_deleted_count: Mutex::new(None),
         }
     }
 
@@ -2302,6 +2310,24 @@ impl MockApiTokenRepository {
 
     pub fn list_calls(&self) -> Vec<(Uuid, PageRequest)> {
         self.list_calls.lock().unwrap().clone()
+    }
+
+    /// Recorded calls to `delete_expired_or_revoked_older_than`. Each
+    /// call appends the horizon argument the sweep ran with.
+    ///
+    /// The *empty* vector is as load-bearing as a recorded one here: a
+    /// refused horizon (malformed `params`, or a value above the
+    /// handler's cap) must not reach a `DELETE` against the credential
+    /// store at all, and this is what lets the sweep's tests assert that
+    /// rather than assume it.
+    pub fn retention_calls(&self) -> Vec<std::time::Duration> {
+        self.retention_calls.lock().unwrap().clone()
+    }
+
+    /// Make `delete_expired_or_revoked_older_than` return the configured
+    /// row count on the next call. Default is 0.
+    pub fn set_retention_deleted_count(&self, count: u64) {
+        *self.retention_deleted_count.lock().unwrap() = Some(count);
     }
 }
 
@@ -2372,6 +2398,28 @@ impl hort_domain::ports::api_token_repository::ApiTokenRepository for MockApiTok
     fn revoke(&self, token_id: Uuid) -> BoxFut<'_, DomainResult<()>> {
         self.revokes.lock().unwrap().push(token_id);
         Box::pin(async { Ok(()) })
+    }
+
+    /// Records the horizon and answers the seeded row count.
+    ///
+    /// Deliberately **not** a round-trip over the seeded `by_id` map: the
+    /// predicate this stands in for is SQL (`expires_at` / `revoked_at`
+    /// against `now() - $horizon`, each behind its own `IS NOT NULL`), and
+    /// a Rust re-implementation of it here would be a second copy of the
+    /// rule whose agreement with the real statement nothing checks — the
+    /// mock would answer about the copy. What the handler owes a test is
+    /// *which horizon it asked for* and *what it reports back*, and those
+    /// are what this records. The predicate itself is proven against a
+    /// real Postgres in
+    /// `crates/hort-adapters-postgres/tests/api_token_repo.rs`, one test
+    /// per NULL case.
+    fn delete_expired_or_revoked_older_than(
+        &self,
+        horizon: std::time::Duration,
+    ) -> BoxFut<'_, DomainResult<u64>> {
+        self.retention_calls.lock().unwrap().push(horizon);
+        let count = self.retention_deleted_count.lock().unwrap().unwrap_or(0);
+        Box::pin(async move { Ok(count) })
     }
 }
 
@@ -10248,7 +10296,7 @@ mod tests {
     ///    and appends normally.
     #[tokio::test]
     async fn mock_api_token_repository_fail_next_insert_arms_once_then_resets() {
-        use hort_domain::entities::api_token::{ApiToken, TokenKind};
+        use hort_domain::entities::api_token::{ApiToken, IssuedVia, TokenKind};
         use hort_domain::ports::api_token_repository::ApiTokenRepository;
 
         let mock = MockApiTokenRepository::new();
@@ -10270,6 +10318,7 @@ mod tests {
             last_used_user_agent: None,
             created_by_user_id: Uuid::new_v4(),
             created_at: Utc::now(),
+            issued_via: IssuedVia::HttpMint,
         };
 
         // (1) Unarmed → Ok, row persisted.

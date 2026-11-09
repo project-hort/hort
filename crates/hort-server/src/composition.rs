@@ -5176,7 +5176,7 @@ mod tests {
         // change here rather than only in the catalog.
         assert_eq!(
             KIND_SERIES.len() * TaskTier::ALL.len(),
-            26 * 3,
+            27 * 3,
             "the per-kind series are bounded by every value `jobs.kind` can hold \
              (EVENT_TASK_KINDS, held against the column's CHECK by \
              task_kind_check_lockstep_guard) times the three classes"

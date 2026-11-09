@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use hort_app::use_cases::api_token_use_case::{ApiTokenError, IssueTokenRequest, IssuedToken};
-use hort_domain::entities::api_token::{ApiToken, TokenKind};
+use hort_domain::entities::api_token::{ApiToken, IssuedVia, TokenKind};
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
 use hort_domain::events::ApiActor;
@@ -298,6 +298,12 @@ pub struct TokenSummary {
     pub revoked_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Which issuance path minted the row
+    /// ([`IssuedVia`](hort_domain::entities::api_token::IssuedVia)) — the
+    /// same vocabulary the column stores, so the answer an operator gets
+    /// from this endpoint and the one they get from a hand-written query
+    /// are the same string.
+    pub issued_via: &'static str,
 }
 
 /// Page-of-tokens response shape.
@@ -515,6 +521,11 @@ fn parse_request(body: IssueTokenRequestBody) -> Result<IssueTokenRequest, ApiTo
         // The self-mint / admin-mint REST endpoint is not
         // federation. The federation branch lives on /auth/exchange.
         federation_source: None,
+        // Server-side, and deliberately absent from
+        // `IssueTokenRequestBody`: a caller that could name its own
+        // origin could label an HTTP-minted token as any other path,
+        // and the column exists to be trusted.
+        issued_via: IssuedVia::HttpMint,
     })
 }
 
@@ -552,6 +563,7 @@ fn token_summary(token: &ApiToken) -> TokenSummary {
         revoked_at: token.revoked_at,
         last_used_at: token.last_used_at,
         created_at: token.created_at,
+        issued_via: token.issued_via.as_str(),
     }
 }
 
@@ -1021,6 +1033,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             last_used_user_agent: None,
             created_by_user_id: user_id,
             created_at: Utc::now(),
+            issued_via: IssuedVia::HttpMint,
         });
         let mut req = Request::delete(format!("/users/me/tokens/{token_id}"))
             .body(Body::empty())
@@ -1072,6 +1085,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             last_used_user_agent: None,
             created_by_user_id: other_user_id,
             created_at: Utc::now(),
+            issued_via: IssuedVia::HttpMint,
         });
         let mut req = Request::delete(format!("/users/me/tokens/{token_id}"))
             .body(Body::empty())
@@ -1112,6 +1126,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
                     last_used_user_agent: None,
                     created_by_user_id: user_id,
                     created_at: Utc::now(),
+                    issued_via: IssuedVia::HttpMint,
                 };
                 2
             ]);
@@ -1131,7 +1146,31 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         for item in v["items"].as_array().unwrap() {
             assert!(item.get("token_hash").is_none());
             assert!(item.get("token").is_none());
+            // The provenance an operator filters on, in the same
+            // spelling the column stores — the whole point of the field
+            // is that the API answer and a hand-written query agree.
+            assert_eq!(item["issued_via"], "http_mint");
         }
+    }
+
+    #[tokio::test]
+    async fn issue_request_body_cannot_name_its_own_origin() {
+        // `issued_via` is set server-side by `parse_request` and is
+        // deliberately absent from `IssueTokenRequestBody`: a caller
+        // that could name its own origin could label an HTTP-minted
+        // token `bootstrap` or hide one from the operator query by
+        // claiming `federation_exchange`, and the column exists to be
+        // trusted. `deny_unknown_fields` is not in play here — serde
+        // ignores the extra key — so what makes this safe is that the
+        // DTO has no field to carry it.
+        let body: IssueTokenRequestBody = serde_json::from_str(
+            r#"{"name":"ci","declared_permissions":["read"],"issued_via":"bootstrap"}"#,
+        )
+        .expect("an unknown key is ignored, not an error");
+        let Ok(request) = parse_request(body) else {
+            panic!("a valid permission set parses");
+        };
+        assert_eq!(request.issued_via, IssuedVia::HttpMint);
     }
 
     #[tokio::test]
@@ -1290,6 +1329,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             last_used_user_agent: None,
             created_by_user_id: owner_id,
             created_at: Utc::now(),
+            issued_via: IssuedVia::HttpMint,
         });
         let mut req = Request::delete(format!("/admin/tokens/{token_id}"))
             .body(Body::empty())

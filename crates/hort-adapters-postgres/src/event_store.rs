@@ -1979,6 +1979,105 @@ mod tests {
         out
     }
 
+    /// A stream carrying BOTH shapes of a payload whose struct gained a
+    /// field verifies `Ok` — the additive `ApiTokenIssued.issued_via`
+    /// case, asserted rather than reasoned about.
+    ///
+    /// The reason it holds is the one thing a reviewer of such a change
+    /// has to check: the chain attests the payload **as the column holds
+    /// it**, so a row written before the field existed is hashed over
+    /// the bytes it was stored with, and a struct that can now
+    /// deserialise those bytes changes nothing about them. A change that
+    /// instead re-serialised a stored row through the new struct — to
+    /// "normalise" it, say — would write the new key into the hashed
+    /// bytes and break every chain it touched.
+    #[test]
+    fn chain_verifies_across_an_additively_extended_payload() {
+        let sid = "user-deadbeef";
+        // Position 0: the stored bytes of an event appended before the
+        // field existed. Hand-written, because the point is a payload
+        // the current struct cannot produce.
+        let legacy = serde_json::json!({
+            "type": "ApiTokenIssued",
+            "data": {
+                "token_id": "0000000a-cef0-0000-0000-000000000000",
+                "user_id": "00000000-0000-0000-0000-000000000ace",
+                "kind": "ServiceAccount",
+                "declared_permissions": ["Read"],
+                "repository_ids": null,
+                "expires_at": "2026-05-13T12:00:00Z",
+                "minted_by_admin_id": null,
+                "at": "2026-05-13T12:00:00Z"
+            }
+        });
+        // Position 1: the same event type as the current code writes it,
+        // through the same `serialize_event_data` the append path binds.
+        let current = serialize_event_data(&DomainEvent::ApiTokenIssued(
+            hort_domain::events::ApiTokenIssued {
+                token_id: Uuid::from_u128(0x000A_CEF1),
+                user_id: Uuid::from_u128(0xACE),
+                kind: hort_domain::entities::api_token::TokenKind::ServiceAccount,
+                declared_permissions: vec![hort_domain::entities::rbac::Permission::Read],
+                repository_ids: None,
+                expires_at: None,
+                minted_by_admin_id: None,
+                at: chrono::Utc::now(),
+                source_issuer: None,
+                source_jti: None,
+                source_sub: None,
+                issued_via: hort_domain::entities::api_token::IssuedVia::ServiceAccountRotation,
+            },
+        ));
+        assert!(
+            legacy["data"].get("issued_via").is_none(),
+            "the legacy fixture must be the pre-change shape"
+        );
+        assert!(
+            current["data"].get("issued_via").is_some(),
+            "the current shape must carry the field"
+        );
+
+        // Chain them the way `append_with_conn` does.
+        let mut prev = genesis_hash();
+        let mut chained = Vec::new();
+        for (position, payload) in [&legacy, &current].into_iter().enumerate() {
+            let env = synthetic_envelope(position as u64);
+            let hash = compute_event_hash(&ChainInput {
+                prev_event_hash: prev,
+                event_id: env.event_id,
+                stream_id: sid,
+                stream_category: env.stream_category,
+                stream_position: position as u64,
+                event_type: "ApiTokenIssued",
+                event_version: 1,
+                payload,
+                correlation_id: env.correlation_id,
+                causation_id: env.causation_id,
+                actor: env.actor,
+            });
+            chained.push((payload, prev, hash));
+            prev = hash;
+        }
+        let rows: Vec<StreamRow> = chained
+            .iter()
+            .enumerate()
+            .map(|(i, (payload, prev, hash))| {
+                row_view(
+                    sid,
+                    i as u64,
+                    payload,
+                    synthetic_envelope(i as u64),
+                    *prev,
+                    *hash,
+                )
+            })
+            .collect();
+        match verify_stream_chain(&StreamRows::new(&rows)) {
+            StreamVerdict::Ok { position, .. } => assert_eq!(position, 1),
+            other => panic!("a mixed-shape stream must verify Ok, got {other:?}"),
+        }
+    }
+
     /// Untampered: the chain the append path computes verifies `Ok`.
     #[test]
     fn appended_chain_verifies_ok() {

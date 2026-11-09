@@ -1,12 +1,24 @@
-//! Shared `params` → horizon resolution for the three `jobs`-row
-//! retention sweeps (`prefetch-row-retention-sweep`,
-//! `scan-row-retention-sweep`, `jobs-row-retention-sweep`).
+//! Shared `params` → horizon resolution for the retention sweeps.
 //!
-//! All three take the same single-field `params` shape, default to their
-//! own 7-day constant when the field is absent, and reject a value above
-//! their own 365-day cap as a non-retryable configuration error. The
-//! three copies were near-verbatim; the resolution rule lives here once
-//! so a change to it cannot land on two sweeps and miss the third.
+//! Every sweep that ages rows out on a window resolves that window
+//! here — the three over `public.jobs`
+//! (`prefetch-row-retention-sweep`, `scan-row-retention-sweep`,
+//! `jobs-row-retention-sweep`) and the one over `public.api_tokens`
+//! (`api-token-retention-sweep`). They all take the same single-field
+//! `params` shape, fall back to **their own** default constant when the
+//! field is absent, and reject a value above **their own** cap as a
+//! non-retryable configuration error. The copies were near-verbatim; the
+//! resolution rule lives here once so a change to it cannot land on some
+//! of the sweeps and miss the rest.
+//!
+//! What this module decides is a **duration**, and nothing beyond it. The
+//! default and the cap are the caller's arguments, not constants here —
+//! the `jobs`-row sweeps read 7 days and the credential-store sweep 90 —
+//! and so is the predicate the resolved duration is then compared
+//! against: a `jobs` row ages on `updated_at`, while an `api_tokens` row
+//! has no `updated_at` column at all and ages on its own `expires_at` or
+//! `revoked_at`. Each caller owns its column; this module owns the parse
+//! and the cap.
 //!
 //! # No supported path supplies `horizon_seconds`
 //!
@@ -14,15 +26,19 @@
 //! `params` object: the Helm CronJobs and the systemd timers both run
 //! `hort-server enqueue-<kind>`, and those subcommands take no arguments
 //! and write `{}` unconditionally. The `hort-http-admin-tasks` router
-//! enumerates its invoke routes one by one and none of the three
-//! retention kinds is among them, so `POST
-//! /api/v1/admin/tasks/<kind>` answers 404. The field is therefore
+//! enumerates its invoke routes one by one and **no** retention kind is
+//! among them, so a `POST /api/v1/admin/tasks/<kind>` for one of them
+//! reaches no invoke handler at all (it falls through to the router's
+//! `GET /{id}` pattern, which carries no `post`). The field is therefore
 //! readable by the handler and supplied by nothing short of a
 //! hand-written `INSERT` into `public.jobs`, which means the default is
 //! the horizon in force on every deployment. The parse and the cap are
 //! kept because they are what makes that statement safe: a
 //! hand-written row with a nonsense value fails the task instead of
-//! running a year-wide `DELETE`.
+//! running a year-wide `DELETE` — and since one caller's `DELETE` is
+//! against the credential store, that is the difference between a
+//! refused task and an unreviewed retention window on the table that
+//! decides who may do what.
 
 use std::time::Duration;
 
@@ -34,14 +50,16 @@ use hort_domain::ports::task_handler::TaskOutcome;
 /// message in the unit an operator would have reasoned in.
 const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
-/// Parsed shape of the `params` JSONB column for any of the three
-/// retention sweeps.
+/// Parsed shape of the `params` JSONB column for any retention sweep.
 #[derive(Debug, Deserialize, Default)]
 struct SweepHorizonParams {
-    /// Retention horizon in seconds. Rows whose `updated_at` is older
-    /// than `now() - horizon_seconds` are eligible for deletion.
-    /// Absent on every supported enqueue path (see the module docs), in
-    /// which case the caller's default applies.
+    /// Retention horizon in seconds — the length of the window, and
+    /// nothing about which column it is measured from. Each caller
+    /// compares it against its own table's timestamp: `updated_at` for
+    /// the three `jobs`-row sweeps, a row's own `expires_at` or
+    /// `revoked_at` for the credential-store sweep, whose table has no
+    /// `updated_at` column. Absent on every supported enqueue path (see
+    /// the module docs), in which case the caller's default applies.
     #[serde(default)]
     horizon_seconds: Option<u64>,
 }
@@ -52,7 +70,7 @@ struct SweepHorizonParams {
 /// failure modes — malformed `params` and a value above `max`. Neither
 /// is transient: re-running the same row produces the same verdict, so
 /// retrying only burns attempts. `kind` is carried solely to name the
-/// sweep in those two messages; all three sweeps otherwise resolve
+/// sweep in those two messages; every sweep otherwise resolves
 /// identically.
 pub(crate) fn resolve_sweep_horizon(
     kind: &str,

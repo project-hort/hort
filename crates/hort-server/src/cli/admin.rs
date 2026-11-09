@@ -52,7 +52,7 @@ use hort_app::use_cases::api_token_use_case::{
     DEFAULT_SVC_EXPIRY_DAYS,
 };
 use hort_app::use_cases::user_use_case::{CreateUser, UserPrivileges, UserUseCase};
-use hort_domain::entities::api_token::ApiToken;
+use hort_domain::entities::api_token::{ApiToken, IssuedVia};
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
 use hort_domain::entities::user::{AuthProvider, User};
@@ -653,6 +653,10 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
                 expires_in_seconds: None,
                 // CLI issuance is not federation.
                 federation_source: None,
+                // An operator at a terminal declaring the cap, as
+                // against the rotation reconciler's unattended snapshot
+                // through this same system mint.
+                issued_via: IssuedVia::AdminCli,
             },
         )
         .await
@@ -2103,6 +2107,7 @@ mod tests {
             last_used_user_agent: None,
             created_by_user_id: user_id,
             created_at: chrono::Utc::now(),
+            issued_via: IssuedVia::AdminCli,
         }
     }
 

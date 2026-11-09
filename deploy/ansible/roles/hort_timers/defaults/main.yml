@@ -56,6 +56,12 @@ hort_timers_tasks:
     on_calendar: "*-*-* 03:30:00"    # daily 03:30 (Helm: 30 3 * * *)
     enabled: true
     description: "Delete terminal job rows older than the retention horizon for every kind the two kind-specific sweeps do not reach; retains per kind the newest completed row and the newest terminal row, which the liveness gauges and the prefetch rotation cursor read."
+  - kind: api-token-retention-sweep
+    path: dsn-direct
+    exec_subcommand: enqueue-api-token-retention-sweep
+    on_calendar: "*-*-* 04:30:00"    # daily 04:30 (Helm: 30 4 * * *)
+    enabled: true
+    description: "Delete api_tokens rows whose own expires_at or revoked_at is older than the 90-day retention horizon; a row with both marks NULL is a durable identity and is never reached. The only sweep here whose DELETE lands outside public.jobs, and api_tokens had no horizon at all before it."
   # ── enabled — admin-task (hort-cli; needs the cronjob-tasks token) ───────────
   - kind: scanner-registry-prune
     path: admin-task

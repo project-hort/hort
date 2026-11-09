@@ -43,7 +43,7 @@ use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
 use hort_app::use_cases::pat_validation_use_case::{PatLockoutConfig, PatValidationUseCase};
 use hort_app::use_cases::test_support::{sample_repository, MockEventStore, MockIdentityProvider};
 
-use hort_domain::entities::api_token::{ApiToken, TokenKind};
+use hort_domain::entities::api_token::{ApiToken, IssuedVia, TokenKind};
 use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
 use hort_domain::entities::repository::RepositoryFormat;
@@ -262,6 +262,7 @@ fn build_harness_with_lockout(lockout: PatLockoutConfig) -> Harness {
         last_used_user_agent: None,
         created_by_user_id: user_id,
         created_at: now,
+        issued_via: IssuedVia::HttpMint,
     };
 
     let token_repo: Arc<dyn ApiTokenRepository> = {
