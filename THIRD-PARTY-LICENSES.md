@@ -112,7 +112,7 @@ the result instead.
 | regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
 | regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.29.0 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.29.1 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
@@ -322,9 +322,9 @@ the result instead.
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
 | once_cell_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/once_cell_polyfill |
-| serde_spanned | 1.1.2 | MIT | https://github.com/toml-rs/toml |
-| toml | 1.2.0+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
-| toml_datetime | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| serde_spanned | 1.1.3 | MIT | https://github.com/toml-rs/toml |
+| toml | 1.2.1+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml_datetime | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_parser | 1.1.5+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_writer | 1.2.0+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | num-conv | 0.2.1 | MIT | https://github.com/jhpratt/num-conv |
@@ -6686,7 +6686,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.29.0 — MIT
+### uuid 1.29.1 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
@@ -13409,7 +13409,7 @@ SOFTWARE.
 
 ```
 
-### serde_spanned 1.1.2 — MIT
+### serde_spanned 1.1.3 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -13436,7 +13436,7 @@ SOFTWARE.
 
 ```
 
-### toml 1.2.0+spec-1.1.0 — MIT
+### toml 1.2.1+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -13463,7 +13463,7 @@ SOFTWARE.
 
 ```
 
-### toml_datetime 1.1.2+spec-1.1.0 — MIT
+### toml_datetime 1.1.3+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
