@@ -97,7 +97,7 @@ use hort_domain::events::{
     Actor, DomainEvent, InternalActor, TaskFailed, ADMIN_INVOKABLE_TASK_KINDS,
 };
 use hort_domain::policy::{evaluate_class_service, ClassService};
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
     ClaimReservation, JobRow, JobsRepository, KindQueueSample, PendingKindBacklog, PriorityBand,
     QueueServiceSample, RequeueOutcome, REQUEUE_ON_LEASE_EXPIRY_KINDS,
@@ -114,6 +114,9 @@ use crate::event_store_publisher::EventStorePublisher;
 use crate::result_write_fence::surface_attempted_result_write;
 use crate::retry_backoff::compute_backoff;
 use crate::use_cases::task_use_case::TaskUseCase;
+use crate::use_cases::{
+    append_any_with_conflict_retry, event_append_backoff, EVENT_APPEND_RETRY_ATTEMPTS,
+};
 
 // ---------------------------------------------------------------------------
 // Metric name constants
@@ -1614,7 +1617,7 @@ impl TaskDispatcher {
     /// The `jobs` row records a failure for seven days and then the
     /// retention sweep removes it; this is the durable half. It pairs
     /// with the enqueue path's `TaskInvoked`, and the pairing is the
-    /// whole design — four conditions follow from it, and each one is
+    /// whole design — five conditions follow from it, and each one is
     /// load-bearing.
     ///
     /// **Routed through [`TaskUseCase::task_audit_stream`], never
@@ -1627,6 +1630,21 @@ impl TaskDispatcher {
     /// refused or failed destructive run is the half an operator came
     /// to read. A second copy of the routing rule here is how the two
     /// halves would come to disagree.
+    ///
+    /// **Retried on the same budget `TaskInvoked` is.** The two halves
+    /// land on one stream on purpose, so they need one durability
+    /// promise rather than two, and both get it from
+    /// [`append_any_with_conflict_retry`] on
+    /// [`EVENT_APPEND_RETRY_ATTEMPTS`] attempts.
+    /// `ExpectedVersion::Any` is not a promise of success — it is why
+    /// the retry exists, because an append can still lose a race at the
+    /// stream tail. While this append was a bare one and the enqueue
+    /// path's was retried, a `TaskFailed` could be dropped under
+    /// contention that a `TaskInvoked` would have survived, and the loss
+    /// showed up as nothing but the log line below. A second copy of
+    /// that loop here would have been the same defect one step later:
+    /// one promise stated twice is one a later change moves on one side
+    /// only.
     ///
     /// **Only when the result write landed** — the caller branches on
     /// [`surface_attempted_result_write`]'s answer. The fenced write is
@@ -1654,8 +1672,10 @@ impl TaskDispatcher {
     ///
     /// **Never changes the task's outcome.** The row is the operational
     /// record and this is the audit record, so the append comes after
-    /// the write and an event-store failure is logged and nothing else.
-    /// A store that is down must not be able to hold a row open.
+    /// the write and an event-store failure is logged and nothing else
+    /// — a spent retry budget included. A store that is down, or a
+    /// stream tail too contended to reach within the budget, must not be
+    /// able to hold a row open.
     async fn append_failure_audit(
         &self,
         job: &JobRow,
@@ -1684,31 +1704,41 @@ impl TaskDispatcher {
         // bound; leaving it means a producer that ever bypassed the
         // constructor shows up as a rejected append rather than as two
         // silently different texts.
-        let append = AppendEvents {
-            stream_id: TaskUseCase::task_audit_stream(kind),
-            expected_version: ExpectedVersion::Any,
-            events: vec![EventToAppend::new(DomainEvent::TaskFailed(TaskFailed {
-                task_job_id: job.id,
-                kind: kind.to_string(),
-                reason: reason.to_string(),
-                final_attempt,
-            }))],
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            // The same actor this execution's `TaskContext` already
-            // carries, so one dispatched run is attributed one way
-            // rather than two. Deliberately not the row's `actor_id`:
-            // the requester asked for the task, the worker is what
-            // failed it, and attributing the failure to the requester
-            // would read as the operator having done something wrong.
-            actor: Actor::Internal(InternalActor::Timer),
-        };
-        if let Err(e) = self.event_store.append(append).await {
+        let stream_id = TaskUseCase::task_audit_stream(kind);
+        let event = DomainEvent::TaskFailed(TaskFailed {
+            task_job_id: job.id,
+            kind: kind.to_string(),
+            reason: reason.to_string(),
+            final_attempt,
+        });
+        let correlation_id = Uuid::new_v4();
+        let appended = append_any_with_conflict_retry(
+            self.event_store.as_ref(),
+            EVENT_APPEND_RETRY_ATTEMPTS,
+            event_append_backoff,
+            || AppendEvents {
+                stream_id: stream_id.clone(),
+                expected_version: ExpectedVersion::Any,
+                events: vec![EventToAppend::new(event.clone())],
+                correlation_id,
+                causation_id: None,
+                // The same actor this execution's `TaskContext` already
+                // carries, so one dispatched run is attributed one way
+                // rather than two. Deliberately not the row's `actor_id`:
+                // the requester asked for the task, the worker is what
+                // failed it, and attributing the failure to the requester
+                // would read as the operator having done something wrong.
+                actor: Actor::Internal(InternalActor::Timer),
+            },
+        )
+        .await;
+        if let Err(e) = appended {
             tracing::error!(
                 error = %e,
                 job_id = %job.id,
                 kind,
                 final_attempt,
+                attempts = EVENT_APPEND_RETRY_ATTEMPTS,
                 "TaskDispatcher: the TaskFailed audit event did not reach the event store. \
                  The row's state is already written and stands — the failure is \
                  operator-visible there, but absent from the audit trail, so it is lost \
@@ -2532,6 +2562,12 @@ mod tests {
     struct RecordingEventStore {
         batches: Mutex<Vec<AppendEvents>>,
         fails: bool,
+        /// How many of the leading appends answer
+        /// `DomainError::Conflict` before the store starts accepting
+        /// them. The retry budget is only *observable* through a store
+        /// that loses a race and then stops losing it — a double that
+        /// always succeeds proves nothing about a retry.
+        conflicts_remaining: Mutex<u32>,
     }
 
     impl RecordingEventStore {
@@ -2539,6 +2575,7 @@ mod tests {
             Self {
                 batches: Mutex::new(Vec::new()),
                 fails: false,
+                conflicts_remaining: Mutex::new(0),
             }
         }
 
@@ -2548,6 +2585,19 @@ mod tests {
             Self {
                 batches: Mutex::new(Vec::new()),
                 fails: true,
+                conflicts_remaining: Mutex::new(0),
+            }
+        }
+
+        /// The first `n` appends lose the race at the stream tail with
+        /// `DomainError::Conflict`; the next one is accepted. `n` at or
+        /// above the budget means the budget is spent and the event
+        /// never lands.
+        fn conflicting_first(n: u32) -> Self {
+            Self {
+                batches: Mutex::new(Vec::new()),
+                fails: false,
+                conflicts_remaining: Mutex::new(n),
             }
         }
 
@@ -2575,9 +2625,19 @@ mod tests {
         fn append(&self, batch: AppendEvents) -> BoxFuture<'_, DomainResult<AppendResult>> {
             self.batches.lock().unwrap().push(batch);
             let fails = self.fails;
+            let conflicts = {
+                let mut remaining = self.conflicts_remaining.lock().unwrap();
+                let conflicts = *remaining > 0;
+                *remaining = remaining.saturating_sub(1);
+                conflicts
+            };
             Box::pin(async move {
                 if fails {
                     Err(DomainError::Invariant("event store down".into()))
+                } else if conflicts {
+                    Err(DomainError::Conflict(
+                        "stream authorization concurrent append at position 0".into(),
+                    ))
                 } else {
                     Ok(AppendResult {
                         stream_position: 0,
@@ -4087,7 +4147,103 @@ mod tests {
         assert_eq!(
             events.batches().len(),
             1,
-            "the append is attempted once and not retried"
+            "a non-`Conflict` error is not a lost tail race, so it consumes none of the \
+             retry budget and the append is attempted exactly once"
+        );
+    }
+
+    /// A `TaskFailed` append that loses the race at the stream tail is
+    /// retried, and the retry lands.
+    ///
+    /// Driven by a store whose FIRST append answers
+    /// `DomainError::Conflict` and whose second accepts, so the retry is
+    /// observed rather than inferred: two attempts reach the store and
+    /// the event is durable after the second. Before both halves shared
+    /// one budget this append was bare — the conflict was a log line and
+    /// the failure never reached the trail its own `TaskInvoked` is on.
+    #[test]
+    fn a_conflicting_task_failed_append_is_retried_and_then_lands() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let events = Arc::new(RecordingEventStore::conflicting_first(1));
+        let row_id = dispatch_one_row_recording(
+            &repo,
+            &events,
+            "noop",
+            TEST_ATTEMPT_CAP,
+            Arc::new(RetryHandler("noop")),
+        );
+
+        assert_eq!(
+            events.batches().len(),
+            2,
+            "the first append conflicts and the second must be a fresh re-append — one \
+             attempt would mean the conflict was swallowed as before"
+        );
+        // The attempt that landed is the last one — deliberately not
+        // `only_task_failed`, which asserts a single attempt and is the
+        // right shape only for an append that was never retried.
+        let batches = events.batches();
+        let landed = batches.last().expect("an append must have been attempted");
+        assert_eq!(
+            landed.stream_id,
+            StreamId::authorization(),
+            "the retry re-appends to the same kind-routed stream, not a re-derived one"
+        );
+        assert_eq!(landed.events.len(), 1, "expected a single-event batch");
+        assert_eq!(
+            landed.events[0].event,
+            DomainEvent::TaskFailed(TaskFailed {
+                task_job_id: row_id,
+                kind: "noop".to_string(),
+                reason: "transient error".to_string(),
+                final_attempt: true,
+            }),
+            "the retried append carries the same event payload, not a rebuilt one"
+        );
+        assert_eq!(
+            repo.mark_failed_calls(),
+            vec![(row_id, "transient error".to_string())],
+            "the row is closed out exactly once — the audit retry is not a second row write"
+        );
+    }
+
+    /// A spent retry budget on the `TaskFailed` append leaves the job's
+    /// result state exactly as it was.
+    ///
+    /// This is the one way carrying the retry over could have made
+    /// things worse, so it is asserted rather than assumed: every
+    /// attempt conflicts, the budget is bounded at
+    /// `EVENT_APPEND_RETRY_ATTEMPTS`, the exhausted path logs and
+    /// returns, and the row still reads exactly as it does when the
+    /// append succeeds. An audit store nobody can reach must not be
+    /// able to change what a task did.
+    #[test]
+    fn an_exhausted_task_failed_retry_budget_leaves_the_jobs_result_unchanged() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let events = Arc::new(RecordingEventStore::conflicting_first(
+            EVENT_APPEND_RETRY_ATTEMPTS,
+        ));
+        let row_id = dispatch_one_row_recording(
+            &repo,
+            &events,
+            "noop",
+            TEST_ATTEMPT_CAP,
+            Arc::new(RetryHandler("noop")),
+        );
+
+        assert_eq!(
+            events.batches().len(),
+            EVENT_APPEND_RETRY_ATTEMPTS as usize,
+            "the retry is bounded by the shared budget and must not spin past it"
+        );
+        assert_eq!(
+            repo.mark_failed_calls(),
+            vec![(row_id, "transient error".to_string())],
+            "the row is closed out exactly as it would have been with no contention"
+        );
+        assert!(
+            repo.reschedule_calls().is_empty(),
+            "a lost audit append must not be answered with a different row write"
         );
     }
 

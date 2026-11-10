@@ -62,7 +62,6 @@
 //! atomic two-phase write.
 
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
 
 use arc_swap::ArcSwap;
 use uuid::Uuid;
@@ -74,7 +73,7 @@ use hort_domain::events::{
     task_invocation_is_destructive, task_kind_is_destructive, Actor, ApiActor, DomainEvent,
     StreamId, TaskInvoked, ADMIN_INVOKABLE_TASK_KINDS, DESTRUCTIVE_TASK_CLAIM,
 };
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
     CompensatingDelete, EnqueueOutcome, JobRow, JobsRepository, ListJobsFilter, ListJobsPage,
     TriggerSource,
@@ -85,18 +84,9 @@ use hort_domain::types::IdempotencyKey;
 use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
 use crate::rbac::RbacEvaluator;
-
-/// Bounded CAS-retry budget for the `TaskInvoked` append on the
-/// kind-routed audit stream (issue #86, mirroring the #62 SA-stream
-/// precedent in `ApiTokenUseCase`). Every non-destructive kind routes to
-/// the single global [`StreamId::authorization`] stream, so concurrent
-/// enqueues race the same `(stream, position)` unique index; a loser
-/// re-appends the same event (`ExpectedVersion::Any` means the adapter
-/// re-reads the tail itself on each attempt — no client-side expected-
-/// version bookkeeping is needed). 5 is generous headroom for realistic
-/// parallelism; exhausting it falls through to the existing
-/// compensating-delete-and-surface-the-error path unchanged.
-const TASK_AUDIT_APPEND_RETRY_ATTEMPTS: u32 = 5;
+use crate::use_cases::{
+    append_any_with_conflict_retry, event_append_backoff, EVENT_APPEND_RETRY_ATTEMPTS,
+};
 
 /// `jobs.trigger_source` every admin task invoke carries.
 ///
@@ -414,18 +404,28 @@ impl TaskUseCase {
         });
         let correlation_id = Uuid::new_v4();
 
-        // Bounded CAS retry (issue #86): `ExpectedVersion::Any` means the
-        // adapter re-reads the stream tail itself on every attempt, so a
-        // losing `DomainError::Conflict` is resolved by simply
-        // re-invoking `append` with a fresh `AppendEvents` — no
-        // client-side expected-version re-read is needed (contrast the
-        // #62 SA-stream precedent, which retries a *specific* expected
-        // version and therefore does re-read). Only `Conflict` is
+        // Bounded CAS retry through the crate's one `ExpectedVersion::Any`
+        // conflict-retry helper. `Any` means the adapter re-reads the
+        // stream tail itself on every attempt, so a losing
+        // `DomainError::Conflict` is resolved by re-invoking `append`
+        // with a fresh, byte-identical `AppendEvents` — this append
+        // protects no decision taken from the stream's content, which is
+        // exactly the shape that helper is for. Only `Conflict` is
         // retried; any other error fails fast and consumes none of the
-        // budget.
-        let mut attempt: u32 = 0;
-        let append_result = loop {
-            let append = AppendEvents {
+        // budget, and an exhausted budget returns the final `Conflict`
+        // verbatim into the compensating-delete path below.
+        //
+        // `TaskFailed`, the other half of this audit pair, appends to the
+        // stream `task_audit_stream` routes it to through the same helper
+        // and the same budget. The two halves are written to one stream on
+        // purpose, so one of them retrying while the other did not left
+        // the pair with two durability promises — and the half that could
+        // vanish under contention did so as a log line only.
+        let append_result = append_any_with_conflict_retry(
+            self.events.as_ref(),
+            EVENT_APPEND_RETRY_ATTEMPTS,
+            event_append_backoff,
+            || AppendEvents {
                 stream_id: stream_id.clone(),
                 expected_version: ExpectedVersion::Any,
                 events: vec![EventToAppend::new(event.clone())],
@@ -434,35 +434,21 @@ impl TaskUseCase {
                 actor: Actor::Api(ApiActor {
                     user_id: actor.user_id,
                 }),
-            };
-            match self.events.append(append).await {
-                Ok(result) => break Ok(result),
-                Err(DomainError::Conflict(_)) if attempt + 1 < TASK_AUDIT_APPEND_RETRY_ATTEMPTS => {
-                    attempt += 1;
-                    tracing::debug!(
-                        job_id = %audit_job_id,
-                        kind,
-                        attempt,
-                        "TaskInvoked append conflict — retrying with a fresh append",
-                    );
-                    let jitter_ms = u64::from(rand::random::<u8>() % 3);
-                    tokio::time::sleep(StdDuration::from_millis(
-                        u64::from(attempt) * 2 + jitter_ms,
-                    ))
-                    .await;
-                }
-                Err(err @ DomainError::Conflict(_)) => {
-                    tracing::warn!(
-                        job_id = %audit_job_id,
-                        kind,
-                        attempts = TASK_AUDIT_APPEND_RETRY_ATTEMPTS,
-                        "TaskInvoked append retry budget exhausted (transient contention)",
-                    );
-                    break Err(err);
-                }
-                Err(other) => break Err(other),
-            }
-        };
+            },
+        )
+        .await;
+
+        // A `Conflict` can only reach here with the budget spent — the
+        // helper absorbs every intermediate one — so this is the
+        // exhausted-budget signal and not a first-attempt failure.
+        if let Err(DomainError::Conflict(_)) = &append_result {
+            tracing::warn!(
+                job_id = %audit_job_id,
+                kind,
+                attempts = EVENT_APPEND_RETRY_ATTEMPTS,
+                "TaskInvoked append retry budget exhausted (transient contention)",
+            );
+        }
 
         if let Err(append_err) = append_result {
             // 6. Compensating delete — best-effort; log the outcome but do
@@ -1755,7 +1741,7 @@ mod tests {
 
     /// Pathological contention — EVERY append attempt conflicts. The
     /// bounded retry loop must exhaust
-    /// (`TASK_AUDIT_APPEND_RETRY_ATTEMPTS`) and fall through to exactly
+    /// ([`EVENT_APPEND_RETRY_ATTEMPTS`]) and fall through to exactly
     /// today's failure behaviour: the error is surfaced, and — on the
     /// fresh-enqueue branch — the compensating delete fires.
     #[tokio::test]
