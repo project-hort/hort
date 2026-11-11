@@ -59,13 +59,16 @@
 //!    not hold.
 //! 6. Ingest the manifest bytes, carrying the claim set.
 //! 7. Any blob / child that does not resolve to a **deliverable**
-//!    same-repo row — absent, foreign-repo, or present but in a terminal
-//!    quarantine state — returns 400 `MANIFEST_BLOB_UNKNOWN` with a
-//!    `detail.blobs` array. Deliberately answered **after** the mint: the
-//!    manifest artifact stays committed so the client's
-//!    retry-after-pushing-blobs path is idempotent (a terminal reference
-//!    is the case no retry fixes); the group is NOT created, and the
-//!    manifest carries no membership claims.
+//!    same-repo row refuses the push, and **which** refusal follows from
+//!    why it did not resolve: absent or foreign-repo — bytes hort has
+//!    never ingested — is 400 `MANIFEST_BLOB_UNKNOWN` with its
+//!    `detail.blobs` array, while a row carrying a terminal verdict
+//!    answers the refusal the read routes give for that same row (403
+//!    `DENIED` naming the constituent digest, or 503 `UNAVAILABLE`).
+//!    Deliberately answered **after** the mint: the manifest artifact
+//!    stays committed so the client's retry-after-pushing-blobs path is
+//!    idempotent; the group is NOT created, and the manifest carries no
+//!    membership claims.
 //! 8. Attach the primary `manifest` member to the group, plus (single-
 //!    image only) config + layers, via
 //!    [`ArtifactGroupUseCase::add_member`]. Shared per-request
@@ -120,10 +123,10 @@ use uuid::Uuid;
 
 use hort_app::error::AppError;
 use hort_app::use_cases::ingest_use_case::{IngestOutcome, VerifiedIngestRequest};
-use hort_domain::entities::artifact::Artifact;
+use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::mutable_ref::RefTarget;
 use hort_domain::error::DomainError;
-use hort_domain::events::{Actor, ApiActor};
+use hort_domain::events::{Actor, ApiActor, RejectionReason};
 use hort_domain::oci::{AdmissionRefusal, ImageBudget};
 use hort_domain::ports::content_reference_index::ContentReferenceClaim;
 use hort_domain::types::{ArtifactCoords, ContentHash};
@@ -965,24 +968,150 @@ fn parse_referenced_blobs(
 /// The outcome of resolving a manifest's declared references against the
 /// repository, as it stands **before** the manifest is minted.
 ///
-/// Two outcomes, because the mint happens between them and the claim set
-/// depends on which one it is. [`Self::Complete`] means every declared
-/// reference resolved to an artifact in this repository, so the membership
-/// edges are safe to claim: no claim can name bytes the repository does not
-/// hold. [`Self::Missing`] carries the raw `sha256:<hex>` strings for the
-/// 400 `MANIFEST_BLOB_UNKNOWN` the caller answers **after** the mint — the
+/// Three outcomes, because the mint happens between them, the claim set
+/// depends on which one it is, and the two ways a reference fails to
+/// resolve are different facts that owe the publisher different answers.
+///
+/// [`Self::Complete`] means every declared reference resolved to a
+/// deliverable artifact in this repository, so the membership edges are
+/// safe to claim: no claim can name bytes the repository does not hold.
+///
+/// [`Self::Absent`] carries the raw `sha256:<hex>` strings for the 400
+/// `MANIFEST_BLOB_UNKNOWN` the caller answers **after** the mint — the
 /// manifest still commits (unchanged contract: the client's
 /// retry-after-pushing-the-blobs path is idempotent) and simply carries no
 /// membership claims, which is exactly what the post-ingest insert loop
 /// this replaced also left behind on that path.
+///
+/// [`Self::Terminal`] carries the one constituent whose verdict withholds
+/// this push, for the refusal that names it. It is a separate variant and
+/// not a second string in `Absent`'s list because the cause is the whole
+/// of what the publisher needs — see
+/// [`resolve_and_check_referenced_blobs`] for why the two answers differ.
 enum ResolvedReferences {
-    /// Boxed because an `Option<Artifact>` dwarfs a `Vec<String>` and
-    /// `clippy::large_enum_variant` is right to object: the
-    /// unknown-blob arm is the one every missing-blob PUT returns, and it
-    /// should not carry an artifact-sized hole. Same reflex as this
-    /// module's `Box<Response>` returns.
+    /// Boxed because an `Option<Artifact>` dwarfs the other two variants'
+    /// payloads and `clippy::large_enum_variant` is right to object: a
+    /// refused PUT should not carry an artifact-sized hole. Same reflex
+    /// as this module's `Box<Response>` returns.
     Complete(Box<ResolvedReferenceSet>),
-    Missing(Vec<String>),
+    Absent(Vec<String>),
+    Terminal(TerminalReference),
+}
+
+impl ResolvedReferences {
+    /// Whether every declared reference resolved to deliverable content.
+    ///
+    /// The two consumers — the membership claim set and the
+    /// signature-layer door — both need exactly this bit, and asking for
+    /// it here rather than with a `matches!` at each of them is what
+    /// keeps the question wildcard-free: a fourth outcome is a compile
+    /// error in this one match instead of silently taking the `false`
+    /// branch at two call sites that never mentioned it.
+    fn is_complete(&self) -> bool {
+        match self {
+            Self::Complete(_) => true,
+            Self::Absent(_) | Self::Terminal(_) => false,
+        }
+    }
+}
+
+/// The one terminal constituent a refused manifest PUT answers about:
+/// which bytes, and which verdict stands against them.
+struct TerminalReference {
+    /// The reference as the manifest declared it (`sha256:<hex>`), so the
+    /// refusal names the digest the publisher can match against its own
+    /// document.
+    digest: String,
+    verdict: TerminalVerdict,
+}
+
+/// Which terminal verdict a constituent carries — the two
+/// [`QuarantineStatus::is_terminal`](hort_domain::entities::artifact::QuarantineStatus::is_terminal)
+/// states, each with the data its own refusal envelope needs.
+enum TerminalVerdict {
+    /// `QuarantineStatus::Rejected`: a verdict was reached against those
+    /// bytes. `axis` is `RejectionReason::wire_kind()`, hydrated onto the
+    /// row by `ArtifactUseCase` during the resolution load, and `None` for
+    /// the illegal state ADR 0039 D6 names (a `Rejected` projection with
+    /// no `ArtifactRejected` behind it).
+    Rejected { axis: Option<&'static str> },
+    /// `QuarantineStatus::ScanIndeterminate`: no verdict was reached, and
+    /// the fail-closed posture withholds until one is (ADR 0007).
+    ScanIndeterminate,
+}
+
+impl TerminalVerdict {
+    /// Which of two terminal constituents a manifest naming both answers
+    /// about: the higher number wins.
+    ///
+    /// Same principle as terminal-over-absent one tier in. The refusal
+    /// names the constituent the publisher has least power over, because
+    /// naming a weaker one first walks them into a second refusal: an
+    /// indeterminate hold can clear on a rescan that reaches a verdict, so
+    /// a push blocked on it can succeed on a later attempt, while one
+    /// blocked on a rejection cannot succeed until someone replaces the
+    /// content or waives the verdict.
+    ///
+    /// Wildcard-free, so a third terminal state has to state its own
+    /// place in this order rather than inherit `ScanIndeterminate`'s.
+    fn refusal_precedence(&self) -> u8 {
+        match self {
+            Self::Rejected { .. } => 1,
+            Self::ScanIndeterminate => 0,
+        }
+    }
+}
+
+impl TerminalReference {
+    /// The refusal this constituent owes the publisher.
+    ///
+    /// Both arms reuse the envelope the **read** routes answer with for
+    /// the same fact — a `Rejected` artifact's `403 DENIED` and an
+    /// indeterminate one's `503 UNAVAILABLE` — so one fact has one answer
+    /// whichever route asks it, and a client meets no shape it does not
+    /// already know. No new error variant and no new OCI error code.
+    ///
+    /// **`Retry-After`: deliberately absent on the 503, and that is the
+    /// decision this site owns.** A `503` invites a harder retry than the
+    /// `400` this refusal used to be, so the header had to be chosen
+    /// rather than inherited. There is no real quantity to put in it: an
+    /// indeterminate hold has no self-resolving deadline — its exits are a
+    /// curator's waive and a rescan that reaches a verdict, never the
+    /// passage of time (ADR 0007, "a reached verdict supersedes an absent
+    /// one") — so any number would tell a well-behaved client to come back
+    /// forever on a schedule hort invented. `OciError::ScanIndeterminate`
+    /// carries no `retry_after_seconds` for exactly that reason and
+    /// `IntoResponse` emits no header for it; the status still says "not
+    /// yet", which is the half of the answer that *is* true, and the
+    /// envelope's code and message say the rest.
+    ///
+    /// **What the body discloses, and nothing more.** The `Rejected` arm
+    /// names the **constituent** blob digest as `subject`, plus the axis.
+    /// The subject is deliberately NOT the reference the client pushed:
+    /// that document is fine, and naming it would state the refusal is
+    /// about the wrong thing. No
+    /// policy, no `curator_id`, no `rule_id`, no findings and no CVE
+    /// identifiers; `OciError::ArtifactRejected`'s doc is the full list
+    /// and this constituent-shaped subject does not widen it. The axis is
+    /// omitted entirely when unknown rather than sent as a token, because
+    /// a token would dress an inconsistency up as a verdict.
+    ///
+    /// The indeterminate arm names nothing: its envelope is the unit one
+    /// the read route sends, and a hold's subject stays opaque there too.
+    /// Which constituent it was reaches the operator through the
+    /// resolution log line, and the publisher's next move does not depend
+    /// on knowing — it is "wait for the verdict, or ask the operator" for
+    /// every constituent in that state.
+    fn into_refusal(self) -> Response {
+        match self.verdict {
+            TerminalVerdict::Rejected { axis } => OciError::ArtifactRejected {
+                subject: self.digest,
+                axis,
+            }
+            .into_response(),
+            TerminalVerdict::ScanIndeterminate => OciError::ScanIndeterminate.into_response(),
+        }
+    }
 }
 
 /// The artifacts behind a [`ResolvedReferences::Complete`] resolution: the
@@ -995,23 +1124,27 @@ struct ResolvedReferenceSet {
     layer_artifacts: Vec<Artifact>,
 }
 
-/// Resolve each referenced blob / child manifest. Cross-repo isolation: a
-/// hash that exists in a foreign repo counts as missing — the blob must
-/// live in the same repo as the manifest (mount it across explicitly via
+/// Resolve each referenced blob / child manifest, and classify what the
+/// repository has to say about each one.
+///
+/// Cross-repo isolation: a hash that exists in a foreign repo counts as
+/// **absent** — the blob must live in the same repo as the manifest (mount
+/// it across explicitly via
 /// `POST /v2/.../blobs/uploads/?mount=...&from=...`). A hash whose
-/// same-repo row is in a terminal state counts as missing too — see
+/// same-repo row carries a terminal verdict is neither resolved nor
+/// absent: it is the [`ResolvedReferences::Terminal`] outcome — see
 /// [`resolve_referenced_blobs`]. For an index the children are resolved
-/// for **existence only** — a missing child is `MANIFEST_BLOB_UNKNOWN`,
-/// exactly like a missing layer (clients push the platform manifests
+/// for **existence only** — an absent child is `MANIFEST_BLOB_UNKNOWN`,
+/// exactly like an absent layer (clients push the platform manifests
 /// before the index). A single-image manifest has a resolved `config`; an
 /// index carries none — the config is required only on the single-image
 /// path.
 ///
 /// `Err` is reserved for the two failures that must abort before anything
 /// is minted: an infrastructure error from the lookup, and the defensive
-/// no-config assertion. A *missing* reference is not an error here — it is
-/// the [`ResolvedReferences::Missing`] outcome, answered after the mint so
-/// the committed-manifest contract is preserved.
+/// no-config assertion. An unresolved reference is not an error here — it
+/// is one of the two refusal outcomes, answered after the mint so the
+/// committed-manifest contract is preserved.
 ///
 /// This is a pure read — `find_in_repo_by_hash` and nothing else — which is
 /// what makes it runnable ahead of the mint. It used to take the minted
@@ -1024,65 +1157,89 @@ async fn resolve_and_check_referenced_blobs(
     media_type_is_index: bool,
     manifest_digest: &ContentHash,
 ) -> Result<ResolvedReferences, Response> {
-    let (config_artifact, layer_artifacts, missing) =
-        resolve_referenced_blobs(ctx, repo_id, referenced)
-            .await
-            .inspect_err(|_| {
-                tracing::error!("infrastructure error during blob resolution");
-            })?;
+    let resolution = resolve_referenced_blobs(ctx, repo_id, referenced)
+        .await
+        .inspect_err(|_| {
+            tracing::error!("infrastructure error during blob resolution");
+        })?;
 
-    if !missing.is_empty() {
-        // The manifest artifact stays committed, and what that buys the
-        // client depends on WHY the reference did not resolve — the two
-        // cases this list folds together:
-        //
-        // - **No row for the digest.** A retry after pushing the blob
-        //   reconciles cleanly; that is the case this path was built for
-        //   and the common one (a client pushing out of order, or an
-        //   index landing ahead of its platform children).
-        // - **A row in a terminal state** (`Rejected` /
-        //   `ScanIndeterminate`). No retry can help: the row already
-        //   exists, so re-pushing those bytes deduplicates onto it and
-        //   leaves the status untouched. Leaving the hold needs a
-        //   deliberate act on the blob — admin override, curator waiver,
-        //   a re-scan — or different content.
-        //
-        // Both answer the same envelope on purpose. It is not an opaque
-        // one — `detail.blobs` names every unresolvable digest, so the
-        // publisher knows exactly which references to act on; what it
-        // does not say is which of the two causes applied, and that
-        // costs them nothing because their next move is the same for
-        // both (upload or cross-mount the blob, at which point a
-        // terminal row surfaces on its own). The cause is in the log
-        // line in `resolve_referenced_blobs`, which names the digest and
-        // the status. Either way we do NOT create the group on this path, and
-        // the mint carries no membership claims — an edge must never name
-        // a blob the repository cannot deliver.
+    // One fact, one answer, whichever route asks it — so WHY a reference
+    // did not resolve decides what the publisher is told, and the two
+    // causes are not the same fact:
+    //
+    // - **A row in a terminal state.** Those bytes are *known*: hort
+    //   holds them and has decided about them. Re-pushing them
+    //   deduplicates onto the existing row and leaves its status
+    //   untouched, so no retry can change the answer — leaving the state
+    //   needs a deliberate act on that blob (a curator's waiver, an admin
+    //   override, a re-scan that reaches a verdict) or different content.
+    //   Calling that an unknown blob names a cause that does not apply
+    //   and sends the publisher to push bytes hort already has, which is
+    //   a loop with no exit in it. So this answers the refusal the READ
+    //   routes give for the same row — `403` for a rejected constituent,
+    //   `503` for a held one — and the publisher's next move is to take
+    //   it up with the operator or wait for the verdict.
+    // - **No row for the digest.** Nothing has been decided, because hort
+    //   has never seen those bytes; the push is simply out of order (a
+    //   client pushing a manifest before its layers, or an index before
+    //   its platform children). Here `MANIFEST_BLOB_UNKNOWN` is exactly
+    //   true, `detail.blobs` names what to send, and the retry does
+    //   reconcile — which is why this tier keeps both its answer and its
+    //   idempotent retry-after-push path.
+    //
+    // **A document naming both answers the terminal one.** The publisher
+    // can fix an absent reference by pushing it and cannot fix a terminal
+    // one, so naming the absent one first would walk them through a push
+    // into a second refusal.
+    //
+    // Either way the group is NOT created and the mint carries no
+    // membership claims — an edge must never name a blob the repository
+    // cannot deliver.
+    if let Some(terminal) = resolution.terminal {
+        // Bound rather than written inline in the field set below. A
+        // value expression inside the macro does not report as covered
+        // even when a test asserts the field it produced: measured, with
+        // `the_refusal_names_the_document_the_constituent_and_its_status_in_the_log`
+        // reading this very count out of the emitted line while the
+        // inline form showed as an uncovered line.
+        let also_absent = resolution.absent.len();
         tracing::info!(
             manifest_digest = %manifest_digest,
-            missing = ?missing,
-            "manifest referenced unresolvable blobs; group attachment and membership claims \
-             withheld (absent blobs reconcile on client retry; a terminal blob does not)"
+            constituent = %terminal.digest,
+            also_absent,
+            "manifest references a constituent carrying a terminal verdict; refusing the push \
+             with that constituent's own refusal (no retry changes this answer), and withholding \
+             group attachment and membership claims"
         );
-        return Ok(ResolvedReferences::Missing(missing));
+        return Ok(ResolvedReferences::Terminal(terminal));
     }
 
-    if !media_type_is_index && config_artifact.is_none() {
+    if !resolution.absent.is_empty() {
+        tracing::info!(
+            manifest_digest = %manifest_digest,
+            absent = ?resolution.absent,
+            "manifest referenced blobs this repository does not hold; group attachment and \
+             membership claims withheld (the client's push-then-retry path reconciles)"
+        );
+        return Ok(ResolvedReferences::Absent(resolution.absent));
+    }
+
+    if !media_type_is_index && resolution.config.is_none() {
         // Defensive: reachable only if `parse_manifest_blobs` accepted a
-        // single-image manifest with no config AND this resolution didn't
-        // mark it missing. The current parser rejects missing config, so
-        // this branch is an assertion.
+        // single-image manifest with no config AND this resolution found
+        // every reference deliverable. The current parser rejects missing
+        // config, so this branch is an assertion.
         tracing::error!(
             manifest_digest = %manifest_digest,
-            "resolve_referenced_blobs returned None config with empty missing list"
+            "resolve_referenced_blobs returned None config with every reference resolved"
         );
         return Err(OciError::Internal.into_response());
     }
 
     Ok(ResolvedReferences::Complete(Box::new(
         ResolvedReferenceSet {
-            config_artifact,
-            layer_artifacts,
+            config_artifact: resolution.config,
+            layer_artifacts: resolution.layers,
         },
     )))
 }
@@ -1430,7 +1587,7 @@ fn manifest_ingest_claims(
     media_type: &str,
 ) -> Vec<ContentReferenceClaim> {
     let mut claims: Vec<ContentReferenceClaim> = subject_claim.into_iter().collect();
-    if matches!(resolved, ResolvedReferences::Complete(_)) {
+    if resolved.is_complete() {
         claims.extend(membership_claims(referenced, media_type));
     }
     claims
@@ -1529,11 +1686,12 @@ async fn put_manifest_dispatch_inner(
     let is_pure_signature = is_pure_signature_manifest(&subject_digest_parsed, &body_bytes);
 
     // The door, before the mint. Gated on a COMPLETE resolution so the bytes
-    // it parses are bytes this repository holds: on the `Missing` path there
-    // is nothing of ours to read behind at least one declared layer, and that
-    // push keeps its established answer (the post-mint 400
-    // `MANIFEST_BLOB_UNKNOWN` below) rather than acquiring a second one.
-    if is_pure_signature && matches!(resolved, ResolvedReferences::Complete(_)) {
+    // it parses are bytes this repository holds and will serve: on either
+    // unresolved path there is nothing of ours to read behind at least one
+    // declared layer — absent, or present and refused — and that push keeps
+    // the answer its own cause earns below rather than acquiring a second
+    // one.
+    if is_pure_signature && resolved.is_complete() {
         refuse_misdeclared_signature_layers(ctx, &body_bytes, &hashes.computed_hash).await?;
     }
 
@@ -1559,23 +1717,30 @@ async fn put_manifest_dispatch_inner(
     let manifest_event_id = ingest_outcome.ingested_event_id;
     let manifest_digest = hashes.computed_hash.clone();
 
-    // The unresolvable-reference answer lands HERE — after the mint — and
+    // The unresolved-reference answer lands HERE — after the mint — and
     // that is the unchanged contract, not an oversight: a manifest
     // referencing blobs the client has not pushed yet stays committed so the
-    // retry-after-pushing path is idempotent. For a reference that resolved
-    // to a TERMINAL row the mint is still committed but buys the client
-    // nothing — that blob's row already exists, so no re-push changes the
-    // answer (see `resolve_and_check_referenced_blobs` for both cases). What
-    // the reorder above changed is only that such a manifest now also
-    // carries no membership claims, which is what the post-ingest insert
-    // loop this replaced already left behind on this path (its gate returned
-    // before the first insert).
+    // retry-after-pushing path is idempotent. A manifest refused for a
+    // TERMINAL constituent stays committed too, and that half buys the
+    // client nothing — no re-push changes the answer — but it is the
+    // behaviour this route already had and a decision of its own to change.
+    // Either way the manifest carries no membership claims, which is what
+    // the post-ingest insert loop this replaced already left behind on this
+    // path (its gate returned before the first insert).
+    //
+    // Which refusal, and why the two differ, is
+    // `resolve_and_check_referenced_blobs`; the envelope each one answers in
+    // is `TerminalReference::into_refusal`. Wildcard-free, so a fourth
+    // resolution outcome has to be answered rather than silently served.
     let (config_artifact, layer_artifacts) = match resolved {
         ResolvedReferences::Complete(set) => (set.config_artifact, set.layer_artifacts),
-        ResolvedReferences::Missing(blobs) => {
+        ResolvedReferences::Absent(blobs) => {
             return Err(Box::new(
                 OciError::ManifestBlobUnknown { blobs }.into_response(),
             ));
+        }
+        ResolvedReferences::Terminal(terminal) => {
+            return Err(Box::new(terminal.into_refusal()));
         }
     };
 
@@ -1995,7 +2160,7 @@ pub(crate) fn parse_manifest_blobs(
 ///
 /// Each child becomes a [`ReferencedBlob`] with role
 /// [`BlobRole::ChildManifest`], so the shared [`resolve_referenced_blobs`]
-/// same-repo existence check treats a missing child exactly like a missing
+/// same-repo existence check treats an absent child exactly like an absent
 /// layer — a `MANIFEST_BLOB_UNKNOWN`. Clients push the platform child
 /// manifests before the index, so an unresolved child is the expected
 /// out-of-order case, not a hard error. The descriptor's declared `size`
@@ -2165,12 +2330,26 @@ fn parse_blob_digest(raw: &str) -> Result<ContentHash, serde_json::Value> {
     }
 }
 
-/// Resolve every referenced blob by SHA-256 against the artifact
-/// repository, enforcing cross-repo isolation. Returns
-/// `(config_opt, layers, missing_digests)` — `missing_digests` carries
-/// the raw `sha256:<hex>` strings so the response body can echo the
-/// client's form.
-///
+/// Everything one pass of the reference-resolution loop learned: the
+/// artifacts it resolved, and both causes of a reference that did not
+/// resolve. Carrying the two causes separately is what lets the caller —
+/// and not this loop — decide which answer the document owes; see
+/// [`resolve_and_check_referenced_blobs`].
+struct ReferenceResolution {
+    /// The config blob, on the single-image path (an index has none).
+    config: Option<Artifact>,
+    /// The layer blobs, in manifest order.
+    layers: Vec<Artifact>,
+    /// The raw `sha256:<hex>` of every reference with no row in this
+    /// repository, in the client's own spelling so the response can echo
+    /// it back verbatim.
+    absent: Vec<String>,
+    /// The terminal constituent the refusal names, if any — one, chosen
+    /// by [`TerminalVerdict::refusal_precedence`], because the response
+    /// answers about one.
+    terminal: Option<TerminalReference>,
+}
+
 /// Resolve every referenced blob by SHA-256 against the artifact
 /// repository, enforcing cross-repo isolation (ADR 0008). The call
 /// uses `find_in_repo_by_hash` which scopes the SQL query to the
@@ -2178,21 +2357,27 @@ fn parse_blob_digest(raw: &str) -> Result<ContentHash, serde_json::Value> {
 /// candidate and there is no ordering hazard from cross-repo rows
 /// sharing the same SHA-256.
 ///
-/// **A row is not enough: the row's status decides too.** A reference
-/// resolving to an artifact in a terminal state
-/// ([`QuarantineStatus::is_terminal`](hort_domain::entities::artifact::QuarantineStatus::is_terminal)
-/// — `Rejected` / `ScanIndeterminate`) counts as **not present** and joins
-/// `missing`, because the blob GET refuses that very row (`403 DENIED`
-/// naming the digest and the rejection axis for `Rejected`, `503
-/// UNAVAILABLE` with no `Retry-After` for `ScanIndeterminate` —
-/// `blobs.rs`, the exhaustive status match). Neither is a 404: a terminal
+/// **A row is not enough: the row's status decides too, and it decides
+/// which of two refusals the push gets.** A reference resolving to an
+/// artifact in a terminal state — the two states
+/// [`QuarantineStatus::is_terminal`](hort_domain::entities::artifact::QuarantineStatus::is_terminal)
+/// names, matched here wildcard-free so a sixth status cannot inherit
+/// either side — is not a satisfied reference, because the blob GET
+/// refuses that very row (`403 DENIED` naming the digest and the
+/// rejection axis for `Rejected`, `503 UNAVAILABLE` with no
+/// `Retry-After` for `ScanIndeterminate` — `blobs.rs`, the exhaustive
+/// status match). Accepting the manifest over it is how a push reports
+/// success and the subsequent pull answers `not found` on a layer.
+///
+/// Such a reference does **not** join the absent list: those bytes are
+/// known, so no re-push changes the answer, and it travels out as a
+/// [`TerminalReference`] carrying the verdict that refuses it. Neither
+/// refusal is a 404 and neither is an unknown-blob 400: a terminal
 /// verdict answers with its own envelope precisely so the refusal is
 /// distinguishable from "no such blob", which is the one fact that ends a
-/// caller's search (ADR 0055). Accepting the manifest over
-/// it is how a push reports success and the subsequent pull answers `not
-/// found` on a layer. The status arrives with the row
-/// `find_in_repo_by_hash` already returns, so this costs no extra port
-/// call and no extra I/O.
+/// caller's search (ADR 0055). The status — and, for a rejection, the
+/// axis — arrives with the row `find_in_repo_by_hash` already returns, so
+/// this costs no extra port call and no extra I/O.
 ///
 /// `Quarantined` still resolves as present — including a hold with no
 /// self-resolving deadline. Hort quarantines at ingest and the manifest
@@ -2200,16 +2385,17 @@ fn parse_blob_digest(raw: &str) -> Result<ContentHash, serde_json::Value> {
 /// essentially every push; and under `provenance_mode: required` the
 /// subject is held until its signature arrives, which ADR 0039 §10
 /// exists to let the signer read and sign. Hence the status-only
-/// predicate: see its rustdoc for why widening it to the hydrated
-/// `provenance_hold_indefinite` flag would break sign-after-push.
+/// predicate: widening it to the hydrated `provenance_hold_indefinite`
+/// flag would break sign-after-push.
 async fn resolve_referenced_blobs(
     ctx: &AppContext,
     repo: Uuid,
     refs: &[ReferencedBlob],
-) -> Result<(Option<Artifact>, Vec<Artifact>, Vec<String>), Response> {
+) -> Result<ReferenceResolution, Response> {
     let mut config: Option<Artifact> = None;
     let mut layers: Vec<Artifact> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
+    let mut absent: Vec<String> = Vec::new();
+    let mut terminal: Option<TerminalReference> = None;
 
     for r in refs {
         let hit = match ctx
@@ -2224,70 +2410,93 @@ async fn resolve_referenced_blobs(
             }
         };
         match hit {
-            // A row in a terminal state is not a satisfied reference:
-            // the blob GET refuses this exact row, so admitting it here
-            // mints a manifest the registry cannot deliver. It joins the
-            // same `missing` list as an absent row — one code path, one
-            // `MANIFEST_BLOB_UNKNOWN` envelope, and the client is not
-            // told which of the two the reference was.
-            //
-            // Folding the two together is sound here on its own terms,
-            // and does not depend on how the blob GET answers. The caller
-            // on this path is a **publisher**, and
-            // `MANIFEST_BLOB_UNKNOWN`'s `detail.blobs` already names the
-            // offending digest — so nobody is left searching, which is
-            // the harm a collapsed answer would otherwise do. Their next
-            // action is the same for both causes: upload or cross-mount
-            // that blob, and if it is terminally blocked the upload is
-            // what surfaces that. The diagnosis of WHICH cause is this
-            // log line, which is why it carries the digest AND the
-            // status: without the status an operator has to compare
-            // event timestamps to learn why the push was refused.
-            Some(a) if a.quarantine_status.is_terminal() => {
-                tracing::warn!(
-                    digest = %r.digest_raw,
-                    status = %a.quarantine_status,
-                    role = ?r.role,
-                    "manifest references a terminally-blocked artifact; counted as missing \
-                     (the blob read would refuse this row)"
-                );
-                missing.push(r.digest_raw.clone());
-            }
             // The use case already enforces `repository_id == repo`
             // at the port boundary; no post-filter needed. Clients
             // cross-mount explicitly via
             // `POST …/blobs/uploads/?mount=<digest>&from=<src_repo>`
             // before pushing the manifest.
-            Some(a) => match r.role {
-                BlobRole::Config => {
-                    if config.is_some() {
-                        // Defensive — `parse_manifest_blobs` emits at
-                        // most one config; two configs would be a
-                        // parser regression.
-                        tracing::warn!(
-                            "multiple config blobs resolved; keeping first and ignoring extras"
-                        );
+            //
+            // Exhaustive on the status with no wildcard arm, so a sixth
+            // `QuarantineStatus` variant is a compile error here rather
+            // than a silent admission into the deliverable arm — which is
+            // the direction that mints a manifest the registry cannot
+            // deliver, and the one no test would notice.
+            Some(a) => match a.quarantine_status {
+                QuarantineStatus::Rejected | QuarantineStatus::ScanIndeterminate => {
+                    // A terminal row is not a satisfied reference, and
+                    // not an unknown blob either: the bytes are here and
+                    // decided about. Logged per reference because the
+                    // refusal names only one of them, so the record of
+                    // the others is this line — digest AND status,
+                    // because without the status an operator has to
+                    // compare event timestamps to learn why the push was
+                    // refused.
+                    tracing::warn!(
+                        digest = %r.digest_raw,
+                        status = %a.quarantine_status,
+                        role = ?r.role,
+                        "manifest references a terminally-blocked artifact; the push is refused \
+                         with the refusal the blob read would give this row"
+                    );
+                    let verdict = if a.quarantine_status == QuarantineStatus::Rejected {
+                        // The axis is a plain field here. `ArtifactUseCase`
+                        // derives it from the artifact's own
+                        // `ArtifactRejected` event during the load (the
+                        // `artifacts` projection has no such column), so
+                        // the format crate reads a field and never a
+                        // stream (ADR 0008) — and it tells the two causes
+                        // of an absent axis apart in its own log, which is
+                        // why there is no second line for that here.
+                        TerminalVerdict::Rejected {
+                            axis: a.rejection_reason.as_ref().map(RejectionReason::wire_kind),
+                        }
                     } else {
-                        config = Some(a);
+                        TerminalVerdict::ScanIndeterminate
+                    };
+                    let candidate = TerminalReference {
+                        digest: r.digest_raw.clone(),
+                        verdict,
+                    };
+                    if terminal.as_ref().is_none_or(|held| {
+                        candidate.verdict.refusal_precedence() > held.verdict.refusal_precedence()
+                    }) {
+                        terminal = Some(candidate);
                     }
                 }
-                BlobRole::Layer => layers.push(a),
-                // A child manifest of an image index is not attached as a
-                // group member (the index lands as a plain primary
-                // `manifest`; the index→child linkage is a
-                // content-reference edge, Item 3) — but it IS held against
-                // the descriptor that named it before being dropped.
-                BlobRole::ChildManifest {
-                    position,
-                    declared_size,
-                } => {
-                    check_child_against_descriptor(r, position, declared_size, &a)
-                        .map_err(|e| *e)?;
-                }
+                QuarantineStatus::None
+                | QuarantineStatus::Quarantined
+                | QuarantineStatus::Released => match r.role {
+                    BlobRole::Config => {
+                        if config.is_some() {
+                            // Defensive — `parse_manifest_blobs` emits at
+                            // most one config; two configs would be a
+                            // parser regression.
+                            tracing::warn!(
+                                "multiple config blobs resolved; keeping first and ignoring extras"
+                            );
+                        } else {
+                            config = Some(a);
+                        }
+                    }
+                    BlobRole::Layer => layers.push(a),
+                    // A child manifest of an image index is not attached as a
+                    // group member (the index lands as a plain primary
+                    // `manifest`; the index→child linkage is an
+                    // `oci_index_member` content-reference edge, not a group
+                    // role) — but it IS held against the descriptor that
+                    // named it before being dropped.
+                    BlobRole::ChildManifest {
+                        position,
+                        declared_size,
+                    } => {
+                        check_child_against_descriptor(r, position, declared_size, &a)
+                            .map_err(|e| *e)?;
+                    }
+                },
             },
             None => {
                 if matches!(r.role, BlobRole::ChildManifest { .. }) {
-                    // Mirror the layer-missing path: a child pushed
+                    // Mirror the absent-layer path: a child pushed
                     // out-of-order (index before its platform manifests)
                     // is the expected retry case, surfaced as
                     // `MANIFEST_BLOB_UNKNOWN` at the call site.
@@ -2296,12 +2505,17 @@ async fn resolve_referenced_blobs(
                         "image index references an unknown child manifest; deferring until client retry"
                     );
                 }
-                missing.push(r.digest_raw.clone());
+                absent.push(r.digest_raw.clone());
             }
         }
     }
 
-    Ok((config, layers, missing))
+    Ok(ReferenceResolution {
+        config,
+        layers,
+        absent,
+        terminal,
+    })
 }
 
 /// Hold a **present** index child against the descriptor that named it.
@@ -4974,13 +5188,14 @@ mod tests {
 
     // -------------------- PUT — terminal reference --------------------
     //
-    // A referenced blob / child whose same-repo row exists but is in a
-    // terminal quarantine state (`Rejected` / `ScanIndeterminate`) is not
-    // a satisfied reference: the blob GET refuses that exact row (404
-    // `BLOB_UNKNOWN` / 503), so accepting the manifest is how a push
-    // reports success and the pull then answers `not found` on a layer.
-    // Such a reference joins the same `missing` list an absent row does —
-    // one envelope, same opacity, same post-mint answer.
+    // A referenced blob / child whose same-repo row exists but carries a
+    // terminal verdict (`Rejected` / `ScanIndeterminate`) is not a
+    // satisfied reference: the blob GET refuses that exact row, so
+    // accepting the manifest is how a push reports success and the pull
+    // then answers `not found` on a layer. It is not an *unknown* blob
+    // either — those bytes are here and decided about — so it answers the
+    // refusal the read route gives for the same row, and the absent tier
+    // keeps `MANIFEST_BLOB_UNKNOWN` to itself.
 
     /// Which reference of the pushed document carries the seeded status.
     #[derive(Clone, Copy, Debug)]
@@ -4992,26 +5207,58 @@ mod tests {
 
     /// Outcome of a push whose `role` reference resolves to a row in the
     /// seeded status: the response status + body, the number of group
-    /// commits, and whether the pushed document itself was committed.
+    /// commits, whether the pushed document itself was committed, and the
+    /// two digests the refusal has to be told apart by.
     struct PushOutcome {
         status: StatusCode,
         body: Vec<u8>,
         group_calls: usize,
         document_committed: bool,
+        /// The `sha256:<hex>` of the seeded constituent — what a
+        /// constituent-scoped refusal must name.
+        reference_digest: String,
+        /// The `sha256:<hex>` of the document the client pushed — what it
+        /// must NOT name.
+        document_digest: String,
+        /// `Retry-After` as the client received it, if at all.
+        retry_after: Option<String>,
+    }
+
+    impl PushOutcome {
+        /// The envelope's single error object.
+        fn envelope(&self) -> serde_json::Value {
+            let parsed: serde_json::Value = serde_json::from_slice(&self.body).unwrap();
+            parsed["errors"][0].clone()
+        }
     }
 
     /// Push a document one of whose references resolves to an existing
     /// same-repo row in `status`. Every other reference is seeded
     /// `QuarantineStatus::None` (plainly deliverable), so the only thing
     /// under test is the seeded row's state.
-    fn push_with_referenced_status(role: SeededRole, status: QuarantineStatus) -> PushOutcome {
+    ///
+    /// `axis` is read only when `status` is `Rejected`, and then it seeds
+    /// the row's **stream** with an `ArtifactRejected` carrying that
+    /// reason — `None` leaves the stream empty, which is the ADR 0039 D6
+    /// illegal state (a `Rejected` projection with no rejection on the
+    /// record). The fixture entity's `rejection_reason` is never set:
+    /// `MockArtifactRepository` clears it on read exactly as
+    /// `hort-adapters-postgres`'s one `row -> Artifact` mapper does, so
+    /// only `ArtifactUseCase`'s hydration can put it back — which is why
+    /// every push here goes through `with_provenance_hold_hydration`
+    /// rather than reading an axis a harness handed it.
+    fn push_with_referenced_status(
+        role: SeededRole,
+        status: QuarantineStatus,
+        axis: Option<RejectionReason>,
+    ) -> PushOutcome {
         run(async {
             let h = harness();
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
 
-            let (body, content_type) = match role {
+            let (body, content_type, reference) = match role {
                 SeededRole::Config => {
                     let config = seed_blob_with_status(
                         &h.artifacts,
@@ -5024,6 +5271,7 @@ mod tests {
                     (
                         build_manifest_json(&config, &[layer]),
                         "application/vnd.oci.image.manifest.v1+json",
+                        config,
                     )
                 }
                 SeededRole::Layer => {
@@ -5036,8 +5284,9 @@ mod tests {
                         status,
                     );
                     (
-                        build_manifest_json(&config, &[layer]),
+                        build_manifest_json(&config, std::slice::from_ref(&layer)),
                         "application/vnd.oci.image.manifest.v1+json",
+                        layer,
                     )
                 }
                 SeededRole::IndexChild => {
@@ -5053,24 +5302,34 @@ mod tests {
                         ),
                         size: b"seeded-child".len() as i64,
                     };
+                    let child = seeded.hash.clone();
                     (
                         build_index_json(
                             &[present, seeded],
                             "application/vnd.oci.image.index.v1+json",
                         ),
                         "application/vnd.oci.image.index.v1+json",
+                        child,
                     )
                 }
             };
+            if status == QuarantineStatus::Rejected {
+                seed_rejection_axis(&h, repo_id, &reference, axis).await;
+            }
             let document_hex = hex::encode(Sha256::digest(&body));
 
-            let router = router().with_state(h.ctx.clone());
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            let router = router().with_state(ctx);
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
             let resp = router
                 .oneshot(put_index_request(uri, body, content_type))
                 .await
                 .unwrap();
             let status_code = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("Retry-After")
+                .map(|v| v.to_str().unwrap().to_string());
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             let document_committed = h
                 .artifacts
@@ -5083,43 +5342,72 @@ mod tests {
                 body,
                 group_calls: h.group_lifecycle.commit_call_count(),
                 document_committed,
+                reference_digest: format!("sha256:{}", reference.as_ref()),
+                document_digest: format!("sha256:{document_hex}"),
+                retry_after,
             }
         })
     }
 
-    /// The whole refusal shape for a terminal reference: 400
-    /// `MANIFEST_BLOB_UNKNOWN`, exactly one digest echoed in
-    /// `detail.blobs`, no "why" anywhere in the envelope (the client is
-    /// never told the reference was terminal — the diagnosis is the
-    /// server-side log line), the document still committed, and no group.
-    fn assert_terminal_reference_refusal(out: &PushOutcome, case: &str) {
-        assert_eq!(
-            out.status,
-            StatusCode::BAD_REQUEST,
-            "{case}: a terminal reference must refuse the push: body = {}",
-            String::from_utf8_lossy(&out.body)
+    /// Put an `ArtifactRejected` on the seeded row's own stream, so the
+    /// axis the refusal reports is hydrated from the record rather than
+    /// stamped on the fixture. `None` leaves the stream empty on purpose.
+    async fn seed_rejection_axis(
+        h: &Harness,
+        repo_id: Uuid,
+        hash: &ContentHash,
+        axis: Option<RejectionReason>,
+    ) {
+        let artifact_id = h
+            .artifacts
+            .find_by_repo_and_checksum(repo_id, hash)
+            .await
+            .unwrap()
+            .expect("the seeded reference must have a row to carry a stream")
+            .id;
+        h.events.set_stream(
+            &hort_domain::events::StreamId::artifact(artifact_id),
+            axis.map(|reason| {
+                vec![
+                    hort_app::use_cases::test_support::persisted_artifact_rejected(
+                        artifact_id,
+                        reason,
+                        1,
+                    ),
+                ]
+            })
+            .unwrap_or_default(),
         );
-        let parsed: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
-        assert_eq!(
-            parsed["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN",
-            "{case}: must reuse the existing missing-reference envelope"
-        );
-        let blobs = parsed["errors"][0]["detail"]["blobs"].as_array().unwrap();
-        assert_eq!(
-            blobs.len(),
-            1,
-            "{case}: exactly the one unresolvable reference is echoed"
-        );
-        assert!(
-            blobs[0].as_str().unwrap().starts_with("sha256:"),
-            "{case}: blobs detail must echo the raw sha256:<hex> shape"
-        );
+    }
+
+    /// What every terminal-constituent refusal shares, whichever verdict
+    /// it carries: the document still committed (the mint behaviour this
+    /// change deliberately left alone), no group, and **nothing from
+    /// `ArtifactRejected`'s excluded list anywhere on the wire** — no
+    /// policy, no `curator_id`, no `rule_id`, no findings, no CVE
+    /// identifiers. The exclusion is asserted on both arms because a
+    /// hold's envelope has the same discipline to keep as a verdict's.
+    ///
+    /// The tokens below are those identifiers and deliberately not the
+    /// axis vocabulary: `scanner` and `curator` ARE legitimate axis
+    /// values, so banning the words would ban the one disclosure this
+    /// refusal is supposed to make. What bounds that disclosure instead
+    /// is the exact key-set assertion in
+    /// [`assert_rejected_constituent_refusal`].
+    fn assert_constituent_refusal_discloses_no_more(out: &PushOutcome, case: &str) {
         let wire = String::from_utf8_lossy(&out.body).to_lowercase();
-        for leak in ["reject", "indeterminate", "quarantin", "terminal"] {
+        for leak in [
+            "curator_id",
+            "rule_id",
+            "policy",
+            "finding",
+            "cve",
+            "severity",
+            "reason",
+        ] {
             assert!(
                 !wire.contains(leak),
-                "{case}: the envelope must not disclose WHY the reference failed \
-                 (found {leak:?} in {wire})"
+                "{case}: the envelope must not widen the disclosure (found {leak:?} in {wire})"
             );
         }
         assert!(
@@ -5128,56 +5416,451 @@ mod tests {
         );
         assert_eq!(
             out.group_calls, 0,
-            "{case}: no group attachment on the unresolvable-reference path"
+            "{case}: no group attachment on the unresolved-reference path"
         );
     }
 
-    #[test]
-    fn put_with_rejected_layer_returns_400_manifest_blob_unknown() {
-        let out = push_with_referenced_status(SeededRole::Layer, QuarantineStatus::Rejected);
-        assert_terminal_reference_refusal(&out, "rejected layer");
+    /// The whole refusal shape for a **rejected** constituent: `403
+    /// DENIED` through `ArtifactRejected`, naming the constituent digest
+    /// as `subject` and the expected axis, and naming nothing else.
+    fn assert_rejected_constituent_refusal(
+        out: &PushOutcome,
+        expected_axis: Option<&str>,
+        case: &str,
+    ) {
+        let rendered = String::from_utf8_lossy(&out.body);
+        assert_eq!(
+            out.status,
+            StatusCode::FORBIDDEN,
+            "{case}: a rejected constituent answers the read route's own 403: body = {rendered}"
+        );
+        let envelope = out.envelope();
+        assert_eq!(
+            envelope["code"], "DENIED",
+            "{case}: the read route's envelope for this fact"
+        );
+        assert_eq!(
+            envelope["message"], "artifact is rejected",
+            "{case}: one wording for one fact across every route"
+        );
+        // The subject is the CONSTITUENT, not the reference the client
+        // pushed. Both assertions are load-bearing: the first is the
+        // disclosure, the second is what makes it a statement about the
+        // blob rather than about the document.
+        assert_eq!(
+            envelope["detail"]["subject"], out.reference_digest,
+            "{case}: the subject must name the constituent blob digest"
+        );
+        assert_ne!(
+            envelope["detail"]["subject"], out.document_digest,
+            "{case}: the subject must NOT be the manifest the client pushed"
+        );
+        match expected_axis {
+            Some(axis) => assert_eq!(
+                envelope["detail"]["axis"], axis,
+                "{case}: the axis comes from the constituent's own ArtifactRejected"
+            ),
+            // No `unknown` token and no null — an absent axis emits no
+            // field at all, so a client cannot read "the server does not
+            // know why" as a reason of its own.
+            None => assert!(
+                envelope["detail"].get("axis").is_none(),
+                "{case}: an unrecoverable axis emits no axis field: {envelope}"
+            ),
+        }
+        // Axis plus subject and NOTHING else — asserted as the exact key
+        // set rather than as a list of absent names, so a field nobody
+        // thought to ban fails this too.
+        let mut keys: Vec<&str> = envelope["detail"]
+            .as_object()
+            .expect("the rejection detail is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let expected: &[&str] = if expected_axis.is_some() {
+            &["axis", "subject"]
+        } else {
+            &["subject"]
+        };
+        assert_eq!(keys, expected, "{case}: axis plus subject, and no more");
+        assert!(
+            out.retry_after.is_none(),
+            "{case}: a verdict is not a hold — nothing to come back for"
+        );
+        assert_constituent_refusal_discloses_no_more(out, case);
     }
 
-    #[test]
-    fn put_with_scan_indeterminate_layer_returns_400_manifest_blob_unknown() {
-        let out =
-            push_with_referenced_status(SeededRole::Layer, QuarantineStatus::ScanIndeterminate);
-        assert_terminal_reference_refusal(&out, "scan-indeterminate layer");
+    /// The whole refusal shape for an **indeterminate** constituent: the
+    /// `503 UNAVAILABLE` the read route sends, and — the decision this
+    /// change had to make deliberately — **no `Retry-After`**. A `503`
+    /// invites a harder retry than the `400` this used to be, and the
+    /// incident behind the change was already seventy pushes against that
+    /// `400`; the header is omitted because this hold has no
+    /// self-resolving deadline to put in it, so any number would be a
+    /// schedule hort invented. The status still says "not yet", which is
+    /// the true half.
+    fn assert_indeterminate_constituent_refusal(out: &PushOutcome, case: &str) {
+        let rendered = String::from_utf8_lossy(&out.body);
+        assert_eq!(
+            out.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{case}: a held constituent answers the read route's own 503: body = {rendered}"
+        );
+        let envelope = out.envelope();
+        assert_eq!(
+            envelope["code"], "UNAVAILABLE",
+            "{case}: the read route's envelope for this fact"
+        );
+        assert_eq!(
+            envelope["message"], "artifact scan result is indeterminate",
+            "{case}: one wording for one fact across every route"
+        );
+        assert!(
+            envelope["detail"].is_null(),
+            "{case}: a hold's subject stays opaque, exactly as on the read route: {envelope}"
+        );
+        assert_eq!(
+            out.retry_after, None,
+            "{case}: this hold has no self-resolving deadline, so it advertises no schedule"
+        );
+        assert_constituent_refusal_discloses_no_more(out, case);
     }
 
-    /// The config blob is caught too, not only a layer — it is resolved
-    /// through the same loop and the pull reads it through the same blob
-    /// handler.
-    #[test]
-    fn put_with_rejected_config_returns_400_manifest_blob_unknown() {
-        let out = push_with_referenced_status(SeededRole::Config, QuarantineStatus::Rejected);
-        assert_terminal_reference_refusal(&out, "rejected config");
-    }
+    /// Every role a terminal constituent can hold — a layer, the config,
+    /// and an index child, which is resolved for existence only and so
+    /// could only ever be caught in the resolution loop.
+    const TERMINAL_ROLES: [SeededRole; 3] = [
+        SeededRole::Config,
+        SeededRole::Layer,
+        SeededRole::IndexChild,
+    ];
 
     #[test]
-    fn put_with_scan_indeterminate_config_returns_400_manifest_blob_unknown() {
-        let out =
-            push_with_referenced_status(SeededRole::Config, QuarantineStatus::ScanIndeterminate);
-        assert_terminal_reference_refusal(&out, "scan-indeterminate config");
+    fn put_with_rejected_constituent_returns_403_naming_that_constituent() {
+        for role in TERMINAL_ROLES {
+            let out = push_with_referenced_status(
+                role,
+                QuarantineStatus::Rejected,
+                Some(RejectionReason::Scanner),
+            );
+            assert_rejected_constituent_refusal(&out, Some("scanner"), &format!("{role:?}"));
+        }
     }
 
-    /// An index child is caught too. It is resolved for existence only
-    /// (never attached as a group member), which is exactly why the
-    /// status read has to happen in the resolution loop rather than in
-    /// the attachment step.
+    /// A rejection the record cannot explain (ADR 0039 D6's illegal
+    /// state) still refuses, still names the constituent, and reports no
+    /// axis rather than an invented one.
     #[test]
-    fn put_image_index_with_rejected_child_returns_400_manifest_blob_unknown() {
-        let out = push_with_referenced_status(SeededRole::IndexChild, QuarantineStatus::Rejected);
-        assert_terminal_reference_refusal(&out, "rejected index child");
+    fn put_with_rejected_constituent_lacking_an_axis_still_names_the_subject() {
+        let out = push_with_referenced_status(SeededRole::Layer, QuarantineStatus::Rejected, None);
+        assert_rejected_constituent_refusal(&out, None, "axis-less rejected layer");
     }
 
+    /// A non-scanner axis reaches the wire as its own token, so the
+    /// assertion above is about the hydration rather than about one
+    /// hard-coded string — and the variant chosen is one carrying a
+    /// payload, so the same case proves the payload stays behind: the
+    /// `curator_id` is in the event the axis was derived from and must
+    /// appear nowhere in the response.
     #[test]
-    fn put_image_index_with_scan_indeterminate_child_returns_400_manifest_blob_unknown() {
+    fn the_reported_axis_is_the_constituents_own_and_carries_none_of_its_payload() {
+        let curator_id = Uuid::new_v4();
         let out = push_with_referenced_status(
-            SeededRole::IndexChild,
-            QuarantineStatus::ScanIndeterminate,
+            SeededRole::Layer,
+            QuarantineStatus::Rejected,
+            Some(RejectionReason::Curator { curator_id }),
         );
-        assert_terminal_reference_refusal(&out, "scan-indeterminate index child");
+        assert_rejected_constituent_refusal(&out, Some("curator"), "curator-rejected layer");
+        assert!(
+            !String::from_utf8_lossy(&out.body).contains(&curator_id.to_string()),
+            "an actor is not a diagnosis of an artifact — the curator id must not ship"
+        );
+    }
+
+    #[test]
+    fn put_with_scan_indeterminate_constituent_returns_503_with_no_retry_after() {
+        for role in TERMINAL_ROLES {
+            let out = push_with_referenced_status(role, QuarantineStatus::ScanIndeterminate, None);
+            assert_indeterminate_constituent_refusal(&out, &format!("{role:?}"));
+        }
+    }
+
+    /// A document naming **both** an absent and a terminal constituent
+    /// answers the terminal one.
+    ///
+    /// The publisher can fix the absent reference by pushing it and
+    /// cannot fix the terminal one, so answering `MANIFEST_BLOB_UNKNOWN`
+    /// first would send them through a push into a second refusal — which
+    /// is the loop this whole change exists to end.
+    ///
+    /// Returns the response status and the envelope, plus the proof that
+    /// the absent reference really has no row: without that the test
+    /// could pass on a fixture where there was only ever one cause.
+    fn push_with_absent_and_terminal(status: QuarantineStatus) -> (StatusCode, bool) {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let terminal =
+                seed_blob_with_status(&h.artifacts, &h.storage, repo_id, b"terminal-layer", status);
+            if status == QuarantineStatus::Rejected {
+                seed_rejection_axis(&h, repo_id, &terminal, Some(RejectionReason::Scanner)).await;
+            }
+            // Never seeded in any state: the absent cause.
+            let absent: ContentHash = hex::encode(Sha256::digest(b"never-pushed-layer"))
+                .parse()
+                .unwrap();
+            // Absent FIRST in manifest order, so a loop that answered
+            // about whichever cause it met first would answer 400 here.
+            let body = build_manifest_json(&config, &[absent.clone(), terminal]);
+
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            let router = router().with_state(ctx);
+            let resp = router
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap();
+            let row_absent = h
+                .artifacts
+                .find_by_repo_and_checksum(repo_id, &absent)
+                .await
+                .unwrap()
+                .is_none();
+            (resp.status(), row_absent)
+        })
+    }
+
+    #[test]
+    fn a_document_naming_an_absent_and_a_rejected_constituent_answers_the_rejected_one() {
+        let (status, row_absent) = push_with_absent_and_terminal(QuarantineStatus::Rejected);
+        assert!(
+            row_absent,
+            "fixture integrity: the absent reference must have no catalog row, or this test \
+             has only one cause in it"
+        );
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the terminal cause is the one the publisher cannot fix, so it is the one named"
+        );
+    }
+
+    #[test]
+    fn a_document_naming_an_absent_and_a_held_constituent_answers_the_held_one() {
+        let (status, row_absent) =
+            push_with_absent_and_terminal(QuarantineStatus::ScanIndeterminate);
+        assert!(
+            row_absent,
+            "fixture integrity: the absent reference must have no catalog row, or this test \
+             has only one cause in it"
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A document naming **two** terminal constituents answers the one
+    /// whose cause the publisher has least power over: an indeterminate
+    /// hold can clear on a rescan that reaches a verdict, so a push
+    /// blocked on it can succeed later, while one blocked on a rejection
+    /// cannot. The held layer is declared first, so a first-wins loop
+    /// would answer `503` here.
+    #[test]
+    fn a_document_naming_a_held_and_a_rejected_constituent_answers_the_rejected_one() {
+        let (status, body) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let held = seed_blob_with_status(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                b"held-layer",
+                QuarantineStatus::ScanIndeterminate,
+            );
+            let rejected = seed_blob_with_status(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                b"rejected-layer",
+                QuarantineStatus::Rejected,
+            );
+            seed_rejection_axis(&h, repo_id, &rejected, Some(RejectionReason::Scanner)).await;
+            let rejected_digest = format!("sha256:{}", rejected.as_ref());
+            let body = build_manifest_json(&config, &[held, rejected]);
+
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            let router = router().with_state(ctx);
+            let resp = router
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, (body, rejected_digest))
+        });
+        let (body, rejected_digest) = body;
+        let rendered = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the rejection is the refusal no later attempt resolves: body = {rendered}"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["errors"][0]["detail"]["subject"], rejected_digest,
+            "and it is the rejected constituent that is named"
+        );
+    }
+
+    /// The client's `503` names no constituent at all, so the operator's
+    /// record is the only place the cause survives — and it has to carry
+    /// the whole of it: the document pushed, the constituent that
+    /// withheld it, that constituent's status, and how many other
+    /// references were merely absent (so a reader knows the refusal chose
+    /// between two causes rather than having only one).
+    ///
+    /// This is the half that was already right before the refusal was:
+    /// the diagnosis was in the log while the client was told the wrong
+    /// cause. It is pinned here so an edit cannot quietly trade one for
+    /// the other.
+    #[test]
+    fn the_refusal_names_the_document_the_constituent_and_its_status_in_the_log() {
+        let ((status, held_hex, document_hex), records) = capture_tracing(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+                let held = seed_blob_with_status(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    b"held-layer",
+                    QuarantineStatus::ScanIndeterminate,
+                );
+                let absent: ContentHash = hex::encode(Sha256::digest(b"never-pushed-layer"))
+                    .parse()
+                    .unwrap();
+                let held_hex = held.as_ref().to_string();
+                let body = build_manifest_json(&config, &[absent, held]);
+                let document_hex = hex::encode(Sha256::digest(&body));
+
+                let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+                let router = router().with_state(ctx);
+                let resp = router
+                    .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                    .await
+                    .unwrap();
+                (resp.status(), held_hex, document_hex)
+            })
+        });
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "premise: the push is refused for the held constituent"
+        );
+        // The per-reference line: which blob, and in which state. Without
+        // the status an operator has to compare event timestamps to learn
+        // why the push was refused.
+        let warns = events_at(
+            &records,
+            tracing::Level::WARN,
+            "hort_http_oci::manifests_write",
+        );
+        assert!(
+            warns.iter().any(|e| {
+                e.fields.contains(&format!("sha256:{held_hex}"))
+                    && e.fields.contains("scan_indeterminate")
+                    && e.fields.contains("terminally-blocked")
+            }),
+            "expected a WARN naming the held constituent and its status; captured: {warns:?}"
+        );
+        // The decision line: which document, which constituent decided
+        // it, and that a second, absent cause was passed over.
+        let infos = events_at(
+            &records,
+            tracing::Level::INFO,
+            "hort_http_oci::manifests_write",
+        );
+        assert!(
+            infos.iter().any(|e| {
+                e.fields.contains(&document_hex)
+                    && e.fields.contains(&format!("sha256:{held_hex}"))
+                    && e.fields.contains("also_absent=1")
+            }),
+            "expected an INFO naming the document, the deciding constituent and the \
+             passed-over absent count; captured: {infos:?}"
+        );
+    }
+
+    /// The resolution loop keeps the FIRST config and ignores a second,
+    /// rather than overwriting or failing.
+    ///
+    /// `parse_manifest_blobs` emits at most one config, so the handler
+    /// cannot put this loop in that state — which is exactly why the
+    /// branch is tested against the loop directly. It is a defensive arm
+    /// guarding a parser regression, and the behaviour it guards (keep
+    /// the first, warn, carry on) is the whole of what a reader needs to
+    /// know it does.
+    #[test]
+    fn two_config_references_keep_the_first_and_warn() {
+        let (kept, warned) = capture_tracing(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let first = seed_blob(&h.artifacts, &h.storage, repo_id, b"first-config");
+                let second = seed_blob(&h.artifacts, &h.storage, repo_id, b"second-config");
+                let refs = [&first, &second].map(|hash| ReferencedBlob {
+                    digest_raw: format!("sha256:{}", hash.as_ref()),
+                    hash: hash.clone(),
+                    role: BlobRole::Config,
+                });
+                let resolution = resolve_referenced_blobs(&h.ctx, repo_id, &refs)
+                    .await
+                    .expect("both configs resolve; this is not an infrastructure failure");
+                (
+                    resolution
+                        .config
+                        .expect("a config resolved")
+                        .sha256_checksum
+                        .as_ref()
+                        .to_string(),
+                    first.as_ref().to_string(),
+                )
+            })
+        });
+        let (kept_hex, first_hex) = kept;
+        assert_eq!(
+            kept_hex, first_hex,
+            "the first config wins; the extra is dropped, not swapped in"
+        );
+        let warns = events_at(
+            &warned,
+            tracing::Level::WARN,
+            "hort_http_oci::manifests_write",
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|e| e.fields.contains("multiple config blobs resolved")),
+            "a parser regression must leave a record, not pass silently: {warns:?}"
+        );
     }
 
     /// `Quarantined` is NOT terminal and must keep resolving as present.
@@ -5187,7 +5870,7 @@ mod tests {
     #[test]
     fn put_with_quarantined_layer_still_succeeds() {
         for role in [SeededRole::Layer, SeededRole::Config] {
-            let out = push_with_referenced_status(role, QuarantineStatus::Quarantined);
+            let out = push_with_referenced_status(role, QuarantineStatus::Quarantined, None);
             assert_eq!(
                 out.status,
                 StatusCode::CREATED,
@@ -7006,8 +7689,8 @@ mod tests {
 
     #[test]
     fn the_descriptor_check_is_not_gated_on_every_other_child_resolving() {
-        // ORDER, which is what this issue is about. A missing reference is NOT
-        // an error on this path — it is the `Missing` outcome, answered with
+        // ORDER, which is what this issue is about. An absent reference is NOT
+        // an error on this path — it is the `Absent` outcome, answered with
         // `MANIFEST_BLOB_UNKNOWN` AFTER the mint, because the client's
         // retry-after-pushing-the-blob has to be idempotent. A descriptor that
         // disagrees with a child the repository DOES hold is a different thing:
