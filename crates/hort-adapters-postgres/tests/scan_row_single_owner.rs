@@ -26,6 +26,23 @@
 //! across two claims, and — for a persistence failure at the attempt cap —
 //! that the artifact is left where a rescan sweep still sees it.
 //!
+//! ## The row's status and the artifact's status answer different questions
+//!
+//! Three of these tests pair a row state with the stranded sweep's
+//! selection over the same artifact, because that pairing is the property
+//! and either half alone is half of it:
+//!
+//! - a scanner-execution failure (`failed` row) **is** selected — the
+//!   scan could not run and is owed another chance;
+//! - a scan that answered "nothing to analyse" (`completed` row) is
+//!   **not** — every backend ran, and the same inputs abstain again, so
+//!   re-enqueueing it would repeat one answer every tick forever;
+//! - a persistence failure at the cap (`failed` row, no verdict written)
+//!   **is** — the obligation is undischarged.
+//!
+//! The artifact is held in all three. What differs is whether anything is
+//! still owed a scan.
+//!
 //! ## Why the handler here is a stub
 //!
 //! A real `ScanTaskHandler` needs a whole `ScanOrchestrationUseCase`
@@ -397,7 +414,15 @@ async fn a_transient_scan_failure_with_budget_left_stays_a_scheduled_retry() {
 // ---------------------------------------------------------------------------
 
 /// The same transient failure with the budget spent leaves the row
-/// `failed`, keeping the error that failed it.
+/// `failed`, keeping the error that failed it — and the artifact stays
+/// selected by the stranded sweep.
+///
+/// **This is the counter-assertion to the no-verdict test above.** A real
+/// scanner-execution failure must keep every surface it had: the terminal
+/// `failed` row an operator triages on, and `select_stranded`'s re-pick
+/// once the scanner recovers. A change that moved both populations out of
+/// `failed` would have fixed nothing — it would have made the dead
+/// scanner invisible too.
 ///
 /// The artifact half of this boundary — an already-`quarantined` artifact
 /// stays quarantined with no `ScanIndeterminate`, any other status routes
@@ -430,48 +455,110 @@ async fn a_transient_scan_failure_with_the_budget_spent_leaves_a_terminal_row() 
         Some(COMPOSE_ERROR),
         "the row keeps the error that failed it"
     );
+    assert!(
+        state.result_summary.is_none(),
+        "a failed row carries its text on `last_error`, not on a summary; got {state:?}"
+    );
+
+    // And the sweep still re-picks the artifact, so the scan gets another
+    // chance once the scanner is back.
+    let candidates = PgRescanCandidatesRepository::new(pool.clone())
+        .select_stranded(50)
+        .await
+        .expect("select_stranded");
+    assert!(
+        candidates.iter().any(|c| c.artifact_id == artifact),
+        "a scanner-execution failure is exactly what the stranded sweep is for — the \
+         artifact is still owed a verdict and the failed row is the signal that says so. \
+         Got {} candidates",
+        candidates.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Acceptance 3 — NothingAnalysable is terminal at the first attempt
+// Acceptance 3 — NothingAnalysable answers, so the row completes — and
+// the stranded sweep stops seeing the artifact
 // ---------------------------------------------------------------------------
 
-/// A disposition that is terminal by the scan's own verdict goes terminal
-/// immediately, with the whole budget still unspent.
+/// A scan that answered "nothing to analyse" completes its row at the
+/// first attempt, with the whole budget unspent — and the artifact it
+/// holds is no longer selected by the stranded-rescan sweep.
 ///
-/// `ScanRowDisposition::Failed` maps to `retry: false`, and the row has to
-/// honour that rather than spending five backoffs on an abstention that
-/// will abstain again — the artifact's kind and the backends' analyzers are
-/// both fixed. This is also where the old defect was loudest: the blanket
-/// `TaskOutcome::Completed` made this row read `completed`, which is the
-/// one word that must never describe a scan with no verdict.
+/// Both halves of one property, over one artifact. The row half: every
+/// backend ran and reported, so nothing failed, and the reason travels on
+/// `result_summary` rather than `last_error` — a non-error reason in the
+/// error field is the same category mistake one field down. The sweep
+/// half: `select_stranded` requires the most recent `kind='scan'` job to
+/// be `failed` or absent, so a completed row takes the artifact out of
+/// it, which is what ends the re-enqueue loop a deterministic abstention
+/// used to drive on every tick.
+///
+/// **This is also the item's rollout condition made visible.** A
+/// `scan_indeterminate` artifact is outside the interval sweep's
+/// `released`/NULL predicate, so once this row completes the artifact has
+/// no automatic selection signal at all. That is correct for a question
+/// whose answer cannot change until its cause is removed, and it is why
+/// this change ships with the targeted reassessment of the
+/// completed/no-verdict population rather than alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(hort_pg_db)]
-async fn a_scan_with_nothing_to_analyse_is_terminal_at_the_first_attempt() {
+async fn a_scan_with_nothing_to_analyse_completes_the_row_and_leaves_the_sweep() {
     let Some(pool) = maybe_pool().await else {
         return;
     };
     let repo = seed_repo(&pool).await;
-    let artifact = seed_artifact(&pool, repo, Some("quarantined")).await;
+    // The status `record_scan_indeterminate` has just written: the
+    // artifact is held because nothing examined it. This item changes no
+    // release decision, so the hold is the premise rather than the thing
+    // under test.
+    let artifact = seed_artifact(&pool, repo, Some("scan_indeterminate")).await;
     let job_id = seed_pending_scan(&pool, artifact, repo, 0).await;
     let reason = "no scan backend could analyse artifact (kind npm_tarball): \
                   trivy=no_analyzer_matched";
+    let summary = serde_json::json!({
+        "scanner": "trivy",
+        "nothing_analysable": reason,
+    });
 
-    dispatch_scan_rows(&pool, TaskOutcome::fail(reason, false)).await;
+    // Exactly what `ScanTaskHandler` returns for this arm: the
+    // `Completed` disposition carrying the handler's summary.
+    dispatch_scan_rows(
+        &pool,
+        TaskOutcome::Completed {
+            result_summary: summary.clone(),
+        },
+    )
+    .await;
 
     let state = row_state(&pool, job_id).await;
     assert_eq!(
-        state.status, "failed",
-        "a deterministic abstention is terminal on the first attempt; got {state:?}"
+        state.status, "completed",
+        "a scan that answered must not be recorded as a scan that failed; got {state:?}"
     );
     assert_eq!(
         state.attempts, 1,
-        "and it must not spend the retry budget first"
+        "and it must not spend the retry budget first — the same inputs abstain again"
     );
-    assert_eq!(state.last_error.as_deref(), Some(reason));
+    assert_eq!(
+        state.result_summary.as_ref(),
+        Some(&summary),
+        "the reason is the row's only record of why no verdict exists; got {state:?}"
+    );
+    assert_eq!(
+        state.last_error, None,
+        "nothing errored, so the error field must stay empty; got {state:?}"
+    );
+
+    // The sweep half.
+    let candidates = PgRescanCandidatesRepository::new(pool.clone())
+        .select_stranded(50)
+        .await
+        .expect("select_stranded");
     assert!(
-        state.result_summary.is_none(),
-        "a row with no verdict must not carry a result summary; got {state:?}"
+        !candidates.iter().any(|c| c.artifact_id == artifact),
+        "a completed scan job is not a stranded one: the sweep re-drives a scan that could \
+         not run, and this one ran and answered. Got {} candidates",
+        candidates.len()
     );
 }
 

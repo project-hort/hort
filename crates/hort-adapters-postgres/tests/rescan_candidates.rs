@@ -40,6 +40,10 @@
 //! - `select_stranded_skips_released_artifact_even_with_failed_scan`
 //! - `select_stranded_returns_scan_indeterminate_artifact_with_failed_last_scan`
 //! - `select_stranded_returns_scan_indeterminate_artifact_with_no_scan_job_under_scanning_policy`
+//! - `select_stranded_skips_scan_indeterminate_artifact_with_completed_last_scan`
+//!   (a scan that answered "nothing analysable" completes its row, so
+//!   the sweep declines the artifact — carries its own
+//!   flip-the-status counter-assertion)
 //! - `select_stranded_skips_scan_indeterminate_artifact_under_scan_waived_policy`
 //! - `select_stranded_skips_soft_deleted_scan_indeterminate_artifact`
 //! - `select_stranded_skips_rejected_artifact_even_with_failed_scan`
@@ -871,6 +875,71 @@ async fn select_stranded_returns_scan_indeterminate_artifact_with_no_scan_job_un
         1,
         "the job-absent arm admits scan_indeterminate exactly as the \
          failed-job arm does"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (e2b) scan_indeterminate whose last scan job COMPLETED → NOT
+//       returned. This is the sweep half of "a scan that answered must
+//       not be recorded as a scan that failed": the no-verdict arm now
+//       completes its row, and the predicate's
+//       `last_job.status = 'failed' OR IS NULL` is what then declines
+//       the artifact.
+//
+//       The query is unchanged and correct — it was being fed a wrong
+//       fact. What this pins is the consequence: the artifact's only
+//       automatic selection signal is gone, because the interval sweep
+//       admits `released`/NULL only and this one requires a failed or
+//       absent job. A deterministic abstention therefore stops being
+//       re-enqueued every tick, and nothing re-answers a question whose
+//       answer cannot change until the cause is removed (the policy's
+//       `scan_backends`, a backend that can analyse the format) or a
+//       curator releases it.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_stranded_skips_scan_indeterminate_artifact_with_completed_last_scan() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let artifact = seed_artifact(&pool, repo, Some("scan_indeterminate"), None).await;
+    // Exactly the row a `NothingAnalysable` scan leaves behind: the
+    // artifact held for want of a verdict, the job completed because
+    // every backend ran and reported.
+    let _job = seed_scan_job(&pool, repo, artifact, "completed").await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "a completed scan job is not a stranded one — the sweep exists to re-drive a scan \
+         that could not run, and re-enqueueing one that ran and answered would repeat the \
+         same answer every tick forever"
+    );
+
+    // The counter-assertion, over the same seeded shape: flip only the
+    // job's status and the artifact comes back. Without it a predicate
+    // that stopped admitting `scan_indeterminate` at all — or a policy
+    // row a sibling left behind — would satisfy the assertion above
+    // while saying nothing about the job status at all.
+    let failed_artifact = seed_artifact(&pool, repo, Some("scan_indeterminate"), None).await;
+    let _failed_job = seed_scan_job(&pool, repo, failed_artifact, "failed").await;
+    let rows = port
+        .select_stranded(1000)
+        .await
+        .expect("select_stranded Ok");
+    assert_eq!(
+        filter_to(&rows, &[failed_artifact]).len(),
+        1,
+        "the job's status is what decides it: the identical artifact with a failed last scan \
+         is still selected, so the skip above is about the row and not about the status"
     );
 }
 

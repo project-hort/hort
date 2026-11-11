@@ -2903,7 +2903,7 @@ intentionally NOT operator-tunable.
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
-| `hort_scan_jobs_total` | counter | `result` | — | `pending_claimed`, `completed`, `failed`, `retried` |
+| `hort_scan_jobs_total` | counter | `result` | — | `pending_claimed`, `completed`, `nothing_analysable`, `failed`, `retried` |
 | `hort_scan_findings_total` | counter | `scanner`, `severity` | — | `scanner ∈ {trivy, osv, advisory, …registered backend names}`; `severity ∈ {critical, high, medium, low}` |
 | `hort_scan_duration_seconds` | histogram | `scanner` | seconds | — |
 | `hort_scan_queue_depth` | gauge | (none) | rows | — |
@@ -2945,28 +2945,56 @@ Adding a variant to any of those enums requires updating this catalog
 in the same change.
 
 **`hort_scan_jobs_total.result` semantics** (one increment per state
-transition; closed taxonomy of 4):
+transition; closed taxonomy of 5):
 
 - `pending_claimed` — emitted by
   [`ScanOrchestrationUseCase::claim_pending`](../crates/hort-app/src/use_cases/scan_orchestration.rs)
   once per job returned from the `JobsRepository::claim_scan_jobs`
   call. A batch of N claimed jobs ticks the counter N times so the
   `pending → running` rate is observable on a single label.
-  These three labels report what `record_outcome` decided the row
+  The four labels below report what `record_outcome` decided the row
   should become — the `ScanRowDisposition` it returns. The row itself
   is written by the dispatcher, from that disposition, so the
   scan-specific counter and the `hort_admin_tasks_completed_total`
-  result label describe the same transition from the two layers.
+  result label describe the same transition from the two layers. They
+  are **not** one-to-one with the disposition: `completed` and
+  `nothing_analysable` share `ScanRowDisposition::Completed`, because
+  the row's fate and the scan's answer are two questions and this
+  counter answers the second.
 - `completed` — emitted by
   `ScanOrchestrationUseCase::record_outcome` whenever the scan
-  recorded a result. Both `Completed { … }` and `SkippedNoBackends`
-  reach `ScanRowDisposition::Completed` and tick this label; the wire
-  reports the terminal happy-path outcome regardless of whether
-  scanning ran.
+  recorded a verdict. Both `Completed { … }` and `SkippedNoBackends`
+  tick this label; the wire reports the terminal happy-path outcome
+  regardless of whether scanning ran.
+- `nothing_analysable` — emitted on the `NothingAnalysable` arm: every
+  configured backend ran and none examined the artifact, so the scan
+  **answered without producing a verdict**. The artifact transitions to
+  the terminal `scan_indeterminate` status (fail-closed, ADR 0007 — no
+  verdict carries no release authority) while the `jobs` row
+  **completes**, carrying the reason on `result_summary` rather than
+  `last_error`.
+
+  Deliberately its own value rather than folded into either neighbour.
+  As `failed` it claimed an error that did not happen, which is what
+  put this population into every surface keyed on `jobs.status='failed'`
+  — see the *Issue #6 refinement* note under `hort_scan_terminal_total`
+  below for what that key does and does not reach now. As `completed`
+  it would be worse: an artifact held with nothing known about its bytes
+  would read as cleanly scanned in the only counter that reports what
+  the scan found, and `hort_admin_tasks_completed_total{kind="scan"}`
+  already reports the row as `completed`.
+
+  A sustained non-zero rate means a repository is paired with backends
+  that cannot adjudicate its format, and the fix is the policy's
+  `scanBackends`, not another scan attempt — which is why this arm
+  spends no retry budget. The per-backend
+  `hort_scan_record_outcome_failures_total{result="nothing_analysable"}`
+  attributes it to a backend name; this label counts the *job* that
+  ended with no verdict from any of them.
 - `failed` — emitted when `record_outcome` lands on a terminal
-  disposition (the job exhausted `max_attempts` retries, or had
-  nothing analysable). One tick per terminal failure; never
-  co-emitted with `retried` for the same observation.
+  disposition: the job exhausted `max_attempts` retries, every
+  configured backend having errored. One tick per terminal failure;
+  never co-emitted with `retried` for the same observation.
 - `retried` — emitted when `record_outcome` returns
   `ScanRowDisposition::Retry`, asking the dispatcher to reschedule the
   job for a future attempt. One tick per retried observation.
@@ -3305,7 +3333,7 @@ failure is attributable to one (the `report_too_large`,
 sentinel (the `failed_branch` path).
 
 Cardinality:
-- `hort_scan_jobs_total`: 4 result values → 4 series ceiling.
+- `hort_scan_jobs_total`: 5 result values → 5 series ceiling.
 - `hort_scan_findings_total`: ~3 scanners × 4 severities → 12 series.
   Includes the `advisory` sentinel scanner emitted by
   advisory-only contributors.
@@ -3372,17 +3400,27 @@ double-count (architect "one metric, one layer"). Closed taxonomy of
   a hold that does not exist — scan authority *is* recorded and the
   release gate opens on the time gate alone). A steady stream of these
   from an OCI repository is the expected shape, not an alert.
-- `indeterminate` — the scanner could not decide: terminal scan
-  failure after retry exhaustion, for a prior status OTHER than
-  `Quarantined` (issue #6 narrowed this — see below). Ticks only when
-  the retry-exhausted `Failed` arm actually transitions the artifact to
-  `scan_indeterminate` (fail-closed — ADR 0007): a `None`-status
-  artifact (permissive default, no quarantine window to fall back into)
-  still hard-blocks here, and an already-terminal artifact hits the
-  idempotent skip (no double-tick). Never co-emitted with `completed`/
-  `rejected` for the same observation. An attacker who DoSes a
-  configured scanner for a chosen artifact shows up here, distinctly
-  from a clean rejection — a required audit signal.
+- `indeterminate` — no verdict exists for the artifact and none is
+  coming from this job. Ticks on the **two** arms that transition the
+  artifact to `scan_indeterminate` (fail-closed — ADR 0007), which are
+  distinguishable on the per-job counter even though they share this
+  value:
+  - the retry-exhausted `Failed` arm — the scanner could not decide,
+    for a prior status OTHER than `Quarantined` (issue #6 narrowed
+    this — see below). A `None`-status artifact (permissive default, no
+    quarantine window to fall back into) still hard-blocks here, and an
+    already-terminal artifact hits the idempotent skip (no
+    double-tick). Pairs with `hort_scan_jobs_total{result=failed}`.
+  - the `NothingAnalysable` arm — every configured backend ran and none
+    examined the artifact, so there was no verdict to record. Pairs
+    with `hort_scan_jobs_total{result=nothing_analysable}`, and its
+    `jobs` row **completes**: the job did everything asked of it.
+
+  Never co-emitted with `completed`/`rejected` for the same
+  observation. An attacker who DoSes a configured scanner for a chosen
+  artifact shows up here, distinctly from a clean rejection — a
+  required audit signal; the per-job label is what separates that case
+  from a backend that merely has no analyzer for the format.
 - `rejected` — the scanner decided: bad content. Ticks on the
   `Completed{findings: [..]}` arm; the artifact transitioned to
   `rejected`.
@@ -3403,6 +3441,18 @@ belong in this counter's closed taxonomy of 4 — it produces zero
 reads to re-pick the artifact once the scanner recovers — see the
 `hort_cron_rescan_stranded_eligible_artifacts` gauge below and
 `docs/architecture/how-to/recover-stranded-artifacts.md`.
+
+**Both of those facts belong to the scanner-execution failure and to
+nothing else.** A scan that ran and *answered* that there was nothing
+to analyse ticks `hort_scan_jobs_total{result=nothing_analysable}`, not
+`{result=failed}`, and completes its `jobs` row — so it is absent from
+an operator's `GET /api/v1/admin/tasks?kind=scan&status=failed` listing
+and `select_stranded` declines it, which is the point: re-driving a
+deterministic abstention repeats one answer every tick. Reading the
+`status='failed'` key as the discovery signal for every artifact held
+without a verdict is therefore wrong in both directions — it omits the
+abstentions and it says nothing about which of the two a `failed` row
+is. The per-job `result` label is what tells them apart.
 
 Cardinality: 4 result values → 4 series ceiling. `artifact_id` is
 NOT a label (architect "high-cardinality metric labels" rule);

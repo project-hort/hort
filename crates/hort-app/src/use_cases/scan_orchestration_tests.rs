@@ -2066,7 +2066,7 @@ async fn no_record_outcome_arm_writes_the_jobs_row() {
                 scanner: "trivy".into(),
                 reason: "trivy=no_analyzer_matched".into(),
             },
-            ScanRowDisposition::Failed("trivy=no_analyzer_matched".into()),
+            ScanRowDisposition::Completed,
         ),
     ];
     for (arm, attempts, outcome, expected) in cases {
@@ -4153,6 +4153,66 @@ mod metrics_emission_tests {
         assert_eq!(count, Some(1));
     }
 
+    /// The no-verdict arm gets its own label, and neither of the two it
+    /// could have been folded into fires.
+    ///
+    /// Both negatives are the assertion. `failed` was this arm's label
+    /// and is the word that is wrong about it — nothing errored.
+    /// `completed` is the word that would be worse: an artifact held
+    /// `scan_indeterminate` with nothing known about its bytes would
+    /// read as a clean scan in the one counter that reports what the
+    /// scan found, and the generic
+    /// `hort_admin_tasks_completed_total{kind="scan"}` already reports
+    /// the row as completed, so there would be nothing left saying
+    /// otherwise.
+    #[test]
+    fn hort_scan_jobs_total_nothing_analysable_fires_on_the_no_verdict_arm() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let (uc, _jobs, _events, _storage, artifacts, repositories, _policy) =
+                    make_uc(vec![], HashMap::new(), Arc::new(MockAdvisory::ok(vec![])));
+                let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+                let job = sample_scan_job(artifact_id, 1);
+                uc.record_outcome(
+                    &job,
+                    ScanRunOutcome::NothingAnalysable {
+                        scanner: "trivy".into(),
+                        reason: "trivy=no_analyzer_matched".into(),
+                    },
+                )
+                .await
+                .expect("record_outcome");
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_scan_jobs_total", |l| l.get("result")
+                == Some(&"nothing_analysable")),
+            Some(1),
+            "the no-verdict arm must tick its own label"
+        );
+        assert_eq!(
+            find_counter(&snap, "hort_scan_jobs_total", |l| l.get("result")
+                == Some(&"failed")),
+            None,
+            "nothing failed — every backend ran and reported"
+        );
+        assert_eq!(
+            find_counter(&snap, "hort_scan_jobs_total", |l| l.get("result")
+                == Some(&"completed")),
+            None,
+            "and no verdict was recorded, so the artifact must not read as cleanly scanned"
+        );
+        // The artifact-terminal counter is unchanged by this item: the
+        // hold still happens and is still counted, which is why the
+        // job-level label had to carry the distinction instead.
+        assert_eq!(
+            find_counter(&snap, "hort_scan_terminal_total", |l| l.get("result")
+                == Some(&"indeterminate")),
+            Some(1),
+            "the artifact is still held, and the artifact-terminal tick still says so"
+        );
+    }
+
     #[test]
     fn hort_scan_jobs_total_failed_fires_on_terminal_failure() {
         let snap = capture_async_metrics(|| {
@@ -4173,6 +4233,16 @@ mod metrics_emission_tests {
             labels.get("result") == Some(&"failed")
         });
         assert_eq!(count, Some(1));
+        // The counter-assertion to the no-verdict label above: a real
+        // scanner-execution failure keeps `failed`. A change that moved
+        // both populations out of it would have silenced the one signal
+        // an operator alerts a dead scanner on.
+        assert_eq!(
+            find_counter(&snap, "hort_scan_jobs_total", |l| l.get("result")
+                == Some(&"nothing_analysable")),
+            None,
+            "every backend errored — that is a failure, not an abstention"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -5586,11 +5656,18 @@ async fn run_scan_prefers_the_retryable_failure_when_one_backend_errored() {
 }
 
 /// A materialisation a backend cannot analyse is a policy mismatch, not a
-/// clean scan: the artifact goes terminal `scan_indeterminate` and the job
-/// goes terminal `failed` with no retry budget spent, because the next
-/// attempt would reach the same answer.
+/// clean scan: the artifact goes terminal `scan_indeterminate`, and the
+/// job **completes** without spending the retry budget, because every
+/// backend ran and the next attempt would reach the same answer.
+///
+/// The two halves part company here and the test asserts both. The
+/// artifact is held — nothing examined it, so nothing knows it is clean,
+/// and this item changes no release decision. The row is not `failed` —
+/// a scan that answered did not error, and a `failed` row is what put
+/// this population into the operator's `?kind=scan&status=failed`
+/// listing and into `select_stranded`'s endless re-enqueue.
 #[tokio::test]
-async fn record_outcome_nothing_analysable_holds_the_artifact_and_does_not_retry() {
+async fn record_outcome_nothing_analysable_holds_the_artifact_and_completes_the_row() {
     let scanner = Arc::new(MockScanner::with_analysis(
         "trivy",
         Ok(ScanAnalysis::NothingAnalysable(
@@ -5628,13 +5705,10 @@ async fn record_outcome_nothing_analysable_holds_the_artifact_and_does_not_retry
     );
     assert_eq!(
         disposition,
-        ScanRowDisposition::Failed(
-            "no scan backend could analyse artifact (kind npm_tarball): \
-             trivy=no_analyzer_matched"
-                .into()
-        ),
-        "the job must go terminal, not be rescheduled, and must not read as completed — \
-         a deterministic abstention does not spend the retry budget"
+        ScanRowDisposition::Completed,
+        "the scan answered: every backend ran and reported, so the row must not read as a \
+         failure — and it must not be rescheduled either, since a deterministic abstention \
+         re-answers the same way and spends no retry budget"
     );
     assert_no_row_write(&jobs);
 
@@ -5691,10 +5765,7 @@ async fn record_outcome_nothing_analysable_is_idempotent_on_a_terminal_artifact(
             .any(|e| matches!(e, DomainEvent::ScanIndeterminate(_))),
         "no duplicate ScanIndeterminate on an already-terminal artifact"
     );
-    assert_eq!(
-        disposition,
-        ScanRowDisposition::Failed("trivy=not_applicable".into())
-    );
+    assert_eq!(disposition, ScanRowDisposition::Completed);
     assert_no_row_write(&jobs);
 }
 
