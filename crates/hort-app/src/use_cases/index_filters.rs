@@ -50,10 +50,23 @@
 //! before the hold clears. It is the caller's job to establish that
 //! authority — the filters only carry the decision.
 //!
-//! The exemption is `Quarantined`-only and metadata-only.
-//! `Rejected` and `ScanIndeterminate` are terminal verdicts and stay
-//! filtered for every caller; held **bytes** stay unserved to everyone
-//! (the download paths do not consult this type at all).
+//! The exemption is metadata-only, and it reaches exactly the statuses
+//! that are a hold *pending* a verdict:
+//! [`QuarantineStatus::Quarantined`] and
+//! [`QuarantineStatus::ScanIndeterminate`]. The second one is a hold for
+//! the same reason the first is — `QuarantineEvent::SupersedeAbsentVerdict`
+//! admits it and reaches `Quarantined`, so a verdict arriving later
+//! supersedes the absent one and the version rejoins the ordinary timed
+//! hold. [`QuarantineStatus::Rejected`] is a verdict already reached: no
+//! workflow makes that version deliverable, so it stays filtered for
+//! every caller, publisher included. Held **bytes** stay unserved to
+//! everyone (the download paths do not consult this type at all).
+//!
+//! That status set has one spelling for every consumer:
+//! [`HeldVisibility::exemption_covers`]. A per-format serve handler
+//! decides whether to establish the caller's write authority at all,
+//! and asking it with a `matches!` of its own is how that gate comes to
+//! name a narrower set than the truth table it feeds.
 //!
 //! # Composition
 //!
@@ -83,7 +96,8 @@ use hort_domain::entities::repository::IndexMode;
 
 use crate::use_cases::index_serve::{IndexFilter, VersionEntry};
 
-/// Whether the status filters admit a **held** (`Quarantined`) version.
+/// Whether the status filters admit a **held** (`Quarantined` /
+/// `ScanIndeterminate`) version.
 ///
 /// See the module-level rustdoc for the boundary this encodes. The
 /// variants are not interchangeable authority levels: `Hidden` is the
@@ -92,13 +106,13 @@ use crate::use_cases::index_serve::{IndexFilter, VersionEntry};
 /// construct one.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum HeldVisibility {
-    /// A `Quarantined` version is absent from the served index. Every
+    /// A held version is absent from the served index. Every
     /// anonymous, read-only and pull-through caller.
     #[default]
     Hidden,
-    /// A `Quarantined` version survives the status filters — the
-    /// write-authorized hold-read (ADR 0055). Only `Quarantined`;
-    /// terminal verdicts are unaffected.
+    /// A held version survives the status filters — the
+    /// write-authorized hold-read (ADR 0055). Only a hold pending a
+    /// verdict; `Rejected` is unaffected.
     WriteAuthorized,
 }
 
@@ -121,9 +135,37 @@ impl HeldVisibility {
     fn admits(self, status: QuarantineStatus) -> bool {
         match status {
             QuarantineStatus::Released | QuarantineStatus::None => true,
-            QuarantineStatus::Quarantined => matches!(self, Self::WriteAuthorized),
-            QuarantineStatus::Rejected | QuarantineStatus::ScanIndeterminate => false,
+            QuarantineStatus::Quarantined | QuarantineStatus::ScanIndeterminate => {
+                matches!(self, Self::WriteAuthorized)
+            }
+            QuarantineStatus::Rejected => false,
         }
+    }
+
+    /// Whether the hold-read exemption covers `status` — i.e. whether
+    /// it is a hold *pending a verdict* (ADR 0055 D2, as amended
+    /// 2026-11-11: `Quarantined` and `ScanIndeterminate`).
+    ///
+    /// `admits` answers "does this entry reach the served set,
+    /// given the visibility I already decided on". This answers the
+    /// question a per-format serve handler asks *before* that, to
+    /// decide whether to establish the caller's authority at all: a
+    /// `resolve_granted_write` is only worth making when some entry's
+    /// visibility actually turns on it.
+    ///
+    /// The two have to name the same status set, and a gate narrower
+    /// than the truth table it feeds leaves the widened cell
+    /// unreachable — the cargo sparse-index path gated on
+    /// `Quarantined` alone, so a `ScanIndeterminate` entry kept the
+    /// ordinary view for its own publisher while `admits` said
+    /// otherwise. So this is **derived** from the truth table rather
+    /// than a second list of statuses: a status is a covered hold
+    /// exactly when `WriteAuthorized` admits it and `Hidden` does not.
+    /// A future [`QuarantineStatus`] variant is therefore decided once,
+    /// in `admits`, and flows here with nothing to keep in step.
+    #[must_use]
+    pub fn exemption_covers(status: QuarantineStatus) -> bool {
+        Self::WriteAuthorized.admits(status) && !Self::Hidden.admits(status)
     }
 }
 
@@ -192,8 +234,9 @@ pub struct IndexModeFilter {
     /// `IncludePending` keeps them).
     pub mode: IndexMode,
     /// Held-metadata visibility for this caller. The mode arms are
-    /// unaffected by it — it only decides the `Some(Quarantined)`
-    /// column, identically in both modes.
+    /// unaffected by it — it only decides the two held columns
+    /// (`Some(Quarantined)` / `Some(ScanIndeterminate)`), identically in
+    /// both modes.
     held: HeldVisibility,
 }
 
@@ -292,9 +335,9 @@ mod tests {
     /// | 1.0.0 | never ingested (no Hort row) |
     /// | 1.0.1 | `Released` |
     /// | 1.0.2 | `None` |
-    /// | 1.0.3 | `Quarantined` — the only column the exemption moves |
-    /// | 1.0.4 | `Rejected` |
-    /// | 1.0.5 | `ScanIndeterminate` |
+    /// | 1.0.3 | `Quarantined` — a hold the exemption moves |
+    /// | 1.0.4 | `Rejected` — the verdict the exemption never moves |
+    /// | 1.0.5 | `ScanIndeterminate` — a hold the exemption moves |
     fn every_status_entry_set() -> Vec<VersionEntry> {
         vec![
             entry("1.0.0", None),
@@ -338,9 +381,10 @@ mod tests {
                 &NonServableStatusFilter::new(HeldVisibility::WriteAuthorized),
                 every_status_entry_set()
             ),
-            ["1.0.0", "1.0.1", "1.0.2", "1.0.3"],
-            "the exemption admits the Quarantined column and moves no other — the two \
-             verdicts stay dropped for a write-authorized caller too"
+            ["1.0.0", "1.0.1", "1.0.2", "1.0.3", "1.0.5"],
+            "the exemption admits both held columns — Quarantined and ScanIndeterminate \
+             — and moves no other: Rejected stays dropped for a write-authorized caller \
+             too"
         );
     }
 
@@ -405,8 +449,8 @@ mod tests {
 
     #[test]
     fn non_servable_status_filter_predicate_matrix_write_authorized() {
-        // The exemption's whole effect on this filter: the Quarantined
-        // column flips, nothing else moves.
+        // The exemption's whole effect on this filter: the two held
+        // columns flip, nothing else moves.
         let held = HeldVisibility::WriteAuthorized;
         assert!(non_servable_filter_keeps_for(held, None));
         assert!(non_servable_filter_keeps_for(
@@ -421,13 +465,13 @@ mod tests {
             held,
             Some(QuarantineStatus::Quarantined)
         ));
-        assert!(!non_servable_filter_keeps_for(
+        assert!(non_servable_filter_keeps_for(
             held,
-            Some(QuarantineStatus::Rejected)
+            Some(QuarantineStatus::ScanIndeterminate)
         ));
         assert!(!non_servable_filter_keeps_for(
             held,
-            Some(QuarantineStatus::ScanIndeterminate)
+            Some(QuarantineStatus::Rejected)
         ));
     }
 
@@ -446,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn held_visibility_write_authorized_widens_quarantined_and_nothing_else() {
+    fn held_visibility_write_authorized_widens_both_holds_and_nothing_else() {
         let v = HeldVisibility::WriteAuthorized;
         assert!(v.admits(QuarantineStatus::Released));
         assert!(v.admits(QuarantineStatus::None));
@@ -455,15 +499,78 @@ mod tests {
             "the exemption exists so a publisher can resolve what it just uploaded"
         );
         assert!(
-            !v.admits(QuarantineStatus::Rejected),
-            "Rejected is a terminal verdict — the exemption covers a hold pending a \
-             verdict, never a verdict already reached"
+            v.admits(QuarantineStatus::ScanIndeterminate),
+            "ScanIndeterminate is a hold pending a verdict, not a verdict reached: \
+             QuarantineEvent::SupersedeAbsentVerdict admits it and reaches Quarantined, \
+             so a verdict arriving later supersedes the absent one"
         );
         assert!(
-            !v.admits(QuarantineStatus::ScanIndeterminate),
-            "ScanIndeterminate is a terminal fail-closed block with no self-resolving \
-             deadline — no caller sees it"
+            !v.admits(QuarantineStatus::Rejected),
+            "Rejected is a verdict already reached — the exemption covers a hold \
+             pending a verdict and never a verdict reached"
         );
+    }
+
+    /// **Counter-assertion.** The two statuses the exemption used to
+    /// answer together have parted, so the one that stayed behind needs
+    /// an assertion of its own: `Rejected` is refused for *every*
+    /// visibility, and a future edit that folds it back in beside
+    /// `ScanIndeterminate` fails here rather than silently serving a
+    /// reached verdict to a publisher.
+    #[test]
+    fn held_visibility_refuses_rejected_for_every_visibility() {
+        for v in [HeldVisibility::Hidden, HeldVisibility::WriteAuthorized] {
+            assert!(
+                !v.admits(QuarantineStatus::Rejected),
+                "{v:?}: a reached verdict never resolves, for anyone"
+            );
+        }
+    }
+
+    /// The gate half of the exemption: which statuses make it worth
+    /// establishing the caller's write authority at all.
+    #[test]
+    fn exemption_covers_names_exactly_the_holds_pending_a_verdict() {
+        assert!(HeldVisibility::exemption_covers(
+            QuarantineStatus::Quarantined
+        ));
+        assert!(
+            HeldVisibility::exemption_covers(QuarantineStatus::ScanIndeterminate),
+            "a hold pending a verdict, so a handler's gate must establish write \
+             authority for it rather than keep the ordinary view"
+        );
+        assert!(
+            !HeldVisibility::exemption_covers(QuarantineStatus::Rejected),
+            "a verdict already reached is not a hold the exemption covers"
+        );
+        assert!(!HeldVisibility::exemption_covers(
+            QuarantineStatus::Released
+        ));
+        assert!(!HeldVisibility::exemption_covers(QuarantineStatus::None));
+    }
+
+    /// The property the two predicates exist to keep: a status the gate
+    /// skips is one the exemption could not have changed anyway, and a
+    /// status it covers is one where establishing the caller's authority
+    /// actually moves the answer.
+    ///
+    /// Driven off [`QuarantineStatus::ALL`], so a sixth variant is
+    /// decided once in `admits` and checked here with no edit. The
+    /// equality also pins the monotonicity the derivation rests on —
+    /// `Hidden` admitting a status implies `WriteAuthorized` does, so
+    /// "widens" never means "withholds".
+    #[test]
+    fn exemption_covers_agrees_with_the_admits_truth_table_for_every_status() {
+        for s in QuarantineStatus::ALL {
+            let visibility_differs =
+                HeldVisibility::WriteAuthorized.admits(s) != HeldVisibility::Hidden.admits(s);
+            assert_eq!(
+                HeldVisibility::exemption_covers(s),
+                visibility_differs,
+                "{s}: the gate deciding whether to establish write authority and the \
+                 truth table it feeds must name one set"
+            );
+        }
     }
 
     #[test]
@@ -503,12 +610,16 @@ mod tests {
 
     #[test]
     fn index_mode_filter_held_column_is_mode_independent() {
-        // The exemption widens the `Some(Quarantined)` column only, and
-        // does so identically in both modes — the never-ingested column
-        // stays the mode's own decision.
+        // The exemption widens the two held columns only, and does so
+        // identically in both modes — the never-ingested column stays
+        // the mode's own decision.
         for mode in [IndexMode::ReleasedOnly, IndexMode::IncludePending] {
             let f = IndexModeFilter::with_held_visibility(mode, HeldVisibility::WriteAuthorized);
             assert!(f.held.admits(QuarantineStatus::Quarantined), "{mode:?}");
+            assert!(
+                f.held.admits(QuarantineStatus::ScanIndeterminate),
+                "{mode:?}"
+            );
             assert!(!f.held.admits(QuarantineStatus::Rejected), "{mode:?}");
             assert_eq!(f.mode, mode);
         }
@@ -517,8 +628,9 @@ mod tests {
     #[test]
     fn index_mode_filter_apply_over_every_status_column_in_both_modes() {
         // The mode decides the never-ingested column (1.0.0) and the
-        // held visibility decides the Quarantined one (1.0.3); the two
-        // are independent, and no other column moves.
+        // held visibility decides the two held ones (1.0.3, 1.0.5); the
+        // two are independent, and no other column moves — 1.0.4
+        // (`Rejected`) is absent from every row.
         let cases = [
             (
                 IndexMode::ReleasedOnly,
@@ -528,7 +640,7 @@ mod tests {
             (
                 IndexMode::ReleasedOnly,
                 HeldVisibility::WriteAuthorized,
-                vec!["1.0.1", "1.0.2", "1.0.3"],
+                vec!["1.0.1", "1.0.2", "1.0.3", "1.0.5"],
             ),
             (
                 IndexMode::IncludePending,
@@ -538,7 +650,7 @@ mod tests {
             (
                 IndexMode::IncludePending,
                 HeldVisibility::WriteAuthorized,
-                vec!["1.0.0", "1.0.1", "1.0.2", "1.0.3"],
+                vec!["1.0.0", "1.0.1", "1.0.2", "1.0.3", "1.0.5"],
             ),
         ];
         for (mode, held, expected) in cases {

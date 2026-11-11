@@ -98,6 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A write-granted publisher can now resolve its own artifact held
+  `scan_indeterminate` — OCI manifest and cargo index entry — so an upload held
+  for want of a scan verdict can still be signed.
 - An OCI image manifest whose composition could not be produced within the
   scan's attempt budget — an unreachable upstream or a store that did not
   answer — is now held `quarantined` rather than terminal

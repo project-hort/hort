@@ -31,6 +31,7 @@ use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{
     emit_download_audit_dropped, labels, values, DownloadAuditDropResult, DownloadResult,
 };
+use crate::use_cases::index_filters::HeldVisibility;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::quarantine_hold::resolve_transient_hold;
 use crate::use_cases::read_artifact_stream;
@@ -1153,16 +1154,33 @@ impl ArtifactUseCase {
         Ok((artifact, stream))
     }
 
-    /// Stream a **quarantined** artifact's CAS bytes for an authorized
-    /// hold-read (the push-then-sign manifest-GET exemption, ADR 0039 §10).
+    /// Stream a **held** artifact's CAS bytes for an authorized
+    /// hold-read (the push-then-sign manifest-GET exemption, ADR 0039 §10,
+    /// generalised by ADR 0055).
     ///
     /// [`Self::download`] refuses a non-[`is_downloadable`](Artifact::is_downloadable)
-    /// artifact (a held `Quarantined` manifest fails that gate), so it cannot
+    /// artifact (a held manifest fails that gate), so it cannot
     /// serve the held subject a keyed `cosign sign` resolves by `GET` before
-    /// attaching the signature. This method streams the CAS bytes for a
-    /// `Quarantined` artifact **only** — every other status (including
-    /// `Rejected`) is `Forbidden`, so a rejected manifest is never served and
-    /// a released artifact goes through the audited [`Self::download`] path.
+    /// attaching the signature. This method streams the CAS bytes for an
+    /// artifact under a hold **pending a verdict**, so a publisher can sign
+    /// what it uploaded in either hold — and it asks *which* statuses those
+    /// are with [`HeldVisibility::exemption_covers`] rather than naming them
+    /// here. Every status that predicate does not cover is `Forbidden`:
+    /// `Rejected` is a verdict already reached and its manifest is never
+    /// served, and a released artifact goes through the audited
+    /// [`Self::download`] path.
+    ///
+    /// Asking the held-*metadata* predicate on a byte route is right because
+    /// on this one the bytes **are** the resolution document: a manifest's
+    /// bytes are the manifest (ADR 0055 puts a cargo sparse-index entry in
+    /// the same place and the `.crate` download in the layer blob's). Held
+    /// content — the layer blob — stays refused on every path. And asking
+    /// it, rather than keeping a second copy of the status set, is what keeps
+    /// this half from drifting from the caller's gate: the predicate is
+    /// derived from a wildcard-free match, so a future [`QuarantineStatus`]
+    /// variant is decided once instead of being admitted there and refused
+    /// here — which the OCI manifest route reports as `500`, having already
+    /// decided the read was allowed.
     ///
     /// The caller (the OCI manifest handler) has already proven the read is
     /// write-authorized and the artifact is a manifest, not a layer blob; this
@@ -1175,7 +1193,7 @@ impl ArtifactUseCase {
         artifact_id: Uuid,
     ) -> AppResult<(Artifact, Box<dyn AsyncRead + Send + Unpin>)> {
         let artifact = self.artifacts.find_by_id(artifact_id).await?;
-        if !matches!(artifact.quarantine_status, QuarantineStatus::Quarantined) {
+        if !HeldVisibility::exemption_covers(artifact.quarantine_status) {
             return Err(AppError::Domain(DomainError::Forbidden(format!(
                 "artifact {} is not a held manifest hold-read (status: {})",
                 artifact_id, artifact.quarantine_status
@@ -1186,7 +1204,7 @@ impl ArtifactUseCase {
             .get(&artifact.sha256_checksum)
             .await
             .map_err(|e| AppError::Storage(e.to_string()))?;
-        // Security-relevant audit signal: a quarantined manifest's bytes
+        // Security-relevant audit signal: a held manifest's bytes
         // left the hold under the write-authorized exemption. `info!`
         // (not an event) — the documented no-`ArtifactDownloaded` choice
         // stands: a hold-read for signing is a signer's metadata resolve,
@@ -1213,7 +1231,8 @@ impl ArtifactUseCase {
     /// [`Self::download_hold_read`] (the narrow ADR 0039 §10
     /// write-authorized hold-read exemption). Neither is a substitute
     /// here: `download` refuses every held artifact, and
-    /// `download_hold_read` refuses every artifact that is *not* held —
+    /// `download_hold_read` refuses every artifact that is *not* under a
+    /// hold pending a verdict —
     /// so a projection rebuild that must work in both states can use
     /// neither, and reusing the latter would also emit its
     /// hold-read-served audit line for a read that served nobody.
@@ -5152,42 +5171,55 @@ mod visibility_extension_tests {
 
     // -- download_hold_read (push-then-sign manifest-GET exemption) --------
 
-    /// A `Quarantined` artifact streams its CAS bytes — this is the whole
-    /// point of the exemption: keyed `cosign sign` resolves the held subject
-    /// manifest by GET, and `download` refuses it (`is_downloadable()` is
-    /// false), so `download_hold_read` is the CAS-read half that serves it.
+    /// Either hold streams its CAS bytes — this is the whole point of the
+    /// exemption: keyed `cosign sign` resolves the held subject manifest by
+    /// GET, and `download` refuses it (`is_downloadable()` is false), so
+    /// `download_hold_read` is the CAS-read half that serves it.
+    ///
+    /// `ScanIndeterminate` is in the loop because it is a hold pending a
+    /// verdict too — `QuarantineEvent::SupersedeAbsentVerdict` admits it and
+    /// reaches `Quarantined` — so a publisher whose upload is held for want
+    /// of a verdict can sign it exactly as one held by the timed quarantine
+    /// can.
     #[tokio::test]
-    async fn download_hold_read_quarantined_serves_bytes() {
+    async fn download_hold_read_held_statuses_serve_bytes() {
         use tokio::io::AsyncReadExt;
 
-        let artifacts = Arc::new(MockArtifactRepository::new());
-        let storage = Arc::new(MockStoragePort::new());
-        let repos = Arc::new(MockRepositoryRepository::new());
-        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        for status in [
+            QuarantineStatus::Quarantined,
+            QuarantineStatus::ScanIndeterminate,
+        ] {
+            let artifacts = Arc::new(MockArtifactRepository::new());
+            let storage = Arc::new(MockStoragePort::new());
+            let repos = Arc::new(MockRepositoryRepository::new());
+            let metadata = Arc::new(MockArtifactMetadataRepository::new());
 
-        let hash: ContentHash = VALID_SHA256.parse().unwrap();
-        storage.insert_content(hash, b"held manifest bytes".to_vec());
+            let hash: ContentHash = VALID_SHA256.parse().unwrap();
+            storage.insert_content(hash, b"held manifest bytes".to_vec());
 
-        let mut a = artifact_in_repo(Uuid::new_v4(), "manifests/sha256:x", VALID_SHA256);
-        a.quarantine_status = QuarantineStatus::Quarantined;
-        a.quarantine_window_start = Some(Utc::now());
-        let a_id = a.id;
-        artifacts.insert(a);
+            let mut a = artifact_in_repo(Uuid::new_v4(), "manifests/sha256:x", VALID_SHA256);
+            a.quarantine_status = status;
+            a.quarantine_window_start = Some(Utc::now());
+            let a_id = a.id;
+            artifacts.insert(a);
 
-        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
-        let (got_a, mut stream) = uc.download_hold_read(a_id).await.unwrap();
-        assert_eq!(got_a.id, a_id);
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        assert_eq!(buf, b"held manifest bytes");
+            let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+            let (got_a, mut stream) = uc.download_hold_read(a_id).await.unwrap();
+            assert_eq!(got_a.id, a_id, "{status:?}");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            assert_eq!(buf, b"held manifest bytes", "{status:?}");
+        }
     }
 
-    /// Fail-closed: a non-`Quarantined` status is `Forbidden` on the hold-read
-    /// path. `None` / `Released` artifacts go through the audited `download`;
-    /// a `Rejected` manifest must NEVER be served — the exemption is strictly a
-    /// held-manifest-signing read.
+    /// Fail-closed: a status that is not a hold pending a verdict is
+    /// `Forbidden` on the hold-read path. `None` / `Released` artifacts go
+    /// through the audited `download`; a `Rejected` manifest must NEVER be
+    /// served — a verdict has been reached there and no publisher workflow
+    /// makes that version deliverable, which is exactly what separates it
+    /// from the two holds above.
     #[tokio::test]
-    async fn download_hold_read_non_quarantined_is_forbidden() {
+    async fn download_hold_read_unheld_statuses_are_forbidden() {
         for status in [
             QuarantineStatus::None,
             QuarantineStatus::Released,

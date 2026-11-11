@@ -135,11 +135,17 @@ pub enum OciError {
     /// artifact to the time-bounded hold, a blocking one condemns it
     /// (ADR 0007, "A reached verdict supersedes an absent one") — and
     /// never the passage of time. So this variant deliberately does NOT
-    /// carry `retry_after_seconds` and emits no `Retry-After` header. Fail-closed for every caller, including a
-    /// write-granted one — the ADR 0039 §10 push-then-sign / dedup
-    /// hold-read exemptions that apply to `Quarantined` do NOT extend
-    /// here (issue #92). Code is `UNAVAILABLE` — the same spec-extension
-    /// as `Quarantined`; no new OCI error code.
+    /// carry `retry_after_seconds` and emits no `Retry-After` header.
+    ///
+    /// Who reaches this envelope tracks `Quarantined`, because a hold
+    /// out of which an arriving verdict leads is the same kind of hold:
+    /// the ADR 0039 §10 / ADR 0055 hold-read serves a *manifest* to a
+    /// caller with granted Write on the repository, so on that route
+    /// this answer is the one every caller without that grant gets. The
+    /// blob route is not a resolution document and keeps its existence
+    /// probe `HEAD`-only, so a content `GET` answers here for every
+    /// caller, write-granted included. Code is `UNAVAILABLE` — the same
+    /// spec-extension as `Quarantined`; no new OCI error code.
     ScanIndeterminate,
     /// 403 — the artifact exists, the caller passed the repository read
     /// gate, and it is **`Rejected`**: a terminal verdict was reached
