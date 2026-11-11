@@ -175,6 +175,37 @@ INDEX_RELEASE_WAIT_SECS="${INDEX_RELEASE_WAIT_SECS:-$(( QUARANTINE_DURATION_SECS
 # storage. Keeping this budget SHORT is what makes a timeout here mean
 # "clearance or cascade" and never "the window".
 ANON_PULL_WAIT_SECS="${ANON_PULL_WAIT_SECS:-60}"
+#
+# Step 9a budget — the AUTHENTICATED `--all` warm pass.
+#
+# Sized against the CONSTITUENT CLEARANCE TAIL, not against a round
+# number, because the exemption this step leans on does not reach what
+# the step actually downloads. ADR 0039 §10's hold-read exemption is
+# MANIFEST-only: a granted-Write caller may GET a held manifest body so
+# a subject image can be signed, and `skopeo copy --all` does get every
+# manifest in the tree that way. Its BLOB content does not come with it
+# — `get_blob_quarantined_write_authorized_caller_still_returns_503`
+# pins that ("only the HEAD existence probe is released; content
+# download stays held"), and serving held blob content would defeat the
+# quarantine. So this pull completes only once every CONSTITUENT blob
+# has actually RELEASED, which for a zero-window descendant means its
+# own scan clearing plus a sweep tick.
+#
+# That tail scales with the SIZE OF THE TREE — one scan per constituent
+# — so it is not RELEASE_PROCESSING_BUDGET_SECS, which budgets the
+# release work behind a single artifact's tick (observed 10-40s) and
+# would be reused here far outside what it was measured for.
+#
+# FASTER MUST NOT BE WORSE, the same rule 9b-i states: the elapsed time
+# before this wait is deliberately NOT subtracted, so the worst case is
+# "this pass starts at the instant of the Step 0 ingest" and no future
+# speed-up of Steps 0-8 can beat it. (The bare `120` this step used to
+# carry failed exactly that way: a run whose Steps 0-8 took 9.8s reached
+# its deadline 20.4s before the last constituent released, with every
+# byte already in CAS since 28.6s — the tree was ingested and hort was
+# holding it exactly as ADR 0007 requires.)
+CONSTITUENT_CLEARANCE_BUDGET_SECS=240
+WARM_PASS_WAIT_SECS="${WARM_PASS_WAIT_SECS:-$(( CONSTITUENT_CLEARANCE_BUDGET_SECS + RELEASE_SWEEP_TICK_BUDGET_SECS ))}"
 
 REGISTRY_HOST="${HORT_URL#http://}"
 REGISTRY_HOST="${REGISTRY_HOST#https://}"
@@ -662,9 +693,17 @@ fi
 # blobs via the root behind their cascade-cleared parent).
 #
 # 9a is the ingest vehicle: an AUTHENTICATED `--all` warm pass. Write
-# authorization gives the hold-read exemption, so this pull can read
-# every held constituent as it lands and drives the full foreign-platform
-# tree through cold pull-through in one client-side pass.
+# authorization carries the ADR 0039 §10 hold-read exemption for every
+# MANIFEST in the tree, so the walk is never blocked on resolving one;
+# each blob it then requests is pulled through and ingested even when
+# the response to that request is the 503 of a fresh hold. That is what
+# makes this the ingest vehicle, and it is all this step relies on.
+#
+# It is NOT exempt from the holds themselves. Blob CONTENT stays held
+# from every caller, write-granted included, so the copy only COMPLETES
+# once each constituent has released on its own clearance plus a sweep
+# tick. The budget is sized for that tail (WARM_PASS_WAIT_SECS); do not
+# re-describe this step as reading held constituents.
 #
 # 9b proves the actual acceptance criterion: an ANONYMOUS `--all` pull
 # succeeds end-to-end once every constituent has cleared and released.
@@ -689,13 +728,13 @@ log "--- Step 9a: authenticated warm pass (late-joiner ingest vehicle)"
 rm -f "$WARM_ARCHIVE"
 if bounded_poll \
         "signed image pullable (authenticated warm pass)" \
-        120 \
+        "$WARM_PASS_WAIT_SECS" \
         "skopeo copy --all --insecure-policy --src-tls-verify=false --src-creds '${PUSH_USER}:${PUSH_SECRET}' 'docker://${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}' 'oci-archive:${WARM_ARCHIVE}'" \
         5; then
     pass "authenticated --all warm pass ingested every foreign platform (hold-read exemption honored; each late joiner self-cleared at its own quarantine commit)"
 else
     fail "authenticated warm pass ingests every foreign platform" \
-         "the signed index never became fully (--all) authenticated-pullable within 120s (hold-read exemption not honored, or a foreign platform failed to ingest/self-clear)"
+         "the signed index never became fully (--all) authenticated-pullable within ${WARM_PASS_WAIT_SECS}s, a budget that covers the whole constituent clearance tail measured from the Step 0 ingest — so neither the elapsed time before this step nor the index's own window is an available explanation. Write authority exempts the MANIFEST reads only; what this pass waits on is every constituent BLOB releasing. Look at the scan path: a constituent whose scan never completed, or a foreign platform that never ingested at all (compare count(*) on artifacts in this repository against the index's .manifests[] children)."
 fi
 rm -f "$WARM_ARCHIVE"
 
