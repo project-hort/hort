@@ -68,6 +68,7 @@ use uuid::Uuid;
 use hort_app::error::AppError;
 use hort_app::metrics::{emit_upstream_checksum, UpstreamChecksumResult};
 use hort_app::pull_dedup::DedupKey;
+use hort_app::use_cases::index_filters::HeldVisibility;
 use hort_app::use_cases::ingest_use_case::{RegisterExistingCasBlobRequest, VerifiedIngestRequest};
 use hort_app::use_cases::manifest_deliverability::ManifestDeliverability;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
@@ -285,18 +286,30 @@ pub(super) async fn serve(
     //    before attaching the signature. Hence no `head` term: the body
     //    is the point.
     //
+    //    It covers both holds *pending a verdict*. `ScanIndeterminate`
+    //    is one: `QuarantineEvent::SupersedeAbsentVerdict` admits it and
+    //    reaches `Quarantined`, so a verdict arriving later supersedes
+    //    the absent one and the artifact rejoins the ordinary timed
+    //    hold. The two holds differ in what is known about the artifact,
+    //    not in whether the publisher may finish publishing it — a
+    //    publisher that could sign an artifact held by the timed
+    //    quarantine but not one held for want of a verdict would be
+    //    blocked by the same unreachable precondition this exemption
+    //    exists to remove.
+    //
     //    (b) `write_authorized_existence_probe` — the pre-upload
-    //    existence probe on a terminal verdict (ADR 0055's 2026-10-21
-    //    amendment D2). `head`-bound, and that bound is the whole
-    //    difference: a hold means "not yet", so serving its manifest
-    //    lets the publisher complete a workflow that resolves it, while
-    //    a terminal verdict is a verdict already reached and no workflow
-    //    makes it deliverable. Widening (a) to cover it would serve a
-    //    rejected manifest's BODY, which the amendment refuses outright.
-    //    What the probe answers is "must I still send these bytes?" —
-    //    the caller already holds them, the answer leads to no download,
-    //    and the `GET` on this same route keeps refusing with its axis
-    //    for every caller.
+    //    existence probe on a verdict already reached, which is
+    //    `Rejected` and only `Rejected` (ADR 0055's 2026-10-21 amendment
+    //    D2, as amended 2026-11-11). `head`-bound, and that bound is the
+    //    whole difference: a hold means "not yet", so serving its
+    //    manifest lets the publisher complete a workflow that resolves
+    //    it, while a reached verdict is final and no workflow makes it
+    //    deliverable. Widening (a) to cover it would serve a rejected
+    //    manifest's BODY, which the amendment refuses outright. What the
+    //    probe answers is "must I still send these bytes?" — the caller
+    //    already holds them, the answer leads to no download, and the
+    //    `GET` on this same route keeps refusing with its axis for every
+    //    caller.
     //
     //    Both key on GRANTED write authority (`resolve_granted_write`:
     //    the grants leg alone, cap ignored), not the presented token's
@@ -320,22 +333,25 @@ pub(super) async fn serve(
     //    (quarantine invariant #5) is untouched, and a `Rejected`
     //    manifest's body is served to nobody. Fail closed on both: ONLY
     //    a definitive granted-Write authorization lifts the refusal — a
-    //    denied or errored resolve keeps it. The two `matches!` sets are
+    //    denied or errored resolve keeps it. The two status sets are
     //    disjoint, so at most one `resolve_granted_write` ever fires, and
     //    only on the narrow withheld-manifest path — the hot read path is
     //    unaffected.
-    let write_authorized_hold_read =
-        matches!(artifact.quarantine_status, QuarantineStatus::Quarantined)
-            && ctx
-                .repository_access_use_case
-                .resolve_granted_write(repo_key, actor)
-                .await
-                .is_ok();
-    let write_authorized_existence_probe =
-        head && matches!(
-            artifact.quarantine_status,
-            QuarantineStatus::Rejected | QuarantineStatus::ScanIndeterminate
-        ) && ctx
+    //
+    //    (a) asks `HeldVisibility::exemption_covers` rather than
+    //    spelling the pair again here: that type carries the hold-read's
+    //    status set for every consumer, and a route that re-states it
+    //    locally is a copy that can answer a status differently from the
+    //    rule it is enforcing.
+    let write_authorized_hold_read = HeldVisibility::exemption_covers(artifact.quarantine_status)
+        && ctx
+            .repository_access_use_case
+            .resolve_granted_write(repo_key, actor)
+            .await
+            .is_ok();
+    let write_authorized_existence_probe = head
+        && matches!(artifact.quarantine_status, QuarantineStatus::Rejected)
+        && ctx
             .repository_access_use_case
             .resolve_granted_write(repo_key, actor)
             .await
@@ -373,7 +389,9 @@ pub(super) async fn serve(
                 return response;
             }
             // else: ADR 0039 §10 write-authorized hold-read — fall
-            // through to serve the manifest (HEAD and GET alike).
+            // through to serve the manifest (HEAD and GET alike). The
+            // `ScanIndeterminate` arm below reaches the same
+            // fall-through through the same predicate.
         }
         QuarantineStatus::Rejected => {
             if !write_authorized_existence_probe {
@@ -390,10 +408,11 @@ pub(super) async fn serve(
                 //
                 // Resolvability is NOT what changes. The manifest still
                 // never resolves to bytes, for anyone, publisher
-                // included: the hold-read exemption serves a
-                // `Quarantined` body and stops there, and the probe
-                // exemption that does reach this arm is `head`-bound. So
-                // every `GET` lands here, whatever the caller's grants.
+                // included: the hold-read exemption serves a body held
+                // *pending a verdict* and stops short of a verdict
+                // reached, and the probe exemption that does reach this
+                // arm is `head`-bound. So every `GET` lands here,
+                // whatever the caller's grants.
                 // What the write-granted caller gains is the diagnosis,
                 // which they are owed for the same reason every admitted
                 // reader is: they certainly pass the read gate.
@@ -447,18 +466,28 @@ pub(super) async fn serve(
             // exemption exists for.
         }
         QuarantineStatus::ScanIndeterminate => {
-            if !write_authorized_existence_probe {
-                // Refused for every caller on the body path, the
-                // write-granted one included — the hold-read exemption
-                // above covers `Quarantined` only, because an
-                // indeterminate verdict is already reached and no
-                // publisher workflow resolves it. No `Retry-After`: this
-                // hold has no self-resolving deadline.
+            if !write_authorized_hold_read {
+                // A hold pending a verdict, refused to every caller that
+                // has not established granted Write on this repository —
+                // the same gate and the same predicate the `Quarantined`
+                // arm above applies, because an arriving verdict leads
+                // out of this state too
+                // (`QuarantineEvent::SupersedeAbsentVerdict` reaches
+                // `Quarantined`), so the publisher workflow the exemption
+                // exists for stays reachable here. No `Retry-After`,
+                // which is where the two holds still differ: this one
+                // advertises no deadline, because its exit is an arriving
+                // verdict or an operator, never elapsed time.
                 let response = quarantine::check_scan_indeterminate();
                 log_refused_read(&response, &refused, &RefusalReason::ScanIndeterminate);
                 return response;
             }
-            // else: same probe, same `head` bound as the `Rejected` arm.
+            // else: the same write-authorized hold-read as the
+            // `Quarantined` arm — fall through and serve, HEAD and GET
+            // alike. Bytes are untouched: a layer blob of this artifact
+            // stays `503` for every caller (`blobs.rs` keeps its
+            // existence probe `HEAD`-only), so what leaves the hold is
+            // the resolution document and nothing else.
         }
     }
 
@@ -526,8 +555,14 @@ pub(super) async fn serve(
 
     // A held manifest served under the write-authorized hold-read exemption
     // (ADR 0039 §10) streams via `download_hold_read`: the audited `download`
-    // path refuses a `Quarantined` artifact (`is_downloadable()` is false),
-    // so it cannot serve the held subject keyed `cosign sign` resolves by GET.
+    // path refuses a held artifact (`is_downloadable()` is false), so it
+    // cannot serve the held subject keyed `cosign sign` resolves by GET.
+    // `download_hold_read` gates on `HeldVisibility::exemption_covers` too,
+    // so the two halves ask one question rather than agreeing by hand: a
+    // status the gate above admits is one that read serves, and a future
+    // one is decided in that predicate alone. An admitted status refused
+    // there would arrive here as the `OciError::Internal` below — a `500`
+    // on a read this route already decided was allowed.
     // Otherwise (a released / `None` artifact) thread the resolved principal
     // through the audited `download` for opt-in download-audit attribution
     // (ADR 0020). No per-handler auth code.
@@ -3726,7 +3761,8 @@ mod tests {
     ///
     /// Both halves of that pin now have to be stated, because only one of
     /// them moved. **Resolvability is unchanged**: the ADR 0039 §10
-    /// hold-read exemption covers `Quarantined` and stops there, so a
+    /// hold-read exemption covers a hold pending a verdict and stops
+    /// short of a verdict reached, so a
     /// write-granted pull-scoped capability principal gets no manifest
     /// body out of a `Rejected` row — no grant and no cap shape
     /// resurrects a rejected manifest. **Diagnosability is what changes**:
@@ -3910,9 +3946,9 @@ mod tests {
     /// (`rejected_manifest_write_authorized_get_still_hidden_as_404`),
     /// the RBAC-enabled claims-principal mirror of the capability case
     /// above. Same two halves, and the same split: the ADR 0039 §10
-    /// hold-read exemption is `Quarantined`-only, so a `Write` grant
-    /// still buys no manifest body out of a `Rejected` row —
-    /// resolvability does not move. What the write-granted caller gains
+    /// hold-read exemption reaches a hold pending a verdict and stops
+    /// there, so a `Write` grant still buys no manifest body out of a
+    /// `Rejected` row — resolvability does not move. What the write-granted caller gains
     /// is the diagnosis, owed to them because they certainly pass the
     /// read gate, which is the only predicate the reason keys on.
     #[test]
@@ -3926,7 +3962,8 @@ mod tests {
             status,
             StatusCode::FORBIDDEN,
             "a write-authorized GET of a Rejected manifest must still never serve it — \
-             the hold-read exemption covers Quarantined only"
+             the hold-read exemption covers a hold pending a verdict and never a \
+             verdict reached"
         );
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "DENIED");
@@ -3936,15 +3973,19 @@ mod tests {
         );
     }
 
-    // ------- The existence probe on a terminal verdict (ADR 0055) -------
+    // ------- The existence probe on a reached verdict (ADR 0055) -------
     //
-    // The manifest route carries its own, `head`-bound predicate for the
-    // two terminal verdicts rather than a widened
-    // `write_authorized_hold_read`: that one has no `head` term because
-    // for `Quarantined` the exemption deliberately serves the `GET` too,
-    // and widening it would serve a rejected manifest's BODY. So the
-    // matrix below asserts both halves on every arm — the probe answers
-    // `200`, and the `GET` beside it does not.
+    // `Rejected` is the whole of this predicate's reach, and the
+    // `head` bound is why it is a separate predicate rather than a
+    // widened `write_authorized_hold_read`: that one has no `head` term,
+    // because for a hold pending a verdict the exemption deliberately
+    // serves the `GET` too, and widening it to a reached verdict would
+    // serve a rejected manifest's BODY. (`ScanIndeterminate` was in this
+    // set until the 2026-11-11 amendment re-sorted it as a hold; it now
+    // answers through the hold-read exemption itself, `GET` included,
+    // and its arms live in the `ScanIndeterminate` section below.) So
+    // the matrix below asserts both halves on every arm — the probe
+    // answers `200`, and the `GET` beside it does not.
 
     /// The manifest every arm in this section seeds — the same
     /// constituent-free body the `Quarantined` helpers use, so the
@@ -4117,19 +4158,6 @@ mod tests {
         let (status, parsed) = run(manifest_refusal_parts(resp));
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(parsed["errors"][0]["detail"]["axis"], "scanner");
-    }
-
-    /// `ScanIndeterminate` answers the probe identically, through the
-    /// same helper, so the two terminal verdicts cannot drift apart.
-    #[test]
-    fn head_manifest_scan_indeterminate_by_write_authorized_caller_reports_exists() {
-        let resp = terminal_manifest_response(
-            QuarantineStatus::ScanIndeterminate,
-            /* no axis: this verdict has none */ None,
-            /* head = */ true,
-            Some("ci-pusher"),
-        );
-        run(assert_manifest_probe_reports_exists(resp));
     }
 
     /// The gate that fires before any of this: a caller the repository
@@ -4871,14 +4899,18 @@ mod tests {
 
     // ---------------- ScanIndeterminate ----------------
     //
-    // ScanIndeterminate has no hold-read exemption: the manifest BODY is
-    // withheld from every caller — anonymous, pull-scoped,
-    // write-granted — with a 503 carrying NO Retry-After (no
-    // self-resolving deadline; exit is admin action or a successful
-    // rescan). The one shape that answers 200 is the write-authorized
-    // `HEAD` existence probe, `head`-bound and body-less (ADR 0055's
-    // 2026-10-21 amendment). The state × {GET, HEAD} × {anonymous,
-    // pull-scoped, write-granted} matrix below pins that shape.
+    // ScanIndeterminate carries the hold-read exemption, on the same
+    // terms as Quarantined (ADR 0055's 2026-11-11 amendment): it is a
+    // hold *pending* a verdict, because
+    // `QuarantineEvent::SupersedeAbsentVerdict` admits it and reaches
+    // `Quarantined`. So a write-granted caller resolves the manifest by
+    // HEAD and by GET, and every caller without that grant — anonymous,
+    // pull-scoped — still gets a 503 carrying NO Retry-After (this hold
+    // advertises no deadline: its exit is an arriving verdict or an
+    // operator, never elapsed time). The state × {GET, HEAD} ×
+    // {anonymous, pull-scoped, write-granted} matrix below pins that
+    // shape, and the asymmetry test at the end of the section pins the
+    // other half of the rule: the document resolves, the bytes do not.
 
     /// Common assertions for every `ScanIndeterminate` response in this
     /// section: 503, `UNAVAILABLE` code, the scan-indeterminate detail
@@ -4930,8 +4962,8 @@ mod tests {
                 QuarantineStatus::ScanIndeterminate,
             );
             // `ci-pusher` Write grant wired the same as the Quarantined
-            // suite: the write-granted caller's HEAD is exempted here
-            // too, and — unlike Quarantined — the GET is not.
+            // suite: the write-granted caller's HEAD and GET are both
+            // exempted here, exactly as they are there.
             let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
             serve(
                 ctx,
@@ -4959,22 +4991,60 @@ mod tests {
         run(assert_scan_indeterminate_response(resp));
     }
 
+    /// The hold-read exemption's payoff for this state: a publisher
+    /// whose own upload is held for want of a verdict can resolve the
+    /// manifest it just pushed, and therefore sign it — keyed signing
+    /// resolves the subject by `GET` before it can attach anything.
+    /// Before the 2026-11-11 amendment this answered `503`, so the same
+    /// publisher could sign an artifact held by the timed quarantine and
+    /// not one held for want of a verdict.
+    ///
+    /// The body is asserted, not just the status: `HEAD`-before-`GET`
+    /// parity makes the header set identical to the probe's `200`, so
+    /// only the bytes distinguish "served the manifest" from "reported
+    /// that it exists".
     #[test]
-    fn scan_indeterminate_manifest_get_write_granted_still_returns_503() {
+    fn scan_indeterminate_manifest_get_write_granted_serves_the_body() {
         let principal = principal_with_claim("ci-pusher");
         let resp = scan_indeterminate_manifest_response(/* head = */ false, Some(&principal));
-        run(assert_scan_indeterminate_response(resp));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = run(to_bytes(resp.into_body(), 4 * 1024)).unwrap().to_vec();
+        assert_eq!(
+            body, br#"{"schemaVersion":2}"#,
+            "the hold-read serves the manifest itself, not an empty probe answer"
+        );
     }
 
     #[test]
     fn scan_indeterminate_manifest_head_write_granted_reports_exists() {
-        // The existence probe reaches this verdict too; the GET above
-        // still refuses. Status-only, because the header set and the
-        // empty body are pinned by
+        // The same exemption, through its `HEAD` half — which the
+        // exemption has no `head` term to distinguish, so this and the
+        // `GET` above differ only in step 6's short-circuit.
+        // Status-only, because the header set and the empty body are
+        // pinned by
         // `head_manifest_scan_indeterminate_by_write_authorized_caller_reports_exists`.
         let principal = principal_with_claim("ci-pusher");
         let resp = scan_indeterminate_manifest_response(/* head = */ true, Some(&principal));
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The `HEAD` answer's whole shape, on the fixture the `Rejected`
+    /// arms share: `200`, the normal manifest header set, and an empty
+    /// body. Reached through the hold-read exemption rather than the
+    /// `head`-bound probe since the 2026-11-11 amendment, which is why
+    /// the `GET` beside it serves the manifest instead of refusing —
+    /// but the `HEAD` answer itself is unchanged, and asserting it on
+    /// the shared fixture is what keeps this state's header set from
+    /// drifting away from `Rejected`'s.
+    #[test]
+    fn head_manifest_scan_indeterminate_by_write_authorized_caller_reports_exists() {
+        let resp = terminal_manifest_response(
+            QuarantineStatus::ScanIndeterminate,
+            /* no axis: this state has none */ None,
+            /* head = */ true,
+            Some("ci-pusher"),
+        );
+        run(assert_manifest_probe_reports_exists(resp));
     }
 
     #[test]
@@ -5021,8 +5091,11 @@ mod tests {
     fn scan_indeterminate_manifest_pull_scoped_cap_with_write_grant_reports_exists() {
         // The cap-token shape that exempts a Quarantined manifest
         // (`quarantined_manifest_pull_scoped_cap_with_write_grant_serves`)
-        // exempts this verdict's HEAD too: the exemption keys on the
-        // grants leg, and a read-only cap does not veto it.
+        // exempts this hold too: the exemption keys on the grants leg,
+        // and a read-only cap does not veto it. This is the shape a real
+        // OCI client presents — a subject read is scoped `pull` — so a
+        // cap-intersected resolve would make the exemption unreachable
+        // for exactly the caller it exists for.
         use hort_domain::entities::rbac::Permission;
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
@@ -5064,6 +5137,103 @@ mod tests {
             .await
         });
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// **The rule's second sentence, asserted where the first one just
+    /// moved.** ADR 0055: "A principal that may write to a repository
+    /// may resolve held *metadata* there. Held *bytes* never leave
+    /// quarantine, for anyone." Admitting `ScanIndeterminate` to the
+    /// hold-read widens the first sentence by one status and the second
+    /// by none, and nothing in either route's own tests states that
+    /// asymmetry — each side only ever asserts about itself.
+    ///
+    /// So: one harness, one repository, one write-granted caller, one
+    /// status, and the two routes side by side. The manifest `GET`
+    /// serves its body; the layer blob's `GET` is `503`, which is what
+    /// keeps the image unpullable and unrunnable while the hold stands.
+    /// A change that widened `blobs.rs` to match the manifest route
+    /// would leave every test in both files green and fail here.
+    #[test]
+    fn scan_indeterminate_serves_the_manifest_to_a_writer_and_never_the_blob() {
+        let manifest_body = br#"{"schemaVersion":2}"#.to_vec();
+        let manifest_hex = sha256_hex(&manifest_body);
+        let layer_body = b"held layer bytes".to_vec();
+        let layer_hex = sha256_hex(&layer_body);
+
+        let (manifest_status, manifest_bytes, blob_status) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &manifest_hex,
+                &manifest_body,
+                None,
+                QuarantineStatus::ScanIndeterminate,
+            );
+            // The layer, seeded the way `blobs.rs` addresses one: a
+            // separate artifact row at `blobs/sha256:<hex>`, held in the
+            // same state as the manifest that names it.
+            let layer_hash: ContentHash = layer_hex.parse().unwrap();
+            let mut layer = sample_artifact(QuarantineStatus::None);
+            layer.repository_id = repo_id;
+            layer.path = format!("blobs/sha256:{layer_hex}");
+            layer.sha256_checksum = layer_hash.clone();
+            layer.size_bytes = layer_body.len() as i64;
+            layer.quarantine_status = QuarantineStatus::ScanIndeterminate;
+            h.artifacts.insert(layer);
+            h.storage.insert_content(layer_hash, layer_body.clone());
+
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let principal = principal_with_claim("ci-pusher");
+
+            let manifest_resp = serve(
+                ctx.clone(),
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{manifest_hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                Some(&principal),
+            )
+            .await;
+            let manifest_status = manifest_resp.status();
+            let manifest_bytes = to_bytes(manifest_resp.into_body(), 4 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+
+            let blob_status = crate::blobs::serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{layer_hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                Some(&principal),
+            )
+            .await
+            .status();
+
+            (manifest_status, manifest_bytes, blob_status)
+        });
+
+        assert_eq!(
+            manifest_status,
+            StatusCode::OK,
+            "the resolution document resolves for a principal that may write here"
+        );
+        assert_eq!(manifest_bytes, manifest_body, "and it is the manifest");
+        assert_eq!(
+            blob_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "held bytes never leave quarantine, for anyone — the same caller, the same \
+             repository and the same status, and the layer is still withheld"
+        );
     }
 
     // ---------------- Default media type fallback ----------------

@@ -34,12 +34,16 @@
 //! # Write-authorized hold-read
 //!
 //! A caller holding *granted* write authority on the repository sees
-//! `Quarantined` versions in the served index (ADR 0055, generalising
+//! **held** versions in the served index (ADR 0055, generalising
 //! ADR 0039 §10) — a publisher has to resolve the sibling it just
 //! uploaded, and `cargo publish` does that through the index even under
-//! `--no-verify`. The widening is metadata-only and `Quarantined`-only:
-//! terminal verdicts stay hidden from everyone, and held `.crate` bytes
-//! stay unserved to everyone (the download path carries no exemption).
+//! `--no-verify`. **Held** is a hold *pending a verdict* —
+//! `Quarantined` and `ScanIndeterminate` alike, a pair with one
+//! spelling in [`HeldVisibility::exemption_covers`]. The widening is
+//! metadata-only and reaches nothing else: `Rejected`, the verdict
+//! already reached, stays hidden from everyone, and held `.crate`
+//! bytes stay unserved to everyone (the download path carries no
+//! exemption).
 //! It does not apply to an aggregated (virtual) read, whose entries
 //! belong to member repositories the caller's grant says nothing about.
 //!
@@ -92,7 +96,6 @@ use hort_app::use_cases::index_filters::{
 use hort_app::use_cases::index_serve::{BuildContext, IndexFilter, VersionEntry};
 use hort_app::use_cases::index_serve_filter::NpmSemverOrdering;
 use hort_app::use_cases::repository_access::AccessLevel;
-use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{Repository, RepositoryType};
 use hort_domain::ports::format_handler::FormatHandler;
@@ -229,12 +232,20 @@ pub(crate) async fn serve_index_unified(
     // the view — a denied or errored resolve leaves held entries hidden.
     // The resolve fires solely when the source actually produced a held
     // entry, so the ordinary read path pays nothing for it.
+    //
+    // "A held entry" is `HeldVisibility::exemption_covers` and not a
+    // status literal of this handler's own. This gate decides whether
+    // the exemption is worth establishing; the filters below decide
+    // what it then shows, and a gate that names a narrower set than
+    // they do leaves their widened cell unreachable — which is exactly
+    // what gating on `Quarantined` alone did to `ScanIndeterminate`,
+    // a hold pending a verdict the filters already admit.
     let upstream_count = output.entries.len();
     let held_visibility = if !matches!(repo.repo_type, RepositoryType::Virtual)
         && output
             .entries
             .iter()
-            .any(|e| e.status == Some(QuarantineStatus::Quarantined))
+            .any(|e| e.status.is_some_and(HeldVisibility::exemption_covers))
         && ctx
             .repository_access_use_case
             .resolve_granted_write(repo_key, caller)
@@ -382,7 +393,7 @@ mod tests {
     use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
     use hort_app::use_cases::test_support::sample_repository;
     use hort_domain::entities::api_token::TokenCap;
-    use hort_domain::entities::artifact::Artifact;
+    use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
     use hort_domain::entities::repository::{IndexMode, RepositoryFormat};
@@ -739,8 +750,13 @@ mod tests {
         );
     }
 
-    /// Scope guard: `Rejected` is a terminal verdict, not a hold pending
-    /// one. The exemption does NOT reach it, for any caller.
+    /// **Counter-assertion**, and the one that has to survive every
+    /// later edit to this section: `Rejected` is a verdict already
+    /// reached, not a hold pending one, so the exemption does NOT reach
+    /// it for any caller. It and `ScanIndeterminate` used to answer
+    /// together here; they have parted, and folding `Rejected` back in
+    /// beside its former partner fails here rather than serving a
+    /// reached verdict to a publisher.
     #[tokio::test]
     async fn rejected_entry_stays_hidden_even_from_a_write_granted_caller() {
         let publisher = principal("ci-publisher", None);
@@ -748,23 +764,47 @@ mod tests {
         assert_eq!(
             versions,
             vec!["0.11.0"],
-            "the hold-read covers Quarantined only — a reached verdict stays hidden \
-             from everyone, publisher included"
+            "the hold-read covers a hold pending a verdict and never a verdict \
+             reached — Rejected stays hidden from everyone, publisher included"
         );
     }
 
-    /// Scope guard: `ScanIndeterminate` is a terminal fail-closed block
-    /// with no self-resolving deadline. Same answer as `Rejected`.
+    /// `ScanIndeterminate` is a hold *pending* a verdict, not a verdict
+    /// reached: `QuarantineEvent::SupersedeAbsentVerdict` admits it and
+    /// reaches `Quarantined`, so a verdict arriving later supersedes the
+    /// absent one. The exemption therefore reaches it exactly as it
+    /// reaches `Quarantined` (ADR 0055 D2, as amended 2026-11-11) — the
+    /// sparse-index entry is the cargo resolution document that
+    /// amendment names.
     #[tokio::test]
-    async fn scan_indeterminate_entry_stays_hidden_even_from_a_write_granted_caller() {
+    async fn scan_indeterminate_entry_is_served_to_a_write_granted_caller() {
         let publisher = principal("ci-publisher", None);
         let versions =
             served_versions_for(Some(&publisher), QuarantineStatus::ScanIndeterminate).await;
         assert_eq!(
             versions,
-            vec!["0.11.0"],
-            "ScanIndeterminate is terminal and fail-closed — no caller sees it"
+            vec!["0.11.0", "0.11.1"],
+            "a publisher whose own upload is held for want of a verdict must resolve \
+             it, exactly as it resolves one held by the timed quarantine"
         );
+    }
+
+    /// Scope guard: the exemption is write-authorized for *both* holds.
+    /// A caller without the Write grant — read-only or anonymous — keeps
+    /// the ordinary view of a `ScanIndeterminate` entry, as it does of a
+    /// `Quarantined` one.
+    #[tokio::test]
+    async fn scan_indeterminate_entry_stays_hidden_from_callers_without_the_write_grant() {
+        let reader = principal("ci-reader", None);
+        for caller in [Some(&reader), None] {
+            let versions = served_versions_for(caller, QuarantineStatus::ScanIndeterminate).await;
+            assert_eq!(
+                versions,
+                vec!["0.11.0"],
+                "widening the hold-read to a second hold must not widen who it \
+                 answers for: {caller:?} holds no Write grant"
+            );
+        }
     }
 
     /// `Released` is unaffected by the caller's authority — the
@@ -1303,32 +1343,33 @@ mod tests {
     /// caller.
     #[tokio::test]
     async fn virtual_read_does_not_grant_the_hold_read_over_member_repos() {
-        let (ctx, mocks) = build_mock_ctx(handle());
-        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
-        let ctx = write_grant_ctx(&ctx, &mocks, "ci-publisher");
-        let member = insert_hosted_repo(&mocks, "cargo-member", IndexMode::ReleasedOnly);
-        insert_artifact(
-            &mocks,
-            member.id,
-            "serde",
-            "1.0.0",
-            1,
+        // Both holds the exemption covers: the `RepositoryType::Virtual`
+        // guard sits ahead of the status question, so widening the
+        // latter must leave the aggregated read exactly where it was.
+        for status in [
             QuarantineStatus::Quarantined,
-        );
-        insert_virtual_repo(&mocks, "cargo-virt", &[&member]);
+            QuarantineStatus::ScanIndeterminate,
+        ] {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+            let ctx = write_grant_ctx(&ctx, &mocks, "ci-publisher");
+            let member = insert_hosted_repo(&mocks, "cargo-member", IndexMode::ReleasedOnly);
+            insert_artifact(&mocks, member.id, "serde", "1.0.0", 1, status);
+            insert_virtual_repo(&mocks, "cargo-virt", &[&member]);
 
-        // The very principal that WOULD see the held entry on the
-        // member repo directly.
-        let publisher = principal("ci-publisher", None);
-        let res = serve_index_unified(&ctx, "cargo-virt", "serde", Some(&publisher))
-            .await
-            .unwrap_or_else(|_| panic!("virtual serve must succeed"));
-        let versions = served_versions(res).await;
-        assert!(
-            versions.is_empty(),
-            "a write grant on the aggregator must not surface a member's held \
-             metadata: {versions:?}"
-        );
+            // The very principal that WOULD see the held entry on the
+            // member repo directly.
+            let publisher = principal("ci-publisher", None);
+            let res = serve_index_unified(&ctx, "cargo-virt", "serde", Some(&publisher))
+                .await
+                .unwrap_or_else(|_| panic!("virtual serve must succeed"));
+            let versions = served_versions(res).await;
+            assert!(
+                versions.is_empty(),
+                "{status}: a write grant on the aggregator must not surface a \
+                 member's held metadata: {versions:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------
