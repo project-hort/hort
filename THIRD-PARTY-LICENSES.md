@@ -450,7 +450,7 @@ the result instead.
 | prost-reflect-derive | 0.16.0 | MIT | https://github.com/andrewhickman/prost-reflect |
 | prost-reflect | 0.16.4 | MIT | https://github.com/andrewhickman/prost-reflect |
 | quote | 1.0.45 | MIT | https://github.com/dtolnay/quote |
-| rustix | 1.1.4 | MIT | https://github.com/bytecodealliance/rustix |
+| rustix | 1.1.6 | MIT | https://github.com/bytecodealliance/rustix |
 | rustversion | 1.0.22 | MIT | https://github.com/dtolnay/rustversion |
 | semver | 1.0.28 | MIT | https://github.com/dtolnay/semver |
 | serde-saphyr | 0.0.29 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
@@ -17021,7 +17021,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustix 1.1.4 — MIT
+### rustix 1.1.6 — MIT
 
 Repository: https://github.com/bytecodealliance/rustix
 
